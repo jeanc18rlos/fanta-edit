@@ -64,7 +64,7 @@ impl settings::Settings for AllLanguageModelSettings {
         let openai_compatible = language_models.openai_compatible.unwrap();
         let vercel_ai_gateway = language_models.vercel_ai_gateway.unwrap();
         let x_ai = language_models.x_ai.unwrap();
-        let zed_dot_dev = language_models.zed_dot_dev.unwrap();
+        let zed_dot_dev = language_models.zed_dot_dev.unwrap_or_default();
         Self {
             anthropic: AnthropicSettings {
                 api_url: anthropic.api_url.unwrap(),
