@@ -6,7 +6,8 @@ use super::{
     AssetResolver, Bounds, Canvas, CanvasNode, ImageCache, InstanceCache, MaskType, NodeData,
     NodeFlags, NodeId, Paint, RenderInputs, RenderMetrics, Scene, apply_background_blur,
     begin_effects_layer, draw_inner_shadows, effects_layer_bounds, paint_node_content,
-    render_instance, resolve_bound_value, shadow_expanded_world_bounds, to_sk_matrix,
+    paint_node_foreground, render_instance, resolve_bound_value, shadow_expanded_world_bounds,
+    to_sk_matrix,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,7 +141,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // background rect can fall back to the scene-computed content bounds, so we
     // pass `Some(id)`; the transient (instance) walk passes `None` and uses the
     // clip box only.
-    paint_node_content(canvas, node, Some(id), ctx);
+    let content_state = paint_node_content(canvas, node, Some(id), ctx);
 
     // Inner shadows ride ON TOP of the node's own fill (and under any children),
     // clipped to its silhouette. Drop shadows already rode the layer paint above.
@@ -189,6 +190,11 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             |canvas, ctx, &child| render_node(canvas, child, ctx),
         );
     }
+
+    if content_state.restore_child_clip {
+        canvas.restore();
+    }
+    paint_node_foreground(canvas, node, Some(id), ctx);
 
     if used_layer {
         canvas.restore();

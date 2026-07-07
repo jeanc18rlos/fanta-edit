@@ -100,7 +100,7 @@ pub use vector::vector_outline_sk_path; // track svg-prod
 // items referenced from a *different* submodule (or the tests) are re-exported
 // here; helpers used solely within their defining submodule are reached
 // directly there and stay unlisted.
-pub(crate) use content::paint_node_content;
+pub(crate) use content::{paint_node_content, paint_node_foreground};
 pub(crate) use cull::visible_world_rect;
 pub(crate) use effects::{
     apply_background_blur, begin_effects_layer, draw_inner_shadows, effects_layer_bounds,

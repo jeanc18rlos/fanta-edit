@@ -6,8 +6,8 @@ use super::{
     Arc, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey, InstanceNode, NodeData,
     NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur, begin_effects_layer,
     draw_inner_shadows, draw_unresolved_outline, effects_layer_bounds, expand_instance,
-    hash_overrides, paint_child_sequence, paint_node_content, resolve_overlay, to_sk_matrix,
-    with_shaped_layout,
+    hash_overrides, paint_child_sequence, paint_node_content, paint_node_foreground,
+    resolve_overlay, to_sk_matrix, with_shaped_layout,
 };
 
 // ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ pub(crate) fn render_expanded(
     // Transient nodes have no scene id, so a background-only unclipped group
     // paints nothing (no bounds to fall back to) — correct for a transient
     // subtree.
-    paint_node_content(canvas, node, None, ctx);
+    let content_state = paint_node_content(canvas, node, None, ctx);
 
     // Inner shadows on a transient (expanded-instance) node, clipped to its
     // silhouette — same treatment as a live-scene node, but with no scene id so
@@ -246,6 +246,11 @@ pub(crate) fn render_expanded(
             },
         );
     }
+
+    if content_state.restore_child_clip {
+        canvas.restore();
+    }
+    paint_node_foreground(canvas, node, None, ctx);
 
     if used_layer {
         canvas.restore();

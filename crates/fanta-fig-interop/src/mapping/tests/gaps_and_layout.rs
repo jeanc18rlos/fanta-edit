@@ -618,8 +618,7 @@ fn vertical_auto_layout_uses_legacy_padding_and_justify_fallbacks() {
 #[test]
 fn non_stack_frame_has_no_auto_layout() {
     // A plain FRAME (no stackMode) must NOT gain an AutoLayout, so plain frames
-    // round-trip without one when it also has no OpenPencil layout-inference
-    // signals such as stack padding or spacing.
+    // round-trip without one.
     let fig = doc_from(vec![o(
         "NodeChange",
         vec![
@@ -638,11 +637,11 @@ fn non_stack_frame_has_no_auto_layout() {
 }
 
 #[test]
-fn non_stack_frame_with_padding_infers_openpencil_horizontal_layout() {
-    use fanta_doc::node::LayoutMode;
-    // OpenPencil maps stack padding/spacing even without `stackMode`, then its
-    // renderer infers a horizontal layout from those props. The Spectrum icon
-    // catalogue frames rely on this exact quirk.
+fn non_stack_frame_with_stale_stack_fields_has_no_auto_layout() {
+    // Real .fig files can carry stale stack spacing/padding on free-positioned
+    // frames. Figma does not auto-layout those frames unless `stackMode` is an
+    // explicit HORIZONTAL/VERTICAL flow; inferring from these fields reflows
+    // already-baked compositions.
     let fig = doc_from(vec![o(
         "NodeChange",
         vec![
@@ -655,21 +654,14 @@ fn non_stack_frame_with_padding_infers_openpencil_horizontal_layout() {
         ],
     )]);
     let (doc, report, _) = fig_to_doc(&fig).unwrap();
-    let al = group_named(&doc, "Icon Grid")
-        .auto_layout
-        .expect("OpenPencil inference should create AutoLayout");
-    assert_eq!(al.mode, LayoutMode::Horizontal);
-    assert_eq!(al.spacing, 36.0);
-    assert_eq!(al.padding, [96.0, 96.0, 96.0, 96.0]);
     assert!(
-        !al.flow_reverse,
-        ".fig child order already matches Figma visual flow"
+        group_named(&doc, "Icon Grid").auto_layout.is_none(),
+        "stale stack fields without stackMode must not create AutoLayout"
     );
-    assert!(
-        !al.child_layout,
-        "OpenPencil inferred layout ignores stackChild* sizing"
+    assert_eq!(
+        report.auto_layout_horizontal + report.auto_layout_vertical,
+        0
     );
-    assert_eq!(report.auto_layout_horizontal, 1);
 }
 
 #[test]

@@ -16,6 +16,11 @@ fn media_progress(ctx: &RenderCtx, scene_id: Option<NodeId>) -> Option<f32> {
     ctx.inputs.playback?.get(&id).map(|p| p.progress)
 }
 
+#[derive(Default)]
+pub(crate) struct ContentPaintState {
+    pub(crate) restore_child_clip: bool,
+}
+
 /// Paint a single node's *own* content — no child recursion. Shared by the
 /// live-scene walk ([`render_node`]) and the transient instance-subtree walk
 /// ([`render_expanded`]) so a component instance renders pixel-identically to
@@ -30,7 +35,8 @@ pub(crate) fn paint_node_content(
     node: &CanvasNode,
     scene_id: Option<NodeId>,
     ctx: &mut RenderCtx,
-) {
+) -> ContentPaintState {
+    let mut state = ContentPaintState::default();
     match &node.data {
         NodeData::Instance(i) => {
             // The instance's own content is nothing — its pixels come from the
@@ -39,7 +45,9 @@ pub(crate) fn paint_node_content(
             // box (Figma instances clip like a frame). `local_size` is the
             // instance's box, independent of the master's size.
             let [w, h] = i.local_size;
+            canvas.save();
             canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
+            state.restore_child_clip = true;
         }
         NodeData::Group(g) => {
             // A Figma frame is a group carrying a background fill (and usually a
@@ -131,25 +139,6 @@ pub(crate) fn paint_node_content(
                 }
             }
 
-            // The frame's border (stroke): drawn on the frame's box, rounded to
-            // the frame corners, honoring `Stroke.align` (Inside/Outside/Center)
-            // — the SAME logic a shape's stroke uses. SECTION strokes are
-            // Figma editor outlines, so they stay render-inert here. Drawn AFTER
-            // the background so an inside border sits on top of the fill.
-            if let (Some(b), Some(_)) = (box_bounds, &box_path) {
-                if !g.strokes.is_empty() && !is_figma_section(node) {
-                    stroke_box_path(
-                        canvas,
-                        bounds_to_f32(&b),
-                        g.corner_radius,
-                        g.corner_radii,
-                        g.corner_smoothing,
-                        &g.strokes,
-                        ctx,
-                    );
-                }
-            }
-
             // Frame clipping: a Figma FRAME usually confines its content to its
             // box, whereas a plain group/page lets content overflow. The box is
             // carried by `clip_size`; `meta.clip_content=false` preserves the
@@ -164,8 +153,9 @@ pub(crate) fn paint_node_content(
             // box). It is applied within this node's `save()`/`restore()` pair —
             // and BEFORE the child recursion that follows in the caller — so it
             // scopes exactly this frame's subtree and is lifted off the stack
-            // before any sibling is drawn, never leaking. Background + border
-            // were painted first, above, so they are unaffected.
+            // before any sibling is drawn, never leaking. The background is
+            // painted before this child slot; the foreground stroke is painted
+            // after the child slot is restored.
             //
             // Anti-aliased (`true`) to match the soft edges the rest of the
             // renderer draws, so a clipped child's boundary doesn't show a hard
@@ -176,6 +166,7 @@ pub(crate) fn paint_node_content(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
             if clips_content && let Some([w, h]) = g.clip_size {
+                canvas.save();
                 if g.corner_radius.is_some() || g.corner_radii.is_some() {
                     let path = rounded_rect_path(
                         [0.0, 0.0, w as f32, h as f32],
@@ -187,6 +178,7 @@ pub(crate) fn paint_node_content(
                 } else {
                     canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
                 }
+                state.restore_child_clip = true;
             }
         }
         NodeData::Vector(v) => {
@@ -346,6 +338,43 @@ pub(crate) fn paint_node_content(
             draw_placeholder(canvas, e.local_size, Color::rgba(180, 180, 180, 80));
             ctx.metrics.nodes_drawn += 1;
         }
+    }
+    state
+}
+
+pub(crate) fn paint_node_foreground(
+    canvas: &Canvas,
+    node: &CanvasNode,
+    scene_id: Option<NodeId>,
+    ctx: &mut RenderCtx,
+) {
+    let NodeData::Group(g) = &node.data else {
+        return;
+    };
+    if g.strokes.is_empty() || is_figma_section(node) {
+        return;
+    }
+
+    let box_bounds = match g.clip_size {
+        Some([w, h]) => Some(Bounds::from_xywh(0.0, 0.0, w, h)),
+        None if g.background.is_some()
+            || !g.background_fills.is_empty()
+            || !g.strokes.is_empty() =>
+        {
+            scene_id.and_then(|id| ctx.scene.local_bounds(id))
+        }
+        None => None,
+    };
+    if let Some(bounds) = box_bounds {
+        stroke_box_path(
+            canvas,
+            bounds_to_f32(&bounds),
+            g.corner_radius,
+            g.corner_radii,
+            g.corner_smoothing,
+            &g.strokes,
+            ctx,
+        );
     }
 }
 

@@ -136,6 +136,43 @@ fn rounded_frame_inside_border_keeps_top_edge_opaque() {
 }
 
 #[test]
+fn rounded_frame_stroke_paints_above_clipped_child_slot() {
+    let mut doc = Doc::new();
+    let mut stroke = fanta_doc::Stroke::solid(Color::BLACK, 4.0);
+    stroke.align = fanta_doc::StrokeAlign::Inside;
+    let mut frame = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode {
+        clip_size: Some([40.0, 40.0]),
+        background: Some(Fill::solid(Color::WHITE)),
+        strokes: smallvec::smallvec![stroke],
+        corner_radius: Some(8.0),
+        ..Default::default()
+    }));
+    frame.transform = Transform2D::translation(-20.0, -20.0);
+    let frame_id = frame.id;
+    doc.apply(Operation::create_node(frame)).unwrap();
+
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        40.0,
+        20.0,
+        Color::WHITE,
+    )));
+    child.parent = Some(frame_id);
+    doc.apply(Operation::create_node(child)).unwrap();
+
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let buf = r.copy_rgba();
+
+    let top = rgba_at(&buf, 64, 32, 14);
+    assert!(
+        top[0] < 80 && top[1] < 80 && top[2] < 80 && top[3] > 220,
+        "rounded frame stroke should paint above a top-edge child, got {top:?}"
+    );
+}
+
+#[test]
 fn figma_section_does_not_paint_its_outline_as_document_content() {
     let mut doc = Doc::new();
     let mut stroke = fanta_doc::Stroke::solid(Color::BLACK, 4.0);

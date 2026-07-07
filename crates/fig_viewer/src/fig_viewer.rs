@@ -30,8 +30,8 @@ use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent,
-    Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Task,
-    Window, actions, div, px, relative, size,
+    Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
+    Subscription, Task, Window, actions, div, px, relative, size,
 };
 use image::{Frame, RgbaImage};
 use language::Capability;
@@ -75,7 +75,44 @@ pub struct FigItem {
     path: ProjectPath,
     abs_path: PathBuf,
     entry_id: Option<ProjectEntryId>,
-    document: Result<FigDocument, Arc<anyhow::Error>>,
+    document: FigDocumentState,
+    _load_task: Option<Task<()>>,
+}
+
+enum FigDocumentState {
+    Loading { message: SharedString },
+    Ready(FigDocument),
+    Error(Arc<anyhow::Error>),
+}
+
+impl FigDocumentState {
+    fn from_result(result: Result<FigDocument>) -> Self {
+        match result {
+            Ok(document) => Self::Ready(document),
+            Err(error) => Self::Error(Arc::new(error)),
+        }
+    }
+
+    fn ready(&self) -> Option<&FigDocument> {
+        match self {
+            Self::Ready(document) => Some(document),
+            Self::Loading { .. } | Self::Error(_) => None,
+        }
+    }
+
+    fn loading_message(&self) -> Option<SharedString> {
+        match self {
+            Self::Loading { message } => Some(message.clone()),
+            Self::Ready(_) | Self::Error(_) => None,
+        }
+    }
+
+    fn error(&self) -> Option<Arc<anyhow::Error>> {
+        match self {
+            Self::Error(error) => Some(error.clone()),
+            Self::Loading { .. } | Self::Ready(_) => None,
+        }
+    }
 }
 
 struct FigDocument {
@@ -105,16 +142,61 @@ impl project::ProjectItem for FigItem {
 
         Some(cx.spawn(async move |cx| {
             let abs_path = abs_path.context("Figma viewer only supports local .fig files")?;
-            let document = std::fs::read(&abs_path)
-                .with_context(|| format!("reading {}", abs_path.display()))
-                .and_then(|bytes| load_fig_document(&bytes));
+            let item = cx.new(|cx| {
+                let load_path = abs_path.clone();
+                let load_task = cx.spawn(async move |this, cx| {
+                    if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
+                        this.document = FigDocumentState::Loading {
+                            message: "Reading .fig file...".into(),
+                        };
+                        cx.notify();
+                    }) {
+                        log::debug!("dropping .fig load update for closed item: {error:#}");
+                        return;
+                    }
 
-            let document = document.map_err(Arc::new);
-            let item = cx.new(|_| Self {
-                path,
-                abs_path,
-                entry_id,
-                document,
+                    let bytes = cx
+                        .background_spawn(async move {
+                            std::fs::read(&load_path)
+                                .with_context(|| format!("reading {}", load_path.display()))
+                        })
+                        .await;
+                    let document = match bytes {
+                        Ok(bytes) => {
+                            if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
+                                this.document = FigDocumentState::Loading {
+                                    message: "Parsing and mapping .fig file...".into(),
+                                };
+                                cx.notify();
+                            }) {
+                                log::debug!(
+                                    "dropping .fig parse update for closed item: {error:#}"
+                                );
+                                return;
+                            }
+                            cx.background_spawn(async move { load_fig_document(&bytes) })
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    };
+
+                    if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
+                        this.document = FigDocumentState::from_result(document);
+                        cx.notify();
+                    }) {
+                        log::debug!("dropping .fig loaded update for closed item: {error:#}");
+                    }
+                });
+
+                Self {
+                    path,
+                    abs_path,
+                    entry_id,
+                    document: FigDocumentState::Loading {
+                        message: "Opening .fig file...".into(),
+                    },
+                    _load_task: Some(load_task),
+                }
             });
             Ok(item)
         }))
@@ -362,6 +444,7 @@ pub struct FigView {
     rendered_canvas: Option<RenderedCanvas>,
     #[cfg(target_os = "macos")]
     gpu_renderer: Option<MacGpuRenderer>,
+    _item_subscription: Subscription,
 }
 
 struct RenderedCanvas {
@@ -527,6 +610,10 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let item_subscription = cx.observe(&item, |this: &mut FigView, _, cx| {
+            this.reset_rendered_canvas();
+            cx.notify();
+        });
         Self {
             item,
             project,
@@ -537,6 +624,7 @@ impl FigView {
             rendered_canvas: None,
             #[cfg(target_os = "macos")]
             gpu_renderer: None,
+            _item_subscription: item_subscription,
         }
     }
 
@@ -588,7 +676,7 @@ impl FigView {
     fn reset_zoom(&mut self, _: &ResetZoom, _window: &mut Window, cx: &mut Context<Self>) {
         let viewport = self
             .container_bounds
-            .zip(self.item.read(cx).document.as_ref().ok())
+            .zip(self.item.read(cx).document.ready())
             .map(|(bounds, document)| {
                 fit_bounds(document.page_bounds, bounds_size(bounds), RENDER_PADDING)
             });
@@ -600,7 +688,7 @@ impl FigView {
     fn fit_to_view(&mut self, _: &FitToView, _window: &mut Window, cx: &mut Context<Self>) {
         let viewport = self
             .container_bounds
-            .zip(self.item.read(cx).document.as_ref().ok())
+            .zip(self.item.read(cx).document.ready())
             .map(|(bounds, document)| {
                 fit_bounds(document.page_bounds, bounds_size(bounds), RENDER_PADDING)
             });
@@ -764,7 +852,7 @@ impl Element for FigContentElement {
         let (viewport, is_dragging) = {
             let view = self.view.read(cx);
             let item = view.item.read(cx);
-            let Ok(document) = item.document.as_ref() else {
+            let Some(document) = item.document.ready() else {
                 return None;
             };
             let viewport = view
@@ -818,8 +906,8 @@ impl Element for FigContentElement {
             let item = item.read(cx);
             let document = item
                 .document
-                .as_ref()
-                .map_err(|error| anyhow!(error.to_string()))?;
+                .ready()
+                .ok_or_else(|| anyhow!("Figma document is not ready"))?;
 
             #[cfg(target_os = "macos")]
             {
@@ -931,16 +1019,26 @@ impl Item for FigView {
     where
         Self: Sized,
     {
-        Task::ready(Some(cx.new(|cx| Self {
-            item: self.item.clone(),
-            project: self.project.clone(),
-            focus_handle: cx.focus_handle(),
-            viewport: self.viewport,
-            last_mouse_position: None,
-            container_bounds: None,
-            rendered_canvas: None,
-            #[cfg(target_os = "macos")]
-            gpu_renderer: None,
+        let item = self.item.clone();
+        let project = self.project.clone();
+        let viewport = self.viewport;
+        Task::ready(Some(cx.new(|cx| {
+            let item_subscription = cx.observe(&item, |this: &mut FigView, _, cx| {
+                this.reset_rendered_canvas();
+                cx.notify();
+            });
+            Self {
+                item,
+                project,
+                focus_handle: cx.focus_handle(),
+                viewport,
+                last_mouse_position: None,
+                container_bounds: None,
+                rendered_canvas: None,
+                #[cfg(target_os = "macos")]
+                gpu_renderer: None,
+                _item_subscription: item_subscription,
+            }
         })))
     }
 
@@ -978,19 +1076,26 @@ impl Focusable for FigView {
 
 impl Render for FigView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let report_text = self.item.read(cx).document.as_ref().ok().map(|document| {
-            let skipped: usize = document.report.skipped_by_type.values().sum();
-            let page_name = document
-                .page_root
-                .and_then(|page| document.doc.page_name(page))
-                .unwrap_or("Page");
-            format!(
-                "{page_name} · {} mapped, {skipped} skipped",
-                document.report.mapped
+        let (report_text, loading_message, error) = {
+            let item = self.item.read(cx);
+            (
+                item.document.ready().map(|document| {
+                    let skipped: usize = document.report.skipped_by_type.values().sum();
+                    let page_name = document
+                        .page_root
+                        .and_then(|page| document.doc.page_name(page))
+                        .unwrap_or("Page");
+                    format!(
+                        "{page_name} · {} mapped, {skipped} skipped",
+                        document.report.mapped
+                    )
+                }),
+                item.document.loading_message(),
+                item.document.error(),
             )
-        });
-        let error = self.item.read(cx).document.as_ref().err().cloned();
+        };
         let has_error = error.is_some();
+        let is_loading = loading_message.is_some();
 
         div()
             .track_focus(&self.focus_handle(cx))
@@ -1013,7 +1118,21 @@ impl Render for FigView {
                         .child(Label::new(error.to_string()).color(Color::Muted)),
                 )
             })
-            .when(!has_error, |this| {
+            .when_some(loading_message, |this, message| {
+                this.child(
+                    v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(Label::new(message).size(LabelSize::Large))
+                        .child(
+                            Label::new("The canvas will appear as soon as parsing finishes.")
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .when(!has_error && !is_loading, |this| {
                 this.child(
                     div()
                         .id("fig-container")

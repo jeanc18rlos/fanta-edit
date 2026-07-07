@@ -6,12 +6,13 @@ use super::{
 };
 
 /// Read the auto-layout ("stack") configuration from a `NodeChange`, or `None`
-/// when the change carries none of OpenPencil's layout signals.
+/// when the change is not an explicit Figma auto-layout frame.
 ///
 /// Figma stack spacing, padding, alignment, sizing, wrapping, and reverse-z
-/// fields are mapped into Fanta's model. Axis hug sizing is only trusted for
-/// explicit HORIZONTAL/VERTICAL stack modes; otherwise stale stack fields may be
-/// present on non-auto-layout frames.
+/// fields are mapped into Fanta's model only when `stackMode` is an explicit
+/// HORIZONTAL or VERTICAL flow. Real `.fig` files can carry stale `stack*`
+/// fields on free-positioned frames; inferring auto-layout from those values
+/// reflows baked Figma compositions incorrectly.
 ///
 /// Figma fields (verified against the embedded `fig.kiwi`): `stackMode`,
 /// `stackSpacing`, `stackCounterSpacing`, the `stack*Padding*` family,
@@ -48,47 +49,29 @@ pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
     let pad_right = f("stackPaddingRight").or(horiz).or(base).unwrap_or(0.0);
     let padding = [pad_top, pad_right, pad_bottom, pad_left];
 
-    let spacing = f("stackSpacing").unwrap_or(0.0);
-    let has_openpencil_infer_signal = spacing != 0.0
-        || padding.iter().any(|v| *v != 0.0)
-        || primary_align != PrimaryAlign::Start
-        || counter_align != CounterAlign::Start;
-
     let stack_mode = change.get("stackMode").and_then(KiwiValue::as_str);
-    let explicit_axis_mode = matches!(stack_mode, Some("HORIZONTAL" | "VERTICAL"));
     let mode = match stack_mode {
         Some("HORIZONTAL") => LayoutMode::Horizontal,
         Some("VERTICAL") => LayoutMode::Vertical,
-        // OpenPencil maps any other non-NONE stack mode (notably GRID) to a
-        // vertical flow. When no stack mode exists, its renderer still infers a
-        // horizontal flow from gap/padding/align props.
-        Some(mode) if mode != "NONE" => LayoutMode::Vertical,
-        _ if has_openpencil_infer_signal => LayoutMode::Horizontal,
         _ => return None,
-    };
-    let primary_sizing = if explicit_axis_mode {
-        map_axis_sizing(change.get("stackPrimarySizing").and_then(KiwiValue::as_str))
-    } else {
-        AxisSizing::Fixed
-    };
-    let counter_sizing = if explicit_axis_mode {
-        map_axis_sizing(change.get("stackCounterSizing").and_then(KiwiValue::as_str))
-    } else {
-        AxisSizing::Fixed
     };
 
     Some(AutoLayout {
         mode,
-        spacing,
+        spacing: f("stackSpacing").unwrap_or(0.0),
         counter_spacing: f("stackCounterSpacing").unwrap_or(0.0),
         padding,
         primary_align,
         counter_align,
-        primary_sizing,
-        counter_sizing,
+        primary_sizing: map_axis_sizing(
+            change.get("stackPrimarySizing").and_then(KiwiValue::as_str),
+        ),
+        counter_sizing: map_axis_sizing(
+            change.get("stackCounterSizing").and_then(KiwiValue::as_str),
+        ),
         wrap: change.get("stackWrap").and_then(KiwiValue::as_str) == Some("WRAP"),
         flow_reverse: false,
-        child_layout: explicit_axis_mode,
+        child_layout: true,
         reverse_z: matches!(
             change.get("stackReverseZIndex"),
             Some(KiwiValue::Bool(true))
