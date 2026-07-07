@@ -4,6 +4,19 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+#[cfg(target_os = "macos")]
+use core_foundation::{
+    base::{CFType, TCFType},
+    boolean::CFBoolean,
+    dictionary::CFDictionary,
+    string::CFString,
+};
+#[cfg(target_os = "macos")]
+use core_video::{
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA},
+};
 use fanta_doc::{Doc, NodeId, Viewport};
 use fanta_fig_interop::{MapReport, fig_to_doc, read_fig};
 use fanta_render::{
@@ -11,17 +24,24 @@ use fanta_render::{
     solve_scene_layout,
 };
 use file_icons::FileIcons;
+#[cfg(target_os = "macos")]
+use foreign_types::ForeignType;
 use gpui::{
     AnyElement, App, Bounds, Context, DispatchPhase, Element, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent,
     Pixels, Point, Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Task,
-    Window, actions, div, img, px, relative, size,
+    Window, actions, div, px, relative, size,
 };
 use image::{Frame, RgbaImage};
 use language::Capability;
 use project::{Project, ProjectPath};
 use settings::Settings;
+#[cfg(target_os = "macos")]
+use skia_safe::{
+    ColorType,
+    gpu::{self, SurfaceOrigin, backend_render_targets, direct_contexts, mtl},
+};
 use smallvec::SmallVec;
 use ui::prelude::*;
 use util::paths::PathExt;
@@ -340,12 +360,164 @@ pub struct FigView {
     last_mouse_position: Option<Point<Pixels>>,
     container_bounds: Option<Bounds<Pixels>>,
     rendered_canvas: Option<RenderedCanvas>,
+    #[cfg(target_os = "macos")]
+    gpu_renderer: Option<MacGpuRenderer>,
 }
 
 struct RenderedCanvas {
     image: Arc<RenderImage>,
     size: (u32, u32),
     viewport: Viewport,
+}
+
+enum PaintCanvas {
+    #[cfg(target_os = "macos")]
+    Surface(CVPixelBuffer),
+    Image(Arc<RenderImage>),
+}
+
+#[cfg(target_os = "macos")]
+struct MacGpuRenderer {
+    raster_renderer: RasterRenderer,
+    direct_context: skia_safe::gpu::DirectContext,
+    texture_cache: CVMetalTextureCache,
+    _device: metal::Device,
+    _command_queue: metal::CommandQueue,
+    size: (u32, u32),
+}
+
+#[cfg(target_os = "macos")]
+impl MacGpuRenderer {
+    fn new(size: (u32, u32)) -> Result<Self> {
+        let device = metal::Device::system_default()
+            .ok_or_else(|| anyhow!("Metal system default device is unavailable"))?;
+        let command_queue = device.new_command_queue();
+        let backend = unsafe {
+            // Ganesh retains the Objective-C device and queue handles while the
+            // DirectContext lives; this renderer stores both owners alongside it.
+            mtl::BackendContext::new(
+                device.as_ptr() as mtl::Handle,
+                command_queue.as_ptr() as mtl::Handle,
+            )
+        };
+        let direct_context = direct_contexts::make_metal(&backend, None)
+            .ok_or_else(|| anyhow!("creating Skia Metal context failed"))?;
+        let texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
+            .map_err(|status| anyhow!("creating CoreVideo Metal texture cache failed: {status}"))?;
+        let raster_renderer =
+            RasterRenderer::new(size.0, size.1).context("creating Skia renderer state")?;
+
+        Ok(Self {
+            raster_renderer,
+            direct_context,
+            texture_cache,
+            _device: device,
+            _command_queue: command_queue,
+            size,
+        })
+    }
+
+    fn resize(&mut self, size: (u32, u32)) -> Result<()> {
+        if self.size == size {
+            return Ok(());
+        }
+
+        self.raster_renderer =
+            RasterRenderer::new(size.0, size.1).context("resizing Skia renderer state")?;
+        self.size = size;
+        Ok(())
+    }
+
+    fn render(
+        &mut self,
+        document: &FigDocument,
+        size: (u32, u32),
+        viewport: Viewport,
+        scale_factor: f32,
+    ) -> Result<CVPixelBuffer> {
+        self.resize(size)?;
+        if let Some(asset_resolver) = document.asset_resolver.clone() {
+            self.raster_renderer.set_asset_resolver(asset_resolver);
+        }
+
+        let pixel_buffer = create_bgra_pixel_buffer(size.0, size.1)?;
+        let color_texture = self
+            .texture_cache
+            .create_texture_from_image(
+                pixel_buffer.as_concrete_TypeRef(),
+                None,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                size.0 as usize,
+                size.1 as usize,
+                0,
+            )
+            .map_err(|status| anyhow!("creating CoreVideo Metal texture failed: {status}"))?;
+        let texture = unsafe { CVMetalTextureGetTexture(color_texture.as_concrete_TypeRef()) };
+        if texture.is_null() {
+            return Err(anyhow!("CoreVideo returned a null Metal texture"));
+        }
+
+        let texture_info = unsafe { mtl::TextureInfo::new(texture as mtl::Handle) };
+        let backend_render_target =
+            backend_render_targets::make_mtl((size.0 as i32, size.1 as i32), &texture_info);
+        let mut surface = gpu::surfaces::wrap_backend_render_target(
+            &mut self.direct_context,
+            &backend_render_target,
+            SurfaceOrigin::TopLeft,
+            ColorType::BGRA8888,
+            None,
+            None,
+        )
+        .ok_or_else(|| anyhow!("wrapping Metal texture as Skia surface failed"))?;
+
+        let render_viewport = Viewport {
+            center: viewport.center,
+            zoom: viewport.zoom * f64::from(scale_factor),
+        };
+        let inputs = RenderInputs {
+            components: &document.doc.components,
+            variables: &document.doc.variables,
+            active_modes: &document.doc.active_modes,
+            mode_generation: 0,
+            playback: None,
+            dark_ui: false,
+        };
+        self.raster_renderer.render_to_canvas(
+            surface.canvas(),
+            size.0,
+            size.1,
+            &document.doc.scene,
+            &render_viewport,
+            document.page_root,
+            &inputs,
+        );
+        self.direct_context.flush_submit_and_sync_cpu();
+        drop(surface);
+
+        Ok(pixel_buffer)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn create_bgra_pixel_buffer(width: u32, height: u32) -> Result<CVPixelBuffer> {
+    let io_surface_options = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[]);
+    let options = CFDictionary::<CFString, CFType>::from_CFType_pairs(&[
+        (
+            CFString::from(CVPixelBufferKeys::IOSurfaceProperties),
+            io_surface_options.as_CFType(),
+        ),
+        (
+            CFString::from(CVPixelBufferKeys::MetalCompatibility),
+            CFBoolean::true_value().as_CFType(),
+        ),
+    ]);
+    CVPixelBuffer::new(
+        kCVPixelFormatType_32BGRA,
+        width as usize,
+        height as usize,
+        Some(&options),
+    )
+    .map_err(|status| anyhow!("creating BGRA CVPixelBuffer failed: {status}"))
 }
 
 impl FigView {
@@ -363,6 +535,8 @@ impl FigView {
             last_mouse_position: None,
             container_bounds: None,
             rendered_canvas: None,
+            #[cfg(target_os = "macos")]
+            gpu_renderer: None,
         }
     }
 
@@ -372,6 +546,29 @@ impl FigView {
 
     fn reset_rendered_canvas(&mut self) {
         self.rendered_canvas = None;
+    }
+
+    fn render_cpu_canvas(
+        &mut self,
+        document: &FigDocument,
+        size: (u32, u32),
+        viewport: Viewport,
+        scale_factor: f32,
+    ) -> Result<Arc<RenderImage>> {
+        if let Some(rendered) = &self.rendered_canvas
+            && rendered.size == size
+            && same_viewport(rendered.viewport, viewport)
+        {
+            return Ok(rendered.image.clone());
+        }
+
+        let image = render_fig_canvas(document, size.0, size.1, viewport, scale_factor)?;
+        self.rendered_canvas = Some(RenderedCanvas {
+            image: image.clone(),
+            size,
+            viewport,
+        });
+        Ok(image)
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
@@ -524,7 +721,7 @@ impl IntoElement for FigContentElement {
 
 impl Element for FigContentElement {
     type RequestLayoutState = ();
-    type PrepaintState = Option<(AnyElement, bool)>;
+    type PrepaintState = Option<bool>;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -560,14 +757,11 @@ impl Element for FigContentElement {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let scale_factor = window.scale_factor();
         let logical_size = bounds_size(bounds);
-        let render_size = render_size_for_bounds(bounds, scale_factor);
-
-        let (viewport, is_dragging, needs_render) = {
+        let (viewport, is_dragging) = {
             let view = self.view.read(cx);
             let item = view.item.read(cx);
             let Ok(document) = item.document.as_ref() else {
@@ -576,78 +770,27 @@ impl Element for FigContentElement {
             let viewport = view
                 .viewport
                 .unwrap_or_else(|| fit_bounds(document.page_bounds, logical_size, RENDER_PADDING));
-            let needs_render = view.rendered_canvas.as_ref().is_none_or(|rendered| {
-                rendered.size != render_size || !same_viewport(rendered.viewport, viewport)
-            });
-            (viewport, view.is_dragging(), needs_render)
+            (viewport, view.is_dragging())
         };
 
-        let rendered_image = if needs_render {
-            let render_result = {
-                let view = self.view.read(cx);
-                let item = view.item.read(cx);
-                let Ok(document) = item.document.as_ref() else {
-                    return None;
-                };
-                render_fig_canvas(
-                    document,
-                    render_size.0,
-                    render_size.1,
-                    viewport,
-                    scale_factor,
-                )
-            };
-
-            match render_result {
-                Ok(image) => {
-                    self.view.update(cx, |this, _| {
-                        this.container_bounds = Some(bounds);
-                        this.viewport = Some(viewport);
-                        this.rendered_canvas = Some(RenderedCanvas {
-                            image: image.clone(),
-                            size: render_size,
-                            viewport,
-                        });
-                    });
-                    image
-                }
-                Err(error) => {
-                    log::warn!("failed to render .fig canvas: {error:#}");
-                    return None;
-                }
-            }
-        } else {
-            self.view.update(cx, |this, _| {
-                this.container_bounds = Some(bounds);
-            });
-            let view = self.view.read(cx);
-            let Some(rendered) = &view.rendered_canvas else {
-                return None;
-            };
-            rendered.image.clone()
-        };
-
-        let mut content = div()
-            .relative()
-            .size_full()
-            .child(img(rendered_image).size_full())
-            .into_any_element();
-
-        content.prepaint_as_root(bounds.origin, bounds.size.into(), window, cx);
-        Some((content, is_dragging))
+        self.view.update(cx, |this, _| {
+            this.container_bounds = Some(bounds);
+            this.viewport = Some(viewport);
+        });
+        Some(is_dragging)
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some((mut element, is_dragging)) = prepaint.take() else {
+        let Some(is_dragging) = prepaint.take() else {
             return;
         };
 
@@ -665,7 +808,59 @@ impl Element for FigContentElement {
             });
         }
 
-        element.paint(window, cx);
+        let scale_factor = window.scale_factor();
+        let render_size = render_size_for_bounds(bounds, scale_factor);
+        let paint_canvas = self.view.update(cx, |this, cx| {
+            let viewport = this
+                .viewport
+                .ok_or_else(|| anyhow!("Figma canvas viewport was not initialized"))?;
+            let item = this.item.clone();
+            let item = item.read(cx);
+            let document = item
+                .document
+                .as_ref()
+                .map_err(|error| anyhow!(error.to_string()))?;
+
+            #[cfg(target_os = "macos")]
+            {
+                let mut gpu_renderer = match this.gpu_renderer.take() {
+                    Some(renderer) => renderer,
+                    None => MacGpuRenderer::new(render_size)?,
+                };
+                let gpu_result = gpu_renderer.render(document, render_size, viewport, scale_factor);
+                this.gpu_renderer = Some(gpu_renderer);
+                match gpu_result {
+                    Ok(surface) => {
+                        this.rendered_canvas = None;
+                        return Ok(PaintCanvas::Surface(surface));
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "failed to render .fig canvas with Skia Metal, falling back to CPU: {error:#}"
+                        );
+                    }
+                }
+            }
+
+            this.render_cpu_canvas(document, render_size, viewport, scale_factor)
+                .map(PaintCanvas::Image)
+        });
+
+        match paint_canvas {
+            #[cfg(target_os = "macos")]
+            Ok(PaintCanvas::Surface(surface)) => {
+                window.paint_surface(bounds, surface);
+            }
+            Ok(PaintCanvas::Image(image)) => {
+                if let Err(error) = window.paint_image(bounds, Default::default(), image, 0, false)
+                {
+                    log::warn!("failed to paint .fig CPU canvas: {error:#}");
+                }
+            }
+            Err(error) => {
+                log::warn!("failed to render .fig canvas: {error:#}");
+            }
+        }
     }
 }
 
@@ -744,6 +939,8 @@ impl Item for FigView {
             last_mouse_position: None,
             container_bounds: None,
             rendered_canvas: None,
+            #[cfg(target_os = "macos")]
+            gpu_renderer: None,
         })))
     }
 
