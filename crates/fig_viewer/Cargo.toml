@@ -1,0 +1,31 @@
+[package]
+name = "fig_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fig_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fanta-doc.workspace = true
+fanta-fig-interop.workspace = true
+fanta-render.workspace = true
+file_icons.workspace = true
+gpui.workspace = true
+image.workspace = true
+language.workspace = true
+log.workspace = true
+project.workspace = true
+settings.workspace = true
+smallvec.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+worktree.workspace = true

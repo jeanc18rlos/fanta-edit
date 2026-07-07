@@ -6,7 +6,7 @@ version = "1.11.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
-default-run = "fantaedit"
+default-run = "fanta"
 
 [lints]
 workspace = true
@@ -54,7 +54,7 @@ visual-tests = [
 ]
 
 [[bin]]
-name = "fantaedit"
+name = "fanta"
 path = "src/main.rs"
 
 [[bin]]
@@ -109,6 +109,7 @@ extension_host.workspace = true
 extensions_ui.workspace = true
 feature_flags.workspace = true
 feedback.workspace = true
+fig_viewer.workspace = true
 file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
@@ -276,35 +277,35 @@ repl = { workspace = true, features = ["test-support"] }
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.fantaedit.FantaEdit-Dev"
+identifier = "dev.fanta.Fanta-Dev"
 name = "Fanta Edit Dev"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["fantaedit"]
+osx_url_schemes = ["fanta"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
-identifier = "dev.fantaedit.FantaEdit-Nightly"
+identifier = "dev.fanta.Fanta-Nightly"
 name = "Fanta Edit Nightly"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["fantaedit"]
+osx_url_schemes = ["fanta"]
 
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
-identifier = "dev.fantaedit.FantaEdit-Preview"
+identifier = "dev.fanta.Fanta-Preview"
 name = "Fanta Edit Preview"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["fantaedit"]
+osx_url_schemes = ["fanta"]
 
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
-identifier = "dev.fantaedit.FantaEdit"
+identifier = "dev.fanta.Fanta"
 name = "Fanta Edit"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["fantaedit"]
+osx_url_schemes = ["fanta"]
 
 [package.metadata.cargo-machete]
 ignored = ["profiling", "zstd", "tracing"]

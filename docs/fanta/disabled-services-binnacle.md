@@ -16,7 +16,7 @@ release process, and user-facing disclosure.
 | Telemetry metrics | `"metrics": false` | Fanta does not yet own analytics ingestion, retention, dashboards, or privacy language. | Fanta has an analytics endpoint, schema validation, retention policy, opt-out UX, and docs. |
 | Diagnostics and crash upload | `"diagnostics": false` | Crash reports can contain sensitive metadata and need Fanta-owned handling. | Fanta has crash ingestion, symbolication, retention rules, alerting, and disclosure. |
 | Auto-update | `"auto_update": false` | The updater expects trusted signed artifacts and release metadata owned by the product. | Fanta has signed builds, update assets, checksums/signatures, release notes, and rollback steps. |
-| Hosted server URL | `"server_url": "https://fantaedit.dev"` | Account, docs, release, collaboration, telemetry, and cloud routes must not target `zed.dev` by default. | `fantaedit.dev` has compatible routes, or cloud-dependent features are gated. |
+| Hosted server URL | `"server_url": "https://fanta.dev"` | Account, docs, release, collaboration, telemetry, and cloud routes must not target `zed.dev` by default. | `fanta.dev` has compatible routes, or cloud-dependent features are gated. |
 | Zed-hosted model provider | Default model uses `anthropic`; the default `zed.dev` provider entry was removed. | New agent threads should not assume access to Zed-hosted model brokerage. | Fanta owns a model gateway, or users explicitly configure their own provider. |
 
 ## Code Touchpoints Changed
@@ -25,7 +25,7 @@ release process, and user-facing disclosure.
   - Default agent model provider changed from `zed.dev` to `anthropic`.
   - Default telemetry diagnostics and metrics changed to `false`.
   - Default auto-update changed to `false`.
-  - Default `server_url` changed from `https://zed.dev` to `https://fantaedit.dev`.
+  - Default `server_url` changed from `https://zed.dev` to `https://fanta.dev`.
   - Default `zed.dev` language model provider entry was removed.
 - [crates/auto_update/src/auto_update.rs](/Users/jeanrojas/fanta-edit/crates/auto_update/src/auto_update.rs)
   - Auto-update default documentation now describes Fanta's disabled baseline.
@@ -50,8 +50,8 @@ as Fanta but still behave like an unowned cloud client.
 
 Minimum resources:
 
-- Fanta-owned domain, for example `fantaedit.dev`.
-- API host decision: `api.fantaedit.dev` or `fantaedit.dev/api`.
+- Fanta-owned domain, for example `fanta.dev`.
+- API host decision: `api.fanta.dev` or `fanta.dev/api`.
 - TLS certificates.
 - Environment split for local, staging, and production.
 - Route map for account, docs, releases, telemetry, collaboration, and model gateway paths.

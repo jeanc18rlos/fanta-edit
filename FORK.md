@@ -37,8 +37,8 @@ Already done in this fork:
 
 | Item | Location | Value |
 |------|----------|-------|
-| App data/config name | `crates/paths/src/paths.rs` → `APP_NAME` | `FantaEdit` |
-| macOS bundle IDs & display names | `crates/zed/Cargo.toml` → `[package.metadata.bundle-*]` | `dev.fantaedit.*` / `Fanta Edit` |
+| App data/config name | `crates/paths/src/paths.rs` → `APP_NAME` | `Fanta` |
+| macOS bundle IDs & display names | `crates/zed/Cargo.toml` → `[package.metadata.bundle-*]` | `dev.fanta.*` / `Fanta Edit` |
 
 Still to customize as you build out Fanta Edit:
 
@@ -46,7 +46,7 @@ Still to customize as you build out Fanta Edit:
 - [ ] **CLI binary name** — `crates/cli` (currently still `cli` / `zed` in places)
 - [ ] **Window title / about dialog** — search for `"Zed"` in `crates/zed/src/`
 - [ ] **Default settings** — `assets/settings/default.json` (`server_url`, provider IDs)
-- [ ] **Deep links / URL schemes** — currently `fantaedit://` in bundle metadata
+- [ ] **Deep links / URL schemes** — currently `fanta://` in bundle metadata
 - [ ] **Project folder** — still `.zed/` in upstream; change in `crates/paths/src/paths.rs` if you want `.fanta-edit/`
 - [ ] **Remote server dirs** — `.zed_server` paths in `paths.rs` if you use remote dev
 - [ ] **Documentation & marketing** — `docs/`, GitHub repo description
@@ -59,10 +59,10 @@ Zed explicitly documents fork branding in `crates/paths/src/paths.rs`:
 
 ```rust
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "FantaEdit";
+pub const APP_NAME: &str = "Fanta";
 ```
 
-Config paths become `~/.config/fantaedit`, `~/Library/Application Support/FantaEdit`, etc.
+Config paths become `~/.config/fanta`, `~/Library/Application Support/Fanta`, etc.
 
 ## Legal note
 

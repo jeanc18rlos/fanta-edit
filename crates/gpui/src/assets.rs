@@ -68,6 +68,14 @@ impl RenderImage {
         }
     }
 
+    /// Set the image's source scale factor for layout.
+    pub fn with_scale_factor(mut self, scale_factor: f32) -> Self {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
+            self.scale_factor = scale_factor;
+        }
+        self
+    }
+
     /// Convert this image into a byte slice.
     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
         self.data
