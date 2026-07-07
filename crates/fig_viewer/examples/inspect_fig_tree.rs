@@ -7,6 +7,7 @@ use fanta_doc::{
     expand_instance,
 };
 use fanta_fig_interop::{fig_to_doc, read_fig};
+use fanta_render::solve_scene_layout;
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -15,11 +16,19 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("missing .fig path"))?;
     let root_filter = args.next().unwrap_or_else(|| "Action Bar".to_string());
-    let list_matches = args.any(|arg| arg == "--list");
+    let mut list_matches = false;
+    let mut solve_layout = false;
+    for arg in args {
+        match arg.as_str() {
+            "--list" => list_matches = true,
+            "--solve-layout" => solve_layout = true,
+            other => return Err(anyhow!("unknown argument {other:?}")),
+        }
+    }
 
     let bytes = fs::read(&fig_path).with_context(|| format!("reading {}", fig_path.display()))?;
     let fig = read_fig(&bytes).context("parsing .fig")?;
-    let (doc, report, _assets) = fig_to_doc(&fig).context("mapping .fig")?;
+    let (mut doc, report, _assets) = fig_to_doc(&fig).context("mapping .fig")?;
     eprintln!(
         "mapped {} nodes, {} components, {} sets, {} instances, {} with props, {} with derived",
         report.mapped,
@@ -37,6 +46,10 @@ fn main() -> Result<()> {
 
     let root = find_node_by_path(&doc, &root_filter)
         .with_context(|| format!("finding node containing {root_filter:?}"))?;
+    if solve_layout {
+        let page = page_for_node(&doc, root).unwrap_or(root);
+        solve_scene_layout(&mut doc.scene, page);
+    }
     println!("root: {}", node_path(&doc, root));
     dump_scene_subtree(&doc, root, 0);
     Ok(())
@@ -65,6 +78,17 @@ fn list_node_paths(doc: &Doc, filter: &str) {
             println!("{} :: {}", node_kind(node), node_path(doc, node_id));
         }
     }
+}
+
+fn page_for_node(doc: &Doc, node: NodeId) -> Option<NodeId> {
+    if doc.pages().contains(&node) {
+        return Some(node);
+    }
+
+    doc.scene
+        .ancestors_of(node)
+        .find(|ancestor| doc.pages().contains(&ancestor.id))
+        .map(|ancestor| ancestor.id)
 }
 
 fn dump_scene_subtree(doc: &Doc, root: NodeId, depth: usize) {

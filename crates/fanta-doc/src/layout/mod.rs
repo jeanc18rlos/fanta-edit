@@ -34,8 +34,8 @@ mod size;
 
 use crate::id::NodeId;
 use crate::node::{
-    AutoLayout, AxisSizing, CanvasNode, CounterAlign, LayoutMode, NodeData, PrimaryAlign,
-    TextAutoResize, TextNode,
+    AutoLayout, AxisSizing, CanvasNode, CounterAlign, LayoutMode, NodeData, NodeFlags,
+    PrimaryAlign, TextAutoResize, TextNode,
 };
 use crate::transform::Transform2D;
 use glam::{DMat2, DVec2};
@@ -267,6 +267,9 @@ fn push_child_info<T: LayoutTree>(
     infos: &mut Vec<ChildInfo>,
 ) {
     let Some(node) = tree.node(cid) else { return };
+    if node.flags.contains(NodeFlags::HIDDEN) {
+        return;
+    }
     let lc = if al.child_layout {
         node.layout_child
     } else {

@@ -30,6 +30,30 @@ fn horizontal_stack_with_spacing_and_padding() {
 }
 
 #[test]
+fn hidden_children_do_not_take_flow_space() {
+    let mut t = VecTree::new();
+    let al = AutoLayout {
+        mode: LayoutMode::Horizontal,
+        spacing: 10.0,
+        padding: [0.0, 0.0, 0.0, 8.0],
+        ..Default::default()
+    };
+    let f = t.push(frame(400.0, 100.0, al));
+    let a = t.push(rect_child(f, 30.0, 20.0));
+    let mut hidden = rect_child(f, 40.0, 20.0);
+    hidden.flags |= NodeFlags::HIDDEN;
+    let hidden = t.push(hidden);
+    let b = t.push(rect_child(f, 50.0, 20.0));
+    let hidden_origin = placed_origin(&t, hidden);
+
+    solve_auto_layout(&mut t, f, &mut no_measure);
+
+    approx(placed_origin(&t, a), [8.0, 0.0]);
+    approx(placed_origin(&t, b), [8.0 + 30.0 + 10.0, 0.0]);
+    approx(placed_origin(&t, hidden), hidden_origin);
+}
+
+#[test]
 fn horizontal_stack_can_flow_reverse_scene_order() {
     let mut t = VecTree::new();
     let al = AutoLayout {

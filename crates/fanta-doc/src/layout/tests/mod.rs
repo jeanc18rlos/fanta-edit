@@ -16,7 +16,7 @@ pub(crate) mod size {
 // the `super::*` surface.
 pub(crate) use crate::color::Color;
 pub(crate) use crate::node::{
-    AutoLayout, AxisSizing, CounterAlign, GroupNode, LayoutChild, LayoutMode, NodeData,
+    AutoLayout, AxisSizing, CounterAlign, GroupNode, LayoutChild, LayoutMode, NodeData, NodeFlags,
     PrimaryAlign, TextAutoResize, TextNode, VectorNode,
 };
 pub(crate) use crate::transform::Transform2D;

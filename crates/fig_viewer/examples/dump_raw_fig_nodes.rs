@@ -23,10 +23,12 @@ fn main() -> Result<()> {
         let name = change.get("name").and_then(KiwiValue::as_str).unwrap_or("");
         let ty = change.get("type").and_then(KiwiValue::as_str).unwrap_or("");
         let guid = format_value(change.get("guid"));
+        let text = text_characters(change).unwrap_or("");
         if !needle.is_empty()
             && !name.to_lowercase().contains(&needle)
             && !ty.to_lowercase().contains(&needle)
             && !guid.to_lowercase().contains(&needle)
+            && !text.to_lowercase().contains(&needle)
         {
             continue;
         }
@@ -54,6 +56,13 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn text_characters(value: &KiwiValue) -> Option<&str> {
+    value
+        .get("textData")
+        .and_then(|text_data| text_data.get("characters"))
+        .and_then(KiwiValue::as_str)
 }
 
 fn print_selected_fields(value: &KiwiValue, depth: usize) {
