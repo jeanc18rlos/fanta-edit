@@ -126,6 +126,51 @@ fn expand_applies_derived_geometry_fills_and_stroke_to_vector() {
 }
 
 #[test]
+fn derived_fill_geometry_without_stroke_clears_master_stroke() {
+    use crate::node::DerivedOverride;
+    use crate::path::PathData;
+
+    let mut scene = Scene::new();
+    let (lib, comp_id, _root_id, rect_id) = master_with_vector(&mut scene);
+    if let Some(NodeData::Vector(vector)) = scene.get_mut(rect_id).map(|node| &mut node.data) {
+        vector.strokes = smallvec![crate::style::Stroke::solid(Color::BLACK, 1.0)];
+    }
+
+    let baked = PathData::rect(0.0, 0.0, 40.0, 4.0);
+    let inst = InstanceNode {
+        component: comp_id,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: vec![DerivedOverride {
+            path: smallvec![rect_id],
+            transform: None,
+            size: None,
+            fills: Some(smallvec![crate::style::Fill::solid(Color::WHITE)]),
+            path_data: Some(baked),
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        }],
+        local_size: [100.0, 100.0],
+    };
+
+    let expanded = expand_instance(&scene, &lib, &inst);
+    let child = expanded
+        .iter()
+        .find(|entry| entry.def_path.as_slice() == [rect_id])
+        .unwrap();
+    match &child.node.data {
+        NodeData::Vector(vector) => {
+            assert!(
+                vector.strokes.is_empty(),
+                "a derived filled path with no derived stroke must not keep the master outline"
+            );
+        }
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
 fn expand_keeps_stroked_vector_path_when_derived_stroke_path_is_present() {
     use crate::node::DerivedOverride;
     use crate::path::PathData;
@@ -307,6 +352,21 @@ fn expand_applies_derived_text_color_and_weight_to_a_text_clone() {
     use crate::node::{DerivedOverride, DerivedText};
     let mut scene = Scene::new();
     let (lib, comp_id, _root_id, label_id) = master(&mut scene);
+    {
+        let Some(label) = scene.get_mut(label_id) else {
+            panic!("missing label");
+        };
+        let NodeData::Text(text) = &mut label.data else {
+            panic!("expected text");
+        };
+        let mut run_style = text.style.clone();
+        run_style.color = Color::BLACK;
+        text.style_runs.push(crate::node::TextStyleRun {
+            start: 0,
+            end: text.content.len(),
+            style: run_style,
+        });
+    }
     // The master label is the default style: black, weight 400, Inter.
     let themed = Color::rgb(0xEE, 0xEE, 0xEE);
     let inst = InstanceNode {
@@ -344,6 +404,10 @@ fn expand_applies_derived_text_color_and_weight_to_a_text_clone() {
                 t.style.color, themed,
                 "derived color must overwrite master black"
             );
+            assert!(
+                t.style_runs.iter().all(|run| run.style.color == themed),
+                "derived color must also overwrite rich text runs"
+            );
             assert_eq!(
                 t.style.weight, 600,
                 "derived weight must overwrite master 400"
@@ -374,6 +438,21 @@ fn override_fills_set_glyph_color_on_a_text_clone() {
     // color, NOT the master/default.
     let mut scene = Scene::new();
     let (lib, comp_id, _root_id, label_id) = master(&mut scene);
+    {
+        let Some(label) = scene.get_mut(label_id) else {
+            panic!("missing label");
+        };
+        let NodeData::Text(text) = &mut label.data else {
+            panic!("expected text");
+        };
+        let mut run_style = text.style.clone();
+        run_style.color = Color::BLACK;
+        text.style_runs.push(crate::node::TextStyleRun {
+            start: 0,
+            end: text.content.len(),
+            style: run_style,
+        });
+    }
     // The master label is the default near-black; the per-page themed color is
     // a light gray (a Darkest gray-700).
     let themed = Color::rgb(0xD0, 0xD0, 0xD0);
@@ -396,10 +475,16 @@ fn override_fills_set_glyph_color_on_a_text_clone() {
         .find(|e| e.def_path.as_slice() == [label_id])
         .unwrap();
     match &child.node.data {
-        NodeData::Text(t) => assert_eq!(
-            t.style.color, themed,
-            "text override fill must set the glyph color (per-page theme), not be dropped"
-        ),
+        NodeData::Text(t) => {
+            assert_eq!(
+                t.style.color, themed,
+                "text override fill must set the glyph color (per-page theme), not be dropped"
+            );
+            assert!(
+                t.style_runs.iter().all(|run| run.style.color == themed),
+                "text override fill must also recolor rich text runs"
+            );
+        }
         other => panic!("expected text, got {other:?}"),
     }
 }

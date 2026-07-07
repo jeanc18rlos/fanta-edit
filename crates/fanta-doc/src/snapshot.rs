@@ -174,10 +174,11 @@ fn visit_scene_node(doc: &Doc, scene: &Scene, id: NodeId, out: &mut Vec<NodeSnap
         // expansion root; descendants compose their own local transforms on top.
         let world = scene.world_transform(id).unwrap_or(Transform2D::IDENTITY);
         let mut expanded = expand_instance(scene, &doc.components, inst);
-        // Solve auto-layout INSIDE the expanded subtree (cards/buttons reflow
-        // their children) before walking it, mirroring the renderer's order:
-        // expansion + derived baked data first, then the layout pass.
-        crate::layout::solve_expanded(&mut expanded, &mut metric_measure);
+        // Figma-derived instances already carry baked per-descendant layout; the
+        // renderer only solves component masters that have no derived data.
+        if inst.derived.is_empty() {
+            crate::layout::solve_expanded(&mut expanded, &mut metric_measure);
+        }
         visit_expanded_root(doc, scene, &expanded, world, out);
     } else {
         for &child in scene.children_of(Some(id)) {
@@ -236,7 +237,9 @@ fn visit_expanded(
 
     if let NodeData::Instance(inner) = &node.data {
         let mut inner_expanded = expand_instance(scene, &doc.components, inner);
-        crate::layout::solve_expanded(&mut inner_expanded, &mut metric_measure);
+        if inner.derived.is_empty() {
+            crate::layout::solve_expanded(&mut inner_expanded, &mut metric_measure);
+        }
         visit_expanded_root(doc, scene, &inner_expanded, world, out);
     } else {
         for child in expanded.iter().filter(|e| e.node.parent == Some(node.id)) {

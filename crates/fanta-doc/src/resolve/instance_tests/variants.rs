@@ -144,6 +144,86 @@ fn expand_set_instance_selects_matching_variant() {
 }
 
 #[test]
+fn expand_set_instance_selects_boolean_variant_axis() {
+    use crate::component::{
+        ComponentPropDef, ComponentPropKind, ComponentSet, ComponentSetMembership, VariantAxis,
+    };
+
+    let mut scene = Scene::new();
+    let mut lib = ComponentLibrary::new();
+    let set_id = ComponentId::new();
+    let quiet_prop = crate::id::ComponentPropId::new();
+    let mut members = BTreeMap::new();
+
+    for (quiet, label) in [("False", "bordered"), ("True", "quiet")] {
+        let mut root = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([80.0, 30.0]),
+            ..Default::default()
+        }));
+        root.name = format!("Quiet ?={quiet}");
+        let root_name = root.name.clone();
+        let root_id = root.id;
+        scene.insert(root).unwrap();
+        let mut child = CanvasNode::new(NodeData::Text(TextNode::new(label, 70.0, 20.0)));
+        child.parent = Some(root_id);
+        scene.insert(child).unwrap();
+
+        let id = ComponentId::new();
+        let mut def = ComponentDef::new(id, root_id, root_name);
+        def.variant_of = Some(ComponentSetMembership {
+            set: set_id,
+            axis_values: BTreeMap::from([("Quiet ?".to_owned(), quiet.to_owned())]),
+        });
+        def.props.push(ComponentPropDef {
+            id: quiet_prop,
+            name: "Quiet ?".into(),
+            kind: ComponentPropKind::Variant {
+                axis: "Quiet ?".into(),
+            },
+            formatter: Default::default(),
+            default: VarValue::String {
+                value: "False".into(),
+            },
+            bindings: Vec::new(),
+        });
+        lib.defs.insert(id, def);
+        members.insert(quiet, id);
+    }
+
+    lib.sets.insert(
+        set_id,
+        ComponentSet {
+            id: set_id,
+            name: "Action Button".into(),
+            axes: vec![VariantAxis {
+                name: "Quiet ?".into(),
+                values: vec!["False".into(), "True".into()],
+            }],
+            members: vec![members["False"], members["True"]],
+            default_variant: members["False"],
+        },
+    );
+
+    let inst = InstanceNode {
+        component: set_id,
+        overrides: Vec::new(),
+        prop_values: BTreeMap::from([(quiet_prop, VarValue::Boolean { value: true })]),
+        derived: Vec::new(),
+        local_size: [80.0, 30.0],
+    };
+    let expanded = expand_instance(&scene, &lib, &inst);
+    let text = expanded.iter().find_map(|e| match &e.node.data {
+        NodeData::Text(t) => Some(t.content.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        text.as_deref(),
+        Some("quiet"),
+        "boolean variant props should match Figma's True/False axis values"
+    );
+}
+
+#[test]
 fn expand_set_with_dangling_default_yields_empty() {
     // A degenerate set whose default_variant is not a real def resolves to
     // nothing rather than panicking.

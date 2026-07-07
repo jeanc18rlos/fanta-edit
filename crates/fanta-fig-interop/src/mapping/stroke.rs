@@ -110,7 +110,7 @@ fn default_black_stroke(change: &KiwiValue) -> bool {
     matches!(
         change.get("type").and_then(KiwiValue::as_str),
         Some("RECTANGLE" | "ROUNDED_RECTANGLE")
-    )
+    ) && read_fills(change).is_empty()
 }
 
 fn defaults_to_inside_stroke(change: &KiwiValue) -> bool {

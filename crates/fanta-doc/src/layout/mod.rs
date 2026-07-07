@@ -234,6 +234,9 @@ struct ChildInfo {
     /// The child's current transform linear part (matrix2) — preserved so a
     /// scaled/rotated child keeps its orientation while we set its translation.
     matrix: DMat2,
+    /// The child's current translation before layout. Absolute/overlay children
+    /// keep this baked placement; flow children get a computed translation.
+    original_translation: DVec2,
     /// The translation the layout computed for this child (`None` until placed).
     /// `info_transform` rebuilds the final transform from `matrix` + this.
     computed_translation: Option<DVec2>,
@@ -276,6 +279,7 @@ fn push_child_info<T: LayoutTree>(
         counter_align: lc.and_then(|l| l.align_self).unwrap_or(al.counter_align),
         absolute: lc.map(|l| l.absolute).unwrap_or(false),
         matrix: node.transform.0.matrix2,
+        original_translation: node.transform.0.translation,
         computed_translation: None,
     });
 }
@@ -330,6 +334,51 @@ struct RunMetrics {
 
 fn collect_flow_indices(infos: &[ChildInfo]) -> Vec<usize> {
     (0..infos.len()).filter(|&i| !infos[i].absolute).collect()
+}
+
+fn mark_overflowing_children_absolute(infos: &mut [ChildInfo], frame: LocalBox) {
+    for info in infos {
+        if !info.absolute && transformed_box_overflows_frame(info, frame) {
+            info.absolute = true;
+        }
+    }
+}
+
+fn transformed_box_overflows_frame(info: &ChildInfo, frame: LocalBox) -> bool {
+    let [x, y] = info.bx.origin;
+    let [w, h] = info.bx.size;
+    let points = [
+        DVec2::new(x, y),
+        DVec2::new(x + w, y),
+        DVec2::new(x, y + h),
+        DVec2::new(x + w, y + h),
+    ];
+    let mut min = DVec2::splat(f64::INFINITY);
+    let mut max = DVec2::splat(f64::NEG_INFINITY);
+    let transform = Transform2D(glam::DAffine2 {
+        matrix2: info.matrix,
+        translation: info.original_translation,
+    });
+    for point in points {
+        let transformed = transform.transform_point(point);
+        min = min.min(transformed);
+        max = max.max(transformed);
+    }
+
+    let epsilon = 1e-6;
+    let frame_min = DVec2::new(frame.origin[0], frame.origin[1]);
+    let frame_max = DVec2::new(
+        frame.origin[0] + frame.size[0],
+        frame.origin[1] + frame.size[1],
+    );
+    let overlap_x = max.x.min(frame_max.x) - min.x.max(frame_min.x);
+    let overlap_y = max.y.min(frame_max.y) - min.y.max(frame_min.y);
+    let crosses_left = min.x < frame_min.x - epsilon && overlap_y > epsilon;
+    let crosses_right = max.x > frame_max.x + epsilon && overlap_y > epsilon;
+    let crosses_top = min.y < frame_min.y - epsilon && overlap_x > epsilon;
+    let crosses_bottom = max.y > frame_max.y + epsilon && overlap_x > epsilon;
+
+    crosses_left || crosses_right || crosses_top || crosses_bottom
 }
 
 fn run_metrics(infos: &[ChildInfo], run: &[usize], horizontal: bool, spacing: f64) -> RunMetrics {
@@ -611,6 +660,7 @@ fn layout_frame<T: LayoutTree>(
 
     // Frame inner box. Padding is [top, right, bottom, left].
     let frame = frame_box(tree, frame_id);
+    mark_overflowing_children_absolute(&mut infos, frame);
     let flow = FrameFlow::new(al, frame);
 
     // Flow children only.
@@ -725,6 +775,7 @@ fn layout_frame_wrap<T: LayoutTree>(
     let mut infos = gather_child_infos(tree, al, children);
 
     let frame = frame_box(tree, frame_id);
+    mark_overflowing_children_absolute(&mut infos, frame);
     let flow = FrameFlow::new(al, frame);
 
     let flow_indices = collect_flow_indices(&infos);
@@ -813,10 +864,31 @@ fn place_child(info: &mut ChildInfo, target: DVec2) {
 /// Rebuild a placed child's final transform from its preserved linear part and
 /// the translation the layout computed (identity translation if never placed).
 fn info_transform(info: &ChildInfo) -> Transform2D {
+    let translation = info
+        .computed_translation
+        .unwrap_or(info.original_translation);
+    let translation = if should_snap_flow_translation(info) {
+        DVec2::new(translation.x.round(), translation.y.round())
+    } else {
+        translation
+    };
+
     Transform2D(glam::DAffine2 {
         matrix2: info.matrix,
-        translation: info.computed_translation.unwrap_or(DVec2::ZERO),
+        translation,
     })
+}
+
+fn should_snap_flow_translation(info: &ChildInfo) -> bool {
+    if info.computed_translation.is_none() {
+        return false;
+    }
+
+    let epsilon = 1e-9;
+    (info.matrix.x_axis.x - 1.0).abs() < epsilon
+        && info.matrix.x_axis.y.abs() < epsilon
+        && info.matrix.y_axis.x.abs() < epsilon
+        && (info.matrix.y_axis.y - 1.0).abs() < epsilon
 }
 
 // =============================================================================

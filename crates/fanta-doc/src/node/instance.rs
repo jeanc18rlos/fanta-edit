@@ -8,7 +8,7 @@ use crate::binding::BoundProp;
 use crate::color::Color;
 use crate::id::{ComponentId, ComponentPropId, NodeId};
 use crate::path::PathData;
-use crate::style::Fill;
+use crate::style::{Fill, Stroke};
 use crate::transform::Transform2D;
 use crate::value::VarValue;
 use serde::{Deserialize, Serialize};
@@ -168,6 +168,8 @@ pub enum OverrideValue {
     Text { value: String },
     /// Replace the whole fill stack.
     Fills { fills: SmallVec<[Fill; 1]> },
+    /// Replace the whole stroke stack. Empty means "explicitly unstroked".
+    Strokes { strokes: SmallVec<[Stroke; 1]> },
     /// Show / hide the targeted descendant.
     Visible { value: bool },
     /// Swap a nested instance for a different component.

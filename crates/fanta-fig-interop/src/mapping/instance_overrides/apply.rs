@@ -4,8 +4,9 @@
 use super::{
     BoundProp, ComponentId, ComponentMaps, Doc, HashMap, KiwiValue, MapReport, NodeData, NodeId,
     Override, OverridePath, OverrideValue, PendingInstanceOverrides, PropRefKind, VarValue,
-    build_swap_redirects, guid_key, master_guid_paths, master_root_for, prop_assignment_text,
-    read_derived_override, read_fills, resolve_full_guid_path, text_override,
+    build_stroke, build_swap_redirects, guid_key, has_stroke_fields, master_guid_paths,
+    master_root_for, prop_assignment_text, read_derived_override, read_fills,
+    resolve_full_guid_path, text_override,
 };
 
 /// Resolve each instance's override material to typed [`Override`]s addressed by
@@ -135,6 +136,7 @@ pub(crate) fn apply_instance_overrides(
             &mut overrides,
         );
         apply_own_surface_fill(doc, po, master_root, &mut overrides);
+        apply_own_surface_strokes(doc, po, master_root, &mut overrides);
         apply_prop_assignments(
             doc,
             report,
@@ -259,13 +261,26 @@ fn apply_symbol_overrides(
         // both text and a (theme) fill; keeping both means a dark header keeps its
         // dark background *and* its relabeled text. The override entry's paints are
         // already style-resolved by the pre-pass.
-        let ov_fills = read_fills(ov);
+        let ov_fills = if should_emit_symbol_fill_override(ov) {
+            read_fills(ov)
+        } else {
+            Vec::new()
+        };
         if !ov_fills.is_empty() {
             overrides.push(Override {
                 target_path: path.clone(),
                 target_prop: BoundProp::FillColor { index: 0 },
                 value: OverrideValue::Fills {
                     fills: ov_fills.into_iter().collect(),
+                },
+            });
+        }
+        if has_stroke_fields(ov) {
+            overrides.push(Override {
+                target_path: path.clone(),
+                target_prop: BoundProp::StrokeColor { index: 0 },
+                value: OverrideValue::Strokes {
+                    strokes: build_stroke(ov).into_iter().collect(),
                 },
             });
         }
@@ -278,6 +293,26 @@ fn apply_symbol_overrides(
             });
         }
     }
+}
+
+fn should_emit_symbol_fill_override(override_change: &KiwiValue) -> bool {
+    !is_text_layout_snapshot_paint(override_change)
+}
+
+fn is_text_layout_snapshot_paint(override_change: &KiwiValue) -> bool {
+    // Figma's text-layout NodeChange entries can include the node's current
+    // fillPaints as snapshot state. Without a paint-style ref or text-content
+    // change, those paints are not an authored recolor.
+    let carries_text_layout = override_change.get("textAlignHorizontal").is_some()
+        || override_change.get("textAlignVertical").is_some()
+        || override_change.get("textAutoResize").is_some();
+    if !carries_text_layout {
+        return false;
+    }
+
+    override_change.get("textData").is_none()
+        && override_change.get("styleIdForFill").is_none()
+        && override_change.get("styleIdForText").is_none()
 }
 
 /// Count a guidPath by length: len ≤ 1 is a direct descendant, len > 1 crosses a
@@ -320,6 +355,29 @@ fn apply_own_surface_fill(
             target_prop: BoundProp::FillColor { index: 0 },
             value: OverrideValue::Fills {
                 fills: po.own_fills.iter().cloned().collect(),
+            },
+        });
+    }
+}
+
+fn apply_own_surface_strokes(
+    doc: &Doc,
+    po: &PendingInstanceOverrides,
+    master_root: NodeId,
+    overrides: &mut Vec<Override>,
+) {
+    let Some(strokes) = &po.own_strokes else {
+        return;
+    };
+    if matches!(
+        doc.scene.get(master_root).map(|n| &n.data),
+        Some(NodeData::Group(g)) if !g.strokes.is_empty()
+    ) {
+        overrides.push(Override {
+            target_path: OverridePath::new(),
+            target_prop: BoundProp::StrokeColor { index: 0 },
+            value: OverrideValue::Strokes {
+                strokes: strokes.iter().cloned().collect(),
             },
         });
     }

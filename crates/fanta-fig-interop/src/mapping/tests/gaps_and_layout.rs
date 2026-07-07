@@ -716,6 +716,31 @@ fn imports_per_child_grow_and_align_self() {
 }
 
 #[test]
+fn imports_api_named_per_child_layout_fields() {
+    use fanta_doc::node::CounterAlign;
+
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("FRAME".to_owned())),
+            ("name", KiwiValue::String("Tip".to_owned())),
+            ("size", vector(8.0, 4.0)),
+            ("layoutGrow", KiwiValue::Float(1.0)),
+            ("layoutPositioning", KiwiValue::Enum("ABSOLUTE".to_owned())),
+            ("layoutAlignSelf", KiwiValue::Enum("CENTER".to_owned())),
+        ],
+    )]);
+    let (doc, report, _) = fig_to_doc(&fig).unwrap();
+    let child = layout_child_of(&doc, "Tip").expect("child has layout data");
+    assert_eq!(child.grow, 1.0);
+    assert!(child.absolute);
+    assert_eq!(child.align_self, Some(CounterAlign::Center));
+    assert_eq!(report.layout_children_grow, 1);
+    assert_eq!(report.layout_children_absolute, 1);
+}
+
+#[test]
 fn imports_text_auto_resize_into_report_and_node() {
     use fanta_doc::node::TextAutoResize;
     // Three text nodes, one of each autoResize mode; the report tallies them and

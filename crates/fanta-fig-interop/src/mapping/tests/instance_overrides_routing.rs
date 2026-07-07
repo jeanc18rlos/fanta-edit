@@ -81,6 +81,97 @@ fn symbol_override_text_replaces_master_default_on_expand() {
     );
 }
 
+#[test]
+fn symbol_override_text_alignment_snapshot_does_not_recolor_text() {
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("SYMBOL".to_owned())),
+                ("name", KiwiValue::String("Cell".to_owned())),
+                ("size", vector(120.0, 32.0)),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("parentIndex", parent_index(0, 1)),
+                ("type", KiwiValue::Enum("TEXT".to_owned())),
+                ("name", KiwiValue::String("Value".to_owned())),
+                ("size", vector(80.0, 18.0)),
+                ("textData", text_data("Row item")),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(
+                        235.0 / 255.0,
+                        235.0 / 255.0,
+                        235.0 / 255.0,
+                        1.0,
+                    )]),
+                ),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 3)),
+                ("type", KiwiValue::Enum("INSTANCE".to_owned())),
+                ("name", KiwiValue::String("Cell instance".to_owned())),
+                ("size", vector(120.0, 32.0)),
+                (
+                    "symbolData",
+                    o(
+                        "SymbolData",
+                        vec![
+                            ("symbolID", guid(0, 1)),
+                            (
+                                "symbolOverrides",
+                                KiwiValue::Array(vec![o(
+                                    "NodeChange",
+                                    vec![
+                                        ("guidPath", guid_path(0, 2)),
+                                        (
+                                            "textAlignHorizontal",
+                                            KiwiValue::Enum("RIGHT".to_owned()),
+                                        ),
+                                        (
+                                            "fillPaints",
+                                            KiwiValue::Array(vec![solid_paint(
+                                                34.0 / 255.0,
+                                                34.0 / 255.0,
+                                                34.0 / 255.0,
+                                                1.0,
+                                            )]),
+                                        ),
+                                    ],
+                                )]),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        ),
+    ]);
+
+    let (doc, _report, _) = fig_to_doc(&fig).unwrap();
+    let expanded = expand_only_instance(&doc);
+    let text = expanded
+        .iter()
+        .find_map(|expanded| match &expanded.node.data {
+            NodeData::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("expanded text node");
+
+    assert_eq!(
+        text.style.color,
+        Color::rgba(235, 235, 235, 255),
+        "text alignment snapshots must not be imported as text color overrides"
+    );
+}
+
 /// Build a nested-component `.fig`: an INNER "Chip" SYMBOL (guid 0:1) with a
 /// TEXT child (0:2), an OUTER "Card" SYMBOL (0:10) whose child is an INSTANCE
 /// (0:11) of Chip, and a top-level INSTANCE (0:20) of Card carrying `extra`

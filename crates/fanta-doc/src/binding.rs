@@ -211,7 +211,7 @@ fn set_node_fill_color(node: &mut CanvasNode, index: u16, color: Color) -> bool 
             true
         }
         NodeData::Text(t) if index == 0 => {
-            t.style.color = color;
+            t.set_glyph_color(color);
             true
         }
         _ => false,
@@ -358,11 +358,30 @@ mod tests {
 
         let mut text =
             CanvasNode::new(NodeData::Text(crate::node::TextNode::new("hi", 10.0, 10.0)));
+        if let NodeData::Text(text_node) = &mut text.data {
+            let mut run_style = text_node.style.clone();
+            run_style.color = Color::BLACK;
+            text_node.style_runs.push(crate::node::TextStyleRun {
+                start: 0,
+                end: text_node.content.len(),
+                style: run_style,
+            });
+        }
         assert!(
             BoundProp::FillColor { index: 0 }
                 .apply_resolved(&mut text, ResolvedVarValue::Color { value: red })
         );
         assert_eq!(node_fill_color(&text, 0), Some(red));
+        match &text.data {
+            NodeData::Text(text_node) => assert!(
+                text_node
+                    .style_runs
+                    .iter()
+                    .all(|run| run.style.color == red),
+                "text color binding must recolor rich text runs"
+            ),
+            _ => panic!("expected text"),
+        }
     }
 
     #[test]

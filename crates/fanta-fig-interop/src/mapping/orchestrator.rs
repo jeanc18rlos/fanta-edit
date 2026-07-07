@@ -4,14 +4,14 @@
 
 use super::{
     AssetId, BoundProp, CanvasNode, Doc, FigDocument, FigError, FigResult, Fill, GroupNode,
-    HashMap, KiwiValue, MapReport, NodeBuild, NodeData, NodeId, PropDefInfo, PropRefKind, VarValue,
-    VariableId, VariableType, apply_bindings, apply_explicit_modes, apply_instance_overrides,
-    apply_paint_color_bindings, apply_reactions, asset_id_for_image, build_components_and_sets,
-    build_node, build_variables, clips_content, collect_prop_def_infos, guid_key,
-    hide_master_variant_placeholders, image_hash_hex, is_state_group, node_name,
-    populate_instance_prop_values, read_component_prop_refs, read_explicit_modes, read_fills,
-    read_paint, read_paint_color_bindings, read_pending_variable, read_prop_defs_raw,
-    read_set_modes, resolve_style_references, tally_fidelity,
+    HashMap, KiwiValue, MapReport, NodeBuild, NodeData, NodeId, PropDefInfo, PropRefKind, Stroke,
+    VarValue, VariableId, VariableType, apply_bindings, apply_explicit_modes,
+    apply_instance_overrides, apply_paint_color_bindings, apply_reactions, asset_id_for_image,
+    build_components_and_sets, build_node, build_stroke, build_variables, clips_content,
+    collect_prop_def_infos, guid_key, hide_master_variant_placeholders, image_hash_hex,
+    is_state_group, node_name, populate_instance_prop_values, read_component_prop_refs,
+    read_explicit_modes, read_fills, read_paint, read_paint_color_bindings, read_pending_variable,
+    read_prop_defs_raw, read_set_modes, resolve_style_references, tally_fidelity,
 };
 
 /// Map a parsed `.fig` document into a Fantaisa [`Doc`].
@@ -720,10 +720,11 @@ fn collect_instance_side_tables(
         .and_then(KiwiValue::as_array)
         .map(<[KiwiValue]>::to_vec)
         .unwrap_or_default();
-    // The instance's OWN (style-resolved) surface fills. The style pre-pass
+    // The instance's OWN (style-resolved) surface fills/strokes. The style pre-pass
     // already inlined a `styleIdForFill` ref into `fillPaints` (so a dark
     // `_Header` carries its resolved `#1D1D1D` here, not the light master's white).
     let own_fills = read_fills(change);
+    let own_strokes = has_stroke_fields(change).then(|| build_stroke(change));
     // Push a pending record for EVERY symbol-bound instance, even one with no
     // explicit override material: pass 4 also applies a master's component-property
     // DEFAULTS to an instance that leaves a prop unset (a prop-less master is a
@@ -735,7 +736,14 @@ fn collect_instance_side_tables(
         prop_assignments,
         derived_symbol_data,
         own_fills,
+        own_strokes,
     });
+}
+
+pub(crate) fn has_stroke_fields(change: &KiwiValue) -> bool {
+    change.get("strokePaints").is_some()
+        || change.get("strokeWeight").is_some()
+        || change.get("strokeGeometry").is_some()
 }
 
 /// Collect the per-node side-table material that applies regardless of type:
@@ -945,6 +953,10 @@ pub(crate) struct PendingInstanceOverrides {
     /// the expanded master root with the instance's resolved surface instead of
     /// the master's. Empty ⇒ inherit the master surface (unchanged behavior).
     pub(crate) own_fills: Vec<Fill>,
+    /// The instance node's OWN stroke stack, when the instance explicitly carries
+    /// stroke fields. `Some(empty)` means Figma explicitly resolved "no border",
+    /// which must clear a stroked master root.
+    pub(crate) own_strokes: Option<Vec<Stroke>>,
 }
 
 // =============================================================================

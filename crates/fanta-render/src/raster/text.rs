@@ -83,10 +83,9 @@ thread_local! {
 /// - [`Height`](TextAutoResize::Height) ("Auto height") and [`None`](TextAutoResize::None)
 ///   (fixed box) — the shaper wraps to `node.local_size[0]` (the box width).
 fn shape_params(node: &TextNode) -> (f64, Align) {
-    let align = to_align(node.align);
-    let wrap_width = match node.auto_resize {
-        TextAutoResize::WidthAndHeight => f64::INFINITY,
-        TextAutoResize::Height | TextAutoResize::None => node.local_size[0],
+    let (wrap_width, align) = match node.auto_resize {
+        TextAutoResize::WidthAndHeight => (f64::INFINITY, Align::Left),
+        TextAutoResize::Height | TextAutoResize::None => (node.local_size[0], to_align(node.align)),
     };
     (wrap_width, align)
 }
@@ -96,7 +95,7 @@ fn shape_params(node: &TextNode) -> (f64, Align) {
 /// only move the paint origin (computed per call), so they are deliberately
 /// excluded — one shaped layout serves every v-align. Computed identically for
 /// measure and draw so the two share cache entries exactly.
-fn shape_key(node: &TextNode, wrap_width: f64) -> u64 {
+fn shape_key(node: &TextNode, wrap_width: f64, align: Align) -> u64 {
     let mut h = DefaultHasher::new();
     node.content.hash(&mut h);
     hash_doc_text_style(&node.style, &mut h);
@@ -107,7 +106,7 @@ fn shape_key(node: &TextNode, wrap_width: f64) -> u64 {
         hash_doc_text_style(&run.style, &mut h);
     }
     wrap_width.to_bits().hash(&mut h);
-    std::mem::discriminant(&node.align).hash(&mut h);
+    std::mem::discriminant(&align).hash(&mut h);
     h.finish()
 }
 
@@ -136,7 +135,7 @@ fn hash_doc_text_style(s: &fanta_doc::TextStyle, h: &mut DefaultHasher) {
 /// the whole cache (cheap, rare) so a long session can't grow it unbounded.
 pub(crate) fn with_shaped_layout<R>(node: &TextNode, f: impl FnOnce(&TextLayout) -> R) -> R {
     let (wrap_width, align) = shape_params(node);
-    let key = shape_key(node, wrap_width);
+    let key = shape_key(node, wrap_width, align);
     LAYOUT_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if cache.len() >= LAYOUT_CACHE_CAP && !cache.contains_key(&key) {
@@ -155,6 +154,15 @@ pub(crate) fn with_shaped_layout<R>(node: &TextNode, f: impl FnOnce(&TextLayout)
         });
         f(layout)
     })
+}
+
+pub(crate) fn vertical_paint_offset(node: &TextNode, layout_height: f64) -> f64 {
+    let factor = match node.vertical_align {
+        VAlign::Top => 0.0,
+        VAlign::Center => 0.5,
+        VAlign::Bottom => 1.0,
+    };
+    (node.local_size[1] - layout_height) * factor
 }
 
 /// Test-only access to the shared shaped-text cache size, used to prove that
@@ -228,16 +236,7 @@ pub fn text_node_outline(node: &TextNode) -> Option<fanta_doc::PathData> {
     let mut layout = with_layout_engine(|engine| engine.layout_aligned(&buffer, wrap_width, align));
     // Match `draw_text_node`'s vertical-align paint origin so the outline sits
     // exactly where the glyphs were drawn.
-    let factor = match node.vertical_align {
-        VAlign::Top => 0.0,
-        VAlign::Center => 0.5,
-        VAlign::Bottom => 1.0,
-    };
-    let dy = if factor > 0.0 {
-        ((node.local_size[1] - layout.height()) * factor).max(0.0)
-    } else {
-        0.0
-    };
+    let dy = vertical_paint_offset(node, layout.height());
     layout.outline([0.0, dy])
 }
 
@@ -263,8 +262,9 @@ pub(crate) fn clear_layout_cache() {
 /// fixed box — see [`TextNode::local_size`](fanta_doc::TextNode::local_size)):
 /// - [`None`](TextAutoResize::None) (the fixed box) — the box is a hard frame,
 ///   so we clip the glyphs to `[0, 0, w, h]`. Centered/bottom v-aligned text
-///   that overflows is clamped by the `.max(0.0)` below to overflow the *bottom*
-///   edge, where the clip then shaves it exactly like Figma's fixed text box.
+///   can have a line box taller than Figma's authored text frame; its paragraph
+///   origin is still centered/bottom-aligned in that frame, so fixed controls do
+///   not pin labels to their top edge.
 /// - [`Height`](TextAutoResize::Height) (auto-height) and
 ///   [`WidthAndHeight`](TextAutoResize::WidthAndHeight) (auto-width) — these
 ///   modes grow the box to fit the glyphs, so there is by definition no overflow;
@@ -278,12 +278,6 @@ pub(crate) fn draw_text_node(canvas: &Canvas, node: &TextNode) {
     if node.content.is_empty() {
         return;
     }
-    let box_height = node.local_size[1];
-    let factor = match node.vertical_align {
-        VAlign::Top => 0.0,
-        VAlign::Center => 0.5,
-        VAlign::Bottom => 1.0,
-    };
     // The shape-and-paint step, factored once so the clipped (fixed-box) and
     // unclipped (auto-resize / zero-size) paths share identical paint logic and
     // cannot drift. The canvas transform already places the box; we offset
@@ -292,14 +286,9 @@ pub(crate) fn draw_text_node(canvas: &Canvas, node: &TextNode) {
         with_shaped_layout(node, |layout| {
             // Vertical alignment: offset the paint origin so the measured
             // paragraph block sits Top (0), Center (½), or Bottom (1) within the
-            // box height. Clamp the slack to >= 0 so overflowing text never
-            // shifts upward (it overflows the bottom edge, where the fixed-box
-            // clip below shaves it like Figma).
-            let dy = if factor > 0.0 {
-                ((box_height - layout.height()) * factor).max(0.0)
-            } else {
-                0.0
-            };
+            // box height. Negative slack is intentional: Figma centers/bottoms
+            // the line box even when it is taller than the authored text frame.
+            let dy = vertical_paint_offset(node, layout.height());
             layout.paint(canvas, [0.0, dy]);
         });
     };

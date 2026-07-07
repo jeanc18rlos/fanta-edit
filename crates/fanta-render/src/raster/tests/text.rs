@@ -179,6 +179,34 @@ fn auto_width_text_renders_single_line_beyond_its_box_width() {
 }
 
 #[test]
+fn auto_width_center_aligned_text_draws_at_hugged_origin() {
+    use fanta_doc::{TextAlign, TextAutoResize, TextNode, VAlign};
+
+    let mut text = TextNode::new("Action", 39.0, 18.0);
+    text.auto_resize = TextAutoResize::WidthAndHeight;
+    text.align = TextAlign::Center;
+    text.vertical_align = VAlign::Center;
+    text.style.size_px = 14.0;
+    text.style.weight = 600;
+    text.style.color = Color::rgb(255, 255, 255);
+
+    let mut node = CanvasNode::new(NodeData::Text(text));
+    node.transform = Transform2D::translation(-20.0, -9.0);
+    let mut doc = Doc::new();
+    doc.apply(Operation::create_node(node)).unwrap();
+
+    let mut renderer = RasterRenderer::new(96, 48).unwrap();
+    let metrics = renderer.render(&doc.scene, &doc.viewport);
+    let pixels = renderer.copy_rgba();
+
+    assert!(metrics.nodes_drawn >= 1);
+    assert!(
+        opaque_pixel_count(&pixels) > 0,
+        "center-aligned auto-width text must paint at its hugged box origin"
+    );
+}
+
+#[test]
 fn vertical_center_offsets_text_below_top_aligned() {
     // In a tall box, CENTER-aligned text must paint lower than TOP-aligned
     // text (offset down by half the box's unused height). We compare the mean
@@ -215,6 +243,21 @@ fn vertical_center_offsets_text_below_top_aligned() {
     assert!(
         center_y > top_y + 15.0,
         "center-aligned text must sit well below top-aligned: top={top_y:.1} center={center_y:.1}"
+    );
+}
+
+#[test]
+fn vertical_center_can_offset_overflowing_line_box_upward() {
+    use fanta_doc::{TextNode, VAlign};
+
+    let mut text = TextNode::new("51", 24.0, 11.0);
+    text.style.size_px = 13.0;
+    text.style.line_height = 1.25;
+    text.vertical_align = VAlign::Center;
+
+    assert!(
+        crate::raster::text::vertical_paint_offset(&text, 16.25) < 0.0,
+        "centered fixed text must center an oversized line box instead of pinning it to the top"
     );
 }
 

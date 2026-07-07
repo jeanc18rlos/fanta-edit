@@ -227,6 +227,99 @@ fn legacy_render_draws_instance_outline_without_a_library() {
 }
 
 #[test]
+fn derived_instance_preserves_baked_positions_instead_of_reflowing() {
+    use fanta_doc::{
+        AutoLayout, AxisSizing, CounterAlign, DerivedOverride, GroupNode, LayoutMode, PrimaryAlign,
+    };
+    use smallvec::smallvec;
+
+    let mut doc = Doc::new();
+    let mut root = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([100.0, 20.0]),
+        background: None,
+        auto_layout: Some(AutoLayout {
+            mode: LayoutMode::Horizontal,
+            spacing: 0.0,
+            counter_spacing: 0.0,
+            padding: [0.0, 0.0, 0.0, 0.0],
+            primary_align: PrimaryAlign::Start,
+            counter_align: CounterAlign::Start,
+            primary_sizing: AxisSizing::Fixed,
+            counter_sizing: AxisSizing::Fixed,
+            wrap: false,
+            flow_reverse: false,
+            child_layout: true,
+            reverse_z: false,
+        }),
+        explicit_modes: Default::default(),
+        ..Default::default()
+    }));
+    root.transform = Transform2D::translation(10_000.0, 0.0);
+    let root_id = root.id;
+    doc.apply(Operation::create_node(root)).unwrap();
+
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        Color::rgb(255, 0, 0),
+    )));
+    child.parent = Some(root_id);
+    let child_id = child.id;
+    doc.apply(Operation::create_node(child)).unwrap();
+
+    let comp = ComponentId::new();
+    let mut lib = ComponentLibrary::new();
+    lib.defs
+        .insert(comp, ComponentDef::new(comp, root_id, "AutoLayoutMaster"));
+
+    let mut inst = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: comp,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: vec![DerivedOverride {
+            path: smallvec![child_id],
+            transform: Some(Transform2D::translation(60.0, 5.0)),
+            size: None,
+            fills: None,
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        }],
+        local_size: [100.0, 20.0],
+    }));
+    inst.transform = Transform2D::translation(-50.0, -10.0);
+    doc.apply(Operation::create_node(inst)).unwrap();
+
+    let registry = VariableRegistry::new();
+    let inputs = RenderInputs {
+        components: &lib,
+        variables: &registry,
+        active_modes: &BTreeMap::new(),
+        mode_generation: 0,
+        playback: None,
+        dark_ui: false,
+    };
+
+    let mut renderer = RasterRenderer::new(128, 64).unwrap();
+    renderer.render_with(&doc.scene, &doc.viewport, &inputs);
+    let buffer = renderer.copy_rgba();
+
+    let left = rgba_at(&buffer, 128, 18, 32);
+    let right = rgba_at(&buffer, 128, 78, 32);
+    assert!(
+        left[3] == 0,
+        "a solver reflow would place the rect near the left edge, got {left:?}"
+    );
+    assert!(
+        right[0] > 200 && right[1] < 40 && right[2] < 40 && right[3] > 200,
+        "derived transform should keep the rect near the right edge, got {right:?}"
+    );
+}
+
+#[test]
 fn instance_expansion_is_memoized_across_frames() {
     // Two renders of the same unchanged instance must reuse one cached
     // expansion (the memo key is stable), so the cache holds exactly one

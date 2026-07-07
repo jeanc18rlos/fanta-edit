@@ -112,22 +112,28 @@ pub(crate) fn map_counter_align(s: Option<&str>) -> CounterAlign {
     }
 }
 
-/// Read per-child auto-layout participation (`stackChildPrimaryGrow`,
-/// `stackPositioning`, `stackChildAlignSelf`) from a child `NodeChange`. Returns
-/// `None` when the child carries no non-default layout data, so plain children
-/// round-trip without an empty struct. Mirrors op1's per-child reads
-/// (`layoutGrow`/`layoutPositioning`/`layoutAlignSelf`).
+/// Read per-child auto-layout participation (`stackChildPrimaryGrow` /
+/// `layoutGrow`, `stackPositioning` / `layoutPositioning`,
+/// `stackChildAlignSelf` / `layoutAlignSelf`) from a child `NodeChange`.
+/// Returns `None` when the child carries no non-default layout data, so plain
+/// children round-trip without an empty struct.
 pub(crate) fn read_layout_child(change: &KiwiValue) -> Option<LayoutChild> {
     let grow = change
         .get("stackChildPrimaryGrow")
+        .or_else(|| change.get("layoutGrow"))
         .and_then(KiwiValue::as_f64)
         .unwrap_or(0.0) as f32;
-    let absolute = change.get("stackPositioning").and_then(KiwiValue::as_str) == Some("ABSOLUTE");
+    let absolute = change
+        .get("stackPositioning")
+        .or_else(|| change.get("layoutPositioning"))
+        .and_then(KiwiValue::as_str)
+        == Some("ABSOLUTE");
     // `stackChildAlignSelf` uses `StackCounterAlign`: MIN/CENTER/MAX/STRETCH/
     // BASELINE/AUTO. `AUTO` (and absent) ⇒ inherit the parent ⇒ `None`. `MIN`
     // ⇒ Start (op1 `mapAlignSelf`).
     let align_self = match change
         .get("stackChildAlignSelf")
+        .or_else(|| change.get("layoutAlignSelf"))
         .and_then(KiwiValue::as_str)
     {
         Some("MIN") => Some(CounterAlign::Start),

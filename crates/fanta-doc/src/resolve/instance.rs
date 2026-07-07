@@ -93,7 +93,7 @@ pub fn expand_instance(
         });
     }
 
-    pin_inherited_root_surface(&mut out, instance);
+    pin_expansion_root_box(&mut out, instance);
     apply_prop_bindings(&mut out, def, instance);
     apply_sparse_overrides(&mut out, instance);
 
@@ -119,20 +119,15 @@ pub fn expand_instance(
     out
 }
 
-/// mergeSymbolProps (op2 `mergeSymbolProps`): the instance's own surface is its
-/// master root's surface — its background fill — but rendered at the *instance's*
-/// box. The expansion root IS the master-root clone, so it already carries the
-/// master root's `background`; here we additionally pin the root's clip box to the
-/// instance's `local_size` when it has a background, so an instance that merely
-/// INHERITS its background (rather than overriding it) still paints that
-/// background at its own box, and a resized instance clips correctly. Without
-/// this, a master root that isn't a clipping frame (`clip_size: None`) paints no
-/// background on the transient walk, so the instance renders without its
-/// inherited surface.
-fn pin_inherited_root_surface(out: &mut [ExpandedNode], instance: &InstanceNode) {
+/// mergeSymbolProps (op2 `mergeSymbolProps`): the expansion root is the placed
+/// instance's box, not the component master's original box. Pin clipped roots to
+/// `local_size` even when they have no background; otherwise icon components with
+/// baked larger descendant geometry keep the master's stale clip and crop their
+/// own vectors.
+fn pin_expansion_root_box(out: &mut [ExpandedNode], instance: &InstanceNode) {
     if let Some(rooten) = out.iter_mut().find(|e| e.def_path.is_empty()) {
         if let NodeData::Group(g) = &mut rooten.node.data {
-            if g.background.is_some() {
+            if g.background.is_some() || g.clip_size.is_some() {
                 g.clip_size = Some(instance.local_size);
             }
         }
@@ -358,6 +353,9 @@ fn apply_derived_geometry(data: &mut NodeData, d: &crate::node::DerivedOverride)
             // Resolved fill geometry replaces the master path outright.
             if let Some(path) = &d.path_data {
                 v.path = path.clone();
+                if d.stroke_path.is_none() && d.stroke_weight.is_none() {
+                    v.strokes.clear();
+                }
             }
             // Baked per-instance fills, when present (uncommon — theme fills
             // usually flow through variable/mode resolution, not the baked
@@ -404,7 +402,7 @@ fn apply_derived_text(t: &mut crate::node::TextNode, dt: &crate::node::DerivedTe
         t.style.letter_spacing = ls;
     }
     if let Some(color) = dt.color {
-        t.style.color = color;
+        t.set_glyph_color(color);
     }
     if let Some(weight) = dt.weight {
         t.style.weight = weight;
@@ -449,8 +447,7 @@ fn resolve_instance_def<'a>(
 /// Choose which member [`ComponentId`](crate::id::ComponentId) of `set` an
 /// instance resolves to.
 ///
-/// Builds the instance's selected axis→value map from its `prop_values` (only
-/// the def's `Variant { axis }` props with a string value participate), then
+/// Builds the instance's selected axis→value map from its `prop_values`, then
 /// returns the first member whose membership `axis_values` agree on every
 /// selected axis. With no usable selection, or no matching member, returns the
 /// set's `default_variant`.
@@ -472,8 +469,12 @@ fn select_set_variant(
         };
         for prop in &def.props {
             if let ComponentPropKind::Variant { axis } = &prop.kind {
-                if let Some(VarValue::String { value }) = instance.prop_values.get(&prop.id) {
-                    selected.insert(axis.clone(), value.clone());
+                if let Some(value) = instance
+                    .prop_values
+                    .get(&prop.id)
+                    .and_then(variant_value_string)
+                {
+                    selected.insert(axis.clone(), value);
                 }
             }
         }
@@ -517,6 +518,14 @@ fn select_set_variant(
         }
     }
     set.default_variant
+}
+
+fn variant_value_string(value: &VarValue) -> Option<String> {
+    match value {
+        VarValue::String { value } => Some(value.clone()),
+        VarValue::Boolean { value } => Some(if *value { "True" } else { "False" }.to_owned()),
+        _ => None,
+    }
 }
 
 /// The def-local path of `node` within the master rooted at `root`: original
@@ -577,8 +586,17 @@ fn apply_override(node: &mut CanvasNode, value: &OverrideValue) {
             // surface fix (the per-page fill override must win over the master).
             NodeData::Text(t) => {
                 if let Some(crate::style::Fill::Solid { color }) = fills.first() {
-                    t.style.color = *color;
+                    t.set_glyph_color(*color);
                 }
+            }
+            _ => {}
+        },
+        OverrideValue::Strokes { strokes } => match &mut node.data {
+            NodeData::Vector(v) => {
+                v.strokes = strokes.clone();
+            }
+            NodeData::Group(g) => {
+                g.strokes = strokes.clone();
             }
             _ => {}
         },

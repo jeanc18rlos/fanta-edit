@@ -83,12 +83,12 @@ pub(crate) fn expand_instance_memoized(
         return Arc::clone(cached);
     }
     let mut expanded = expand_instance(ctx.scene, ctx.inputs.components, inst);
-    // Stage 2: run the auto-layout solver over the freshly expanded subtree
-    // (cards/buttons reflow their children) BEFORE memoizing it, so every cache
-    // hit reuses the laid-out geometry. Order matches the doc: expansion +
-    // derived baked data first, then layout. Auto-width labels are measured with
-    // the real `fanta-text` shaper so "Edit"/"Copy" get their true glyph width.
-    fanta_doc::solve_expanded(&mut expanded, &mut measure_text_node);
+    // Figma's `derivedSymbolData` is already a resolved per-instance subtree.
+    // Re-solving those clones moves icons/carets/text away from the baked
+    // geometry; only masters without derived data need our layout pass.
+    if inst.derived.is_empty() {
+        fanta_doc::solve_expanded(&mut expanded, &mut measure_text_node);
+    }
     let expanded = Arc::new(expanded);
     ctx.instance_cache
         .entries

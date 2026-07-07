@@ -37,6 +37,47 @@ fn absolute_child_excluded_from_flow_and_untouched() {
     approx(placed_origin(&t, abs), [150.0, 30.0]);
 }
 
+#[test]
+fn edge_overlay_child_inferred_absolute_and_untouched() {
+    let mut t = VecTree::new();
+    let al = AutoLayout {
+        mode: LayoutMode::Horizontal,
+        spacing: 6.0,
+        padding: [4.0, 8.0, 5.0, 8.0],
+        counter_align: CounterAlign::Center,
+        child_layout: true,
+        ..Default::default()
+    };
+    let f = t.push(frame(44.0, 24.0, al));
+    let label = t.push(rect_child(f, 28.0, 15.0));
+
+    let mut tip = rect_child(f, 8.0, 4.0);
+    tip.transform = Transform2D::translation(17.0, -4.0);
+    let tip = t.push(tip);
+
+    solve_auto_layout(&mut t, f, &mut no_measure);
+
+    approx(placed_origin(&t, label), [8.0, 4.0]);
+    approx(placed_origin(&t, tip), [17.0, -4.0]);
+}
+
+#[test]
+fn centered_identity_flow_child_snaps_to_whole_pixel() {
+    let mut t = VecTree::new();
+    let al = AutoLayout {
+        mode: LayoutMode::Horizontal,
+        padding: [6.0, 15.0, 7.0, 14.0],
+        counter_align: CounterAlign::Center,
+        ..Default::default()
+    };
+    let f = t.push(frame(94.0, 32.0, al));
+    let label = t.push(rect_child(f, 39.0, 18.0));
+
+    solve_auto_layout(&mut t, f, &mut no_measure);
+
+    approx(placed_origin(&t, label), [14.0, 7.0]);
+}
+
 // ---------------------------------------------------------------------------
 // Free (non-auto-layout) frames keep baked transforms
 // ---------------------------------------------------------------------------

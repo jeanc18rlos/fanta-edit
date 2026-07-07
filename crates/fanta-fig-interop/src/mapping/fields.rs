@@ -306,7 +306,7 @@ pub(crate) fn resolve_style_references(changes: &mut [KiwiValue]) -> StyleResolv
                     _ => None,
                 })
             {
-                resolve_style_on(ov, &style_map, &mut report);
+                resolve_style_on_symbol_override(ov, &style_map, &mut report);
             }
         }
     }
@@ -324,7 +324,19 @@ pub(crate) fn resolve_style_on(
 ) {
     resolve_fill_style(nc, style_map, report);
     resolve_stroke_fill_style(nc, style_map);
-    resolve_text_style(nc, style_map);
+    resolve_text_style(nc, style_map, true);
+    resolve_effect_style(nc, style_map);
+    resolve_rich_text_run_styles(nc, style_map, report);
+}
+
+pub(crate) fn resolve_style_on_symbol_override(
+    nc: &mut KiwiValue,
+    style_map: &HashMap<String, KiwiValue>,
+    report: &mut StyleResolveReport,
+) {
+    resolve_fill_style(nc, style_map, report);
+    resolve_stroke_fill_style(nc, style_map);
+    resolve_text_style(nc, style_map, false);
     resolve_effect_style(nc, style_map);
     resolve_rich_text_run_styles(nc, style_map, report);
 }
@@ -385,7 +397,11 @@ fn resolve_stroke_fill_style(nc: &mut KiwiValue, style_map: &HashMap<String, Kiw
 }
 
 /// ---- TEXT ----  font fields + the text color (style's fillPaints)
-fn resolve_text_style(nc: &mut KiwiValue, style_map: &HashMap<String, KiwiValue>) {
+fn resolve_text_style(
+    nc: &mut KiwiValue,
+    style_map: &HashMap<String, KiwiValue>,
+    copy_style_fills: bool,
+) {
     let Some(guid) = style_ref_guid(nc, "styleIdForText") else {
         return;
     };
@@ -407,8 +423,10 @@ fn resolve_text_style(nc: &mut KiwiValue, style_map: &HashMap<String, KiwiValue>
             }
         }
     }
-    // A TEXT style may also carry the glyph color via its own fillPaints.
-    if !has_nonempty_fills(nc) && has_nonempty_fills(&style) {
+    // A TEXT style may also carry the glyph color via its own fillPaints. Symbol
+    // override entries are different: Spectrum uses `styleIdForText` there to
+    // swap typography while leaving the descendant's authored/theme fill intact.
+    if copy_style_fills && !has_nonempty_fills(nc) && has_nonempty_fills(&style) {
         if let Some(paints) = style.get("fillPaints") {
             nc.set_field("fillPaints", paints.clone());
         }

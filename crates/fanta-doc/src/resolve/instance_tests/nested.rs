@@ -255,6 +255,56 @@ fn icon_swap_recolor_falls_back_to_the_sole_vector() {
 }
 
 #[test]
+fn clipped_root_without_background_uses_instance_box() {
+    let mut scene = Scene::new();
+    let comp = ComponentId::new();
+    let mut root = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([18.0, 18.0]),
+        background: None,
+        explicit_modes: Default::default(),
+        ..Default::default()
+    }));
+    root.name = "Brackets".into();
+    let root_id = root.id;
+    scene.insert(root).unwrap();
+
+    let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        26.0,
+        28.0,
+        Color::BLACK,
+    )));
+    vector.parent = Some(root_id);
+    scene.insert(vector).unwrap();
+
+    let mut lib = ComponentLibrary::new();
+    lib.defs
+        .insert(comp, ComponentDef::new(comp, root_id, "Brackets"));
+    let inst = InstanceNode {
+        component: comp,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [32.0, 32.0],
+    };
+
+    let expanded = expand_instance(&scene, &lib, &inst);
+    let root = expanded
+        .iter()
+        .find(|entry| entry.def_path.is_empty())
+        .expect("root clone present");
+    match &root.node.data {
+        NodeData::Group(group) => assert_eq!(
+            group.clip_size,
+            Some([32.0, 32.0]),
+            "clipped component roots without a background still use the placed instance box"
+        ),
+        other => panic!("expected group, got {other:?}"),
+    }
+}
+
+#[test]
 fn inheriting_instance_gets_the_masters_background() {
     // An instance that does NOT override its surface inherits the master
     // root's background, painted at the instance's own box. The expansion

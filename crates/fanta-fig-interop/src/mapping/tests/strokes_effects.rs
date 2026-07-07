@@ -328,6 +328,46 @@ fn frame_without_border_imports_no_stroke() {
 }
 
 #[test]
+fn filled_rectangle_without_stroke_paints_does_not_gain_default_black_stroke() {
+    let rect = o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 2)),
+            ("parentIndex", parent_index(0, 1)),
+            ("type", KiwiValue::Enum("RECTANGLE".to_owned())),
+            ("size", vector(100.0, 2.0)),
+            (
+                "fillPaints",
+                KiwiValue::Array(vec![solid_paint(0.3, 0.3, 0.3, 1.0)]),
+            ),
+            ("strokeWeight", KiwiValue::Float(1.0)),
+        ],
+    );
+    let (doc, report, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    assert_eq!(report.strokes_imported, 0);
+    assert!(first_vector(&doc).strokes.is_empty());
+}
+
+#[test]
+fn unfilled_rectangle_with_weight_can_use_default_black_stroke() {
+    let rect = o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 2)),
+            ("parentIndex", parent_index(0, 1)),
+            ("type", KiwiValue::Enum("RECTANGLE".to_owned())),
+            ("size", vector(100.0, 50.0)),
+            ("strokeWeight", KiwiValue::Float(1.0)),
+        ],
+    );
+    let (doc, report, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    assert_eq!(report.strokes_imported, 1);
+    let strokes = &first_vector(&doc).strokes;
+    assert_eq!(strokes.len(), 1);
+    assert_eq!(strokes[0].paint, Fill::solid(Color::BLACK));
+}
+
+#[test]
 fn rounded_rect_imports_uniform_corner_radius() {
     let rect = o(
         "NodeChange",

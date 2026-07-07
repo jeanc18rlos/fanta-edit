@@ -302,6 +302,13 @@ impl TextNode {
             auto_resize: TextAutoResize::default(),
         }
     }
+
+    pub fn set_glyph_color(&mut self, color: Color) {
+        self.style.color = color;
+        for run in &mut self.style_runs {
+            run.style.color = color;
+        }
+    }
 }
 
 /// Raster image fitted into a node-local rectangle.

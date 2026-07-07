@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -43,7 +44,7 @@ use skia_safe::{
     gpu::{self, SurfaceOrigin, backend_render_targets, direct_contexts, mtl},
 };
 use smallvec::SmallVec;
-use ui::prelude::*;
+use ui::{ContextMenu, ContextMenuEntry, DropdownMenu, DropdownStyle, IconPosition, prelude::*};
 use util::paths::PathExt;
 use workspace::{
     ItemSettings, Pane,
@@ -117,10 +118,53 @@ impl FigDocumentState {
 
 struct FigDocument {
     doc: Doc,
-    page_root: Option<NodeId>,
-    page_bounds: fanta_doc::Bounds,
+    pages: Vec<FigPage>,
+    default_page_index: usize,
+    solved_pages: HashSet<NodeId>,
     asset_resolver: Option<Arc<dyn AssetResolver>>,
     report: MapReport,
+}
+
+struct FigPage {
+    root: Option<NodeId>,
+    name: SharedString,
+    bounds: fanta_doc::Bounds,
+}
+
+impl FigDocument {
+    fn page(&self, selected_page_index: Option<usize>) -> Option<&FigPage> {
+        let index = selected_page_index
+            .filter(|index| *index < self.pages.len())
+            .unwrap_or(
+                self.default_page_index
+                    .min(self.pages.len().saturating_sub(1)),
+            );
+        self.pages.get(index)
+    }
+
+    fn page_index(&self, selected_page_index: Option<usize>) -> Option<usize> {
+        if self.pages.is_empty() {
+            return None;
+        }
+        Some(
+            selected_page_index
+                .filter(|index| *index < self.pages.len())
+                .unwrap_or(self.default_page_index.min(self.pages.len() - 1)),
+        )
+    }
+
+    fn ensure_page_solved(&mut self, page_index: usize) {
+        let Some(page_root) = self.pages.get(page_index).and_then(|page| page.root) else {
+            return;
+        };
+        if self.solved_pages.insert(page_root) {
+            solve_scene_layout(&mut self.doc.scene, page_root);
+            let bounds = page_bounds(&self.doc, Some(page_root));
+            if let Some(page) = self.pages.get_mut(page_index) {
+                page.bounds = bounds;
+            }
+        }
+    }
 }
 
 impl project::ProjectItem for FigItem {
@@ -227,19 +271,26 @@ fn path_has_fig_extension(path: &Path) -> bool {
 fn load_fig_document(bytes: &[u8]) -> Result<FigDocument> {
     let fig = read_fig(bytes).context("parsing .fig")?;
     let (mut doc, report, assets) = fig_to_doc(&fig).context("mapping .fig to Fanta document")?;
-    let page_root = doc.active_page().or_else(|| doc.pages().first().copied());
-    if let Some(page_root) = page_root {
+    let visible_page_roots = visible_page_roots(&doc);
+    let default_page_root = default_page_root(&doc, &visible_page_roots);
+    let mut solved_pages = HashSet::new();
+    if let Some(page_root) = default_page_root {
         solve_scene_layout(&mut doc.scene, page_root);
+        solved_pages.insert(page_root);
     }
     let resolver = decode_assets(assets);
     let asset_resolver =
         (!resolver.is_empty()).then(|| Arc::new(resolver) as Arc<dyn AssetResolver>);
-    let page_bounds = page_bounds(&doc, page_root);
+    let pages = collect_pages(&doc, &visible_page_roots);
+    let default_page_index = default_page_root
+        .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
+        .unwrap_or(0);
 
     Ok(FigDocument {
         doc,
-        page_root,
-        page_bounds,
+        pages,
+        default_page_index,
+        solved_pages,
         asset_resolver,
         report,
     })
@@ -247,6 +298,7 @@ fn load_fig_document(bytes: &[u8]) -> Result<FigDocument> {
 
 fn render_fig_canvas(
     document: &FigDocument,
+    page_root: Option<NodeId>,
     width: u32,
     height: u32,
     viewport: Viewport,
@@ -270,16 +322,79 @@ fn render_fig_canvas(
         playback: None,
         dark_ui: false,
     };
-    renderer.render_page_with(
-        &document.doc.scene,
-        &render_viewport,
-        document.page_root,
-        &inputs,
-    );
+    renderer.render_page_with(&document.doc.scene, &render_viewport, page_root, &inputs);
     render_image_from_rgba(width, height, renderer.copy_rgba(), scale_factor)
 }
 
+fn visible_page_roots(doc: &Doc) -> Vec<NodeId> {
+    doc.pages()
+        .iter()
+        .copied()
+        .filter(|page| {
+            doc.scene
+                .get(*page)
+                .and_then(|node| node.meta.get("hidden_page"))
+                .and_then(|value| value.as_bool())
+                != Some(true)
+        })
+        .collect()
+}
+
+fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId> {
+    if visible_page_roots.is_empty() {
+        return None;
+    }
+
+    let active_page = doc
+        .active_page()
+        .filter(|page| visible_page_roots.contains(page));
+    if let Some(active_page) = active_page
+        && page_content_area(doc, Some(active_page)) > 1.0
+    {
+        return Some(active_page);
+    }
+
+    visible_page_roots.iter().copied().max_by(|left, right| {
+        page_content_area(doc, Some(*left)).total_cmp(&page_content_area(doc, Some(*right)))
+    })
+}
+
+fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
+    if visible_page_roots.is_empty() {
+        return vec![FigPage {
+            root: None,
+            name: "Document".into(),
+            bounds: page_bounds(doc, None),
+        }];
+    }
+
+    visible_page_roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| FigPage {
+            root: Some(*root),
+            name: doc
+                .page_name(*root)
+                .filter(|name| !name.is_empty())
+                .map(SharedString::from)
+                .unwrap_or_else(|| format!("Page {}", index + 1).into()),
+            bounds: page_bounds(doc, Some(*root)),
+        })
+        .collect()
+}
+
+fn page_content_area(doc: &Doc, page_root: Option<NodeId>) -> f64 {
+    try_page_bounds(doc, page_root)
+        .map(|bounds| bounds.width() * bounds.height())
+        .unwrap_or(0.0)
+}
+
 fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> fanta_doc::Bounds {
+    try_page_bounds(doc, page_root)
+        .unwrap_or_else(|| fanta_doc::Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
+}
+
+fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bounds> {
     let mut bounds: Option<fanta_doc::Bounds> = None;
     let mut include = |node_id| {
         if let Some(node_bounds) = doc.scene.world_bounds(node_id)
@@ -296,7 +411,9 @@ fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> fanta_doc::Bounds {
 
     if let Some(page_root) = page_root {
         for node_id in doc.scene.descendants_of(page_root) {
-            include(node_id);
+            if node_id != page_root {
+                include(node_id);
+            }
         }
     } else {
         for root in doc.scene.roots() {
@@ -306,7 +423,7 @@ fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> fanta_doc::Bounds {
         }
     }
 
-    bounds.unwrap_or_else(|| fanta_doc::Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
+    bounds
 }
 
 fn fit_bounds(bounds: fanta_doc::Bounds, screen_size: (f64, f64), padding: f64) -> Viewport {
@@ -438,6 +555,7 @@ pub struct FigView {
     item: Entity<FigItem>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
+    selected_page_index: Option<usize>,
     viewport: Option<Viewport>,
     last_mouse_position: Option<Point<Pixels>>,
     container_bounds: Option<Bounds<Pixels>>,
@@ -514,6 +632,7 @@ impl MacGpuRenderer {
     fn render(
         &mut self,
         document: &FigDocument,
+        page_root: Option<NodeId>,
         size: (u32, u32),
         viewport: Viewport,
         scale_factor: f32,
@@ -571,7 +690,7 @@ impl MacGpuRenderer {
             size.1,
             &document.doc.scene,
             &render_viewport,
-            document.page_root,
+            page_root,
             &inputs,
         );
         self.direct_context.flush_submit_and_sync_cpu();
@@ -618,6 +737,7 @@ impl FigView {
             item,
             project,
             focus_handle: cx.focus_handle(),
+            selected_page_index: None,
             viewport: None,
             last_mouse_position: None,
             container_bounds: None,
@@ -639,6 +759,7 @@ impl FigView {
     fn render_cpu_canvas(
         &mut self,
         document: &FigDocument,
+        page_root: Option<NodeId>,
         size: (u32, u32),
         viewport: Viewport,
         scale_factor: f32,
@@ -650,7 +771,7 @@ impl FigView {
             return Ok(rendered.image.clone());
         }
 
-        let image = render_fig_canvas(document, size.0, size.1, viewport, scale_factor)?;
+        let image = render_fig_canvas(document, page_root, size.0, size.1, viewport, scale_factor)?;
         self.rendered_canvas = Some(RenderedCanvas {
             image: image.clone(),
             size,
@@ -677,8 +798,10 @@ impl FigView {
         let viewport = self
             .container_bounds
             .zip(self.item.read(cx).document.ready())
-            .map(|(bounds, document)| {
-                fit_bounds(document.page_bounds, bounds_size(bounds), RENDER_PADDING)
+            .and_then(|(bounds, document)| {
+                document
+                    .page(self.selected_page_index)
+                    .map(|page| fit_bounds(page.bounds, bounds_size(bounds), RENDER_PADDING))
             });
         if let Some(viewport) = viewport {
             self.set_viewport(viewport, cx);
@@ -689,12 +812,26 @@ impl FigView {
         let viewport = self
             .container_bounds
             .zip(self.item.read(cx).document.ready())
-            .map(|(bounds, document)| {
-                fit_bounds(document.page_bounds, bounds_size(bounds), RENDER_PADDING)
+            .and_then(|(bounds, document)| {
+                document
+                    .page(self.selected_page_index)
+                    .map(|page| fit_bounds(page.bounds, bounds_size(bounds), RENDER_PADDING))
             });
         if let Some(viewport) = viewport {
             self.set_viewport(viewport, cx);
         }
+    }
+
+    fn select_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, _| {
+            if let FigDocumentState::Ready(document) = &mut item.document {
+                document.ensure_page_solved(index);
+            }
+        });
+        self.selected_page_index = Some(index);
+        self.viewport = None;
+        self.reset_rendered_canvas();
+        cx.notify();
     }
 
     fn zoom_by(&mut self, factor: f64, anchor: Option<Point<Pixels>>, cx: &mut Context<Self>) {
@@ -787,6 +924,44 @@ impl FigView {
     fn handle_pinch(&mut self, event: &PinchEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.zoom_by(f64::from(1.0 + event.delta), Some(event.position), cx);
     }
+
+    fn build_page_menu(&self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
+        let (pages, selected_page_index) = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document.ready() else {
+                return ContextMenu::build(window, cx, |menu, _, _| menu);
+            };
+            let selected_page_index = document.page_index(self.selected_page_index).unwrap_or(0);
+            let pages = document
+                .pages
+                .iter()
+                .enumerate()
+                .map(|(index, page)| (index, page.name.clone()))
+                .collect::<Vec<_>>();
+            (pages, selected_page_index)
+        };
+        let this = cx.weak_entity();
+
+        ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            for (index, name) in pages {
+                let this = this.clone();
+                menu.push_item(
+                    ContextMenuEntry::new(name)
+                        .toggleable(IconPosition::End, index == selected_page_index)
+                        .handler(move |_window, cx| {
+                            if let Err(error) = this.update(cx, |this, cx| {
+                                this.select_page(index, cx);
+                            }) {
+                                log::debug!(
+                                    "dropping .fig page selection for closed view: {error:#}"
+                                );
+                            }
+                        }),
+                );
+            }
+            menu
+        })
+    }
 }
 
 struct FigContentElement {
@@ -855,9 +1030,12 @@ impl Element for FigContentElement {
             let Some(document) = item.document.ready() else {
                 return None;
             };
+            let Some(page) = document.page(view.selected_page_index) else {
+                return None;
+            };
             let viewport = view
                 .viewport
-                .unwrap_or_else(|| fit_bounds(document.page_bounds, logical_size, RENDER_PADDING));
+                .unwrap_or_else(|| fit_bounds(page.bounds, logical_size, RENDER_PADDING));
             (viewport, view.is_dragging())
         };
 
@@ -908,6 +1086,10 @@ impl Element for FigContentElement {
                 .document
                 .ready()
                 .ok_or_else(|| anyhow!("Figma document is not ready"))?;
+            let page_root = document
+                .page(this.selected_page_index)
+                .map(|page| page.root)
+                .ok_or_else(|| anyhow!("Figma document has no renderable pages"))?;
 
             #[cfg(target_os = "macos")]
             {
@@ -915,7 +1097,8 @@ impl Element for FigContentElement {
                     Some(renderer) => renderer,
                     None => MacGpuRenderer::new(render_size)?,
                 };
-                let gpu_result = gpu_renderer.render(document, render_size, viewport, scale_factor);
+                let gpu_result =
+                    gpu_renderer.render(document, page_root, render_size, viewport, scale_factor);
                 this.gpu_renderer = Some(gpu_renderer);
                 match gpu_result {
                     Ok(surface) => {
@@ -930,7 +1113,7 @@ impl Element for FigContentElement {
                 }
             }
 
-            this.render_cpu_canvas(document, render_size, viewport, scale_factor)
+            this.render_cpu_canvas(document, page_root, render_size, viewport, scale_factor)
                 .map(PaintCanvas::Image)
         });
 
@@ -1022,6 +1205,7 @@ impl Item for FigView {
         let item = self.item.clone();
         let project = self.project.clone();
         let viewport = self.viewport;
+        let selected_page_index = self.selected_page_index;
         Task::ready(Some(cx.new(|cx| {
             let item_subscription = cx.observe(&item, |this: &mut FigView, _, cx| {
                 this.reset_rendered_canvas();
@@ -1031,6 +1215,7 @@ impl Item for FigView {
                 item,
                 project,
                 focus_handle: cx.focus_handle(),
+                selected_page_index,
                 viewport,
                 last_mouse_position: None,
                 container_bounds: None,
@@ -1075,21 +1260,29 @@ impl Focusable for FigView {
 }
 
 impl Render for FigView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (report_text, loading_message, error) = {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (report_text, page_label, page_count, loading_message, error) = {
             let item = self.item.read(cx);
             (
                 item.document.ready().map(|document| {
                     let skipped: usize = document.report.skipped_by_type.values().sum();
                     let page_name = document
-                        .page_root
-                        .and_then(|page| document.doc.page_name(page))
+                        .page(self.selected_page_index)
+                        .map(|page| page.name.as_ref())
                         .unwrap_or("Page");
                     format!(
                         "{page_name} · {} mapped, {skipped} skipped",
                         document.report.mapped
                     )
                 }),
+                item.document
+                    .ready()
+                    .and_then(|document| document.page(self.selected_page_index))
+                    .map(|page| page.name.clone()),
+                item.document
+                    .ready()
+                    .map(|document| document.pages.len())
+                    .unwrap_or(0),
                 item.document.loading_message(),
                 item.document.error(),
             )
@@ -1151,6 +1344,20 @@ impl Render for FigView {
                         .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
                         .on_mouse_move(cx.listener(Self::handle_mouse_move))
                         .child(FigContentElement::new(cx.entity())),
+                )
+            })
+            .when(!has_error && !is_loading && page_count > 1, |this| {
+                this.child(
+                    div().absolute().left_2().top_2().child(
+                        DropdownMenu::new(
+                            "fig-page-picker",
+                            page_label.unwrap_or_else(|| "Page".into()),
+                            self.build_page_menu(window, cx),
+                        )
+                        .style(DropdownStyle::Subtle)
+                        .trigger_size(ButtonSize::Compact)
+                        .aria_label("Select Figma page"),
+                    ),
                 )
             })
             .when_some(report_text, |this, report_text| {

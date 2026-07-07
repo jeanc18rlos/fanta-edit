@@ -29,6 +29,23 @@ fn fill_style_def(sid: u32, lid: u32, r: f32, g: f32, b: f32) -> KiwiValue {
     )
 }
 
+fn text_style_def(sid: u32, lid: u32, r: f32, g: f32, b: f32) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guid", guid(sid, lid)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("styleType", KiwiValue::Enum("TEXT".to_owned())),
+            ("name", KiwiValue::String("heading".to_owned())),
+            ("fontSize", KiwiValue::Float(18.0)),
+            (
+                "fillPaints",
+                KiwiValue::Array(vec![solid_paint(r, g, b, 1.0)]),
+            ),
+        ],
+    )
+}
+
 #[test]
 fn empty_fillpaints_with_style_ref_resolves_to_the_styles_paints() {
     // A rect with an EMPTY fillPaints + a styleIdForFill must inherit the
@@ -510,5 +527,86 @@ fn symbol_override_style_ref_resolves_to_dark_fill_on_expand() {
         rect_fill,
         Some(Fill::solid(Color::rgba(16, 24, 32, 255))),
         "dark style ref resolves through the symbolOverride to the master child"
+    );
+}
+
+#[test]
+fn symbol_override_text_style_ref_does_not_synthesize_fill_override() {
+    let fig = doc_from(vec![
+        text_style_def(9, 77, 0.0, 0.0, 0.0),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("SYMBOL".to_owned())),
+                ("name", KiwiValue::String("Breadcrumb title".to_owned())),
+                ("size", vector(180.0, 32.0)),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("parentIndex", parent_index(0, 1)),
+                ("type", KiwiValue::Enum("TEXT".to_owned())),
+                ("name", KiwiValue::String("Label".to_owned())),
+                ("size", vector(120.0, 20.0)),
+                ("textData", text_data("Master label")),
+                ("fontSize", KiwiValue::Float(16.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                ),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 3)),
+                ("type", KiwiValue::Enum("INSTANCE".to_owned())),
+                (
+                    "name",
+                    KiwiValue::String("Breadcrumb title / dark".to_owned()),
+                ),
+                ("size", vector(180.0, 32.0)),
+                (
+                    "symbolData",
+                    o(
+                        "SymbolData",
+                        vec![
+                            ("symbolID", guid(0, 1)),
+                            (
+                                "symbolOverrides",
+                                KiwiValue::Array(vec![o(
+                                    "NodeChange",
+                                    vec![
+                                        ("guidPath", guid_path(0, 2)),
+                                        ("styleIdForText", style_ref(9, 77)),
+                                        ("textData", text_data("Avatar: The Way of Water")),
+                                    ],
+                                )]),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        ),
+    ]);
+
+    let (doc, _report, _) = fig_to_doc(&fig).unwrap();
+    let expanded = expand_only_instance(&doc);
+    let text = expanded
+        .iter()
+        .find_map(|entry| match &entry.node.data {
+            NodeData::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("expanded instance contains text");
+
+    assert_eq!(text.content, "Avatar: The Way of Water");
+    assert_eq!(
+        text.style.color,
+        Color::rgba(255, 255, 255, 255),
+        "a text style ref inside a symbolOverride must not turn into a fill override"
     );
 }

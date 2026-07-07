@@ -579,3 +579,27 @@ fn raw_one_line_height_uses_authored_figma_box_height() {
         other => panic!("expected text, got {other:?}"),
     }
 }
+
+#[test]
+fn raw_one_line_height_ignores_subnormal_compact_box_height() {
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("size", vector(47.0, 11.0)),
+            ("textData", text_data("#FF0000")),
+            ("fontSize", KiwiValue::Float(13.0)),
+            ("lineHeight", number(1.0, "RAW")),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Text(t) => assert!(
+            (t.style.line_height - 1.25).abs() < 1e-6,
+            "RAW 1.0 should keep normal leading for compact boxes, got {}",
+            t.style.line_height
+        ),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
