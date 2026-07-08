@@ -955,6 +955,22 @@
     // Default width of the collaboration panel.
     "default_width": 240,
   },
+  "fanta_design_panel": {
+    // Whether to show the Fanta design panel button in the status bar.
+    "button": true,
+    // Where to dock the Fanta design panel. Can be 'left' or 'right'.
+    "dock": "left",
+    // Default width of the Fanta design panel.
+    "default_width": 280,
+  },
+  "fanta_properties_panel": {
+    // Whether to show the Fanta properties panel button in the status bar.
+    "button": true,
+    // Where to dock the Fanta properties panel. Can be 'left' or 'right'.
+    "dock": "right",
+    // Default width of the Fanta properties panel.
+    "default_width": 320,
+  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,

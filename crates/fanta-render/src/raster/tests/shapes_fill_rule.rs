@@ -31,6 +31,7 @@ fn two_square_subpaths_doc(fill_rule: fanta_doc::FillRule) -> Doc {
         strokes: Default::default(),
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(n)).unwrap();
@@ -103,6 +104,7 @@ fn donut_same_winding_doc(fill_rule: fanta_doc::FillRule) -> Doc {
         strokes: Default::default(),
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(n)).unwrap();

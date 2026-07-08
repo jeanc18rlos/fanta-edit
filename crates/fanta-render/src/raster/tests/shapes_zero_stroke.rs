@@ -25,6 +25,7 @@ fn zero_width_stroke_rect_doc(width: f64) -> Doc {
         strokes,
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     doc

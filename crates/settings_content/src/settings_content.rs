@@ -207,6 +207,10 @@ pub struct SettingsContent {
 
     pub language_models: Option<AllLanguageModelSettingsContent>,
 
+    pub fanta_design_panel: Option<PanelSettingsContent>,
+
+    pub fanta_properties_panel: Option<PanelSettingsContent>,
+
     pub outline_panel: Option<OutlinePanelSettingsContent>,
 
     pub project_panel: Option<ProjectPanelSettingsContent>,

@@ -4,8 +4,8 @@
 //! walk and the transient instance walk.
 use super::{
     BlendMode, Blur, BlurKind, Bounds, Canvas, CanvasNode, NodeData, NodeId, Paint, RenderCtx,
-    Scene, Shadow, ShadowKind, bounds_to_f32, path_is_rect, rounded_rect_path, to_sk_color,
-    to_sk_path,
+    Scene, Shadow, ShadowKind, bounds_to_f32, path_is_rect, rounded_rect_path, to_sk_blend_mode,
+    to_sk_color, to_sk_fill_path,
 };
 
 /// Push a save-layer carrying this node's compositing effects — opacity, drop
@@ -17,11 +17,17 @@ use super::{
 /// - the node has ≥1 **drop** shadow (an `ImageFilter` paints the shadow behind
 ///   the node silhouette);
 /// - the node's `blend_mode` is non-`Normal` (the layer composites against the
-///   backdrop with that mode).
+///   backdrop with that mode);
+/// - `isolate` is set ([`NodeFlags::ISOLATED_BLEND`](super::NodeFlags)) — the
+///   container's children must be flattened into their own group before
+///   compositing, so a descendant's blend mode reads the group's contents
+///   rather than leaking through to the backdrop (Figma's "Pass through"
+///   toggle, inverted). The isolation layer is bounded by the same padded
+///   content box as every other effects layer.
 ///
 /// When none hold (the overwhelmingly common case: full opacity, no shadows,
-/// `Normal` blend) this allocates nothing and returns `false`, so the existing
-/// fast path is untouched — no regression, no extra layer.
+/// `Normal` blend, pass-through) this allocates nothing and returns `false`, so
+/// the existing fast path is untouched — no regression, no extra layer.
 ///
 /// The layer's `Paint` carries all three at once: `alpha_f` for opacity, the
 /// merged drop-shadow `ImageFilter` (see [`build_drop_shadow_filter`]) so the
@@ -43,12 +49,14 @@ use super::{
 /// layer paint here. It is painted separately, on top of the node's own content
 /// and clipped to its shape, by [`draw_inner_shadows`]; this function ignores
 /// `ShadowKind::Inner` entirely (only drop shadows feed the layer filter).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_effects_layer(
     canvas: &Canvas,
     opacity: f32,
     blend_mode: BlendMode,
     effects: &[Shadow],
     blurs: &[Blur],
+    isolate: bool,
     effective_scale: f32,
     content_bounds: Option<Bounds>,
 ) -> bool {
@@ -60,8 +68,9 @@ pub(crate) fn begin_effects_layer(
     let shadow_filter = build_drop_shadow_filter(effects, effective_scale);
     let image_filter = build_layer_blur_filter(blurs, effective_scale, shadow_filter);
     let non_normal_blend = blend_mode != BlendMode::Normal;
-    // Nothing to do: full opacity, no drop shadow, no layer blur, normal blend.
-    if opacity >= 1.0 && image_filter.is_none() && !non_normal_blend {
+    // Nothing to do: full opacity, no drop shadow, no layer blur, normal
+    // blend, and no isolation requested.
+    if opacity >= 1.0 && image_filter.is_none() && !non_normal_blend && !isolate {
         return false;
     }
     let mut paint = Paint::default();
@@ -86,27 +95,34 @@ pub(crate) fn begin_effects_layer(
     // unbounded behavior.
     let rec = skia_safe::canvas::SaveLayerRec::default().paint(&paint);
     if let Some(b) = content_bounds {
-        // Pad in DEVICE pixels so the safety margin is zoom-independent:
-        // covers outside-aligned strokes, anti-aliasing, and small geometry
-        // overshoot (glyph overhang, a child stroke at the box edge) at any
-        // zoom without re-deriving per-node stroke reach.
-        let scale = f64::from(effective_scale);
-        let pad = if scale.is_finite() && scale > 0.0 {
-            LAYER_BOUNDS_PAD_DEVICE_PX / scale
-        } else {
-            LAYER_BOUNDS_PAD_DEVICE_PX
-        };
-        let padded = skia_safe::Rect::new(
-            (b.min_x - pad) as f32,
-            (b.min_y - pad) as f32,
-            (b.max_x + pad) as f32,
-            (b.max_y + pad) as f32,
-        );
-        canvas.save_layer(&rec.bounds(&padded));
+        canvas.save_layer(&rec.bounds(&padded_layer_rect(&b, effective_scale)));
     } else {
         canvas.save_layer(&rec);
     }
     true
+}
+
+/// The save-layer bounds rect for a content box `b` in the CURRENT (node-local)
+/// canvas space: `b` padded by [`LAYER_BOUNDS_PAD_DEVICE_PX`] converted through
+/// `effective_scale`. Padding in DEVICE pixels keeps the safety margin
+/// zoom-independent: it covers outside-aligned strokes, anti-aliasing, and
+/// small geometry overshoot (glyph overhang, a child stroke at the box edge)
+/// at any zoom without re-deriving per-node stroke reach. Shared by the
+/// effects layer and the mask layers so both bound their offscreens
+/// identically.
+pub(crate) fn padded_layer_rect(b: &Bounds, effective_scale: f32) -> skia_safe::Rect {
+    let scale = f64::from(effective_scale);
+    let pad = if scale.is_finite() && scale > 0.0 {
+        LAYER_BOUNDS_PAD_DEVICE_PX / scale
+    } else {
+        LAYER_BOUNDS_PAD_DEVICE_PX
+    };
+    skia_safe::Rect::new(
+        (b.min_x - pad) as f32,
+        (b.min_y - pad) as f32,
+        (b.max_x + pad) as f32,
+        (b.max_y + pad) as f32,
+    )
 }
 
 /// Device-pixel padding added around an effects layer's content bounds (see
@@ -122,43 +138,33 @@ pub(crate) const LAYER_BOUNDS_PAD_DEVICE_PX: f64 = 32.0;
 /// slower). Priority order:
 /// - a clipped frame's `clip_size` box — overlay-accurate (a binding can
 ///   resize the clip, and descendants are clipped to it anyway);
-/// - the node's own intrinsic geometry (vector path bounds, text/bitmap/etc.
+/// - the node's own intrinsic geometry (vector path bounds, text/bitmap/media
 ///   `local_size`) — also valid for TRANSIENT instance-expansion clones that
 ///   have no scene entry;
-/// - the scene's memoized subtree `local_bounds` for a live unclipped group.
+/// - the scene's memoized subtree `local_bounds` for a live unclipped group
+///   (a TRANSIENT unclipped group resolves to `None` here; the instance walk
+///   falls back to the union of its transient children).
 pub(crate) fn effects_layer_bounds(
     node: &CanvasNode,
     scene_id: Option<NodeId>,
     scene: &Scene,
 ) -> Option<Bounds> {
+    let size_box = |[w, h]: [f64; 2]| Some(Bounds::from_xywh(0.0, 0.0, w, h));
     match &node.data {
         NodeData::Group(g) => match g.clip_size {
             Some([w, h]) => Some(Bounds::from_xywh(0.0, 0.0, w, h)),
             None => scene_id.and_then(|id| scene.local_bounds(id)),
         },
         NodeData::Vector(v) => v.path.rough_bounds(),
-        NodeData::Text(t) => Some(Bounds::from_xywh(
-            0.0,
-            0.0,
-            t.local_size[0],
-            t.local_size[1],
-        )),
-        NodeData::Bitmap(b) => Some(Bounds::from_xywh(
-            0.0,
-            0.0,
-            b.local_size[0],
-            b.local_size[1],
-        )),
-        NodeData::Instance(i) => Some(Bounds::from_xywh(
-            0.0,
-            0.0,
-            i.local_size[0],
-            i.local_size[1],
-        )),
-        // Remaining kinds (video/audio/embed/...) are rare effect carriers;
-        // the live scene resolves them via local_bounds, transient ones stay
-        // unbounded.
-        _ => scene_id.and_then(|id| scene.local_bounds(id)),
+        NodeData::Text(t) => size_box(t.local_size),
+        NodeData::Bitmap(b) => size_box(b.local_size),
+        NodeData::Instance(i) => size_box(i.local_size),
+        NodeData::Video(v) => size_box(v.local_size),
+        NodeData::Audio(a) => size_box(a.local_size),
+        NodeData::NodeGraph(n) => size_box(n.local_size),
+        NodeData::Model3d(m) => size_box(m.local_size),
+        NodeData::AiArtifact(a) => size_box(a.local_size),
+        NodeData::Embed(e) => size_box(e.local_size),
     }
 }
 
@@ -478,22 +484,7 @@ pub(crate) fn shadow_expanded_world_bounds(
     world: Bounds,
     effective_scale: f32,
 ) -> Bounds {
-    // Fast path: no drop shadow AND no LAYER blur ⇒ the body bounds are the
-    // whole story. (A BACKGROUND blur frosts the backdrop *inside* the node's
-    // silhouette and never grows its painted extent, so it doesn't widen the
-    // cull box.)
-    let has_drop = effects
-        .iter()
-        .any(|s| s.kind == ShadowKind::Drop && s.color.a != 0);
-    let layer_blur_sigma_sq: f64 = blurs
-        .iter()
-        .filter(|b| b.kind == BlurKind::Layer)
-        .map(|b| {
-            let s = blur_world_sigma(b);
-            s * s
-        })
-        .sum();
-    if !has_drop && layer_blur_sigma_sq <= 0.0 {
+    if !shadow_expansion_needed(effects, blurs) {
         return world;
     }
     // We need the node's LOCAL bounds + world transform to expand in local
@@ -502,6 +493,45 @@ pub(crate) fn shadow_expanded_world_bounds(
     let (Some(local), Some(world_t)) = (scene.local_bounds(id), scene.world_transform(id)) else {
         return world;
     };
+    // Project the expanded local box to world space (corner-wise AABB).
+    shadow_expanded_local_bounds(local, effects, blurs, effective_scale).transformed(&world_t)
+}
+
+/// Fast pre-check for the shadow expansions: no visible drop shadow AND no
+/// LAYER blur ⇒ the body bounds are the whole story. (A BACKGROUND blur frosts
+/// the backdrop *inside* the node's silhouette and never grows its painted
+/// extent, so it doesn't widen any box.)
+fn shadow_expansion_needed(effects: &[Shadow], blurs: &[Blur]) -> bool {
+    effects
+        .iter()
+        .any(|s| s.kind == ShadowKind::Drop && s.color.a != 0)
+        || blurs
+            .iter()
+            .any(|b| b.kind == BlurKind::Layer && blur_world_sigma(b) > 0.0)
+}
+
+/// Expand a node's LOCAL bounds by the world-space reach of its own drop
+/// shadow(s) and layer blur — the local-space core of
+/// [`shadow_expanded_world_bounds`], shared with the mask-layer bounds (which
+/// need the same expansion in the parent's local space rather than world
+/// space). Returns `local` unchanged when nothing expands.
+pub(crate) fn shadow_expanded_local_bounds(
+    local: Bounds,
+    effects: &[Shadow],
+    blurs: &[Blur],
+    effective_scale: f32,
+) -> Bounds {
+    if !shadow_expansion_needed(effects, blurs) {
+        return local;
+    }
+    let layer_blur_sigma_sq: f64 = blurs
+        .iter()
+        .filter(|b| b.kind == BlurKind::Layer)
+        .map(|b| {
+            let s = blur_world_sigma(b);
+            s * s
+        })
+        .sum();
 
     // Convert the on-screen sigma cap back to world units (the ceiling on a
     // shadow's/blur's painted sigma in this frame). A degenerate scale disables
@@ -550,8 +580,7 @@ pub(crate) fn shadow_expanded_world_bounds(
         };
         acc = acc.union(&blur_box);
     }
-    // Project the expanded local box to world space (corner-wise AABB).
-    acc.transformed(&world_t)
+    acc
 }
 
 /// The WORLD-space Gaussian sigma Skia's drop-shadow filter should be given for
@@ -659,7 +688,22 @@ pub(crate) fn build_drop_shadow_filter(
             spread_input, // the spread-morphed silhouette (or the source bitmap)
             None,         // no crop rect — shadow may extend past the node bounds
         ) {
-            shadow_layers.push(f);
+            // Figma's `showShadowBehindNode = false` (its default): the shadow
+            // is knocked out wherever the node's own coverage sits, so nothing
+            // shows through a translucent or hollow body. `DstOut` with the
+            // source silhouette (`None` foreground) multiplies the shadow by
+            // `1 − source alpha` — for a fully opaque body this is invisible
+            // (the body repaints over the shadow anyway), for a translucent
+            // one it is exactly the Figma knockout.
+            let layer = if shadow.show_behind_node {
+                f
+            } else {
+                match image_filters::blend(skia_safe::BlendMode::DstOut, f.clone(), None, None) {
+                    Some(knocked_out) => knocked_out,
+                    None => f,
+                }
+            };
+            shadow_layers.push(layer);
         }
     }
     if shadow_layers.is_empty() {
@@ -712,23 +756,36 @@ fn spread_morphology_filter(spread: f64, invert: bool) -> Option<skia_safe::Imag
 ///   vector path.
 /// - **Group / frame**: the rounded box of the frame's `clip_size`, else the
 ///   scene-computed content bounds for a background/border-only group.
-/// - **Instance / Bitmap / Video / Text / etc.**: `None` — an inner shadow on a
-///   text run or an instance box is rare and its silhouette is ill-defined here
-///   (text wants per-glyph, an instance wants its expanded subtree), so we skip
-///   rather than ring a wrong box.
+/// - **Instance / Bitmap / Video / Text / media**: the node's `local_size` box —
+///   the same box `effects_layer_bounds` uses. Figma renders inner shadows and
+///   background blurs on every node type against its bounding box (an instance
+///   of a card component visibly keeps its inner shadow), so a box silhouette is
+///   far closer to Figma than silently dropping the effect. A degenerate
+///   (zero-area) box yields `None`.
 pub(crate) fn node_silhouette_path(
     node: &CanvasNode,
     scene_id: Option<NodeId>,
     scene: &Scene,
 ) -> Option<skia_safe::Path> {
+    let size_box = |[w, h]: [f64; 2]| -> Option<skia_safe::Path> {
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let mut p = skia_safe::Path::new();
+        p.add_rect(
+            skia_safe::Rect::from_xywh(0.0, 0.0, w as f32, h as f32),
+            None,
+        );
+        Some(p)
+    };
     match &node.data {
         NodeData::Vector(v) => {
             let bounds = v.path.rough_bounds().unwrap_or(Bounds::ZERO);
             let local = bounds_to_f32(&bounds);
             Some(if path_is_rect(&v.path) {
-                rounded_rect_path(local, v.corner_radius, v.corner_radii, 0.0)
+                rounded_rect_path(local, v.corner_radius, v.corner_radii, v.corner_smoothing)
             } else {
-                to_sk_path(&v.path)
+                to_sk_fill_path(&v.path)
             })
         }
         NodeData::Group(g) => {
@@ -748,7 +805,15 @@ pub(crate) fn node_silhouette_path(
                 )
             })
         }
-        _ => None,
+        NodeData::Instance(i) => size_box(i.local_size),
+        NodeData::Text(t) => size_box(t.local_size),
+        NodeData::Bitmap(b) => size_box(b.local_size),
+        NodeData::Video(v) => size_box(v.local_size),
+        NodeData::Audio(a) => size_box(a.local_size),
+        NodeData::NodeGraph(n) => size_box(n.local_size),
+        NodeData::Model3d(m) => size_box(m.local_size),
+        NodeData::AiArtifact(a) => size_box(a.local_size),
+        NodeData::Embed(e) => size_box(e.local_size),
     }
 }
 
@@ -846,34 +911,5 @@ pub(crate) fn draw_inner_shadows(
         canvas.draw_path(&path, &paint);
         canvas.restore();
         ctx.metrics.nodes_drawn += 1;
-    }
-}
-
-/// Map a [`fanta_doc::BlendMode`] to its [`skia_safe::BlendMode`] equivalent.
-///
-/// `fanta_doc::BlendMode` is the CSS Compositing Level 1 / `SkBlendMode` set, so
-/// each separable + non-separable mode has an exact Skia counterpart. `Normal`
-/// maps to Skia `SrcOver` (regular alpha-over) — though `Normal` never reaches a
-/// layer paint in practice, since [`begin_effects_layer`] skips the layer for it
-/// unless opacity/shadow already forced one.
-pub(crate) fn to_sk_blend_mode(mode: BlendMode) -> skia_safe::BlendMode {
-    use skia_safe::BlendMode as Sk;
-    match mode {
-        BlendMode::Normal => Sk::SrcOver,
-        BlendMode::Multiply => Sk::Multiply,
-        BlendMode::Screen => Sk::Screen,
-        BlendMode::Overlay => Sk::Overlay,
-        BlendMode::Darken => Sk::Darken,
-        BlendMode::Lighten => Sk::Lighten,
-        BlendMode::ColorDodge => Sk::ColorDodge,
-        BlendMode::ColorBurn => Sk::ColorBurn,
-        BlendMode::HardLight => Sk::HardLight,
-        BlendMode::SoftLight => Sk::SoftLight,
-        BlendMode::Difference => Sk::Difference,
-        BlendMode::Exclusion => Sk::Exclusion,
-        BlendMode::Hue => Sk::Hue,
-        BlendMode::Saturation => Sk::Saturation,
-        BlendMode::Color => Sk::Color,
-        BlendMode::Luminosity => Sk::Luminosity,
     }
 }

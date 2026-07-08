@@ -3,11 +3,11 @@
 //! ([`render_expanded`]) mirroring the live-scene walk. Also hosts the public
 //! [`solve_scene_layout`] entry point for scene-direct auto-layout frames.
 use super::{
-    Arc, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey, InstanceNode, NodeData,
-    NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur, begin_effects_layer,
+    Arc, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey, InstanceNode,
+    NodeData, NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur, begin_effects_layer,
     draw_inner_shadows, draw_unresolved_outline, effects_layer_bounds, expand_instance,
     hash_overrides, paint_child_sequence, paint_node_content, paint_node_foreground,
-    resolve_overlay, to_sk_matrix, with_shaped_layout,
+    resolve_overlay, shadow_expanded_local_bounds, to_sk_matrix, with_shaped_layout,
 };
 
 // ---------------------------------------------------------------------------
@@ -15,9 +15,11 @@ use super::{
 // ---------------------------------------------------------------------------
 
 /// Expand and draw a component instance's master subtree. The caller has
-/// already concatenated the instance's own transform and applied the
-/// instance-box clip (in [`paint_node_content`]'s `Instance` arm), so the
-/// expanded subtree paints in the instance's local space, confined to its box.
+/// already concatenated the instance's own transform, so the expanded subtree
+/// paints in the instance's local space. Content confinement comes from the
+/// expansion root itself: its `clip_size` is pinned to the instance box
+/// (`pin_expansion_root_box`), so the root's frame clip crops descendants while
+/// the root's own border correctly escapes it (Figma frame-stroke semantics).
 ///
 /// The expansion (deep-clone of the master with overrides applied) is memoized
 /// across frames; the resulting transient subtree is walked by
@@ -112,7 +114,11 @@ pub fn measure_text_node(t: &fanta_doc::TextNode) -> (f64, f64) {
     if t.content.is_empty() {
         return (0.0, 0.0);
     }
-    with_shaped_layout(t, |layout| (layout.width(), layout.height()))
+    // Height includes the paragraph-spacing bands the draw inserts, so an
+    // auto-height box hugs the pixels that actually paint.
+    with_shaped_layout(t, |layout| {
+        (layout.width(), super::text::painted_text_height(t, layout))
+    })
 }
 
 /// Lay out the **scene-direct** auto-layout frames under `page` — the page →
@@ -133,6 +139,45 @@ pub fn measure_text_node(t: &fanta_doc::TextNode) -> (f64, f64) {
 pub fn solve_scene_layout(scene: &mut Scene, page: NodeId) {
     fanta_doc::solve_auto_layout(scene, page, &mut measure_text_node);
     scene.invalidate_world_cache();
+}
+
+/// The local AABB of a transient (expanded-instance) node's subtree, mirroring
+/// [`Scene::local_bounds`] for clones that have no scene entry: an unclipped
+/// group unions its transient children's boxes (transformed into its space);
+/// every other kind reports its intrinsic geometry (via
+/// [`effects_layer_bounds`], which never consults the scene when `scene_id` is
+/// `None`). Used to bound the effects/mask save-layers of the transient walk —
+/// without it an unclipped group inside a component allocates viewport-sized
+/// layers per frame (see [`begin_effects_layer`]).
+fn expanded_subtree_bounds(
+    node: &CanvasNode,
+    expanded: &[ExpandedNode],
+    children: &HashMap<NodeId, Vec<usize>>,
+    scene: &Scene,
+) -> Option<Bounds> {
+    match &node.data {
+        NodeData::Group(g) if g.clip_size.is_none() => {
+            let mut acc: Option<Bounds> = None;
+            for &i in children.get(&node.id).into_iter().flatten() {
+                let Some(entry) = expanded.get(i) else {
+                    continue;
+                };
+                let child = &entry.node;
+                let Some(b) = expanded_subtree_bounds(child, expanded, children, scene) else {
+                    continue;
+                };
+                let Some(in_parent) = b.try_transformed(&child.transform) else {
+                    continue;
+                };
+                acc = Some(match acc {
+                    Some(a) => a.union(&in_parent),
+                    None => in_parent,
+                });
+            }
+            acc
+        }
+        _ => effects_layer_bounds(node, None, scene),
+    }
 }
 
 /// Map each expanded clone's parent id → its child clone indices, so the
@@ -204,22 +249,20 @@ pub(crate) fn render_expanded(
         node.blend_mode,
         &node.effects,
         &node.blurs,
+        node.flags.contains(NodeFlags::ISOLATED_BLEND),
         ctx.effective_scale,
         // Transient clone: no scene entry, so the box comes from the node's
         // own geometry (clip box / path bounds / local_size); an unclipped
-        // transient group resolves to `None` and stays unbounded.
-        effects_layer_bounds(node, None, ctx.scene),
+        // transient group falls back to the union of its transient children so
+        // its layer is still bounded rather than viewport-sized.
+        effects_layer_bounds(node, None, ctx.scene)
+            .or_else(|| expanded_subtree_bounds(node, expanded, children, ctx.scene)),
     );
 
     // Transient nodes have no scene id, so a background-only unclipped group
     // paints nothing (no bounds to fall back to) — correct for a transient
     // subtree.
     let content_state = paint_node_content(canvas, node, None, ctx);
-
-    // Inner shadows on a transient (expanded-instance) node, clipped to its
-    // silhouette — same treatment as a live-scene node, but with no scene id so
-    // a background-only group has no fallback box (matches `paint_node_content`).
-    draw_inner_shadows(canvas, node, None, ctx);
 
     if let NodeData::Instance(inner) = &node.data {
         // Nested instance: recurse one expansion level (a swap-override on it
@@ -241,6 +284,20 @@ pub(crate) fn render_expanded(
                 let n = &expanded[i].node;
                 (n.is_mask && !n.flags.contains(NodeFlags::HIDDEN)).then_some(n.mask_type)
             },
+            // A transient child subtree's painted extent in this node's local
+            // space, mirroring the live walk's bounds closure: subtree box,
+            // shadow-expanded, mapped through the child's transform.
+            |ctx, &i| {
+                let child = &expanded.get(i)?.node;
+                let local = expanded_subtree_bounds(child, expanded, children, ctx.scene)?;
+                shadow_expanded_local_bounds(
+                    local,
+                    &child.effects,
+                    &child.blurs,
+                    ctx.effective_scale,
+                )
+                .try_transformed(&child.transform)
+            },
             |canvas, ctx, &i| {
                 render_expanded(canvas, &expanded[i].node, false, expanded, children, ctx)
             },
@@ -251,6 +308,11 @@ pub(crate) fn render_expanded(
         canvas.restore();
     }
     paint_node_foreground(canvas, node, None, ctx);
+
+    // Inner shadows composite over the node's flattened content (fill, border,
+    // children), mirroring the live-scene walk's ordering — with no scene id, so
+    // a background-only group has no fallback box (matches `paint_node_content`).
+    draw_inner_shadows(canvas, node, None, ctx);
 
     if used_layer {
         canvas.restore();

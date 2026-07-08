@@ -19,21 +19,34 @@ pub(crate) fn read_number_px(number: Option<&KiwiValue>, font_px: f64) -> Option
     }
 }
 
-/// Resolve a Figma `lineHeight` `Number` to our unitless multiple-of-size_px.
-pub(crate) fn read_line_height(number: Option<&KiwiValue>, font_px: f64) -> Option<f64> {
+/// A decoded Figma `lineHeight`: either a plain multiple of the font size, or
+/// a percentage of the FONT'S INTRINSIC line height (Kiwi PERCENT units — 100
+/// is Figma's "auto").
+pub(crate) enum LineHeight {
+    /// A unitless multiple of `size_px` (Kiwi RAW, or PIXELS ÷ font size).
+    Multiple(f64),
+    /// Percent of the font's intrinsic (metric) line height. `100.0` = auto.
+    IntrinsicPercent(f64),
+}
+
+/// Resolve a Figma `lineHeight` `Number`.
+///
+/// - `PIXELS` → a multiple of the font size (`value / font_px`).
+/// - `RAW` → already a unitless multiple of the font size.
+/// - `PERCENT` → percent of the font's INTRINSIC line height, NOT of the font
+///   size: `100` is exactly Figma's "auto" (ascent+descent metrics, ~1.21× the
+///   size for Inter). Verified across the corpus — every default-line-height
+///   text node stores `PERCENT 100`.
+pub(crate) fn read_line_height(number: Option<&KiwiValue>, font_px: f64) -> Option<LineHeight> {
     let number = number?;
     let value = number.get("value").and_then(KiwiValue::as_f64)?;
     if font_px <= 0.0 {
         return None;
     }
     match number.get("units").and_then(KiwiValue::as_str) {
-        Some("PIXELS") => Some(value / font_px),
-        Some("PERCENT") => Some(value / 100.0),
-        // RAW is already a unitless multiple of the font size — exactly our
-        // `line_height` semantics — so pass it through. (Without this it fell to
-        // `None` and kept the 1.2 default, which mis-spaced the ~67 RAW-unit text
-        // nodes in the Spectrum file.)
-        Some("RAW") => Some(value),
+        Some("PIXELS") => Some(LineHeight::Multiple(value / font_px)),
+        Some("PERCENT") => Some(LineHeight::IntrinsicPercent(value)),
+        Some("RAW") => Some(LineHeight::Multiple(value)),
         _ => None,
     }
 }
@@ -54,7 +67,19 @@ pub(crate) fn make_shape(
         strokes: build_stroke(change).into_iter().collect(),
         corner_radius,
         corner_radii,
+        corner_smoothing: corner_smoothing(change),
     }
+}
+
+/// Read `cornerSmoothing` (Figma's iOS-squircle amount, 0..=1). `0.0` when
+/// absent or out of range.
+pub(crate) fn corner_smoothing(change: &KiwiValue) -> f32 {
+    change
+        .get("cornerSmoothing")
+        .and_then(KiwiValue::as_f64)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .map(|s| s.clamp(0.0, 1.0) as f32)
+        .unwrap_or(0.0)
 }
 
 /// A filled rectangle [`VectorNode`] (single optional fill, no stroke). Kept for
@@ -70,6 +95,7 @@ pub(crate) fn make_rect(
         strokes: Default::default(),
         corner_radius,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }
 }
 
@@ -539,7 +565,10 @@ pub(crate) fn read_paint(paint: &KiwiValue) -> Option<Fill> {
         }
         Some(
             t @ ("GRADIENT_LINEAR" | "GRADIENT_RADIAL" | "GRADIENT_ANGULAR" | "GRADIENT_DIAMOND"),
-        ) => read_gradient(t, paint, opacity).map(|gradient| Fill::Gradient { gradient }),
+        ) => read_gradient(t, paint, opacity).map(|gradient| Fill::Gradient {
+            gradient,
+            blend: paint_blend_mode(paint),
+        }),
         Some("IMAGE") => {
             // An IMAGE paint references its bitmap by `image.hash` (a sha1 the
             // `.fig` ZIP stores under `images/<hex>`). Mint a *deterministic*
@@ -551,15 +580,59 @@ pub(crate) fn read_paint(paint: &KiwiValue) -> Option<Fill> {
             // can't back with bytes still degrades gracefully (never panics).
             let hash = image_hash_hex(paint)?;
             let asset = asset_id_for_image(&hash);
+            let mode = image_fit_mode(paint);
+            // `imageTransform` is only *applicable* in Figma's CROP mode (Kiwi
+            // `STRETCH`); FILL/FIT/TILE paints keep a stale transform around
+            // after the user switches modes, which Figma preserves but ignores
+            // — reading it there wrongly cropped those paints.
+            let crop = is_crop_scale_mode(paint)
+                .then(|| image_crop(paint))
+                .flatten();
+            // `scale` (plugin `scalingFactor`) is likewise only applicable in
+            // TILE mode: each tile draws at natural-size × scale.
+            let scale = (mode == ImageFitMode::Tile)
+                .then(|| paint.get("scale").and_then(KiwiValue::as_f64))
+                .flatten()
+                .filter(|s| s.is_finite() && *s > 0.0 && (*s - 1.0).abs() > 1e-6)
+                .map(|s| s as f32);
+            let rotation = paint
+                .get("rotation")
+                .and_then(KiwiValue::as_f64)
+                .filter(|r| r.is_finite() && r.abs() > 1e-6)
+                .map(|r| r as f32);
             Some(Fill::Image {
                 asset,
-                mode: image_fit_mode(paint),
+                mode,
                 opacity: opacity.clamp(0.0, 1.0) as f32,
-                crop: image_crop(paint).map(Box::new),
+                crop: crop.map(Box::new),
+                scale,
+                rotation,
+                blend: paint_blend_mode(paint),
             })
         }
         _ => None,
     }
+}
+
+/// Read a paint's own `blendMode` (per-paint compositing against the paints
+/// below it in the stack). Absent / unrecognized / PASS_THROUGH → `Normal`.
+pub(crate) fn paint_blend_mode(paint: &KiwiValue) -> BlendMode {
+    paint
+        .get("blendMode")
+        .and_then(KiwiValue::as_str)
+        .and_then(blend_mode)
+        .unwrap_or(BlendMode::Normal)
+}
+
+/// Whether an IMAGE paint is in Figma's plugin-API **CROP** mode, which the
+/// Kiwi schema spells `STRETCH` (the plugin API has no STRETCH member). Only in
+/// this mode is `imageTransform` applicable. `CROP` is accepted too for schema
+/// variants that spell it out.
+fn is_crop_scale_mode(paint: &KiwiValue) -> bool {
+    matches!(
+        paint.get("imageScaleMode").and_then(KiwiValue::as_str),
+        Some("STRETCH" | "CROP")
+    )
 }
 
 /// Hex-encode an IMAGE paint's `image.hash` (a Kiwi `byte[]`), which is the key
@@ -687,6 +760,7 @@ pub(crate) fn read_gradient(kind: &str, paint: &KiwiValue, paint_opacity: f64) -
             Some(Gradient::Radial {
                 center,
                 radius,
+                handles: gradient_axis_handles(&m),
                 stops,
             })
         }
@@ -695,6 +769,7 @@ pub(crate) fn read_gradient(kind: &str, paint: &KiwiValue, paint_opacity: f64) -
             Some(Gradient::Diamond {
                 center,
                 radius,
+                handles: gradient_axis_handles(&m),
                 stops,
             })
         }
@@ -727,6 +802,34 @@ pub(crate) fn read_gradient(kind: &str, paint: &KiwiValue, paint_opacity: f64) -
             })
         }
     }
+}
+
+/// The full-ellipse axis handles of a radial/diamond gradient — the node-local
+/// positions of gradient-space `(1, 0.5)` (radius handle) and `(0.5, 1)` (width
+/// handle) — but only when they carry information the scalar `center + radius`
+/// form loses: a rotated/skewed transform (non-zero off-diagonals) or
+/// normalized-space anisotropy (the two axis lengths differ). Returns `None`
+/// for the plain axis-aligned isotropic case, keeping the common gradient
+/// byte-identical on the wire.
+pub(crate) fn gradient_axis_handles(m: &[f64; 6]) -> Option<[[f32; 2]; 2]> {
+    let center = apply_inverse(m, 0.5, 0.5);
+    let x_end = apply_inverse(m, 1.0, 0.5);
+    let y_end = apply_inverse(m, 0.5, 1.0);
+    let x_axis = (x_end.0 - center.0, x_end.1 - center.1);
+    let y_axis = (y_end.0 - center.0, y_end.1 - center.1);
+    if !(x_end.0.is_finite() && x_end.1.is_finite() && y_end.0.is_finite() && y_end.1.is_finite()) {
+        return None;
+    }
+    let len_x = (x_axis.0 * x_axis.0 + x_axis.1 * x_axis.1).sqrt();
+    let len_y = (y_axis.0 * y_axis.0 + y_axis.1 * y_axis.1).sqrt();
+    let rotated = x_axis.1.abs() > 1e-4 || y_axis.0.abs() > 1e-4;
+    let anisotropic = (len_x - len_y).abs() > 1e-3 * len_x.max(len_y).max(1e-9);
+    (rotated || anisotropic).then(|| {
+        [
+            [x_end.0 as f32, x_end.1 as f32],
+            [y_end.0 as f32, y_end.1 as f32],
+        ]
+    })
 }
 
 /// Read a gradient paint's `stops` into doc [`GradientStop`]s, multiplying each
@@ -832,12 +935,16 @@ pub(crate) fn read_effects(change: &KiwiValue) -> Vec<Shadow> {
             .and_then(|o| o.get("y"))
             .and_then(KiwiValue::as_f64)
             .unwrap_or(0.0);
+        // Figma's default is `false` (drop shadow knocked out under the node's
+        // own — possibly translucent — body), so an absent flag reads false.
+        let show_behind_node = matches!(e.get("showShadowBehindNode"), Some(KiwiValue::Bool(true)));
         out.push(Shadow {
             kind,
             color,
             blur,
             spread,
             offset: [ox, oy],
+            show_behind_node,
         });
     }
     out

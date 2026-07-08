@@ -9,9 +9,34 @@ use crate::style::TextStyle;
 use skia_safe::{
     FontMgr, FontStyle,
     textlayout::{
-        FontCollection, ParagraphBuilder, ParagraphStyle, TextDecoration, TextStyle as SkTextStyle,
+        FontCollection, ParagraphBuilder, ParagraphStyle, PlaceholderStyle, TextDecoration,
+        TextStyle as SkTextStyle,
     },
 };
+
+/// Paragraph-level layout controls beyond wrap width + alignment — the Figma
+/// text-node properties that must be baked into the Skia `ParagraphStyle` /
+/// builder before shaping. [`Default`] is "no limits, no truncation, no
+/// indent", which reproduces [`LayoutEngine::layout_aligned`] exactly.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LayoutOptions {
+    /// Lay out at most this many lines (Figma `maxLines`); text beyond them is
+    /// dropped. `None` = unlimited.
+    pub max_lines: Option<usize>,
+    /// Truncate the last visible line with an ellipsis (`…`) when the text
+    /// exceeds [`max_lines`](Self::max_lines) (Figma `textTruncation: ENDING`).
+    /// Only meaningful together with a line limit — Skia applies the ellipsis
+    /// when lines overflow `max_lines`.
+    pub ellipsize: bool,
+    /// First-line indent of each hard-break paragraph in logical pixels
+    /// (Figma `paragraphIndent`). Realized as a zero-height inline placeholder
+    /// at every paragraph start, so the indent participates in line breaking.
+    /// NOTE: placeholders insert an object-replacement character into the Skia
+    /// paragraph's internal text, so byte-offset queries (hit-test / caret) on
+    /// an indented layout drift by 3 bytes per paragraph — acceptable for the
+    /// rare imported indent, and irrelevant to painting.
+    pub first_line_indent: f64,
+}
 
 /// Lays out [`TextBuffer`]s into [`TextLayout`]s, owning the Skia font
 /// collection so font managers are set up once and reused.
@@ -90,20 +115,76 @@ impl LayoutEngine {
     /// fact. Centering and right-alignment are relative to `max_width`, so a
     /// node whose box is wider than its text shows the text shifted accordingly.
     pub fn layout_aligned(&self, buffer: &TextBuffer, max_width: f64, align: Align) -> TextLayout {
+        self.layout_with(buffer, max_width, align, &LayoutOptions::default())
+    }
+
+    /// Lay out `buffer` like [`layout_aligned`](Self::layout_aligned), also
+    /// honoring the paragraph-level [`LayoutOptions`] — line clamp, ellipsis
+    /// truncation, and first-line paragraph indent. `LayoutOptions::default()`
+    /// reproduces `layout_aligned` exactly.
+    pub fn layout_with(
+        &self,
+        buffer: &TextBuffer,
+        max_width: f64,
+        align: Align,
+        options: &LayoutOptions,
+    ) -> TextLayout {
         let mut para_style = ParagraphStyle::new();
         para_style.set_text_align(align.to_sk());
+        if let Some(limit) = options.max_lines {
+            para_style.set_max_lines(Some(limit.max(1)));
+            if options.ellipsize {
+                para_style.set_ellipsis("…");
+            }
+        }
         let mut builder = ParagraphBuilder::new(&para_style, self.fonts.clone());
+        // The paragraph indent, as a zero-height inline box at each paragraph
+        // start (there is no first-line-indent on Skia's ParagraphStyle). Width
+        // participates in line breaking exactly like a leading glyph.
+        let indent = (options.first_line_indent > 0.0).then(|| {
+            PlaceholderStyle::new(
+                options.first_line_indent as f32,
+                0.0,
+                skia_safe::textlayout::PlaceholderAlignment::Baseline,
+                skia_safe::textlayout::TextBaseline::Alphabetic,
+                0.0,
+            )
+        });
 
         if buffer.is_empty() {
             // Push the default style so the builder is well-formed, add no text.
             let sk = self.to_sk_style(buffer.default_style());
             builder.push_style(&sk);
         } else {
+            // Whether the next added character starts a paragraph (and so gets
+            // the indent placeholder): at the very beginning and after each
+            // hard newline.
+            let mut at_paragraph_start = true;
             for run in buffer.runs() {
                 let slice = &buffer.text()[run.start..run.end];
                 let sk = self.to_sk_style(&run.style);
                 builder.push_style(&sk);
-                builder.add_text(slice);
+                match &indent {
+                    None => {
+                        builder.add_text(slice);
+                    }
+                    Some(placeholder) => {
+                        // Split the run at hard newlines so the placeholder can
+                        // be inserted at every paragraph start within it. The
+                        // newline itself is added with its piece, keeping the
+                        // paragraph's own text byte-for-byte intact.
+                        for piece in slice.split_inclusive('\n') {
+                            if at_paragraph_start && !piece.is_empty() {
+                                // Skia's addPlaceholder pushes/pops its own
+                                // internal style, so the run's pushed style
+                                // still applies to the following text.
+                                builder.add_placeholder(placeholder);
+                            }
+                            builder.add_text(piece);
+                            at_paragraph_start = piece.ends_with('\n');
+                        }
+                    }
+                }
                 builder.pop();
             }
         }
@@ -178,8 +259,29 @@ impl LayoutEngine {
 
         // `line_height` is a multiple of the font size; Skia's `set_height`
         // takes exactly that multiplier when height-override is enabled.
-        sk.set_height(style.line_height as f32);
+        // A metric-relative line height (`line_height_auto_percent`, Figma's
+        // "auto" = 100%) is a percentage of the RESOLVED FACE'S intrinsic
+        // ascent+descent+gap rather than of the em size, so it is converted to
+        // the equivalent em multiplier through the face metrics; if the face
+        // resolves no usable metrics we fall back to the scalar approximation
+        // the doc layer carries alongside it.
+        let height_multiplier = style
+            .line_height_auto_percent
+            .and_then(|percent| {
+                self.metric_relative_height(&families, font_style, style.size_px, percent)
+            })
+            .unwrap_or(style.line_height);
+        sk.set_height(height_multiplier as f32);
         sk.set_height_override(true);
+        // Figma's (post-2019) line-height model is CSS half-leading: the extra
+        // space beyond the font's intrinsic ascent+descent is split evenly
+        // above and below the glyph box. Skia's default height override instead
+        // scales ascent and descent proportionally, which pushes baselines
+        // progressively lower as the line height grows — glyphs sat visibly low
+        // inside fixed boxes compared to Figma. Line geometry (total height,
+        // wrapping) is unchanged by this; only the baseline position within
+        // each line moves.
+        sk.set_half_leading(true);
 
         let c = style.color;
         let sk_color = skia_safe::Color::from_argb(c.a, c.r, c.g, c.b);
@@ -198,6 +300,48 @@ impl LayoutEngine {
         }
 
         sk
+    }
+
+    /// The `set_height` em-multiplier realizing a METRIC-RELATIVE line height:
+    /// `percent`% of the resolved face's intrinsic line height (ascent +
+    /// descent + line gap, from the face metrics at `size_px`), expressed as a
+    /// multiple of `size_px` — i.e. Figma's `lineHeight` PERCENT units, whose
+    /// `100` is the "auto" line height. `None` when the inputs are degenerate
+    /// or no typeface resolves (the caller then falls back to the scalar
+    /// multiplier), so a missing face degrades rather than laying out at a
+    /// nonsense height.
+    ///
+    /// The typeface is looked up through the SAME font collection the paragraph
+    /// shapes with (`find_typefaces` walks asset manager → system manager in
+    /// the same order), so the metrics measured here belong to the face that
+    /// actually paints. The collection handle is cloned for the lookup because
+    /// `find_typefaces` needs `&mut` — a refcount bump, not a copy.
+    fn metric_relative_height(
+        &self,
+        families: &[String],
+        font_style: FontStyle,
+        size_px: f64,
+        percent: f64,
+    ) -> Option<f64> {
+        if size_px <= 0.0 || !size_px.is_finite() || !percent.is_finite() || percent < 0.0 {
+            return None;
+        }
+        let typeface = self
+            .fonts
+            .clone()
+            .find_typefaces(families, font_style)
+            .into_iter()
+            .next()?;
+        let font = skia_safe::Font::new(typeface, Some(size_px as f32));
+        let (_, metrics) = font.metrics();
+        // `ascent` is negative (y-up from the baseline); `leading` is the
+        // font's line gap.
+        let intrinsic =
+            f64::from(-metrics.ascent) + f64::from(metrics.descent) + f64::from(metrics.leading);
+        if !intrinsic.is_finite() || intrinsic <= 0.0 {
+            return None;
+        }
+        Some((percent / 100.0) * intrinsic / size_px)
     }
 }
 
@@ -285,6 +429,134 @@ mod tests {
         let italic = font_style_for(&TextStyle::new("Inter", 16.0).with_italic(true));
         assert_eq!(upright.slant(), Slant::Upright);
         assert_eq!(italic.slant(), Slant::Italic);
+    }
+
+    #[test]
+    fn explicit_line_height_distributes_as_half_leading() {
+        // Figma's line-height model is CSS half-leading: the extra space beyond
+        // the font's intrinsic ascent+descent splits evenly above and below the
+        // glyph box. Consequence (face-independent): growing a 20px run's line
+        // height from 2.0x (40px) to 4.0x (80px) moves the first baseline down
+        // by exactly half the added 40px — 20px. Skia's default proportional
+        // ascent/descent scaling (the old behavior) moves it by
+        // `40·ascent/(ascent+descent)` ≈ 32px for Inter, sinking glyphs low in
+        // fixed boxes. Bundled Inter keeps the numbers deterministic.
+        let engine = LayoutEngine::new();
+        let baseline_at = |line_height: f64| {
+            let mut style = TextStyle::new("Inter", 20.0);
+            style.line_height = line_height;
+            let layout = engine.layout(&TextBuffer::from_str("Hg", style), 1.0e7);
+            let lines = layout.lines();
+            assert_eq!(lines.len(), 1);
+            lines[0].baseline
+        };
+        let b2 = baseline_at(2.0);
+        let b4 = baseline_at(4.0);
+        assert!(
+            ((b4 - b2) - 20.0).abs() < 1.5,
+            "baseline must shift by half the added line height (half-leading); \
+             got Δ={:.2} (proportional scaling would give ~32)",
+            b4 - b2
+        );
+    }
+
+    #[test]
+    fn metric_relative_line_height_overrides_the_scalar() {
+        // Figma's PERCENT line height ("auto" = 100%) is metric-relative: the
+        // scalar multiplier must be IGNORED whenever the percent is present.
+        let engine = LayoutEngine::new();
+        let height_of = |scalar: f64, percent: Option<f64>| {
+            let mut style = TextStyle::new("Inter", 20.0);
+            style.line_height = scalar;
+            style.line_height_auto_percent = percent;
+            engine
+                .layout(&TextBuffer::from_str("Hg", style), 1.0e7)
+                .height()
+        };
+        let auto = height_of(1.0, Some(100.0));
+        let auto_with_wild_scalar = height_of(3.0, Some(100.0));
+        assert!(
+            (auto - auto_with_wild_scalar).abs() < 1e-6,
+            "the scalar must not leak into a metric-relative layout: {auto} vs {auto_with_wild_scalar}"
+        );
+        // 200% is (near-)exactly twice 100% — both percentages of the same
+        // intrinsic metric height. Tolerance covers Skia per-line rounding.
+        let double = height_of(1.0, Some(200.0));
+        assert!(
+            (double - 2.0 * auto).abs() < 1.5,
+            "200% must be twice 100%: {double} vs 2×{auto}"
+        );
+        // Sanity: Inter's intrinsic ascent+descent+gap is a bit over one em —
+        // the auto height is near (but not equal to) the em size, far from the
+        // 3.0-em scalar it must be overriding.
+        assert!(
+            auto >= 20.0 && auto < 20.0 * 1.5,
+            "auto line height should be ~1.2 em for Inter, got {auto}"
+        );
+    }
+
+    #[test]
+    fn layout_with_clamps_lines_and_truncates() {
+        let engine = LayoutEngine::new();
+        let buf = TextBuffer::from_str(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+            TextStyle::new("Inter", 16.0),
+        );
+        let unclamped = engine.layout(&buf, 70.0);
+        assert!(
+            unclamped.line_count() > 2,
+            "fixture must wrap past two lines, got {}",
+            unclamped.line_count()
+        );
+        let clamped = engine.layout_with(
+            &buf,
+            70.0,
+            Align::Left,
+            &LayoutOptions {
+                max_lines: Some(2),
+                ellipsize: true,
+                ..LayoutOptions::default()
+            },
+        );
+        assert_eq!(clamped.line_count(), 2, "max_lines must clamp the layout");
+        assert!(
+            clamped.height() < unclamped.height(),
+            "the clamped paragraph is shorter"
+        );
+        // Default options reproduce layout_aligned exactly.
+        let default_options =
+            engine.layout_with(&buf, 70.0, Align::Left, &LayoutOptions::default());
+        assert_eq!(default_options.line_count(), unclamped.line_count());
+        assert_eq!(default_options.height(), unclamped.height());
+    }
+
+    #[test]
+    fn first_line_indent_insets_each_paragraph_start() {
+        // The indent placeholder widens the FIRST line of every hard-break
+        // paragraph by exactly the indent (single-line paragraphs here, so
+        // every line is a first line).
+        let engine = LayoutEngine::new();
+        let buf = TextBuffer::from_str("Hello\nWorld", TextStyle::new("Inter", 16.0));
+        let plain = engine.layout(&buf, 1.0e7);
+        let indented = engine.layout_with(
+            &buf,
+            1.0e7,
+            Align::Left,
+            &LayoutOptions {
+                first_line_indent: 24.0,
+                ..LayoutOptions::default()
+            },
+        );
+        let plain_widths: Vec<f64> = plain.lines().iter().map(|line| line.width).collect();
+        let indented_widths: Vec<f64> = indented.lines().iter().map(|line| line.width).collect();
+        assert_eq!(plain_widths.len(), 2);
+        assert_eq!(indented_widths.len(), 2);
+        for (plain_width, indented_width) in plain_widths.iter().zip(&indented_widths) {
+            assert!(
+                (indented_width - plain_width - 24.0).abs() < 1.5,
+                "each paragraph's first line must widen by the indent: {plain_width} → {indented_width}"
+            );
+        }
     }
 
     #[test]

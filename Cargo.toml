@@ -82,8 +82,12 @@ members = [
     "crates/file_icons",
     "crates/fanta-doc",
     "crates/fanta-fig-interop",
+    "crates/fanta-fnx",
+    "crates/fanta-format",
+    "crates/fanta-canvas",
     "crates/fanta-render",
     "crates/fanta-text",
+    "crates/fanta-tools",
     "crates/fs",
     "crates/fs_benchmarks",
     "crates/fuzzy",
@@ -345,7 +349,11 @@ file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
 fanta-doc = { path = "crates/fanta-doc" }
 fanta-fig-interop = { path = "crates/fanta-fig-interop" }
+fanta-fnx = { path = "crates/fanta-fnx" }
+fanta-format = { path = "crates/fanta-format" }
+fanta-canvas = { path = "crates/fanta-canvas" }
 fanta-render = { path = "crates/fanta-render" }
+fanta-tools = { path = "crates/fanta-tools" }
 fanta-text = { path = "crates/fanta-text" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }

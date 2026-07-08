@@ -37,6 +37,7 @@ fn linear_gradient_fill_maps_to_fill_gradient_with_endpoints_and_stops() {
     match v.fills.first() {
         Some(Fill::Gradient {
             gradient: Gradient::Linear { start, end, stops },
+            ..
         }) => {
             // Inverse of a +90° rotation maps (0,0)→(1,0) and (1,0)→(1,1): a
             // vertical run down the right edge.
@@ -86,11 +87,17 @@ fn radial_gradient_fill_maps_to_fill_gradient_radial() {
                 Gradient::Radial {
                     center,
                     radius,
+                    handles,
                     stops,
                 },
+            ..
         }) => {
             assert!((center[0] - 0.5).abs() < 1e-3 && (center[1] - 0.5).abs() < 1e-3);
             assert!(*radius > 0.0);
+            assert_eq!(
+                *handles, None,
+                "an axis-aligned isotropic radial carries no axis handles"
+            );
             assert_eq!(stops.len(), 2);
         }
         other => panic!("expected radial gradient fill, got {other:?}"),
@@ -128,6 +135,7 @@ fn angular_gradient_fill_maps_to_fill_gradient_angular() {
     match v.fills.first() {
         Some(Fill::Gradient {
             gradient: Gradient::Angular { center, stops, .. },
+            ..
         }) => {
             assert!((center[0] - 0.5).abs() < 1e-3 && (center[1] - 0.5).abs() < 1e-3);
             assert_eq!(stops.len(), 2);
@@ -169,8 +177,10 @@ fn diamond_gradient_fill_maps_to_fill_gradient_diamond() {
                 Gradient::Diamond {
                     center,
                     radius,
+                    handles: _,
                     stops,
                 },
+            ..
         }) => {
             assert!((center[0] - 0.5).abs() < 1e-3 && (center[1] - 0.5).abs() < 1e-3);
             assert!(*radius > 0.0);
@@ -209,10 +219,70 @@ fn per_paint_opacity_multiplies_gradient_stop_alpha() {
     match v.fills.first() {
         Some(Fill::Gradient {
             gradient: Gradient::Linear { stops, .. },
+            ..
         }) => {
             // 1.0 alpha * 0.5 paint opacity ≈ 128.
             assert_eq!(stops[0].color.a, 128, "stop alpha folds in paint opacity");
         }
         other => panic!("expected gradient, got {other:?}"),
+    }
+}
+
+#[test]
+fn rotated_radial_gradient_keeps_axis_handles() {
+    // A rotated (45°) radial: the gradient transform carries off-diagonal
+    // terms, so the scalar center+radius form loses the rotation and the
+    // second-axis radius. The importer must keep the two axis-handle
+    // positions (gradient-space (1,0.5) and (0.5,1) mapped into node space).
+    // Inverse of a 45° rotation about (0.5, 0.5) — forward == inverse^T here;
+    // this matrix maps node space → gradient space.
+    let c = std::f32::consts::FRAC_1_SQRT_2;
+    let tx = 0.5 - c * 0.5 - c * 0.5;
+    let ty = 0.5 + c * 0.5 - c * 0.5;
+    let m = [c, c, tx, -c, c, ty];
+    let rect = o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 2)),
+            ("parentIndex", parent_index(0, 1)),
+            ("type", KiwiValue::Enum("RECTANGLE".to_owned())),
+            ("size", vector(100.0, 100.0)),
+            (
+                "fillPaints",
+                KiwiValue::Array(vec![gradient_paint(
+                    "GRADIENT_RADIAL",
+                    m,
+                    vec![
+                        grad_stop(0.0, 1.0, 1.0, 1.0, 1.0),
+                        grad_stop(1.0, 0.0, 0.0, 0.0, 1.0),
+                    ],
+                )]),
+            ),
+        ],
+    );
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let v = first_vector(&doc);
+    match v.fills.first() {
+        Some(Fill::Gradient {
+            gradient: Gradient::Radial {
+                center, handles, ..
+            },
+            ..
+        }) => {
+            assert!((center[0] - 0.5).abs() < 1e-3 && (center[1] - 0.5).abs() < 1e-3);
+            let [x_end, y_end] = handles.expect("rotated radial keeps handles");
+            // The primary axis points along the rotated +x direction from the
+            // center; both handles sit half a unit from the center.
+            let dx = (x_end[0] - 0.5, x_end[1] - 0.5);
+            let dy = (y_end[0] - 0.5, y_end[1] - 0.5);
+            let len = |v: (f32, f32)| (v.0 * v.0 + v.1 * v.1).sqrt();
+            assert!((len(dx) - 0.5).abs() < 1e-3, "|x axis| = 0.5, got {dx:?}");
+            assert!((len(dy) - 0.5).abs() < 1e-3, "|y axis| = 0.5, got {dy:?}");
+            assert!(
+                dx.1.abs() > 0.3,
+                "rotated x-axis has a significant y component: {dx:?}"
+            );
+        }
+        other => panic!("expected radial gradient fill, got {other:?}"),
     }
 }

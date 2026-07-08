@@ -1,7 +1,7 @@
 //! Generic typographic class — serif / sans / mono classification and the
 //! per-class substitute + system fallback chains.
 
-use super::bundled::{SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY};
+use super::bundled::{INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY};
 
 /// The broad typographic class a family belongs to, used for the generic
 /// last-resort fallback (step 5) and to pick the right Source substitute for a
@@ -96,7 +96,16 @@ impl GenericFamily {
                 "Courier New",
                 "monospace",
             ],
+            // Bundled Inter leads the sans chain: Figma substitutes MISSING
+            // fonts with Inter, so an unknown, uninstalled sans family must
+            // land on Inter (deterministic, ships with the app) rather than
+            // whatever system sans this machine happens to have. The system
+            // faces stay behind it as the safety net for platforms where the
+            // bundled registration ever fails. Installed families are
+            // unaffected (the requested name still leads the resolved list),
+            // and proprietary substitutions resolve before the generic chain.
             GenericFamily::Sans => &[
+                INTER_FAMILY,
                 "Helvetica",
                 "Arial",
                 "Segoe UI",

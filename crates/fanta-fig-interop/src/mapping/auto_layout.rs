@@ -20,7 +20,16 @@ use super::{
 /// `stackCounterAlignItems`/`stackCounterAlign`,
 /// `stackPrimarySizing`/`stackCounterSizing`, `stackWrap`, `stackReverseZIndex`.
 pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
-    let f = |name: &str| change.get(name).and_then(KiwiValue::as_f64);
+    // Non-finite stack values are Figma sentinels, not usable geometry (an
+    // "Auto" wrap gap is stored as a NaN `stackCounterSpacing`); a NaN that
+    // leaks into the solver poisons every downstream position, so numeric
+    // reads only accept finite values and fall through to their defaults.
+    let f = |name: &str| {
+        change
+            .get(name)
+            .and_then(KiwiValue::as_f64)
+            .filter(|value| value.is_finite())
+    };
 
     let primary_align = map_primary_align(
         change
@@ -56,10 +65,20 @@ pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
         _ => return None,
     };
 
+    // Figma's "Auto" gap between wrapped rows/columns is encoded as a NaN
+    // `stackCounterSpacing` (the finite filter above already rejected it);
+    // it means "distribute the lines across the counter extent", not a gap
+    // of zero, so it maps to the explicit auto flag.
+    let counter_auto_spacing = change
+        .get("stackCounterSpacing")
+        .and_then(KiwiValue::as_f64)
+        .is_some_and(f64::is_nan);
+
     Some(AutoLayout {
         mode,
         spacing: f("stackSpacing").unwrap_or(0.0),
         counter_spacing: f("stackCounterSpacing").unwrap_or(0.0),
+        counter_auto_spacing,
         padding,
         primary_align,
         counter_align,

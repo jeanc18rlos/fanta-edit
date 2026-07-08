@@ -2,12 +2,13 @@
 //! Fantaisa [`CanvasNode`], and tally element-fidelity counters off the result.
 
 use super::{
-    AxisSizing, BlendMode, CanvasNode, ComponentId, GroupNode, IndexKey, InstanceNode, KiwiValue,
-    LayoutMode, MapReport, MaskType, NodeData, NodeFlags, PathData, StrokeCap, StrokeJoin,
-    TextAutoResize, VectorNode, arc_ellipse_path, blend_mode, build_stroke, build_text,
-    build_vector, corner_radii, first_fill, group_with_optional_clip, guid_key,
-    has_independent_corners, make_shape, read_auto_layout, read_blurs, read_effects, read_fills,
-    read_layout_child, read_mask, read_paint, read_size, read_transform, text_case_of,
+    AxisSizing, BlendMode, CanvasNode, ComponentId, Fill, GroupNode, IndexKey, InstanceNode,
+    KiwiValue, LayoutMode, MapReport, MaskType, NodeData, NodeFlags, PathData, StrokeCap,
+    StrokeJoin, TextAutoResize, VectorNode, arc_ellipse_path, blend_mode, build_stroke, build_text,
+    build_vector, corner_radii, corner_smoothing, first_fill, group_with_optional_clip, guid_key,
+    has_independent_corners, make_shape, read_auto_layout, read_blurs, read_color_with_opacity,
+    read_effects, read_fills, read_layout_child, read_mask, read_paint, read_size, read_transform,
+    text_case_of,
 };
 
 /// The outcome of trying to turn a Figma node change into a Fantaisa node.
@@ -40,9 +41,12 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
 
     let data = match type_name {
         "GROUP" => NodeData::Group(GroupNode::default()),
+        // A page's canvas color lives in CANVAS.backgroundColor (+ opacity +
+        // enabled), NOT in the paint arrays — read it first and fall back to
+        // any background paints for older exports.
         "CANVAS" => NodeData::Group(GroupNode {
             clip_size: None,
-            background: first,
+            background: canvas_background(change).or(first),
             background_fills: fills.iter().skip(1).cloned().collect(),
             explicit_modes: Default::default(),
             // Set after construction in `build_node` (a page is never auto-layout).
@@ -70,7 +74,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
                 strokes: build_stroke(change).into_iter().collect(),
                 corner_radius: uniform,
                 corner_radii: per_corner,
-                corner_smoothing: 0.0,
+                corner_smoothing: corner_smoothing(change),
             })
         }
         // A SECTION is Figma's organizational container: it paints a background
@@ -91,7 +95,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
                 strokes: build_stroke(change).into_iter().collect(),
                 corner_radius: uniform,
                 corner_radii: per_corner,
-                corner_smoothing: 0.0,
+                corner_smoothing: corner_smoothing(change),
             })
         }
         // A SYMBOL (main component) or COMPONENT/COMPONENT_SET master is an
@@ -149,6 +153,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
                 strokes: build_stroke(change).into_iter().collect(),
                 corner_radius: None,
                 corner_radii: None,
+                corner_smoothing: 0.0,
             })
         }
         // VECTOR-family geometry. STEP 2: decode the real path from the node's
@@ -220,6 +225,25 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
     }
 }
 
+/// A CANVAS page's editor canvas color: `backgroundColor` × `backgroundOpacity`
+/// (Figma writes these on every modern page), honoring `backgroundEnabled`
+/// (absent ⇒ enabled). `None` when the fields are missing — the caller then
+/// falls back to the paint arrays (older exports) or no background.
+pub(crate) fn canvas_background(change: &KiwiValue) -> Option<Fill> {
+    if matches!(
+        change.get("backgroundEnabled"),
+        Some(KiwiValue::Bool(false))
+    ) {
+        return None;
+    }
+    let color = change.get("backgroundColor")?;
+    let opacity = change
+        .get("backgroundOpacity")
+        .and_then(KiwiValue::as_f64)
+        .unwrap_or(1.0);
+    read_color_with_opacity(color, opacity).map(Fill::solid)
+}
+
 /// Whether a FRAME/SECTION-style container clips its content to its box (Figma's
 /// "Clip content" toggle). Figma stores the toggle as the boolean
 /// `frameMaskDisabled` on the NodeChange: `true` means clip is OFF, while an
@@ -253,6 +277,17 @@ pub(crate) fn apply_node_visual_props(node: &mut CanvasNode, change: &KiwiValue)
         .and_then(blend_mode)
     {
         node.blend_mode = bm;
+    }
+    // A container whose blend is EXPLICITLY `NORMAL` (vs the absent default,
+    // `PASS_THROUGH`) isolates its subtree: descendants' blend modes composite
+    // against the flattened group only, never leaking to the backdrop behind
+    // it. Both members map to `BlendMode::Normal` for painting; the isolation
+    // itself is the `ISOLATED_BLEND` flag. Leaf nodes paint atomically, so the
+    // distinction only matters for nodes that own (real or virtual) children.
+    if matches!(node.data, NodeData::Group(_) | NodeData::Instance(_))
+        && change.get("blendMode").and_then(KiwiValue::as_str) == Some("NORMAL")
+    {
+        node.flags |= NodeFlags::ISOLATED_BLEND;
     }
     node.effects = read_effects(change).into_iter().collect();
     node.blurs = read_blurs(change).into_iter().collect();

@@ -428,10 +428,14 @@ fn vector_image_fill_paints_the_image_clipped_to_the_path() {
             mode: ImageFitMode::Fill,
             opacity: 1.0,
             crop: None,
+            scale: None,
+            rotation: None,
+            blend: fanta_doc::BlendMode::Normal,
         }),
         strokes: Default::default(),
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(node)).unwrap();
 
@@ -468,10 +472,14 @@ fn vector_image_fill_missing_asset_shows_placeholder_paint() {
             mode: ImageFitMode::Fill,
             opacity: 1.0,
             crop: None,
+            scale: None,
+            rotation: None,
+            blend: fanta_doc::BlendMode::Normal,
         }),
         strokes: Default::default(),
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(node)).unwrap();
 

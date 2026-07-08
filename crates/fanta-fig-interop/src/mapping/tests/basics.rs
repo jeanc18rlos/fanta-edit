@@ -411,6 +411,9 @@ fn text_vertical_align_maps_center_and_bottom() {
 
 #[test]
 fn text_line_height_and_letter_spacing_units_are_converted() {
+    // Kiwi PERCENT line height is percent of the font's INTRINSIC line height
+    // (100 = Figma "auto"), NOT of the font size — so 150% must land in the
+    // metric-relative field with a 1.2×-based scalar approximation, not 1.5.
     let fig = doc_from(vec![o(
         "NodeChange",
         vec![
@@ -426,7 +429,8 @@ fn text_line_height_and_letter_spacing_units_are_converted() {
     let (doc, _, _) = fig_to_doc(&fig).unwrap();
     match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
         NodeData::Text(t) => {
-            assert_eq!(t.style.line_height, 1.5);
+            assert_eq!(t.style.line_height_auto_percent, Some(150.0));
+            assert!((t.style.line_height - 1.8).abs() < 1e-6);
             assert_eq!(t.style.letter_spacing, 2.0);
         }
         other => panic!("expected text, got {other:?}"),
@@ -582,4 +586,187 @@ fn built_node_meta_carries_figma_id_in_sid_lid_form() {
         Some("RECTANGLE"),
         "figma_type must be preserved alongside figma_id"
     );
+}
+
+#[test]
+fn canvas_background_color_fields_import_as_page_background() {
+    // Figma stores each page's canvas color on the CANVAS NodeChange itself
+    // (backgroundColor / backgroundOpacity / backgroundEnabled), not in the
+    // paint arrays. #1E1E1E at full opacity — the dark default of new files.
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("CANVAS".to_owned())),
+            ("name", KiwiValue::String("Page 1".to_owned())),
+            (
+                "backgroundColor",
+                color(0.11764706, 0.11764706, 0.11764706, 1.0),
+            ),
+            ("backgroundOpacity", KiwiValue::Float(1.0)),
+            ("backgroundEnabled", KiwiValue::Bool(true)),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let page = doc.scene.get(doc.scene.roots()[0]).unwrap();
+    match &page.data {
+        NodeData::Group(g) => {
+            assert_eq!(
+                g.background,
+                Some(Fill::solid(Color::rgb(0x1E, 0x1E, 0x1E))),
+                "canvas backgroundColor lands in the page background"
+            );
+        }
+        other => panic!("expected group page, got {other:?}"),
+    }
+    // The public helper surfaces the same imported color (no name heuristics).
+    assert_eq!(
+        crate::canvas::figma_page_canvas_color(&doc, doc.scene.roots()[0]),
+        Some(Color::rgb(0x1E, 0x1E, 0x1E))
+    );
+}
+
+#[test]
+fn canvas_background_disabled_or_absent_yields_no_background() {
+    // backgroundEnabled: false ⇒ no background; and a canvas with no
+    // background fields at all imports without one (no name-based guessing).
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("CANVAS".to_owned())),
+                ("name", KiwiValue::String("Disabled".to_owned())),
+                ("backgroundColor", color(1.0, 0.0, 0.0, 1.0)),
+                ("backgroundEnabled", KiwiValue::Bool(false)),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("type", KiwiValue::Enum("CANVAS".to_owned())),
+                // The old importer inferred a backdrop from this Spectrum page
+                // name; the real signal is only ever the background fields.
+                ("name", KiwiValue::String("↳  🌙  Darkest Theme".to_owned())),
+            ],
+        ),
+    ]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    for root in doc.scene.roots() {
+        let page = doc.scene.get(*root).unwrap();
+        match &page.data {
+            NodeData::Group(g) => assert_eq!(
+                g.background, None,
+                "page {:?} must not synthesize a background",
+                page.name
+            ),
+            other => panic!("expected group page, got {other:?}"),
+        }
+        assert_eq!(crate::canvas::figma_page_canvas_color(&doc, *root), None);
+    }
+}
+
+#[test]
+fn explicit_normal_blend_on_container_sets_isolated_blend_flag() {
+    // A container whose blendMode is EXPLICITLY `NORMAL` isolates its subtree
+    // (Figma's non-pass-through group blend); an absent blendMode (the
+    // PASS_THROUGH default) must NOT set the flag. Leaf shapes never isolate.
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("FRAME".to_owned())),
+                ("name", KiwiValue::String("Isolated".to_owned())),
+                ("size", vector(10.0, 10.0)),
+                ("blendMode", KiwiValue::Enum("NORMAL".to_owned())),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("type", KiwiValue::Enum("FRAME".to_owned())),
+                ("name", KiwiValue::String("PassThrough".to_owned())),
+                ("size", vector(10.0, 10.0)),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 3)),
+                ("type", KiwiValue::Enum("RECTANGLE".to_owned())),
+                ("name", KiwiValue::String("Leaf".to_owned())),
+                ("size", vector(10.0, 10.0)),
+                ("blendMode", KiwiValue::Enum("NORMAL".to_owned())),
+            ],
+        ),
+    ]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let flag_of = |name: &str| {
+        doc.scene
+            .roots()
+            .iter()
+            .map(|id| doc.scene.get(*id).unwrap())
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("node {name} present"))
+            .flags
+            .contains(NodeFlags::ISOLATED_BLEND)
+    };
+    assert!(flag_of("Isolated"), "explicit NORMAL container isolates");
+    assert!(!flag_of("PassThrough"), "absent blend stays pass-through");
+    assert!(!flag_of("Leaf"), "a leaf shape never sets the flag");
+}
+
+#[test]
+fn corner_smoothing_imports_on_frames_and_rectangles() {
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("FRAME".to_owned())),
+                ("name", KiwiValue::String("Squircle frame".to_owned())),
+                ("size", vector(100.0, 100.0)),
+                ("cornerRadius", KiwiValue::Float(20.0)),
+                ("cornerSmoothing", KiwiValue::Float(0.6)),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("type", KiwiValue::Enum("ROUNDED_RECTANGLE".to_owned())),
+                ("name", KiwiValue::String("Squircle rect".to_owned())),
+                ("size", vector(40.0, 40.0)),
+                ("cornerRadius", KiwiValue::Float(8.0)),
+                ("cornerSmoothing", KiwiValue::Float(0.6)),
+            ],
+        ),
+    ]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let by_name = |name: &str| {
+        doc.scene
+            .roots()
+            .iter()
+            .map(|id| doc.scene.get(*id).unwrap())
+            .find(|n| n.name == name)
+            .unwrap_or_else(|| panic!("node {name} present"))
+            .clone()
+    };
+    match &by_name("Squircle frame").data {
+        NodeData::Group(g) => {
+            assert!((g.corner_smoothing - 0.6).abs() < 1e-6);
+            assert_eq!(g.corner_radius, Some(20.0));
+        }
+        other => panic!("expected group, got {other:?}"),
+    }
+    match &by_name("Squircle rect").data {
+        NodeData::Vector(v) => {
+            assert!((v.corner_smoothing - 0.6).abs() < 1e-6);
+            assert_eq!(v.corner_radius, Some(8.0));
+        }
+        other => panic!("expected vector, got {other:?}"),
+    }
 }

@@ -84,6 +84,15 @@ pub struct TextStyle {
     /// multiplier rather than an absolute value so it scales correctly when the
     /// font size changes — the standard CSS `line-height` unitless behavior.
     pub line_height: f64,
+    /// Metric-relative line height: `Some(p)` means the line height is `p`
+    /// percent of the FONT'S INTRINSIC line height (ascent + descent + line
+    /// gap from the resolved face's metrics), not of `size_px`. Figma's "auto"
+    /// line height is exactly `Some(100.0)`. When present this takes
+    /// precedence over the scalar [`line_height`](Self::line_height), which
+    /// then only serves as a fallback for faces whose metrics cannot be
+    /// resolved. `None` (the default) keeps the scalar behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height_auto_percent: Option<f64>,
 }
 
 impl TextStyle {
@@ -168,6 +177,7 @@ impl Default for TextStyle {
             color: Color::BLACK,
             letter_spacing: 0.0,
             line_height: 1.2,
+            line_height_auto_percent: None,
         }
     }
 }
@@ -199,6 +209,7 @@ mod tests {
         assert_eq!(s.color, Color::BLACK);
         assert_eq!(s.letter_spacing, 0.0);
         assert_eq!(s.line_height, 1.2);
+        assert_eq!(s.line_height_auto_percent, None);
         assert!(!s.is_bold());
     }
 

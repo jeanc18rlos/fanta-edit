@@ -9,12 +9,32 @@
 
 use crate::asset::DecodedImage;
 use crate::color::to_sk_color;
-use fanta_doc::{AssetId, Color, ImageFitMode};
+use crate::paint::to_sk_blend_mode;
+use fanta_doc::{AssetId, BlendMode, Color, ImageFitMode};
 use skia_safe::{
-    AlphaType, Canvas, ColorType, Data, FilterMode, ImageInfo, Matrix, Paint, Rect,
+    AlphaType, Canvas, ColorType, Data, FilterMode, ImageInfo, Matrix, MipmapMode, Paint, Rect,
     SamplingOptions, TileMode, canvas::SrcRectConstraint, images,
 };
 use std::collections::HashMap;
+
+/// The per-paint modifiers a [`Fill::Image`](fanta_doc::Fill::Image) carries
+/// beyond fit/crop/tint — bundled so the image-draw entry points don't grow an
+/// argument per Figma paint field. [`Default`] (no scale, no rotation, normal
+/// blend) reproduces the plain draw exactly, and is what non-fill callers
+/// (bitmap nodes, video posters) pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ImageFillMods {
+    /// Tile scaling factor for [`ImageFitMode::Tile`] (Figma
+    /// `ImagePaint.scalingFactor`): each tile paints at `natural × scale`.
+    /// `None` ⇒ native size. Ignored for non-tile modes.
+    pub scale: Option<f32>,
+    /// Clockwise rotation of the image within the fill, in degrees (Figma
+    /// exposes 90° steps; the draw snaps to the nearest quarter turn).
+    pub rotation: Option<f32>,
+    /// Blend mode of this paint against the paints below it / the backdrop
+    /// (Figma's per-paint `blendMode`, distinct from the node-level blend).
+    pub blend: BlendMode,
+}
 
 /// Caches uploaded [`skia_safe::Image`]s keyed by [`AssetId`].
 ///
@@ -239,14 +259,35 @@ fn build_sk_image(img: &DecodedImage) -> Option<skia_safe::Image> {
     // constructor, so zero-copy sharing of the resolver's Arc would be unsafe
     // against Skia-internal refs outliving the cache entry.
     let data = Data::new_copy(&img.pixels_rgba);
-    images::raster_from_data(&info, data, row_bytes)
+    let image = images::raster_from_data(&info, data, row_bytes)?;
+    // Attach the default mip chain so a zoomed-out draw can sample trilinearly
+    // (see `blit_sk_image`) instead of aliasing over the full-res pixels. Built
+    // once here because the image is cached; ~1/3 extra memory per image. If
+    // Skia declines (`None`), the un-mipped image still draws — the minified
+    // path checks `has_mipmaps` before asking for mip sampling.
+    let mipped = image.with_default_mipmaps();
+    Some(mipped.unwrap_or(image))
+}
+
+/// The largest scale factor the canvas CTM applies to a local unit vector —
+/// how many device pixels one local pixel spans. Used to detect minification
+/// (`< 1.0`: the image is drawn smaller than its pixels). A degenerate matrix
+/// yields `NaN`, which fails every `< 1.0` test — safely selecting the
+/// non-mipmapped path.
+fn max_device_scale(canvas: &Canvas) -> f32 {
+    let m = canvas.local_to_device_as_3x3();
+    let x = (m.scale_x() * m.scale_x() + m.skew_y() * m.skew_y()).sqrt();
+    let y = (m.skew_x() * m.skew_x() + m.scale_y() * m.scale_y()).sqrt();
+    x.max(y)
 }
 
 /// Optional multiplicative tint as a Skia paint configured with a `Multiply`
 /// colour filter. `None` tint → a plain paint. Multiply means a white tint is a
 /// no-op and a coloured tint darkens the channels it lacks — the documented
 /// overlay semantics, applied at composite time rather than by mutating pixels.
-fn tinted_paint(tint: Option<Color>, opacity: f32) -> Paint {
+/// The per-paint `blend` (Figma's paint-level blend mode) rides on the same
+/// paint so the image composites against whatever is below it with that mode.
+fn tinted_paint(tint: Option<Color>, opacity: f32, blend: BlendMode) -> Paint {
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
     paint.set_alpha_f(opacity.clamp(0.0, 1.0));
@@ -257,6 +298,9 @@ fn tinted_paint(tint: Option<Color>, opacity: f32) -> Paint {
             paint.set_color_filter(cf);
         }
     }
+    if !blend.is_normal() {
+        paint.set_blend_mode(to_sk_blend_mode(blend));
+    }
     paint
 }
 
@@ -264,9 +308,10 @@ fn tinted_paint(tint: Option<Color>, opacity: f32) -> Paint {
 /// `fit`, `crop`, and `tint`. Returns `true` if it drew the real image, `false`
 /// if the image could not be built (caller draws the placeholder).
 ///
-/// Linear sampling is used so a scaled photo is smooth rather than blocky; this
-/// matches what a designer expects from "the actual photo," and is cheap on the
-/// CPU surface.
+/// A whole-image draw that lands SMALLER than its pixels (zoomed out) samples
+/// trilinearly through the image's mip chain so it averages instead of
+/// aliasing; magnified and cropped draws keep Skia's strict-constraint
+/// sampling (see `blit_sk_image`).
 pub fn draw_decoded_image(
     canvas: &Canvas,
     img: &DecodedImage,
@@ -280,7 +325,16 @@ pub fn draw_decoded_image(
         return false;
     };
     blit_sk_image(
-        canvas, &sk_image, img.width, img.height, local_size, crop, fit, tint, opacity,
+        canvas,
+        &sk_image,
+        img.width,
+        img.height,
+        local_size,
+        crop,
+        fit,
+        tint,
+        opacity,
+        ImageFillMods::default(),
     )
 }
 
@@ -309,6 +363,7 @@ pub fn draw_image_cached(
     fit: ImageFitMode,
     tint: Option<Color>,
     opacity: f32,
+    mods: ImageFillMods,
 ) -> bool {
     // Clone the handle out so the cache borrow ends before we draw.
     // `skia_safe::Image` is a refcounted handle (an `SkImage` smart pointer),
@@ -329,7 +384,7 @@ pub fn draw_image_cached(
     // natural size — the crop math needs no DecodedImage on the hit path.
     let (nat_w, nat_h) = (sk_image.width() as u32, sk_image.height() as u32);
     blit_sk_image(
-        canvas, &sk_image, nat_w, nat_h, local_size, crop, fit, tint, opacity,
+        canvas, &sk_image, nat_w, nat_h, local_size, crop, fit, tint, opacity, mods,
     )
 }
 
@@ -340,6 +395,11 @@ pub fn draw_image_cached(
 ///
 /// Factored out of [`draw_decoded_image`] so the cached and uncached entry
 /// points share one body and cannot drift apart.
+///
+/// A quarter-turn `mods.rotation` (Figma rotates image fills in 90° steps) is
+/// realized here as a canvas rotation mapping the rotated frame onto the dst
+/// rect — the fit then runs against the frame's SWAPPED dimensions for 90/270°
+/// so cover/contain crops exactly like Figma's rotated fill.
 #[allow(clippy::too_many_arguments)]
 fn blit_sk_image(
     canvas: &Canvas,
@@ -351,7 +411,53 @@ fn blit_sk_image(
     fit: ImageFitMode,
     tint: Option<Color>,
     opacity: f32,
+    mods: ImageFillMods,
 ) -> bool {
+    let quarter = quarter_turns(mods.rotation);
+    if quarter != 0 {
+        let (w, h) = (local_size[0] as f32, local_size[1] as f32);
+        canvas.save();
+        // Map the rotated drawing frame onto [0, 0, w, h]: rotate clockwise
+        // (y-down), then translate the rotated frame's origin back into the
+        // rect. 90°/270° swap the frame's width and height.
+        match quarter {
+            1 => {
+                canvas.translate((w, 0.0));
+                canvas.rotate(90.0, None);
+            }
+            2 => {
+                canvas.translate((w, h));
+                canvas.rotate(180.0, None);
+            }
+            _ => {
+                canvas.translate((0.0, h));
+                canvas.rotate(270.0, None);
+            }
+        }
+        let rotated_size = if quarter % 2 == 1 {
+            [local_size[1], local_size[0]]
+        } else {
+            local_size
+        };
+        let drawn = blit_sk_image(
+            canvas,
+            sk_image,
+            nat_w,
+            nat_h,
+            rotated_size,
+            crop,
+            fit,
+            tint,
+            opacity,
+            ImageFillMods {
+                rotation: None,
+                ..mods
+            },
+        );
+        canvas.restore();
+        return drawn;
+    }
+
     let dst_w = local_size[0] as f32;
     let dst_h = local_size[1] as f32;
     if dst_w <= 0.0 || dst_h <= 0.0 {
@@ -363,10 +469,18 @@ fn blit_sk_image(
 
     // Crop first (asset pixels), then fit the cropped region into the rect.
     let [crop_x, crop_y, crop_w, crop_h] = crop_to_pixels(crop, nat_w as f32, nat_h as f32);
-    let paint = tinted_paint(tint, opacity);
-    let sampling = SamplingOptions::from(FilterMode::Linear);
+    let paint = tinted_paint(tint, opacity, mods.blend);
 
     if fit == ImageFitMode::Tile {
+        // Trilinear when the CTM minifies the native-size tiles (zoomed out),
+        // so a repeated texture doesn't shimmer; the plain linear tile
+        // sampling is kept at magnification, where mip level 0 is all a
+        // trilinear lookup would read anyway.
+        let sampling = if sk_image.has_mipmaps() && max_device_scale(canvas) < 1.0 {
+            SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear)
+        } else {
+            SamplingOptions::from(FilterMode::Linear)
+        };
         draw_tiled(
             canvas,
             sk_image,
@@ -374,6 +488,7 @@ fn blit_sk_image(
             [dst_w, dst_h],
             sampling,
             &paint,
+            mods.scale,
         );
         return true;
     }
@@ -386,6 +501,36 @@ fn blit_sk_image(
         rects.src[3],
     );
     let dst = Rect::from_xywh(rects.dst[0], rects.dst[1], rects.dst[2], rects.dst[3]);
+
+    // The effective image→device scale: the CTM's span of a local unit times
+    // the dst/src stretch of this blit.
+    let stretch = if rects.src[2] > 0.0 && rects.src[3] > 0.0 {
+        (rects.dst[2] / rects.src[2]).max(rects.dst[3] / rects.src[3])
+    } else {
+        1.0
+    };
+    let device_scale = max_device_scale(canvas) * stretch;
+    // Whether this draw samples the ENTIRE image (no crop, no cover
+    // centre-crop). Exact float compares are fine: the whole-image case is
+    // produced by identity arithmetic in `crop_to_pixels`/`fit_src_dst`, and a
+    // false negative merely keeps the conservative path.
+    let src_is_whole_image = src == Rect::from_wh(nat_w as f32, nat_h as f32);
+
+    if src_is_whole_image && sk_image.has_mipmaps() && device_scale < 1.0 {
+        // Minified whole-image draw: sample trilinearly so a zoomed-out photo
+        // averages its pixels instead of aliasing. Skia's raster pipeline
+        // ignores mip levels under a Strict constraint (verified empirically),
+        // and Fast is only safe when there is no sub-rect to bleed across —
+        // which is exactly this whole-image case (the image edge clamps).
+        canvas.draw_image_rect_with_sampling_options(
+            sk_image,
+            Some((&src, SrcRectConstraint::Fast)),
+            dst,
+            SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear),
+            &paint,
+        );
+        return true;
+    }
     // Strict constraint keeps Fill's centre-crop from bleeding neighbouring
     // texels at the cropped edge.
     canvas.draw_image_rect(
@@ -397,8 +542,22 @@ fn blit_sk_image(
     true
 }
 
-/// Tile the (cropped) image across the local rect at native pixel size via a
-/// repeating shader. The image's own pixels start at the rect origin and repeat
+/// Snap an optional rotation (degrees clockwise) to whole quarter turns in
+/// `0..=3`. Figma authors image-fill rotation in 90° steps; snapping keeps a
+/// slightly-off import faithful and a `None`/0° fill on the untouched path.
+fn quarter_turns(rotation: Option<f32>) -> i32 {
+    let Some(deg) = rotation else {
+        return 0;
+    };
+    if !deg.is_finite() {
+        return 0;
+    }
+    ((deg / 90.0).round() as i32).rem_euclid(4)
+}
+
+/// Tile the (cropped) image across the local rect via a repeating shader, each
+/// tile at `natural × scale` pixels (`None` scale = native size — Figma's
+/// `scalingFactor`). The image's own pixels start at the rect origin and repeat
 /// in both axes; the draw is clipped to the local rect.
 fn draw_tiled(
     canvas: &Canvas,
@@ -407,11 +566,15 @@ fn draw_tiled(
     dst: [f32; 2],
     sampling: SamplingOptions,
     base_paint: &Paint,
+    scale: Option<f32>,
 ) {
     let [cx, cy, cw, ch] = crop_px;
     // A local matrix translates the shader so the cropped region's top-left
-    // lands at the rect origin; TileMode::Repeat handles the wrap.
-    let local = Matrix::translate((-cx, -cy));
+    // lands at the rect origin, scaled so one tile spans `natural × scale`;
+    // TileMode::Repeat handles the wrap. Degenerate scales fall back to 1.0.
+    let tile_scale = scale.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(1.0);
+    let mut local = Matrix::scale((tile_scale, tile_scale));
+    local.pre_translate((-cx, -cy));
     let shader = sk_image.to_shader((TileMode::Repeat, TileMode::Repeat), sampling, &local);
     let mut paint = base_paint.clone();
     if let Some(shader) = shader {
@@ -533,6 +696,62 @@ mod tests {
         assert!(cache.get(a).is_some(), "referenced image survives");
         assert!(cache.get(b).is_none(), "orphaned image is gone");
         assert_eq!(cache.retain(&keep), 0, "idempotent");
+    }
+
+    #[test]
+    fn cached_image_carries_mipmaps_for_minified_sampling() {
+        let mut cache = ImageCache::new();
+        let id = AssetId::new();
+        let img = solid_image(4, 4, [10, 20, 30, 255]);
+        let has_mips = cache
+            .get_or_build(id, &img)
+            .expect("well-formed builds")
+            .has_mipmaps();
+        assert!(has_mips, "the cache should attach a default mip chain");
+    }
+
+    #[test]
+    fn minified_whole_image_draw_samples_through_the_mip_chain() {
+        // 64x64 checker of 2px black/white squares: a trilinear lookup at ~1/9
+        // scale reads a deep mip level, which has averaged to uniform mid-gray;
+        // base-level sampling would keep near-pure black/white pixels (the
+        // aliasing this path exists to remove).
+        let size = 64u32;
+        let mut px = Vec::with_capacity((size * size * 4) as usize);
+        for y in 0..size {
+            for x in 0..size {
+                let on = ((x / 2) + (y / 2)) % 2 == 0;
+                let v = if on { 255 } else { 0 };
+                px.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let img = DecodedImage::new(Arc::new(px), size, size);
+
+        let dst = 7;
+        let mut surface = skia_safe::surfaces::raster_n32_premul((dst, dst)).expect("surface");
+        let canvas = surface.canvas();
+        canvas.scale((dst as f32 / size as f32, dst as f32 / size as f32));
+        assert!(draw_decoded_image(
+            canvas,
+            &img,
+            [size as f64, size as f64],
+            None,
+            ImageFitMode::Stretch,
+            None,
+            1.0,
+        ));
+
+        let info = ImageInfo::new((dst, dst), ColorType::RGBA8888, AlphaType::Unpremul, None);
+        let row_bytes = info.min_row_bytes();
+        let mut buf = vec![0u8; row_bytes * dst as usize];
+        assert!(surface.read_pixels(&info, &mut buf, row_bytes, (0, 0)));
+        for i in 0..(dst * dst) as usize {
+            let r = buf[i * 4];
+            assert!(
+                (64..=192).contains(&r),
+                "pixel {i} should be an averaged mid-gray, got {r}"
+            );
+        }
     }
 
     #[test]

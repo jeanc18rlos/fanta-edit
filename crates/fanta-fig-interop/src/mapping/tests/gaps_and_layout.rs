@@ -291,8 +291,11 @@ fn gap_c_default_cap_join_no_dash_not_counted() {
 }
 
 #[test]
-fn gap_c_stroke_miter_angle_maps_to_miter_limit() {
-    // strokeMiterAngle = 60° → miter_limit = 1 / sin(30°) = 2.0.
+fn gap_c_miter_limit_field_maps_to_miter_limit() {
+    // The real Kiwi field is `NodeChange.miterLimit`, already an SVG-style
+    // ratio (e.g. 16 on the Spectrum "Tab Unit" frames) — NOT the fictional
+    // `strokeMiterAngle` an earlier version read (that name never occurs in
+    // real files, so authored miter limits were silently ignored).
     let rect = o(
         "NodeChange",
         vec![
@@ -305,14 +308,14 @@ fn gap_c_stroke_miter_angle_maps_to_miter_limit() {
                 KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(2.0)),
-            ("strokeMiterAngle", KiwiValue::Float(60.0)),
+            ("miterLimit", KiwiValue::Float(16.0)),
         ],
     );
     let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
     let v = first_vector(&doc);
     assert!(
-        (v.strokes[0].miter_limit - 2.0).abs() < 1e-6,
-        "1/sin(30deg) = 2.0"
+        (v.strokes[0].miter_limit - 16.0).abs() < 1e-6,
+        "miterLimit is used as the ratio it already is"
     );
 }
 
@@ -587,6 +590,41 @@ fn imports_horizontal_auto_layout_frame_with_padding_align_sizing() {
     assert_eq!(report.auto_layout_horizontal, 1);
     assert_eq!(report.auto_layout_counter_hug, 1);
     assert_eq!(report.auto_layout_primary_hug, 0);
+}
+
+#[test]
+fn nan_counter_spacing_imports_as_auto_gap() {
+    // Figma encodes a wrap frame's "Auto" counter gap as a literal NaN
+    // `stackCounterSpacing` (UI3 kit icon grids). It must import as the
+    // explicit auto flag with a finite 0 spacing — a raw NaN reaching the
+    // layout solver poisons every wrapped row's position and the hugged frame
+    // height, which made whole icon grids vanish.
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("FRAME".to_owned())),
+            ("name", KiwiValue::String("Icon Grid".to_owned())),
+            ("size", vector(928.0, 5728.0)),
+            ("stackMode", KiwiValue::Enum("HORIZONTAL".to_owned())),
+            ("stackSpacing", KiwiValue::Float(32.0)),
+            ("stackCounterSpacing", KiwiValue::Float(f32::NAN)),
+            ("stackWrap", KiwiValue::Enum("WRAP".to_owned())),
+            ("stackPrimarySizing", KiwiValue::Enum("FIXED".to_owned())),
+            (
+                "stackCounterSizing",
+                KiwiValue::Enum("RESIZE_TO_FIT_WITH_IMPLICIT_SIZE".to_owned()),
+            ),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let al = group_named(&doc, "Icon Grid")
+        .auto_layout
+        .expect("AutoLayout");
+    assert!(al.wrap);
+    assert!(al.counter_auto_spacing, "NaN counter gap means Auto");
+    assert_eq!(al.counter_spacing, 0.0, "no NaN may survive the import");
+    assert_eq!(al.spacing, 32.0);
 }
 
 #[test]

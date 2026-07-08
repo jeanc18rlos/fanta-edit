@@ -21,6 +21,7 @@ fn rounded_per_side_doc(align: fanta_doc::StrokeAlign, radius: f64) -> Doc {
         strokes,
         corner_radius: Some(radius),
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     doc
@@ -107,5 +108,55 @@ fn center_per_side_border_rounds_its_outer_corner() {
     assert!(
         mid_top[2] > 200 && mid_top[3] > 200,
         "center border straight outer edge must still paint blue, got {mid_top:?}"
+    );
+}
+
+#[test]
+fn single_side_border_follows_the_corner_arc() {
+    // Figma paints a single-side border through its half of each adjacent
+    // corner arc (split at the arc's angular midpoint). The old axis-aligned
+    // band faded out where the arc curved away from the edge, so thin
+    // bottom-only dividers on rounded frames lost their corners.
+    let mut stroke = fanta_doc::Stroke::solid(Color::rgb(0, 0, 255), 1.0);
+    stroke.align = fanta_doc::StrokeAlign::Inside;
+    stroke.per_side = Some([0.0, 0.0, 2.0, 0.0]); // bottom only, 2px
+    let mut strokes = smallvec::SmallVec::new();
+    strokes.push(stroke);
+    let mut doc = Doc::new();
+    let n = CanvasNode::new(NodeData::Vector(VectorNode {
+        path: fanta_doc::PathData::rect(-24.0, -24.0, 48.0, 48.0),
+        fills: smallvec_of(Fill::solid(Color::rgb(0, 200, 0))),
+        strokes,
+        corner_radius: Some(16.0),
+        corner_radii: None,
+        corner_smoothing: 0.0,
+    }));
+    doc.apply(Operation::create_node(n)).unwrap();
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let buf = r.copy_rgba();
+
+    // Box is screen (8,8)..(56,56); bottom-left arc pivot is screen (24,40),
+    // radius 16. A point on the arc's inner band at 120° from the +x axis
+    // (inside the bottom side's half of the arc, past the 135° midpoint's
+    // side): (24 - 15·cos60°, 40 + 15·sin60°) ≈ (16.5, 53.0). That's ABOVE the
+    // old 2px axis band (y ≥ 54), so the old code left it green; the arc-
+    // following band must paint it blue.
+    let arc = rgba_at(&buf, 64, 16, 53);
+    assert!(
+        arc[2] > 150 && arc[1] < 120,
+        "bottom border must follow the corner arc, got {arc:?}"
+    );
+    // Mid-bottom straight band still blue…
+    let mid = rgba_at(&buf, 64, 32, 55);
+    assert!(
+        mid[2] > 150 && mid[1] < 120,
+        "bottom border straight band must paint, got {mid:?}"
+    );
+    // …and the top edge carries NO border (side width 0).
+    let top = rgba_at(&buf, 64, 32, 9);
+    assert!(
+        top[2] < 100,
+        "top side is off and must not paint a border, got {top:?}"
     );
 }

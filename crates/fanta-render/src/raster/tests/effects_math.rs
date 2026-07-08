@@ -84,6 +84,7 @@ fn shadow_expanded_bounds_grows_by_offset_and_blur() {
         blur: 8.0,
         spread: 0.0,
         offset: [8.0, 8.0],
+        show_behind_node: false,
     });
     let id = n.id;
     doc.apply(Operation::create_node(n)).unwrap();
@@ -122,6 +123,7 @@ fn shadow_expanded_bounds_unchanged_without_drop_shadow() {
         blur: 40.0,
         spread: 0.0,
         offset: [40.0, 40.0],
+        show_behind_node: false,
     });
     n.effects.push(Shadow {
         kind: ShadowKind::Drop,
@@ -129,6 +131,7 @@ fn shadow_expanded_bounds_unchanged_without_drop_shadow() {
         blur: 40.0,
         spread: 0.0,
         offset: [40.0, 40.0],
+        show_behind_node: false,
     });
     let id = n.id;
     doc.apply(Operation::create_node(n)).unwrap();
@@ -171,6 +174,7 @@ fn node_offscreen_but_shadow_onscreen_is_not_culled() {
         blur: 12.0,
         spread: 0.0,
         offset: [-50.0, 0.0],
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -213,6 +217,7 @@ fn node_and_shadow_both_offscreen_is_culled() {
         blur: 12.0,
         spread: 0.0,
         offset: [50.0, 0.0], // shadow goes further off-screen
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -248,6 +253,7 @@ fn normal_zoom_shadow_pixels_unchanged_by_the_cap() {
         blur: 8.0,
         spread: 0.0,
         offset: [8.0, 8.0],
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(64, 64).unwrap();

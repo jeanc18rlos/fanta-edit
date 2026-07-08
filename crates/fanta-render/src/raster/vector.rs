@@ -2,8 +2,8 @@
 //! stroke alignment (incl. per-side borders), the vector-fill draw path, and
 //! the debug placeholder / unresolved-instance outline helpers.
 use super::{
-    Bounds, Canvas, Color, Fill, Paint, Rect, RenderCtx, draw_image_cached, fill_to_paint,
-    stroke_to_paint, to_sk_color, to_sk_path,
+    Bounds, Canvas, Color, Fill, ImageFillMods, Paint, Rect, RenderCtx, draw_image_cached,
+    fill_to_paint, stroke_to_paint, to_sk_color, to_sk_fill_path, to_sk_path,
 };
 
 /// Whether a [`PathData`] is an axis-aligned rectangle (the shape `corner_radius`
@@ -21,10 +21,13 @@ pub(crate) fn path_is_rect(path: &fanta_doc::PathData) -> bool {
 /// Build a Skia path for an axis-aligned rect `[x, y, w, h]` (logical px),
 /// rounded by an optional uniform `corner_radius` or independent `corner_radii`
 /// ([TL, TR, BR, BL]). `corner_radii` takes precedence; absent/zero rounding
-/// yields a plain rectangle path. Each radius is clamped to half the smaller box
-/// dimension so two adjacent radii never overlap (Skia would otherwise scale
-/// them down silently). Shared by the vector-rect path and the frame-box path so
-/// a frame's background + border round exactly like a rounded rect.
+/// yields a plain rectangle path. Overlapping radii are resolved the way Figma
+/// (and CSS) resolve them — scaled down **proportionally, pairwise per edge** via
+/// [`scaled_corner_radii`] — NOT clamped independently to half the smaller box
+/// dimension: a wide, short rect with a single large corner radius keeps that
+/// radius as long as no shared edge overflows. Shared by the vector-rect path
+/// and the frame-box path so a frame's background + border round exactly like a
+/// rounded rect.
 pub(crate) fn rounded_rect_path(
     bounds_f32: [f32; 4],
     corner_radius: Option<f64>,
@@ -33,9 +36,6 @@ pub(crate) fn rounded_rect_path(
 ) -> skia_safe::Path {
     let [x, y, w, h] = bounds_f32;
     let rect = Rect::from_xywh(x, y, w, h);
-    // Clamp any single radius to half the smaller box dimension so two adjacent
-    // radii never overlap (Skia would otherwise scale them down).
-    let cap = (w.min(h) * 0.5).max(0.0);
     // Corner smoothing → continuous-curvature superellipse corners (only when
     // there's both smoothing AND a radius; otherwise fall through to the exact,
     // byte-identical original construction so smoothing=0 never shifts a pixel).
@@ -45,19 +45,14 @@ pub(crate) fn rounded_rect_path(
             None => corner_radius.filter(|r| *r > 0.0).map(|r| [r as f32; 4]),
         };
         if let Some(r) = radii {
-            return superellipse_rect_path(rect, r.map(|v| v.clamp(0.0, cap)), smoothing);
+            return superellipse_rect_path(rect, scaled_corner_radii(w, h, r), smoothing);
         }
     }
     match corner_radii {
         Some([tl, tr, br, bl]) => {
-            let c = |v: f64| (v as f32).clamp(0.0, cap);
+            let scaled = scaled_corner_radii(w, h, [tl as f32, tr as f32, br as f32, bl as f32]);
             // skia_safe::RRect radii order is TL, TR, BR, BL — matching ours.
-            let radii = [
-                skia_safe::Point::new(c(tl), c(tl)),
-                skia_safe::Point::new(c(tr), c(tr)),
-                skia_safe::Point::new(c(br), c(br)),
-                skia_safe::Point::new(c(bl), c(bl)),
-            ];
+            let radii = scaled.map(|r| skia_safe::Point::new(r, r));
             let rrect = skia_safe::RRect::new_rect_radii(rect, &radii);
             let mut p = skia_safe::Path::new();
             p.add_rrect(rrect, None);
@@ -65,7 +60,9 @@ pub(crate) fn rounded_rect_path(
         }
         None => match corner_radius {
             Some(r) if r > 0.0 => {
-                let r = (r as f32).clamp(0.0, cap);
+                // A uniform radius overflows all four edges equally, so the
+                // pairwise scale reduces to the old half-min-dimension clamp.
+                let r = (r as f32).clamp(0.0, (w.min(h) * 0.5).max(0.0));
                 let mut p = skia_safe::Path::new();
                 p.add_round_rect(rect, (r, r), None);
                 p
@@ -77,6 +74,28 @@ pub(crate) fn rounded_rect_path(
             }
         },
     }
+}
+
+/// Resolve per-corner radii that overlap on a shared edge the way Figma/CSS do:
+/// every radius is multiplied by the same factor `min(1, edge/(rᵃ+rᵇ))` over the
+/// four edges, so adjacent corners never overlap but an isolated large radius on
+/// a wide-short rect is NOT needlessly reduced (the old per-radius
+/// half-min-dimension clamp shrank e.g. TL=15 on a 100×20 box to 10 where Figma
+/// keeps 15). Negative radii are treated as 0.
+fn scaled_corner_radii(w: f32, h: f32, radii: [f32; 4]) -> [f32; 4] {
+    let [tl, tr, br, bl] = radii.map(|r| r.max(0.0));
+    let mut scale = 1.0_f32;
+    let mut fit = |edge: f32, a: f32, b: f32| {
+        let sum = a + b;
+        if sum > 0.0 && sum > edge {
+            scale = scale.min((edge / sum).max(0.0));
+        }
+    };
+    fit(w, tl, tr);
+    fit(w, bl, br);
+    fit(h, tl, bl);
+    fit(h, tr, br);
+    [tl, tr, br, bl].map(|r| r * scale)
 }
 
 /// A rounded-rect path whose corners are quarter-superellipses (Figma "corner
@@ -231,6 +250,29 @@ pub(crate) fn stroke_box_path(
             fanta_doc::StrokeAlign::Outside => (-stroke_width * 0.5, stroke_width * 0.5),
         };
 
+        // An Inside stroke wider than twice a corner's radius cannot be drawn as
+        // an inset offset path: the inset radius clamps to 0 and stroking that
+        // square path at full width squares off the OUTER corner too. Figma
+        // keeps the stroke's outer edge on the shape's rounded outline (only the
+        // inner edge goes square), which is exactly what the clip-based
+        // `stroke_sk_path` Inside branch produces (double-width stroke of the
+        // TRUE outline, clipped to its interior) — so route those through it.
+        if stroke.align == fanta_doc::StrokeAlign::Inside {
+            let half = f64::from(stroke_width) * 0.5;
+            let radii = corner_radii.unwrap_or([corner_radius.unwrap_or(0.0); 4]);
+            if radii.iter().any(|&r| r > 0.0 && r < half) {
+                let box_path = original_path();
+                stroke_sk_path(
+                    canvas,
+                    &box_path,
+                    std::slice::from_ref(stroke),
+                    local_bounds_f32,
+                    ctx,
+                );
+                continue;
+            }
+        }
+
         let Some(stroke_bounds) = offset_box_bounds(local_bounds_f32, offset) else {
             let box_path = original_path();
             stroke_sk_path(
@@ -328,6 +370,17 @@ pub(crate) fn draw_per_side_border(
     paint.set_style(skia_safe::paint::Style::Fill);
     paint.set_path_effect(None); // edges are solid bands, not dashed lines
 
+    // Rounded outline: axis-aligned bands cannot follow the corner arcs (the
+    // band fades out where the arc curves away from the edge, dropping the
+    // stroke exactly where Figma paints it through the corner). Build each
+    // side's band as real ring geometry instead; the plain-rect fast path below
+    // stays byte-identical.
+    if shape_path.is_rect().is_none()
+        && draw_per_side_border_rounded(canvas, shape_path, stroke, sides, &paint)
+    {
+        return true;
+    }
+
     // For each side, `(outer_off, inner_off)` are how far the band extends past
     // the box edge outward and inward, by alignment.
     let (out_frac, in_frac) = match stroke.align {
@@ -420,6 +473,143 @@ pub(crate) fn draw_per_side_border(
     drew
 }
 
+/// Per-side border bands for a ROUNDED (non-rect) outline: each side's band is
+/// the true ring geometry of a stroke at that side's width — so it follows the
+/// corner arcs the way Figma paints per-side borders — intersected with the
+/// side's wedge region.
+///
+/// **Ring.** A centered Skia stroke of `shape_path` at width `2·wᵢ`, converted
+/// to its filled equivalent, reaches exactly `wᵢ` to each side of the outline;
+/// intersecting with (Inside), subtracting (Outside), or halving the width of
+/// (Center) the filled outline yields the aligned ring — the same construction a
+/// uniform stroke's alignment uses, so band edges are true parallel curves of
+/// the outline (rounded corners stay rounded).
+///
+/// **Wedge.** Each side owns the region between the 45° diagonals of its two
+/// box corners — the diagonal from a box corner passes through the corner arc's
+/// angular midpoint for any radius, so splitting there gives each side its half
+/// of the adjacent arcs (CSS's border-corner ownership, which is also how Figma
+/// resolves differing side widths at a corner).
+///
+/// Returns `false` when any Skia path op fails (degenerate geometry); the caller
+/// then falls back to the axis-aligned band path (previous behavior).
+fn draw_per_side_border_rounded(
+    canvas: &Canvas,
+    shape_path: &skia_safe::Path,
+    stroke: &fanta_doc::Stroke,
+    sides: [f64; 4],
+    paint: &Paint,
+) -> bool {
+    let bounds = shape_path.compute_tight_bounds();
+    let (x0, y0, x1, y1) = (bounds.left, bounds.top, bounds.right, bounds.bottom);
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w <= 0.0 || h <= 0.0 {
+        return false;
+    }
+    let widths = sides.map(|v| v.max(0.0) as f32);
+    // Outward reach of the widest band + margin, so every wedge fully covers
+    // the band it clips even for Outside-aligned strokes.
+    let reach = widths.iter().fold(0.0_f32, |a, &b| a.max(b)) + 2.0;
+    // Inward wedge depth: the two 45° diagonals of a side meet at half the
+    // smaller box dimension; stopping there keeps the wedge a simple quad.
+    let depth = (w.min(h)) * 0.5;
+
+    // The wedge quad for each side, as [outer-a, outer-b, inner-b, inner-a]:
+    // outer corners pushed `reach` outward along the corner diagonals, inner
+    // corners `depth` inward along the same diagonals.
+    let quad = |pts: [(f32, f32); 4]| {
+        let mut p = skia_safe::Path::new();
+        p.move_to(pts[0]);
+        p.line_to(pts[1]);
+        p.line_to(pts[2]);
+        p.line_to(pts[3]);
+        p.close();
+        p
+    };
+    let wedges = [
+        // Top: between the TL and TR corner diagonals.
+        quad([
+            (x0 - reach, y0 - reach),
+            (x1 + reach, y0 - reach),
+            (x1 - depth, y0 + depth),
+            (x0 + depth, y0 + depth),
+        ]),
+        // Right: between the TR and BR corner diagonals.
+        quad([
+            (x1 + reach, y0 - reach),
+            (x1 + reach, y1 + reach),
+            (x1 - depth, y1 - depth),
+            (x1 - depth, y0 + depth),
+        ]),
+        // Bottom: between the BR and BL corner diagonals.
+        quad([
+            (x1 + reach, y1 + reach),
+            (x0 - reach, y1 + reach),
+            (x0 + depth, y1 - depth),
+            (x1 - depth, y1 - depth),
+        ]),
+        // Left: between the BL and TL corner diagonals.
+        quad([
+            (x0 - reach, y1 + reach),
+            (x0 - reach, y0 - reach),
+            (x0 + depth, y0 + depth),
+            (x0 + depth, y1 - depth),
+        ]),
+    ];
+
+    // The ring for one side's width, honoring the stroke's alignment.
+    let ring_for = |width: f32| -> Option<skia_safe::Path> {
+        let centered_width = match stroke.align {
+            fanta_doc::StrokeAlign::Center => width,
+            fanta_doc::StrokeAlign::Inside | fanta_doc::StrokeAlign::Outside => width * 2.0,
+        };
+        let mut ring_paint = Paint::default();
+        ring_paint.set_style(skia_safe::paint::Style::Stroke);
+        ring_paint.set_stroke_width(centered_width);
+        ring_paint.set_stroke_join(skia_safe::paint::Join::Round);
+        let mut ring = skia_safe::Path::new();
+        if !skia_safe::path_utils::fill_path_with_paint(
+            shape_path,
+            &ring_paint,
+            &mut ring,
+            None,
+            None,
+        ) {
+            return None;
+        }
+        match stroke.align {
+            fanta_doc::StrokeAlign::Center => Some(ring),
+            fanta_doc::StrokeAlign::Inside => ring.op(shape_path, skia_safe::PathOp::Intersect),
+            fanta_doc::StrokeAlign::Outside => ring.op(shape_path, skia_safe::PathOp::Difference),
+        }
+    };
+
+    // `sides` is [top, right, bottom, left], matching `wedges`' order. Bands are
+    // collected before drawing so a failed path op falls back WITHOUT having
+    // painted a partial border.
+    let mut bands: Vec<skia_safe::Path> = Vec::new();
+    for (width, wedge) in widths.iter().zip(&wedges) {
+        if *width <= 0.0 {
+            continue;
+        }
+        let Some(band) =
+            ring_for(*width).and_then(|ring| ring.op(wedge, skia_safe::PathOp::Intersect))
+        else {
+            return false;
+        };
+        bands.push(band);
+    }
+    // All-zero sides: nothing to draw — report unhandled so the caller keeps
+    // the same fall-through the axis-aligned path has.
+    if bands.is_empty() {
+        return false;
+    }
+    for band in &bands {
+        canvas.draw_path(band, paint);
+    }
+    true
+}
+
 /// Build the silhouette of `shape_path` grown **outward** by `offset` logical px,
 /// or `None` when no offset clip is needed.
 ///
@@ -485,16 +675,22 @@ pub fn vector_outline_sk_path(
     path: &fanta_doc::PathData,
     corner_radius: Option<f64>,
     corner_radii: Option<[f64; 4]>,
+    corner_smoothing: f32,
 ) -> skia_safe::Path {
     if path_is_rect(path) {
         let bounds = path.rough_bounds().unwrap_or(Bounds::ZERO);
-        // Vector shapes carry no corner-smoothing field yet (frames do), so 0.0.
-        rounded_rect_path(bounds_to_f32(&bounds), corner_radius, corner_radii, 0.0)
+        rounded_rect_path(
+            bounds_to_f32(&bounds),
+            corner_radius,
+            corner_radii,
+            corner_smoothing,
+        )
     } else {
         to_sk_path(path)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_vector(
     canvas: &Canvas,
     path: &fanta_doc::PathData,
@@ -502,11 +698,20 @@ pub(crate) fn draw_vector(
     strokes: &[fanta_doc::Stroke],
     corner_radius: Option<f64>,
     corner_radii: Option<[f64; 4]>,
+    corner_smoothing: f32,
     ctx: &mut RenderCtx,
 ) {
     let bounds = path.rough_bounds().unwrap_or(Bounds::ZERO);
     let local_bounds_f32 = bounds_to_f32(&bounds);
-    let sk_path = vector_outline_sk_path(path, corner_radius, corner_radii);
+    let sk_path = vector_outline_sk_path(path, corner_radius, corner_radii, corner_smoothing);
+    // The FILL coverage path: differs from the stroke outline only when the
+    // subpaths carry MIXED winding rules (see `to_sk_fill_path`) — strokes keep
+    // following the authored contours via `sk_path`.
+    let fill_path: skia_safe::Path = if !path.subpath_rules.is_empty() && !path_is_rect(path) {
+        to_sk_fill_path(path)
+    } else {
+        sk_path.clone()
+    };
 
     for fill in fills {
         // Image fills route through the same decode/fit path as BitmapNode:
@@ -519,13 +724,16 @@ pub(crate) fn draw_vector(
             mode,
             opacity,
             crop,
+            scale,
+            rotation,
+            blend,
         } = fill
         {
             // Hoisted so the resolve closure captures a local, not `ctx`,
             // which `ctx.cache` borrows mutably.
             let resolver = ctx.resolver;
             canvas.save();
-            canvas.clip_path(&sk_path, None, true);
+            canvas.clip_path(&fill_path, None, true);
             // The image fits the path's bounding box; the clip restricts it
             // to the actual path shape. `crop` carries Figma's CROP-mode
             // `imageTransform` (a normalized sub-rect of the asset); the
@@ -548,6 +756,11 @@ pub(crate) fn draw_vector(
                 *mode,
                 None,
                 *opacity,
+                ImageFillMods {
+                    scale: *scale,
+                    rotation: *rotation,
+                    blend: *blend,
+                },
             );
             canvas.restore();
             if drawn {
@@ -557,7 +770,7 @@ pub(crate) fn draw_vector(
             // Fall through to the placeholder paint for a missing asset.
         }
         let paint = fill_to_paint(fill, local_bounds_f32);
-        canvas.draw_path(&sk_path, &paint);
+        canvas.draw_path(&fill_path, &paint);
         ctx.metrics.nodes_drawn += 1;
     }
     if path_is_rect(path) {
@@ -566,7 +779,7 @@ pub(crate) fn draw_vector(
             local_bounds_f32,
             corner_radius,
             corner_radii,
-            0.0,
+            corner_smoothing,
             strokes,
             ctx,
         );
@@ -628,6 +841,38 @@ pub(crate) fn bounds_to_f32(b: &Bounds) -> [f32; 4] {
         b.width() as f32,
         b.height() as f32,
     ]
+}
+
+#[cfg(test)]
+mod corner_radii_tests {
+    use super::*;
+
+    #[test]
+    fn isolated_large_radius_on_a_wide_short_rect_is_kept() {
+        // Figma/CSS only scale radii down when two adjacent corners overlap on
+        // a shared edge. TL=15 on a 100x20 box overlaps nothing (its partners
+        // are 0), so it must survive — the old per-radius clamp to half the
+        // smaller dimension cut it to 10.
+        let r = scaled_corner_radii(100.0, 20.0, [15.0, 0.0, 0.0, 0.0]);
+        assert_eq!(r, [15.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn overlapping_adjacent_radii_scale_down_proportionally() {
+        // TL=30 and BL=30 share the 40px left edge (sum 60): both scale by
+        // 40/60, and the unrelated TR scales by the same global factor (CSS's
+        // uniform-scale rule, which Figma follows).
+        let r = scaled_corner_radii(100.0, 40.0, [30.0, 12.0, 0.0, 30.0]);
+        for (got, want) in r.iter().zip([20.0, 8.0, 0.0, 20.0]) {
+            assert!((got - want).abs() < 1e-4, "got {r:?}");
+        }
+    }
+
+    #[test]
+    fn negative_radii_are_treated_as_zero() {
+        let r = scaled_corner_radii(100.0, 40.0, [-5.0, 10.0, 0.0, 0.0]);
+        assert_eq!(r, [0.0, 10.0, 0.0, 0.0]);
+    }
 }
 
 #[cfg(test)]

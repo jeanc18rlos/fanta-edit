@@ -16,6 +16,7 @@ mod cull;
 mod diamond_gradient;
 mod effects;
 mod effects_math;
+mod fidelity;
 mod image;
 mod instance;
 mod masks;

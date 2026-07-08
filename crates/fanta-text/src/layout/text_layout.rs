@@ -233,6 +233,96 @@ impl TextLayout {
             .paint(canvas, (origin[0] as f32, origin[1] as f32));
     }
 
+    /// Byte offsets at which each hard-break paragraph begins: 0, then the
+    /// byte after every `'\n'`. A trailing newline therefore starts a final
+    /// (possibly empty) paragraph, matching how Skia lays out a trailing blank
+    /// line.
+    fn paragraph_starts(&self) -> Vec<usize> {
+        let mut starts = vec![0];
+        starts.extend(self.text.match_indices('\n').map(|(i, _)| i + 1));
+        starts
+    }
+
+    /// Total painted height when `spacing` extra pixels are inserted after
+    /// every hard newline (Figma's `paragraphSpacing`); equals
+    /// [`height`](Self::height) for zero spacing or single-paragraph text.
+    /// This is the height [`paint_spaced`](Self::paint_spaced) occupies, so
+    /// vertical alignment and auto-height measurement agree with the pixels.
+    pub fn spaced_height(&self, spacing: f64) -> f64 {
+        if self.text.is_empty() || spacing == 0.0 {
+            return self.height();
+        }
+        let breaks = self.text.matches('\n').count();
+        self.height() + spacing * breaks as f64
+    }
+
+    /// Paint like [`paint`](Self::paint), inserting `spacing` extra vertical
+    /// pixels after each hard-break paragraph (Figma's `paragraphSpacing`).
+    ///
+    /// Skia's `Paragraph` has no between-paragraph spacing, so the paragraph
+    /// is painted once per hard-break block, each pass clipped to that block's
+    /// line band and shifted down by the spacing accumulated before it. The
+    /// bands are the exact line boxes (line tops tile), so each glyph is
+    /// painted by exactly one pass. Zero spacing (or one paragraph) takes the
+    /// single-paint fast path, byte-identical to [`paint`](Self::paint).
+    pub fn paint_spaced(&self, canvas: &Canvas, origin: [f64; 2], spacing: f64) {
+        if self.text.is_empty() {
+            return;
+        }
+        let starts = self.paragraph_starts();
+        if spacing == 0.0 || starts.len() <= 1 {
+            self.paint(canvas, origin);
+            return;
+        }
+        let lines = self.lines();
+        // The y where each paragraph's band begins: the top of its first line.
+        // Lines are in order and a paragraph's first line starts exactly at the
+        // paragraph's start byte (the preceding '\n' ends the previous line). A
+        // paragraph past the last laid-out line (e.g. truncated away) has no
+        // band and paints nothing.
+        let mut band_tops: Vec<Option<f64>> = Vec::with_capacity(starts.len());
+        let mut line_index = 0;
+        for &start in &starts {
+            while line_index < lines.len() && lines[line_index].start_byte < start {
+                line_index += 1;
+            }
+            band_tops.push(lines.get(line_index).map(|line| line.top));
+        }
+        for (paragraph, top) in band_tops.iter().enumerate() {
+            let Some(top) = *top else {
+                continue;
+            };
+            let bottom = band_tops[paragraph + 1..]
+                .iter()
+                .find_map(|t| *t)
+                .unwrap_or(f64::INFINITY);
+            let shift = spacing * paragraph as f64;
+            // Effectively-unbounded extent that still survives the canvas CTM
+            // without overflowing to infinity (glyphs may overhang the layout
+            // box horizontally; the last band is open-ended downward).
+            const BAND_REACH: f32 = 1.0e7;
+            canvas.save();
+            // Clip in the shifted frame so the band keeps exactly this
+            // paragraph's lines.
+            canvas.clip_rect(
+                skia_safe::Rect::new(
+                    -BAND_REACH,
+                    (origin[1] + top + shift) as f32,
+                    BAND_REACH,
+                    if bottom.is_finite() {
+                        (origin[1] + bottom + shift) as f32
+                    } else {
+                        BAND_REACH
+                    },
+                ),
+                None,
+                false,
+            );
+            self.paint(canvas, [origin[0], origin[1] + shift]);
+            canvas.restore();
+        }
+    }
+
     /// The glyph outlines of the laid-out text as a single vector
     /// [`fanta_doc::PathData`], in paragraph-local pixels translated by `offset`
     /// (the renderer's paint origin — its vertical-alignment shift). This is the
@@ -507,6 +597,56 @@ mod tests {
         let engine = LayoutEngine::new();
         let layout = engine.layout(&TextBuffer::new(), 200.0);
         assert_eq!(layout.caret_rect(0), [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn spaced_height_adds_spacing_per_hard_break() {
+        let engine = LayoutEngine::new();
+        let layout = engine.layout(&TextBuffer::from_str("a\nb\nc", body()), 1000.0);
+        assert_eq!(layout.spaced_height(0.0), layout.height());
+        assert!((layout.spaced_height(10.0) - layout.height() - 20.0).abs() < 1e-9);
+        // Single paragraph: no breaks, no growth.
+        let single = engine.layout(&TextBuffer::from_str("abc", body()), 1000.0);
+        assert_eq!(single.spaced_height(10.0), single.height());
+        // Empty text stays zero.
+        let empty = engine.layout(&TextBuffer::new(), 1000.0);
+        assert_eq!(empty.spaced_height(10.0), 0.0);
+    }
+
+    #[test]
+    fn paint_spaced_shifts_later_paragraphs_down() {
+        use skia_safe::{AlphaType, ColorType, ImageInfo, surfaces};
+        let engine = LayoutEngine::new();
+        let style =
+            crate::style::TextStyle::new("Inter", 20.0).with_color(fanta_doc::Color::rgb(0, 0, 0));
+        let layout = engine.layout(&TextBuffer::from_str("Top\nBottom", style), 1000.0);
+
+        let lowest_ink = |spacing: f64| -> usize {
+            let (w, h) = (160i32, 160i32);
+            let mut surface = surfaces::raster_n32_premul((w, h)).unwrap();
+            surface.canvas().clear(skia_safe::Color::TRANSPARENT);
+            layout.paint_spaced(surface.canvas(), [4.0, 4.0], spacing);
+            let info = ImageInfo::new((w, h), ColorType::RGBA8888, AlphaType::Unpremul, None);
+            let row = info.min_row_bytes();
+            let mut px = vec![0u8; row * h as usize];
+            assert!(surface.read_pixels(&info, &mut px, row, (0, 0)));
+            let mut lowest = 0;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    if px[y * row + x * 4 + 3] != 0 {
+                        lowest = y;
+                    }
+                }
+            }
+            lowest
+        };
+        let plain = lowest_ink(0.0);
+        let spaced = lowest_ink(32.0);
+        let shift = spaced as i64 - plain as i64;
+        assert!(
+            (shift - 32).abs() <= 2,
+            "the second paragraph must paint ~32px lower, moved {shift}px"
+        );
     }
 
     #[test]

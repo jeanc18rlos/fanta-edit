@@ -204,13 +204,33 @@ pub(crate) fn hash_overrides(instance: &InstanceNode) -> u64 {
     hasher.finish()
 }
 
-/// CPU-backed Skia surface renderer. Width and height are fixed at
-/// construction; resize by building a new renderer (cheap — allocation is
-/// the only cost, no GPU resources to release).
+/// CPU-backed Skia surface renderer. Resize in place via [`resize`] — it keeps
+/// the image/instance caches (they are size-independent) and only the owned
+/// CPU surface, if any, is re-created at the new size.
+///
+/// [`resize`]: Self::resize
 pub struct RasterRenderer {
     width: u32,
     height: u32,
+    /// The owned CPU pixel surface. Starts as a draw-discarding NULL surface
+    /// (no pixel memory) and is upgraded to a real `width × height` raster
+    /// surface by the first path that actually draws to or reads it
+    /// ([`render_page_with`], [`render_tile_self`], [`encode_png`],
+    /// [`canvas`]) — so a caller that only ever renders onto an external
+    /// canvas ([`render_to_canvas`] / [`render_tile_onto`], the GPU present
+    /// path) never allocates `width × height × 4` bytes it does not read, and
+    /// never re-allocates them on resize.
+    ///
+    /// [`render_page_with`]: Self::render_page_with
+    /// [`render_tile_self`]: Self::render_tile_self
+    /// [`encode_png`]: Self::encode_png
+    /// [`canvas`]: Self::canvas
+    /// [`render_to_canvas`]: Self::render_to_canvas
+    /// [`render_tile_onto`]: Self::render_tile_onto
     surface: Surface,
+    /// Whether `surface` is still the draw-discarding null placeholder. See
+    /// [`Self::ensure_raster_surface`].
+    surface_is_placeholder: bool,
     /// Color the canvas is cleared to before each frame (transparent by
     /// default; the app sets a dark or light "infinite canvas" color).
     pub background: Color,
@@ -263,21 +283,74 @@ pub struct RasterRenderer {
 }
 
 impl RasterRenderer {
-    /// Construct a renderer with a CPU-backed raster surface of `width` ×
-    /// `height` pixels. Returns `Err` if Skia cannot allocate the surface.
+    /// Construct a renderer for `width` × `height` pixels. Returns `Err` for a
+    /// zero dimension.
+    ///
+    /// The pixel-backed CPU surface is NOT allocated here: construction starts
+    /// with a draw-discarding null surface (no pixel memory), upgraded lazily
+    /// by the first path that draws to or reads the owned surface — so an
+    /// external-canvas caller ([`render_to_canvas`]) never pays for a
+    /// `width × height × 4` buffer it does not use.
+    ///
+    /// [`render_to_canvas`]: Self::render_to_canvas
     pub fn new(width: u32, height: u32) -> Result<Self, RenderError> {
-        let surface = surfaces::raster_n32_premul((width as i32, height as i32))
+        // Null-surface creation fails exactly for a non-positive size, which
+        // doubles as the dimension validation the old eager allocation did.
+        let surface = surfaces::null((width as i32, height as i32))
             .ok_or(RenderError::SurfaceCreate { width, height })?;
         Ok(Self {
             width,
             height,
             surface,
+            surface_is_placeholder: true,
             background: Color::TRANSPARENT,
             display_scale: 1.0,
             asset_resolver: None,
             image_cache: ImageCache::new(),
             instance_cache: InstanceCache::default(),
         })
+    }
+
+    /// Change the render target size in place, KEEPING the image and instance
+    /// caches — they are size-independent, and rebuilding the renderer on
+    /// every window resize threw them away along with a full surface
+    /// re-allocation. The owned CPU surface reverts to the (pixel-free) null
+    /// placeholder and is re-created lazily at the new size by the paths that
+    /// use it; an external-canvas caller pays nothing here. Returns `Err` for
+    /// a zero dimension, like [`new`].
+    ///
+    /// [`new`]: Self::new
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), RenderError> {
+        if (width, height) == (self.width, self.height) {
+            return Ok(());
+        }
+        let surface = surfaces::null((width as i32, height as i32))
+            .ok_or(RenderError::SurfaceCreate { width, height })?;
+        self.width = width;
+        self.height = height;
+        self.surface = surface;
+        self.surface_is_placeholder = true;
+        Ok(())
+    }
+
+    /// Swap the null placeholder for a real `width × height` raster surface
+    /// (idempotent). Returns `Err` when Skia cannot allocate the pixels —
+    /// memory exhaustion, since the dimensions were validated at
+    /// construction/resize — which the old eager constructor surfaced as its
+    /// `Err`; callers that cannot propagate degrade to a blank frame instead.
+    fn ensure_raster_surface(&mut self) -> Result<(), RenderError> {
+        if !self.surface_is_placeholder {
+            return Ok(());
+        }
+        let surface = surfaces::raster_n32_premul((self.width as i32, self.height as i32)).ok_or(
+            RenderError::SurfaceCreate {
+                width: self.width,
+                height: self.height,
+            },
+        )?;
+        self.surface = surface;
+        self.surface_is_placeholder = false;
+        Ok(())
     }
 
     /// Install the asset resolver used to turn an `AssetId` into decoded pixels
@@ -348,8 +421,19 @@ impl RasterRenderer {
     /// status text). Call after [`render`]; the canvas is in screen-space —
     /// no viewport transform is active.
     ///
+    /// Allocates the owned raster surface on first use. If that allocation
+    /// fails (memory exhaustion — this signature has no error channel), the
+    /// returned canvas is the draw-discarding placeholder, matching the blank
+    /// frame the render paths degrade to in the same state.
+    ///
     /// [`render`]: Self::render
     pub fn canvas(&mut self) -> &skia_safe::Canvas {
+        match self.ensure_raster_surface() {
+            Ok(()) => {}
+            // No error channel in this signature: keep the placeholder —
+            // draws are discarded, reads see blank, no panic.
+            Err(_) => {}
+        }
         self.surface.canvas()
     }
 
@@ -436,6 +520,13 @@ impl RasterRenderer {
         let started = Instant::now();
         let mut metrics = RenderMetrics::default();
 
+        // First CPU render allocates the owned surface. Allocation failure
+        // (memory exhaustion; the dimensions were validated at construction)
+        // degrades to a skipped, blank frame — this signature has no error
+        // channel, and the old eager constructor surfaced the same failure.
+        if self.ensure_raster_surface().is_err() {
+            return metrics;
+        }
         let background = self.background;
         let display_scale = self.display_scale;
         let resolver = self.asset_resolver.clone();
@@ -548,6 +639,11 @@ impl RasterRenderer {
         inputs: &RenderInputs,
     ) {
         if tile_w < 1.0 || tile_h < 1.0 {
+            return;
+        }
+        // See `render_page_with`: allocation failure degrades to a skipped
+        // tile rather than a panic.
+        if self.ensure_raster_surface().is_err() {
             return;
         }
         let display_scale = self.display_scale;
@@ -765,6 +861,10 @@ impl RasterRenderer {
         );
         let row_bytes = info.min_row_bytes();
         let mut buf = vec![0u8; row_bytes * self.height as usize];
+        // A never-rendered renderer still holds the pixel-free placeholder;
+        // its `read_pixels` reads nothing, leaving the zeroed buffer — byte-
+        // identical to reading the freshly-zeroed surface the eager
+        // constructor used to allocate, without forcing the allocation here.
         let _ = self.surface.read_pixels(&info, &mut buf, row_bytes, (0, 0));
         buf
     }
@@ -773,6 +873,10 @@ impl RasterRenderer {
     ///
     /// [`render`]: Self::render
     pub fn encode_png(&mut self) -> Result<Vec<u8>, RenderError> {
+        // Snapshotting the pixel-free placeholder is undefined (Skia returns
+        // no image for a null surface), so materialize the raster surface
+        // first — a never-rendered renderer encodes a blank PNG, as before.
+        self.ensure_raster_surface()?;
         let image = self.surface.image_snapshot();
         // CPU surfaces don't need a GPU `DirectContext`; passing `None` is the
         // documented shape for raster encode.

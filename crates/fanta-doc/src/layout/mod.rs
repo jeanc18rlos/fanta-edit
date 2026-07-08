@@ -169,11 +169,21 @@ fn solve_node<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut Measure) {
 }
 
 /// The [`AutoLayout`] config of `id` if it is an auto-layout frame, else `None`.
+///
+/// Numeric config is sanitized: a non-finite spacing or padding (e.g. a NaN
+/// imported from Figma's "Auto" gap encoding before it was mapped, or a stale
+/// project file) would poison every position this frame computes — one NaN
+/// cursor makes the whole subtree vanish — so non-finite values collapse to 0.
 fn auto_layout_of<T: LayoutTree>(tree: &T, id: NodeId) -> Option<AutoLayout> {
-    match &tree.node(id)?.data {
-        NodeData::Group(g) => g.auto_layout,
-        _ => None,
-    }
+    let mut al = match &tree.node(id)?.data {
+        NodeData::Group(g) => g.auto_layout?,
+        _ => return None,
+    };
+    let finite_or_zero = |value: f64| if value.is_finite() { value } else { 0.0 };
+    al.spacing = finite_or_zero(al.spacing);
+    al.counter_spacing = finite_or_zero(al.counter_spacing);
+    al.padding = al.padding.map(finite_or_zero);
+    Some(al)
 }
 
 /// Re-flow an auto-layout child whose size its parent just changed (a counter-axis
@@ -568,12 +578,31 @@ fn place_wrap_lines(
     line_thickness: &[f64],
     al: &AutoLayout,
     flow: FrameFlow,
+    counter_gap: f64,
 ) {
     let mut cross_cursor = flow.pad_cross_lo;
     for (line, &thickness) in lines.iter().zip(line_thickness) {
         place_run(infos, line, al, flow, cross_cursor, thickness);
-        cross_cursor += thickness + al.counter_spacing;
+        cross_cursor += thickness + counter_gap;
     }
+}
+
+/// The gap between wrapped lines on the counter axis. An "Auto" gap
+/// ([`AutoLayout::counter_auto_spacing`], Figma's NaN `stackCounterSpacing`)
+/// distributes the lines across the frame's inner counter extent —
+/// space-between semantics. Figma bakes the distributed extent into the frame
+/// size even for a hugged counter axis (`RESIZE_TO_FIT_WITH_IMPLICIT_SIZE`),
+/// so `inner_cross` is the authored extent to distribute into; when the lines
+/// overflow it the gap clamps to 0 and hug sizing grows the frame instead.
+fn wrap_counter_gap(al: &AutoLayout, flow: FrameFlow, line_thickness: &[f64]) -> f64 {
+    if !al.counter_auto_spacing {
+        return al.counter_spacing;
+    }
+    if line_thickness.len() < 2 {
+        return 0.0;
+    }
+    let total: f64 = line_thickness.iter().sum();
+    ((flow.inner_cross - total) / (line_thickness.len() - 1) as f64).max(0.0)
 }
 
 fn widest_line_main(
@@ -812,9 +841,13 @@ fn layout_frame_wrap<T: LayoutTree>(
     // thickness (so each row's stretch children are the same height as that row).
     stretch_lines_counter(&mut infos, &lines, &line_thickness, flow.horizontal);
 
+    // ---- The counter gap between lines: the authored `counter_spacing`, or
+    // the space-between share when the gap is "Auto" (see [`wrap_counter_gap`]).
+    let counter_gap = wrap_counter_gap(al, flow, &line_thickness);
+
     // ---- Place each line: counter offset accumulates down the lines; within a
     // line the primary placement honors PrimaryAlign against inner_main.
-    place_wrap_lines(&mut infos, &lines, &line_thickness, al, flow);
+    place_wrap_lines(&mut infos, &lines, &line_thickness, al, flow, counter_gap);
 
     // ---- Write back sizes + transforms for the flow children. ---------------
     write_flow_children(tree, &infos, &flow_indices);
@@ -832,7 +865,7 @@ fn layout_frame_wrap<T: LayoutTree>(
         al,
         flow,
         widest_line_main(&infos, &lines, flow.horizontal, al.spacing),
-        total_line_cross(&line_thickness, al.counter_spacing),
+        total_line_cross(&line_thickness, counter_gap),
     );
 }
 

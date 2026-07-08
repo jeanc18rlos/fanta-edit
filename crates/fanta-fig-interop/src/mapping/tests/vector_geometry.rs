@@ -332,3 +332,230 @@ fn vector_no_fill_with_stroke_is_stroke_only_outline_not_a_width_stroke() {
         other => panic!("expected vector, got {other:?}"),
     }
 }
+
+#[test]
+fn line_with_stroke_geometry_fills_the_baked_outline() {
+    // LINE nodes never carry fillGeometry; Figma bakes the stroked segment —
+    // width, caps (incl. arrowheads), dashes — into `strokeGeometry`. The
+    // importer paints that outline as a FILL with the stroke's paint and emits
+    // no width stroke (the old bbox fallback stroked a degenerate h=0 rect:
+    // no caps, dashes traversing the perimeter twice).
+    let mut outline = Vec::new();
+    outline.extend(cmd(1, &[0.0, 0.0]));
+    outline.extend(cmd(2, &[100.0, 0.0]));
+    outline.extend(cmd(2, &[100.0, 2.0]));
+    outline.extend(cmd(2, &[0.0, 2.0]));
+    outline.extend(cmd(0, &[]));
+
+    let fig = doc_from_with_blobs(
+        vec![o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("LINE".to_owned())),
+                ("name", KiwiValue::String("Divider".to_owned())),
+                ("size", vector(100.0, 0.0)),
+                (
+                    "strokePaints",
+                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                ),
+                ("strokeWeight", KiwiValue::Float(2.0)),
+                (
+                    "strokeGeometry",
+                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                ),
+            ],
+        )],
+        vec![outline],
+    );
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let node = doc.scene.get(doc.scene.roots()[0]).unwrap();
+    assert_eq!(node.meta["geometry"], "stroke_geometry");
+    match &node.data {
+        NodeData::Vector(v) => {
+            assert_eq!(
+                v.fills[0],
+                Fill::solid(Color::BLACK),
+                "the stroke paint becomes the outline fill"
+            );
+            assert!(
+                v.strokes.is_empty(),
+                "no width stroke on top of the outline"
+            );
+            let b = v.path.rough_bounds().unwrap();
+            assert_eq!((b.width(), b.height()), (100.0, 2.0));
+        }
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
+fn boolean_operation_without_fill_geometry_uses_stroke_geometry() {
+    // A stroke-only BOOLEAN_OPERATION (no fillGeometry at all) must render its
+    // baked strokeGeometry result, not a stroked bounding box.
+    let mut ring = Vec::new();
+    ring.extend(cmd(1, &[0.0, 0.0]));
+    ring.extend(cmd(2, &[10.0, 0.0]));
+    ring.extend(cmd(2, &[10.0, 10.0]));
+    ring.extend(cmd(2, &[0.0, 10.0]));
+    ring.extend(cmd(0, &[]));
+    let fig = doc_from_with_blobs(
+        vec![o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("BOOLEAN_OPERATION".to_owned())),
+                ("size", vector(10.0, 10.0)),
+                (
+                    "strokePaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                ),
+                ("strokeWeight", KiwiValue::Float(1.0)),
+                (
+                    "strokeGeometry",
+                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                ),
+            ],
+        )],
+        vec![ring],
+    );
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let node = doc.scene.get(doc.scene.roots()[0]).unwrap();
+    assert_eq!(node.meta["geometry"], "stroke_geometry");
+    match &node.data {
+        NodeData::Vector(v) => {
+            assert_eq!(v.fills[0], Fill::solid(Color::rgb(255, 0, 0)));
+            assert!(v.strokes.is_empty());
+        }
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
+fn node_with_fills_keeps_bbox_fallback_over_stroke_geometry() {
+    // The strokeGeometry outline path only applies to stroke-only nodes: a
+    // FILLED node with no fillGeometry keeps the bbox fallback (filling its
+    // stroke outline would drop the fill).
+    let mut outline = Vec::new();
+    outline.extend(cmd(1, &[0.0, 0.0]));
+    outline.extend(cmd(2, &[10.0, 0.0]));
+    outline.extend(cmd(2, &[10.0, 10.0]));
+    outline.extend(cmd(0, &[]));
+    let fig = doc_from_with_blobs(
+        vec![o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("VECTOR".to_owned())),
+                ("size", vector(10.0, 10.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
+                ),
+                (
+                    "strokePaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                ),
+                ("strokeWeight", KiwiValue::Float(1.0)),
+                (
+                    "strokeGeometry",
+                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                ),
+            ],
+        )],
+        vec![outline],
+    );
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    let node = doc.scene.get(doc.scene.roots()[0]).unwrap();
+    assert_eq!(node.meta["geometry"], "bbox_fallback");
+}
+
+#[test]
+fn mixed_winding_rules_are_preserved_per_subpath() {
+    // Figma fills each fillGeometry Path with its OWN windingRule. Two paths —
+    // a NONZERO outer square, then an ODD path with two subpaths — must keep
+    // per-subpath rules so the ODD holes survive.
+    let mut outer = Vec::new();
+    outer.extend(cmd(1, &[0.0, 0.0]));
+    outer.extend(cmd(2, &[10.0, 0.0]));
+    outer.extend(cmd(2, &[10.0, 10.0]));
+    outer.extend(cmd(0, &[]));
+    let mut holes = Vec::new();
+    holes.extend(cmd(1, &[2.0, 2.0]));
+    holes.extend(cmd(2, &[4.0, 2.0]));
+    holes.extend(cmd(2, &[4.0, 4.0]));
+    holes.extend(cmd(0, &[]));
+    holes.extend(cmd(1, &[6.0, 6.0]));
+    holes.extend(cmd(2, &[8.0, 6.0]));
+    holes.extend(cmd(2, &[8.0, 8.0]));
+    holes.extend(cmd(0, &[]));
+
+    let fig = doc_from_with_blobs(
+        vec![o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("VECTOR".to_owned())),
+                ("size", vector(10.0, 10.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                ),
+                (
+                    "fillGeometry",
+                    KiwiValue::Array(vec![fig_path(0, "NONZERO"), fig_path(1, "ODD")]),
+                ),
+            ],
+        )],
+        vec![outer, holes],
+    );
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Vector(v) => {
+            assert_eq!(v.path.fill_rule, FillRule::NonZero, "first path's rule");
+            assert_eq!(
+                v.path.subpath_rules,
+                vec![FillRule::NonZero, FillRule::EvenOdd, FillRule::EvenOdd],
+                "one rule per subpath: NONZERO outer, ODD hole path's two subpaths"
+            );
+        }
+        other => panic!("expected vector, got {other:?}"),
+    }
+}
+
+#[test]
+fn uniform_winding_rules_leave_subpath_rules_empty() {
+    // The common all-same-rule case must not populate subpath_rules (keeps the
+    // serialized form byte-identical to pre-feature docs).
+    let mut a = Vec::new();
+    a.extend(cmd(1, &[0.0, 0.0]));
+    a.extend(cmd(2, &[10.0, 0.0]));
+    a.extend(cmd(0, &[]));
+    let mut b = Vec::new();
+    b.extend(cmd(1, &[3.0, 3.0]));
+    b.extend(cmd(2, &[6.0, 3.0]));
+    b.extend(cmd(0, &[]));
+    let fig = doc_from_with_blobs(
+        vec![o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("VECTOR".to_owned())),
+                ("size", vector(10.0, 10.0)),
+                (
+                    "fillGeometry",
+                    KiwiValue::Array(vec![fig_path(0, "ODD"), fig_path(1, "ODD")]),
+                ),
+            ],
+        )],
+        vec![a, b],
+    );
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Vector(v) => {
+            assert_eq!(v.path.fill_rule, FillRule::EvenOdd);
+            assert!(v.path.subpath_rules.is_empty());
+        }
+        other => panic!("expected vector, got {other:?}"),
+    }
+}

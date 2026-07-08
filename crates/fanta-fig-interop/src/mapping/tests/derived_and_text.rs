@@ -554,10 +554,12 @@ fn raw_unit_line_height_is_a_passthrough_multiplier() {
 }
 
 #[test]
-fn raw_one_line_height_uses_authored_figma_box_height() {
-    // Real Figma exports often encode "auto"/normal leading as RAW 1.0 while
-    // the TEXT box already carries the normal line box height. Use that box
-    // height so vertically-centered labels do not sink inside their frames.
+fn raw_one_line_height_is_kept_exact() {
+    // Kiwi RAW 1.0 is a legitimate authored value — exactly 1.0× the font size
+    // (Figma renders it that way). An earlier heuristic rewrote it into a
+    // box-derived guess clamped to [1.05, 1.5] (or a hardcoded 1.25), corrupting
+    // genuine 100%-of-font-size line heights; Figma's "auto" is instead encoded
+    // as PERCENT 100 and handled via `line_height_auto_percent`.
     let fig = doc_from(vec![o(
         "NodeChange",
         vec![
@@ -571,17 +573,23 @@ fn raw_one_line_height_uses_authored_figma_box_height() {
     )]);
     let (doc, _, _) = fig_to_doc(&fig).unwrap();
     match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
-        NodeData::Text(t) => assert!(
-            (t.style.line_height - 1.25).abs() < 1e-6,
-            "RAW 1.0 should use the 15/12 authored box ratio, got {}",
-            t.style.line_height
-        ),
+        NodeData::Text(t) => {
+            assert!(
+                (t.style.line_height - 1.0).abs() < 1e-6,
+                "RAW 1.0 passes through exactly, got {}",
+                t.style.line_height
+            );
+            assert_eq!(t.style.line_height_auto_percent, None);
+        }
         other => panic!("expected text, got {other:?}"),
     }
 }
 
 #[test]
-fn raw_one_line_height_ignores_subnormal_compact_box_height() {
+fn percent_100_line_height_marks_figma_auto() {
+    // PERCENT 100 is Figma "auto": 100% of the font's INTRINSIC line height.
+    // The importer records the metric-relative marker and a 1.2× approximation
+    // scalar for consumers without font metrics.
     let fig = doc_from(vec![o(
         "NodeChange",
         vec![
@@ -590,16 +598,142 @@ fn raw_one_line_height_ignores_subnormal_compact_box_height() {
             ("size", vector(47.0, 11.0)),
             ("textData", text_data("#FF0000")),
             ("fontSize", KiwiValue::Float(13.0)),
-            ("lineHeight", number(1.0, "RAW")),
+            ("lineHeight", number(100.0, "PERCENT")),
         ],
     )]);
     let (doc, _, _) = fig_to_doc(&fig).unwrap();
     match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
-        NodeData::Text(t) => assert!(
-            (t.style.line_height - 1.25).abs() < 1e-6,
-            "RAW 1.0 should keep normal leading for compact boxes, got {}",
-            t.style.line_height
-        ),
+        NodeData::Text(t) => {
+            assert_eq!(t.style.line_height_auto_percent, Some(100.0));
+            assert!((t.style.line_height - 1.2).abs() < 1e-6);
+        }
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+#[test]
+fn absent_line_height_defaults_to_figma_auto() {
+    // A TEXT change with no lineHeight field takes Figma's default — auto.
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("size", vector(47.0, 11.0)),
+            ("textData", text_data("label")),
+            ("fontSize", KiwiValue::Float(13.0)),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Text(t) => {
+            assert_eq!(t.style.line_height_auto_percent, Some(100.0));
+        }
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+#[test]
+fn font_variations_weight_axis_overrides_style_name_weight() {
+    // Figma's UI3 kit sets body text to weight 450 via the variable-font
+    // `Weight` axis while the style name stays "Medium" (500). The axis value
+    // is authoritative.
+    let variation = |axis: &str, tag: u32, value: f32| {
+        o(
+            "FontVariation",
+            vec![
+                ("axisName", KiwiValue::String(axis.to_owned())),
+                ("axisTag", KiwiValue::Uint(tag)),
+                ("value", KiwiValue::Float(value)),
+            ],
+        )
+    };
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("size", vector(100.0, 20.0)),
+            ("textData", text_data("body")),
+            ("fontName", font_name("Inter", "Medium")),
+            (
+                "fontVariations",
+                KiwiValue::Array(vec![
+                    variation("Weight", 2003265652, 450.0),
+                    variation("Slant", 1936486004, 0.0),
+                ]),
+            ),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Text(t) => assert_eq!(t.style.weight, 450),
+        other => panic!("expected text, got {other:?}"),
+    }
+
+    // An EMPTY fontVariations array (very common) leaves the name-parsed weight.
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("size", vector(100.0, 20.0)),
+            ("textData", text_data("body")),
+            ("fontName", font_name("Inter", "Medium")),
+            ("fontVariations", KiwiValue::Array(vec![])),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Text(t) => assert_eq!(t.style.weight, 500),
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+#[test]
+fn text_truncation_max_lines_and_paragraph_fields_import() {
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("size", vector(120.0, 32.0)),
+            ("textData", text_data("Value that is very long")),
+            ("textTruncation", KiwiValue::Enum("ENDING".to_owned())),
+            ("maxLines", KiwiValue::Int(2)),
+            ("paragraphSpacing", KiwiValue::Float(8.372093)),
+            ("paragraphIndent", KiwiValue::Float(12.0)),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Text(t) => {
+            assert!(t.truncate, "textTruncation ENDING imports");
+            assert_eq!(t.max_lines, Some(2));
+            assert!((t.paragraph_spacing - 8.372093).abs() < 1e-4);
+            assert!((t.paragraph_indent - 12.0).abs() < 1e-9);
+        }
+        other => panic!("expected text, got {other:?}"),
+    }
+
+    // Defaults: no truncation fields ⇒ unlimited, no clamp, no extra spacing.
+    let fig = doc_from(vec![o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 1)),
+            ("type", KiwiValue::Enum("TEXT".to_owned())),
+            ("size", vector(120.0, 32.0)),
+            ("textData", text_data("plain")),
+        ],
+    )]);
+    let (doc, _, _) = fig_to_doc(&fig).unwrap();
+    match &doc.scene.get(doc.scene.roots()[0]).unwrap().data {
+        NodeData::Text(t) => {
+            assert!(!t.truncate);
+            assert_eq!(t.max_lines, None);
+            assert_eq!(t.paragraph_spacing, 0.0);
+            assert_eq!(t.paragraph_indent, 0.0);
+        }
         other => panic!("expected text, got {other:?}"),
     }
 }

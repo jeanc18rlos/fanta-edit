@@ -99,9 +99,16 @@ pub struct AutoLayout {
     #[serde(default)]
     pub spacing: f64,
     /// Gap between wrapped rows/columns on the counter axis (Figma
-    /// `stackCounterSpacing`); only meaningful when wrapping is enabled.
+    /// `stackCounterSpacing`); only meaningful when wrapping is enabled and
+    /// ignored when [`Self::counter_auto_spacing`] is set.
     #[serde(default)]
     pub counter_spacing: f64,
+    /// Whether the counter-axis gap between wrapped lines is "Auto" (Figma
+    /// encodes it as a NaN `stackCounterSpacing`): the lines are distributed
+    /// across the frame's counter extent (space-between) instead of separated
+    /// by [`Self::counter_spacing`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub counter_auto_spacing: bool,
     /// Inner padding `[top, right, bottom, left]`, in logical px. Resolved from
     /// Figma's `stackPadding*` / `stack{Horizontal,Vertical}Padding` fields with
     /// the same fallback chain OpenPencil uses.
@@ -150,6 +157,7 @@ impl Default for AutoLayout {
             mode: LayoutMode::default(),
             spacing: 0.0,
             counter_spacing: 0.0,
+            counter_auto_spacing: false,
             padding: [0.0; 4],
             primary_align: PrimaryAlign::default(),
             counter_align: CounterAlign::default(),

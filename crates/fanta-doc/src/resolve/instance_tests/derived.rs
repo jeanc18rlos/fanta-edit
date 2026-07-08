@@ -194,6 +194,7 @@ fn expand_keeps_stroked_vector_path_when_derived_stroke_path_is_present() {
         strokes: smallvec![crate::style::Stroke::solid(Color::BLACK, 1.0)],
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     line.parent = Some(root_id);
     let line_id = line.id;
@@ -385,6 +386,7 @@ fn expand_applies_derived_text_color_and_weight_to_a_text_clone() {
                 content: None,
                 font_size: None,
                 line_height: None,
+                line_height_auto_percent: None,
                 letter_spacing: None,
                 color: Some(themed),
                 weight: Some(600),

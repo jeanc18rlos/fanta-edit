@@ -29,6 +29,7 @@ fn drop_spread_buf(spread: f64) -> Vec<u8> {
         blur: 4.0,
         spread,
         offset: [0.0, 0.0],
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(96, 96).unwrap();
@@ -112,6 +113,7 @@ fn stacked_drop_shadows_each_contribute_on_their_own_side() {
         blur: 2.0,
         spread: 0.0,
         offset: [-18.0, 0.0],
+        show_behind_node: false,
     });
     // Shadow B: hard black, pushed right.
     n.effects.push(Shadow {
@@ -120,6 +122,7 @@ fn stacked_drop_shadows_each_contribute_on_their_own_side() {
         blur: 2.0,
         spread: 0.0,
         offset: [18.0, 0.0],
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(96, 96).unwrap();
@@ -173,6 +176,7 @@ fn inner_spread_buf(spread: f64) -> Vec<u8> {
         blur: 4.0,
         spread,
         offset: [0.0, 0.0],
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(96, 96).unwrap();
@@ -235,6 +239,7 @@ fn shadow_world_sigma_no_longer_folds_spread() {
         blur: 8.0,
         spread: 0.0,
         offset: [0.0, 0.0],
+        show_behind_node: false,
     };
     let spread_pos = Shadow {
         spread: 20.0,
@@ -260,6 +265,7 @@ fn shadow_world_spread_passes_signed_spread_through() {
         blur: 4.0,
         spread,
         offset: [0.0, 0.0],
+        show_behind_node: false,
     };
     assert_eq!(shadow_world_spread(&mk(12.0)), 12.0);
     assert_eq!(shadow_world_spread(&mk(-7.5)), -7.5);
@@ -286,6 +292,7 @@ fn shadow_expanded_bounds_grows_by_positive_spread() {
         blur: 0.0,
         spread: 10.0,
         offset: [0.0, 0.0],
+        show_behind_node: false,
     });
     let id = n.id;
     doc.apply(Operation::create_node(n)).unwrap();
@@ -302,4 +309,128 @@ fn shadow_expanded_bounds_grows_by_positive_spread() {
     assert!((exp.min_y - (-20.0)).abs() < 1e-6, "min_y {}", exp.min_y);
     assert!((exp.max_x - 20.0).abs() < 1e-6, "max_x {}", exp.max_x);
     assert!((exp.max_y - 20.0).abs() < 1e-6, "max_y {}", exp.max_y);
+}
+
+#[test]
+fn frame_inner_shadow_composites_over_children() {
+    // Figma applies node-level effects to the COMPOSITED node: a frame's inner
+    // shadow darkens edge-touching children instead of hiding beneath them. The
+    // old walk painted inner shadows before the child recursion, so a full-bleed
+    // opaque child completely covered the shadow ring.
+    use fanta_doc::GroupNode;
+
+    let mut doc = Doc::new();
+    let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([40.0, 40.0]),
+        background: Some(Fill::solid(Color::rgb(255, 255, 255))),
+        explicit_modes: Default::default(),
+        ..Default::default()
+    }));
+    frame.transform = Transform2D::translation(-20.0, -20.0);
+    frame.effects.push(Shadow {
+        kind: ShadowKind::Inner,
+        color: Color::rgba(0, 0, 0, 255),
+        blur: 12.0,
+        spread: 0.0,
+        offset: [0.0, 0.0],
+        show_behind_node: false,
+    });
+    let frame_id = frame.id;
+    doc.apply(Operation::create_node(frame)).unwrap();
+
+    // Full-bleed opaque green child covering the whole frame box.
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        40.0,
+        40.0,
+        Color::rgb(0, 200, 0),
+    )));
+    child.parent = Some(frame_id);
+    doc.apply(Operation::create_node(child)).unwrap();
+
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let buf = r.copy_rgba();
+
+    // Frame box is screen (12,12)..(52,52). 2px inside the left edge the inner
+    // shadow must darken the green child; the centre stays (nearly) pure green.
+    let edge = rgba_at(&buf, 64, 14, 32);
+    let centre = rgba_at(&buf, 64, 32, 32);
+    assert!(
+        centre[1] > 160,
+        "centre must stay the child's green, got {centre:?}"
+    );
+    assert!(
+        edge[1] + 40 < centre[1],
+        "inner shadow must darken the child at the frame edge: edge {edge:?} vs centre {centre:?}"
+    );
+}
+
+#[test]
+fn instance_inner_shadow_uses_its_box_silhouette() {
+    // `node_silhouette_path` used to return `None` for Instance nodes, silently
+    // dropping their inner shadows (UI3 carries 38 of them). An instance now
+    // rings its `local_size` box, matching Figma.
+    use fanta_doc::{ComponentDef, ComponentId, ComponentLibrary, InstanceNode, VariableRegistry};
+
+    let mut doc = Doc::new();
+    let mut master = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        20.0,
+        20.0,
+        Color::rgb(255, 0, 0),
+    )));
+    master.transform = Transform2D::translation(10_000.0, 0.0);
+    let root = master.id;
+    doc.apply(Operation::create_node(master)).unwrap();
+
+    let comp = ComponentId::new();
+    let mut lib = ComponentLibrary::new();
+    lib.defs.insert(comp, ComponentDef::new(comp, root, "Rect"));
+
+    let mut inst = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: comp,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [20.0, 20.0],
+    }));
+    inst.transform = Transform2D::translation(-10.0, -10.0);
+    inst.effects.push(Shadow {
+        kind: ShadowKind::Inner,
+        color: Color::rgba(0, 0, 0, 255),
+        blur: 8.0,
+        spread: 0.0,
+        offset: [0.0, 0.0],
+        show_behind_node: false,
+    });
+    doc.apply(Operation::create_node(inst)).unwrap();
+
+    let registry = VariableRegistry::new();
+    let inputs = RenderInputs {
+        components: &lib,
+        variables: &registry,
+        active_modes: &std::collections::BTreeMap::new(),
+        mode_generation: 0,
+        playback: None,
+        dark_ui: false,
+    };
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render_with(&doc.scene, &doc.viewport, &inputs);
+    let buf = r.copy_rgba();
+
+    // Instance box is screen (22,22)..(42,42). 1px inside the left edge the
+    // shadow must darken the master's red; the centre stays (nearly) pure red.
+    let edge = rgba_at(&buf, 64, 23, 32);
+    let centre = rgba_at(&buf, 64, 32, 32);
+    assert!(
+        centre[0] > 160,
+        "centre must stay the master's red, got {centre:?}"
+    );
+    assert!(
+        edge[0] + 40 < centre[0],
+        "instance inner shadow must darken its box edge: edge {edge:?} vs centre {centre:?}"
+    );
 }

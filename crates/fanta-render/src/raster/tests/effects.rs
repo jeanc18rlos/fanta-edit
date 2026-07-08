@@ -34,6 +34,7 @@ fn drop_shadow_bleeds_pixels_outside_the_node_rect() {
                 blur: 8.0,
                 spread: 0.0,
                 offset: [8.0, 8.0],
+                show_behind_node: false,
             });
         }
         doc.apply(Operation::create_node(n)).unwrap();
@@ -258,6 +259,7 @@ fn inner_shadow_does_not_bleed_outside_the_node_rect() {
         blur: 8.0,
         spread: 0.0,
         offset: [8.0, 8.0],
+        show_behind_node: false,
     });
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -297,6 +299,7 @@ fn inner_shadow_darkens_the_interior_edge_away_from_the_offset() {
                 blur: 6.0,
                 spread: 0.0,
                 offset: [6.0, 6.0],
+                show_behind_node: false,
             });
         }
         doc.apply(Operation::create_node(n)).unwrap();
@@ -354,9 +357,11 @@ fn radial_gradient_is_a_node_aspect_ellipse_not_a_circle() {
     let mut v = VectorNode::rect_solid(-30.0, -10.0, 60.0, 20.0, Color::rgb(0, 0, 0));
     // Replace the solid fill (rect_solid seeds exactly one) with the radial.
     v.fills[0] = Fill::Gradient {
+        blend: fanta_doc::BlendMode::Normal,
         gradient: Gradient::Radial {
             center: [0.5, 0.5],
             radius: 0.5,
+            handles: None,
             stops: vec![
                 GradientStop {
                     position: 0.0,

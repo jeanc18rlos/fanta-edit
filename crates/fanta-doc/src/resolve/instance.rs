@@ -396,6 +396,10 @@ fn apply_derived_text(t: &mut crate::node::TextNode, dt: &crate::node::DerivedTe
     if let Some(lh) = dt.line_height {
         if lh > 0.0 {
             t.style.line_height = lh;
+            // The derived entry replaces the master's line height wholesale:
+            // a plain multiple clears any inherited auto marker, while an
+            // auto/metric-relative resolution re-establishes it below.
+            t.style.line_height_auto_percent = dt.line_height_auto_percent;
         }
     }
     if let Some(ls) = dt.letter_spacing {

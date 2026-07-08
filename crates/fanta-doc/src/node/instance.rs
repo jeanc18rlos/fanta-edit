@@ -116,9 +116,16 @@ pub struct DerivedText {
     /// Resolved font size in px.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub font_size: Option<f64>,
-    /// Resolved line height as a unitless multiple of font size.
+    /// Resolved line height as a unitless multiple of font size. When
+    /// [`line_height_auto_percent`](Self::line_height_auto_percent) is also
+    /// set, this holds only its metric-free approximation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_height: Option<f64>,
+    /// Metric-relative resolved line height: percent of the font's INTRINSIC
+    /// line height (Figma "auto" = 100). Mirrors
+    /// [`TextStyle::line_height_auto_percent`](crate::node::TextStyle::line_height_auto_percent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height_auto_percent: Option<f64>,
     /// Resolved extra letter spacing in px.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub letter_spacing: Option<f64>,

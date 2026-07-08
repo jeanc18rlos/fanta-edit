@@ -1,0 +1,21 @@
+[package]
+name = "fanta-canvas"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Viewport (pan/zoom), hit testing, snapping, alignment, distribution."
+
+[dependencies]
+fanta-doc.workspace = true
+
+# Pure math layer. f64 vectors; no rendering deps.
+glam.workspace = true
+serde = { version = "1", features = ["derive"] }
+smallvec = { workspace = true, features = ["serde", "union"] }
+bitflags = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

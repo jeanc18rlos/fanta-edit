@@ -374,11 +374,13 @@ mod tests {
         assert_eq!(fams.first().map(String::as_str), Some("Adobe Clean"));
         let source = fams.iter().position(|f| f == SOURCE_SANS_FAMILY);
         assert!(source.is_some(), "Source Sans must be in chain: {fams:?}");
-        // Inter must NOT be the blanket override — it isn't in this chain at all.
-        assert!(
-            !fams.iter().any(|f| f == INTER_FAMILY),
-            "Inter must not appear as a blanket sans fallback: {fams:?}"
-        );
+        // Inter is only the MISSING-font fallback (the generic chain's head);
+        // the proprietary substitute must outrank it so Adobe Clean paints
+        // Source Sans, never Inter.
+        let inter = fams.iter().position(|f| f == INTER_FAMILY);
+        if let (Some(s), Some(i)) = (source, inter) {
+            assert!(s < i, "Source must precede the Inter fallback: {fams:?}");
+        }
         // Source must precede any generic system sans.
         let helvetica = fams.iter().position(|f| f == "Helvetica");
         if let (Some(s), Some(h)) = (source, helvetica) {
@@ -416,19 +418,35 @@ mod tests {
     }
 
     #[test]
-    fn inter_is_available_by_name_but_not_a_blanket_override() {
+    fn unknown_sans_falls_back_to_inter_like_figma_missing_fonts() {
         let r = FontResolver::new();
         // Requesting Inter explicitly resolves to Inter (still available).
         assert_eq!(
             r.resolve_families("Inter").first().map(String::as_str),
             Some("Inter")
         );
-        // But a plain unknown sans family does NOT silently become Inter.
+        // Figma renders MISSING fonts in Inter, so an unknown, uninstalled sans
+        // family must land on bundled Inter — deterministically, ahead of the
+        // machine's system sans faces — while the requested name still leads so
+        // an installed family always wins.
         let unknown = r.resolve_families("Totally Unknown Sans XYZ");
-        assert!(
-            !unknown.iter().any(|f| f == INTER_FAMILY),
-            "unknown family must not fall back to Inter: {unknown:?}"
+        assert_eq!(
+            unknown.first().map(String::as_str),
+            Some("Totally Unknown Sans XYZ")
         );
+        let inter = unknown.iter().position(|f| f == INTER_FAMILY);
+        let helvetica = unknown.iter().position(|f| f == "Helvetica");
+        assert!(
+            inter.is_some(),
+            "unknown sans must carry the Inter fallback: {unknown:?}"
+        );
+        if let (Some(i), Some(h)) = (inter, helvetica) {
+            assert!(
+                i < h,
+                "Inter must precede system sans faces so the missing-font \
+                 substitution is deterministic: {unknown:?}"
+            );
+        }
     }
 
     #[test]

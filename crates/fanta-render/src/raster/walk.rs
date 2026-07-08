@@ -5,9 +5,9 @@
 use super::{
     AssetResolver, Bounds, Canvas, CanvasNode, ImageCache, InstanceCache, MaskType, NodeData,
     NodeFlags, NodeId, Paint, RenderInputs, RenderMetrics, Scene, apply_background_blur,
-    begin_effects_layer, draw_inner_shadows, effects_layer_bounds, paint_node_content,
-    paint_node_foreground, render_instance, resolve_bound_value, shadow_expanded_world_bounds,
-    to_sk_matrix,
+    begin_effects_layer, draw_inner_shadows, effects_layer_bounds, padded_layer_rect,
+    paint_node_content, paint_node_foreground, render_instance, resolve_bound_value,
+    shadow_expanded_local_bounds, shadow_expanded_world_bounds, to_sk_matrix,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,17 +122,21 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     apply_background_blur(canvas, node, Some(id), ctx.scene, ctx.effective_scale);
 
     // Wrap this node's contribution in a save-layer when it needs one: opacity
-    // < 1.0, ≥1 drop shadow, a LAYER blur, or a non-`Normal` blend mode. The
+    // < 1.0, ≥1 drop shadow, a LAYER blur, a non-`Normal` blend mode, or an
+    // ISOLATED_BLEND container (children flatten into their own group so a
+    // descendant's blend mode stops at the group instead of the backdrop). The
     // layer composites strokes/fills/children together, then blends the whole
     // node (with its shadow behind it, the layer Gaussian-blurred) at the
     // requested alpha and blend mode. A node with full opacity, no shadows, no
-    // layer blur, and `Normal` blend allocates no layer (the hot path).
+    // layer blur, `Normal` blend, and pass-through allocates no layer (the hot
+    // path).
     let used_layer = begin_effects_layer(
         canvas,
         opacity,
         node.blend_mode,
         &node.effects,
         &node.blurs,
+        node.flags.contains(NodeFlags::ISOLATED_BLEND),
         ctx.effective_scale,
         effects_layer_bounds(node, Some(id), ctx.scene),
     );
@@ -142,10 +146,6 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // pass `Some(id)`; the transient (instance) walk passes `None` and uses the
     // clip box only.
     let content_state = paint_node_content(canvas, node, Some(id), ctx);
-
-    // Inner shadows ride ON TOP of the node's own fill (and under any children),
-    // clipped to its silhouette. Drop shadows already rode the layer paint above.
-    draw_inner_shadows(canvas, node, Some(id), ctx);
 
     if let NodeData::Instance(inst) = &node.data {
         render_instance(canvas, node.id, inst, ctx);
@@ -187,6 +187,17 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
                     .filter(|n| n.is_mask && !n.flags.contains(NodeFlags::HIDDEN))
                     .map(|n| n.mask_type)
             },
+            // One child subtree's painted extent in THIS node's local space:
+            // the scene's memoized subtree bounds, expanded by the child's own
+            // drop-shadow / layer-blur reach (descendant shadows are absorbed
+            // by the shared device-pixel pad, like the cull box), mapped
+            // through the child's transform.
+            |ctx, &child| {
+                let node = ctx.scene.get(child)?;
+                let local = ctx.scene.local_bounds(child)?;
+                shadow_expanded_local_bounds(local, &node.effects, &node.blurs, ctx.effective_scale)
+                    .try_transformed(&node.transform)
+            },
             |canvas, ctx, &child| render_node(canvas, child, ctx),
         );
     }
@@ -195,6 +206,15 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
         canvas.restore();
     }
     paint_node_foreground(canvas, node, Some(id), ctx);
+
+    // Inner shadows composite over the node's flattened content — fill, border,
+    // AND children — clipped to its silhouette (Figma applies node-level effects
+    // to the composited node, so a frame's inner shadow darkens edge-touching
+    // children instead of hiding beneath them). Painted after the child clip is
+    // restored (its own silhouette clip still confines it) and inside the
+    // effects layer so opacity/blend apply to the shadow too. Drop shadows
+    // already rode the layer paint above.
+    draw_inner_shadows(canvas, node, Some(id), ctx);
 
     if used_layer {
         canvas.restore();
@@ -247,14 +267,30 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
 ///
 /// Nested masks recurse naturally because each subtree paints through its own
 /// `paint_child_sequence`.
-pub(crate) fn paint_child_sequence<C, M, P>(
+///
+/// ## Layer bounds
+///
+/// Without explicit bounds Skia sizes each of these offscreen layers from the
+/// clip — the whole viewport — so at high zoom every masked run costs a stack
+/// of viewport-sized allocations per frame (the same pathology
+/// [`begin_effects_layer`] bounds away). `bounds_of` reports one child
+/// subtree's painted extent in the CURRENT canvas space (shadow-expanded, so a
+/// child's drop shadow is not cropped); the union over the masked run, padded
+/// like the effects layer, bounds the content layer. Every `DstIn` mask layer
+/// uses the SAME rect deliberately: a mask layer smaller than the content
+/// layer would leave whatever it doesn't cover un-multiplied — i.e. visible
+/// UNmasked — at restore time. If any child's extent is unknown (`None`) the
+/// run falls back to unbounded layers — correct, just slower.
+pub(crate) fn paint_child_sequence<C, M, B, P>(
     canvas: &Canvas,
     ctx: &mut RenderCtx,
     children: &[C],
     mut mask_of: M,
+    mut bounds_of: B,
     mut paint: P,
 ) where
     M: FnMut(&RenderCtx, &C) -> Option<MaskType>,
+    B: FnMut(&RenderCtx, &C) -> Option<Bounds>,
     P: FnMut(&Canvas, &mut RenderCtx, &C),
 {
     let mut i = 0;
@@ -289,8 +325,40 @@ pub(crate) fn paint_child_sequence<C, M, P>(
             continue;
         }
 
+        // The shared bounds for the content layer AND every mask layer of this
+        // run (see the fn docs for why they must match): the padded union of
+        // the masked children's extents, or `None` (unbounded) when any extent
+        // is unknown.
+        let layer_bounds = {
+            let mut acc: Option<Bounds> = None;
+            let mut all_known = true;
+            for child in &children[content_start..content_end] {
+                match bounds_of(ctx, child) {
+                    Some(b) => {
+                        acc = Some(match acc {
+                            Some(a) => a.union(&b),
+                            None => b,
+                        });
+                    }
+                    None => {
+                        all_known = false;
+                        break;
+                    }
+                }
+            }
+            match (all_known, acc) {
+                (true, Some(b)) => Some(padded_layer_rect(&b, ctx.effective_scale)),
+                _ => None,
+            }
+        };
+
         // (1) Offscreen content layer: paint the masked siblings into it.
-        canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default());
+        let content_rec = skia_safe::canvas::SaveLayerRec::default();
+        let content_rec = match layer_bounds.as_ref() {
+            Some(rect) => content_rec.bounds(rect),
+            None => content_rec,
+        };
+        canvas.save_layer(&content_rec);
         for child in &children[content_start..content_end] {
             paint(canvas, ctx, child);
         }
@@ -309,7 +377,12 @@ pub(crate) fn paint_child_sequence<C, M, P>(
             if mask_type == MaskType::Luminance {
                 mask_paint.set_color_filter(skia_safe::ColorFilter::luma());
             }
-            canvas.save_layer(&skia_safe::canvas::SaveLayerRec::default().paint(&mask_paint));
+            let mask_rec = skia_safe::canvas::SaveLayerRec::default().paint(&mask_paint);
+            let mask_rec = match layer_bounds.as_ref() {
+                Some(rect) => mask_rec.bounds(rect),
+                None => mask_rec,
+            };
+            canvas.save_layer(&mask_rec);
             paint(canvas, ctx, mask_child);
         }
         // Restore each mask layer (DstIn composited onto the layer below), then

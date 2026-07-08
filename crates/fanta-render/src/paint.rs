@@ -4,7 +4,7 @@
 //! [`Stroke`]: fanta_doc::Stroke
 
 use crate::color::{to_sk_color, to_sk_color4f};
-use fanta_doc::{Fill, Gradient, GradientStop, Stroke, StrokeCap, StrokeJoin};
+use fanta_doc::{BlendMode, Fill, Gradient, GradientStop, Stroke, StrokeCap, StrokeJoin};
 use skia_safe::{
     Matrix, Paint, Point, Shader, TileMode, paint::Cap, paint::Join, paint::Style as PaintStyle,
 };
@@ -15,6 +15,10 @@ use skia_safe::{
 /// gradient endpoints (which are stored in normalized 0..=1 space). For
 /// image fills this also drives the texture sampling rectangle; assets
 /// are resolved via [`AssetResolver`] in the calling renderer.
+///
+/// A per-paint `blend` (Figma's paint-level blend mode, carried by gradient
+/// fills) rides on the returned paint, so the layer composites against the
+/// paints below it — and the backdrop — with that mode.
 pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
     let mut paint = Paint::default();
     paint.set_anti_alias(true);
@@ -23,9 +27,12 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
         Fill::Solid { color } => {
             paint.set_color(to_sk_color(*color));
         }
-        Fill::Gradient { gradient } => {
+        Fill::Gradient { gradient, blend } => {
             if let Some(shader) = gradient_to_shader(gradient, local_bounds) {
                 paint.set_shader(shader);
+            }
+            if !blend.is_normal() {
+                paint.set_blend_mode(to_sk_blend_mode(*blend));
             }
         }
         Fill::Image { .. } => {
@@ -37,6 +44,34 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
         }
     }
     paint
+}
+
+/// Map a [`fanta_doc::BlendMode`] to its [`skia_safe::BlendMode`] equivalent.
+///
+/// `fanta_doc::BlendMode` is the CSS Compositing Level 1 / `SkBlendMode` set, so
+/// each separable + non-separable mode has an exact Skia counterpart. `Normal`
+/// maps to Skia `SrcOver` (regular alpha-over). Owned here so the node-level
+/// effects layer and the per-paint fill/image blends share one mapping.
+pub(crate) fn to_sk_blend_mode(mode: BlendMode) -> skia_safe::BlendMode {
+    use skia_safe::BlendMode as Sk;
+    match mode {
+        BlendMode::Normal => Sk::SrcOver,
+        BlendMode::Multiply => Sk::Multiply,
+        BlendMode::Screen => Sk::Screen,
+        BlendMode::Overlay => Sk::Overlay,
+        BlendMode::Darken => Sk::Darken,
+        BlendMode::Lighten => Sk::Lighten,
+        BlendMode::ColorDodge => Sk::ColorDodge,
+        BlendMode::ColorBurn => Sk::ColorBurn,
+        BlendMode::HardLight => Sk::HardLight,
+        BlendMode::SoftLight => Sk::SoftLight,
+        BlendMode::Difference => Sk::Difference,
+        BlendMode::Exclusion => Sk::Exclusion,
+        BlendMode::Hue => Sk::Hue,
+        BlendMode::Saturation => Sk::Saturation,
+        BlendMode::Color => Sk::Color,
+        BlendMode::Luminosity => Sk::Luminosity,
+    }
 }
 
 /// Convert a [`Stroke`] into a paint pre-configured with style = stroke.
@@ -91,6 +126,7 @@ fn gradient_to_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader> {
         Gradient::Radial {
             center,
             radius,
+            handles,
             stops,
         } => {
             // `center`/`radius` live in the node's normalized 0–1 local space.
@@ -103,11 +139,29 @@ fn gradient_to_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader> {
             // any non-square node.) We build the shader in unit space and let
             // Skia apply the ellipse via `local_matrix`, so a degenerate
             // `w == h` collapses back to the faithful circle.
-            let unit_center = Point::new(center[0], center[1]);
             let (colors, positions) = stops_to_arrays(stops);
-            let local_matrix = node_local_matrix(x, y, w, h);
+            let mut local_matrix = node_local_matrix(x, y, w, h);
+            // Full axis handles (a rotated and/or anisotropic radial): the
+            // ellipse is `center` plus the two axis vectors to the handle
+            // endpoints. Build the gradient on the CANONICAL unit circle
+            // (origin, radius 1) and let the handle matrix carry it onto the
+            // rotated ellipse — the node-aspect matrix above then maps
+            // normalized space onto pixels as usual. Degenerate handles
+            // (zero-area axes) fall back to the aspect-only ellipse.
+            if let Some(axes) = (*handles).and_then(|ends| handle_axes_matrix(*center, ends)) {
+                local_matrix.pre_concat(&axes);
+                return Shader::radial_gradient(
+                    Point::new(0.0, 0.0),
+                    1.0,
+                    colors.as_slice(),
+                    Some(positions.as_slice()),
+                    TileMode::Clamp,
+                    None,
+                    Some(&local_matrix),
+                );
+            }
             Shader::radial_gradient(
-                unit_center,
+                Point::new(center[0], center[1]),
                 *radius,
                 colors.as_slice(),
                 Some(positions.as_slice()),
@@ -146,6 +200,7 @@ fn gradient_to_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader> {
         Gradient::Diamond {
             center,
             radius,
+            handles,
             stops,
         } => {
             // Diamond gradient: the iso-distance contours are axis-aligned
@@ -162,9 +217,37 @@ fn gradient_to_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader> {
             // iso-contours are real rhombi. A baked tile keeps us off
             // skia-safe 0.84's `RuntimeEffect::make_for_shader`, whose options
             // argument has an unsatisfiable higher-ranked lifetime bound.
-            diamond_shader([x, y, w, h], *center, *radius, stops, DIAMOND_TILE)
+            // Axis `handles` (a rotated/anisotropic diamond) ride the same
+            // baked tile through an extra affine — see `diamond_shader`.
+            diamond_shader(
+                [x, y, w, h],
+                *center,
+                *radius,
+                *handles,
+                stops,
+                DIAMOND_TILE,
+            )
         }
     }
+}
+
+/// The affine mapping the CANONICAL gradient space (origin-centered, radius-1
+/// unit circle / unit diamond) onto a gradient authored with full axis
+/// HANDLES: column one is the x-axis vector `ends[0] − center`, column two the
+/// y-axis vector `ends[1] − center`, translation `center` — all in the node's
+/// normalized 0–1 space. `None` when the axes span (near-)zero area, letting
+/// callers fall back to the aspect-only mapping instead of emitting a
+/// degenerate shader.
+fn handle_axes_matrix(center: [f32; 2], ends: [[f32; 2]; 2]) -> Option<Matrix> {
+    let x_axis = [ends[0][0] - center[0], ends[0][1] - center[1]];
+    let y_axis = [ends[1][0] - center[0], ends[1][1] - center[1]];
+    let det = x_axis[0] * y_axis[1] - x_axis[1] * y_axis[0];
+    if !det.is_finite() || det.abs() < 1e-6 {
+        return None;
+    }
+    Some(Matrix::new_all(
+        x_axis[0], y_axis[0], center[0], x_axis[1], y_axis[1], center[1], 0.0, 0.0, 1.0,
+    ))
 }
 
 /// Edge length (texels) of the baked diamond ramp tile. The tile encodes the
@@ -180,15 +263,30 @@ const DIAMOND_TILE: usize = 256;
 /// turning that image into a clamped image shader mapped onto the node rect.
 /// Returns `None` if the image can't be built — the fill is then skipped rather
 /// than drawing garbage; never panics.
+///
+/// With axis `handles` (a rotated/anisotropic diamond) the ramp is instead
+/// baked in a CANONICAL frame — center `(0.5, 0.5)`, radius `0.5`, so `t = 1`
+/// lands exactly on the tile edge midpoints — and an extra affine (canonical
+/// square → `center ± axes` parallelogram, via [`handle_axes_matrix`]) is
+/// folded into the local matrix. Degenerate handles fall back to the
+/// aspect-only mapping, keeping the handle-less path byte-identical.
 fn diamond_shader(
     bounds: [f32; 4],
     center: [f32; 2],
     radius: f32,
+    handles: Option<[[f32; 2]; 2]>,
     stops: &[GradientStop],
     n: usize,
 ) -> Option<Shader> {
     use skia_safe::{AlphaType, ColorType, FilterMode, ImageInfo, MipmapMode, SamplingOptions};
     let [x, y, w, h] = bounds;
+
+    let axes = handles.and_then(|ends| handle_axes_matrix(center, ends));
+    let (center, radius) = if axes.is_some() {
+        ([0.5, 0.5], 0.5)
+    } else {
+        (center, radius)
+    };
 
     // Guard a degenerate radius so the divide can't produce NaN/inf.
     let r = if radius.abs() < f32::EPSILON {
@@ -236,6 +334,13 @@ fn diamond_shader(
     // rect: scale unit→rect (anisotropic for non-square nodes, the diamond
     // signature is preserved), then scale 1/N to go from rect-unit to texels.
     let mut local_matrix = node_local_matrix(x, y, w, h);
+    // Handle axes: the canonical bake frame's unit square maps onto the
+    // parallelogram `center ± axes` — i.e. canonical point q → axes·(2q − 1).
+    if let Some(axes_matrix) = axes {
+        local_matrix.pre_concat(&axes_matrix);
+        let square_to_canonical = Matrix::new_all(2.0, 0.0, -1.0, 0.0, 2.0, -1.0, 0.0, 0.0, 1.0);
+        local_matrix.pre_concat(&square_to_canonical);
+    }
     let mut to_texels = Matrix::new_identity();
     to_texels.set_scale((1.0 / n as f32, 1.0 / n as f32), None);
     // shader-space point → (node_local · to_texels)⁻¹ is what Skia applies; we
@@ -373,6 +478,7 @@ mod tests {
         // A conic/angular gradient must produce a shader (Skia sweep_gradient),
         // not drop the fill or collapse to a flat color.
         let fill = Fill::Gradient {
+            blend: fanta_doc::BlendMode::Normal,
             gradient: fanta_doc::Gradient::Angular {
                 center: [0.5, 0.5],
                 start_angle: 0.0,
@@ -403,9 +509,11 @@ mod tests {
     fn diamond_gradient_builds_a_shader() {
         // A diamond gradient must produce a shader (SkSL L1-distance + ramp).
         let fill = Fill::Gradient {
+            blend: fanta_doc::BlendMode::Normal,
             gradient: fanta_doc::Gradient::Diamond {
                 center: [0.5, 0.5],
                 radius: 0.5,
+                handles: None,
                 stops: vec![
                     GradientStop {
                         position: 0.0,
@@ -440,7 +548,7 @@ mod tests {
                 color: Color::BLACK,
             },
         ];
-        let shader = diamond_shader([0.0, 0.0, 120.0, 40.0], [0.5, 0.5], 0.5, &stops, 64);
+        let shader = diamond_shader([0.0, 0.0, 120.0, 40.0], [0.5, 0.5], 0.5, None, &stops, 64);
         assert!(
             shader.is_some(),
             "the baked diamond image shader must build for a non-square node"
@@ -490,9 +598,11 @@ mod tests {
         // The radial branch must produce a shader (with the ellipse local-matrix
         // attached) rather than dropping the fill on a non-square node.
         let fill = Fill::Gradient {
+            blend: fanta_doc::BlendMode::Normal,
             gradient: fanta_doc::Gradient::Radial {
                 center: [0.5, 0.5],
                 radius: 0.5,
+                handles: None,
                 stops: vec![
                     GradientStop {
                         position: 0.0,
@@ -510,5 +620,127 @@ mod tests {
             paint.shader().is_some(),
             "a radial gradient on a wide node must still build a shader"
         );
+    }
+
+    /// The gradient editor can transiently hand the renderer pathological
+    /// gradients — a fill mid-edit with zero or one stop, a stop dragged to a
+    /// non-finite position, coincident linear endpoints, a collapsed radius, or
+    /// degenerate axis handles. None of these may panic (skia-safe's gradient
+    /// constructors abort on some malformed inputs): a degenerate gradient must
+    /// resolve to *no shader* (the fill is skipped) rather than taking down the
+    /// process. This is the render-side guard for the "crashes on opening
+    /// gradients" report — the panel path is covered by `fig_viewer`'s suite.
+    #[test]
+    fn degenerate_gradients_never_panic_and_drop_the_shader() {
+        let nan = f32::NAN;
+        let one = vec![GradientStop {
+            position: 0.0,
+            color: Color::WHITE,
+        }];
+        let nan_pos = vec![
+            GradientStop {
+                position: nan,
+                color: Color::WHITE,
+            },
+            GradientStop {
+                position: 1.0,
+                color: Color::BLACK,
+            },
+        ];
+        let two = vec![
+            GradientStop {
+                position: 0.0,
+                color: Color::WHITE,
+            },
+            GradientStop {
+                position: 1.0,
+                color: Color::BLACK,
+            },
+        ];
+
+        let gradients = [
+            // Empty and single-stop of every kind.
+            Gradient::Linear {
+                start: [0.0, 0.0],
+                end: [1.0, 1.0],
+                stops: vec![],
+            },
+            Gradient::Linear {
+                start: [0.0, 0.0],
+                end: [1.0, 1.0],
+                stops: one.clone(),
+            },
+            // Coincident linear endpoints (zero-length axis).
+            Gradient::Linear {
+                start: [0.5, 0.5],
+                end: [0.5, 0.5],
+                stops: two.clone(),
+            },
+            // Non-finite stop position.
+            Gradient::Linear {
+                start: [0.0, 0.0],
+                end: [1.0, 1.0],
+                stops: nan_pos.clone(),
+            },
+            // Non-finite endpoints.
+            Gradient::Linear {
+                start: [nan, nan],
+                end: [1.0, 1.0],
+                stops: two.clone(),
+            },
+            Gradient::Radial {
+                center: [0.5, 0.5],
+                radius: 0.0,
+                handles: None,
+                stops: two.clone(),
+            },
+            Gradient::Radial {
+                center: [nan, nan],
+                radius: nan,
+                handles: None,
+                stops: one.clone(),
+            },
+            Gradient::Radial {
+                center: [0.5, 0.5],
+                radius: 0.5,
+                handles: Some([[nan, nan], [nan, nan]]),
+                stops: two.clone(),
+            },
+            Gradient::Angular {
+                center: [0.5, 0.5],
+                start_angle: nan,
+                stops: vec![],
+            },
+            Gradient::Angular {
+                center: [nan, nan],
+                start_angle: 0.0,
+                stops: one.clone(),
+            },
+            Gradient::Diamond {
+                center: [0.5, 0.5],
+                radius: 0.0,
+                handles: None,
+                stops: two.clone(),
+            },
+            Gradient::Diamond {
+                center: [0.5, 0.5],
+                radius: 0.5,
+                handles: Some([[nan, nan], [nan, nan]]),
+                stops: one,
+            },
+        ];
+
+        // Also exercise a zero-size node rect, which the editor produces before
+        // the first layout pass. The assertion is simply that we return without
+        // panicking; whether a shader is built is left to each branch.
+        for gradient in gradients {
+            for bounds in [[0.0, 0.0, 120.0, 40.0], [0.0, 0.0, 0.0, 0.0]] {
+                let fill = Fill::Gradient {
+                    blend: fanta_doc::BlendMode::Normal,
+                    gradient: gradient.clone(),
+                };
+                let _ = fill_to_paint(&fill, bounds);
+            }
+        }
     }
 }

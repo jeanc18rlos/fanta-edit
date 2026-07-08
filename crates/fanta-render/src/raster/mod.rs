@@ -104,7 +104,7 @@ pub(crate) use content::{paint_node_content, paint_node_foreground};
 pub(crate) use cull::visible_world_rect;
 pub(crate) use effects::{
     apply_background_blur, begin_effects_layer, draw_inner_shadows, effects_layer_bounds,
-    shadow_expanded_world_bounds,
+    padded_layer_rect, shadow_expanded_local_bounds, shadow_expanded_world_bounds,
 };
 pub(crate) use instance::render_instance;
 pub(crate) use renderer::{InstanceCache, InstanceCacheKey, hash_overrides};
@@ -129,9 +129,9 @@ pub(crate) use text::{clear_layout_cache, layout_cache_len};
 // `use super::*;` resolves the same names the monolith's top-of-file `use`s did.
 pub(crate) use crate::asset::AssetResolver;
 pub(crate) use crate::color::to_sk_color;
-pub(crate) use crate::image::{ImageCache, draw_image_cached};
-pub(crate) use crate::paint::{fill_to_paint, stroke_to_paint};
-pub(crate) use crate::path::to_sk_path;
+pub(crate) use crate::image::{ImageCache, ImageFillMods, draw_image_cached};
+pub(crate) use crate::paint::{fill_to_paint, stroke_to_paint, to_sk_blend_mode};
+pub(crate) use crate::path::{to_sk_fill_path, to_sk_path};
 pub(crate) use crate::transform::to_sk_matrix;
 pub(crate) use fanta_doc::{
     BlendMode, Bounds, CanvasNode, Color, ComponentLibrary, ExpandedNode, Fill, InstanceNode,

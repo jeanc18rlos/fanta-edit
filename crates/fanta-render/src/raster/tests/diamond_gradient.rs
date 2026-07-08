@@ -20,6 +20,7 @@ fn diamond_doc(half: f64) -> Doc {
     let gradient = fanta_doc::Gradient::Diamond {
         center: [0.5, 0.5],
         radius: 0.5,
+        handles: None,
         stops: vec![
             GradientStop {
                 position: 0.0,
@@ -33,10 +34,14 @@ fn diamond_doc(half: f64) -> Doc {
     };
     let node = VectorNode {
         path: PathData::rect(-half, -half, half * 2.0, half * 2.0),
-        fills: smallvec_of(Fill::Gradient { gradient }),
+        fills: smallvec_of(Fill::Gradient {
+            gradient,
+            blend: fanta_doc::BlendMode::Normal,
+        }),
         strokes: Default::default(),
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     };
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(CanvasNode::new(NodeData::Vector(

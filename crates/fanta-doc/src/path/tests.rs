@@ -287,3 +287,23 @@ fn svg_d_parses_smooth_cubic_and_quadratic() {
 fn svg_d_rejects_garbage_number() {
     assert!(PathData::from_svg_d("M zz 0").is_err());
 }
+
+#[test]
+fn subpath_rules_round_trip_and_default_empty() {
+    // Empty per-subpath rules are skipped (old docs byte-identical); absent
+    // field loads as empty; a mixed-rule path round-trips its rule list.
+    let plain = PathData::rect(0.0, 0.0, 4.0, 4.0);
+    let s = serde_json::to_string(&plain).unwrap();
+    assert!(!s.contains("subpath_rules"), "skipped when empty: {s}");
+    let loaded: PathData = serde_json::from_str(&s).unwrap();
+    assert!(loaded.subpath_rules.is_empty());
+
+    let mut mixed = PathData::rect(0.0, 0.0, 4.0, 4.0);
+    mixed.move_to(1.0, 1.0);
+    mixed.line_to(2.0, 1.0);
+    mixed.close();
+    mixed.subpath_rules = vec![FillRule::NonZero, FillRule::EvenOdd];
+    let j = serde_json::to_string(&mixed).unwrap();
+    let back: PathData = serde_json::from_str(&j).unwrap();
+    assert_eq!(back, mixed);
+}

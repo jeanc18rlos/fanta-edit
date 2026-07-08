@@ -38,16 +38,19 @@ pub(crate) fn paint_node_content(
 ) -> ContentPaintState {
     let mut state = ContentPaintState::default();
     match &node.data {
-        NodeData::Instance(i) => {
+        NodeData::Instance(_) => {
             // The instance's own content is nothing — its pixels come from the
-            // expanded subtree, drawn by the caller. We only set up the frame
-            // clip here so the master's content is confined to the instance
-            // box (Figma instances clip like a frame). `local_size` is the
-            // instance's box, independent of the master's size.
-            let [w, h] = i.local_size;
-            canvas.save();
-            canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
-            state.restore_child_clip = true;
+            // expanded subtree, drawn by the caller. No clip is pushed here:
+            // the expansion root is a frame whose `clip_size` is pinned to the
+            // instance box (`pin_expansion_root_box`), so the root's own Group
+            // arm clips the master's CONTENT to the instance box exactly like
+            // a frame placed in the scene — while the root frame's own border
+            // (painted by `paint_node_foreground` after that clip is restored)
+            // correctly escapes it. The old instance-box `clip_rect` here
+            // wrapped the whole expansion, so an Outside-aligned stroke on the
+            // master's root frame was clipped away — Figma renders it.
+            // A master with clipping disabled (`clip_content=false` /
+            // `frameMaskDisabled`) then also correctly overflows its instance.
         }
         NodeData::Group(g) => {
             // A Figma frame is a group carrying a background fill (and usually a
@@ -72,14 +75,85 @@ pub(crate) fn paint_node_content(
                 }
                 None => None,
             };
+
+            // Frame clipping: a Figma FRAME usually confines its content to its
+            // box, whereas a plain group/page lets content overflow. The box is
+            // carried by `clip_size`; `meta.clip_content=false` preserves the
+            // box/background/border while disabling the descendant crop
+            // (`frameMaskDisabled=true` and SECTION).
+            //
+            // The clip is pushed BEFORE the background is painted, deliberately:
+            // the background is then drawn with a ~1-device-px outward bleed so
+            // ONE anti-aliased edge — the clip's — governs both the background
+            // fill and the children. Painting the background with its own,
+            // independently-computed AA edge (the old order) left a fractional-
+            // pixel conflation seam wherever an opaque dark frame fill was
+            // exactly covered by lighter children: the background's path edge
+            // and the children's clip edge each contributed partial coverage,
+            // and the residual `c·(1-c)` of the dark fill read as a gray
+            // hairline along every section boundary at non-integer zoom.
+            //
+            // A rounded frame clips to its ROUNDED-rect path so children respect
+            // the corner radius; a square frame clips to the plain rect. The clip
+            // is in node-LOCAL space because `node.transform` is already
+            // concatenated by the caller. It is applied within this node's
+            // `save()`/`restore()` pair — and BEFORE the child recursion that
+            // follows in the caller — so it scopes exactly this frame's subtree.
+            // Anti-aliased (`true`) to match the soft edges the rest of the
+            // renderer draws.
+            let clips_content = node
+                .meta
+                .get("clip_content")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let clipping = clips_content && g.clip_size.is_some();
+            if clipping && let Some([w, h]) = g.clip_size {
+                canvas.save();
+                if g.corner_radius.is_some() || g.corner_radii.is_some() {
+                    let path = rounded_rect_path(
+                        [0.0, 0.0, w as f32, h as f32],
+                        g.corner_radius,
+                        g.corner_radii,
+                        g.corner_smoothing,
+                    );
+                    canvas.clip_path(&path, None, true);
+                } else {
+                    canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
+                }
+                state.restore_child_clip = true;
+            }
+
+            // The bleed: when this frame clips, the background geometry is grown
+            // outward by ~1 device pixel (converted to local units through the
+            // canvas scale) so the clip edge — not the fill's own path edge —
+            // is the single AA boundary. Confined by the clip just pushed, the
+            // bleed never paints outside the frame's true silhouette. A
+            // non-clipping group keeps the exact geometry (no clip to confine a
+            // bleed, and nothing to seam against).
+            let bleed = if clipping {
+                let scale = f64::from(ctx.effective_scale);
+                if scale.is_finite() && scale > 0.0 {
+                    1.0 / scale
+                } else {
+                    1.0
+                }
+            } else {
+                0.0
+            };
             // The rounded-rect path of the frame box (square when no radius),
             // shared by the background fill and the border stroke so they round
             // identically. Built once and reused.
             let box_path = box_bounds.map(|b| {
+                let grown = Bounds {
+                    min_x: b.min_x - bleed,
+                    min_y: b.min_y - bleed,
+                    max_x: b.max_x + bleed,
+                    max_y: b.max_y + bleed,
+                };
                 rounded_rect_path(
-                    bounds_to_f32(&b),
-                    g.corner_radius,
-                    g.corner_radii,
+                    bounds_to_f32(&grown),
+                    g.corner_radius.map(|r| r + bleed),
+                    g.corner_radii.map(|radii| radii.map(|r| r + bleed)),
                     g.corner_smoothing,
                 )
             });
@@ -97,6 +171,9 @@ pub(crate) fn paint_node_content(
                         mode,
                         opacity,
                         crop,
+                        scale,
+                        rotation,
+                        blend,
                     } = fill
                     {
                         // Hoisted so the resolve closure captures a local, not
@@ -116,6 +193,11 @@ pub(crate) fn paint_node_content(
                             *mode,
                             None,
                             *opacity,
+                            super::ImageFillMods {
+                                scale: *scale,
+                                rotation: *rotation,
+                                blend: *blend,
+                            },
                         );
                         canvas.restore();
                         if !drawn {
@@ -138,48 +220,6 @@ pub(crate) fn paint_node_content(
                     paint_box_fill(bg);
                 }
             }
-
-            // Frame clipping: a Figma FRAME usually confines its content to its
-            // box, whereas a plain group/page lets content overflow. The box is
-            // carried by `clip_size`; `meta.clip_content=false` preserves the
-            // box/background/border while disabling the descendant crop
-            // (`frameMaskDisabled=true` and SECTION).
-            //
-            // A rounded frame clips to its ROUNDED-rect path so children respect
-            // the corner radius; a square frame clips to the plain rect (cheaper,
-            // and identical to the old behaviour). The clip is in node-LOCAL
-            // space because `node.transform` is already concatenated by the
-            // caller (so a translated/rotated frame clips to its own oriented
-            // box). It is applied within this node's `save()`/`restore()` pair —
-            // and BEFORE the child recursion that follows in the caller — so it
-            // scopes exactly this frame's subtree and is lifted off the stack
-            // before any sibling is drawn, never leaking. The background is
-            // painted before this child slot; the foreground stroke is painted
-            // after the child slot is restored.
-            //
-            // Anti-aliased (`true`) to match the soft edges the rest of the
-            // renderer draws, so a clipped child's boundary doesn't show a hard
-            // aliased step against the frame edge.
-            let clips_content = node
-                .meta
-                .get("clip_content")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if clips_content && let Some([w, h]) = g.clip_size {
-                canvas.save();
-                if g.corner_radius.is_some() || g.corner_radii.is_some() {
-                    let path = rounded_rect_path(
-                        [0.0, 0.0, w as f32, h as f32],
-                        g.corner_radius,
-                        g.corner_radii,
-                        g.corner_smoothing,
-                    );
-                    canvas.clip_path(&path, None, true);
-                } else {
-                    canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
-                }
-                state.restore_child_clip = true;
-            }
         }
         NodeData::Vector(v) => {
             draw_vector(
@@ -189,6 +229,7 @@ pub(crate) fn paint_node_content(
                 &v.strokes,
                 v.corner_radius,
                 v.corner_radii,
+                v.corner_smoothing,
                 ctx,
             );
         }
@@ -220,6 +261,7 @@ pub(crate) fn paint_node_content(
                 b.fit,
                 b.tint,
                 1.0,
+                super::ImageFillMods::default(),
             );
             if !drawn {
                 draw_placeholder(canvas, b.local_size, Color::rgba(120, 200, 255, 100));
@@ -257,6 +299,7 @@ pub(crate) fn paint_node_content(
                     v.fit,
                     None,
                     1.0,
+                    super::ImageFillMods::default(),
                 );
                 canvas.restore();
                 if ok {

@@ -2,11 +2,11 @@
 
 use super::{
     Color, Fill, GroupNode, KiwiValue, Stroke, StrokeAlign, StrokeCap, StrokeJoin, corner_radii,
-    read_fills, read_paint,
+    corner_smoothing, read_fills, read_paint,
 };
 
 /// Build the node's stroke(s) from `strokePaints` + `strokeWeight` (+
-/// `strokeAlign`, `strokeCap`, `strokeJoin`, `dashPattern`, `strokeMiterAngle`).
+/// `strokeAlign`, `strokeCap`, `strokeJoin`, `dashPattern`, `miterLimit`).
 ///
 /// **Every** visible stroke paint (solid OR gradient) becomes its own [`Stroke`]
 /// — Figma stacks multiple stroke paints on one node (e.g. a solid edge under a
@@ -27,7 +27,7 @@ use super::{
 /// We also carry the line-decoration fields the renderer already honors via
 /// [`fanta_render::stroke_to_paint`] (zero renderer change): `strokeCap`
 /// (NONE→Butt/ROUND→Round/SQUARE→Square), `strokeJoin` (MITER/BEVEL/ROUND),
-/// `dashPattern` (an array of on/off lengths → `dash`), and `strokeMiterAngle`
+/// `dashPattern` (an array of on/off lengths → `dash`), and `miterLimit`
 /// → `miter_limit`. Mirrors op2 `figma-stroke-mapper.ts` (its `visibleStrokes`
 /// filter, here producing one Stroke per surviving paint).
 pub(crate) fn build_stroke(change: &KiwiValue) -> Vec<Stroke> {
@@ -179,22 +179,20 @@ pub(crate) fn stroke_join(join: Option<&str>) -> StrokeJoin {
     }
 }
 
-/// Read Figma's `strokeMiterAngle` (degrees, the angle below which a miter is
-/// clipped to a bevel) into an SVG-style `miter_limit` ratio
-/// (`1 / sin(angle/2)`), which is what the renderer + doc model expect. Absent
+/// Read Figma's `miterLimit` — already an SVG-style miter-limit RATIO, exactly
+/// what the doc model + renderer expect. (An earlier version read a
+/// `strokeMiterAngle` field and converted degrees → ratio, but that field name
+/// never occurs in real `.fig` files — the Kiwi schema stores
+/// `NodeChange.miterLimit`, e.g. 16 on the Spectrum "Tab Unit" frames.) Absent
 /// or out-of-range values keep the doc default (4.0).
 pub(crate) fn stroke_miter_limit(change: &KiwiValue) -> f64 {
     const DEFAULT_MITER_LIMIT: f64 = 4.0;
-    let Some(angle_deg) = change.get("strokeMiterAngle").and_then(KiwiValue::as_f64) else {
-        return DEFAULT_MITER_LIMIT;
-    };
-    let half = (angle_deg.to_radians()) / 2.0;
-    let s = half.sin();
-    if s > 0.0 && s.is_finite() {
-        (1.0 / s).clamp(1.0, 1.0e6)
-    } else {
-        DEFAULT_MITER_LIMIT
-    }
+    change
+        .get("miterLimit")
+        .and_then(KiwiValue::as_f64)
+        .filter(|limit| limit.is_finite() && *limit >= 1.0)
+        .map(|limit| limit.clamp(1.0, 1.0e6))
+        .unwrap_or(DEFAULT_MITER_LIMIT)
 }
 
 /// Read Figma's `dashPattern` (an array of alternating on/off dash lengths) into
@@ -236,6 +234,6 @@ pub(crate) fn group_with_optional_clip(
         strokes: build_stroke(change).into_iter().collect(),
         corner_radius: uniform,
         corner_radii: per_corner,
-        corner_smoothing: 0.0,
+        corner_smoothing: corner_smoothing(change),
     }
 }

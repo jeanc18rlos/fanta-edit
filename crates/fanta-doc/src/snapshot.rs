@@ -427,6 +427,7 @@ mod tests {
             strokes: smallvec![crate::style::Stroke::solid(Color::rgb(0, 0, 255), 2.0)],
             corner_radius: Some(8.0),
             corner_radii: None,
+            corner_smoothing: 0.0,
         }));
         rect.name = "Rect".into();
         rect.parent = Some(frame_id);

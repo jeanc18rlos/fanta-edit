@@ -45,6 +45,7 @@ fn shadow_zoom_bench() {
                 blur: 16.0,
                 spread: 2.0,
                 offset: [4.0, 6.0],
+                show_behind_node: false,
             });
             grid_doc.apply(Operation::create_node(n)).unwrap();
         }
@@ -73,6 +74,7 @@ fn shadow_zoom_bench() {
             blur: 48.0, // world sigma 24 → on-screen sigma hits the 128 cap at ~5.3x
             spread: 0.0,
             offset: [0.0, 12.0],
+            show_behind_node: false,
         });
         onscreen_doc.apply(Operation::create_node(n)).unwrap();
     }

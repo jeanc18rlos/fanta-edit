@@ -211,6 +211,7 @@ mod tests {
             strokes: smallvec![],
             corner_radius: None,
             corner_radii: None,
+            corner_smoothing: 0.0,
         }));
         rect.parent = Some(frame);
         rect.transform = Transform2D::translation(x, y);

@@ -57,5 +57,5 @@ mod engine;
 mod text_layout;
 
 pub use align::Align;
-pub use engine::LayoutEngine;
+pub use engine::{LayoutEngine, LayoutOptions};
 pub use text_layout::{LineMetrics, TextLayout};

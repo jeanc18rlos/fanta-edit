@@ -43,6 +43,9 @@ fn image_background_frame_doc(asset: fanta_doc::AssetId) -> Doc {
             mode: ImageFitMode::Stretch,
             opacity: 1.0,
             crop: None,
+            scale: None,
+            rotation: None,
+            blend: fanta_doc::BlendMode::Normal,
         }),
         ..GroupNode::default()
     };
@@ -152,6 +155,9 @@ fn image_fill_rect_doc_with_opacity(
         mode: ImageFitMode::Stretch,
         opacity,
         crop: crop.map(Box::new),
+        scale: None,
+        rotation: None,
+        blend: fanta_doc::BlendMode::Normal,
     });
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(CanvasNode::new(NodeData::Vector(

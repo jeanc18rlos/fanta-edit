@@ -6502,6 +6502,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-canvas"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.10.0",
+ "fanta-doc",
+ "glam 0.32.1",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
 name = "fanta-doc"
 version = "0.1.0"
 dependencies = [
@@ -6530,6 +6542,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-fnx"
+version = "0.1.0"
+dependencies = [
+ "fanta-doc",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "fanta-format"
+version = "0.1.0"
+dependencies = [
+ "fanta-doc",
+ "fanta-fnx",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tracing",
+ "zip 2.4.2",
+]
+
+[[package]]
 name = "fanta-render"
 version = "0.1.0"
 dependencies = [
@@ -6555,6 +6592,20 @@ dependencies = [
  "unicode-segmentation",
  "ureq",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "fanta-tools"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.10.0",
+ "fanta-canvas",
+ "fanta-doc",
+ "glam 0.32.1",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tracing",
 ]
 
 [[package]]
@@ -6670,26 +6721,40 @@ name = "fig_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "core-foundation 0.10.0",
  "core-video",
+ "editor",
+ "fanta-canvas",
  "fanta-doc",
  "fanta-fig-interop",
+ "fanta-format",
  "fanta-render",
+ "fanta-text",
+ "fanta-tools",
  "file_icons",
  "foreign-types 0.5.0",
+ "fs",
+ "glam 0.32.1",
  "gpui",
  "image",
  "language",
  "log",
  "metal",
  "project",
+ "release_channel",
+ "semver",
  "settings",
  "skia-safe",
  "smallvec",
+ "tempfile",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",
  "worktree",
+ "zlog",
 ]
 
 [[package]]

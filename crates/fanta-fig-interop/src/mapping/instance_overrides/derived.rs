@@ -1,8 +1,8 @@
 //! Decoding baked `derivedSymbolData` entries into typed `DerivedOverride`s.
 
 use super::{
-    Color, Fill, KiwiValue, MapReport, OverridePath, decode_geometry, parse_font_weight,
-    read_fills, read_line_height, read_number_px, read_paint, read_transform,
+    Color, Fill, KiwiValue, LineHeight, MapReport, OverridePath, decode_geometry,
+    parse_font_weight, read_fills, read_line_height, read_number_px, read_paint, read_transform,
 };
 
 /// Decode one `derivedSymbolData` entry (a resolved `NodeChange`) into a typed
@@ -59,7 +59,17 @@ pub(crate) fn read_derived_override(
                 .and_then(KiwiValue::as_f64)
         })
         .filter(|f| *f > 0.0);
-    let line_height = read_line_height(d.get("lineHeight"), font_size.unwrap_or(16.0));
+    // A PERCENT line height is percent of the font's INTRINSIC line height
+    // (100 = Figma auto); carry both the metric marker and a 1.2×-approximation
+    // scalar, mirroring `build_text`'s TextStyle handling.
+    let (line_height, line_height_auto_percent) =
+        match read_line_height(d.get("lineHeight"), font_size.unwrap_or(16.0)) {
+            Some(LineHeight::Multiple(multiple)) => (Some(multiple), None),
+            Some(LineHeight::IntrinsicPercent(percent)) => {
+                (Some(1.2 * percent / 100.0), Some(percent))
+            }
+            None => (None, None),
+        };
     let letter_spacing = read_number_px(d.get("letterSpacing"), font_size.unwrap_or(16.0));
     let content = dtd
         .and_then(|t| t.get("characters"))
@@ -113,6 +123,7 @@ pub(crate) fn read_derived_override(
             content,
             font_size,
             line_height,
+            line_height_auto_percent,
             letter_spacing,
             color,
             weight,

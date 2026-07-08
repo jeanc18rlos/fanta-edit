@@ -17,7 +17,14 @@ pub enum Fill {
     /// Solid color fill.
     Solid { color: Color },
     /// Linear or radial gradient.
-    Gradient { gradient: Gradient },
+    Gradient {
+        gradient: Gradient,
+        /// Blend mode of THIS paint against the paints below it in the fill
+        /// stack (Figma per-paint `blendMode`). Default skipped, so old docs
+        /// round-trip byte-identical.
+        #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+        blend: BlendMode,
+    },
     /// Image fill. `asset` references a bitmap in the asset store; `mode`
     /// determines how the image is sized into the node bounds.
     ///
@@ -44,6 +51,22 @@ pub enum Fill {
         opacity: f32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         crop: Option<Box<[f32; 4]>>, // [x, y, w, h] in 0..=1 asset space
+        /// Tile scaling factor for [`ImageFitMode::Tile`] (Figma
+        /// `ImagePaint.scalingFactor`): each tile is drawn at
+        /// `natural_size × scale`. `None` ⇒ native size (1.0). Ignored for
+        /// non-tile modes. Additive — absent on old docs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale: Option<f32>,
+        /// Clockwise rotation of the image within the fill, in degrees (Figma
+        /// exposes 90° increments). `None` ⇒ unrotated. Additive.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rotation: Option<f32>,
+        /// Blend mode of THIS paint against the paints below it in the fill
+        /// stack (and the backdrop) — Figma's per-paint `blendMode`, distinct
+        /// from the node-level blend. Default [`BlendMode::Normal`] is skipped
+        /// so old docs round-trip byte-identical.
+        #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+        blend: BlendMode,
     },
 }
 
@@ -164,6 +187,17 @@ pub struct Shadow {
     pub blur: f64,
     pub spread: f64,
     pub offset: [f64; 2],
+    /// Figma `showShadowBehindNode`: when `false` (Figma's default) a drop
+    /// shadow is knocked out where the node itself covers it, so nothing shows
+    /// through a translucent/transparent body; when `true` the shadow paints
+    /// behind the whole node. Only meaningful for [`ShadowKind::Drop`].
+    /// Default `false` is skipped, so old docs round-trip byte-identical.
+    #[serde(default, skip_serializing_if = "is_false_flag")]
+    pub show_behind_node: bool,
+}
+
+fn is_false_flag(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -253,6 +287,14 @@ pub enum BlendMode {
     Luminosity,
 }
 
+impl BlendMode {
+    /// Whether this is the default [`BlendMode::Normal`] — used by serde
+    /// `skip_serializing_if` on per-paint blend fields.
+    pub fn is_normal(&self) -> bool {
+        matches!(self, BlendMode::Normal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +324,9 @@ mod tests {
             mode: ImageFitMode::Fill,
             opacity: 0.5,
             crop: Some(Box::new([0.1, 0.2, 0.5, 0.4])),
+            scale: None,
+            rotation: None,
+            blend: BlendMode::Normal,
         };
         let j = serde_json::to_string(&cropped).unwrap();
         assert!(j.contains("crop"), "crop is present on the wire: {j}");
@@ -301,6 +346,9 @@ mod tests {
             mode: ImageFitMode::Fill,
             opacity: 1.0,
             crop: None,
+            scale: None,
+            rotation: None,
+            blend: BlendMode::Normal,
         };
         let ju = serde_json::to_string(&uncropped).unwrap();
         assert!(!ju.contains("crop"), "None crop is omitted: {ju}");
@@ -319,6 +367,87 @@ mod tests {
             ),
             "absent crop and opacity default to None/1.0"
         );
+    }
+
+    #[test]
+    fn shadow_show_behind_node_round_trips_and_defaults_false() {
+        // Old docs (no field) load as false — Figma's own default — and the
+        // default is skipped on the wire so pre-existing docs stay
+        // byte-identical.
+        let base = Shadow {
+            kind: ShadowKind::Drop,
+            color: Color::BLACK,
+            blur: 4.0,
+            spread: 0.0,
+            offset: [0.0, 2.0],
+            show_behind_node: false,
+        };
+        let s = serde_json::to_string(&base).unwrap();
+        assert!(!s.contains("show_behind_node"), "default skipped: {s}");
+        let loaded: Shadow = serde_json::from_str(&s).unwrap();
+        assert!(!loaded.show_behind_node);
+
+        let behind = Shadow {
+            show_behind_node: true,
+            ..base
+        };
+        let j = serde_json::to_string(&behind).unwrap();
+        let back: Shadow = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, behind);
+    }
+
+    #[test]
+    fn image_fill_scale_rotation_blend_round_trip_and_default_off() {
+        use crate::id::AssetId;
+
+        let plain = Fill::Image {
+            asset: AssetId::new(),
+            mode: ImageFitMode::Tile,
+            opacity: 1.0,
+            crop: None,
+            scale: None,
+            rotation: None,
+            blend: BlendMode::Normal,
+        };
+        let s = serde_json::to_string(&plain).unwrap();
+        for key in ["scale", "rotation", "blend"] {
+            assert!(!s.contains(key), "{key} skipped at default: {s}");
+        }
+        let loaded: Fill = serde_json::from_str(&s).unwrap();
+        assert_eq!(loaded, plain);
+
+        let tiled = Fill::Image {
+            asset: AssetId::new(),
+            mode: ImageFitMode::Tile,
+            opacity: 1.0,
+            crop: None,
+            scale: Some(0.78),
+            rotation: Some(90.0),
+            blend: BlendMode::Multiply,
+        };
+        let j = serde_json::to_string(&tiled).unwrap();
+        let back: Fill = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, tiled);
+    }
+
+    #[test]
+    fn gradient_fill_blend_round_trips_and_defaults_normal() {
+        use crate::color::{Gradient, GradientStop};
+        let g = Fill::Gradient {
+            gradient: Gradient::Linear {
+                start: [0.0, 0.0],
+                end: [1.0, 0.0],
+                stops: vec![GradientStop {
+                    position: 0.0,
+                    color: Color::BLACK,
+                }],
+            },
+            blend: BlendMode::Normal,
+        };
+        let s = serde_json::to_string(&g).unwrap();
+        assert!(!s.contains("blend"), "normal blend skipped: {s}");
+        let loaded: Fill = serde_json::from_str(&s).unwrap();
+        assert_eq!(loaded, g);
     }
 
     #[test]

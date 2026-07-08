@@ -9,6 +9,68 @@
 use fanta_doc::{FillRule, PathData, PathSegment};
 use skia_safe::{Path, PathFillType};
 
+/// The Skia path whose FILLED COVERAGE honors per-subpath fill rules
+/// ([`PathData::subpath_rules`], Figma's per-`fillGeometry` `windingRule`).
+///
+/// A `Path` carries one fill type, so a doc path whose subpaths were authored
+/// with MIXED winding rules cannot be filled as-is: the subpaths are split
+/// into one group per rule (entry *i* rules the *i*-th `Move`-started subpath;
+/// subpaths beyond the list use the path-level [`PathData::fill_rule`]), each
+/// group is materialized with its own fill type, and the groups are unioned
+/// with Skia path-ops — the boolean respects each operand's fill type, so the
+/// result is exactly the union of the per-rule coverages Figma paints.
+///
+/// The empty/uniform-rule case (the overwhelmingly common one) returns
+/// [`to_sk_path`] unchanged, and so does a failed path-op (degenerate
+/// geometry) — approximate coverage beats dropping the shape. Use this for
+/// FILLS and fill-derived clips/silhouettes; STROKES must keep [`to_sk_path`]
+/// (the union rewrites contours, but a stroke follows the authored ones).
+pub(crate) fn to_sk_fill_path(data: &PathData) -> Path {
+    if data.subpath_rules.is_empty()
+        || data
+            .subpath_rules
+            .iter()
+            .all(|rule| *rule == data.fill_rule)
+    {
+        return to_sk_path(data);
+    }
+
+    // Split the segment list into per-rule groups. A subpath starts at each
+    // `Move`; leading segments before any `Move` form subpath 0.
+    let mut groups: [PathData; 2] = [PathData::new(), PathData::new()];
+    let group_of = |rule: FillRule| match rule {
+        FillRule::NonZero => 0,
+        FillRule::EvenOdd => 1,
+    };
+    let mut subpath: usize = 0;
+    let mut any_segment = false;
+    for segment in &data.segments {
+        if matches!(segment, PathSegment::Move { .. }) && any_segment {
+            subpath += 1;
+        }
+        any_segment = true;
+        let rule = data
+            .subpath_rules
+            .get(subpath)
+            .copied()
+            .unwrap_or(data.fill_rule);
+        groups[group_of(rule)].segments.push(*segment);
+    }
+    groups[0].fill_rule = FillRule::NonZero;
+    groups[1].fill_rule = FillRule::EvenOdd;
+
+    match groups {
+        [non_zero, even_odd] if non_zero.segments.is_empty() => to_sk_path(&even_odd),
+        [non_zero, even_odd] if even_odd.segments.is_empty() => to_sk_path(&non_zero),
+        [non_zero, even_odd] => {
+            let a = to_sk_path(&non_zero);
+            let b = to_sk_path(&even_odd);
+            a.op(&b, skia_safe::PathOp::Union)
+                .unwrap_or_else(|| to_sk_path(data))
+        }
+    }
+}
+
 /// Materialize a [`PathData`] into a Skia [`Path`].
 ///
 /// This is the **single owner** of the [`FillRule`] → [`PathFillType`] mapping:

@@ -112,6 +112,7 @@ fn image_paint_maps_to_fill_image_with_stable_asset_id() {
         mode,
         opacity,
         crop,
+        ..
     } = &v.fills[0]
     else {
         panic!("expected Fill::Image, got {:?}", v.fills[0]);
@@ -362,7 +363,12 @@ fn image_paint_imports_paint_transform_as_crop_rect() {
 }
 
 #[test]
-fn fill_paint_with_image_transform_carries_crop_rect() {
+fn fill_paint_with_stale_image_transform_carries_no_crop() {
+    // Per Figma plugin-API semantics `imageTransform` is only applicable in
+    // CROP mode (Kiwi `STRETCH`). A FILL paint keeps a stale non-identity
+    // transform around after the user switches modes — Figma preserves but
+    // IGNORES it, so importing it as a crop wrongly cropped those paints
+    // (822 FILL paints carry a transform in the UI3 kit alone).
     let hash_bytes: Vec<u8> = (91u8..=110).collect();
     let m = [0.5, 0.0, 0.25, 0.0, 0.5, 0.125];
     let mut paint = image_paint(&hash_bytes, "FILL");
@@ -373,10 +379,27 @@ fn fill_paint_with_image_transform_carries_crop_rect() {
     let Fill::Image { crop, .. } = &first_vector(&doc).fills[0] else {
         panic!("expected image fill");
     };
+    assert_eq!(*crop, None, "non-crop modes ignore the stale transform");
+}
+
+#[test]
+fn stretch_paint_with_image_transform_carries_crop_rect() {
+    // Kiwi `STRETCH` is the plugin API's CROP mode — there `imageTransform`
+    // IS the crop window.
+    let hash_bytes: Vec<u8> = (91u8..=110).collect();
+    let m = [0.5, 0.0, 0.25, 0.0, 0.5, 0.125];
+    let mut paint = image_paint(&hash_bytes, "STRETCH");
+    paint.set_field("imageTransform", matrix(m));
+
+    let rect = rect_with_paints(vec![paint]);
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let Fill::Image { crop, .. } = &first_vector(&doc).fills[0] else {
+        panic!("expected image fill");
+    };
     let crop = crop
         .as_deref()
         .copied()
-        .expect("a FILL paint with imageTransform carries a crop");
+        .expect("a STRETCH (plugin CROP) paint with imageTransform carries a crop");
     assert_eq!(crop, [0.25, 0.125, 0.5, 0.5]);
 }
 
@@ -475,4 +498,68 @@ fn image_paint_without_bytes_still_maps_but_has_no_asset() {
     assert_eq!(report.images_imported, 1);
     assert_eq!(report.image_assets_extracted, 0, "no bytes => no asset");
     assert!(assets.is_empty());
+}
+
+#[test]
+fn tile_paint_scale_imports_and_other_modes_ignore_it() {
+    // TILE paints carry Figma's `scalingFactor` in the paint `scale` field —
+    // each tile draws at natural-size × scale (0.78 in the UI3 kit's
+    // checkerboard). Non-TILE modes keep a stale `scale` around which Figma
+    // ignores, so we must too.
+    let hash_bytes: Vec<u8> = (31u8..=50).collect();
+    let mut tiled = image_paint(&hash_bytes, "TILE");
+    tiled.set_field("scale", KiwiValue::Float(0.78));
+    let rect = rect_with_paints(vec![tiled]);
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let Fill::Image { mode, scale, .. } = &first_vector(&doc).fills[0] else {
+        panic!("expected image fill");
+    };
+    assert_eq!(*mode, ImageFitMode::Tile);
+    assert!((scale.expect("tile scale imported") - 0.78).abs() < 1e-6);
+
+    let mut filled = image_paint(&hash_bytes, "FILL");
+    filled.set_field("scale", KiwiValue::Float(0.5));
+    let rect = rect_with_paints(vec![filled]);
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let Fill::Image { scale, .. } = &first_vector(&doc).fills[0] else {
+        panic!("expected image fill");
+    };
+    assert_eq!(*scale, None, "a FILL paint's stale scale is ignored");
+}
+
+#[test]
+fn image_paint_rotation_imports() {
+    let hash_bytes: Vec<u8> = (51u8..=70).collect();
+    let mut rotated = image_paint(&hash_bytes, "FILL");
+    rotated.set_field("rotation", KiwiValue::Float(90.0));
+    let rect = rect_with_paints(vec![rotated]);
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let Fill::Image { rotation, .. } = &first_vector(&doc).fills[0] else {
+        panic!("expected image fill");
+    };
+    assert!((rotation.expect("rotation imported") - 90.0).abs() < 1e-6);
+}
+
+#[test]
+fn per_paint_blend_mode_imports_on_image_paints() {
+    // Figma blends each paint of the fill stack with its own blendMode (the
+    // UI3 kit multiplies an IMAGE paint over the fill below it). Absent /
+    // NORMAL stays the default so old docs serialize identically.
+    let hash_bytes: Vec<u8> = (71u8..=90).collect();
+    let mut multiplied = image_paint(&hash_bytes, "FILL");
+    multiplied.set_field("blendMode", KiwiValue::Enum("MULTIPLY".to_owned()));
+    let rect = rect_with_paints(vec![multiplied]);
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let Fill::Image { blend, .. } = &first_vector(&doc).fills[0] else {
+        panic!("expected image fill");
+    };
+    assert_eq!(*blend, BlendMode::Multiply);
+
+    let plain = image_paint(&hash_bytes, "FILL");
+    let rect = rect_with_paints(vec![plain]);
+    let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+    let Fill::Image { blend, .. } = &first_vector(&doc).fills[0] else {
+        panic!("expected image fill");
+    };
+    assert_eq!(*blend, BlendMode::Normal);
 }

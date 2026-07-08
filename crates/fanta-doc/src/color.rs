@@ -94,6 +94,14 @@ pub enum Gradient {
     Radial {
         center: [f32; 2],
         radius: f32,
+        /// Full-ellipse axis handles for a rotated and/or elliptical radial:
+        /// the node-local (0–1 space) positions of the radius handle (end of
+        /// the primary axis) and the width handle (end of the secondary axis)
+        /// — Figma's `gradientHandlePositions[1..=2]`. `None` ⇒ the legacy
+        /// axis-aligned form driven by `radius` alone. Additive — absent on
+        /// old docs, skipped when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handles: Option<[[f32; 2]; 2]>,
         stops: Vec<GradientStop>,
     },
     /// Angular (conic / sweep) gradient: stops are swept around `center` in
@@ -115,6 +123,11 @@ pub enum Gradient {
     Diamond {
         center: [f32; 2],
         radius: f32,
+        /// Axis handles for a rotated/anisotropic diamond — same convention as
+        /// [`Gradient::Radial::handles`]. `None` ⇒ axis-aligned with
+        /// half-extent `radius`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handles: Option<[[f32; 2]; 2]>,
         stops: Vec<GradientStop>,
     },
 }
@@ -151,6 +164,34 @@ mod tests {
     }
 
     #[test]
+    fn radial_handles_round_trip_and_default_none() {
+        let stops = vec![GradientStop {
+            position: 0.0,
+            color: Color::WHITE,
+        }];
+        let plain = Gradient::Radial {
+            center: [0.5, 0.5],
+            radius: 0.5,
+            handles: None,
+            stops: stops.clone(),
+        };
+        let s = serde_json::to_string(&plain).unwrap();
+        assert!(!s.contains("handles"), "None handles skipped: {s}");
+        let loaded: Gradient = serde_json::from_str(&s).unwrap();
+        assert_eq!(loaded, plain);
+
+        let rotated = Gradient::Radial {
+            center: [0.5, 0.5],
+            radius: 0.5,
+            handles: Some([[0.85, 0.85], [0.15, 0.85]]),
+            stops,
+        };
+        let j = serde_json::to_string(&rotated).unwrap();
+        let back: Gradient = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, rotated);
+    }
+
+    #[test]
     fn angular_and_diamond_gradients_round_trip() {
         let stops = vec![
             GradientStop {
@@ -175,6 +216,7 @@ mod tests {
         let diamond = Gradient::Diamond {
             center: [0.5, 0.5],
             radius: 0.5,
+            handles: None,
             stops,
         };
         let jd = serde_json::to_value(&diamond).unwrap();

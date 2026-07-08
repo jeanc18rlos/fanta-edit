@@ -729,3 +729,44 @@ fn invisible_paint_is_skipped() {
     assert_eq!(v.fills.len(), 1);
     assert_eq!(v.fills[0], Fill::solid(Color::rgba(0, 255, 0, 255)));
 }
+
+#[test]
+fn drop_shadow_show_behind_node_imports() {
+    // Figma's default is `false` (the drop shadow is knocked out under the
+    // node's own body); an explicit `true` paints it behind the whole node.
+    let shadow_with = |behind: Option<bool>| {
+        let mut fields = vec![
+            ("type", KiwiValue::Enum("DROP_SHADOW".to_owned())),
+            ("color", color(0.0, 0.0, 0.0, 0.5)),
+            ("radius", KiwiValue::Float(4.0)),
+            ("offset", vector(0.0, 2.0)),
+            ("visible", KiwiValue::Bool(true)),
+        ];
+        if let Some(b) = behind {
+            fields.push(("showShadowBehindNode", KiwiValue::Bool(b)));
+        }
+        o("Effect", fields)
+    };
+    for (behind_field, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let rect = o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("parentIndex", parent_index(0, 1)),
+                ("type", KiwiValue::Enum("RECTANGLE".to_owned())),
+                ("size", vector(20.0, 20.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 0.5)]),
+                ),
+                ("effects", KiwiValue::Array(vec![shadow_with(behind_field)])),
+            ],
+        );
+        let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
+        let n = first_node_with_vector(&doc);
+        assert_eq!(
+            n.effects[0].show_behind_node, expected,
+            "showShadowBehindNode={behind_field:?} imports as {expected}"
+        );
+    }
+}

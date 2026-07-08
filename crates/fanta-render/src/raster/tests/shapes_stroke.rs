@@ -26,6 +26,7 @@ fn stroked_rect_doc(align: fanta_doc::StrokeAlign) -> Doc {
         strokes,
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     doc
@@ -111,6 +112,7 @@ fn per_side_border_draws_only_the_weighted_edges() {
         strokes,
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -164,6 +166,7 @@ fn per_side_border_respects_corner_radius() {
         strokes,
         corner_radius: Some(20.0),
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -214,6 +217,7 @@ fn per_side_border_on_square_box_keeps_hard_corner() {
         strokes,
         corner_radius: None,
         corner_radii: None,
+        corner_smoothing: 0.0,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -228,5 +232,52 @@ fn per_side_border_on_square_box_keeps_hard_corner() {
     assert!(
         corner[2] > 200 && corner[3] > 200,
         "square box must keep its hard blue corner band, got {corner:?}"
+    );
+}
+
+#[test]
+fn thick_inside_stroke_keeps_the_rounded_outer_corner() {
+    // An Inside stroke wider than twice the corner radius used to square off
+    // the OUTER corner: the inset offset path clamped its radius to 0 and was
+    // stroked at full width. Figma keeps the stroke's outer edge on the shape's
+    // rounded outline (radius r); only the inner edge goes square.
+    let mut stroke = fanta_doc::Stroke::solid(Color::rgb(0, 0, 255), 12.0);
+    stroke.align = fanta_doc::StrokeAlign::Inside;
+    let mut strokes = smallvec::SmallVec::new();
+    strokes.push(stroke);
+    let mut doc = Doc::new();
+    let n = CanvasNode::new(NodeData::Vector(VectorNode {
+        path: fanta_doc::PathData::rect(-20.0, -20.0, 40.0, 40.0),
+        fills: smallvec_of(Fill::solid(Color::rgb(0, 200, 0))),
+        strokes,
+        corner_radius: Some(4.0),
+        corner_radii: None,
+        corner_smoothing: 0.0,
+    }));
+    doc.apply(Operation::create_node(n)).unwrap();
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let buf = r.copy_rgba();
+
+    // Box is screen (12,12)..(52,52), radius 4 → corner pivot (16,16). Pixel
+    // (12,12) (centre (12.5,12.5)) sits ~4.95 from the pivot, outside the
+    // rounded outline: it must stay (nearly) unpainted. The old squared corner
+    // painted it solid blue.
+    let corner = rgba_at(&buf, 64, 12, 12);
+    assert!(
+        corner[3] < 100,
+        "outer corner must stay rounded (unpainted), got {corner:?}"
+    );
+    // Mid-top edge inside the 12px band → blue.
+    let mid_top = rgba_at(&buf, 64, 32, 15);
+    assert!(
+        mid_top[2] > 200 && mid_top[3] > 200,
+        "inside stroke band must paint along the straight edge, got {mid_top:?}"
+    );
+    // Centre keeps the green fill (band reaches only 12px in).
+    let centre = rgba_at(&buf, 64, 32, 32);
+    assert!(
+        centre[1] > 180 && centre[2] < 40,
+        "interior must stay the green fill, got {centre:?}"
     );
 }

@@ -110,3 +110,82 @@ fn wrap_single_oversized_child_keeps_its_own_line() {
     // `small` wraps below `big` (big's line is full at 100 > 60).
     approx(placed_origin(&t, small), [0.0, 20.0]);
 }
+
+#[test]
+fn auto_counter_gap_distributes_wrapped_lines_space_between() {
+    // Figma's "Auto" wrap gap (a NaN `stackCounterSpacing`, imported as
+    // `counter_auto_spacing`): the lines spread across the frame's counter
+    // extent. A 100x200 frame with three 40x20 children wraps into two rows
+    // (thickness 20 each); the free counter space (200 - 40 = 160) becomes
+    // the single between-lines gap, pushing row 2 to the bottom edge.
+    let mut t = VecTree::new();
+    let al = AutoLayout {
+        mode: LayoutMode::Horizontal,
+        spacing: 10.0,
+        counter_auto_spacing: true,
+        wrap: true,
+        ..Default::default()
+    };
+    let f = t.push(frame(100.0, 200.0, al));
+    let a = t.push(rect_child(f, 40.0, 20.0));
+    let b = t.push(rect_child(f, 40.0, 20.0));
+    let c = t.push(rect_child(f, 40.0, 20.0));
+
+    solve_auto_layout(&mut t, f, &mut no_measure);
+
+    approx(placed_origin(&t, a), [0.0, 0.0]);
+    approx(placed_origin(&t, b), [50.0, 0.0]);
+    approx(placed_origin(&t, c), [0.0, 180.0]);
+}
+
+#[test]
+fn auto_counter_gap_keeps_hugged_frame_at_its_implicit_extent() {
+    // Figma pairs the "Auto" gap with RESIZE_TO_FIT_WITH_IMPLICIT_SIZE: the
+    // counter axis hugs, but the baked frame extent is what the lines were
+    // distributed into — so hug sizing must reproduce that extent (sum of
+    // lines + distributed gaps = authored size), not collapse the gaps away.
+    let mut t = VecTree::new();
+    let al = AutoLayout {
+        mode: LayoutMode::Horizontal,
+        spacing: 10.0,
+        counter_auto_spacing: true,
+        counter_sizing: AxisSizing::Hug,
+        wrap: true,
+        ..Default::default()
+    };
+    let f = t.push(frame(100.0, 200.0, al));
+    let _a = t.push(rect_child(f, 40.0, 20.0));
+    let _b = t.push(rect_child(f, 40.0, 20.0));
+    let c = t.push(rect_child(f, 40.0, 20.0));
+
+    solve_auto_layout(&mut t, f, &mut no_measure);
+
+    approx(placed_origin(&t, c), [0.0, 180.0]);
+    approx(placed_size(&t, f), [100.0, 200.0]);
+}
+
+#[test]
+fn non_finite_wrap_gap_from_a_stale_doc_is_sanitized_to_zero() {
+    // A raw NaN `counter_spacing` (Figma's on-disk "Auto" encoding, as older
+    // imports stored it) must not poison the layout: one NaN gap would give
+    // every row after the first a NaN position and the hugged frame a NaN
+    // height, making the whole subtree vanish. The solver sanitizes it to 0.
+    let mut t = VecTree::new();
+    let al = AutoLayout {
+        mode: LayoutMode::Horizontal,
+        spacing: 10.0,
+        counter_spacing: f64::NAN,
+        counter_sizing: AxisSizing::Hug,
+        wrap: true,
+        ..Default::default()
+    };
+    let f = t.push(frame(100.0, 200.0, al));
+    let _a = t.push(rect_child(f, 40.0, 20.0));
+    let _b = t.push(rect_child(f, 40.0, 20.0));
+    let c = t.push(rect_child(f, 40.0, 20.0));
+
+    solve_auto_layout(&mut t, f, &mut no_measure);
+
+    approx(placed_origin(&t, c), [0.0, 20.0]);
+    approx(placed_size(&t, f), [100.0, 40.0]);
+}

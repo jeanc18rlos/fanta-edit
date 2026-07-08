@@ -4,7 +4,7 @@ use super::{
     Align, Canvas, CanvasNode, LayoutEngine, Rect, RefCell, TextAlign, TextAutoResize, TextBuffer,
     TextNode, TextStyle, Transform2D, VAlign,
 };
-use fanta_text::TextLayout;
+use fanta_text::{LayoutOptions, TextLayout};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -107,6 +107,18 @@ fn shape_key(node: &TextNode, wrap_width: f64, align: Align) -> u64 {
     }
     wrap_width.to_bits().hash(&mut h);
     std::mem::discriminant(&align).hash(&mut h);
+    // Truncation + paragraph indent change the SHAPED result (line clamp,
+    // ellipsis glyphs, first-line inset), so they key the cache too.
+    // `paragraph_spacing` deliberately does NOT: it only moves paint bands
+    // (like v-align), never the shaped lines.
+    node.max_lines.hash(&mut h);
+    node.truncate.hash(&mut h);
+    node.paragraph_indent.to_bits().hash(&mut h);
+    // The box height participates only when it drives the truncation clamp
+    // (see `shape_layout`): truncating a fixed box with no explicit max_lines.
+    if truncates_at_box_height(node) {
+        node.local_size[1].to_bits().hash(&mut h);
+    }
     h.finish()
 }
 
@@ -120,6 +132,71 @@ fn hash_doc_text_style(s: &fanta_doc::TextStyle, h: &mut DefaultHasher) {
     s.color.hash(h);
     s.letter_spacing.to_bits().hash(h);
     s.line_height.to_bits().hash(h);
+    s.line_height_auto_percent.map(f64::to_bits).hash(h);
+}
+
+/// Whether `node` truncates at its BOX HEIGHT: Figma's `textTruncation:
+/// ENDING` with no explicit `maxLines` clamps a fixed box to however many
+/// lines fit `local_size[1]` (an auto-resize box grows instead, so only the
+/// fixed box has a height to clamp to).
+fn truncates_at_box_height(node: &TextNode) -> bool {
+    node.truncate
+        && node.max_lines.is_none()
+        && node.auto_resize == TextAutoResize::None
+        && node.local_size[1] > 0.0
+}
+
+/// The paragraph-level [`LayoutOptions`] a [`TextNode`] shapes with (line
+/// clamp + ellipsis + first-line indent). The box-height-derived clamp is NOT
+/// resolved here — it needs a probe layout, done in [`shape_layout`].
+fn layout_options(node: &TextNode) -> LayoutOptions {
+    LayoutOptions {
+        max_lines: node.max_lines.map(|limit| (limit.max(1)) as usize),
+        ellipsize: node.truncate,
+        first_line_indent: node.paragraph_indent.max(0.0),
+    }
+}
+
+/// Shape `node`'s content — the single shaping path behind the cache and the
+/// outline query, so both produce the identical paragraph. Resolves the
+/// box-height truncation clamp ([`truncates_at_box_height`]) by probing an
+/// unclamped layout for how many lines fit, then re-shaping with that limit
+/// (skipping the second pass when everything already fits).
+fn shape_layout(node: &TextNode) -> TextLayout {
+    let (wrap_width, align) = shape_params(node);
+    let style = to_text_style(&node.style);
+    let mut buffer = TextBuffer::from_str(node.content.as_str(), style);
+    for run in &node.style_runs {
+        let style = to_text_style(&run.style);
+        let _ = buffer.set_style(run.start..run.end, style);
+    }
+    let mut options = layout_options(node);
+    with_layout_engine(|engine| {
+        if truncates_at_box_height(node) {
+            let unclamped = engine.layout_with(
+                &buffer,
+                wrap_width,
+                align,
+                &LayoutOptions {
+                    max_lines: None,
+                    ellipsize: false,
+                    ..options.clone()
+                },
+            );
+            let fitting = unclamped
+                .lines()
+                .iter()
+                // Half a pixel of slack so a line that fits up to rounding is
+                // not truncated away.
+                .filter(|line| line.top + line.height <= node.local_size[1] + 0.5)
+                .count();
+            if fitting >= unclamped.line_count() {
+                return unclamped;
+            }
+            options.max_lines = Some(fitting.max(1));
+        }
+        engine.layout_with(&buffer, wrap_width, align, &options)
+    })
 }
 
 /// Run `f` with this thread's cached shaped [`TextLayout`] for `node`, shaping
@@ -143,17 +220,17 @@ pub(crate) fn with_shaped_layout<R>(node: &TextNode, f: impl FnOnce(&TextLayout)
         }
         // Shape on a miss (the expensive path); reuse the shaped paragraph on
         // every subsequent measure/draw of the same run.
-        let layout = cache.entry(key).or_insert_with(|| {
-            let style = to_text_style(&node.style);
-            let mut buffer = TextBuffer::from_str(node.content.as_str(), style);
-            for run in &node.style_runs {
-                let style = to_text_style(&run.style);
-                let _ = buffer.set_style(run.start..run.end, style);
-            }
-            with_layout_engine(|engine| engine.layout_aligned(&buffer, wrap_width, align))
-        });
+        let layout = cache.entry(key).or_insert_with(|| shape_layout(node));
         f(layout)
     })
+}
+
+/// The height `node`'s glyphs actually occupy when painted: the shaped layout
+/// height plus the paragraph-spacing bands [`draw_text_node`] inserts. This —
+/// not the bare `layout.height()` — is what vertical alignment and the
+/// auto-height measure must use so pixels and geometry agree.
+pub(crate) fn painted_text_height(node: &TextNode, layout: &TextLayout) -> f64 {
+    layout.spaced_height(node.paragraph_spacing.max(0.0))
 }
 
 pub(crate) fn vertical_paint_offset(node: &TextNode, layout_height: f64) -> f64 {
@@ -228,15 +305,14 @@ pub fn text_node_outline(node: &TextNode) -> Option<fanta_doc::PathData> {
     if node.content.is_empty() {
         return None;
     }
-    let (wrap_width, align) = shape_params(node);
-    let mut buffer = TextBuffer::from_str(node.content.as_str(), to_text_style(&node.style));
-    for run in &node.style_runs {
-        let _ = buffer.set_style(run.start..run.end, to_text_style(&run.style));
-    }
-    let mut layout = with_layout_engine(|engine| engine.layout_aligned(&buffer, wrap_width, align));
+    // Shape through the same path the cache uses so truncation/indent match
+    // the painted glyphs (a fresh layout, though — Skia builds glyph paths via
+    // a `&mut` paragraph, and the shared cache is immutable).
+    let mut layout = shape_layout(node);
     // Match `draw_text_node`'s vertical-align paint origin so the outline sits
-    // exactly where the glyphs were drawn.
-    let dy = vertical_paint_offset(node, layout.height());
+    // exactly where the glyphs were drawn. (Paragraph-spacing band shifts are
+    // not applied to the outline.)
+    let dy = vertical_paint_offset(node, painted_text_height(node, &layout));
     layout.outline([0.0, dy])
 }
 
@@ -288,8 +364,13 @@ pub(crate) fn draw_text_node(canvas: &Canvas, node: &TextNode) {
             // paragraph block sits Top (0), Center (½), or Bottom (1) within the
             // box height. Negative slack is intentional: Figma centers/bottoms
             // the line box even when it is taller than the authored text frame.
-            let dy = vertical_paint_offset(node, layout.height());
-            layout.paint(canvas, [0.0, dy]);
+            let dy = vertical_paint_offset(node, painted_text_height(node, layout));
+            let spacing = node.paragraph_spacing.max(0.0);
+            if spacing > 0.0 {
+                layout.paint_spaced(canvas, [0.0, dy], spacing);
+            } else {
+                layout.paint(canvas, [0.0, dy]);
+            }
         });
     };
 
@@ -324,6 +405,7 @@ pub(crate) fn to_text_style(s: &fanta_doc::TextStyle) -> TextStyle {
         color: s.color,
         letter_spacing: s.letter_spacing,
         line_height: s.line_height,
+        line_height_auto_percent: s.line_height_auto_percent,
     }
 }
 

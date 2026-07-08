@@ -359,6 +359,7 @@ fn auto_layout_round_trips_and_is_back_compat() {
         mode: LayoutMode::Vertical,
         spacing: 8.0,
         counter_spacing: 4.0,
+        counter_auto_spacing: true,
         padding: [10.0, 12.0, 10.0, 12.0],
         primary_align: PrimaryAlign::SpaceBetween,
         counter_align: CounterAlign::Stretch,
@@ -483,4 +484,62 @@ fn text_auto_resize_round_trips_and_defaults_none() {
     assert!(!s.contains("auto_resize"));
     let loaded: TextNode = serde_json::from_str(&s).unwrap();
     assert_eq!(loaded.auto_resize, TextAutoResize::None);
+}
+
+#[test]
+fn text_truncation_and_paragraph_fields_round_trip_and_default_off() {
+    // New fields are skipped at their defaults (byte-stable with old docs) and
+    // absent fields load as the defaults.
+    let plain = TextNode::new("x", 1.0, 1.0);
+    let s = serde_json::to_string(&plain).unwrap();
+    for key in [
+        "max_lines",
+        "truncate",
+        "paragraph_spacing",
+        "paragraph_indent",
+    ] {
+        assert!(!s.contains(key), "{key} skipped at default: {s}");
+    }
+    let loaded: TextNode = serde_json::from_str(&s).unwrap();
+    assert_eq!(loaded.max_lines, None);
+    assert!(!loaded.truncate);
+    assert_eq!(loaded.paragraph_spacing, 0.0);
+    assert_eq!(loaded.paragraph_indent, 0.0);
+
+    let mut clamped = TextNode::new("long label", 100.0, 30.0);
+    clamped.max_lines = Some(2);
+    clamped.truncate = true;
+    clamped.paragraph_spacing = 8.0;
+    clamped.paragraph_indent = 12.0;
+    let j = serde_json::to_string(&clamped).unwrap();
+    let back: TextNode = serde_json::from_str(&j).unwrap();
+    assert_eq!(back, clamped);
+}
+
+#[test]
+fn line_height_auto_percent_round_trips_and_defaults_none() {
+    let mut style = TextStyle::default();
+    let s = serde_json::to_string(&style).unwrap();
+    assert!(!s.contains("line_height_auto_percent"), "skipped at None");
+    let loaded: TextStyle = serde_json::from_str(&s).unwrap();
+    assert_eq!(loaded.line_height_auto_percent, None);
+
+    style.line_height_auto_percent = Some(100.0);
+    let j = serde_json::to_string(&style).unwrap();
+    let back: TextStyle = serde_json::from_str(&j).unwrap();
+    assert_eq!(back.line_height_auto_percent, Some(100.0));
+}
+
+#[test]
+fn vector_corner_smoothing_round_trips_and_defaults_zero() {
+    let mut v = VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, crate::Color::BLACK);
+    let s = serde_json::to_string(&v).unwrap();
+    assert!(!s.contains("corner_smoothing"), "skipped at 0.0");
+    let loaded: VectorNode = serde_json::from_str(&s).unwrap();
+    assert_eq!(loaded.corner_smoothing, 0.0);
+
+    v.corner_smoothing = 0.6;
+    let j = serde_json::to_string(&v).unwrap();
+    let back: VectorNode = serde_json::from_str(&j).unwrap();
+    assert!((back.corner_smoothing - 0.6).abs() < 1e-6);
 }

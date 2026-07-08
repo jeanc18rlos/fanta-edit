@@ -1,8 +1,8 @@
 //! TEXT node construction, font-weight parsing, and `textCase` transforms.
 
 use super::{
-    Fill, KiwiValue, NodeData, TextAlign, TextAutoResize, TextNode, TextStyle, TextStyleRun,
-    VAlign, first_paint_fill, make_rect, read_line_height, read_number_px,
+    Fill, KiwiValue, LineHeight, NodeData, TextAlign, TextAutoResize, TextNode, TextStyle,
+    TextStyleRun, VAlign, first_paint_fill, make_rect, read_line_height, read_number_px,
 };
 
 /// Build a [`NodeData::Text`] from a Figma TEXT `NodeChange`.
@@ -40,6 +40,7 @@ pub(crate) fn build_text(change: &KiwiValue, size: (f64, f64), fills: Option<Fil
             style.italic = lower.contains("italic") || lower.contains("oblique");
         }
     }
+    apply_font_variations(change, &mut style);
 
     if let Some(color) = fills.and_then(|f| match f {
         Fill::Solid { color } => Some(color),
@@ -53,7 +54,11 @@ pub(crate) fn build_text(change: &KiwiValue, size: (f64, f64), fills: Option<Fil
     if let Some(ls) = read_number_px(change.get("letterSpacing"), style.size_px) {
         style.letter_spacing = ls;
     }
-    let line_height = read_line_height(change.get("lineHeight"), style.size_px);
+    // An absent `lineHeight` means Figma's default — "auto", 100% of the font's
+    // intrinsic metric line height — NOT our 1.2 constant.
+    let line_height = read_line_height(change.get("lineHeight"), style.size_px)
+        .unwrap_or(LineHeight::IntrinsicPercent(100.0));
+    apply_line_height(&mut style, line_height);
 
     let align = match change
         .get("textAlignHorizontal")
@@ -84,9 +89,6 @@ pub(crate) fn build_text(change: &KiwiValue, size: (f64, f64), fills: Option<Fil
         Some("HEIGHT") => TextAutoResize::Height,
         _ => TextAutoResize::None,
     };
-    if let Some(lh) = line_height {
-        style.line_height = normalize_node_line_height(lh, style.size_px, size.1);
-    }
     // Gap D — `textCase` is a display transform Figma applies on top of the
     // stored characters (so ALL-CAPS nav/button labels store mixed-case but
     // render uppercase). Apply it to the string so the rendered glyphs match.
@@ -98,6 +100,26 @@ pub(crate) fn build_text(change: &KiwiValue, size: (f64, f64), fills: Option<Fil
     let (content, style_runs) =
         build_content_and_style_runs(content, text_case, change.get("textData"), &style);
 
+    // Figma's "Truncate text" (`textTruncation: ENDING`) with an optional line
+    // clamp (`maxLines`): the label ellipsizes instead of showing every wrapped
+    // line. Carried on the doc TextNode; the text engine consumes it.
+    let truncate = change.get("textTruncation").and_then(KiwiValue::as_str) == Some("ENDING");
+    let max_lines = change
+        .get("maxLines")
+        .and_then(KiwiValue::as_f64)
+        .filter(|n| n.is_finite() && *n >= 1.0)
+        .map(|n| n as u32);
+    let paragraph_spacing = change
+        .get("paragraphSpacing")
+        .and_then(KiwiValue::as_f64)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(0.0);
+    let paragraph_indent = change
+        .get("paragraphIndent")
+        .and_then(KiwiValue::as_f64)
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(0.0);
+
     NodeData::Text(TextNode {
         content,
         local_size: [size.0, size.1],
@@ -106,7 +128,52 @@ pub(crate) fn build_text(change: &KiwiValue, size: (f64, f64), fills: Option<Fil
         style,
         style_runs,
         auto_resize,
+        max_lines,
+        truncate,
+        paragraph_spacing,
+        paragraph_indent,
     })
+}
+
+/// Consume `fontVariations` (variable-font axis values). A `Weight` axis (tag
+/// `'wght'`) overrides the weight parsed from the style NAME — Figma's own UI
+/// kit sets body text to 450/550 via axes while the name stays "Medium"/etc.
+fn apply_font_variations(change: &KiwiValue, style: &mut TextStyle) {
+    let Some(variations) = change.get("fontVariations").and_then(KiwiValue::as_array) else {
+        return;
+    };
+    for variation in variations {
+        // 'wght' big-endian: 0x77676874.
+        let is_weight_axis = variation.get("axisName").and_then(KiwiValue::as_str)
+            == Some("Weight")
+            || variation.get("axisTag").and_then(KiwiValue::as_f64) == Some(2003265652.0);
+        if !is_weight_axis {
+            continue;
+        }
+        if let Some(weight) = variation.get("value").and_then(KiwiValue::as_f64) {
+            if (1.0..=1000.0).contains(&weight) {
+                style.weight = weight.round() as u16;
+            }
+        }
+    }
+}
+
+/// Apply a decoded [`LineHeight`] onto the style: a multiple lands directly in
+/// `line_height`; an intrinsic percentage (Figma "auto" = 100) is recorded in
+/// `line_height_auto_percent` for metric-aware consumers, with `line_height`
+/// holding a metric-free approximation (most UI faces' intrinsic line height is
+/// ≈1.2× the em size).
+fn apply_line_height(style: &mut TextStyle, line_height: LineHeight) {
+    match line_height {
+        LineHeight::Multiple(multiple) => {
+            style.line_height = multiple;
+            style.line_height_auto_percent = None;
+        }
+        LineHeight::IntrinsicPercent(percent) => {
+            style.line_height = 1.2 * percent / 100.0;
+            style.line_height_auto_percent = Some(percent);
+        }
+    }
 }
 
 fn build_content_and_style_runs(
@@ -188,24 +255,6 @@ fn build_content_and_style_runs(
     (content, style_runs)
 }
 
-fn normalize_node_line_height(raw: f64, font_px: f64, box_h: f64) -> f64 {
-    // Figma's "auto" / normal line height appears in exported `.fig` files as
-    // RAW 1.0 for many Spectrum labels, while Dev Mode reports it as CSS
-    // `normal` and the text box height already carries the real line box. A
-    // literal 1.0 makes centered text sit too low/high, so infer the authored
-    // one-line ratio when possible and otherwise use Source Sans' normal-ish
-    // fallback.
-    if (raw - 1.0).abs() > 1e-6 || font_px <= 0.0 {
-        return raw;
-    }
-    let authored = box_h / font_px;
-    if authored.is_finite() && (1.05..=1.5).contains(&authored) {
-        authored
-    } else {
-        1.25
-    }
-}
-
 fn style_id_at(style_ids: &[KiwiValue], index: usize) -> i32 {
     style_ids
         .get(index)
@@ -252,6 +301,7 @@ fn style_for_override_id(style_id: i32, table: &[KiwiValue], base: &TextStyle) -
             style.italic = lower.contains("italic") || lower.contains("oblique");
         }
     }
+    apply_font_variations(change, &mut style);
     if let Some(color) = first_paint_fill(change.get("fillPaints")).and_then(|fill| match fill {
         Fill::Solid { color } => Some(color),
         _ => None,
@@ -261,8 +311,9 @@ fn style_for_override_id(style_id: i32, table: &[KiwiValue], base: &TextStyle) -
     if let Some(ls) = read_number_px(change.get("letterSpacing"), style.size_px) {
         style.letter_spacing = ls;
     }
+    // Absent lineHeight on an override entry inherits the base style's.
     if let Some(lh) = read_line_height(change.get("lineHeight"), style.size_px) {
-        style.line_height = normalize_node_line_height(lh, style.size_px, 0.0);
+        apply_line_height(&mut style, lh);
     }
     apply_text_decoration(change, &mut style);
     style

@@ -107,6 +107,12 @@ pub struct VectorNode {
     /// this field is skipped when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner_radii: Option<[f64; 4]>,
+    /// Corner smoothing 0..=1 (Figma's "squircle" amount) applied together with
+    /// `corner_radius`/`corner_radii` on rectangle-shaped paths. Mirrors
+    /// [`GroupNode::corner_smoothing`]; `0` ⇒ plain circular corners and is
+    /// skipped, so old docs round-trip byte-identical.
+    #[serde(default, skip_serializing_if = "is_zero_smoothing")]
+    pub corner_smoothing: f32,
 }
 
 impl VectorNode {
@@ -118,6 +124,7 @@ impl VectorNode {
             strokes: SmallVec::new(),
             corner_radius: None,
             corner_radii: None,
+            corner_smoothing: 0.0,
         }
     }
 }
@@ -209,7 +216,21 @@ pub struct TextStyle {
     pub letter_spacing: f64,
     /// Line height as a multiple of `size_px` (1.0 = single spacing). Unitless
     /// so it scales with the font size, matching CSS `line-height`.
+    ///
+    /// When [`line_height_auto_percent`](Self::line_height_auto_percent) is
+    /// `Some`, this holds only a metric-free *approximation* for consumers
+    /// that don't resolve font metrics; the authoritative value is the
+    /// percentage of the font's intrinsic line height.
     pub line_height: f64,
+    /// Metric-relative line height: `Some(p)` means the authored line height is
+    /// `p` percent of the FONT'S INTRINSIC line height (ascent + descent + gap
+    /// from the font metrics), not of `size_px`. Figma's "auto" line height is
+    /// exactly `Some(100.0)` — Kiwi `lineHeight` PERCENT units. Consumers that
+    /// resolve font metrics (the text engine) should prefer this over the
+    /// scalar [`line_height`](Self::line_height) approximation when present.
+    /// Absent ⇒ `None` ⇒ old docs round-trip byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height_auto_percent: Option<f64>,
 }
 
 impl Default for TextStyle {
@@ -227,6 +248,7 @@ impl Default for TextStyle {
             color: Color::BLACK,
             letter_spacing: 0.0,
             line_height: 1.2,
+            line_height_auto_percent: None,
         }
     }
 }
@@ -281,6 +303,28 @@ pub struct TextNode {
     /// Absent ⇒ `None` ⇒ old files round-trip byte-identical.
     #[serde(default, skip_serializing_if = "is_text_autoresize_none")]
     pub auto_resize: TextAutoResize,
+    /// Maximum number of laid-out lines to show (Figma `maxLines`, the "line
+    /// clamp" paired with truncation). `None` ⇒ unlimited. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lines: Option<u32>,
+    /// Truncate overflowing text with an ellipsis (Figma
+    /// `textTruncation: ENDING`) — at [`max_lines`](Self::max_lines) when set,
+    /// otherwise at the box height. Default `false` is skipped.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncate: bool,
+    /// Extra vertical space in logical pixels inserted between paragraphs
+    /// (after each hard newline) — Figma `paragraphSpacing`. `0` ⇒ plain line
+    /// spacing, skipped from JSON.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub paragraph_spacing: f64,
+    /// First-line indent of each paragraph in logical pixels — Figma
+    /// `paragraphIndent`. `0` skipped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub paragraph_indent: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 fn is_text_autoresize_none(v: &TextAutoResize) -> bool {
@@ -300,6 +344,10 @@ impl TextNode {
             style: TextStyle::default(),
             style_runs: Vec::new(),
             auto_resize: TextAutoResize::default(),
+            max_lines: None,
+            truncate: false,
+            paragraph_spacing: 0.0,
+            paragraph_indent: 0.0,
         }
     }
 

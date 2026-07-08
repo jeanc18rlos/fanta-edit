@@ -43,6 +43,24 @@ pub(crate) fn build_vector(
         vn
     });
 
+    // STEP 2c: nodes with NO fill geometry at all but baked `strokeGeometry` —
+    // LINE nodes (Figma never writes `fillGeometry` for them) and stroke-only
+    // BOOLEAN_OPERATIONs. `strokeGeometry` is the ALREADY-EXPANDED stroke
+    // outline: Figma bakes the width, caps (including arrowheads), joins, and
+    // dash pattern into it, so painting it as a FILL with the stroke's paint
+    // reproduces the exact Figma render — where the old bbox fallback stroked a
+    // degenerate h=0 rectangle (no caps on closed contours, dashes traversing
+    // the perimeter twice).
+    let mut from_stroke_geometry = false;
+    let decoded_fill = decoded_fill.or_else(|| {
+        if has_visible_fills(change) || !has_visible_strokes(change) {
+            return None;
+        }
+        let outline = decode_geometry(change, "strokeGeometry", blobs);
+        from_stroke_geometry = outline.is_some();
+        outline
+    });
+
     // Gap A — stroke-only icon outline. Lucide/Feather-style icons are stroke-only
     // vectors: their `fillGeometry` is the ALREADY-EXPANDED stroke outline (a
     // closed region, not a centerline). Decoding it into the path AND then adding
@@ -53,10 +71,11 @@ pub(crate) fn build_vector(
     // `figma-stroke-mapper.ts`. (Only meaningful when geometry actually decoded —
     // without the outline there's nothing to fill, so the bbox fallback keeps its
     // normal stroke.)
-    // The Gap-A trick only applies to `fillGeometry`, which Figma ships as the
-    // already-EXPANDED stroke outline. A `vectorNetworkBlob` path is the editable
-    // CENTERLINE, so a stroke-only network must still be stroked with width (not
-    // painted as a fill) — otherwise it would render as a thin filled hairline.
+    // The Gap-A trick only applies to `fillGeometry` and `strokeGeometry`, which
+    // Figma ships as the already-EXPANDED stroke outline. A `vectorNetworkBlob`
+    // path is the editable CENTERLINE, so a stroke-only network must still be
+    // stroked with width (not painted as a fill) — otherwise it would render as
+    // a thin filled hairline.
     let stroke_only_outline = decoded_fill.is_some()
         && !from_vector_network
         && !has_visible_fills(change)
@@ -74,6 +93,7 @@ pub(crate) fn build_vector(
                     strokes: Default::default(),
                     corner_radius: None,
                     corner_radii: None,
+                    corner_smoothing: 0.0,
                 },
                 true,
                 true,
@@ -85,10 +105,11 @@ pub(crate) fn build_vector(
                 fills: fills.iter().cloned().collect(),
                 strokes: build_stroke(change).into_iter().collect(),
                 // A rounded-rect-ish corner radius is meaningless on a real
-                // decoded path (the curvature is already baked into the
-                // commands), so leave it unset.
+                // decoded path (the curvature — including any corner smoothing —
+                // is already baked into the commands), so leave it unset.
                 corner_radius: None,
                 corner_radii: None,
+                corner_smoothing: 0.0,
             },
             true,
             false,
@@ -102,6 +123,7 @@ pub(crate) fn build_vector(
                 strokes: build_stroke(change).into_iter().collect(),
                 corner_radius: None,
                 corner_radii: None,
+                corner_smoothing: 0.0,
             },
             false,
             false,
@@ -118,6 +140,8 @@ pub(crate) fn build_vector(
     apply_node_visual_props(&mut node, change);
     let geom_tag = if from_vector_network {
         "vector_network"
+    } else if from_stroke_geometry {
+        "stroke_geometry"
     } else if decoded {
         "decoded"
     } else {
@@ -170,8 +194,15 @@ pub(crate) fn has_any_visible_paint(paints: Option<&KiwiValue>) -> bool {
 
 /// Decode a node's `fillGeometry`/`strokeGeometry` (named by `field`) into one
 /// combined [`PathData`]. Returns `None` if the field is absent/empty or no path
-/// decoded cleanly — the caller then keeps the bbox fallback. The fill rule is
-/// taken from the first path's `windingRule`.
+/// decoded cleanly — the caller then keeps the bbox fallback.
+///
+/// The path's base `fill_rule` comes from the first decoded path's
+/// `windingRule`. Figma stores the rule PER Path entry; when the entries carry
+/// MIXED rules (an ODD hole-punching path after a NONZERO outline, or vice
+/// versa), the per-subpath rules are preserved in [`PathData::subpath_rules`]
+/// (one entry per emitted subpath) so a rule-aware renderer can fill each Path
+/// with its own rule instead of losing holes. The uniform-rule common case
+/// leaves `subpath_rules` empty (byte-identical serialization).
 pub(crate) fn decode_geometry(
     change: &KiwiValue,
     field: &str,
@@ -184,6 +215,8 @@ pub(crate) fn decode_geometry(
     let mut out = PathData::new();
     let mut any = false;
     let mut fill_rule_set = false;
+    let mut subpath_rules: Vec<fanta_doc::path::FillRule> = Vec::new();
+    let mut mixed_rules = false;
     for path in paths {
         let Some(idx) = path.get("commandsBlob").and_then(KiwiValue::as_f64) else {
             continue;
@@ -195,20 +228,41 @@ pub(crate) fn decode_geometry(
         let Some(blob) = blobs.get(idx as usize) else {
             continue;
         };
+        let subpaths_before = count_subpaths(&out);
         if crate::geometry::append_blob_path(&mut out, blob) {
             any = true;
-            // The whole node's fill rule comes from its first decoded path; Figma
-            // stores it per-path but a node's paths share one rule in practice,
-            // and our model carries a single rule per `PathData`.
+            let rule =
+                crate::geometry::winding_rule(path.get("windingRule").and_then(KiwiValue::as_str));
             if !fill_rule_set {
-                out.fill_rule = crate::geometry::winding_rule(
-                    path.get("windingRule").and_then(KiwiValue::as_str),
-                );
+                out.fill_rule = rule;
                 fill_rule_set = true;
+            } else if rule != out.fill_rule {
+                mixed_rules = true;
             }
+            let emitted = count_subpaths(&out).saturating_sub(subpaths_before);
+            subpath_rules.extend(std::iter::repeat_n(rule, emitted));
         }
     }
+    if mixed_rules {
+        out.subpath_rules = subpath_rules;
+    }
     any.then_some(out)
+}
+
+/// Number of subpaths in a path under the [`PathData::subpath_rules`]
+/// convention: one per `Move` segment, plus a leading subpath when the segment
+/// list starts with a non-`Move` (degenerate decode output).
+fn count_subpaths(path: &PathData) -> usize {
+    let moves = path
+        .segments
+        .iter()
+        .filter(|s| matches!(s, fanta_doc::path::PathSegment::Move { .. }))
+        .count();
+    let leading = matches!(
+        path.segments.first(),
+        Some(s) if !matches!(s, fanta_doc::path::PathSegment::Move { .. })
+    );
+    moves + usize::from(leading)
 }
 
 /// Decode a VECTOR node's `vectorData.vectorNetworkBlob` into a [`PathData`] —

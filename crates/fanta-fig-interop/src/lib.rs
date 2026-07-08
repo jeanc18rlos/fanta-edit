@@ -51,7 +51,7 @@ pub mod geometry;
 pub mod kiwi;
 pub mod mapping;
 
-pub use canvas::{figma_page_canvas_color, figma_page_canvas_color_from_name};
+pub use canvas::figma_page_canvas_color;
 pub use error::{FigError, FigResult};
 pub use fig::{FigDocument, read_fig, write_fig};
 pub use kiwi::{ByteReader, ByteWriter, Def, DefKind, Field, KiwiType, KiwiValue, Schema};

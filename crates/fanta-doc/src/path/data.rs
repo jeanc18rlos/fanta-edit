@@ -21,6 +21,16 @@ pub struct PathData {
     /// omitted from JSON in that case (see [`FillRule::is_default`]).
     #[serde(default, skip_serializing_if = "FillRule::is_default")]
     pub fill_rule: FillRule,
+    /// Per-subpath fill rules for paths whose subpaths were authored with
+    /// MIXED winding rules (Figma stores a `windingRule` per `fillGeometry`
+    /// Path entry). Entry `i` applies to the `i`-th subpath (a subpath starts
+    /// at each [`Move`](super::PathSegment::Move); leading segments before any
+    /// `Move` form subpath 0). Empty ⇒ every subpath uses [`fill_rule`]
+    /// (`Self::fill_rule`) — the overwhelmingly common case, skipped from JSON
+    /// so old docs round-trip byte-identical. Renderers that don't split
+    /// per-rule may fall back to `fill_rule` alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subpath_rules: Vec<FillRule>,
 }
 
 impl PathData {

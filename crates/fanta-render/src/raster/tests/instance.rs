@@ -241,6 +241,7 @@ fn derived_instance_preserves_baked_positions_instead_of_reflowing() {
             mode: LayoutMode::Horizontal,
             spacing: 0.0,
             counter_spacing: 0.0,
+            counter_auto_spacing: false,
             padding: [0.0, 0.0, 0.0, 0.0],
             primary_align: PrimaryAlign::Start,
             counter_align: CounterAlign::Start,
@@ -363,4 +364,79 @@ fn instance_expansion_is_memoized_across_frames() {
 
     r.clear_instance_cache();
     assert_eq!(r.instance_cache_len(), 0, "clear drops the memo");
+}
+
+#[test]
+fn instance_master_root_outside_stroke_escapes_the_instance_box() {
+    // Figma paints a frame's Outside-aligned stroke past the frame box even on
+    // instances: the instance clips its master's CONTENT, not the root frame's
+    // own border. The old instance-box `clip_rect` wrapped the whole expansion,
+    // so the master root's outside stroke was clipped to a sub-pixel AA sliver
+    // (the 'Wireframe' placeholders in the sample wireframe file lost their 2px
+    // borders). Now content confinement comes from the expansion root's own
+    // frame clip, which `paint_node_foreground` correctly escapes.
+    use fanta_doc::GroupNode;
+
+    let mut doc = Doc::new();
+    // Master: a 20x20 white frame with a 4px OUTSIDE black border, parked far
+    // off-screen so only the instance's expansion can paint on-surface.
+    let mut stroke = fanta_doc::Stroke::solid(Color::rgb(0, 0, 0), 4.0);
+    stroke.align = fanta_doc::StrokeAlign::Outside;
+    let mut strokes = smallvec::SmallVec::new();
+    strokes.push(stroke);
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([20.0, 20.0]),
+        background: Some(Fill::solid(Color::rgb(255, 255, 255))),
+        strokes,
+        explicit_modes: Default::default(),
+        ..Default::default()
+    }));
+    master.transform = Transform2D::translation(10_000.0, 0.0);
+    let root = master.id;
+    doc.apply(Operation::create_node(master)).unwrap();
+
+    let comp = ComponentId::new();
+    let mut lib = ComponentLibrary::new();
+    lib.defs
+        .insert(comp, ComponentDef::new(comp, root, "Bordered"));
+
+    let mut inst = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: comp,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [20.0, 20.0],
+    }));
+    // Centre the instance's [0,0,20,20] box on the world origin → screen
+    // (22,22)..(42,42) on a 64x64 surface.
+    inst.transform = Transform2D::translation(-10.0, -10.0);
+    doc.apply(Operation::create_node(inst)).unwrap();
+
+    let registry = VariableRegistry::new();
+    let inputs = RenderInputs {
+        components: &lib,
+        variables: &registry,
+        active_modes: &BTreeMap::new(),
+        mode_generation: 0,
+        playback: None,
+        dark_ui: false,
+    };
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render_with(&doc.scene, &doc.viewport, &inputs);
+    let buf = r.copy_rgba();
+
+    // 2px OUTSIDE the box's left edge (screen x=20, y=32): inside the outside
+    // border band (screen 18..22) → must be opaque black. The old instance clip
+    // left it fully transparent.
+    let outside = rgba_at(&buf, 64, 20, 32);
+    assert!(
+        outside[3] > 200 && outside[0] < 40,
+        "outside border must escape the instance box, got {outside:?}"
+    );
+    // Interior stays the master's white fill.
+    let interior = rgba_at(&buf, 64, 32, 32);
+    assert!(
+        interior[0] > 200 && interior[3] > 200,
+        "interior must stay the master's white fill, got {interior:?}"
+    );
 }
