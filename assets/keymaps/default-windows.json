@@ -1546,6 +1546,8 @@
       "a": "fig_viewer::ActivateNodeEditTool",
       "f": "fig_viewer::ActivateFrameTool",
       "t": "fig_viewer::ActivateTextTool",
+      "shift-s": "fig_viewer::ActivateSectionTool",
+      "s": "fig_viewer::ActivateSliceTool",
     },
   },
   {

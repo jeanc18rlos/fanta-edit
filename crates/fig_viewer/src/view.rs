@@ -12,16 +12,16 @@ use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection, Window, actions, canvas,
-    div, fill, point, px, size,
+    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection,
+    Window, actions, canvas, div, fill, point, px, size,
 };
 use language::Capability;
 use project::Project;
 use settings::Settings as _;
-use ui::{Divider, Tooltip, prelude::*};
+use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
 use util::paths::PathExt;
 use workspace::{
     ItemSettings, Pane,
@@ -90,8 +90,44 @@ actions!(
         ActivateFrameTool,
         /// Activate the text tool.
         ActivateTextTool,
+        /// Activate the pencil (freehand) tool.
+        ActivatePencilTool,
+        /// Activate the section tool.
+        ActivateSectionTool,
+        /// Activate the slice tool.
+        ActivateSliceTool,
+        /// Activate the scale tool (placeholder).
+        ActivateScaleTool,
+        /// Activate the direct path-selection tool (placeholder).
+        ActivatePathSelectTool,
+        /// Activate the text-on-path tool (placeholder).
+        ActivateTextPathTool,
     ]
 );
+
+/// The action that activates a given tool, so a toolbar dropdown row can both
+/// dispatch it and display its keybinding.
+fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
+    match kind {
+        ToolKind::Select => Box::new(ActivateSelectTool),
+        ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
+        ToolKind::NodeEdit => Box::new(ActivateNodeEditTool),
+        ToolKind::Hand => Box::new(ActivateHandTool),
+        ToolKind::Scale => Box::new(ActivateScaleTool),
+        ToolKind::Rect => Box::new(ActivateRectangleTool),
+        ToolKind::Ellipse => Box::new(ActivateEllipseTool),
+        ToolKind::Line => Box::new(ActivateLineTool),
+        ToolKind::Polygon => Box::new(ActivatePolygonTool),
+        ToolKind::Star => Box::new(ActivateStarTool),
+        ToolKind::Pen => Box::new(ActivatePenTool),
+        ToolKind::Pencil => Box::new(ActivatePencilTool),
+        ToolKind::Frame => Box::new(ActivateFrameTool),
+        ToolKind::Section => Box::new(ActivateSectionTool),
+        ToolKind::Slice => Box::new(ActivateSliceTool),
+        ToolKind::Text => Box::new(ActivateTextTool),
+        ToolKind::TextPath => Box::new(ActivateTextPathTool),
+    }
+}
 
 pub(crate) const MIN_ZOOM: f32 = 0.1;
 pub(crate) const MAX_ZOOM: f32 = 20.0;
@@ -118,6 +154,12 @@ pub struct FigView {
     #[cfg(target_os = "macos")]
     gpu_renderer: Option<MacGpuRenderer>,
     tools: ToolShell,
+    /// The last-used tool per toolbar group, so each group's button keeps
+    /// showing the member you last picked (Figma behavior). Indexed by group.
+    group_faces: Vec<ToolKind>,
+    /// Set once the document's fonts have been queued for background download,
+    /// so the one-shot prewarm doesn't re-fire every frame.
+    fonts_prewarmed: bool,
     hovered_node: Option<NodeId>,
     /// The in-place text-editing session, when a text node is being edited.
     text_edit: Option<CanvasTextEdit>,
@@ -166,6 +208,8 @@ impl FigView {
             #[cfg(target_os = "macos")]
             gpu_renderer: None,
             tools: ToolShell::new(),
+            group_faces: crate::tools::initial_group_faces(),
+            fonts_prewarmed: false,
             hovered_node: None,
             text_edit: None,
             pending_text_edit: None,
@@ -538,8 +582,40 @@ impl FigView {
                 ((), change)
             });
         });
+        // Remember this tool as its group's face so the group button keeps
+        // showing it after switching to another group (Figma behavior).
+        if let Some(index) = crate::tools::group_index_of(kind)
+            && let Some(face) = self.group_faces.get_mut(index)
+        {
+            *face = kind;
+        }
         self.viewport = Some(viewport);
         cx.notify();
+    }
+
+    /// Once the document is loaded, kick off a background download of every
+    /// font family it uses (Figma-style auto-fetch) so a missing family is
+    /// cached off the paint thread instead of stalling the first render that
+    /// shapes it. Fires at most once per view.
+    fn maybe_prewarm_fonts(&mut self, cx: &mut Context<Self>) {
+        if self.fonts_prewarmed {
+            return;
+        }
+        let Some(document) = self.item.read(cx).document() else {
+            return; // document still loading — retry on a later render
+        };
+        self.fonts_prewarmed = true;
+        let families = document.used_font_families();
+        if families.is_empty() {
+            return;
+        }
+        cx.background_spawn(async move {
+            let fetched = fanta_text::prewarm_font_downloads(families.iter().map(String::as_str));
+            if !fetched.is_empty() {
+                log::info!("prewarmed {} document font(s): {fetched:?}", fetched.len());
+            }
+        })
+        .detach();
     }
 
     // === Mouse handling ===================================================
@@ -1634,6 +1710,8 @@ impl FigView {
             })
             .unwrap_or(1.0);
         let zoom_label: SharedString = format!("{:.0}%", zoom * 100.0).into();
+        // The last-used tool per group drives each group button's face.
+        let faces = self.group_faces.clone();
 
         h_flex()
             .absolute()
@@ -1656,6 +1734,7 @@ impl FigView {
                             .iter()
                             .enumerate()
                             .flat_map(|(group_index, group)| {
+                                let group: &'static [ToolKind] = group;
                                 let mut children: Vec<AnyElement> = Vec::new();
                                 if group_index > 0 {
                                     children.push(
@@ -1665,25 +1744,80 @@ impl FigView {
                                             .into_any_element(),
                                     );
                                 }
-                                for kind in group.iter().copied() {
-                                    let disabled = kind.requires_editing() && !editable;
-                                    let selected = active == kind;
-                                    children.push(
-                                        IconButton::new(("fig-tool", kind as usize), kind.icon())
-                                            .toggle_state(selected)
-                                            .icon_color(if selected {
-                                                Color::Accent
-                                            } else {
-                                                Color::Default
-                                            })
-                                            .disabled(disabled)
-                                            .tooltip(Tooltip::text(kind.label()))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.activate_tool(kind, cx);
-                                            }))
-                                            .into_any_element(),
-                                    );
+                                // The group's face = the active tool if it belongs
+                                // to this group, else the last-used member.
+                                let group_active = group.contains(&active);
+                                let face_kind = if group_active {
+                                    active
+                                } else {
+                                    faces.get(group_index).copied().unwrap_or(group[0])
+                                };
+                                let face_disabled = face_kind.requires_editing() && !editable;
+                                let face_btn = IconButton::new(
+                                    ("fig-tool-face", group_index),
+                                    face_kind.icon(),
+                                )
+                                .toggle_state(group_active)
+                                .icon_color(if group_active {
+                                    Color::Accent
+                                } else {
+                                    Color::Default
+                                })
+                                .disabled(face_disabled)
+                                .tooltip(Tooltip::text(face_kind.label()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.activate_tool(face_kind, cx);
+                                }));
+                                if group.len() <= 1 {
+                                    children.push(face_btn.into_any_element());
+                                    return children;
                                 }
+                                // Multi-tool group: face button + caret dropdown.
+                                let caret = PopoverMenu::new(("fig-tool-group", group_index))
+                                    .anchor(Anchor::BottomLeft)
+                                    .trigger(
+                                        IconButton::new(
+                                            ("fig-tool-caret", group_index),
+                                            IconName::ChevronDown,
+                                        )
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Muted),
+                                    )
+                                    .menu(move |window, cx| {
+                                        Some(ContextMenu::build(
+                                            window,
+                                            cx,
+                                            move |mut menu, _window, _cx| {
+                                                for kind in group.iter().copied() {
+                                                    let mut label = kind.label().to_string();
+                                                    if kind.is_stub() {
+                                                        label.push_str("  ·  soon");
+                                                    }
+                                                    let disabled =
+                                                        kind.requires_editing() && !editable;
+                                                    menu = menu.item(
+                                                        ContextMenuEntry::new(label)
+                                                            .icon(kind.icon())
+                                                            .icon_position(IconPosition::Start)
+                                                            .toggleable(
+                                                                IconPosition::End,
+                                                                kind == active,
+                                                            )
+                                                            .action(action_for_kind(kind))
+                                                            .disabled(disabled),
+                                                    );
+                                                }
+                                                menu
+                                            },
+                                        ))
+                                    });
+                                children.push(
+                                    h_flex()
+                                        .items_center()
+                                        .child(face_btn)
+                                        .child(caret)
+                                        .into_any_element(),
+                                );
                                 children
                             }),
                     )
@@ -1732,6 +1866,7 @@ impl Render for FigView {
         if let Some(node) = self.pending_text_edit.take() {
             self.open_text_edit(node, TextEditSeed::SelectAll, window, cx);
         }
+        self.maybe_prewarm_fonts(cx);
         let snapshot = {
             let item = self.item.read(cx);
             FigViewSnapshot {
@@ -1829,6 +1964,24 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivateTextTool, _, cx| {
                 this.activate_tool(ToolKind::Text, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePencilTool, _, cx| {
+                this.activate_tool(ToolKind::Pencil, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateSectionTool, _, cx| {
+                this.activate_tool(ToolKind::Section, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateSliceTool, _, cx| {
+                this.activate_tool(ToolKind::Slice, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateScaleTool, _, cx| {
+                this.activate_tool(ToolKind::Scale, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePathSelectTool, _, cx| {
+                this.activate_tool(ToolKind::PathSelect, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTextPathTool, _, cx| {
+                this.activate_tool(ToolKind::TextPath, cx)
             }))
             .size_full()
             .relative()
@@ -2186,6 +2339,8 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 gpu_renderer: None,
                 tools: ToolShell::new(),
+                group_faces: crate::tools::initial_group_faces(),
+                fonts_prewarmed: false,
                 hovered_node: None,
                 text_edit: None,
                 pending_text_edit: None,

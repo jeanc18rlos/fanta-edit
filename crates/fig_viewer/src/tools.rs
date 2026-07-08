@@ -7,8 +7,9 @@
 use fanta_doc::{Color, Doc, Viewport};
 use fanta_tools::{
     Button, CursorHint, EllipseTool, FrameTool, HandTool, KeyEvent, LineTool, LogicalKey,
-    ModifierKeys, NodeEditTool, PenTool, PointerEvent, PolygonTool, RectTool, SelectTool, StarTool,
-    TextTool, Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
+    ModifierKeys, NodeEditTool, PathSelectTool, PenTool, PencilTool, PointerEvent, PolygonTool,
+    RectTool, ScaleTool, SectionTool, SelectTool, SliceTool, StarTool, TextPathTool, TextTool,
+    Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
 };
 use glam::DVec2;
 use gpui::{CursorStyle, Modifiers, MouseButton};
@@ -17,11 +18,18 @@ use ui::IconName;
 /// Fill assigned to newly drawn shapes until the shell grows a color palette.
 const NEW_SHAPE_FILL: Color = Color::rgb(0xD9, 0xD9, 0xD9);
 
-/// The floating toolbar's tools, grouped Figma-style: selection, frame,
-/// shapes, drawing, pan. Groups render with separators between them.
+/// The floating toolbar's tools, grouped Figma-style. Each group renders as one
+/// button showing the group's active/last-used tool plus a caret that opens a
+/// dropdown of the group's members; the zoom cluster is rendered separately.
+/// Order: navigation, layout, shape, line/vector, text.
 pub const TOOLBAR_GROUPS: [&[ToolKind]; 5] = [
-    &[ToolKind::Select, ToolKind::NodeEdit],
-    &[ToolKind::Frame],
+    &[
+        ToolKind::Select,
+        ToolKind::PathSelect,
+        ToolKind::Hand,
+        ToolKind::Scale,
+    ],
+    &[ToolKind::Frame, ToolKind::Section, ToolKind::Slice],
     &[
         ToolKind::Rect,
         ToolKind::Ellipse,
@@ -29,71 +37,117 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 5] = [
         ToolKind::Polygon,
         ToolKind::Star,
     ],
-    &[ToolKind::Pen, ToolKind::Text],
-    &[ToolKind::Hand],
+    &[ToolKind::NodeEdit, ToolKind::Pencil, ToolKind::Pen],
+    &[ToolKind::Text, ToolKind::TextPath],
 ];
+
+/// The default face (button icon) for each toolbar group before the user picks
+/// a member — each group's first tool. The view stores a mutable copy and
+/// updates it as tools are activated so a group keeps showing its last choice.
+pub fn initial_group_faces() -> Vec<ToolKind> {
+    TOOLBAR_GROUPS
+        .iter()
+        .filter_map(|g| g.first().copied())
+        .collect()
+}
+
+/// The index of the toolbar group that contains `kind`, if any.
+pub fn group_index_of(kind: ToolKind) -> Option<usize> {
+    TOOLBAR_GROUPS.iter().position(|g| g.contains(&kind))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolKind {
     Select,
+    PathSelect,
     NodeEdit,
     Hand,
+    Scale,
     Rect,
     Ellipse,
     Line,
     Polygon,
     Star,
     Pen,
+    Pencil,
     Frame,
+    Section,
+    Slice,
     Text,
+    TextPath,
 }
 
 impl ToolKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Select => "Move",
+            Self::PathSelect => "Path Selection",
             Self::NodeEdit => "Edit Path",
             Self::Hand => "Hand",
+            Self::Scale => "Scale",
             Self::Rect => "Rectangle",
             Self::Ellipse => "Ellipse",
             Self::Line => "Line",
             Self::Polygon => "Polygon",
             Self::Star => "Star",
             Self::Pen => "Pen",
+            Self::Pencil => "Pencil",
             Self::Frame => "Frame",
+            Self::Section => "Section",
+            Self::Slice => "Slice",
             Self::Text => "Text",
+            Self::TextPath => "Text on Path",
         }
     }
 
     pub fn icon(self) -> IconName {
         match self {
             Self::Select => IconName::ToolSelect,
+            Self::PathSelect => IconName::ToolPathSelect,
             Self::NodeEdit => IconName::ToolNodeEdit,
             Self::Hand => IconName::ToolHand,
+            Self::Scale => IconName::ToolScale,
             Self::Rect => IconName::ToolRect,
             Self::Ellipse => IconName::ToolEllipse,
             Self::Line => IconName::ToolLine,
             Self::Polygon => IconName::ToolPolygon,
             Self::Star => IconName::ToolStar,
             Self::Pen => IconName::ToolPen,
+            Self::Pencil => IconName::ToolPencil,
             Self::Frame => IconName::ToolFrame,
+            Self::Section => IconName::ToolSection,
+            Self::Slice => IconName::ToolSlice,
             Self::Text => IconName::ToolText,
+            Self::TextPath => IconName::ToolTextPath,
         }
+    }
+
+    /// Placeholder tools that appear in the toolbar but have no behavior yet
+    /// (Scale, direct path-selection, text-on-path). Rendered with a "soon" hint
+    /// so it's clear they're not wired up.
+    pub fn is_stub(self) -> bool {
+        matches!(self, Self::Scale | Self::PathSelect | Self::TextPath)
     }
 
     fn build(self) -> Box<dyn Tool> {
         match self {
             Self::Select => Box::new(SelectTool::new()),
+            Self::PathSelect => Box::new(PathSelectTool::new()),
             Self::NodeEdit => Box::new(NodeEditTool::new()),
             Self::Hand => Box::new(HandTool::new()),
+            Self::Scale => Box::new(ScaleTool::new()),
             Self::Rect => Box::new(RectTool::new()),
             Self::Ellipse => Box::new(EllipseTool::new()),
             Self::Line => Box::new(LineTool::new()),
             Self::Polygon => Box::new(PolygonTool::new()),
             Self::Star => Box::new(StarTool::new()),
             Self::Pen => Box::new(PenTool::new()),
+            Self::Pencil => Box::new(PencilTool::new()),
             Self::Frame => Box::new(FrameTool::new()),
+            Self::Section => Box::new(SectionTool::new()),
+            Self::Slice => Box::new(SliceTool::new()),
             Self::Text => Box::new(TextTool::new()),
+            Self::TextPath => Box::new(TextPathTool::new()),
         }
     }
 }

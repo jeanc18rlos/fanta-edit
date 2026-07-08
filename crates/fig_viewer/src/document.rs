@@ -184,6 +184,32 @@ impl FigDocument {
         }
     }
 
+    /// Every distinct font family the document's text nodes reference (node
+    /// style + per-run overrides), for pre-warming font downloads at open so a
+    /// missing family is fetched off the paint thread instead of stalling it.
+    pub fn used_font_families(&self) -> Vec<String> {
+        let mut families: Vec<String> = Vec::new();
+        let mut push = |name: &str| {
+            let name = name.trim();
+            if !name.is_empty() && !families.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+                families.push(name.to_string());
+            }
+        };
+        for root in self.doc.scene.roots().to_vec() {
+            for id in self.doc.scene.descendants_of(root) {
+                if let Some(node) = self.doc.scene.get(id)
+                    && let fanta_doc::NodeData::Text(text) = &node.data
+                {
+                    push(&text.style.font_family);
+                    for run in &text.style_runs {
+                        push(&run.style.font_family);
+                    }
+                }
+            }
+        }
+        families
+    }
+
     pub fn page(&self, selected_page_index: Option<usize>) -> Option<&FigPage> {
         let index = selected_page_index
             .filter(|index| *index < self.pages.len())
