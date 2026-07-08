@@ -58,3 +58,7 @@ crates/docs_preprocessor/actions.json
 
 # NixOS integration test state
 .nixos-test-history
+
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/launch.json
