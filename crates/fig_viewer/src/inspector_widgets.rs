@@ -53,16 +53,25 @@ pub(crate) enum AlignGlyph {
     DistributeV,
 }
 
-/// The typography align-strip glyphs: three horizontal-align cells followed by
-/// three vertical-align cells.
+/// The typography align-strip glyphs: four horizontal-align cells (including
+/// justify) followed by three vertical-align cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextAlignGlyph {
     Left,
     CenterH,
     Right,
+    Justify,
     Top,
     CenterV,
     Bottom,
+}
+
+/// The typography decoration glyphs, drawn as three independent toggles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextDecorationGlyph {
+    Italic,
+    Underline,
+    Strikethrough,
 }
 
 fn bar(x: f32, y: f32, w: f32, h: f32, color: Hsla) -> Div {
@@ -136,6 +145,11 @@ pub(crate) fn text_align_glyph(kind: TextAlignGlyph, color: Hsla) -> Div {
             .child(bar(3.0, 3.5, 10.0, 1.5, color))
             .child(bar(6.5, 7.0, 6.5, 1.5, color))
             .child(bar(4.5, 10.5, 8.5, 1.5, color)),
+        // Justify reads as "every line reaches both margins" — all bars flush.
+        TextAlignGlyph::Justify => canvas
+            .child(bar(3.0, 3.5, 10.0, 1.5, color))
+            .child(bar(3.0, 7.0, 10.0, 1.5, color))
+            .child(bar(3.0, 10.5, 10.0, 1.5, color)),
         TextAlignGlyph::Top => canvas
             .child(bar(3.0, 2.5, 10.0, 1.5, color))
             .child(bar(4.5, 5.5, 7.0, 1.5, color)),
@@ -145,6 +159,37 @@ pub(crate) fn text_align_glyph(kind: TextAlignGlyph, color: Hsla) -> Div {
         TextAlignGlyph::Bottom => canvas
             .child(bar(4.5, 9.0, 7.0, 1.5, color))
             .child(bar(3.0, 12.0, 10.0, 1.5, color)),
+    }
+}
+
+/// One typography decoration icon. The letterforms are approximated from the
+/// same axis-aligned bars the align glyphs use (no icon assets): italic is a
+/// staircase of offset strokes, underline an "U" over a rule, strikethrough an
+/// "S"-less stem pair crossed by a rule.
+pub(crate) fn text_decoration_glyph(kind: TextDecorationGlyph, color: Hsla) -> Div {
+    let canvas = glyph_canvas();
+    match kind {
+        // A slanted stem between serifs: four 1.5px steps walking left as they
+        // descend, which reads as an italic "I" at 16px.
+        TextDecorationGlyph::Italic => canvas
+            .child(bar(7.0, 3.0, 6.0, 1.5, color))
+            .child(bar(8.0, 4.5, 1.5, 2.5, color))
+            .child(bar(7.25, 7.0, 1.5, 2.5, color))
+            .child(bar(6.5, 9.5, 1.5, 2.5, color))
+            .child(bar(3.0, 11.5, 6.0, 1.5, color)),
+        // Two stems closed by a bowl, over the underline rule.
+        TextDecorationGlyph::Underline => canvas
+            .child(bar(3.5, 2.5, 1.5, 6.0, color))
+            .child(bar(11.0, 2.5, 1.5, 6.0, color))
+            .child(bar(3.5, 8.5, 9.0, 1.5, color))
+            .child(bar(2.5, 12.0, 11.0, 1.5, color)),
+        // A closed loop crossed by the strike rule at the x-height midline.
+        TextDecorationGlyph::Strikethrough => canvas
+            .child(bar(4.5, 3.0, 7.0, 1.5, color))
+            .child(bar(4.5, 4.5, 1.5, 3.0, color))
+            .child(bar(10.0, 8.5, 1.5, 3.0, color))
+            .child(bar(4.5, 11.0, 7.0, 1.5, color))
+            .child(bar(2.5, 7.25, 11.0, 1.5, color)),
     }
 }
 

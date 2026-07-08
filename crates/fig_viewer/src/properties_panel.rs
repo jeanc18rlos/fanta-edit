@@ -4,6 +4,7 @@
 //! density, drag-to-scrub numeric fields, opacity slider, and anchored color
 //! picker.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,12 +15,13 @@ use fanta_canvas::{
     align_vertical, distribute, resize_transform_keep_rotation, rotate_about, transform_angle,
 };
 use fanta_doc::{
-    Action, AutoLayout, AxisSizing, BlendMode, BoundProp, Bounds as FantaBounds, CanvasNode,
-    Color as FantaColor, ComponentDef, ComponentLibrary, ComponentPropId, ComponentPropKind,
-    CounterAlign, Doc, Fill, Gradient, GroupNode, ImageFitMode, InstanceNode, LayoutChild,
-    LayoutMode, NodeData, NodeFlags, NodeId, Operation, PrimaryAlign, Reaction, Shadow, ShadowKind,
-    Stroke, StrokeAlign, TextAlign, TextAutoResize, Transform2D, Trigger, VAlign as TextVAlign,
-    VarValue, Viewport,
+    Action, AutoLayout, AxisSizing, BlendMode, Blur, BlurKind, BoundProp, Bounds as FantaBounds,
+    CanvasNode, Color as FantaColor, ComponentDef, ComponentId, ComponentLibrary, ComponentPropId,
+    ComponentPropKind, ComponentSet, ComponentSetMembership, CounterAlign, Doc, Fill, Gradient,
+    GroupNode, ImageFitMode, InstanceNode, LayoutChild, LayoutMode, NodeData, NodeFlags, NodeId,
+    Operation, PrimaryAlign, Reaction, Shadow, ShadowKind, Stroke, StrokeAlign, TextAlign,
+    TextAutoResize, Transform2D, Trigger, VAlign as TextVAlign, VarValue, VariantAxis, Viewport,
+    expand_instance,
 };
 use fanta_render::{AssetResolver, RasterRenderer, RenderInputs};
 use fs::Fs;
@@ -34,8 +36,8 @@ use settings::{Settings as _, update_settings_file};
 use smallvec::SmallVec;
 use ui::prelude::*;
 use ui::{
-    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, Switch, ToggleState,
-    Tooltip,
+    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, PopoverMenu, Switch,
+    ToggleState, Tooltip,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -49,7 +51,8 @@ use crate::color_picker::{
 };
 use crate::document::{DocChange, FigDocument, FigItem};
 use crate::inspector_widgets::{
-    AlignGlyph, PanelDrag, TextAlignGlyph, align_glyph, scrub_value, text_align_glyph, track_value,
+    AlignGlyph, PanelDrag, TextAlignGlyph, TextDecorationGlyph, align_glyph, scrub_value,
+    text_align_glyph, text_decoration_glyph, track_value,
 };
 use crate::panel_settings::FantaPropertiesPanelSettings;
 use crate::view::FigView;
@@ -106,10 +109,20 @@ enum InspectorField {
         id: NodeId,
         corner: usize,
     },
+    /// Squircle corner smoothing, edited as a whole percent (0–100 ⇒ 0.0–1.0).
+    CornerSmoothing(NodeId),
     Opacity(NodeId),
     FillColor {
         id: NodeId,
         index: usize,
+    },
+    /// One paint's own opacity, as a whole percent: a solid's alpha channel, an
+    /// image fill's `opacity`. Gradients carry their alpha per stop and have no
+    /// paint-level opacity, so they never bind this field.
+    PaintOpacity {
+        id: NodeId,
+        index: usize,
+        is_stroke: bool,
     },
     /// A gradient fill/stroke bound to the gradient editor popover. Distinct
     /// from [`InspectorField::FillColor`] so the panel routes gradient edits to
@@ -156,17 +169,40 @@ enum InspectorField {
         id: NodeId,
         index: usize,
     },
+    /// Radius of one entry of the node's blur stack (layer / background).
+    BlurRadius {
+        id: NodeId,
+        index: usize,
+    },
+    /// A text node's glyph color: its Fill section is one color row, not a
+    /// paint stack.
+    TextColor(NodeId),
     InstanceTextProp {
         id: NodeId,
         prop: ComponentPropId,
+    },
+    InstanceNumberProp {
+        id: NodeId,
+        prop: ComponentPropId,
+    },
+    InstanceColorProp {
+        id: NodeId,
+        prop: ComponentPropId,
+    },
+    /// A distinct solid color across a multi-node selection. Editing it
+    /// replaces that color everywhere in the selection, so the field binds a
+    /// color rather than a node.
+    SelectionColor {
+        from: FantaColor,
     },
     PageBackground(NodeId),
 }
 
 /// The node a field belongs to, for snapshotting before a scrub / picker
-/// session.
-fn field_node(field: &InspectorField) -> NodeId {
-    match field {
+/// session. `None` for fields that address the whole selection rather than one
+/// node — those commit directly and never stage a per-node preview.
+fn field_node(field: &InspectorField) -> Option<NodeId> {
+    Some(match field {
         InspectorField::Name(id)
         | InspectorField::X(id)
         | InspectorField::Y(id)
@@ -174,7 +210,9 @@ fn field_node(field: &InspectorField) -> NodeId {
         | InspectorField::Height(id)
         | InspectorField::Rotation(id)
         | InspectorField::CornerRadius(id)
+        | InspectorField::CornerSmoothing(id)
         | InspectorField::Opacity(id)
+        | InspectorField::TextColor(id)
         | InspectorField::FontFamily(id)
         | InspectorField::FontSize(id)
         | InspectorField::LineHeight(id)
@@ -186,6 +224,7 @@ fn field_node(field: &InspectorField) -> NodeId {
         | InspectorField::PageBackground(id)
         | InspectorField::CornerRadiusCorner { id, .. }
         | InspectorField::FillColor { id, .. }
+        | InspectorField::PaintOpacity { id, .. }
         | InspectorField::Gradient { id, .. }
         | InspectorField::StrokeColor { id, .. }
         | InspectorField::StrokeWidth { id, .. }
@@ -194,21 +233,25 @@ fn field_node(field: &InspectorField) -> NodeId {
         | InspectorField::EffectBlur { id, .. }
         | InspectorField::EffectSpread { id, .. }
         | InspectorField::EffectColor { id, .. }
-        | InspectorField::InstanceTextProp { id, .. } => *id,
-    }
+        | InspectorField::BlurRadius { id, .. }
+        | InspectorField::InstanceTextProp { id, .. }
+        | InspectorField::InstanceNumberProp { id, .. }
+        | InspectorField::InstanceColorProp { id, .. } => *id,
+        InspectorField::SelectionColor { .. } => return None,
+    })
 }
 
-/// The field Tab jumps to from `field` — its 2-up partner (X↔Y, W↔H, ∠↔R,
-/// LH↔LS, gaps, pads, effect pairs), or the next corner of the per-corner
-/// radius grid.
+/// The field Tab jumps to from `field` — its 2-up partner (X↔Y, W↔H, R↔
+/// smoothing, LH↔LS, gaps, pads, effect pairs), or the next corner of the
+/// per-corner radius grid.
 fn paired_field(field: &InspectorField) -> Option<InspectorField> {
     Some(match field {
         InspectorField::X(id) => InspectorField::Y(*id),
         InspectorField::Y(id) => InspectorField::X(*id),
         InspectorField::Width(id) => InspectorField::Height(*id),
         InspectorField::Height(id) => InspectorField::Width(*id),
-        InspectorField::Rotation(id) => InspectorField::CornerRadius(*id),
-        InspectorField::CornerRadius(id) => InspectorField::Rotation(*id),
+        InspectorField::CornerRadius(id) => InspectorField::CornerSmoothing(*id),
+        InspectorField::CornerSmoothing(id) => InspectorField::CornerRadius(*id),
         InspectorField::CornerRadiusCorner { id, corner } => InspectorField::CornerRadiusCorner {
             id: *id,
             corner: (corner + 1) % 4,
@@ -243,7 +286,9 @@ fn paired_field(field: &InspectorField) -> Option<InspectorField> {
 /// values the commit path would reject.
 fn clamp_field_value(field: &InspectorField, value: f64) -> f64 {
     match field {
-        InspectorField::Opacity(_) => value.clamp(0.0, 100.0),
+        InspectorField::Opacity(_)
+        | InspectorField::CornerSmoothing(_)
+        | InspectorField::PaintOpacity { .. } => value.clamp(0.0, 100.0),
         InspectorField::Width(_) | InspectorField::Height(_) | InspectorField::FontSize(_) => {
             value.max(1.0)
         }
@@ -252,6 +297,7 @@ fn clamp_field_value(field: &InspectorField, value: f64) -> f64 {
         | InspectorField::CornerRadiusCorner { .. }
         | InspectorField::StrokeWidth { .. }
         | InspectorField::EffectBlur { .. }
+        | InspectorField::BlurRadius { .. }
         | InspectorField::LayoutGapH(_)
         | InspectorField::LayoutGapV(_)
         | InspectorField::LayoutPadH(_)
@@ -363,11 +409,30 @@ const BLEND_MODES: [(BlendMode, &str); 16] = [
     (BlendMode::Luminosity, "Luminosity"),
 ];
 
+/// The OpenType weights the typography dropdown offers. The model stores the
+/// numeric weight (100–900), so an off-list value round-trips untouched and is
+/// labeled "Custom" instead of snapping onto the nearest stop.
+const FONT_WEIGHTS: [(u16, &str); 6] = [
+    (300, "Light"),
+    (400, "Regular"),
+    (500, "Medium"),
+    (600, "SemiBold"),
+    (700, "Bold"),
+    (800, "ExtraBold"),
+];
+
 fn text_resize_label(resize: TextAutoResize) -> &'static str {
     match resize {
         TextAutoResize::None => "Fixed",
         TextAutoResize::WidthAndHeight => "Auto width",
         TextAutoResize::Height => "Auto height",
+    }
+}
+
+fn blur_kind_label(kind: BlurKind) -> &'static str {
+    match kind {
+        BlurKind::Layer => "Layer blur",
+        BlurKind::Background => "Background blur",
     }
 }
 
@@ -430,8 +495,42 @@ enum PageBackgroundValue {
     Other(SharedString),
 }
 
+/// What the inspector treats the selected node as. Computed once per snapshot
+/// build; every section's visibility keys off it (see the section matrix in
+/// [`FantaPropertiesPanel::render`]). Deliberately coarser than [`NodeData`]:
+/// the original Fanta inspector has no per-shape subtype — rect, ellipse, star,
+/// line and boolean-op results all read as one "Shape".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    /// A `Group` that paints a surface (`is_frame_surface`).
+    Frame,
+    /// A plain `Group` with no surface of its own.
+    Group,
+    Shape,
+    Text,
+    Image,
+    Instance,
+    /// The root of a `ComponentDef` — overrides the underlying data variant.
+    Component,
+    /// `NodeGraph` / `AiArtifact` / `Embed` (and the out-of-scope media kinds):
+    /// generic wrapper sections only.
+    Other,
+}
+
+impl NodeKind {
+    /// Corner radius, corner smoothing and the frame/group paint stack all key
+    /// off "does this node carry a corner-capable surface".
+    fn is_corner_capable(self) -> bool {
+        matches!(
+            self,
+            Self::Frame | Self::Group | Self::Shape | Self::Component
+        )
+    }
+}
+
 struct NodeSection {
     id: NodeId,
+    kind: NodeKind,
     type_name: SharedString,
     type_icon: IconName,
     name: String,
@@ -441,6 +540,9 @@ struct NodeSection {
     height: f64,
     rotation_degrees: f64,
     corner_radius: CornerRadiusValue,
+    /// Squircle smoothing as a whole percent. `Some` only for corner-capable
+    /// nodes (Vector / Group data).
+    corner_smoothing: Option<f64>,
     opacity_percent: f64,
     blend_mode: BlendMode,
     fills: Option<Vec<PaintSnapshot>>,
@@ -449,11 +551,15 @@ struct NodeSection {
     visible: bool,
     locked: bool,
     typography: Option<TypographySnapshot>,
-    auto_layout: Option<AutoLayoutSnapshot>,
+    /// `Some` for every `Group`-backed node (frame, plain group, component
+    /// master with a group root): clip content, plus auto-layout when enabled.
+    layout: Option<LayoutSnapshot>,
     layout_child: Option<LayoutChildSnapshot>,
     image_fit: Option<ImageFitMode>,
-    component: Option<ComponentSection>,
+    instance: Option<InstanceSection>,
+    master: Option<MasterSection>,
     effects: Vec<EffectSnapshot>,
+    blurs: Vec<BlurSnapshot>,
     reactions: Vec<SharedString>,
     bindings: Vec<BindingSnapshot>,
 }
@@ -462,6 +568,11 @@ enum CornerRadiusValue {
     NotApplicable,
     Uniform(f64),
     PerCorner([f64; 4]),
+}
+
+struct LayoutSnapshot {
+    clip: bool,
+    auto_layout: Option<AutoLayoutSnapshot>,
 }
 
 struct AutoLayoutSnapshot {
@@ -477,7 +588,6 @@ struct AutoLayoutSnapshot {
     primary_sizing: AxisSizing,
     counter_sizing: AxisSizing,
     wrap: bool,
-    clip: bool,
     reverse_z: bool,
 }
 
@@ -486,10 +596,46 @@ struct LayoutChildSnapshot {
     absolute: bool,
 }
 
-struct ComponentSection {
+/// The instance-side component info: which master it renders, its variant axes,
+/// and its exposed props.
+struct InstanceSection {
     component_name: SharedString,
+    /// The resolved master's root node, for "go to main component". `None` when
+    /// the master is dangling.
+    main_root: Option<NodeId>,
     variants: Vec<VariantAxisSnapshot>,
     props: Vec<ComponentPropSnapshot>,
+}
+
+/// The master-side component info, shown when the selected node is the root of
+/// a [`ComponentDef`]. Read-only: editing the schema or the variant set needs
+/// `SetComponentProps` / `SetComponentSet` sub-editors (deferred).
+struct MasterSection {
+    name: SharedString,
+    /// `Some` when the master belongs to a component set: the set's name, axes,
+    /// and this member's value on each axis.
+    variant_set: Option<VariantSetSnapshot>,
+    props: Vec<PropSchemaSnapshot>,
+}
+
+struct VariantSetSnapshot {
+    set_name: SharedString,
+    /// One entry per axis: the axis name, its allowed values, and this member's
+    /// selection.
+    axes: Vec<VariantSetAxisSnapshot>,
+    is_default_variant: bool,
+}
+
+struct VariantSetAxisSnapshot {
+    name: SharedString,
+    values: SharedString,
+    selected: SharedString,
+}
+
+struct PropSchemaSnapshot {
+    name: SharedString,
+    kind: SharedString,
+    default: SharedString,
 }
 
 struct VariantAxisSnapshot {
@@ -506,8 +652,10 @@ struct ComponentPropSnapshot {
 enum PropValueSnapshot {
     Bool(bool),
     Text(String),
-    /// Read-only display for prop kinds without an editor yet (number, color,
-    /// instance swap, alias defaults).
+    Number(f64),
+    Color(FantaColor),
+    /// Read-only display for prop kinds without an editor (instance swap, alias
+    /// defaults, text styles).
     Display(SharedString),
 }
 
@@ -517,6 +665,18 @@ struct EffectSnapshot {
     offset: [f64; 2],
     blur: f64,
     spread: f64,
+}
+
+struct BlurSnapshot {
+    kind: BlurKind,
+    radius: f64,
+}
+
+/// One distinct solid color across a multi-node selection, with how many paints
+/// use it.
+struct SelectionColorSnapshot {
+    color: FantaColor,
+    uses: usize,
 }
 
 struct BindingSnapshot {
@@ -534,6 +694,34 @@ struct PaintSnapshot {
     /// The paint's kind, driving the Solid/Linear/Radial/Angular/Diamond type
     /// selector. `None` for image paints (no type control offered).
     kind: Option<PaintKind>,
+    /// The paint's own opacity as a whole percent — a solid's alpha, an image
+    /// fill's `opacity`. `None` for gradients, whose alpha lives per stop.
+    opacity_percent: Option<f64>,
+    /// The per-paint blend mode (Figma's paint-level `blendMode`). `None` for
+    /// solids, which carry no blend in this model.
+    blend: Option<BlendMode>,
+    /// Whether the paint currently contributes any coverage. Drives the eye.
+    visible: bool,
+}
+
+/// Which paint of which node a hidden-alpha memory belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PaintKey {
+    id: NodeId,
+    index: usize,
+    is_stroke: bool,
+}
+
+/// The alpha a paint carried before the eye hid it. The data model has no
+/// per-paint visible flag, so hiding zeroes the paint's alpha — remembering the
+/// prior value here is what keeps a hide → show round-trip non-destructive
+/// (the pre-fix code forced alpha back to 255 and only handled solids).
+#[derive(Debug, Clone, PartialEq)]
+enum HiddenPaintAlpha {
+    Solid(u8),
+    /// One alpha per gradient stop, in stop order.
+    Gradient(Vec<u8>),
+    Image(f32),
 }
 
 /// The paint-type choices the fill/stroke type selector cycles through.
@@ -547,11 +735,16 @@ struct TypographySnapshot {
     font_family: String,
     size_px: f64,
     weight: u16,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
     line_height: f64,
     letter_spacing: f64,
     align: TextAlign,
     vertical_align: TextVAlign,
     auto_resize: TextAutoResize,
+    /// The glyph color, which stands in for a Text node's fill stack.
+    color: FantaColor,
 }
 
 struct MultiSection {
@@ -564,6 +757,11 @@ struct MultiSection {
     width: Option<f64>,
     height: Option<f64>,
     rotation_degrees: Option<f64>,
+    /// Distinct solid colors used anywhere in the selection, first-seen order.
+    colors: Vec<SelectionColorSnapshot>,
+    /// How many of the selected nodes are component masters, gating "Combine as
+    /// variants".
+    master_count: usize,
 }
 
 // =============================================================================
@@ -581,7 +779,18 @@ struct NodeSnapshot {
     opacity: f32,
     data: Box<NodeData>,
     effects: SmallVec<[Shadow; 0]>,
+    blurs: SmallVec<[Blur; 0]>,
 }
+
+/// The panel's draggable slider tracks. Their painted bounds are captured every
+/// frame so a press maps straight to a fraction of the track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliderTrack {
+    Opacity,
+    CornerSmoothing,
+}
+
+const SLIDER_TRACK_COUNT: usize = 2;
 
 enum ScrubKind {
     /// Value follows the horizontal mouse delta (numeric field labels).
@@ -640,11 +849,15 @@ pub struct FantaPropertiesPanel {
     /// node's data (expanded only when it already carries distinct corners);
     /// reset on subject change so one node's expansion doesn't leak to the next.
     corner_radii_expanded: Option<bool>,
-    /// An in-flight drag-to-scrub gesture (field label or opacity track).
+    /// An in-flight drag-to-scrub gesture (field label or a slider track).
     scrub: Option<ScrubState>,
-    /// The opacity slider track's window bounds, captured during paint so a
-    /// click/drag on the track maps to a 0–100% fraction.
-    opacity_track: Option<Bounds<Pixels>>,
+    /// Each slider track's window bounds, captured during paint so a click/drag
+    /// on the track maps to a 0–100% fraction. Indexed by [`SliderTrack`].
+    slider_tracks: [Option<Bounds<Pixels>>; SLIDER_TRACK_COUNT],
+    /// The alpha each hidden paint carried before its eye was toggled off, so
+    /// showing it again restores the value instead of forcing full opacity.
+    /// View-only state: cleared whenever the inspected subject changes.
+    hidden_paint_alpha: HashMap<PaintKey, HiddenPaintAlpha>,
     /// The open color-picker popover, if any.
     picker: Option<PickerSession>,
     /// The open gradient-editor popover, if any.
@@ -712,7 +925,8 @@ impl FantaPropertiesPanel {
                 content_scroll: ScrollHandle::new(),
                 corner_radii_expanded: None,
                 scrub: None,
-                opacity_track: None,
+                slider_tracks: [None; SLIDER_TRACK_COUNT],
+                hidden_paint_alpha: HashMap::new(),
                 picker: None,
                 gradient_editor: None,
                 swatch_press_dismissed: false,
@@ -778,6 +992,7 @@ impl FantaPropertiesPanel {
                     self.gradient_editor = None;
                     self.content_scroll.set_offset(gpui::Point::default());
                     self.corner_radii_expanded = None;
+                    self.hidden_paint_alpha.clear();
                 }
             }
             None => {
@@ -798,6 +1013,7 @@ impl FantaPropertiesPanel {
         self.abandon_gradient_editor(restore_previews, cx);
         self.content_scroll.set_offset(gpui::Point::default());
         self.corner_radii_expanded = None;
+        self.hidden_paint_alpha.clear();
     }
 
     fn active_view(&self, _cx: &App) -> Option<Entity<FigView>> {
@@ -812,6 +1028,11 @@ impl FantaPropertiesPanel {
 
     /// Build operations against the current document and apply them through
     /// the item so undo history and dirty tracking stay correct.
+    ///
+    /// A gesture that authors more than one operation (aligning a selection,
+    /// replacing a color across it, detaching an instance) is wrapped in a
+    /// single history transaction, so the whole gesture collapses to one undo
+    /// step instead of one per node.
     fn apply_document_ops(
         &mut self,
         cx: &mut Context<Self>,
@@ -830,15 +1051,51 @@ impl FantaPropertiesPanel {
             };
             finite_transform_operations(build(&document.doc))
         };
-        if operations.is_empty() {
-            return;
+        match operations.len() {
+            0 => {}
+            1 => {
+                item.update(cx, |item, cx| {
+                    for operation in operations {
+                        if let Err(error) = item.apply(operation, cx) {
+                            log::error!(
+                                "Fanta properties panel failed to apply operation: {error:#}"
+                            );
+                        }
+                    }
+                });
+            }
+            _ => self.apply_document_transaction(&item, operations, cx),
         }
+    }
+
+    /// Apply several operations as one undoable transaction. `Doc::apply`
+    /// appends to an open transaction instead of committing per-op, so the
+    /// whole batch pushes a single undo entry.
+    fn apply_document_transaction(
+        &mut self,
+        item: &Entity<FigItem>,
+        operations: Vec<Operation>,
+        cx: &mut Context<Self>,
+    ) {
+        let label = operations
+            .first()
+            .map(|operation| operation.label().to_string())
+            .unwrap_or_else(|| "Edit".to_string());
         item.update(cx, |item, cx| {
-            for operation in operations {
-                if let Err(error) = item.apply(operation, cx) {
-                    log::error!("Fanta properties panel failed to apply operation: {error:#}");
-                    break;
+            let applied = item.with_document(cx, |document| {
+                let doc = &mut document.doc;
+                doc.history.begin(label, &mut doc.scene);
+                for operation in operations {
+                    if let Err(error) = doc.apply(operation) {
+                        log::error!("Fanta properties panel failed to apply operation: {error:#}");
+                        break;
+                    }
                 }
+                doc.history.commit(&mut doc.scene);
+                ((), DocChange::Content)
+            });
+            if applied.is_none() {
+                log::debug!("dropping inspector edit: the document is not ready");
             }
         });
     }
@@ -899,6 +1156,7 @@ impl FantaPropertiesPanel {
     }
 
     fn add_paint(&mut self, id: NodeId, is_stroke: bool, cx: &mut Context<Self>) {
+        self.forget_hidden_paint_alpha(id, is_stroke);
         self.update_node_data(
             id,
             move |data| {
@@ -914,7 +1172,18 @@ impl FantaPropertiesPanel {
         );
     }
 
+    /// Drop the visibility-alpha memory for a paint list whose indices are about
+    /// to shift. `hidden_paint_alpha` keys paints by list position, so after an
+    /// add/remove a surviving key would resolve to a *different* paint; the
+    /// memory is best-effort (show falls back to opaque when absent), so forget
+    /// it rather than restore the wrong paint's alpha.
+    fn forget_hidden_paint_alpha(&mut self, id: NodeId, is_stroke: bool) {
+        self.hidden_paint_alpha
+            .retain(|key, _| !(key.id == id && key.is_stroke == is_stroke));
+    }
+
     fn remove_paint(&mut self, id: NodeId, index: usize, is_stroke: bool, cx: &mut Context<Self>) {
+        self.forget_hidden_paint_alpha(id, is_stroke);
         self.update_node_data(
             id,
             move |data| {
@@ -932,9 +1201,12 @@ impl FantaPropertiesPanel {
         );
     }
 
-    /// Toggle a solid paint's visibility by zeroing / restoring its alpha —
-    /// the closest analog of the original's per-paint visibility eye in this
-    /// data model (paints carry no separate visible flag).
+    /// Toggle a paint's visibility by zeroing / restoring its alpha — the
+    /// closest analog of the original's per-paint eye in a data model that
+    /// carries no per-paint visible flag. Works for every paint kind (a solid's
+    /// alpha, every gradient stop's alpha, an image fill's opacity) and, on
+    /// show, restores the alpha the paint had when it was hidden rather than
+    /// forcing it fully opaque.
     fn toggle_paint_visibility(
         &mut self,
         id: NodeId,
@@ -942,30 +1214,89 @@ impl FantaPropertiesPanel {
         is_stroke: bool,
         cx: &mut Context<Self>,
     ) {
+        let key = PaintKey {
+            id,
+            index,
+            is_stroke,
+        };
+        let Some(item) = self.active_item(cx) else {
+            return;
+        };
+        let current = {
+            let item_state = item.read(cx);
+            let Some(document) = item_state.document() else {
+                return;
+            };
+            let Some(node) = document.doc.scene.get(id) else {
+                return;
+            };
+            let mut data = node.data.clone();
+            paint_slot_mut(&mut data, index, is_stroke).map(|paint| paint_alpha(paint))
+        };
+        let Some(current) = current else {
+            return;
+        };
+        let restore = if paint_alpha_is_visible(&current) {
+            self.hidden_paint_alpha.insert(key, current);
+            None
+        } else {
+            // Unknown prior alpha (a doc that loaded with a zeroed paint, or a
+            // panel rebuilt since): fall back to fully opaque. A remembered
+            // alpha whose kind no longer matches the live paint (the paint was
+            // converted solid↔gradient↔image while hidden) is discarded too —
+            // `set_paint_alpha` would silently no-op on the mismatch, leaving
+            // the "show" click dead.
+            Some(
+                self.hidden_paint_alpha
+                    .remove(&key)
+                    .filter(|remembered| {
+                        std::mem::discriminant(remembered) == std::mem::discriminant(&current)
+                    })
+                    .unwrap_or_else(|| opaque_paint_alpha(&current)),
+            )
+        };
         self.update_node_data(
             id,
             move |data| {
-                let fill = if is_stroke {
-                    stroke_list_mut(data)
-                        .and_then(|strokes| strokes.get_mut(index))
-                        .map(|stroke| &mut stroke.paint)
-                } else {
-                    fill_slot_mut(data, index)
-                };
-                if let Some(Fill::Solid { color }) = fill {
-                    color.a = if color.a == 0 { 255 } else { 0 };
+                if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
+                    match &restore {
+                        Some(alpha) => set_paint_alpha(paint, alpha),
+                        None => set_paint_alpha(paint, &zeroed_paint_alpha(paint)),
+                    }
                 }
             },
             cx,
         );
     }
 
-    fn cycle_font_weight(&mut self, id: NodeId, cx: &mut Context<Self>) {
+    fn set_font_weight(&mut self, id: NodeId, weight: u16, cx: &mut Context<Self>) {
         self.update_node_data(
             id,
-            |data| {
+            move |data| {
                 if let NodeData::Text(text) = data {
-                    text.style.weight = next_font_weight(text.style.weight);
+                    text.style.weight = weight;
+                }
+            },
+            cx,
+        );
+    }
+
+    fn toggle_text_decoration(
+        &mut self,
+        id: NodeId,
+        decoration: TextDecorationGlyph,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_node_data(
+            id,
+            move |data| {
+                if let NodeData::Text(text) = data {
+                    let flag = match decoration {
+                        TextDecorationGlyph::Italic => &mut text.style.italic,
+                        TextDecorationGlyph::Underline => &mut text.style.underline,
+                        TextDecorationGlyph::Strikethrough => &mut text.style.strikethrough,
+                    };
+                    *flag = !*flag;
                 }
             },
             cx,
@@ -1046,6 +1377,58 @@ impl FantaPropertiesPanel {
                         ShadowKind::Drop => ShadowKind::Inner,
                         ShadowKind::Inner => ShadowKind::Drop,
                     };
+                }
+            })
+        });
+    }
+
+    fn add_blur(&mut self, id: NodeId, kind: BlurKind, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, move |doc| {
+            blurs_operations(doc, id, |blurs| blurs.push(default_blur(kind)))
+        });
+    }
+
+    fn remove_blur(&mut self, id: NodeId, index: usize, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, move |doc| {
+            blurs_operations(doc, id, |blurs| {
+                if index < blurs.len() {
+                    blurs.remove(index);
+                }
+            })
+        });
+    }
+
+    fn set_blur_kind(&mut self, id: NodeId, index: usize, kind: BlurKind, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, move |doc| {
+            blurs_operations(doc, id, |blurs| {
+                if let Some(blur) = blurs.get_mut(index) {
+                    blur.kind = kind;
+                }
+            })
+        });
+    }
+
+    /// Add or remove a frame/group's auto layout. `FigItem::apply` flips the
+    /// document's cached `uses_auto_layout` gate on when an op introduces the
+    /// first auto layout, so the frame is re-solved immediately.
+    fn toggle_auto_layout(&mut self, id: NodeId, enable: bool, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, move |doc| {
+            // The solver treats an auto-layout group as a frame that carries a
+            // `clip_size` — imported frames always do, but a plain group has
+            // none. Seed one from the current content bounds when enabling on a
+            // clip-less group, or a later "Hug contents" sizing collapses the
+            // frame to a zero-extent box and clips away every child. Mirrors
+            // `toggle_clip_content`.
+            let local_size = doc
+                .scene
+                .local_bounds(id)
+                .map(|bounds| [bounds.width(), bounds.height()]);
+            replace_data_operation(doc, id, move |data| {
+                if let NodeData::Group(group) = data {
+                    group.auto_layout = enable.then(AutoLayout::default);
+                    if enable && group.clip_size.is_none() {
+                        group.clip_size = local_size;
+                    }
                 }
             })
         });
@@ -1205,6 +1588,80 @@ impl FantaPropertiesPanel {
         self.apply_document_ops(cx, move |doc| {
             variant_cycle_operations(doc, id, axis.as_ref())
         });
+    }
+
+    /// Replace the instance with editable copies of its master's subtree. One
+    /// undoable transaction: the detach itself, plus the ops that fold the
+    /// master root's own surface props onto the (now plain) frame, which the
+    /// data swap alone would drop.
+    fn detach_instance(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, move |doc| detach_instance_operations(doc, id));
+    }
+
+    /// Merge the selected component masters into one variant set, so their
+    /// instances can switch between them along a single axis.
+    fn combine_as_variants(&mut self, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, combine_as_variants_operations);
+    }
+
+    /// Select and scroll to the master a component instance renders, switching
+    /// pages when the master lives on the hidden Components page.
+    fn focus_main_component(&mut self, target: NodeId, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let selected_page = view.read(cx).selected_page_index();
+        let (page_index, current_index) = {
+            let fig_item = item.read(cx);
+            let Some(document) = fig_item.document() else {
+                return;
+            };
+            (
+                document.page_index_of_node(target),
+                document.page_index(selected_page),
+            )
+        };
+        view.update(cx, |view, cx| {
+            if let Some(index) = page_index
+                && Some(index) != current_index
+            {
+                view.select_page(index, cx);
+            }
+            view.focus_node(target, cx);
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(target);
+                ((), DocChange::Selection)
+            });
+        });
+    }
+
+    /// Set one paint's per-paint blend mode (gradient / image paints only —
+    /// solids carry no blend in this model).
+    fn set_paint_blend(
+        &mut self,
+        id: NodeId,
+        index: usize,
+        is_stroke: bool,
+        blend: BlendMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_node_data(
+            id,
+            move |data| {
+                if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
+                    match paint {
+                        Fill::Gradient { blend: slot, .. } | Fill::Image { blend: slot, .. } => {
+                            *slot = blend;
+                        }
+                        Fill::Solid { .. } => {}
+                    }
+                }
+            },
+            cx,
+        );
     }
 
     // === Export ===========================================================
@@ -1396,7 +1853,7 @@ impl FantaPropertiesPanel {
             return None;
         }
         let document = item.document()?;
-        let id = field_node(field);
+        let id = field_node(field)?;
         let node = document.doc.scene.get(id)?;
         Some(NodeSnapshot {
             id,
@@ -1404,6 +1861,7 @@ impl FantaPropertiesPanel {
             opacity: node.opacity,
             data: Box::new(node.data.clone()),
             effects: node.effects.clone(),
+            blurs: node.blurs.clone(),
         })
     }
 
@@ -1429,20 +1887,20 @@ impl FantaPropertiesPanel {
         });
     }
 
-    /// Begin an opacity-slider gesture: the press position maps straight to a
-    /// 0–100% value (a click alone sets and commits it on release).
-    fn begin_opacity_scrub(
+    /// Begin a slider gesture: the press position maps straight to a 0–100%
+    /// value (a click alone sets and commits it on release).
+    fn begin_track_scrub(
         &mut self,
-        id: NodeId,
+        track: SliderTrack,
+        field: InspectorField,
         start_percent: f64,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         self.finish_scrub(cx);
-        let Some(bounds) = self.opacity_track else {
+        let Some(bounds) = self.slider_tracks[track as usize] else {
             return;
         };
-        let field = InspectorField::Opacity(id);
         let Some(snapshot) = self.snapshot_for_field(&field, cx) else {
             return;
         };
@@ -1875,13 +2333,17 @@ impl FantaPropertiesPanel {
             .copied()
             .filter(|id| doc.scene.contains(*id))
             .collect();
+        // One O(library) scan per snapshot build — never per row. Both the
+        // single-node "is this a component master" test and the multi-select
+        // "how many masters are selected" count read it.
+        let masters = master_roots(&doc.components);
         let body = match selection.as_slice() {
             [] => InspectorBody::Page(page_section(document, selected_page_index)),
-            [id] => match node_section(doc, *id) {
+            [id] => match node_section(doc, *id, &masters) {
                 Some(node) => InspectorBody::Node(Box::new(node)),
                 None => InspectorBody::Page(page_section(document, selected_page_index)),
             },
-            ids => InspectorBody::Multi(multi_section(doc, ids)),
+            ids => InspectorBody::Multi(multi_section(doc, ids, &masters)),
         };
         InspectorSnapshot::Ready {
             editable,
@@ -2261,6 +2723,28 @@ impl FantaPropertiesPanel {
             .map(|(_, label)| *label)
             .unwrap_or(MIXED_VALUE)
             .into();
+        self.render_labeled_dropdown(
+            element_id, aria_label, label, id, current, options, apply, editable, window, cx,
+        )
+    }
+
+    /// [`Self::render_choice_dropdown`] with an explicit trigger label, for
+    /// properties whose current value may sit off the option list (a font weight
+    /// of 350 reads "Custom", not "–", and is never snapped onto a stop).
+    #[allow(clippy::too_many_arguments)]
+    fn render_labeled_dropdown<T: Copy + PartialEq + 'static>(
+        &self,
+        element_id: &'static str,
+        aria_label: &'static str,
+        label: SharedString,
+        id: NodeId,
+        current: T,
+        options: &'static [(T, &'static str)],
+        apply: fn(&mut Self, NodeId, T, &mut Context<Self>),
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if !editable {
             let colors = cx.theme().colors();
             return h_flex()
@@ -2530,6 +3014,82 @@ impl FantaPropertiesPanel {
             .into_any_element()
     }
 
+    /// The per-paint blend dropdown (Figma's paint-level `blendMode`). Offered
+    /// only for gradient and image paints — a solid carries no blend of its own
+    /// in this model.
+    #[allow(clippy::too_many_arguments)]
+    fn render_paint_blend_selector(
+        &self,
+        id: NodeId,
+        index: usize,
+        is_stroke: bool,
+        current: BlendMode,
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let label: SharedString = BLEND_MODES
+            .iter()
+            .find(|(mode, _)| *mode == current)
+            .map(|(_, label)| *label)
+            .unwrap_or(MIXED_VALUE)
+            .into();
+        if !editable {
+            return h_flex()
+                .flex_1()
+                .min_w_0()
+                .px_2()
+                .h(px(FIELD_BOX_H))
+                .rounded_md()
+                .border_1()
+                .bg(colors.editor_background)
+                .border_color(colors.border_variant)
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+        let element_id: ElementId = if is_stroke {
+            ("fanta-stroke-blend", index).into()
+        } else {
+            ("fanta-fill-blend", index).into()
+        };
+        let panel = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            for (mode, name) in BLEND_MODES {
+                let panel = panel.clone();
+                menu.push_item(
+                    ContextMenuEntry::new(name)
+                        .toggleable(IconPosition::End, mode == current)
+                        .handler(move |_window, cx| {
+                            if let Err(error) = panel.update(cx, |this, cx| {
+                                this.set_paint_blend(id, index, is_stroke, mode, cx)
+                            }) {
+                                log::debug!(
+                                    "dropping paint-blend change for closed properties panel: {error:#}"
+                                );
+                            }
+                        }),
+                );
+            }
+            menu
+        });
+        div()
+            .flex_1()
+            .min_w_0()
+            .child(
+                DropdownMenu::new(element_id, label, menu)
+                    .style(DropdownStyle::Outlined)
+                    .trigger_size(ButtonSize::Compact)
+                    .full_width(true)
+                    .aria_label("Paint blend mode"),
+            )
+            .into_any_element()
+    }
+
     /// A ghost "+ Add …" row, the original's add affordance under a paint /
     /// effect list.
     fn render_add_row(
@@ -2570,14 +3130,16 @@ impl FantaPropertiesPanel {
             .into_any_element()
     }
 
-    /// The transparent overlay that records the opacity track's bounds during
+    /// The transparent overlay that records a slider track's bounds during
     /// paint, so track clicks map to fractions.
-    fn opacity_bounds_probe(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn track_bounds_probe(&self, track: SliderTrack, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.weak_entity();
         canvas(
             move |bounds, _, cx| {
-                this.update(cx, |this, _| this.opacity_track = Some(bounds))
-                    .log_err();
+                this.update(cx, |this, _| {
+                    this.slider_tracks[track as usize] = Some(bounds)
+                })
+                .log_err();
             },
             |_, _, _, _| {},
         )
@@ -2704,8 +3266,12 @@ impl FantaPropertiesPanel {
     }
 
     /// The Position section: X/Y (hidden while the node flows in a parent's
-    /// auto layout), W/H, ∠ + corner radius with the per-corner expander, and
-    /// the auto-layout child controls.
+    /// auto layout), W/H, and the rotation cell.
+    ///
+    /// Diverges from the original Fanta, which showed a frame's W/H inside its
+    /// Layout section instead: keeping W/H here for every node kind means one
+    /// dimension editor, already exercised by the resize / rotation math.
+    /// Corner radius + smoothing live in Appearance (old Fanta's `insp_appearance`).
     fn render_position_section(
         &self,
         node: &NodeSection,
@@ -2774,57 +3340,113 @@ impl FantaPropertiesPanel {
                 )),
         );
 
-        // ∠ + R in one 2-up row, like the original's Position grid; the R cell
-        // gains the per-corner expander toggle.
-        let rotation_cell = self.render_numeric_cell(
-            "fanta-rotation",
-            0,
-            Some("∠".into()),
-            InspectorField::Rotation(id),
-            Some(node.rotation_degrees),
-            Some("°"),
-            editable,
-            cx,
-        );
-        let corners_expanded = self.corner_radii_expanded.unwrap_or(matches!(
-            node.corner_radius,
-            CornerRadiusValue::PerCorner(_)
-        ));
-        let corner_cell = match &node.corner_radius {
-            CornerRadiusValue::NotApplicable => None,
-            CornerRadiusValue::Uniform(radius) => Some(self.render_numeric_cell(
-                "fanta-radius",
-                0,
-                Some("R".into()),
-                InspectorField::CornerRadius(id),
-                Some(*radius),
-                None,
-                editable,
-                cx,
-            )),
-            CornerRadiusValue::PerCorner(_) => Some(self.render_numeric_cell(
-                "fanta-radius",
-                0,
-                Some("R".into()),
-                InspectorField::CornerRadius(id),
-                None,
-                None,
-                editable,
-                cx,
-            )),
-        };
-        let has_corner_cell = corner_cell.is_some();
         section = section.child(
             h_flex()
                 .px_4()
                 .gap_2()
-                .child(rotation_cell)
-                .child(match corner_cell {
-                    Some(cell) => div().flex_1().min_w_0().child(cell),
-                    None => div().flex_1(),
-                })
-                .when(has_corner_cell, |this| {
-                    this.child(
+                .child(self.render_numeric_cell(
+                    "fanta-rotation",
+                    0,
+                    Some("∠".into()),
+                    InspectorField::Rotation(id),
+                    Some(node.rotation_degrees),
+                    Some("°"),
+                    editable,
+                    cx,
+                ))
+                .child(div().flex_1()),
+        );
+        section.into_any_element()
+    }
+
+    /// The "Auto layout child" section: how this node participates in its
+    /// parent's auto layout. Only rendered when the parent is an auto-layout
+    /// frame.
+    fn render_layout_child_section(
+        &self,
+        id: NodeId,
+        layout_child: &LayoutChildSnapshot,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fills_container = layout_child.fills_container;
+        let mut section = v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Auto layout child", None));
+        if !layout_child.absolute {
+            section = section.child(self.render_pill_row(
+                "fanta-child-resize",
+                "Resize",
+                if fills_container {
+                    "Fill container".into()
+                } else {
+                    "Fixed width".into()
+                },
+                "Toggle Fixed Width / Fill Container",
+                editable,
+                move |this, cx| {
+                    this.update_layout_child(
+                        id,
+                        |child| child.grow = if fills_container { 0.0 } else { 1.0 },
+                        cx,
+                    );
+                },
+                cx,
+            ));
+        }
+        section
+            .child(self.render_switch_row(
+                "fanta-child-absolute",
+                "Ignore auto layout",
+                layout_child.absolute,
+                editable,
+                move |this, cx| {
+                    this.update_layout_child(id, |child| child.absolute = !child.absolute, cx);
+                },
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// The per-corner radius pad: a uniform R cell with an expander that opens
+    /// the four TL/TR/BR/BL cells. Lives inside Appearance, next to smoothing.
+    fn render_corner_rows(
+        &self,
+        id: NodeId,
+        corner_radius: &CornerRadiusValue,
+        corner_smoothing: Option<f64>,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut rows = Vec::new();
+        let corners_expanded = self
+            .corner_radii_expanded
+            .unwrap_or(matches!(corner_radius, CornerRadiusValue::PerCorner(_)));
+        let radius_value = match corner_radius {
+            CornerRadiusValue::NotApplicable => None,
+            CornerRadiusValue::Uniform(radius) => Some(Some(*radius)),
+            // Mixed corners read blank, like every other mixed-value cell.
+            CornerRadiusValue::PerCorner(_) => Some(None),
+        };
+        if let Some(radius_value) = radius_value {
+            rows.push(
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .items_center()
+                    .child(self.render_numeric_cell(
+                        "fanta-radius",
+                        0,
+                        Some("R".into()),
+                        InspectorField::CornerRadius(id),
+                        radius_value,
+                        None,
+                        editable,
+                        cx,
+                    ))
+                    .child(div().flex_1())
+                    .child(
                         IconButton::new("fanta-corner-expander", IconName::SquareDot)
                             .icon_size(IconSize::Small)
                             .toggle_state(corners_expanded)
@@ -2834,12 +3456,13 @@ impl FantaPropertiesPanel {
                                 cx.notify();
                             })),
                     )
-                }),
-        );
-        if has_corner_cell && corners_expanded {
-            let radii = match node.corner_radius {
-                CornerRadiusValue::PerCorner(radii) => radii,
-                CornerRadiusValue::Uniform(radius) => [radius; 4],
+                    .into_any_element(),
+            );
+        }
+        if radius_value.is_some() && corners_expanded {
+            let radii = match corner_radius {
+                CornerRadiusValue::PerCorner(radii) => *radii,
+                CornerRadiusValue::Uniform(radius) => [*radius; 4],
                 CornerRadiusValue::NotApplicable => [0.0; 4],
             };
             let corner_keys: [(&'static str, &'static str); 4] = [
@@ -2861,63 +3484,84 @@ impl FantaPropertiesPanel {
                     cx,
                 )
             };
-            section = section
-                .child(
-                    h_flex()
-                        .px_4()
-                        .gap_2()
-                        .child(corner_cell(self, 0, cx))
-                        .child(corner_cell(self, 1, cx)),
-                )
-                .child(
-                    h_flex()
-                        .px_4()
-                        .gap_2()
-                        .child(corner_cell(self, 3, cx))
-                        .child(corner_cell(self, 2, cx)),
-                );
+            rows.push(
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .child(corner_cell(self, 0, cx))
+                    .child(corner_cell(self, 1, cx))
+                    .into_any_element(),
+            );
+            rows.push(
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .child(corner_cell(self, 3, cx))
+                    .child(corner_cell(self, 2, cx))
+                    .into_any_element(),
+            );
         }
-        if let Some(layout_child) = &node.layout_child {
-            let fills_container = layout_child.fills_container;
-            let absolute = layout_child.absolute;
-            if in_flow {
-                section = section.child(self.render_pill_row(
-                    "fanta-child-resize",
-                    "Resize",
-                    if fills_container {
-                        "Fill container".into()
-                    } else {
-                        "Fixed width".into()
-                    },
-                    "Toggle Fixed Width / Fill Container",
-                    editable,
-                    move |this, cx| {
-                        this.update_layout_child(
-                            id,
-                            |child| child.grow = if fills_container { 0.0 } else { 1.0 },
-                            cx,
-                        );
-                    },
-                    cx,
-                ));
-            }
-            section = section.child(self.render_switch_row(
-                "fanta-child-absolute",
-                "Ignore auto layout",
-                absolute,
+        if let Some(percent) = corner_smoothing {
+            rows.push(self.render_slider_row(
+                SliderTrack::CornerSmoothing,
+                "fanta-smoothing-track",
+                "Smoothing",
+                InspectorField::CornerSmoothing(id),
+                percent,
                 editable,
-                move |this, cx| {
-                    this.update_layout_child(id, |child| child.absolute = !child.absolute, cx);
-                },
+                cx,
+            ));
+        }
+        rows
+    }
+
+    /// The Layout section: clip content — which a plain frame carries with or
+    /// without auto layout — followed by the auto-layout controls when the frame
+    /// has an auto layout.
+    fn render_layout_section(
+        &self,
+        id: NodeId,
+        layout: &LayoutSnapshot,
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let auto_layout_on = layout.auto_layout.is_some();
+        let mut section = v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Layout", None))
+            .child(self.render_switch_row(
+                "fanta-layout-clip",
+                "Clip content",
+                layout.clip,
+                editable,
+                move |this, cx| this.toggle_clip_content(id, cx),
+                cx,
+            ))
+            .child(self.render_switch_row(
+                "fanta-layout-auto",
+                "Auto layout",
+                auto_layout_on,
+                editable,
+                move |this, cx| this.toggle_auto_layout(id, !auto_layout_on, cx),
+                cx,
+            ));
+        if let Some(auto_layout) = &layout.auto_layout {
+            section = section.child(self.render_auto_layout_section(
+                id,
+                auto_layout,
+                editable,
+                window,
                 cx,
             ));
         }
         section.into_any_element()
     }
 
-    /// The Auto layout section: direction pill, the interactive 3×3 alignment
+    /// The Auto layout controls: direction pill, the interactive 3×3 alignment
     /// grid beside the align dropdowns, gap and padding pairs, per-axis
-    /// sizing, wrap, clip, and stacking — the original's full control set.
+    /// sizing, wrap, and stacking — the original's full control set.
     fn render_auto_layout_section(
         &self,
         id: NodeId,
@@ -2940,9 +3584,7 @@ impl FantaPropertiesPanel {
             (true, layout.primary_sizing)
         };
         v_flex()
-            .py_1()
             .gap_2()
-            .child(Self::render_section_header("Auto layout", None))
             .child(self.render_choice_row(
                 "fanta-layout-direction",
                 "Direction",
@@ -3104,14 +3746,6 @@ impl FantaPropertiesPanel {
                 move |this, cx| this.toggle_layout_wrap(id, cx),
                 cx,
             ))
-            .child(self.render_switch_row(
-                "fanta-layout-clip",
-                "Clip content",
-                layout.clip,
-                editable,
-                move |this, cx| this.toggle_clip_content(id, cx),
-                cx,
-            ))
             .child(self.render_pill_row(
                 "fanta-layout-stacking",
                 "Stacking",
@@ -3184,13 +3818,15 @@ impl FantaPropertiesPanel {
         grid.into_any_element()
     }
 
-    /// The Typography section: family, weight + size, LH/LS, the 6-cell align
-    /// strip (3 horizontal + 3 vertical), and the resize-mode pill.
+    /// The Typography section: family, weight + size, LH/LS, the independent
+    /// italic / underline / strikethrough toggles, the 7-cell align strip
+    /// (4 horizontal incl. justify + 3 vertical), and the resize-mode pill.
     fn render_typography_section(
         &self,
         id: NodeId,
         typography: &TypographySnapshot,
         editable: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         v_flex()
@@ -3210,15 +3846,19 @@ impl FantaPropertiesPanel {
                 h_flex()
                     .px_4()
                     .gap_2()
-                    .child(self.render_pill(
+                    .child(self.render_labeled_dropdown(
                         "fanta-font-weight",
+                        "Font weight",
                         font_weight_label(typography.weight).into(),
-                        "Cycle Font Weight",
+                        id,
+                        typography.weight,
+                        &FONT_WEIGHTS,
+                        Self::set_font_weight,
                         editable,
-                        move |this, cx| this.cycle_font_weight(id, cx),
+                        window,
                         cx,
                     ))
-                    .child(self.render_numeric_cell(
+                    .child(div().w(px(84.)).flex_none().child(self.render_numeric_cell(
                         "fanta-font-size",
                         0,
                         Some("S".into()),
@@ -3227,7 +3867,7 @@ impl FantaPropertiesPanel {
                         None,
                         editable,
                         cx,
-                    )),
+                    ))),
             )
             .child(
                 h_flex()
@@ -3254,6 +3894,7 @@ impl FantaPropertiesPanel {
                         cx,
                     )),
             )
+            .child(self.render_text_decoration_row(id, typography, editable, cx))
             .child(self.render_text_align_row(id, typography, editable, cx))
             .child(self.render_pill_row(
                 "fanta-text-resize",
@@ -3267,9 +3908,79 @@ impl FantaPropertiesPanel {
             .into_any_element()
     }
 
-    /// The 6-cell text align strip: 3 horizontal cells (the active one gets a
-    /// solid accent pill + white glyph) then 3 vertical cells (the active one
-    /// reads via an accent glyph), matching the original's strip.
+    /// The three independent decoration toggles. Unlike the align strip these
+    /// are not mutually exclusive: a run can be italic AND underlined.
+    fn render_text_decoration_row(
+        &self,
+        id: NodeId,
+        typography: &TypographySnapshot,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let decorations = [
+            (TextDecorationGlyph::Italic, typography.italic, "Italic"),
+            (
+                TextDecorationGlyph::Underline,
+                typography.underline,
+                "Underline",
+            ),
+            (
+                TextDecorationGlyph::Strikethrough,
+                typography.strikethrough,
+                "Strikethrough",
+            ),
+        ];
+        let mut strip = h_flex()
+            .flex_1()
+            .h(px(FIELD_BOX_H))
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .overflow_hidden();
+        for (index, (glyph, active, tooltip)) in decorations.into_iter().enumerate() {
+            let glyph_color = if active {
+                gpui::white()
+            } else {
+                colors.text_muted
+            };
+            let mut cell = div()
+                .id(("fanta-text-decoration", index))
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(text_decoration_glyph(glyph, glyph_color));
+            if active {
+                cell = cell.bg(colors.text_accent);
+            }
+            if editable {
+                let hover_bg = colors.element_hover;
+                cell = cell
+                    .cursor_pointer()
+                    .when(!active, |cell| cell.hover(move |style| style.bg(hover_bg)))
+                    .tooltip(Tooltip::text(tooltip))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_text_decoration(id, glyph, cx);
+                    }));
+            }
+            strip = strip.child(cell);
+        }
+        h_flex()
+            .px_4()
+            .gap_2()
+            .items_center()
+            .child(Self::pill_label("Style"))
+            .child(strip)
+            .child(div().flex_1())
+            .into_any_element()
+    }
+
+    /// The 7-cell text align strip: 4 horizontal cells — left / center / right /
+    /// justify — (the active one gets a solid accent pill + white glyph) then 3
+    /// vertical cells (the active one reads via an accent glyph).
     fn render_text_align_row(
         &self,
         id: NodeId,
@@ -3279,21 +3990,21 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let h_active = match typography.align {
-            TextAlign::Left => Some(0usize),
-            TextAlign::Center => Some(1),
-            TextAlign::Right => Some(2),
-            // Justify is not expressible in the 6-cell strip.
-            TextAlign::Justify => None,
+            TextAlign::Left => 0usize,
+            TextAlign::Center => 1,
+            TextAlign::Right => 2,
+            TextAlign::Justify => 3,
         };
         let v_active = match typography.vertical_align {
-            TextVAlign::Top => 3usize,
-            TextVAlign::Center => 4,
-            TextVAlign::Bottom => 5,
+            TextVAlign::Top => 4usize,
+            TextVAlign::Center => 5,
+            TextVAlign::Bottom => 6,
         };
         let glyphs = [
             TextAlignGlyph::Left,
             TextAlignGlyph::CenterH,
             TextAlignGlyph::Right,
+            TextAlignGlyph::Justify,
             TextAlignGlyph::Top,
             TextAlignGlyph::CenterV,
             TextAlignGlyph::Bottom,
@@ -3307,7 +4018,7 @@ impl FantaPropertiesPanel {
             .bg(colors.editor_background)
             .overflow_hidden();
         for (index, glyph) in glyphs.into_iter().enumerate() {
-            let h_on = h_active == Some(index);
+            let h_on = h_active == index;
             let v_on = v_active == index;
             let glyph_color = if h_on {
                 gpui::white()
@@ -3336,8 +4047,9 @@ impl FantaPropertiesPanel {
                         0 => this.set_text_align(id, TextAlign::Left, cx),
                         1 => this.set_text_align(id, TextAlign::Center, cx),
                         2 => this.set_text_align(id, TextAlign::Right, cx),
-                        3 => this.set_text_vertical_align(id, TextVAlign::Top, cx),
-                        4 => this.set_text_vertical_align(id, TextVAlign::Center, cx),
+                        3 => this.set_text_align(id, TextAlign::Justify, cx),
+                        4 => this.set_text_vertical_align(id, TextVAlign::Top, cx),
+                        5 => this.set_text_vertical_align(id, TextVAlign::Center, cx),
                         _ => this.set_text_vertical_align(id, TextVAlign::Bottom, cx),
                     }));
             }
@@ -3385,27 +4097,174 @@ impl FantaPropertiesPanel {
             .into_any_element()
     }
 
-    /// The component instance Properties section: the component name, one
-    /// cycle pill per variant axis, switches for bool props, and text fields
-    /// for text props.
-    fn render_component_section(
-        &self,
-        id: NodeId,
-        component: &ComponentSection,
-        editable: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The component-master section: identity, the variant-set summary, and the
+    /// exposed-properties schema.
+    ///
+    /// Read-only. Editing the schema (`SetComponentProps` + a per-kind default
+    /// editor + a descendant binding picker) or the variant set
+    /// (`SetComponentSet` + axis/value chips) is a large sub-editor apiece;
+    /// both are deferred.
+    fn render_master_section(&self, master: &MasterSection) -> AnyElement {
         let mut section = v_flex()
             .py_1()
             .gap_2()
-            .child(Self::render_section_header("Properties", None))
+            .child(Self::render_section_header("Component", None))
             .child(
+                h_flex()
+                    .px_4()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Box)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new(master.name.clone())
+                            .size(LabelSize::Small)
+                            .single_line(),
+                    ),
+            );
+        if let Some(variant_set) = &master.variant_set {
+            section = section.child(
                 h_flex().px_4().child(
+                    Label::new(format!(
+                        "Variant of \u{201c}{}\u{201d}{}",
+                        variant_set.set_name,
+                        if variant_set.is_default_variant {
+                            " \u{b7} default"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+                ),
+            );
+            for axis in &variant_set.axes {
+                section = section.child(
+                    h_flex()
+                        .px_4()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div().w(px(PILL_LABEL_W)).flex_none().child(
+                                Label::new(axis.name.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(axis.selected.clone())
+                                    .size(LabelSize::Small)
+                                    .single_line(),
+                            ),
+                        )
+                        .child(
+                            Label::new(axis.values.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                );
+            }
+        }
+        section = section.child(
+            h_flex().px_4().pt_1().child(
+                Label::new("Properties")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ),
+        );
+        if master.props.is_empty() {
+            section = section.child(
+                h_flex().px_4().child(
+                    Label::new("No properties")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+        for prop in &master.props {
+            section = section.child(
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div().w(px(PILL_LABEL_W)).flex_none().child(
+                            Label::new(prop.name.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(prop.kind.clone())
+                                .size(LabelSize::Small)
+                                .single_line(),
+                        ),
+                    )
+                    .child(
+                        Label::new(prop.default.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    ),
+            );
+        }
+        section.into_any_element()
+    }
+
+    /// The component instance Properties section: an identity row that doubles
+    /// as "go to main component", one cycle pill per variant axis, editors for
+    /// bool / text / number / color props, and the detach action.
+    fn render_instance_section(
+        &self,
+        id: NodeId,
+        component: &InstanceSection,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut identity = h_flex()
+            .id("fanta-main-component")
+            .px_4()
+            .gap_1p5()
+            .items_center()
+            .child(
+                Icon::new(IconName::Box)
+                    .size(IconSize::Small)
+                    .color(Color::Accent),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
                     Label::new(component.component_name.clone())
                         .size(LabelSize::Small)
                         .single_line(),
                 ),
             );
+        if let Some(main_root) = component.main_root {
+            identity = identity
+                .cursor_pointer()
+                .tooltip(Tooltip::text("Go to Main Component"))
+                .child(
+                    Icon::new(IconName::ArrowUpRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.focus_main_component(main_root, cx);
+                }));
+        }
+        let mut section = v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Properties", None))
+            .child(identity);
         for (index, variant) in component.variants.iter().enumerate() {
             let axis = variant.axis.clone();
             section = section.child(
@@ -3488,6 +4347,68 @@ impl FantaPropertiesPanel {
                             )),
                     );
                 }
+                PropValueSnapshot::Number(value) => {
+                    let prop_id = prop.id;
+                    section = section.child(
+                        h_flex()
+                            .px_4()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                div().w(px(PILL_LABEL_W)).flex_none().child(
+                                    Label::new(prop.name.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                ),
+                            )
+                            .child(self.render_numeric_cell(
+                                "fanta-prop-number",
+                                index,
+                                None,
+                                InspectorField::InstanceNumberProp { id, prop: prop_id },
+                                Some(*value),
+                                None,
+                                editable,
+                                cx,
+                            )),
+                    );
+                }
+                PropValueSnapshot::Color(color) => {
+                    let prop_id = prop.id;
+                    let field = InspectorField::InstanceColorProp { id, prop: prop_id };
+                    section = section.child(
+                        h_flex()
+                            .px_4()
+                            .gap_1p5()
+                            .items_center()
+                            .child(
+                                div().w(px(PILL_LABEL_W)).flex_none().child(
+                                    Label::new(prop.name.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line(),
+                                ),
+                            )
+                            .child(self.render_color_swatch(
+                                "fanta-prop-color-swatch",
+                                index,
+                                Some(*color),
+                                Some(field.clone()),
+                                editable,
+                                cx,
+                            ))
+                            .child(div().flex_1().min_w_0().child(self.render_text_cell(
+                                "fanta-prop-color",
+                                index,
+                                None,
+                                field,
+                                color.to_hex().trim_start_matches('#').to_string().into(),
+                                editable.then(|| color.to_hex()),
+                                cx,
+                            ))),
+                    );
+                }
                 PropValueSnapshot::Display(value) => {
                     section = section.child(
                         h_flex()
@@ -3514,11 +4435,26 @@ impl FantaPropertiesPanel {
                 }
             }
         }
+        if editable {
+            section = section.child(
+                h_flex().px_4().pt_1().child(
+                    Button::new("fanta-detach-instance", "Detach instance")
+                        .start_icon(Icon::new(IconName::Scissors).size(IconSize::XSmall))
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::Small)
+                        .full_width()
+                        .tooltip(Tooltip::text("Replace the instance with editable copies"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.detach_instance(id, cx))),
+                ),
+            );
+        }
         section.into_any_element()
     }
 
     /// The Appearance section: the opacity slider (draggable track + editable
-    /// % readout), the blend pill, and the visible / locked switches.
+    /// % readout), corner radius with its per-corner pad and the corner
+    /// smoothing slider (corner-capable nodes only), the blend dropdown, and
+    /// the visible / locked switches.
     fn render_appearance_section(
         &self,
         node: &NodeSection,
@@ -3531,7 +4467,22 @@ impl FantaPropertiesPanel {
             .py_1()
             .gap_2()
             .child(Self::render_section_header("Appearance", None))
-            .child(self.render_opacity_row(id, node.opacity_percent, editable, cx))
+            .child(self.render_slider_row(
+                SliderTrack::Opacity,
+                "fanta-opacity-track",
+                "Opacity",
+                InspectorField::Opacity(id),
+                node.opacity_percent,
+                editable,
+                cx,
+            ))
+            .children(self.render_corner_rows(
+                id,
+                &node.corner_radius,
+                node.corner_smoothing,
+                editable,
+                cx,
+            ))
             .child(
                 h_flex()
                     .px_4()
@@ -3569,11 +4520,15 @@ impl FantaPropertiesPanel {
             .into_any_element()
     }
 
-    /// The opacity slider row: label, a real draggable track (filled bar +
-    /// knob), and the focusable % readout.
-    fn render_opacity_row(
+    /// A 0–100% slider row: label, a real draggable track (filled bar + knob),
+    /// and the focusable % readout. Backs both Opacity and corner Smoothing.
+    #[allow(clippy::too_many_arguments)]
+    fn render_slider_row(
         &self,
-        id: NodeId,
+        track_kind: SliderTrack,
+        element_id: &'static str,
+        label: &'static str,
+        field: InspectorField,
         percent: f64,
         editable: bool,
         cx: &mut Context<Self>,
@@ -3586,11 +4541,11 @@ impl FantaPropertiesPanel {
             colors.text_disabled
         };
         let mut track = div()
-            .id("fanta-opacity-track")
+            .id(element_id)
             .relative()
             .flex_1()
             .h(px(FIELD_BOX_H))
-            .child(self.opacity_bounds_probe(cx))
+            .child(self.track_bounds_probe(track_kind, cx))
             .child(
                 div()
                     .absolute()
@@ -3628,6 +4583,7 @@ impl FantaPropertiesPanel {
                     .border_color(thumb_color),
             );
         if editable {
+            let scrub_field = field.clone();
             track = track
                 .cursor_pointer()
                 .on_drag(PanelDrag, |drag, _, _, cx| {
@@ -3638,7 +4594,13 @@ impl FantaPropertiesPanel {
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        this.begin_opacity_scrub(id, percent, event.position, cx);
+                        this.begin_track_scrub(
+                            track_kind,
+                            scrub_field.clone(),
+                            percent,
+                            event.position,
+                            cx,
+                        );
                     }),
                 )
                 .on_mouse_up(
@@ -3650,13 +4612,13 @@ impl FantaPropertiesPanel {
             .px_4()
             .gap_2()
             .items_center()
-            .child(Self::pill_label("Opacity"))
+            .child(Self::pill_label(label))
             .child(track)
             .child(div().w(px(60.)).flex_none().child(self.render_numeric_cell(
-                "fanta-opacity",
+                element_id,
                 0,
                 None,
-                InspectorField::Opacity(id),
+                field,
                 Some(percent),
                 Some("%"),
                 editable,
@@ -3704,7 +4666,7 @@ impl FantaPropertiesPanel {
             } else {
                 InspectorField::FillColor { id, index }
             };
-            let visible = entry.color.map(|color| color.a != 0).unwrap_or(true);
+            let visible = entry.visible;
             let mut row = h_flex().px_4().h(px(LIST_ROW_H)).gap_1p5().items_center();
             if let Some(gradient) = &entry.gradient {
                 row = row
@@ -3763,13 +4725,21 @@ impl FantaPropertiesPanel {
                     editable,
                     cx,
                 )));
-            } else if let Some(color) = entry.color {
-                let alpha_percent = ((f32::from(color.a) / 255.0) * 100.0).round() as i32;
-                row = row.child(
-                    Label::new(format!("{alpha_percent}%"))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
+            } else if let Some(opacity_percent) = entry.opacity_percent {
+                row = row.child(div().w(px(58.)).flex_none().child(self.render_numeric_cell(
+                    "fanta-paint-opacity",
+                    index,
+                    None,
+                    InspectorField::PaintOpacity {
+                        id,
+                        index,
+                        is_stroke,
+                    },
+                    Some(opacity_percent),
+                    Some("%"),
+                    editable,
+                    cx,
+                )));
             }
             if editable {
                 let eye_id: ElementId = if is_stroke {
@@ -3787,7 +4757,6 @@ impl FantaPropertiesPanel {
                         },
                     )
                     .icon_size(IconSize::XSmall)
-                    .disabled(entry.color.is_none())
                     .tooltip(Tooltip::text("Toggle Visibility"))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_paint_visibility(id, index, is_stroke, cx);
@@ -3812,6 +4781,20 @@ impl FantaPropertiesPanel {
                 );
             }
             section = section.child(row);
+            // The per-paint blend gets its own line: the swatch row is already
+            // at its width budget at the panel's 260px minimum.
+            if let Some(blend) = entry.blend {
+                section = section.child(
+                    h_flex()
+                        .px_4()
+                        .gap_2()
+                        .items_center()
+                        .child(div().w(px(18.)).flex_none())
+                        .child(self.render_paint_blend_selector(
+                            id, index, is_stroke, blend, editable, window, cx,
+                        )),
+                );
+            }
         }
         if is_stroke
             && !entries.is_empty()
@@ -3853,24 +4836,104 @@ impl FantaPropertiesPanel {
         section.into_any_element()
     }
 
-    /// The Effects section: header "+" adds a shadow; each shadow is an
-    /// editable block — kind pill + remove ×, X/Y and Blur/Spread 2-ups, and
-    /// a color row whose swatch opens the picker.
+    /// A Text node's Fill section: one glyph-color row (swatch + hex), not a
+    /// paint stack — the model stores the color on `TextStyle`, and the hex
+    /// carries alpha (`#RRGGBBAA`) so transparency is editable here too.
+    fn render_text_fill_section(
+        &self,
+        id: NodeId,
+        color: FantaColor,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let field = InspectorField::TextColor(id);
+        v_flex()
+            .py_1()
+            .gap_1()
+            .child(Self::render_section_header("Fill", None))
+            .child(
+                h_flex()
+                    .px_4()
+                    .h(px(LIST_ROW_H))
+                    .gap_1p5()
+                    .items_center()
+                    .child(self.render_color_swatch(
+                        "fanta-text-fill-swatch",
+                        0,
+                        Some(color),
+                        Some(field.clone()),
+                        editable,
+                        cx,
+                    ))
+                    .child(div().flex_1().min_w_0().child(self.render_text_cell(
+                        "fanta-text-fill",
+                        0,
+                        None,
+                        field,
+                        color.to_hex().trim_start_matches('#').to_string().into(),
+                        editable.then(|| color.to_hex()),
+                        cx,
+                    ))),
+            )
+            .into_any_element()
+    }
+
+    /// The Effects "+" menu: Drop shadow / Layer blur / Background blur, the
+    /// same three the original offers.
+    fn render_effects_add_menu(&self, id: NodeId, cx: &mut Context<Self>) -> AnyElement {
+        let panel = cx.weak_entity();
+        PopoverMenu::new("fanta-add-effect-menu")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                IconButton::new("fanta-add-effect", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Add Effect")),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                Some(ContextMenu::build(
+                    window,
+                    cx,
+                    move |mut menu, _window, _cx| {
+                        let entries: [(&'static str, Option<BlurKind>); 3] = [
+                            ("Drop shadow", None),
+                            ("Layer blur", Some(BlurKind::Layer)),
+                            ("Background blur", Some(BlurKind::Background)),
+                        ];
+                        for (label, blur_kind) in entries {
+                            let panel = panel.clone();
+                            menu
+                                .push_item(ContextMenuEntry::new(label).handler(move |_window, cx| {
+                                if let Err(error) = panel.update(cx, |this, cx| match blur_kind {
+                                    Some(kind) => this.add_blur(id, kind, cx),
+                                    None => this.add_effect(id, cx),
+                                }) {
+                                    log::debug!(
+                                        "dropping add-effect for closed properties panel: {error:#}"
+                                    );
+                                }
+                            }));
+                        }
+                        menu
+                    },
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// The Effects section: header "+" adds a drop shadow, a layer blur, or a
+    /// background blur. Each shadow is an editable block — kind pill + remove ×,
+    /// X/Y and Blur/Spread 2-ups, and a color row whose swatch opens the picker.
+    /// Each blur is a kind pill + radius cell + remove ×.
     fn render_effects_section(
         &self,
         id: NodeId,
         effects: &[EffectSnapshot],
+        blurs: &[BlurSnapshot],
         editable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let add_button = editable.then(|| {
-            self.section_add_button(
-                "fanta-add-effect",
-                "Add Effect",
-                move |this, cx| this.add_effect(id, cx),
-                cx,
-            )
-        });
+        let add_button = editable.then(|| self.render_effects_add_menu(id, cx));
         let mut section = v_flex()
             .py_1()
             .gap_2()
@@ -3987,7 +5050,49 @@ impl FantaPropertiesPanel {
                         ),
                 );
         }
-        if effects.is_empty() {
+        for (index, blur) in blurs.iter().enumerate() {
+            let kind = blur.kind;
+            let mut row = h_flex()
+                .px_4()
+                .gap_2()
+                .items_center()
+                .child(self.render_pill(
+                    ("fanta-blur-kind", index),
+                    blur_kind_label(kind).into(),
+                    "Toggle Layer / Background Blur",
+                    editable,
+                    move |this, cx| {
+                        let next = match kind {
+                            BlurKind::Layer => BlurKind::Background,
+                            BlurKind::Background => BlurKind::Layer,
+                        };
+                        this.set_blur_kind(id, index, next, cx);
+                    },
+                    cx,
+                ))
+                .child(div().w(px(72.)).flex_none().child(self.render_numeric_cell(
+                    "fanta-blur-radius",
+                    index,
+                    Some("R".into()),
+                    InspectorField::BlurRadius { id, index },
+                    Some(blur.radius),
+                    None,
+                    editable,
+                    cx,
+                )));
+            if editable {
+                row = row.child(
+                    IconButton::new(("fanta-blur-remove", index), IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Remove Blur"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_blur(id, index, cx);
+                        })),
+                );
+            }
+            section = section.child(row);
+        }
+        if effects.is_empty() && blurs.is_empty() {
             if editable {
                 section = section.child(self.render_add_row(
                     "fanta-add-effect-row",
@@ -4280,6 +5385,99 @@ impl FantaPropertiesPanel {
             )
             .into_any_element()
     }
+
+    /// The Selection colors section: one row per distinct solid color used
+    /// anywhere in the selection — swatch, editable hex, usage count. Committing
+    /// a hex replaces that color across every selected node in one undo step.
+    fn render_selection_colors_section(
+        &self,
+        colors: &[SelectionColorSnapshot],
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut section = v_flex()
+            .py_1()
+            .gap_1()
+            .child(Self::render_section_header("Selection colors", None));
+        for (index, entry) in colors.iter().enumerate() {
+            let field = InspectorField::SelectionColor { from: entry.color };
+            let hex: SharedString = entry
+                .color
+                .to_hex()
+                .trim_start_matches('#')
+                .to_string()
+                .into();
+            section = section.child(
+                h_flex()
+                    .px_4()
+                    .h(px(LIST_ROW_H))
+                    .gap_1p5()
+                    .items_center()
+                    // The swatch is a preview only: a live color-picker preview
+                    // would need a snapshot of every selected node, and the hex
+                    // field already commits the replacement in one step.
+                    .child(self.render_color_swatch(
+                        "fanta-selection-color-swatch",
+                        index,
+                        Some(entry.color),
+                        None,
+                        false,
+                        cx,
+                    ))
+                    .child(div().flex_1().min_w_0().child(self.render_text_cell(
+                        "fanta-selection-color",
+                        index,
+                        None,
+                        field,
+                        hex,
+                        editable.then(|| entry.color.to_hex()),
+                        cx,
+                    )))
+                    .child(
+                        Label::new(format!("{}", entry.uses))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+        }
+        if colors.is_empty() {
+            section = section.child(
+                h_flex().px_4().child(
+                    Label::new("No solid colors")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            );
+        }
+        section.into_any_element()
+    }
+
+    /// "Combine N as variants": merge the selected component masters into one
+    /// variant set so their instances can switch between them.
+    fn render_combine_variants_section(
+        &self,
+        master_count: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Variants", None))
+            .child(
+                h_flex().px_4().child(
+                    Button::new(
+                        "fanta-combine-variants",
+                        format!("Combine {master_count} as variants"),
+                    )
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Small)
+                    .full_width()
+                    .tooltip(Tooltip::text("Merge the selected components into one set"))
+                    .on_click(cx.listener(|this, _, _, cx| this.combine_as_variants(cx))),
+                ),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for FantaPropertiesPanel {
@@ -4324,117 +5522,178 @@ impl Render for FantaPropertiesPanel {
                     .overflow_y_scroll()
                     .overflow_x_hidden()
                     .pb_4();
+                // Sections after the header are divider-separated; collect them
+                // so the per-kind matrix below reads as a list of section rows
+                // rather than an interleaved `.child(Divider)` chain.
+                let mut sections: Vec<AnyElement> = Vec::new();
                 match body {
                     InspectorBody::Page(page) => {
-                        content = content
-                            .child(self.render_header(
-                                "Page".into(),
-                                page.name.clone(),
-                                page.id.map(InspectorField::Name),
-                                editable,
-                                cx,
-                            ))
-                            .child(Divider::horizontal())
-                            .child(self.render_align_section(selection_len, editable, cx))
-                            .child(Divider::horizontal())
-                            .child(self.render_page_properties(&page, editable, cx))
-                            .child(Divider::horizontal())
-                            .child(self.render_export_section(editable, None, cx));
+                        content = content.child(self.render_header(
+                            "Page".into(),
+                            page.name.clone(),
+                            page.id.map(InspectorField::Name),
+                            editable,
+                            cx,
+                        ));
+                        sections.push(self.render_align_section(selection_len, editable, cx));
+                        sections.push(self.render_page_properties(&page, editable, cx));
+                        sections.push(self.render_export_section(editable, None, cx));
                     }
                     InspectorBody::Node(node) => {
-                        content = content
-                            .child(self.render_header(
-                                node.type_name.clone(),
-                                node.name.clone(),
-                                Some(InspectorField::Name(node.id)),
+                        use NodeKind::*;
+                        content = content.child(self.render_header(
+                            node.type_name.clone(),
+                            node.name.clone(),
+                            Some(InspectorField::Name(node.id)),
+                            editable,
+                            cx,
+                        ));
+                        let id = node.id;
+                        let kind = node.kind;
+
+                        // ---- The per-node-kind section matrix ----------------
+                        // Section order is fixed. `Y` = shown, `-` = hidden.
+                        //
+                        //                    Frame Group Shape Text Image Inst Comp Other
+                        //  Align               Y     Y     Y     Y    Y     Y    Y    Y
+                        //  Position (X/Y/W/H)  Y     Y     Y     Y    Y     Y    Y    Y
+                        //  Component master    -     -     -     -    -     -    Y    -
+                        //  Instance info       -     -     -     -    -     Y    -    -
+                        //  Typography          -     -     -     Y    -     -    -    -
+                        //  Image (fit only)    -     -     -     -    Y     -    -    -
+                        //  Layout              Y     Y     -     -    -     -    Y¹   -
+                        //  Auto layout child  parent is an auto-layout frame    -    "
+                        //  Appearance          Y     Y     Y     Y    Y     Y    Y    Y
+                        //   + radius/smoothing Y     Y     Y     -    -     -    Y    -
+                        //  Fill                Y(bg) Y(bg) Y     Y²   -     -³   Y(bg) -
+                        //  Stroke              Y⁴    Y⁴    Y     -    -     -    Y⁴   -
+                        //  Effects (+ blur)    Y     Y     Y     Y    Y     Y    Y    Y
+                        //  Interactions        Y     Y     Y     Y    Y     Y    Y    Y
+                        //  Export              Y     Y     Y     Y    Y     Y    Y    Y
+                        //
+                        // 1. Only when the master's root is a `Group`.
+                        // 2. A single glyph-color row, not a paint stack.
+                        // 3. Instance fills are reached through exposed Color
+                        //    props, never a raw paint stack.
+                        // 4. Broader than the original, which serves strokes to
+                        //    vectors only — group/frame strokes are real here.
+                        sections.push(self.render_align_section(selection_len, editable, cx));
+                        sections.push(self.render_position_section(&node, editable, cx));
+
+                        // Component master identity + variant set + schema.
+                        if let Some(master) = &node.master {
+                            sections.push(self.render_master_section(master));
+                        }
+                        // Instance info: master, variants, props, detach.
+                        if let Some(instance) = &node.instance {
+                            sections.push(self.render_instance_section(id, instance, editable, cx));
+                        }
+                        if kind == Text
+                            && let Some(typography) = &node.typography
+                        {
+                            sections.push(
+                                self.render_typography_section(
+                                    id, typography, editable, window, cx,
+                                ),
+                            );
+                        }
+                        if kind == Image
+                            && let Some(image_fit) = node.image_fit
+                        {
+                            sections.push(
+                                self.render_image_section(id, image_fit, editable, window, cx),
+                            );
+                        }
+                        // Layout serves the group-backed kinds — a component
+                        // master rooted at a frame gets it too.
+                        if matches!(kind, Frame | Group | Component)
+                            && let Some(layout) = &node.layout
+                        {
+                            sections
+                                .push(self.render_layout_section(id, layout, editable, window, cx));
+                        }
+                        // A master is never a child of an auto-layout frame in
+                        // the scene sense the inspector cares about.
+                        if kind != Component
+                            && let Some(layout_child) = &node.layout_child
+                        {
+                            sections.push(self.render_layout_child_section(
+                                id,
+                                layout_child,
                                 editable,
                                 cx,
-                            ))
-                            .child(Divider::horizontal())
-                            .child(self.render_align_section(selection_len, editable, cx))
-                            .child(Divider::horizontal())
-                            .child(self.render_position_section(&node, editable, cx));
-                        if let Some(auto_layout) = &node.auto_layout {
-                            content = content.child(Divider::horizontal()).child(
-                                self.render_auto_layout_section(
-                                    node.id,
-                                    auto_layout,
-                                    editable,
-                                    window,
-                                    cx,
-                                ),
-                            );
+                            ));
                         }
-                        if let Some(typography) = &node.typography {
-                            content = content.child(Divider::horizontal()).child(
-                                self.render_typography_section(node.id, typography, editable, cx),
-                            );
-                        }
-                        if let Some(image_fit) = node.image_fit {
-                            content = content.child(Divider::horizontal()).child(
-                                self.render_image_section(node.id, image_fit, editable, window, cx),
-                            );
-                        }
-                        if let Some(component) = &node.component {
-                            content = content.child(Divider::horizontal()).child(
-                                self.render_component_section(node.id, component, editable, cx),
-                            );
-                        }
-                        content = content
-                            .child(Divider::horizontal())
-                            .child(self.render_appearance_section(&node, editable, window, cx));
+                        sections.push(self.render_appearance_section(&node, editable, window, cx));
                         if let Some(fills) = &node.fills {
-                            content = content.child(Divider::horizontal()).child(
-                                self.render_paint_section(
-                                    node.id, "Fill", fills, None, false, editable, window, cx,
-                                ),
-                            );
+                            sections.push(self.render_paint_section(
+                                id, "Fill", fills, None, false, editable, window, cx,
+                            ));
+                        } else if kind == Text
+                            && let Some(typography) = &node.typography
+                        {
+                            // Text has no paint stack: its Fill is the glyph color.
+                            sections.push(self.render_text_fill_section(
+                                id,
+                                typography.color,
+                                editable,
+                                cx,
+                            ));
                         }
                         if let Some(strokes) = &node.strokes {
-                            content = content.child(Divider::horizontal()).child(
-                                self.render_paint_section(
-                                    node.id,
-                                    "Stroke",
-                                    strokes,
-                                    node.stroke_align,
-                                    true,
-                                    editable,
-                                    window,
-                                    cx,
-                                ),
-                            );
+                            sections.push(self.render_paint_section(
+                                id,
+                                "Stroke",
+                                strokes,
+                                node.stroke_align,
+                                true,
+                                editable,
+                                window,
+                                cx,
+                            ));
                         }
-                        content = content.child(Divider::horizontal()).child(
-                            self.render_effects_section(node.id, &node.effects, editable, cx),
-                        );
+                        sections.push(self.render_effects_section(
+                            id,
+                            &node.effects,
+                            &node.blurs,
+                            editable,
+                            cx,
+                        ));
                         if !node.reactions.is_empty() {
-                            content = content
-                                .child(Divider::horizontal())
-                                .child(self.render_interactions_section(&node.reactions));
+                            sections.push(self.render_interactions_section(&node.reactions));
                         }
                         if !node.bindings.is_empty() {
-                            content = content
-                                .child(Divider::horizontal())
-                                .child(self.render_bindings_section(&node.bindings));
+                            sections.push(self.render_bindings_section(&node.bindings));
                         }
-                        content = content
-                            .child(Divider::horizontal())
-                            .child(self.render_export_section(editable, Some(node.type_icon), cx));
+                        sections.push(self.render_export_section(
+                            editable,
+                            Some(node.type_icon),
+                            cx,
+                        ));
                     }
                     InspectorBody::Multi(multi) => {
-                        content = content
-                            .child(self.render_header(
-                                "Selection".into(),
-                                format!("{} selected", multi.count),
-                                None,
-                                editable,
-                                cx,
-                            ))
-                            .child(Divider::horizontal())
-                            .child(self.render_align_section(selection_len, editable, cx))
-                            .child(Divider::horizontal())
-                            .child(self.render_multi_position_section(&multi, cx));
+                        content = content.child(self.render_header(
+                            "Selection".into(),
+                            format!("{} selected", multi.count),
+                            None,
+                            editable,
+                            cx,
+                        ));
+                        sections.push(self.render_align_section(selection_len, editable, cx));
+                        sections.push(self.render_multi_position_section(&multi, cx));
+                        sections.push(self.render_selection_colors_section(
+                            &multi.colors,
+                            editable,
+                            cx,
+                        ));
+                        if editable && multi.master_count >= 2 {
+                            sections
+                                .push(self.render_combine_variants_section(multi.master_count, cx));
+                        }
                     }
+                }
+                for section in sections {
+                    content = content.child(Divider::horizontal()).child(section);
                 }
                 root.child(content)
             }
@@ -4472,8 +5731,43 @@ fn page_section(document: &FigDocument, selected_page_index: Option<usize>) -> P
     }
 }
 
-fn node_section(doc: &Doc, id: NodeId) -> Option<NodeSection> {
+/// Every component master's root node → its component id. One pass over the
+/// library per snapshot build; the alternative (asking "is this node a master"
+/// per row) would be an O(library) scan per row.
+fn master_roots(components: &ComponentLibrary) -> HashMap<NodeId, ComponentId> {
+    components
+        .defs
+        .values()
+        .map(|def| (def.root, def.id))
+        .collect()
+}
+
+/// Classify the node for the section matrix. A component master overrides the
+/// underlying data variant (old Fanta's `is_component_master`); everything else
+/// reads off `NodeData`, with `Group` splitting on whether it paints a surface.
+fn classify_node_kind(node: &CanvasNode, is_master: bool) -> NodeKind {
+    if is_master {
+        return NodeKind::Component;
+    }
+    match &node.data {
+        NodeData::Group(group) if group.is_frame_surface() => NodeKind::Frame,
+        NodeData::Group(_) => NodeKind::Group,
+        NodeData::Vector(_) => NodeKind::Shape,
+        NodeData::Text(_) => NodeKind::Text,
+        NodeData::Bitmap(_) => NodeKind::Image,
+        NodeData::Instance(_) => NodeKind::Instance,
+        _ => NodeKind::Other,
+    }
+}
+
+fn node_section(
+    doc: &Doc,
+    id: NodeId,
+    masters: &HashMap<NodeId, ComponentId>,
+) -> Option<NodeSection> {
     let node = doc.scene.get(id)?;
+    let master_id = masters.get(&id).copied();
+    let kind = classify_node_kind(node, master_id.is_some());
     let bounds = doc.scene.world_bounds(id);
     let (x, y) = bounds
         .map(|bounds| (bounds.min_x, bounds.min_y))
@@ -4485,8 +5779,9 @@ fn node_section(doc: &Doc, id: NodeId) -> Option<NodeSection> {
         .unwrap_or((0.0, 0.0));
     Some(NodeSection {
         id,
-        type_name: node_type_name(node).into(),
-        type_icon: node_type_icon(node),
+        kind,
+        type_name: node_type_name(node, kind).into(),
+        type_icon: node_type_icon(node, kind),
         name: node.name.clone(),
         x,
         y,
@@ -4494,6 +5789,10 @@ fn node_section(doc: &Doc, id: NodeId) -> Option<NodeSection> {
         height,
         rotation_degrees: transform_angle(&node.transform).to_degrees(),
         corner_radius: corner_radius_value(node),
+        corner_smoothing: kind
+            .is_corner_capable()
+            .then(|| corner_smoothing_value(node))
+            .flatten(),
         opacity_percent: f64::from(node.opacity) * 100.0,
         blend_mode: node.blend_mode,
         fills: node_fills(node),
@@ -4502,13 +5801,14 @@ fn node_section(doc: &Doc, id: NodeId) -> Option<NodeSection> {
         visible: !node.flags.contains(NodeFlags::HIDDEN),
         locked: node.flags.contains(NodeFlags::LOCKED),
         typography: typography_snapshot(node),
-        auto_layout: auto_layout_snapshot(node),
+        layout: layout_snapshot(node),
         layout_child: layout_child_snapshot(doc, node),
         image_fit: match &node.data {
             NodeData::Bitmap(bitmap) => Some(bitmap.fit),
             _ => None,
         },
-        component: component_section(doc, node),
+        instance: instance_section(doc, node),
+        master: master_id.and_then(|component| master_section(doc, component)),
         effects: node
             .effects
             .iter()
@@ -4520,8 +5820,26 @@ fn node_section(doc: &Doc, id: NodeId) -> Option<NodeSection> {
                 spread: shadow.spread,
             })
             .collect(),
+        blurs: node
+            .blurs
+            .iter()
+            .map(|blur| BlurSnapshot {
+                kind: blur.kind,
+                radius: blur.radius,
+            })
+            .collect(),
         reactions: node.reactions.iter().map(reaction_summary).collect(),
         bindings: binding_snapshots(doc, node),
+    })
+}
+
+fn layout_snapshot(node: &CanvasNode) -> Option<LayoutSnapshot> {
+    let NodeData::Group(group) = &node.data else {
+        return None;
+    };
+    Some(LayoutSnapshot {
+        clip: group.clip_size.is_some(),
+        auto_layout: auto_layout_snapshot(node),
     })
 }
 
@@ -4549,7 +5867,6 @@ fn auto_layout_snapshot(node: &CanvasNode) -> Option<AutoLayoutSnapshot> {
         primary_sizing: layout.primary_sizing,
         counter_sizing: layout.counter_sizing,
         wrap: layout.wrap,
-        clip: group.clip_size.is_some(),
         reverse_z: layout.reverse_z,
     })
 }
@@ -4645,7 +5962,7 @@ fn variant_selection(
     })
 }
 
-fn component_section(doc: &Doc, node: &CanvasNode) -> Option<ComponentSection> {
+fn instance_section(doc: &Doc, node: &CanvasNode) -> Option<InstanceSection> {
     let NodeData::Instance(instance) = &node.data else {
         return None;
     };
@@ -4676,36 +5993,102 @@ fn component_section(doc: &Doc, node: &CanvasNode) -> Option<ComponentSection> {
         .filter(|prop| !matches!(prop.kind, ComponentPropKind::Variant { .. }))
         .map(|prop| {
             let value = instance.prop_values.get(&prop.id).unwrap_or(&prop.default);
-            let value = match (&prop.kind, value) {
-                (ComponentPropKind::Bool, VarValue::Boolean { value }) => {
-                    PropValueSnapshot::Bool(*value)
-                }
-                (ComponentPropKind::Text, VarValue::String { value }) => {
-                    PropValueSnapshot::Text(value.clone())
-                }
-                (_, VarValue::Float { value }) => {
-                    PropValueSnapshot::Display(format_number(*value).into())
-                }
-                (_, VarValue::Color { value }) => PropValueSnapshot::Display(value.to_hex().into()),
-                (_, VarValue::String { value }) => PropValueSnapshot::Display(value.clone().into()),
-                (_, VarValue::Boolean { value }) => {
-                    PropValueSnapshot::Display(if *value { "On" } else { "Off" }.into())
-                }
-                (_, VarValue::TextStyle { .. }) => PropValueSnapshot::Display("Text style".into()),
-                (_, VarValue::Alias { .. }) => PropValueSnapshot::Display("Variable".into()),
-            };
             ComponentPropSnapshot {
                 id: prop.id,
                 name: prop.name.clone().into(),
-                value,
+                value: prop_value_snapshot(&prop.kind, value),
             }
         })
         .collect();
-    Some(ComponentSection {
+    Some(InstanceSection {
         component_name,
+        // The master root must still exist in the scene to be navigable.
+        main_root: doc.scene.contains(def.root).then_some(def.root),
         variants,
         props,
     })
+}
+
+/// Pick the editor a prop's current value gets. Number and Color are editable
+/// (`SetInstanceProp(Float)` / `SetInstanceProp(Color)`); an instance-swap, a
+/// text style or a variable alias has no inspector editor and reads out.
+fn prop_value_snapshot(kind: &ComponentPropKind, value: &VarValue) -> PropValueSnapshot {
+    match (kind, value) {
+        (ComponentPropKind::Bool, VarValue::Boolean { value }) => PropValueSnapshot::Bool(*value),
+        (ComponentPropKind::Text, VarValue::String { value }) => {
+            PropValueSnapshot::Text(value.clone())
+        }
+        (ComponentPropKind::Number, VarValue::Float { value }) => PropValueSnapshot::Number(*value),
+        (ComponentPropKind::Color, VarValue::Color { value }) => PropValueSnapshot::Color(*value),
+        (_, VarValue::Float { value }) => PropValueSnapshot::Display(format_number(*value).into()),
+        (_, VarValue::Color { value }) => PropValueSnapshot::Display(value.to_hex().into()),
+        (_, VarValue::String { value }) => PropValueSnapshot::Display(value.clone().into()),
+        (_, VarValue::Boolean { value }) => {
+            PropValueSnapshot::Display(if *value { "On" } else { "Off" }.into())
+        }
+        (_, VarValue::TextStyle { .. }) => PropValueSnapshot::Display("Text style".into()),
+        (_, VarValue::Alias { .. }) => PropValueSnapshot::Display("Variable".into()),
+    }
+}
+
+fn master_section(doc: &Doc, component: ComponentId) -> Option<MasterSection> {
+    let def = doc.components.def(component)?;
+    let variant_set = def.variant_of.as_ref().and_then(|membership| {
+        let set = doc.components.sets.get(&membership.set)?;
+        Some(VariantSetSnapshot {
+            set_name: set.name.clone().into(),
+            axes: set
+                .axes
+                .iter()
+                .map(|axis| VariantSetAxisSnapshot {
+                    name: axis.name.clone().into(),
+                    values: axis.values.join(", ").into(),
+                    selected: membership
+                        .axis_values
+                        .get(&axis.name)
+                        .cloned()
+                        .unwrap_or_else(|| MIXED_VALUE.to_string())
+                        .into(),
+                })
+                .collect(),
+            is_default_variant: set.default_variant == component,
+        })
+    });
+    Some(MasterSection {
+        name: def.name.clone().into(),
+        variant_set,
+        props: def
+            .props
+            .iter()
+            .map(|prop| PropSchemaSnapshot {
+                name: prop.name.clone().into(),
+                kind: prop_kind_label(&prop.kind).into(),
+                default: prop_default_label(&prop.default).into(),
+            })
+            .collect(),
+    })
+}
+
+fn prop_kind_label(kind: &ComponentPropKind) -> String {
+    match kind {
+        ComponentPropKind::Bool => "Boolean".to_string(),
+        ComponentPropKind::Text => "Text".to_string(),
+        ComponentPropKind::Number => "Number".to_string(),
+        ComponentPropKind::Color => "Color".to_string(),
+        ComponentPropKind::InstanceSwap => "Instance swap".to_string(),
+        ComponentPropKind::Variant { axis } => format!("Variant \u{b7} {axis}"),
+    }
+}
+
+fn prop_default_label(value: &VarValue) -> String {
+    match value {
+        VarValue::Boolean { value } => if *value { "On" } else { "Off" }.to_string(),
+        VarValue::Float { value } => format_number(*value),
+        VarValue::String { value } => value.clone(),
+        VarValue::Color { value } => value.to_hex(),
+        VarValue::TextStyle { .. } => "Text style".to_string(),
+        VarValue::Alias { .. } => "Variable".to_string(),
+    }
 }
 
 fn reaction_summary(reaction: &Reaction) -> SharedString {
@@ -4756,12 +6139,17 @@ fn bound_prop_label(prop: &BoundProp) -> String {
     }
 }
 
-fn multi_section(doc: &Doc, ids: &[NodeId]) -> MultiSection {
+fn multi_section(
+    doc: &Doc,
+    ids: &[NodeId],
+    masters: &HashMap<NodeId, ComponentId>,
+) -> MultiSection {
     let mut xs = Vec::with_capacity(ids.len());
     let mut ys = Vec::with_capacity(ids.len());
     let mut widths = Vec::with_capacity(ids.len());
     let mut heights = Vec::with_capacity(ids.len());
     let mut rotations = Vec::with_capacity(ids.len());
+    let mut colors = Vec::new();
     for &id in ids {
         if let Some(bounds) = doc.scene.world_bounds(id) {
             xs.push(bounds.min_x);
@@ -4773,6 +6161,7 @@ fn multi_section(doc: &Doc, ids: &[NodeId]) -> MultiSection {
         }
         if let Some(node) = doc.scene.get(id) {
             rotations.push(transform_angle(&node.transform).to_degrees());
+            node_solid_colors(node, &mut colors);
         }
     }
     let common = |values: &[f64]| -> Option<f64> {
@@ -4788,25 +6177,91 @@ fn multi_section(doc: &Doc, ids: &[NodeId]) -> MultiSection {
         width: common(&widths),
         height: common(&heights),
         rotation_degrees: common(&rotations),
+        colors: group_selection_colors(colors),
+        // Only masters NOT already in a variant set can be combined; the op
+        // (`combine_as_variants_operations`) filters the same way, so gating the
+        // "Combine N as variants" button on the raw master count would offer it
+        // for a selection that then does nothing.
+        master_count: ids
+            .iter()
+            .filter_map(|id| masters.get(id))
+            .filter(|component| {
+                doc.components
+                    .def(**component)
+                    .is_some_and(|def| def.variant_of.is_none())
+            })
+            .count(),
     }
 }
 
-fn node_type_name(node: &CanvasNode) -> &'static str {
+/// Every solid color the node paints with, in the order the inspector's paint
+/// sections list them: fills (a frame's background first), then strokes, then a
+/// text node's glyph color.
+fn node_solid_colors(node: &CanvasNode, out: &mut Vec<FantaColor>) {
+    let mut push_fill = |fill: &Fill| {
+        if let Fill::Solid { color } = fill {
+            out.push(*color);
+        }
+    };
     match &node.data {
-        NodeData::Group(group) if group.is_frame_surface() => "Frame",
-        NodeData::Vector(_) => "Vector",
-        data => data.default_name(),
+        NodeData::Vector(vector) => {
+            vector.fills.iter().for_each(&mut push_fill);
+            vector
+                .strokes
+                .iter()
+                .for_each(|stroke| push_fill(&stroke.paint));
+        }
+        NodeData::Group(group) => {
+            group
+                .background
+                .iter()
+                .chain(group.background_fills.iter())
+                .for_each(&mut push_fill);
+            group
+                .strokes
+                .iter()
+                .for_each(|stroke| push_fill(&stroke.paint));
+        }
+        NodeData::Text(text) => out.push(text.style.color),
+        _ => {}
     }
 }
 
-fn node_type_icon(node: &CanvasNode) -> IconName {
-    match &node.data {
-        NodeData::Text(_) => IconName::ToolText,
-        NodeData::Bitmap(_) | NodeData::Video(_) => IconName::Image,
-        NodeData::Vector(_) => IconName::ToolRect,
-        NodeData::Instance(_) => IconName::Box,
-        NodeData::Group(_) => IconName::ToolFrame,
-        _ => IconName::Box,
+/// Collapse the selection's solid colors into distinct rows with usage counts,
+/// preserving first-seen order so the list is stable across rebuilds.
+fn group_selection_colors(colors: Vec<FantaColor>) -> Vec<SelectionColorSnapshot> {
+    let mut grouped: Vec<SelectionColorSnapshot> = Vec::new();
+    for color in colors {
+        match grouped.iter_mut().find(|entry| entry.color == color) {
+            Some(entry) => entry.uses += 1,
+            None => grouped.push(SelectionColorSnapshot { color, uses: 1 }),
+        }
+    }
+    grouped
+}
+
+fn node_type_name(node: &CanvasNode, kind: NodeKind) -> &'static str {
+    match kind {
+        // Only these two override the data variant's own name. Everything else
+        // already reads correctly from it — including `Vector` → "Shape", the
+        // label the original inspector uses for every vector subtype.
+        NodeKind::Component => "Component",
+        NodeKind::Frame => "Frame",
+        _ => node.data.default_name(),
+    }
+}
+
+fn node_type_icon(node: &CanvasNode, kind: NodeKind) -> IconName {
+    match kind {
+        NodeKind::Component | NodeKind::Instance => IconName::Box,
+        NodeKind::Text => IconName::ToolText,
+        NodeKind::Image => IconName::Image,
+        NodeKind::Shape => IconName::ToolRect,
+        NodeKind::Frame | NodeKind::Group => IconName::ToolFrame,
+        NodeKind::Other => match &node.data {
+            NodeData::Video(_) => IconName::Image,
+            _ => IconName::Box,
+        },
     }
 }
 
@@ -4823,21 +6278,42 @@ fn corner_radius_value(node: &CanvasNode) -> CornerRadiusValue {
     }
 }
 
+fn corner_smoothing_value(node: &CanvasNode) -> Option<f64> {
+    let smoothing = match &node.data {
+        NodeData::Vector(vector) => vector.corner_smoothing,
+        NodeData::Group(group) => group.corner_smoothing,
+        _ => return None,
+    };
+    Some(f64::from(smoothing) * 100.0)
+}
+
 fn paint_snapshot(fill: &Fill, stroke_width: Option<f64>) -> PaintSnapshot {
-    let (color, label, gradient, kind) = match fill {
+    let (color, label, gradient, kind, opacity_percent, blend) = match fill {
         Fill::Solid { color } => (
             Some(*color),
             SharedString::from(color.to_hex().trim_start_matches('#').to_string()),
             None,
             Some(PaintKind::Solid),
+            Some(alpha_to_percent(color.a)),
+            None,
         ),
-        Fill::Gradient { gradient, .. } => (
+        Fill::Gradient { gradient, blend } => (
             None,
             GradientKind::of(gradient).label().into(),
             Some(gradient.clone()),
             Some(PaintKind::Gradient(GradientKind::of(gradient))),
+            // A gradient's transparency lives on its stops, not the paint.
+            None,
+            Some(*blend),
         ),
-        Fill::Image { .. } => (None, "Image".into(), None, None),
+        Fill::Image { opacity, blend, .. } => (
+            None,
+            "Image".into(),
+            None,
+            None,
+            Some(f64::from(*opacity) * 100.0),
+            Some(*blend),
+        ),
     };
     PaintSnapshot {
         color,
@@ -4845,6 +6321,84 @@ fn paint_snapshot(fill: &Fill, stroke_width: Option<f64>) -> PaintSnapshot {
         stroke_width,
         gradient,
         kind,
+        opacity_percent,
+        blend,
+        visible: paint_is_visible(fill),
+    }
+}
+
+fn alpha_to_percent(alpha: u8) -> f64 {
+    f64::from(alpha) / 255.0 * 100.0
+}
+
+/// Whether a paint contributes any coverage. This is what the per-paint eye
+/// reflects, since the model carries no per-paint visible flag.
+fn paint_is_visible(fill: &Fill) -> bool {
+    match fill {
+        Fill::Solid { color } => color.a != 0,
+        Fill::Gradient { gradient, .. } => crate::color_picker::gradient_stops(gradient)
+            .iter()
+            .any(|stop| stop.color.a != 0),
+        Fill::Image { opacity, .. } => *opacity > 0.0,
+    }
+}
+
+/// Snapshot a paint's alpha so the eye can restore it on show.
+fn paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
+    match fill {
+        Fill::Solid { color } => HiddenPaintAlpha::Solid(color.a),
+        Fill::Gradient { gradient, .. } => HiddenPaintAlpha::Gradient(
+            crate::color_picker::gradient_stops(gradient)
+                .iter()
+                .map(|stop| stop.color.a)
+                .collect(),
+        ),
+        Fill::Image { opacity, .. } => HiddenPaintAlpha::Image(*opacity),
+    }
+}
+
+fn paint_alpha_is_visible(alpha: &HiddenPaintAlpha) -> bool {
+    match alpha {
+        HiddenPaintAlpha::Solid(a) => *a != 0,
+        HiddenPaintAlpha::Gradient(stops) => stops.iter().any(|a| *a != 0),
+        HiddenPaintAlpha::Image(opacity) => *opacity > 0.0,
+    }
+}
+
+/// The fully-transparent counterpart of `alpha`, shaped for the same paint kind.
+fn zeroed_paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
+    match paint_alpha(fill) {
+        HiddenPaintAlpha::Solid(_) => HiddenPaintAlpha::Solid(0),
+        HiddenPaintAlpha::Gradient(stops) => HiddenPaintAlpha::Gradient(vec![0; stops.len()]),
+        HiddenPaintAlpha::Image(_) => HiddenPaintAlpha::Image(0.0),
+    }
+}
+
+/// The fully-opaque counterpart, used when a paint is shown with no remembered
+/// alpha (a doc that loaded already-hidden, or a panel rebuilt since the hide).
+fn opaque_paint_alpha(alpha: &HiddenPaintAlpha) -> HiddenPaintAlpha {
+    match alpha {
+        HiddenPaintAlpha::Solid(_) => HiddenPaintAlpha::Solid(255),
+        HiddenPaintAlpha::Gradient(stops) => HiddenPaintAlpha::Gradient(vec![255; stops.len()]),
+        HiddenPaintAlpha::Image(_) => HiddenPaintAlpha::Image(1.0),
+    }
+}
+
+/// Write a snapshotted alpha back onto a paint. A stop-count mismatch (the
+/// gradient gained or lost stops while hidden) leaves the extra stops alone.
+fn set_paint_alpha(fill: &mut Fill, alpha: &HiddenPaintAlpha) {
+    match (fill, alpha) {
+        (Fill::Solid { color }, HiddenPaintAlpha::Solid(a)) => color.a = *a,
+        (Fill::Gradient { gradient, .. }, HiddenPaintAlpha::Gradient(alphas)) => {
+            for (stop, a) in crate::color_picker::gradient_stops_mut(gradient)
+                .iter_mut()
+                .zip(alphas)
+            {
+                stop.color.a = *a;
+            }
+        }
+        (Fill::Image { opacity, .. }, HiddenPaintAlpha::Image(value)) => *opacity = *value,
+        _ => {}
     }
 }
 
@@ -4900,11 +6454,15 @@ fn typography_snapshot(node: &CanvasNode) -> Option<TypographySnapshot> {
         font_family: text.style.font_family.clone(),
         size_px: text.style.size_px,
         weight: text.style.weight,
+        italic: text.style.italic,
+        underline: text.style.underline,
+        strikethrough: text.style.strikethrough,
         line_height: text.style.line_height,
         letter_spacing: text.style.letter_spacing,
         align: text.align,
         vertical_align: text.vertical_align,
         auto_resize: text.auto_resize,
+        color: text.style.color,
     })
 }
 
@@ -5026,6 +6584,12 @@ fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operat
                 replace_data_operation(doc, *id, |data| set_corner_radius(data, radius.max(0.0)))
             })
             .unwrap_or_default(),
+        InspectorField::CornerSmoothing(id) => parse_number(text.trim_end_matches('%'))
+            .map(|percent| {
+                let smoothing = (percent / 100.0).clamp(0.0, 1.0) as f32;
+                replace_data_operation(doc, *id, |data| set_corner_smoothing(data, smoothing))
+            })
+            .unwrap_or_default(),
         InspectorField::Opacity(id) => {
             let Some(percent) = parse_number(text.trim_end_matches('%')) else {
                 return Vec::new();
@@ -5060,6 +6624,29 @@ fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operat
                             && let Some(stroke) = strokes.get_mut(index)
                         {
                             stroke.paint = Fill::solid(color);
+                        }
+                    })
+                })
+                .unwrap_or_default()
+        }
+        InspectorField::PaintOpacity {
+            id,
+            index,
+            is_stroke,
+        } => {
+            let (index, is_stroke) = (*index, *is_stroke);
+            parse_number(text.trim_end_matches('%'))
+                .map(|percent| {
+                    let fraction = (percent / 100.0).clamp(0.0, 1.0);
+                    replace_data_operation(doc, *id, |data| {
+                        if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
+                            match paint {
+                                Fill::Solid { color } => {
+                                    color.a = (fraction * 255.0).round() as u8;
+                                }
+                                Fill::Image { opacity, .. } => *opacity = fraction as f32,
+                                Fill::Gradient { .. } => {}
+                            }
                         }
                     })
                 })
@@ -5177,27 +6764,45 @@ fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operat
                 })
                 .unwrap_or_default()
         }
-        InspectorField::InstanceTextProp { id, prop } => {
-            let Some(node) = scene.get(*id) else {
-                return Vec::new();
-            };
-            let NodeData::Instance(instance) = &node.data else {
-                return Vec::new();
-            };
-            let old = instance.prop_values.get(prop).cloned();
-            let new = Some(VarValue::String {
-                value: text.to_string(),
-            });
-            if old == new {
-                return Vec::new();
-            }
-            vec![Operation::SetInstanceProp {
-                id: *id,
-                prop: *prop,
-                old,
-                new,
-            }]
+        InspectorField::BlurRadius { id, index } => {
+            let index = *index;
+            parse_number(text)
+                .map(|radius| {
+                    blurs_operations(doc, *id, |blurs| {
+                        if let Some(blur) = blurs.get_mut(index) {
+                            blur.radius = radius.max(0.0);
+                        }
+                    })
+                })
+                .unwrap_or_default()
         }
+        InspectorField::TextColor(id) => parse_color(text)
+            .map(|color| {
+                replace_data_operation(doc, *id, |data| {
+                    if let NodeData::Text(node_text) = data {
+                        node_text.style.color = color;
+                    }
+                })
+            })
+            .unwrap_or_default(),
+        InspectorField::InstanceTextProp { id, prop } => instance_prop_operations(
+            doc,
+            *id,
+            *prop,
+            Some(VarValue::String {
+                value: text.to_string(),
+            }),
+        ),
+        InspectorField::InstanceNumberProp { id, prop } => parse_number(text)
+            .map(|value| instance_prop_operations(doc, *id, *prop, Some(VarValue::Float { value })))
+            .unwrap_or_default(),
+        InspectorField::InstanceColorProp { id, prop } => parse_color(text)
+            .map(|value| instance_prop_operations(doc, *id, *prop, Some(VarValue::Color { value })))
+            .unwrap_or_default(),
+        InspectorField::SelectionColor { from } => parse_color(text)
+            .filter(|to| to != from)
+            .map(|to| selection_color_operations(doc, *from, to))
+            .unwrap_or_default(),
         InspectorField::PageBackground(id) => {
             if text.is_empty() {
                 replace_data_operation(doc, *id, |data| {
@@ -5258,6 +6863,9 @@ fn read_field_text(doc: &Doc, field: &InspectorField) -> Option<String> {
                 }
                 CornerRadiusValue::NotApplicable => None,
             }
+        }
+        InspectorField::CornerSmoothing(id) => {
+            corner_smoothing_value(scene.get(*id)?).map(format_number)
         }
         InspectorField::LineHeight(id) => text_style_value(scene, *id, |style| style.line_height),
         InspectorField::LetterSpacing(id) => {
@@ -5374,6 +6982,223 @@ fn shadow_field_operations(
             mutate(shadow);
         }
     })
+}
+
+/// The blur twin of [`effects_operations`]: snapshot the node's blur stack,
+/// mutate a copy, and emit one `SetBlurs` when it actually changed.
+fn blurs_operations(
+    doc: &Doc,
+    id: NodeId,
+    mutate: impl FnOnce(&mut SmallVec<[Blur; 0]>),
+) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    let old = node.blurs.clone();
+    let mut new = old.clone();
+    mutate(&mut new);
+    if new == old {
+        return Vec::new();
+    }
+    vec![Operation::SetBlurs { id, old, new }]
+}
+
+/// Set (or clear) one exposed prop on an instance. `None` clears the override
+/// back to the def's default.
+fn instance_prop_operations(
+    doc: &Doc,
+    id: NodeId,
+    prop: ComponentPropId,
+    new: Option<VarValue>,
+) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    let NodeData::Instance(instance) = &node.data else {
+        return Vec::new();
+    };
+    let old = instance.prop_values.get(&prop).cloned();
+    if old == new {
+        return Vec::new();
+    }
+    vec![Operation::SetInstanceProp { id, prop, old, new }]
+}
+
+/// Replace one solid color across every selected node — the multi-select
+/// "Selection colors" edit. One `ReplaceData` per node that actually uses the
+/// color; the caller batches them into a single undo step.
+fn selection_color_operations(doc: &Doc, from: FantaColor, to: FantaColor) -> Vec<Operation> {
+    doc.selection
+        .iter()
+        .copied()
+        .filter(|id| doc.scene.contains(*id))
+        .flat_map(|id| {
+            replace_data_operation(doc, id, |data| {
+                let replace = |fill: &mut Fill| {
+                    if let Fill::Solid { color } = fill
+                        && *color == from
+                    {
+                        *color = to;
+                    }
+                };
+                match data {
+                    NodeData::Vector(vector) => {
+                        vector.fills.iter_mut().for_each(replace);
+                        vector
+                            .strokes
+                            .iter_mut()
+                            .for_each(|stroke| replace(&mut stroke.paint));
+                    }
+                    NodeData::Group(group) => {
+                        group
+                            .background
+                            .iter_mut()
+                            .chain(group.background_fills.iter_mut())
+                            .for_each(replace);
+                        group
+                            .strokes
+                            .iter_mut()
+                            .for_each(|stroke| replace(&mut stroke.paint));
+                    }
+                    NodeData::Text(text) => {
+                        if text.style.color == from {
+                            text.style.color = to;
+                        }
+                    }
+                    _ => {}
+                }
+            })
+        })
+        .collect()
+}
+
+/// Detach an instance into a concrete subtree: the instance node becomes the
+/// resolved master-root frame and the expansion's descendants are materialized
+/// under it. The master root's own wrapper-level surface props (opacity,
+/// effects, blurs, blend) live outside `NodeData`, so the data swap alone would
+/// drop them — they are composed onto the detached node by the follow-up ops.
+fn detach_instance_operations(doc: &Doc, id: NodeId) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    let NodeData::Instance(instance) = &node.data else {
+        return Vec::new();
+    };
+    let expanded = expand_instance(&doc.scene, &doc.components, instance);
+    // `expand_instance` yields the root first (empty def path), then its subtree
+    // parents-before-children, so this insertion order stays valid.
+    let Some(root) = expanded.iter().find(|entry| entry.def_path.is_empty()) else {
+        // A dangling master: nothing to materialize.
+        return Vec::new();
+    };
+    let root_id = root.node.id;
+    let children: Vec<CanvasNode> = expanded
+        .iter()
+        .filter(|entry| !entry.def_path.is_empty())
+        .map(|entry| {
+            let mut child = entry.node.clone();
+            if child.parent == Some(root_id) {
+                child.parent = Some(id);
+            }
+            child
+        })
+        .collect();
+
+    let mut operations = vec![Operation::DetachInstance {
+        id,
+        old: Box::new(node.data.clone()),
+        new: Box::new(root.node.data.clone()),
+        expanded: children,
+    }];
+    let composed_opacity = node.opacity * root.node.opacity;
+    if (composed_opacity - node.opacity).abs() > f32::EPSILON {
+        operations.push(Operation::SetOpacity {
+            id,
+            old: node.opacity,
+            new: composed_opacity,
+        });
+    }
+    if node.effects.is_empty() && !root.node.effects.is_empty() {
+        operations.push(Operation::SetEffects {
+            id,
+            old: node.effects.clone(),
+            new: root.node.effects.clone(),
+        });
+    }
+    if node.blurs.is_empty() && !root.node.blurs.is_empty() {
+        operations.push(Operation::SetBlurs {
+            id,
+            old: node.blurs.clone(),
+            new: root.node.blurs.clone(),
+        });
+    }
+    if node.blend_mode.is_normal() && !root.node.blend_mode.is_normal() {
+        operations.push(Operation::SetBlendMode {
+            id,
+            old: node.blend_mode,
+            new: root.node.blend_mode,
+        });
+    }
+    operations
+}
+
+/// Merge the selected component masters into one variant set along a single
+/// "Variant" axis whose values are the masters' names. The first selected master
+/// becomes the set's default variant.
+fn combine_as_variants_operations(doc: &Doc) -> Vec<Operation> {
+    let masters = master_roots(&doc.components);
+    let members: Vec<ComponentId> = doc
+        .selection
+        .iter()
+        .filter_map(|id| masters.get(id).copied())
+        // A master already in a set would need its old set repaired first.
+        .filter(|component| {
+            doc.components
+                .def(*component)
+                .is_some_and(|def| def.variant_of.is_none())
+        })
+        .collect();
+    let (Some(default_variant), true) = (members.first().copied(), members.len() >= 2) else {
+        return Vec::new();
+    };
+    const AXIS: &str = "Variant";
+    let values: Vec<String> = members
+        .iter()
+        .filter_map(|component| doc.components.def(*component))
+        .map(|def| def.name.clone())
+        .collect();
+    let set = ComponentSet {
+        id: ComponentId::new(),
+        name: doc
+            .components
+            .def(default_variant)
+            .map(|def| def.name.clone())
+            .unwrap_or_else(|| "Components".to_string()),
+        axes: vec![VariantAxis {
+            name: AXIS.to_string(),
+            values,
+        }],
+        members: members.clone(),
+        default_variant,
+    };
+    let set_id = set.id;
+    let mut operations = vec![Operation::DefineComponentSet { set: Box::new(set) }];
+    for component in members {
+        let Some(def) = doc.components.def(component) else {
+            continue;
+        };
+        let mut axis_values = std::collections::BTreeMap::new();
+        axis_values.insert(AXIS.to_string(), def.name.clone());
+        operations.push(Operation::SetVariantMembership {
+            id: component,
+            old: def.variant_of.clone(),
+            new: Some(ComponentSetMembership {
+                set: set_id,
+                axis_values,
+            }),
+        });
+    }
+    operations
 }
 
 /// Write one screen-axis gap of an auto-layout frame. The horizontal gap is
@@ -5532,6 +7357,7 @@ fn restore_snapshot(doc: &mut Doc, snapshot: &NodeSnapshot) {
         node.opacity = snapshot.opacity;
         node.data = (*snapshot.data).clone();
         node.effects = snapshot.effects.clone();
+        node.blurs = snapshot.blurs.clone();
     }
 }
 
@@ -5558,6 +7384,21 @@ fn apply_preview_operation(doc: &mut Doc, operation: &Operation) {
         Operation::SetEffects { id, new, .. } => {
             if let Some(node) = doc.scene.get_mut(*id) {
                 node.effects = new.clone();
+            }
+        }
+        Operation::SetBlurs { id, new, .. } => {
+            if let Some(node) = doc.scene.get_mut(*id) {
+                node.blurs = new.clone();
+            }
+        }
+        Operation::SetInstanceProp { id, prop, new, .. } => {
+            if let Some(node) = doc.scene.get_mut(*id)
+                && let NodeData::Instance(instance) = &mut node.data
+            {
+                match new {
+                    Some(value) => instance.prop_values.insert(*prop, value.clone()),
+                    None => instance.prop_values.remove(prop),
+                };
             }
         }
         _ => {}
@@ -5598,6 +7439,17 @@ fn set_corner_radius_corner(data: &mut NodeData, corner: usize, radius: f64) {
     } else {
         *corner_radii = Some(radii);
     }
+}
+
+/// Set the squircle corner smoothing (0.0 = circular corners, 1.0 = full
+/// squircle) on a corner-capable node.
+fn set_corner_smoothing(data: &mut NodeData, smoothing: f32) {
+    let slot = match data {
+        NodeData::Vector(vector) => &mut vector.corner_smoothing,
+        NodeData::Group(group) => &mut group.corner_smoothing,
+        _ => return,
+    };
+    *slot = smoothing.clamp(0.0, 1.0);
 }
 
 fn stroke_list_mut(data: &mut NodeData) -> Option<&mut SmallVec<[Stroke; 1]>> {
@@ -5741,6 +7593,11 @@ fn default_shadow() -> Shadow {
     }
 }
 
+/// Figma's default blur radius for a freshly added layer / background blur.
+fn default_blur(kind: BlurKind) -> Blur {
+    Blur { kind, radius: 4.0 }
+}
+
 // =============================================================================
 // PNG export
 // =============================================================================
@@ -5853,28 +7710,15 @@ fn parse_color(text: &str) -> Option<FantaColor> {
     FantaColor::from_hex(&format!("#{trimmed}"))
 }
 
-fn next_font_weight(weight: u16) -> u16 {
-    if weight < 500 {
-        500
-    } else if weight < 600 {
-        600
-    } else if weight < 700 {
-        700
-    } else {
-        400
-    }
-}
-
+/// The dropdown label for a numeric OpenType weight. Weights off the standard
+/// ladder (an imported 350 or 900) read "Custom" and are never rewritten —
+/// only an explicit pick from the menu changes the stored value.
 fn font_weight_label(weight: u16) -> &'static str {
-    if weight < 450 {
-        "Regular"
-    } else if weight < 550 {
-        "Medium"
-    } else if weight < 650 {
-        "SemiBold"
-    } else {
-        "Bold"
-    }
+    FONT_WEIGHTS
+        .iter()
+        .find(|(value, _)| *value == weight)
+        .map(|(_, label)| *label)
+        .unwrap_or("Custom")
 }
 
 fn fanta_color_rgba(color: FantaColor) -> Rgba {
@@ -6004,9 +7848,9 @@ mod panel_integration_tests {
         }
     }
 
-    /// Write a Fanta project containing a page with a single gradient-filled
-    /// vector to `root`, returning the vector's stable node id.
-    fn write_gradient_project(root: &Path, gradient: Gradient) -> NodeId {
+    /// Write a Fanta project containing a page with a gradient-filled vector and
+    /// a text node, returning their stable node ids.
+    fn write_gradient_project(root: &Path, gradient: Gradient) -> (NodeId, NodeId) {
         let mut doc = Doc::new();
         let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
         page.name = "Page One".into();
@@ -6025,23 +7869,51 @@ mod panel_integration_tests {
         node.name = "Gradient Rect".into();
         let vector_id = node.id;
         doc.scene.insert(node).unwrap();
+
+        // A text node so the typography / decorations / glyph-fill sections get
+        // laid out by the draw tests too.
+        let mut text = fanta_doc::TextNode::new("Hello", 100.0, 24.0);
+        text.style.weight = 350; // an off-ladder weight must survive a render
+        text.align = TextAlign::Justify;
+        let mut text_node = CanvasNode::new(NodeData::Text(text));
+        text_node.parent = Some(page_id);
+        text_node.name = "Label".into();
+        let text_id = text_node.id;
+        doc.scene.insert(text_node).unwrap();
+
         doc.set_active_page(Some(page_id));
 
         fanta_format::write_project_tree(root, &doc, &BTreeMap::new())
             .expect("writing the fanta project tree");
-        vector_id
+        (vector_id, text_id)
     }
 
     struct Harness {
         panel: gpui::WindowHandle<FantaPropertiesPanel>,
         vector_id: NodeId,
+        text_id: NodeId,
         _view: Entity<FigView>,
         _temp: tempfile::TempDir,
     }
 
+    impl Harness {
+        /// Replace the document selection, the way the canvas would.
+        fn select(&self, ids: &[NodeId], cx: &mut TestAppContext) {
+            let item = self._view.read_with(cx, |view, _| view.item().clone());
+            let ids = ids.to_vec();
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.replace_with(ids);
+                    ((), DocChange::Selection)
+                });
+            });
+            cx.run_until_parked();
+        }
+    }
+
     async fn open_panel_with_gradient(gradient: Gradient, cx: &mut TestAppContext) -> Harness {
         let temp = tempfile::tempdir().unwrap();
-        let vector_id = write_gradient_project(temp.path(), gradient);
+        let (vector_id, text_id) = write_gradient_project(temp.path(), gradient);
 
         let fs = std::sync::Arc::new(fs::RealFs::new(None, cx.executor()));
         let project = Project::test(fs.clone(), [temp.path()], cx).await;
@@ -6092,7 +7964,8 @@ mod panel_integration_tests {
             content_scroll: ScrollHandle::new(),
             corner_radii_expanded: None,
             scrub: None,
-            opacity_track: None,
+            slider_tracks: [None; SLIDER_TRACK_COUNT],
+            hidden_paint_alpha: HashMap::new(),
             picker: None,
             gradient_editor: None,
             swatch_press_dismissed: false,
@@ -6109,6 +7982,7 @@ mod panel_integration_tests {
         Harness {
             panel,
             vector_id,
+            text_id,
             _view: view,
             _temp: temp,
         }
@@ -6448,6 +8322,197 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn text_node_draws_typography_decorations_and_glyph_fill(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        // The text node carries an off-ladder weight (350) and a Justify align:
+        // both were previously unrepresentable in the inspector.
+        harness.select(&[harness.text_id], cx);
+        draw(harness.panel, cx);
+
+        let text_id = harness.text_id;
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_text_decoration(text_id, TextDecorationGlyph::Underline, cx);
+                panel.set_font_weight(text_id, 800, cx);
+                panel.set_text_align(text_id, TextAlign::Justify, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw(harness.panel, cx);
+
+        let (weight, underline, align) = harness._view.read_with(cx, |view, cx| {
+            let item = view.item().read(cx);
+            let doc = &item.document().unwrap().doc;
+            let NodeData::Text(text) = &doc.scene.get(text_id).unwrap().data else {
+                panic!("expected a text node");
+            };
+            (text.style.weight, text.style.underline, text.align)
+        });
+        assert_eq!(weight, 800);
+        assert!(underline);
+        assert_eq!(align, TextAlign::Justify);
+    }
+
+    #[gpui::test]
+    async fn blur_rows_add_edit_and_remove_through_set_blurs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let vector_id = harness.vector_id;
+
+        let blurs = |cx: &mut TestAppContext| {
+            harness._view.read_with(cx, |view, cx| {
+                let item = view.item().read(cx);
+                let doc = &item.document().unwrap().doc;
+                doc.scene.get(vector_id).unwrap().blurs.to_vec()
+            })
+        };
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.add_blur(vector_id, BlurKind::Layer, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw(harness.panel, cx);
+        assert_eq!(blurs(cx).len(), 1);
+        assert_eq!(blurs(cx)[0].kind, BlurKind::Layer);
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.set_blur_kind(vector_id, 0, BlurKind::Background, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(blurs(cx)[0].kind, BlurKind::Background);
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.remove_blur(vector_id, 0, cx))
+            .unwrap();
+        cx.run_until_parked();
+        draw(harness.panel, cx);
+        assert!(blurs(cx).is_empty());
+
+        // The whole add → edit → remove sequence stays undoable.
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| item.undo(cx).unwrap());
+        cx.run_until_parked();
+        assert_eq!(blurs(cx).len(), 1);
+    }
+
+    #[gpui::test]
+    async fn hiding_then_showing_a_paint_preserves_partial_alpha(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let vector_id = harness.vector_id;
+
+        // Flatten the gradient to a partially transparent solid.
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.set_paint_kind(vector_id, 0, false, PaintKind::Solid, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.apply(
+                {
+                    let doc = &item.document().unwrap().doc;
+                    replace_data_operation(doc, vector_id, |data| {
+                        if let Some(Fill::Solid { color }) = fill_slot_mut(data, 0) {
+                            color.a = 128;
+                        }
+                    })
+                    .pop()
+                    .expect("an alpha edit")
+                },
+                cx,
+            )
+            .expect("applying the alpha edit");
+        });
+        cx.run_until_parked();
+
+        let alpha = |cx: &mut TestAppContext| {
+            harness._view.read_with(cx, |view, cx| {
+                let item = view.item().read(cx);
+                let doc = &item.document().unwrap().doc;
+                let NodeData::Vector(vector) = &doc.scene.get(vector_id).unwrap().data else {
+                    panic!("expected a vector");
+                };
+                match vector.fills.first() {
+                    Some(Fill::Solid { color }) => color.a,
+                    _ => panic!("expected a solid fill"),
+                }
+            })
+        };
+        assert_eq!(alpha(cx), 128);
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_paint_visibility(vector_id, 0, false, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(alpha(cx), 0, "hiding zeroes the paint's alpha");
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_paint_visibility(vector_id, 0, false, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            alpha(cx),
+            128,
+            "showing restores the alpha, not full opacity"
+        );
+    }
+
+    #[gpui::test]
+    async fn multi_selection_draws_selection_colors_and_replaces_across_the_selection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        // The text node's black glyph color is the only solid in the selection.
+        harness.select(&[harness.vector_id, harness.text_id], cx);
+        draw(harness.panel, cx);
+
+        let text_id = harness.text_id;
+        let glyph_color = |cx: &mut TestAppContext| {
+            harness._view.read_with(cx, |view, cx| {
+                let item = view.item().read(cx);
+                let doc = &item.document().unwrap().doc;
+                let NodeData::Text(text) = &doc.scene.get(text_id).unwrap().data else {
+                    panic!("expected a text node");
+                };
+                text.style.color
+            })
+        };
+        let original = glyph_color(cx);
+        let replacement = FantaColor::rgb(0x22, 0x88, 0x44);
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                let field = InspectorField::SelectionColor { from: original };
+                let text = replacement.to_hex();
+                panel.apply_document_ops(cx, |doc| field_operations(doc, &field, &text));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        draw(harness.panel, cx);
+        assert_eq!(glyph_color(cx), replacement);
+    }
+
+    #[gpui::test]
     async fn degenerate_gradient_fill_draws_without_panicking(cx: &mut TestAppContext) {
         init_test(cx);
         // A single-stop gradient — the kind a real imported `.fig` can carry.
@@ -6472,6 +8537,82 @@ mod panel_integration_tests {
         cx.run_until_parked();
         draw(harness.panel, cx);
     }
+
+    #[gpui::test]
+    async fn enabling_auto_layout_on_a_clip_less_group_seeds_its_clip_box(cx: &mut TestAppContext) {
+        init_test(cx);
+        // The page root is a plain Group (no clip_size, no background) with two
+        // children — exactly the clip-less group the review flagged.
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let page_id = harness._view.read_with(cx, |view, cx| {
+            view.item()
+                .read(cx)
+                .document()
+                .expect("ready")
+                .doc
+                .pages()
+                .first()
+                .copied()
+                .expect("one page")
+        });
+        harness.select(&[page_id], cx);
+
+        // Precondition: a clip-less group.
+        let before = harness._view.read_with(cx, |view, cx| {
+            match &view
+                .item()
+                .read(cx)
+                .document()
+                .unwrap()
+                .doc
+                .scene
+                .get(page_id)
+                .unwrap()
+                .data
+            {
+                NodeData::Group(group) => (group.auto_layout.is_some(), group.clip_size),
+                _ => panic!("the page root is a group"),
+            }
+        });
+        assert_eq!(
+            before,
+            (false, None),
+            "starts as a clip-less group with no auto layout"
+        );
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_auto_layout(page_id, true, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Enabling auto layout must seed a clip box from the content bounds, or
+        // a later Hug sizing would collapse it to zero and hide every child.
+        let (has_auto_layout, clip_size) = harness._view.read_with(cx, |view, cx| {
+            match &view
+                .item()
+                .read(cx)
+                .document()
+                .unwrap()
+                .doc
+                .scene
+                .get(page_id)
+                .unwrap()
+                .data
+            {
+                NodeData::Group(group) => (group.auto_layout.is_some(), group.clip_size),
+                _ => unreachable!(),
+            }
+        });
+        assert!(has_auto_layout, "auto layout is enabled");
+        let clip = clip_size.expect("clip_size is seeded when auto layout is enabled");
+        assert!(
+            clip[0] > 0.0 && clip[1] > 0.0,
+            "the seeded clip box wraps the content instead of collapsing to zero: {clip:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6494,8 +8635,8 @@ mod tests {
             Some(InspectorField::Height(id))
         );
         assert_eq!(
-            paired_field(&InspectorField::Rotation(id)),
-            Some(InspectorField::CornerRadius(id))
+            paired_field(&InspectorField::CornerRadius(id)),
+            Some(InspectorField::CornerSmoothing(id))
         );
         assert_eq!(
             paired_field(&InspectorField::LayoutPadV(id)),
@@ -6503,6 +8644,20 @@ mod tests {
         );
         assert_eq!(paired_field(&InspectorField::Name(id)), None);
         assert_eq!(paired_field(&InspectorField::Opacity(id)), None);
+        // Rotation lost its 2-up partner when corner radius moved to Appearance.
+        assert_eq!(paired_field(&InspectorField::Rotation(id)), None);
+    }
+
+    #[test]
+    fn selection_colors_are_addressed_by_color_not_node() {
+        let id = NodeId::new();
+        assert_eq!(field_node(&InspectorField::Opacity(id)), Some(id));
+        assert_eq!(
+            field_node(&InspectorField::SelectionColor {
+                from: FantaColor::BLACK
+            }),
+            None
+        );
     }
 
     #[test]
@@ -6540,11 +8695,48 @@ mod tests {
     }
 
     #[test]
-    fn font_weight_cycle_hits_every_step() {
-        assert_eq!(next_font_weight(400), 500);
-        assert_eq!(next_font_weight(500), 600);
-        assert_eq!(next_font_weight(600), 700);
-        assert_eq!(next_font_weight(700), 400);
+    fn scrub_values_clamp_the_new_percent_fields() {
+        let id = NodeId::new();
+        assert_eq!(
+            clamp_field_value(&InspectorField::CornerSmoothing(id), 130.0),
+            100.0
+        );
+        assert_eq!(
+            clamp_field_value(&InspectorField::CornerSmoothing(id), -1.0),
+            0.0
+        );
+        assert_eq!(
+            clamp_field_value(
+                &InspectorField::PaintOpacity {
+                    id,
+                    index: 0,
+                    is_stroke: false
+                },
+                150.0
+            ),
+            100.0
+        );
+        assert_eq!(
+            clamp_field_value(&InspectorField::BlurRadius { id, index: 0 }, -8.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn font_weight_dropdown_labels_the_ladder_and_keeps_custom_weights() {
+        assert_eq!(font_weight_label(300), "Light");
+        assert_eq!(font_weight_label(400), "Regular");
+        assert_eq!(font_weight_label(500), "Medium");
+        assert_eq!(font_weight_label(600), "SemiBold");
+        assert_eq!(font_weight_label(700), "Bold");
+        assert_eq!(font_weight_label(800), "ExtraBold");
+        // Off-ladder weights read "Custom"; nothing snaps them onto a stop.
+        assert_eq!(font_weight_label(350), "Custom");
+        assert_eq!(font_weight_label(900), "Custom");
+        // Every option the dropdown offers must round-trip through the label.
+        for (weight, label) in FONT_WEIGHTS {
+            assert_eq!(font_weight_label(weight), label);
+        }
     }
 
     #[test]
@@ -6673,5 +8865,626 @@ mod tests {
                 blend: BlendMode::Multiply,
             })
         );
+    }
+
+    // === Node-kind classification ========================================
+
+    fn node_with_data(data: NodeData) -> CanvasNode {
+        CanvasNode::new(data)
+    }
+
+    fn frame_group() -> GroupNode {
+        GroupNode {
+            background: Some(Fill::solid(FantaColor::WHITE)),
+            ..GroupNode::default()
+        }
+    }
+
+    fn text_node() -> fanta_doc::TextNode {
+        fanta_doc::TextNode::new("Hello", 100.0, 20.0)
+    }
+
+    #[test]
+    fn node_kinds_split_frames_from_groups_and_collapse_every_shape() {
+        let plain_group = node_with_data(NodeData::Group(GroupNode::default()));
+        assert_eq!(classify_node_kind(&plain_group, false), NodeKind::Group);
+
+        let frame = node_with_data(NodeData::Group(frame_group()));
+        assert_eq!(classify_node_kind(&frame, false), NodeKind::Frame);
+
+        // Rect, ellipse, star, line, boolean-op results are all one `Vector` in
+        // the model and one "Shape" in the inspector.
+        let rect = node_with_data(vector_with_fill(Fill::solid(FantaColor::BLACK)));
+        assert_eq!(classify_node_kind(&rect, false), NodeKind::Shape);
+
+        let text = node_with_data(NodeData::Text(text_node()));
+        assert_eq!(classify_node_kind(&text, false), NodeKind::Text);
+
+        // A master overrides whatever data variant backs it.
+        assert_eq!(classify_node_kind(&frame, true), NodeKind::Component);
+        assert_eq!(classify_node_kind(&rect, true), NodeKind::Component);
+    }
+
+    #[test]
+    fn only_corner_capable_kinds_get_radius_and_smoothing() {
+        assert!(NodeKind::Frame.is_corner_capable());
+        assert!(NodeKind::Group.is_corner_capable());
+        assert!(NodeKind::Shape.is_corner_capable());
+        assert!(NodeKind::Component.is_corner_capable());
+        assert!(!NodeKind::Text.is_corner_capable());
+        assert!(!NodeKind::Image.is_corner_capable());
+        assert!(!NodeKind::Instance.is_corner_capable());
+        assert!(!NodeKind::Other.is_corner_capable());
+    }
+
+    #[test]
+    fn master_roots_indexes_every_def_by_its_root_node() {
+        let mut library = ComponentLibrary::new();
+        let root = NodeId::new();
+        let component = ComponentId::new();
+        library
+            .defs
+            .insert(component, ComponentDef::new(component, root, "Button"));
+        let index = master_roots(&library);
+        assert_eq!(index.get(&root), Some(&component));
+        assert_eq!(index.get(&NodeId::new()), None);
+    }
+
+    // === Corner smoothing ================================================
+
+    #[test]
+    fn corner_smoothing_writes_the_fraction_and_clamps() {
+        let mut data = vector_with_fill(Fill::solid(FantaColor::BLACK));
+        set_corner_smoothing(&mut data, 0.6);
+        let NodeData::Vector(vector) = &data else {
+            panic!("expected a vector");
+        };
+        assert!((vector.corner_smoothing - 0.6).abs() < 1e-6);
+
+        set_corner_smoothing(&mut data, 4.0);
+        let NodeData::Vector(vector) = &data else {
+            panic!("expected a vector");
+        };
+        assert_eq!(vector.corner_smoothing, 1.0);
+
+        let mut group = NodeData::Group(GroupNode::default());
+        set_corner_smoothing(&mut group, -1.0);
+        let NodeData::Group(group) = &group else {
+            panic!("expected a group");
+        };
+        assert_eq!(group.corner_smoothing, 0.0);
+
+        // Kinds without corners are untouched.
+        let mut text = NodeData::Text(text_node());
+        let before = text.clone();
+        set_corner_smoothing(&mut text, 1.0);
+        assert_eq!(text, before);
+    }
+
+    #[test]
+    fn corner_smoothing_value_reads_out_as_a_percent() {
+        let mut vector = fanta_doc::VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, FantaColor::BLACK);
+        vector.corner_smoothing = 0.45;
+        let node = node_with_data(NodeData::Vector(vector));
+        // The model stores an f32, so widening to a percent carries f32 dust.
+        assert!((corner_smoothing_value(&node).unwrap() - 45.0).abs() < 1e-4);
+
+        let text = node_with_data(NodeData::Text(text_node()));
+        assert_eq!(corner_smoothing_value(&text), None);
+    }
+
+    // === Blur op builder =================================================
+
+    /// A one-node doc, so the op builders can be exercised against a real `Doc`.
+    fn doc_with_node(data: NodeData) -> (Doc, NodeId) {
+        let mut doc = Doc::new();
+        let node = CanvasNode::new(data);
+        let id = node.id;
+        doc.scene.insert(node).expect("inserting the test node");
+        (doc, id)
+    }
+
+    fn blurs_of(doc: &Doc, id: NodeId) -> Vec<Blur> {
+        doc.scene
+            .get(id)
+            .map(|node| node.blurs.to_vec())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn blurs_operations_emits_one_set_blurs_carrying_the_prior_stack() {
+        let (doc, id) = doc_with_node(vector_with_fill(Fill::solid(FantaColor::BLACK)));
+        let operations =
+            blurs_operations(&doc, id, |blurs| blurs.push(default_blur(BlurKind::Layer)));
+        assert_eq!(operations.len(), 1);
+        let Some(Operation::SetBlurs { old, new, .. }) = operations.first() else {
+            panic!("expected a SetBlurs operation");
+        };
+        assert!(old.is_empty(), "undo must restore the empty stack");
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].kind, BlurKind::Layer);
+        assert_eq!(new[0].radius, 4.0);
+    }
+
+    #[test]
+    fn blurs_operations_is_a_no_op_when_nothing_changed() {
+        let (doc, id) = doc_with_node(vector_with_fill(Fill::solid(FantaColor::BLACK)));
+        assert!(blurs_operations(&doc, id, |_| {}).is_empty());
+        // Removing past the end changes nothing either.
+        assert!(
+            blurs_operations(&doc, id, |blurs| {
+                if 3 < blurs.len() {
+                    blurs.remove(3);
+                }
+            })
+            .is_empty()
+        );
+        assert!(
+            blurs_operations(&doc, NodeId::new(), |blurs| blurs
+                .push(default_blur(BlurKind::Layer)))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn blur_radius_commits_and_previews_through_set_blurs() {
+        let (mut doc, id) = doc_with_node(vector_with_fill(Fill::solid(FantaColor::BLACK)));
+        for operation in blurs_operations(&doc, id, |blurs| {
+            blurs.push(default_blur(BlurKind::Background))
+        }) {
+            doc.apply(operation).expect("adding a blur");
+        }
+        assert_eq!(blurs_of(&doc, id).len(), 1);
+
+        let operations = field_operations(&doc, &InspectorField::BlurRadius { id, index: 0 }, "12");
+        assert_eq!(operations.len(), 1);
+        // The scrub preview path must understand the op it will produce.
+        for operation in &operations {
+            apply_preview_operation(&mut doc, operation);
+        }
+        assert_eq!(blurs_of(&doc, id)[0].radius, 12.0);
+        assert_eq!(blurs_of(&doc, id)[0].kind, BlurKind::Background);
+
+        // Negative radii clamp rather than poisoning the renderer.
+        let operations = field_operations(&doc, &InspectorField::BlurRadius { id, index: 0 }, "-5");
+        for operation in &operations {
+            apply_preview_operation(&mut doc, operation);
+        }
+        assert_eq!(blurs_of(&doc, id)[0].radius, 0.0);
+    }
+
+    #[test]
+    fn a_blur_snapshot_restore_rolls_back_the_stack() {
+        let (mut doc, id) = doc_with_node(vector_with_fill(Fill::solid(FantaColor::BLACK)));
+        let snapshot = {
+            let node = doc.scene.get(id).expect("the test node");
+            NodeSnapshot {
+                id,
+                transform: node.transform,
+                opacity: node.opacity,
+                data: Box::new(node.data.clone()),
+                effects: node.effects.clone(),
+                blurs: node.blurs.clone(),
+            }
+        };
+        for operation in
+            blurs_operations(&doc, id, |blurs| blurs.push(default_blur(BlurKind::Layer)))
+        {
+            doc.apply(operation).expect("adding a blur");
+        }
+        assert_eq!(blurs_of(&doc, id).len(), 1);
+        restore_snapshot(&mut doc, &snapshot);
+        assert!(blurs_of(&doc, id).is_empty());
+    }
+
+    // === Selection colors ================================================
+
+    #[test]
+    fn selection_colors_group_by_value_and_count_uses() {
+        let red = FantaColor::rgb(255, 0, 0);
+        let blue = FantaColor::rgb(0, 0, 255);
+        let grouped = group_selection_colors(vec![red, blue, red, red]);
+        assert_eq!(grouped.len(), 2);
+        // First-seen order, so the list is stable across rebuilds.
+        assert_eq!(grouped[0].color, red);
+        assert_eq!(grouped[0].uses, 3);
+        assert_eq!(grouped[1].color, blue);
+        assert_eq!(grouped[1].uses, 1);
+        assert!(group_selection_colors(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn selection_colors_read_fills_strokes_and_glyph_color() {
+        let fill = FantaColor::rgb(1, 2, 3);
+        let stroke = FantaColor::rgb(4, 5, 6);
+        let mut vector = fanta_doc::VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, fill);
+        vector.strokes = smallvec::smallvec![Stroke::solid(stroke, 1.0)];
+        let mut colors = Vec::new();
+        node_solid_colors(&node_with_data(NodeData::Vector(vector)), &mut colors);
+        assert_eq!(colors, vec![fill, stroke]);
+
+        let mut text = text_node();
+        text.set_glyph_color(FantaColor::rgb(9, 9, 9));
+        let mut colors = Vec::new();
+        node_solid_colors(&node_with_data(NodeData::Text(text)), &mut colors);
+        assert_eq!(colors, vec![FantaColor::rgb(9, 9, 9)]);
+
+        // Gradient paints carry no single solid color, so they contribute none.
+        let mut colors = Vec::new();
+        node_solid_colors(
+            &node_with_data(vector_with_fill(Fill::Gradient {
+                gradient: Gradient::Linear {
+                    start: [0.0, 0.0],
+                    end: [1.0, 0.0],
+                    stops: Vec::new(),
+                },
+                blend: BlendMode::Normal,
+            })),
+            &mut colors,
+        );
+        assert!(colors.is_empty());
+    }
+
+    #[test]
+    fn selection_color_edit_replaces_the_color_on_every_selected_node() {
+        let from = FantaColor::rgb(10, 20, 30);
+        let to = FantaColor::rgb(40, 50, 60);
+        let mut doc = Doc::new();
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let node = CanvasNode::new(vector_with_fill(Fill::solid(from)));
+            ids.push(node.id);
+            doc.scene.insert(node).expect("inserting a test node");
+        }
+        // A third node that does not use the color must not be touched.
+        let untouched = CanvasNode::new(vector_with_fill(Fill::solid(FantaColor::WHITE)));
+        let untouched_id = untouched.id;
+        doc.scene.insert(untouched).expect("inserting a test node");
+        doc.selection
+            .replace_with(ids.iter().copied().chain([untouched_id]));
+
+        let operations = selection_color_operations(&doc, from, to);
+        assert_eq!(
+            operations.len(),
+            2,
+            "only the nodes carrying the color author an op"
+        );
+        for operation in operations {
+            doc.apply(operation).expect("replacing a selection color");
+        }
+        for id in ids {
+            let node = doc.scene.get(id).expect("the test node");
+            assert_eq!(fill_at(&node.data, 0), Some(&Fill::solid(to)));
+        }
+        let node = doc.scene.get(untouched_id).expect("the untouched node");
+        assert_eq!(
+            fill_at(&node.data, 0),
+            Some(&Fill::solid(FantaColor::WHITE))
+        );
+    }
+
+    // === Per-paint visibility (non-destructive) ==========================
+
+    #[test]
+    fn hiding_and_showing_a_paint_round_trips_partial_alpha() {
+        let translucent = FantaColor::rgba(10, 20, 30, 128);
+        let mut data = vector_with_fill(Fill::solid(translucent));
+        let fill = fill_at(&data, 0).expect("a fill").clone();
+        assert!(paint_is_visible(&fill));
+
+        let remembered = paint_alpha(&fill);
+        assert_eq!(remembered, HiddenPaintAlpha::Solid(128));
+
+        // Hide.
+        if let Some(paint) = paint_slot_mut(&mut data, 0, false) {
+            let zeroed = zeroed_paint_alpha(paint);
+            set_paint_alpha(paint, &zeroed);
+        }
+        assert!(!paint_is_visible(fill_at(&data, 0).expect("a fill")));
+
+        // Show, restoring the remembered alpha rather than forcing 255.
+        if let Some(paint) = paint_slot_mut(&mut data, 0, false) {
+            set_paint_alpha(paint, &remembered);
+        }
+        assert_eq!(fill_at(&data, 0), Some(&Fill::solid(translucent)));
+    }
+
+    #[test]
+    fn gradient_and_image_paints_can_be_hidden_too() {
+        let gradient = Gradient::Linear {
+            start: [0.0, 0.0],
+            end: [1.0, 0.0],
+            stops: vec![
+                fanta_doc::GradientStop {
+                    position: 0.0,
+                    color: FantaColor::rgba(0, 0, 0, 200),
+                },
+                fanta_doc::GradientStop {
+                    position: 1.0,
+                    color: FantaColor::rgba(255, 255, 255, 90),
+                },
+            ],
+        };
+        let mut data = vector_with_fill(Fill::Gradient {
+            gradient,
+            blend: BlendMode::Normal,
+        });
+        let remembered = paint_alpha(fill_at(&data, 0).expect("a fill"));
+        assert_eq!(remembered, HiddenPaintAlpha::Gradient(vec![200, 90]));
+
+        if let Some(paint) = paint_slot_mut(&mut data, 0, false) {
+            let zeroed = zeroed_paint_alpha(paint);
+            set_paint_alpha(paint, &zeroed);
+        }
+        assert!(!paint_is_visible(fill_at(&data, 0).expect("a fill")));
+        if let Some(paint) = paint_slot_mut(&mut data, 0, false) {
+            set_paint_alpha(paint, &remembered);
+        }
+        assert_eq!(
+            paint_alpha(fill_at(&data, 0).expect("a fill")),
+            HiddenPaintAlpha::Gradient(vec![200, 90])
+        );
+
+        let mut image = vector_with_fill(Fill::Image {
+            asset: fanta_doc::AssetId::new(),
+            mode: ImageFitMode::Fill,
+            opacity: 0.4,
+            crop: None,
+            scale: None,
+            rotation: None,
+            blend: BlendMode::Normal,
+        });
+        let remembered = paint_alpha(fill_at(&image, 0).expect("a fill"));
+        assert_eq!(remembered, HiddenPaintAlpha::Image(0.4));
+        if let Some(paint) = paint_slot_mut(&mut image, 0, false) {
+            let zeroed = zeroed_paint_alpha(paint);
+            set_paint_alpha(paint, &zeroed);
+        }
+        assert!(!paint_is_visible(fill_at(&image, 0).expect("a fill")));
+        if let Some(paint) = paint_slot_mut(&mut image, 0, false) {
+            set_paint_alpha(paint, &remembered);
+        }
+        assert_eq!(
+            paint_alpha(fill_at(&image, 0).expect("a fill")),
+            HiddenPaintAlpha::Image(0.4)
+        );
+    }
+
+    #[test]
+    fn showing_a_paint_with_no_remembered_alpha_falls_back_to_opaque() {
+        assert_eq!(
+            opaque_paint_alpha(&HiddenPaintAlpha::Solid(0)),
+            HiddenPaintAlpha::Solid(255)
+        );
+        assert_eq!(
+            opaque_paint_alpha(&HiddenPaintAlpha::Gradient(vec![0, 0, 0])),
+            HiddenPaintAlpha::Gradient(vec![255, 255, 255])
+        );
+        assert_eq!(
+            opaque_paint_alpha(&HiddenPaintAlpha::Image(0.0)),
+            HiddenPaintAlpha::Image(1.0)
+        );
+    }
+
+    // === Instances: props, detach, combine ===============================
+
+    /// A doc holding a component master (a frame with one vector child) and one
+    /// live instance of it. Returns the doc, the master's component id, the
+    /// master root's node id and the instance's node id.
+    fn doc_with_instance() -> (Doc, ComponentId, NodeId, NodeId) {
+        let mut doc = Doc::new();
+        let master_root = CanvasNode::new(NodeData::Group(frame_group()));
+        let master_root_id = master_root.id;
+        doc.scene.insert(master_root).expect("inserting the master");
+
+        let mut child = CanvasNode::new(vector_with_fill(Fill::solid(FantaColor::BLACK)));
+        child.parent = Some(master_root_id);
+        let child_id = child.id;
+        doc.scene.insert(child).expect("inserting the master child");
+
+        let component = ComponentId::new();
+        let mut def = ComponentDef::new(component, master_root_id, "Button");
+        def.props.push(fanta_doc::ComponentPropDef {
+            id: ComponentPropId::new(),
+            name: "Radius".into(),
+            kind: ComponentPropKind::Number,
+            formatter: Default::default(),
+            default: VarValue::Float { value: 4.0 },
+            bindings: Vec::new(),
+        });
+        doc.components.defs.insert(component, def);
+
+        let instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: std::collections::BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [120.0, 60.0],
+        }));
+        let instance_id = instance.id;
+        doc.scene.insert(instance).expect("inserting the instance");
+        let _ = child_id;
+        (doc, component, master_root_id, instance_id)
+    }
+
+    #[test]
+    fn instance_number_and_color_props_commit_through_set_instance_prop() {
+        let (mut doc, component, _, instance_id) = doc_with_instance();
+        let prop = doc.components.def(component).unwrap().props[0].id;
+
+        let field = InspectorField::InstanceNumberProp {
+            id: instance_id,
+            prop,
+        };
+        let operations = field_operations(&doc, &field, "12.5");
+        assert_eq!(operations.len(), 1);
+        let Some(Operation::SetInstanceProp { old, new, .. }) = operations.first() else {
+            panic!("expected a SetInstanceProp operation");
+        };
+        assert_eq!(*old, None, "undo must clear back to the def default");
+        assert_eq!(*new, Some(VarValue::Float { value: 12.5 }));
+
+        // The scrub preview path must understand the op it will produce.
+        for operation in &operations {
+            apply_preview_operation(&mut doc, operation);
+        }
+        let NodeData::Instance(instance) = &doc.scene.get(instance_id).unwrap().data else {
+            panic!("expected an instance");
+        };
+        assert_eq!(
+            instance.prop_values.get(&prop),
+            Some(&VarValue::Float { value: 12.5 })
+        );
+
+        // Re-committing the same value authors nothing.
+        assert!(field_operations(&doc, &field, "12.5").is_empty());
+
+        let field = InspectorField::InstanceColorProp {
+            id: instance_id,
+            prop,
+        };
+        let operations = field_operations(&doc, &field, "#204080");
+        let Some(Operation::SetInstanceProp { new, .. }) = operations.first() else {
+            panic!("expected a SetInstanceProp operation");
+        };
+        assert_eq!(
+            *new,
+            Some(VarValue::Color {
+                value: FantaColor::rgb(0x20, 0x40, 0x80)
+            })
+        );
+    }
+
+    #[test]
+    fn detach_instance_materializes_the_master_subtree_in_one_step() {
+        let (mut doc, _, master_root_id, instance_id) = doc_with_instance();
+        let operations = detach_instance_operations(&doc, instance_id);
+        let Some(Operation::DetachInstance {
+            id, new, expanded, ..
+        }) = operations.first()
+        else {
+            panic!("expected a DetachInstance operation");
+        };
+        assert_eq!(*id, instance_id);
+        // The instance node becomes the resolved master-root frame.
+        assert!(matches!(**new, NodeData::Group(_)));
+        // The master's one child is materialized, re-parented onto the node.
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].parent, Some(instance_id));
+        assert_ne!(
+            expanded[0].id, master_root_id,
+            "the expansion must use fresh ids, not the master's"
+        );
+
+        for operation in operations {
+            doc.apply(operation).expect("detaching the instance");
+        }
+        let node = doc.scene.get(instance_id).expect("the detached node");
+        assert!(matches!(node.data, NodeData::Group(_)));
+        assert_eq!(doc.scene.children_of(Some(instance_id)).len(), 1);
+
+        // Detaching something that is not an instance is a no-op.
+        assert!(detach_instance_operations(&doc, master_root_id).is_empty());
+        assert!(detach_instance_operations(&doc, NodeId::new()).is_empty());
+    }
+
+    #[test]
+    fn combine_as_variants_defines_a_set_and_joins_every_selected_master() {
+        let mut doc = Doc::new();
+        let mut components = Vec::new();
+        for name in ["Default", "Hover"] {
+            let root = CanvasNode::new(NodeData::Group(frame_group()));
+            let root_id = root.id;
+            doc.scene.insert(root).expect("inserting a master");
+            let component = ComponentId::new();
+            doc.components
+                .defs
+                .insert(component, ComponentDef::new(component, root_id, name));
+            components.push((component, root_id));
+        }
+        doc.selection
+            .replace_with(components.iter().map(|(_, root)| *root));
+
+        let operations = combine_as_variants_operations(&doc);
+        assert_eq!(operations.len(), 3, "one DefineComponentSet + two members");
+        let Some(Operation::DefineComponentSet { set }) = operations.first() else {
+            panic!("expected a DefineComponentSet operation");
+        };
+        assert_eq!(set.members.len(), 2);
+        assert_eq!(set.default_variant, components[0].0);
+        assert_eq!(set.axes.len(), 1);
+        assert_eq!(set.axes[0].values, vec!["Default", "Hover"]);
+
+        for operation in operations {
+            doc.apply(operation).expect("combining as variants");
+        }
+        for (component, _) in &components {
+            let membership = doc
+                .components
+                .def(*component)
+                .expect("the master")
+                .variant_of
+                .as_ref()
+                .expect("the master joined the set");
+            assert_eq!(membership.axis_values.len(), 1);
+        }
+
+        // Masters already inside a set are skipped, so the button no-ops now.
+        assert!(combine_as_variants_operations(&doc).is_empty());
+    }
+
+    #[test]
+    fn combine_as_variants_needs_at_least_two_masters() {
+        let mut doc = Doc::new();
+        let root = CanvasNode::new(NodeData::Group(frame_group()));
+        let root_id = root.id;
+        doc.scene.insert(root).expect("inserting a master");
+        let component = ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, root_id, "Only"));
+        doc.selection.select_only(root_id);
+        assert!(combine_as_variants_operations(&doc).is_empty());
+    }
+
+    #[test]
+    fn paint_opacity_commits_to_alpha_for_solids_and_opacity_for_images() {
+        let (doc, id) = doc_with_node(vector_with_fill(Fill::solid(FantaColor::rgb(1, 2, 3))));
+        let field = InspectorField::PaintOpacity {
+            id,
+            index: 0,
+            is_stroke: false,
+        };
+        let operations = field_operations(&doc, &field, "50");
+        let Some(Operation::ReplaceData { new, .. }) = operations.first() else {
+            panic!("expected a ReplaceData operation");
+        };
+        let Some(Fill::Solid { color }) = fill_at(new, 0) else {
+            panic!("expected a solid fill");
+        };
+        assert_eq!(color.a, 128);
+
+        let (doc, id) = doc_with_node(vector_with_fill(Fill::Image {
+            asset: fanta_doc::AssetId::new(),
+            mode: ImageFitMode::Fill,
+            opacity: 1.0,
+            crop: None,
+            scale: None,
+            rotation: None,
+            blend: BlendMode::Normal,
+        }));
+        let field = InspectorField::PaintOpacity {
+            id,
+            index: 0,
+            is_stroke: false,
+        };
+        let operations = field_operations(&doc, &field, "25%");
+        let Some(Operation::ReplaceData { new, .. }) = operations.first() else {
+            panic!("expected a ReplaceData operation");
+        };
+        let Some(Fill::Image { opacity, .. }) = fill_at(new, 0) else {
+            panic!("expected an image fill");
+        };
+        assert!((opacity - 0.25).abs() < 1e-6);
     }
 }

@@ -3,7 +3,7 @@
 //! as an unwrapped `fanta-project` directory.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -11,9 +11,12 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
-use fanta_fig_interop::{MapReport, fig_to_doc, read_fig};
+use fanta_fig_interop::{fig_to_doc, read_fig};
 use fanta_render::{AssetResolver, DecodedImage, InMemoryAssetResolver, solve_scene_layout};
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, SharedString, Subscription, Task};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SharedString,
+    Subscription, Task,
+};
 use project::{Project, ProjectPath};
 use worktree::{PathChange, ProjectEntryId, UpdatedEntriesSet, WorktreeId};
 
@@ -114,9 +117,13 @@ pub struct FigDocument {
     pub asset_resolver: Option<Arc<dyn AssetResolver>>,
     /// Original encoded asset bytes, kept for writing the project tree.
     pub raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>,
-    /// Import fidelity report. `None` for documents loaded from a Fanta
-    /// project, which are not imports.
-    pub report: Option<MapReport>,
+    /// GPUI-renderable thumbnails for every embedded asset GPUI can decode,
+    /// built once on the background load thread. Each wraps the asset's ENCODED
+    /// bytes behind the content hash GPUI caches its decoded texture by, so the
+    /// Assets panel clones the shared `Arc` per row instead of re-hashing every
+    /// asset byte on the foreground. Assets in a format GPUI has no decoder for
+    /// are absent (their row falls back to a generic glyph).
+    pub gpui_images: HashMap<AssetId, Arc<Image>>,
     /// Whether any node in the scene uses auto layout. Computed once at load;
     /// documents without it skip the whole-page layout re-solve after every
     /// edit, which includes text measurement and is far too slow to run per
@@ -128,14 +135,25 @@ pub struct FigPage {
     pub root: Option<NodeId>,
     pub name: SharedString,
     pub bounds: fanta_doc::Bounds,
+    /// A page the design surface can navigate to but the Pages panel hides —
+    /// the importer's internal library pages (e.g. the Components page holding
+    /// every component master). Kept in `pages` so a component can be focused by
+    /// switching to it, yet filtered out of the user-facing page list.
+    pub hidden: bool,
 }
 
 impl FigDocument {
-    fn from_doc(
-        mut doc: Doc,
-        raw_assets: BTreeMap<AssetId, Vec<u8>>,
-        report: Option<MapReport>,
-    ) -> Self {
+    fn from_doc(mut doc: Doc, raw_assets: BTreeMap<AssetId, Vec<u8>>) -> Self {
+        // Figma bakes each instance's fully-resolved paints as sparse overrides;
+        // the ones that merely restate the master pin the instance and block
+        // master edits from propagating. Drop them on load (both `.fig` imports
+        // and already-materialized projects) so editing a component master
+        // reaches its unmodified instances.
+        fanta_doc::strip_redundant_instance_overrides(&mut doc.scene, &doc.components);
+        // Legacy migration: projects saved before vectors carried an SVG viewport
+        // get one inferred from geometry, so a stroke thickened past the box is
+        // clipped like a freshly imported file. A no-op once the doc is viewport-aware.
+        fanta_doc::backfill_vector_viewports(&mut doc.scene);
         let visible_page_roots = visible_page_roots(&doc);
         let default_page_root = default_page_root(&doc, &visible_page_roots);
         let uses_auto_layout = scene_uses_auto_layout(&doc.scene);
@@ -147,9 +165,11 @@ impl FigDocument {
         let resolver = decode_assets(&raw_assets);
         let asset_resolver =
             (!resolver.is_empty()).then(|| Arc::new(resolver) as Arc<dyn AssetResolver>);
+        let gpui_images = decode_gpui_images(&raw_assets);
         let pages = collect_pages(&doc, &visible_page_roots);
         let default_page_index = default_page_root
             .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
+            .or_else(|| pages.iter().position(|page| !page.hidden))
             .unwrap_or(0);
 
         Self {
@@ -159,7 +179,7 @@ impl FigDocument {
             solved_pages,
             asset_resolver,
             raw_assets: Arc::new(raw_assets),
-            report,
+            gpui_images,
             uses_auto_layout,
         }
     }
@@ -183,6 +203,24 @@ impl FigDocument {
                 .filter(|index| *index < self.pages.len())
                 .unwrap_or(self.default_page_index.min(self.pages.len() - 1)),
         )
+    }
+
+    /// The index into [`pages`](Self::pages) of the page that contains `node`
+    /// (walking up to its top-level root), including hidden pages. Used to
+    /// navigate to a component master, which lives on the hidden Components
+    /// page.
+    pub fn page_index_of_node(&self, node: NodeId) -> Option<usize> {
+        let mut current = node;
+        loop {
+            let parent = self.doc.scene.get(current)?.parent;
+            match parent {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        self.pages
+            .iter()
+            .position(|page| page.root == Some(current))
     }
 
     pub fn ensure_page_solved(&mut self, page_index: usize) {
@@ -529,10 +567,22 @@ impl FigItem {
             .document
             .ready_mut()
             .context("the document is still loading")?;
+        let target = operation.primary_target();
         document
             .doc
             .apply(operation)
             .context("applying canvas operation")?;
+        // `uses_auto_layout` gates the whole-page re-solve and is computed once
+        // at load. An edit that introduces the document's FIRST auto layout must
+        // flip it on, or that frame would never be solved. Checking only the op's
+        // primary target keeps this O(1); the flag is sticky (clearing the last
+        // auto layout only costs a redundant solve, never a stale layout).
+        if !document.uses_auto_layout
+            && let Some(target) = target
+            && node_uses_auto_layout(&document.doc.scene, target)
+        {
+            document.uses_auto_layout = true;
+        }
         let active_page = document.doc.active_page();
         document.resolve_after_edit(active_page);
         self.mark_edited(false, cx);
@@ -556,6 +606,13 @@ impl FigItem {
                 cx.notify();
             }
             DocChange::Content => {
+                // A multi-op transaction (which bypasses `apply`'s per-op gate
+                // check) could introduce the document's first auto layout; keep
+                // the re-solve gate honest. The scan runs only while the gate is
+                // closed, and the flag is sticky, so this is a one-time cost.
+                if !document.uses_auto_layout && scene_uses_auto_layout(&document.doc.scene) {
+                    document.uses_auto_layout = true;
+                }
                 let active_page = document.doc.active_page();
                 document.resolve_after_edit(active_page);
                 self.mark_edited(false, cx);
@@ -766,29 +823,31 @@ fn is_fanta_manifest(path: &Path) -> bool {
 fn load_fig_document(path: &Path) -> Result<FigDocument> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let fig = read_fig(&bytes).context("parsing .fig")?;
-    let (doc, report, assets) = fig_to_doc(&fig).context("mapping .fig to Fanta document")?;
-    Ok(FigDocument::from_doc(
-        doc,
-        assets.into_iter().collect(),
-        Some(report),
-    ))
+    let (doc, _report, assets) = fig_to_doc(&fig).context("mapping .fig to Fanta document")?;
+    Ok(FigDocument::from_doc(doc, assets.into_iter().collect()))
 }
 
 fn load_project_document(root: &Path) -> Result<FigDocument> {
     let (doc, assets) = fanta_format::read_project_tree(root)
         .with_context(|| format!("reading Fanta project at {}", root.display()))?;
-    Ok(FigDocument::from_doc(doc, assets, None))
+    Ok(FigDocument::from_doc(doc, assets))
+}
+
+/// Whether this single node carries an auto layout. O(1) — the incremental
+/// check [`FigItem::apply`] runs against an op's primary target.
+fn node_uses_auto_layout(scene: &fanta_doc::Scene, id: NodeId) -> bool {
+    scene.get(id).is_some_and(|node| match &node.data {
+        fanta_doc::NodeData::Group(group) => group.auto_layout.is_some(),
+        _ => false,
+    })
 }
 
 fn scene_uses_auto_layout(scene: &fanta_doc::Scene) -> bool {
     let roots: Vec<NodeId> = scene.roots().to_vec();
     roots.into_iter().any(|root| {
-        scene.descendants_of(root).any(|id| {
-            scene.get(id).is_some_and(|node| match &node.data {
-                fanta_doc::NodeData::Group(group) => group.auto_layout.is_some(),
-                _ => false,
-            })
-        })
+        scene
+            .descendants_of(root)
+            .any(|id| node_uses_auto_layout(scene, id))
     })
 }
 
@@ -826,15 +885,22 @@ fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId>
 }
 
 fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
-    if visible_page_roots.is_empty() {
+    let all_roots = doc.pages();
+    if all_roots.is_empty() {
         return vec![FigPage {
             root: None,
             name: "Document".into(),
             bounds: page_bounds(doc, None),
+            hidden: false,
         }];
     }
 
-    visible_page_roots
+    // Every page is included so the canvas can navigate to a hidden library
+    // page (to focus a component master); `hidden` marks the ones the Pages
+    // panel filters out. `index + 1` numbers unnamed pages by their absolute
+    // position, which stays stable as pages are added/removed.
+    let visible: HashSet<NodeId> = visible_page_roots.iter().copied().collect();
+    all_roots
         .iter()
         .enumerate()
         .map(|(index, root)| FigPage {
@@ -845,6 +911,7 @@ fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
                 .map(SharedString::from)
                 .unwrap_or_else(|| format!("Page {}", index + 1).into()),
             bounds: page_bounds(doc, Some(*root)),
+            hidden: !visible.contains(root),
         })
         .collect()
 }
@@ -912,6 +979,44 @@ fn decode_assets(assets: &BTreeMap<AssetId, Vec<u8>>) -> InMemoryAssetResolver {
     resolver
 }
 
+/// Wrap every embedded asset GPUI can decode as an [`Image`] behind its content
+/// hash, skipping formats GPUI has no decoder for. Runs on the background load
+/// thread so `Image::from_bytes`'s hash of every asset byte never lands on the
+/// foreground; the Assets panel then clones these `Arc`s per thumbnail row.
+fn decode_gpui_images(assets: &BTreeMap<AssetId, Vec<u8>>) -> HashMap<AssetId, Arc<Image>> {
+    assets
+        .iter()
+        .filter_map(|(asset_id, bytes)| {
+            let format = gpui_image_format(image::guess_format(bytes).ok()?)?;
+            // The ENCODED bytes go to GPUI (not `decode_assets`' straight-alpha
+            // RGBA8, which the canvas renderer wants): handing over the source
+            // bytes lets GPUI decode, swap channels to BGRA, and cache the
+            // texture behind the content hash `Image::from_bytes` computes.
+            Some((
+                *asset_id,
+                Arc::new(Image::from_bytes(format, bytes.clone())),
+            ))
+        })
+        .collect()
+}
+
+/// GPUI's decoder for `format`, or `None` when it has none. Unlike a paste from
+/// the clipboard, a `.fig` can legitimately embed a format GPUI cannot draw, so
+/// this returns `None` rather than treating it as a bug.
+fn gpui_image_format(format: image::ImageFormat) -> Option<ImageFormat> {
+    match format {
+        image::ImageFormat::Png => Some(ImageFormat::Png),
+        image::ImageFormat::Jpeg => Some(ImageFormat::Jpeg),
+        image::ImageFormat::WebP => Some(ImageFormat::Webp),
+        image::ImageFormat::Gif => Some(ImageFormat::Gif),
+        image::ImageFormat::Bmp => Some(ImageFormat::Bmp),
+        image::ImageFormat::Tiff => Some(ImageFormat::Tiff),
+        image::ImageFormat::Ico => Some(ImageFormat::Ico),
+        image::ImageFormat::Pnm => Some(ImageFormat::Pnm),
+        _ => None,
+    }
+}
+
 /// A viewport fitted around `bounds` with `padding` logical pixels of margin.
 pub(crate) fn fit_bounds(
     bounds: fanta_doc::Bounds,
@@ -948,6 +1053,76 @@ mod tests {
         assert!((viewport.center[1] - 250.0).abs() < 1e-9);
         // Width is the constraining axis: (848 - 48) / 400 = 2.0.
         assert!((viewport.zoom - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn encoded_formats_map_to_gpui_decoders() {
+        assert_eq!(
+            gpui_image_format(image::ImageFormat::Png),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            gpui_image_format(image::ImageFormat::Jpeg),
+            Some(ImageFormat::Jpeg)
+        );
+        assert_eq!(
+            gpui_image_format(image::ImageFormat::WebP),
+            Some(ImageFormat::Webp)
+        );
+        // GPUI cannot decode this one, so the panel keeps the generic glyph.
+        assert_eq!(gpui_image_format(image::ImageFormat::Avif), None);
+    }
+
+    #[test]
+    fn decode_gpui_images_wraps_decodable_assets_and_skips_the_rest() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([1, 2, 3, 4]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encoding a 1x1 png");
+        let png_id = AssetId::new();
+        let junk_id = AssetId::new();
+        let mut assets = BTreeMap::new();
+        assets.insert(png_id, png.clone());
+        assets.insert(junk_id, b"not an image at all".to_vec());
+
+        let images = decode_gpui_images(&assets);
+
+        assert_eq!(images.len(), 1, "only the decodable asset is wrapped");
+        let image = images.get(&png_id).expect("the png is wrapped");
+        assert_eq!(image.format, ImageFormat::Png);
+        assert_eq!(
+            image.bytes, png,
+            "the ENCODED bytes are handed to GPUI unchanged"
+        );
+        assert!(
+            !images.contains_key(&junk_id),
+            "an undecodable blob is left for the generic glyph"
+        );
+    }
+
+    #[test]
+    fn from_doc_precomputes_a_thumbnail_per_decodable_asset() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([9, 8, 7, 6]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encoding a 2x2 png");
+        let asset_id = AssetId::new();
+        let mut assets = BTreeMap::new();
+        assets.insert(asset_id, png);
+
+        let document = FigDocument::from_doc(Doc::new(), assets);
+        assert!(
+            document.gpui_images.contains_key(&asset_id),
+            "from_doc precomputes the GPUI thumbnail during the background load"
+        );
     }
 
     #[test]
@@ -1067,11 +1242,7 @@ mod tests {
                 },
                 abs_path,
                 entry_id: None,
-                document: FigDocumentState::Ready(FigDocument::from_doc(
-                    doc,
-                    BTreeMap::new(),
-                    None,
-                )),
+                document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
                 project_root,
                 dirty: false,
                 conflict: false,
@@ -1173,6 +1344,67 @@ mod tests {
             assert!(
                 item.project_root().is_none(),
                 "a refused materialization must not adopt the project it declined to overwrite"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn introducing_an_auto_layout_opens_the_resolve_gate(cx: &mut TestAppContext) {
+        use fanta_doc::{AutoLayout, NodeData};
+
+        // `uses_auto_layout` gates the whole-page re-solve and is cached at load.
+        // A frame that gains its FIRST auto layout (the inspector's toggle) must
+        // flip the gate on, or its children would never be laid out.
+        let project = empty_project(cx).await;
+        let doc = doc_with_one_page();
+        let page_root = doc.pages().first().copied().expect("one page");
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            doc,
+            cx,
+        );
+
+        item.read_with(cx, |item, _| {
+            assert!(
+                !item.document().expect("ready").uses_auto_layout,
+                "a document with no auto layout starts with the gate closed"
+            );
+        });
+
+        let (old, new) = item.read_with(cx, |item, _| {
+            let data = item
+                .document()
+                .expect("ready")
+                .doc
+                .scene
+                .get(page_root)
+                .expect("page node")
+                .data
+                .clone();
+            let mut updated = data.clone();
+            if let NodeData::Group(group) = &mut updated {
+                group.auto_layout = Some(AutoLayout::default());
+            }
+            (data, updated)
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::ReplaceData {
+                    id: page_root,
+                    old: Box::new(old),
+                    new: Box::new(new),
+                },
+                cx,
+            )
+        })
+        .expect("applying an auto layout");
+
+        item.read_with(cx, |item, _| {
+            assert!(
+                item.document().expect("ready").uses_auto_layout,
+                "introducing the first auto layout must open the re-solve gate"
             );
         });
     }

@@ -1,7 +1,8 @@
 //! The Fanta design panel: Pages, Layers, Components, and Assets sections for
 //! the active Figma canvas, mirroring the original Fanta left sidebar.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -10,13 +11,16 @@ use editor::{
     Editor, EditorEvent,
     actions::{Cancel, SelectAll},
 };
-use fanta_doc::{AssetId, CanvasNode, GroupNode, NodeData, NodeFlags, NodeId, Operation};
+use fanta_doc::{
+    AssetId, CanvasNode, ComponentId, Fill, GroupNode, NodeData, NodeFlags, NodeId, Operation,
+    Scene,
+};
 use fs::Fs;
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, WeakEntity,
-    Window, actions, deferred, px, uniform_list,
+    EventEmitter, FocusHandle, Focusable, Image, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseUpEvent, ObjectFit, Pixels, ScrollStrategy, SharedString, Subscription,
+    UniformListScrollHandle, WeakEntity, Window, actions, deferred, img, px, uniform_list,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::{ListHeader, ListItem, ListItemSpacing, Tooltip, prelude::*};
@@ -26,7 +30,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::document::{DocChange, FigPage, page_bounds};
+use crate::document::{DocChange, FigDocument, FigPage, page_bounds};
 use crate::panel_settings::FantaDesignPanelSettings;
 use crate::view::FigView;
 
@@ -70,9 +74,14 @@ const SECTION_RESIZE_RESERVE: Pixels = px(160.);
 /// header instead of sitting flush against the panel edge. The indent lives
 /// inside the row (`ListItem::indent_level`), keeping hover targets full width.
 const SECTION_INDENT_STEP: Pixels = px(12.);
+/// Asset rows are taller than the rest: they carry a thumbnail beside a
+/// two-line label. `uniform_list` sizes every row from the first one, so the
+/// row pins itself to this height and the list container is measured with it.
+const ASSET_ROW_HEIGHT: f32 = 32.;
+const ASSET_THUMBNAIL_SIZE: Pixels = px(28.);
 
-fn section_list_height(row_count: usize, stored: Pixels) -> Pixels {
-    px((row_count as f32 * SECTION_ROW_HEIGHT).min(stored.as_f32()))
+fn section_list_height(row_count: usize, row_height: f32, stored: Pixels) -> Pixels {
+    px((row_count as f32 * row_height).min(stored.as_f32()))
 }
 
 /// Keep the pages whose name contains `query` (already lowercased), preserving
@@ -114,6 +123,35 @@ struct DividerDragState {
     start_height: Pixels,
 }
 
+/// One row of the Assets section. Everything here is precomputed in
+/// [`FantaDesignPanel::rebuild_assets`] — decoding, hashing, or scanning the
+/// scene from the row builder would run once per visible row per frame.
+struct AssetEntry {
+    id: AssetId,
+    /// The name of the layer that references this asset, or a synthetic
+    /// `"Image {n}"` when nothing in the scene uses it.
+    name: SharedString,
+    /// The encoded bytes wrapped for GPUI, which decodes and caches the
+    /// texture behind the content hash. `None` when GPUI has no decoder for
+    /// the format, in which case the row falls back to a generic glyph.
+    image: Option<Arc<Image>>,
+    /// Natural pixel size, from the decoded asset. `None` if it failed to
+    /// decode at load.
+    dimensions: Option<(u32, u32)>,
+    /// `"PNG"`, `"JPG"`, … Empty when the encoding could not be identified.
+    format_label: SharedString,
+    byte_count: usize,
+}
+
+/// A name recovered for an asset from the scene node that references it.
+struct AssetName {
+    name: SharedString,
+    /// A `Bitmap` layer names its asset directly; a shape painted with an image
+    /// *fill* only lends its own name. Tracked so the former can upgrade the
+    /// latter regardless of which is met first in scene order.
+    from_bitmap: bool,
+}
+
 /// One visible row of the flattened layer tree, rebuilt every render.
 struct LayerRow {
     id: NodeId,
@@ -142,7 +180,19 @@ pub struct FantaDesignPanel {
     layer_rows: Vec<LayerRow>,
     pages_cache: Vec<PageEntry>,
     components_cache: Vec<(SharedString, NodeId)>,
-    assets_cache: Vec<(AssetId, usize)>,
+    assets_cache: Vec<AssetEntry>,
+    /// The `raw_assets` map `assets_cache`'s thumbnails were built from.
+    /// `Image::from_bytes` content-hashes every asset byte, so the thumbnails
+    /// are rebuilt only when the document swaps its (immutable) asset map on
+    /// load — not on every selection change, which also rebuilds this panel.
+    assets_source: Option<Arc<BTreeMap<AssetId, Vec<u8>>>>,
+    /// The scene revision `assets_cache`'s recovered names were resolved at.
+    /// Recovering names is a whole-scene walk, so it reruns only when the scene
+    /// actually changed — not on the selection changes that also rebuild here.
+    assets_names_revision: Option<u64>,
+    /// Indices into `assets_cache` surviving the Assets filter. The cache
+    /// itself stays whole so filtering never invalidates the thumbnails.
+    visible_assets: Vec<usize>,
     current_page_index: Option<usize>,
     document_editable: bool,
     document_ready: bool,
@@ -154,6 +204,9 @@ pub struct FantaDesignPanel {
     divider_drag: Option<DividerDragState>,
     filter_editor: Entity<Editor>,
     filter_target: Option<Section>,
+    /// Scope the Components list to masters actually used (instanced) on the
+    /// page being viewed, rather than every master in the document.
+    components_this_page: bool,
     /// The page or layer being renamed inline, if any; the shared
     /// `rename_editor` carries the edited text.
     renaming: Option<RenameTarget>,
@@ -259,6 +312,9 @@ impl FantaDesignPanel {
                 pages_cache: Vec::new(),
                 components_cache: Vec::new(),
                 assets_cache: Vec::new(),
+                assets_source: None,
+                assets_names_revision: None,
+                visible_assets: Vec::new(),
                 current_page_index: None,
                 document_ready: false,
                 document_editable: false,
@@ -270,6 +326,7 @@ impl FantaDesignPanel {
                 divider_drag: None,
                 filter_editor,
                 filter_target: None,
+                components_this_page: false,
                 renaming: None,
                 rename_editor,
                 _subscriptions: vec![
@@ -372,6 +429,12 @@ impl FantaDesignPanel {
         (!query.is_empty()).then_some(query)
     }
 
+    fn toggle_components_this_page(&mut self, cx: &mut Context<Self>) {
+        self.components_this_page = !self.components_this_page;
+        self.rebuild_layer_rows(cx);
+        cx.notify();
+    }
+
     fn toggle_filter(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter_target == Some(section) {
             self.close_filter(window, cx);
@@ -380,9 +443,12 @@ impl FantaDesignPanel {
         self.filter_target = Some(section);
         self.filter_editor.update(cx, |editor, cx| {
             editor.set_text("", window, cx);
+            // Exhaustive so a new section can't silently inherit the wrong hint.
             let placeholder = match section {
+                Section::Pages => "Filter pages…",
+                Section::Layers => "Filter layers…",
                 Section::Components => "Filter components…",
-                _ => "Filter layers…",
+                Section::Assets => "Filter assets…",
             };
             editor.set_placeholder_text(placeholder, window, cx);
         });
@@ -428,15 +494,21 @@ impl FantaDesignPanel {
     /// from this value keeps the divider tracking the pointer.
     fn section_rendered_height(&self, divider: SectionDivider) -> Pixels {
         match divider {
-            SectionDivider::PagesLayers => {
-                section_list_height(self.pages_cache.len(), self.pages_height)
-            }
-            SectionDivider::LayersComponents => {
-                section_list_height(self.components_cache.len(), self.components_height)
-            }
-            SectionDivider::ComponentsAssets => {
-                section_list_height(self.assets_cache.len(), self.assets_height)
-            }
+            SectionDivider::PagesLayers => section_list_height(
+                self.pages_cache.len(),
+                SECTION_ROW_HEIGHT,
+                self.pages_height,
+            ),
+            SectionDivider::LayersComponents => section_list_height(
+                self.components_cache.len(),
+                SECTION_ROW_HEIGHT,
+                self.components_height,
+            ),
+            SectionDivider::ComponentsAssets => section_list_height(
+                self.visible_assets.len(),
+                ASSET_ROW_HEIGHT,
+                self.assets_height,
+            ),
         }
     }
 
@@ -521,6 +593,41 @@ impl FantaDesignPanel {
         }
     }
 
+    /// Jump to a component master: switch to the page that holds it (the
+    /// importer keeps masters on a hidden Components page), center it in the
+    /// canvas, and select it.
+    fn focus_component(&mut self, target: NodeId, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let selected_page = view.read(cx).selected_page_index();
+        let (page_index, current_index) = {
+            let fig_item = item.read(cx);
+            let Some(document) = fig_item.document() else {
+                return;
+            };
+            (
+                document.page_index_of_node(target),
+                document.page_index(selected_page),
+            )
+        };
+        view.update(cx, |view, cx| {
+            if let Some(index) = page_index
+                && Some(index) != current_index
+            {
+                view.select_page(index, cx);
+            }
+            view.focus_node(target, cx);
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(target);
+                ((), DocChange::Selection)
+            });
+        });
+    }
+
     fn toggle_node_flag(&mut self, id: NodeId, flag: NodeFlags, cx: &mut Context<Self>) {
         let Some(view) = self.active_view(cx) else {
             return;
@@ -585,7 +692,8 @@ impl FantaDesignPanel {
                     return None;
                 }
                 let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
-                page_node.name = format!("Page {}", document.pages.len() + 1);
+                let visible_count = document.pages.iter().filter(|page| !page.hidden).count();
+                page_node.name = format!("Page {}", visible_count + 1);
                 page_node.index = document.doc.scene.next_root_index();
                 let page_name = SharedString::from(page_node.name.clone());
                 Some((page_node, page_name))
@@ -611,6 +719,7 @@ impl FantaDesignPanel {
                     root: Some(root),
                     name: page_name,
                     bounds,
+                    hidden: false,
                 });
                 (document.pages.len() - 1, DocChange::Content)
             })
@@ -678,21 +787,44 @@ impl FantaDesignPanel {
 
     // === Layer tree flattening =============================================
 
-    fn rebuild_layer_rows(&mut self, cx: &App) {
+    fn rebuild_layer_rows(&mut self, cx: &mut App) {
         self.layer_rows.clear();
         self.pages_cache.clear();
         self.components_cache.clear();
-        self.assets_cache.clear();
         self.current_page_index = None;
         self.document_editable = false;
         self.document_ready = false;
         let Some(view) = self.active_view(cx) else {
             self.last_reveal_anchor = None;
+            self.clear_assets(cx);
             return;
         };
+        // Capture document readiness in a scoped read so `cx` stays free (as
+        // `&mut App`) to evict the previous document's cached thumbnails when
+        // the active view has no ready document.
+        let document_ready = {
+            let fig_item = view.read(cx).item().read(cx);
+            self.document_editable = fig_item.is_editable();
+            fig_item.document().is_some()
+        };
+        if !document_ready {
+            self.clear_assets(cx);
+            return;
+        }
+        // The Pages/Components/Layers caches are pure reads of the document; the
+        // Assets cache is rebuilt after, since evicting the outgoing document's
+        // thumbnails needs `&mut App` and cannot run while `document` borrows it.
+        self.rebuild_tree(&view, cx);
+        self.rebuild_assets(&view, cx);
+    }
+
+    /// Flatten the active document's Pages, Components, and Layers into their
+    /// caches. A pure read of the document — Assets are rebuilt separately (see
+    /// [`FantaDesignPanel::rebuild_assets`]), as they need `&mut App` to evict
+    /// thumbnails.
+    fn rebuild_tree(&mut self, view: &Entity<FigView>, cx: &App) {
         let view = view.read(cx);
         let fig_item = view.item().read(cx);
-        self.document_editable = fig_item.is_editable();
         let Some(document) = fig_item.document() else {
             return;
         };
@@ -710,6 +842,9 @@ impl FantaDesignPanel {
             .pages
             .iter()
             .enumerate()
+            // Hidden library pages (e.g. the Components page) stay navigable via
+            // the canvas but never appear in the Pages panel.
+            .filter(|(_, page)| !page.hidden)
             .map(|(index, page)| {
                 let name = page
                     .root
@@ -730,24 +865,88 @@ impl FantaDesignPanel {
         {
             self.renaming = None;
         }
-        self.components_cache = doc
-            .components
-            .defs
-            .values()
-            .map(|def| (SharedString::from(def.name.clone()), def.root))
-            .collect();
+        // When scoping to the current page, collect the master/set ids present
+        // on it — both instances placed there AND masters *defined* there. A
+        // design system's Icons/Typography page holds the component masters
+        // themselves (the importer only relocates orphaned library masters to
+        // the hidden Components page), so counting instances alone would show
+        // nothing there. A variant (instance or master) counts toward its set.
+        let used_on_page: Option<HashSet<ComponentId>> = (self.components_this_page).then(|| {
+            let root_to_component: HashMap<NodeId, ComponentId> = doc
+                .components
+                .defs
+                .values()
+                .map(|def| (def.root, def.id))
+                .collect();
+            let master_of = |component: ComponentId| {
+                doc.components
+                    .defs
+                    .get(&component)
+                    .and_then(|def| def.variant_of.as_ref().map(|m| m.set))
+                    .unwrap_or(component)
+            };
+            let mut used = HashSet::new();
+            if let Some(root) = page_root {
+                for node_id in doc.scene.descendants_of(root) {
+                    // A component master defined on this page.
+                    if let Some(&component) = root_to_component.get(&node_id) {
+                        used.insert(master_of(component));
+                    }
+                    // An instance placed on this page.
+                    if let Some(node) = doc.scene.get(node_id)
+                        && let NodeData::Instance(instance) = &node.data
+                    {
+                        used.insert(master_of(instance.component));
+                    }
+                }
+            }
+            used
+        });
+        let is_used = |id: ComponentId| used_on_page.as_ref().is_none_or(|ids| ids.contains(&id));
+
+        // Show only component MASTERS: standalone components, plus one row per
+        // variant SET (its variants collapse into it). Individual variants and
+        // instances are never listed — a set like Button has thousands of
+        // variants but is one master to the user.
+        let mut components: Vec<(SharedString, NodeId)> = Vec::new();
+        for def in doc.components.defs.values() {
+            if def.variant_of.is_none() && is_used(def.id) {
+                components.push((SharedString::from(def.name.clone()), def.root));
+            }
+        }
+        for set in doc.components.sets.values() {
+            if !is_used(set.id) {
+                continue;
+            }
+            // Navigate to the set's frame — a member variant's parent — so all
+            // its variants come into view, not just one.
+            let member_root = doc
+                .components
+                .defs
+                .get(&set.default_variant)
+                .or_else(|| {
+                    set.members
+                        .first()
+                        .and_then(|id| doc.components.defs.get(id))
+                })
+                .map(|def| def.root);
+            let Some(member_root) = member_root else {
+                continue;
+            };
+            let target = doc
+                .scene
+                .get(member_root)
+                .and_then(|node| node.parent)
+                .unwrap_or(member_root);
+            components.push((SharedString::from(set.name.clone()), target));
+        }
+        self.components_cache = components;
         self.components_cache
             .sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
         if let Some(query) = self.filter_query(Section::Components, cx) {
             self.components_cache
                 .retain(|(name, _)| name.to_lowercase().contains(&query));
         }
-        self.assets_cache = document
-            .raw_assets
-            .iter()
-            .map(|(asset_id, bytes)| (*asset_id, bytes.len()))
-            .collect();
-
         let layers_query = self.filter_query(Section::Layers, cx);
 
         // Reveal the selection: when the anchor changes (typically from a
@@ -850,6 +1049,100 @@ impl FantaDesignPanel {
         }
     }
 
+    // === Assets =============================================================
+
+    /// Evict the current thumbnails from GPUI's global asset cache, then clear
+    /// the Assets rows. GPUI keys a decoded texture by its `Image`'s content
+    /// hash and does NOT free it when the `Arc<Image>` drops, so a swap to
+    /// another document (or losing the active document) must remove them.
+    fn clear_assets(&mut self, cx: &mut App) {
+        self.evict_asset_thumbnails(cx);
+        self.assets_source = None;
+        self.assets_names_revision = None;
+        self.visible_assets.clear();
+    }
+
+    /// Drop the cached-thumbnail entries, removing each decoded texture from
+    /// GPUI's global asset cache. `remove_asset` is a no-op for a thumbnail that
+    /// was never scrolled into view (and so was never decoded).
+    fn evict_asset_thumbnails(&mut self, cx: &mut App) {
+        for entry in self.assets_cache.drain(..) {
+            if let Some(image) = entry.image {
+                image.remove_asset(cx);
+            }
+        }
+    }
+
+    /// Refresh the Assets rows for the active view's document. Thumbnails,
+    /// dimensions, and formats are derived from the (immutable) asset bytes, so
+    /// they are rebuilt only when the document swaps its asset map on load —
+    /// evicting the previous map's cached textures as it does. Only the
+    /// recovered names (which track layer renames and their undo) and the filter
+    /// are recomputed on every rebuild.
+    fn rebuild_assets(&mut self, view: &Entity<FigView>, cx: &mut App) {
+        // Everything that reads the document happens first, under a scoped
+        // shared borrow. The swap path defers installing the freshly built
+        // entries until that borrow is released, so the outgoing document's
+        // thumbnails can be evicted with `&mut App`.
+        let rebuilt = {
+            let fig_item = view.read(cx).item().read(cx);
+            let Some(document) = fig_item.document() else {
+                return;
+            };
+            let same_assets = self
+                .assets_source
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, &document.raw_assets));
+            if same_assets {
+                // The same immutable asset map: no thumbnails to rebuild or
+                // evict. Only the scene-gated names and the filter can change.
+                self.refresh_asset_names(document);
+                self.filter_assets(cx);
+                return;
+            }
+            let mut entries = build_asset_entries(document);
+            let names_revision = document.doc.scene.revision();
+            apply_asset_names(&mut entries, &document.doc.scene);
+            (entries, document.raw_assets.clone(), names_revision)
+        };
+
+        let (entries, source, names_revision) = rebuilt;
+        self.evict_asset_thumbnails(cx);
+        self.assets_cache = entries;
+        self.assets_source = Some(source);
+        self.assets_names_revision = Some(names_revision);
+        self.filter_assets(cx);
+    }
+
+    /// Recover asset names from the scene, gated on the scene revision: this
+    /// rebuild also runs on every `SelectionChanged` (i.e. every canvas click),
+    /// but names can only change when the scene itself does, and the selection
+    /// lives outside the scene.
+    fn refresh_asset_names(&mut self, document: &FigDocument) {
+        let revision = document.doc.scene.revision();
+        if self.assets_names_revision != Some(revision) {
+            self.assets_names_revision = Some(revision);
+            apply_asset_names(&mut self.assets_cache, &document.doc.scene);
+        }
+    }
+
+    /// Narrow the visible rows to those whose name matches the Assets filter.
+    /// The cache itself stays whole so filtering never invalidates thumbnails.
+    fn filter_assets(&mut self, cx: &App) {
+        let query = self.filter_query(Section::Assets, cx);
+        self.visible_assets = self
+            .assets_cache
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                query
+                    .as_ref()
+                    .is_none_or(|query| entry.name.to_lowercase().contains(query))
+            })
+            .map(|(index, _)| index)
+            .collect();
+    }
+
     // === Rendering =========================================================
 
     // GPUI re-renders every visible view on each window redraw, so render
@@ -864,7 +1157,7 @@ impl FantaDesignPanel {
         let pages = self.pages_cache.clone();
         let current_page_index = self.current_page_index;
         let component_count = self.components_cache.len();
-        let asset_count = self.assets_cache.len();
+        let asset_count = self.visible_assets.len();
 
         let pages_open = self.section_open(Section::Pages);
         let layers_open = self.section_open(Section::Layers);
@@ -880,8 +1173,11 @@ impl FantaDesignPanel {
         let pages = filter_pages(pages, pages_query.as_deref());
         let layers_filter_open = self.filter_target == Some(Section::Layers);
         let components_filter_open = self.filter_target == Some(Section::Components);
+        let assets_filter_open = self.filter_target == Some(Section::Assets);
+        let components_this_page = self.components_this_page;
         let layers_filtering = self.filter_query(Section::Layers, cx).is_some();
         let components_filtering = self.filter_query(Section::Components, cx).is_some();
+        let assets_filtering = self.filter_query(Section::Assets, cx).is_some();
 
         let element = v_flex()
             .size_full()
@@ -1053,6 +1349,20 @@ impl FantaDesignPanel {
                                     .gap_1()
                                     .child(
                                         IconButton::new(
+                                            "fanta-components-this-page",
+                                            IconName::ListFilter,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .toggle_state(components_this_page)
+                                        .tooltip(Tooltip::text("Only Components on This Page"))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_components_this_page(cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        IconButton::new(
                                             "fanta-components-filter",
                                             IconName::MagnifyingGlass,
                                         )
@@ -1111,7 +1421,11 @@ impl FantaDesignPanel {
                                     }),
                                 )
                                 .w_full()
-                                .h(section_list_height(component_count, self.components_height)),
+                                .h(section_list_height(
+                                    component_count,
+                                    SECTION_ROW_HEIGHT,
+                                    self.components_height,
+                                )),
                             )
                         }
                     }),
@@ -1128,37 +1442,67 @@ impl FantaDesignPanel {
                                 this.toggle_section(Section::Assets, cx)
                             }))
                             .end_slot(
-                                Label::new(asset_count.to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        IconButton::new(
+                                            "fanta-assets-filter",
+                                            IconName::MagnifyingGlass,
+                                        )
+                                        .icon_size(IconSize::Small)
+                                        .toggle_state(assets_filter_open)
+                                        .tooltip(Tooltip::text("Filter Assets"))
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.toggle_filter(Section::Assets, window, cx)
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        Label::new(asset_count.to_string())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
                             ),
                     )
+                    .when(assets_open && assets_filter_open, |section| {
+                        section.child(self.render_filter_row(cx))
+                    })
                     .when(assets_open, |section| {
                         if asset_count == 0 {
-                            section.child(empty_section_label("fanta-assets-empty", "No assets"))
+                            section.child(empty_section_label(
+                                "fanta-assets-empty",
+                                if assets_filtering {
+                                    "No assets match the filter"
+                                } else {
+                                    "No assets"
+                                },
+                            ))
                         } else {
                             section.child(
                                 uniform_list(
                                     "fanta-assets",
                                     asset_count,
-                                    cx.processor(|this, range: Range<usize>, _window, _cx| {
+                                    cx.processor(|this, range: Range<usize>, _window, cx| {
                                         let mut rows = Vec::with_capacity(range.len());
                                         for index in range {
-                                            if let Some((asset_id, byte_count)) =
-                                                this.assets_cache.get(index)
+                                            if let Some(entry) = this
+                                                .visible_assets
+                                                .get(index)
+                                                .and_then(|asset| this.assets_cache.get(*asset))
                                             {
-                                                rows.push(this.render_asset_row(
-                                                    index,
-                                                    *asset_id,
-                                                    *byte_count,
-                                                ));
+                                                rows.push(this.render_asset_row(index, entry, cx));
                                             }
                                         }
                                         rows
                                     }),
                                 )
                                 .w_full()
-                                .h(section_list_height(asset_count, self.assets_height)),
+                                .h(section_list_height(
+                                    asset_count,
+                                    ASSET_ROW_HEIGHT,
+                                    self.assets_height,
+                                )),
                             )
                         }
                     }),
@@ -1527,7 +1871,7 @@ impl FantaDesignPanel {
             .spacing(ListItemSpacing::ExtraDense)
             .indent_level(1)
             .indent_step_size(SECTION_INDENT_STEP)
-            .on_click(cx.listener(move |this, _, _, cx| this.select_node(root, false, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.focus_component(root, cx)))
             .child(
                 h_flex()
                     .gap_1()
@@ -1541,29 +1885,206 @@ impl FantaDesignPanel {
             .into_any_element()
     }
 
-    fn render_asset_row(&self, index: usize, asset_id: AssetId, byte_count: usize) -> AnyElement {
-        let full_id = SharedString::from(asset_id.to_string());
+    fn render_asset_row(&self, index: usize, entry: &AssetEntry, cx: &App) -> AnyElement {
         ListItem::new(("fanta-asset", index))
             .spacing(ListItemSpacing::ExtraDense)
             .indent_level(1)
             .indent_step_size(SECTION_INDENT_STEP)
-            .tooltip(Tooltip::text(full_id.clone()))
+            .height(px(ASSET_ROW_HEIGHT))
+            // The asset id is the only stable handle a user can copy into a
+            // `.fant` file by hand, so the row keeps it one hover away.
+            .tooltip(Tooltip::text(SharedString::from(entry.id.to_string())))
             .child(
                 h_flex()
-                    .gap_1()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .child(render_asset_thumbnail(entry, cx))
                     .child(
-                        Icon::new(IconName::Image)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(short_asset_label(&full_id)).single_line()),
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                Label::new(entry.name.clone())
+                                    .single_line()
+                                    .truncate()
+                                    .line_height_style(LineHeightStyle::UiLabel),
+                            )
+                            .when_some(asset_detail(entry), |column, detail| {
+                                column.child(
+                                    Label::new(detail)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line()
+                                        .truncate()
+                                        .line_height_style(LineHeightStyle::UiLabel),
+                                )
+                            }),
+                    ),
             )
             .end_slot(
-                Label::new(format_file_size(byte_count as u64, true))
+                Label::new(format_file_size(entry.byte_count as u64, true))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
             .into_any_element()
+    }
+}
+
+/// The asset's thumbnail over an opaque tile, so a transparent PNG reads as an
+/// image rather than a hole in the panel. Assets GPUI cannot decode keep the
+/// generic glyph.
+fn render_asset_thumbnail(entry: &AssetEntry, cx: &App) -> AnyElement {
+    let tile = div()
+        .flex_none()
+        .size(ASSET_THUMBNAIL_SIZE)
+        .rounded_sm()
+        .overflow_hidden()
+        .bg(cx.theme().colors().element_background);
+    match &entry.image {
+        Some(image) => tile.child(
+            img(image.clone())
+                .size(ASSET_THUMBNAIL_SIZE)
+                .object_fit(ObjectFit::Cover)
+                .rounded_sm(),
+        ),
+        None => tile.items_center().justify_center().child(
+            Icon::new(IconName::Image)
+                .size(IconSize::Small)
+                .color(Color::Muted),
+        ),
+    }
+    .into_any_element()
+}
+
+/// The muted secondary line: `"512×512 · PNG"`, dropping whichever half could
+/// not be recovered.
+fn asset_detail(entry: &AssetEntry) -> Option<SharedString> {
+    let dimensions = entry
+        .dimensions
+        .map(|(width, height)| format!("{width}×{height}"));
+    let format = (!entry.format_label.is_empty()).then(|| entry.format_label.as_ref());
+    match (dimensions, format) {
+        (Some(dimensions), Some(format)) => Some(format!("{dimensions} · {format}").into()),
+        (Some(dimensions), None) => Some(dimensions.into()),
+        (None, Some(format)) => Some(SharedString::from(format.to_owned())),
+        (None, None) => None,
+    }
+}
+
+/// Precompute one [`AssetEntry`] per embedded asset. `name` is left empty for
+/// [`apply_asset_names`] to fill from the scene. The GPUI thumbnail is cloned
+/// from the document's precomputed set (built on the background load thread), so
+/// no asset bytes are hashed here on the foreground.
+fn build_asset_entries(document: &FigDocument) -> Vec<AssetEntry> {
+    document
+        .raw_assets
+        .iter()
+        .map(|(asset_id, bytes)| {
+            let image = document.gpui_images.get(asset_id).cloned();
+            let dimensions = document
+                .asset_resolver
+                .as_ref()
+                .and_then(|resolver| resolver.resolve(*asset_id))
+                .map(|decoded| (decoded.width, decoded.height));
+            AssetEntry {
+                id: *asset_id,
+                name: SharedString::default(),
+                image,
+                dimensions,
+                // Guessing the format reads only the header, not the whole
+                // asset, so identifying the label stays cheap on the foreground.
+                format_label: image::guess_format(bytes)
+                    .ok()
+                    .map(format_label)
+                    .unwrap_or_default(),
+                byte_count: bytes.len(),
+            }
+        })
+        .collect()
+}
+
+/// A short, uppercase label for an encoded format, from its canonical extension
+/// (`Jpeg` → `"JPG"`).
+fn format_label(format: image::ImageFormat) -> SharedString {
+    match format.extensions_str().first() {
+        Some(extension) => SharedString::from(extension.to_uppercase()),
+        None => SharedString::default(),
+    }
+}
+
+/// Fill each entry's `name` from the scene node that references it, numbering
+/// the assets nothing references (`"Image 1"`, `"Image 2"`, …).
+fn apply_asset_names(entries: &mut [AssetEntry], scene: &Scene) {
+    let names = collect_asset_names(scene);
+    let mut unnamed = 0usize;
+    for entry in entries {
+        entry.name = match names.get(&entry.id) {
+            Some(recovered) => recovered.name.clone(),
+            None => {
+                unnamed += 1;
+                SharedString::from(format!("Image {unnamed}"))
+            }
+        };
+    }
+}
+
+/// The best name for every asset the scene references. An asset with no
+/// reference is absent, and gets a synthetic name from the caller.
+fn collect_asset_names(scene: &Scene) -> HashMap<AssetId, AssetName> {
+    let mut names = HashMap::new();
+    for root in scene.roots() {
+        for node_id in scene.descendants_of(*root) {
+            if let Some(node) = scene.get(node_id) {
+                record_asset_names(node, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// Record the names `node` lends to the assets it references: its own name, for
+/// its bitmap or any image fill it paints with.
+fn record_asset_names(node: &CanvasNode, names: &mut HashMap<AssetId, AssetName>) {
+    // The name is cloned only where it is kept: a page of image-filled shapes
+    // walks this for every one of them.
+    let mut record = |asset: AssetId, from_bitmap: bool| {
+        let name = || AssetName {
+            name: SharedString::from(node.name.clone()),
+            from_bitmap,
+        };
+        match names.entry(asset) {
+            Entry::Vacant(slot) => {
+                slot.insert(name());
+            }
+            // A bitmap layer is named after the asset itself, so it replaces a
+            // name merely borrowed from a shape that paints with it. Between
+            // two references of the same strength, the first in scene order
+            // wins, keeping the list stable.
+            Entry::Occupied(mut slot) if from_bitmap && !slot.get().from_bitmap => {
+                slot.insert(name());
+            }
+            Entry::Occupied(_) => {}
+        }
+    };
+
+    match &node.data {
+        NodeData::Bitmap(bitmap) => record(bitmap.asset, true),
+        NodeData::Vector(vector) => {
+            for fill in &vector.fills {
+                if let Fill::Image { asset, .. } = fill {
+                    record(*asset, false);
+                }
+            }
+        }
+        NodeData::Group(group) => {
+            for fill in group.background.iter().chain(group.background_fills.iter()) {
+                if let Fill::Image { asset, .. } = fill {
+                    record(*asset, false);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1586,14 +2107,6 @@ fn layer_icon(node: &CanvasNode) -> IconName {
         | NodeData::Model3d(_)
         | NodeData::AiArtifact(_)
         | NodeData::Embed(_) => IconName::SquareDot,
-    }
-}
-
-fn short_asset_label(full_id: &str) -> SharedString {
-    let tail_start = full_id.len().saturating_sub(6);
-    match full_id.get(tail_start..) {
-        Some(tail) if tail_start > 2 => format!("a_…{tail}").into(),
-        _ => full_id.to_string().into(),
     }
 }
 
@@ -1716,6 +2229,104 @@ impl Panel for FantaDesignPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fanta_doc::{BitmapNode, BlendMode, ImageFitMode};
+
+    fn image_fill(asset: AssetId) -> Fill {
+        Fill::Image {
+            asset,
+            mode: ImageFitMode::Fill,
+            opacity: 1.0,
+            crop: None,
+            scale: None,
+            rotation: None,
+            blend: BlendMode::Normal,
+        }
+    }
+
+    fn bitmap_layer(asset: AssetId, name: &str) -> CanvasNode {
+        let mut node = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+            asset,
+            natural_size: [64, 64],
+            local_size: [64., 64.],
+            crop: None,
+            fit: ImageFitMode::Fill,
+            tint: None,
+        }));
+        node.name = name.to_owned();
+        node
+    }
+
+    fn frame_filled_with(asset: AssetId, name: &str) -> CanvasNode {
+        let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+            background: Some(image_fill(asset)),
+            ..GroupNode::default()
+        }));
+        node.name = name.to_owned();
+        node
+    }
+
+    #[test]
+    fn asset_names_prefer_a_bitmap_layer_over_a_shape_that_paints_with_the_asset() {
+        let asset = AssetId::new();
+        let mut names = HashMap::new();
+
+        // A shape painted with an image fill only lends its own name.
+        record_asset_names(&frame_filled_with(asset, "Hero card"), &mut names);
+        assert_eq!(
+            names.get(&asset).map(|name| name.name.as_ref()),
+            Some("Hero card")
+        );
+
+        // A bitmap layer names the asset itself, so it upgrades that name even
+        // though it was met second.
+        record_asset_names(&bitmap_layer(asset, "avatar.png"), &mut names);
+        assert_eq!(
+            names.get(&asset).map(|name| name.name.as_ref()),
+            Some("avatar.png")
+        );
+
+        // Between two references of equal strength the first one wins, so the
+        // list does not shuffle as the scene is walked.
+        record_asset_names(&bitmap_layer(asset, "avatar copy.png"), &mut names);
+        record_asset_names(&frame_filled_with(asset, "Other card"), &mut names);
+        assert_eq!(
+            names.get(&asset).map(|name| name.name.as_ref()),
+            Some("avatar.png")
+        );
+
+        // An asset no node references stays unnamed; the panel numbers it.
+        assert!(!names.contains_key(&AssetId::new()));
+    }
+
+    #[test]
+    fn encoded_formats_map_to_short_labels() {
+        assert_eq!(format_label(image::ImageFormat::Png).as_ref(), "PNG");
+        assert_eq!(format_label(image::ImageFormat::Jpeg).as_ref(), "JPG");
+        assert_eq!(format_label(image::ImageFormat::WebP).as_ref(), "WEBP");
+    }
+
+    #[test]
+    fn the_asset_detail_line_drops_whichever_half_is_unknown() {
+        let entry = |dimensions, format_label: &str| AssetEntry {
+            id: AssetId::new(),
+            name: SharedString::default(),
+            image: None,
+            dimensions,
+            format_label: SharedString::from(format_label.to_owned()),
+            byte_count: 0,
+        };
+
+        assert_eq!(
+            asset_detail(&entry(Some((512, 384)), "PNG")).as_deref(),
+            Some("512×384 · PNG")
+        );
+        assert_eq!(
+            asset_detail(&entry(Some((512, 384)), "")).as_deref(),
+            Some("512×384")
+        );
+        assert_eq!(asset_detail(&entry(None, "PNG")).as_deref(), Some("PNG"));
+        assert_eq!(asset_detail(&entry(None, "")), None);
+    }
 
     fn page(name: &str, index: usize) -> PageEntry {
         PageEntry {

@@ -133,7 +133,8 @@ pub(crate) fn gradient_stops(gradient: &Gradient) -> &[GradientStop] {
     }
 }
 
-fn gradient_stops_mut(gradient: &mut Gradient) -> &mut Vec<GradientStop> {
+/// Mutate a gradient's stops regardless of kind.
+pub(crate) fn gradient_stops_mut(gradient: &mut Gradient) -> &mut Vec<GradientStop> {
     match gradient {
         Gradient::Linear { stops, .. }
         | Gradient::Radial { stops, .. }

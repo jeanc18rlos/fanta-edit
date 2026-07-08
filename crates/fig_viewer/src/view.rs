@@ -342,6 +342,40 @@ impl FigView {
         );
     }
 
+    /// Center the canvas on `id` and pick a zoom that fits it (never past 1:1
+    /// for a small node), computing a fresh viewport rather than nudging the
+    /// current one — the caller may have just switched pages, which clears the
+    /// viewport. Used to jump to a component master after navigating to its
+    /// (possibly hidden) page.
+    pub(crate) fn focus_node(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        let Some(bounds) = self.container_bounds else {
+            return;
+        };
+        let (width, height) = bounds_size(bounds);
+        let screen_size = DVec2::new(width, height);
+        let Some(node_bounds) = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.world_bounds(id))
+        else {
+            return;
+        };
+        if !node_bounds.is_finite() {
+            return;
+        }
+        let fit = fanta_canvas::fit_bounds(node_bounds, screen_size, RENDER_PADDING);
+        let zoom = fit.zoom.min(1.0).clamp(MIN_ZOOM as f64, MAX_ZOOM as f64);
+        let center = node_bounds.center();
+        self.set_viewport(
+            Viewport {
+                center: [center.x, center.y],
+                zoom,
+            },
+            cx,
+        );
+    }
+
     // === Tool routing =====================================================
 
     /// Send one event through the active tool, tracking whether it changed
@@ -1686,7 +1720,6 @@ impl FigView {
 }
 
 struct FigViewSnapshot {
-    report_text: Option<String>,
     loading_message: Option<SharedString>,
     error: Option<std::sync::Arc<anyhow::Error>>,
 }
@@ -1702,18 +1735,6 @@ impl Render for FigView {
         let snapshot = {
             let item = self.item.read(cx);
             FigViewSnapshot {
-                report_text: item.document().and_then(|document| {
-                    let report = document.report.as_ref()?;
-                    let skipped: usize = report.skipped_by_type.values().sum();
-                    let page_name = document
-                        .page(self.selected_page_index)
-                        .map(|page| page.name.as_ref())
-                        .unwrap_or("Page");
-                    Some(format!(
-                        "{page_name} · {} mapped, {skipped} skipped",
-                        report.mapped
-                    ))
-                }),
                 loading_message: item.document.loading_message(),
                 error: item.document.error(),
             }
@@ -1855,20 +1876,6 @@ impl Render for FigView {
                 )
                 .child(self.render_tool_pill(cx))
                 .children(self.render_text_edit_overlay(cx))
-            })
-            .when_some(snapshot.report_text, |this, report_text| {
-                this.child(
-                    div()
-                        .absolute()
-                        .right_2()
-                        .bottom_2()
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().colors().panel_background)
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(Label::new(report_text).size(LabelSize::Small)),
-                )
             })
     }
 }
