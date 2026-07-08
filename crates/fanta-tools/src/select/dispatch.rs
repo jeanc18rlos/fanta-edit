@@ -354,13 +354,13 @@ impl SelectTool {
                 ops.push(Operation::SetTransform { id: *id, old, new });
             }
         }
-        let _ = ctx.doc.history.begin("Nudge", &mut ctx.doc.scene);
+        ctx.doc.history.begin("Nudge", &mut ctx.doc.scene);
         for op in ops {
             if let Err(e) = ctx.doc.apply(op) {
                 tracing::warn!(target: "fanta-tools.select", "nudge op failed: {e}");
             }
         }
-        let _ = ctx.doc.history.commit(&mut ctx.doc.scene);
+        ctx.doc.history.commit(&mut ctx.doc.scene);
         ToolResponse::empty()
     }
 }

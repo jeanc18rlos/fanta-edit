@@ -58,6 +58,7 @@ fn rounded_rect_clips_its_corner() {
         corner_radius: Some(20.0),
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     n.name = "pill".into();
     doc.apply(Operation::create_node(n)).unwrap();
@@ -97,6 +98,7 @@ fn independent_corner_radii_round_distinct_corners() {
         corner_radius: None,
         corner_radii: Some([20.0, 0.0, 0.0, 0.0]), // round only TL
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     n.name = "tab".into();
     doc.apply(Operation::create_node(n)).unwrap();

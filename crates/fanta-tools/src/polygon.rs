@@ -251,6 +251,7 @@ impl PolygonTool {
                         corner_radius: None,
                         corner_radii: None,
                         corner_smoothing: 0.0,
+                        local_size: None,
                     }));
                     ctx.place_new_node_on_active_page(&mut node);
                     let id = node.id;

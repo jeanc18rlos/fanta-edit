@@ -79,6 +79,9 @@ fn frame_with_rectangle_maps_to_group_with_vector_child() {
             assert_eq!(v.fills[0], Fill::solid(Color::rgba(255, 0, 0, 255)));
             let b = v.path.rough_bounds().unwrap();
             assert_eq!((b.width(), b.height()), (100.0, 50.0));
+            // The vector carries its Figma `size` as an SVG viewport, so a stroke
+            // later thickened past the box is clipped at render time.
+            assert_eq!(v.local_size, Some([100.0, 50.0]));
         }
         _ => panic!("rectangle should be a vector"),
     }

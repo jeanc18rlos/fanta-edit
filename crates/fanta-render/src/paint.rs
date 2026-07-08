@@ -680,7 +680,7 @@ mod tests {
             Gradient::Linear {
                 start: [0.0, 0.0],
                 end: [1.0, 1.0],
-                stops: nan_pos.clone(),
+                stops: nan_pos,
             },
             // Non-finite endpoints.
             Gradient::Linear {
@@ -720,7 +720,7 @@ mod tests {
                 center: [0.5, 0.5],
                 radius: 0.0,
                 handles: None,
-                stops: two.clone(),
+                stops: two,
             },
             Gradient::Diamond {
                 center: [0.5, 0.5],

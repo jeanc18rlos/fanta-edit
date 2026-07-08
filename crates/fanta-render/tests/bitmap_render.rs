@@ -436,6 +436,7 @@ fn vector_image_fill_paints_the_image_clipped_to_the_path() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(node)).unwrap();
 
@@ -480,6 +481,7 @@ fn vector_image_fill_missing_asset_shows_placeholder_paint() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(node)).unwrap();
 

@@ -81,6 +81,11 @@ pub(crate) fn build_vector(
         && !has_visible_fills(change)
         && has_visible_strokes(change);
 
+    // The node's declared box, used as the vector's SVG-style viewport so a
+    // stroke thickened past the authored size is cropped rather than growing the
+    // shape. Skipped for degenerate sizes (LINE nodes report a zero-height box,
+    // which would clip the whole stroke outline to nothing).
+    let viewport = (size.0 > 0.0 && size.1 > 0.0).then_some([size.0, size.1]);
     let (vector, decoded, stroke_only) = match decoded_fill {
         Some(path) if stroke_only_outline => {
             // Render the expanded stroke outline AS a fill (the stroke's paint),
@@ -94,6 +99,7 @@ pub(crate) fn build_vector(
                     corner_radius: None,
                     corner_radii: None,
                     corner_smoothing: 0.0,
+                    local_size: viewport,
                 },
                 true,
                 true,
@@ -110,6 +116,7 @@ pub(crate) fn build_vector(
                 corner_radius: None,
                 corner_radii: None,
                 corner_smoothing: 0.0,
+                local_size: viewport,
             },
             true,
             false,
@@ -124,6 +131,7 @@ pub(crate) fn build_vector(
                 corner_radius: None,
                 corner_radii: None,
                 corner_smoothing: 0.0,
+                local_size: viewport,
             },
             false,
             false,

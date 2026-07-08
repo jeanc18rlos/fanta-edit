@@ -22,6 +22,7 @@ fn rounded_per_side_doc(align: fanta_doc::StrokeAlign, radius: f64) -> Doc {
         corner_radius: Some(radius),
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     doc
@@ -130,6 +131,7 @@ fn single_side_border_follows_the_corner_arc() {
         corner_radius: Some(16.0),
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(64, 64).unwrap();

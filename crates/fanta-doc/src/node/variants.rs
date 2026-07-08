@@ -113,6 +113,15 @@ pub struct VectorNode {
     /// skipped, so old docs round-trip byte-identical.
     #[serde(default, skip_serializing_if = "is_zero_smoothing")]
     pub corner_smoothing: f32,
+    /// The vector's own viewport box `[width, height]` in local coordinates,
+    /// analogous to an SVG `viewBox`. When `Some`, rendering is clipped to
+    /// `[0, 0, w, h]` so geometry that spills past the box — most commonly a
+    /// stroke thickened well beyond the authored size — is cropped instead of
+    /// growing the visible shape (SVG viewport semantics). `None` (old docs,
+    /// tool-created shapes) means no clip, and the field is skipped on
+    /// serialization so those docs round-trip byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_size: Option<[f64; 2]>,
 }
 
 impl VectorNode {
@@ -125,6 +134,9 @@ impl VectorNode {
             corner_radius: None,
             corner_radii: None,
             corner_smoothing: 0.0,
+            // Authored at (x, y), not the local origin, so a `[0,0,w,h]` viewport
+            // clip would misalign. Solid rects never overflow their box anyway.
+            local_size: None,
         }
     }
 }

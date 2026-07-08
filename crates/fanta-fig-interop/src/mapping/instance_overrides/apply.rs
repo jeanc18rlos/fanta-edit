@@ -8,6 +8,21 @@ use super::{
     master_root_for, prop_assignment_text, read_derived_override, read_fills,
     resolve_full_guid_path, text_override,
 };
+use fanta_doc::{Fill, Stroke};
+
+/// The master node's own fills and strokes at `node_id`, for detecting a
+/// redundant override (see the drop in [`apply_symbol_overrides`]). A group's
+/// single background counts as its fill.
+fn master_paints(doc: &Doc, node_id: NodeId) -> (Vec<Fill>, Vec<Stroke>) {
+    match doc.scene.get(node_id).map(|node| &node.data) {
+        Some(NodeData::Vector(v)) => (v.fills.to_vec(), v.strokes.to_vec()),
+        Some(NodeData::Group(g)) => (
+            g.background.clone().into_iter().collect(),
+            g.strokes.to_vec(),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
 
 /// Resolve each instance's override material to typed [`Override`]s addressed by
 /// def-local path, and push them onto the [`InstanceNode`] so
@@ -248,6 +263,14 @@ fn apply_symbol_overrides(
         if path_len > 1 {
             report.override_nested_resolved += 1;
         }
+        // The master node this override targets (empty path = the master root).
+        // Figma bakes each instance's fully-resolved node state into its override
+        // list, so a fill/stroke override that merely RESTATES the master's own
+        // value is a snapshot, not an authored recolor. Keeping it would pin the
+        // instance to the pre-edit look and stop a master edit from ever reaching
+        // it. We drop those redundant snapshots below and keep only real deltas.
+        let master_target = path.last().copied().unwrap_or(master_root);
+        let (master_fills, master_strokes) = master_paints(doc, master_target);
         // Text content override.
         if let Some(text) = ov
             .get("textData")
@@ -266,7 +289,8 @@ fn apply_symbol_overrides(
         } else {
             Vec::new()
         };
-        if !ov_fills.is_empty() {
+        // Keep the fill override only when it actually differs from the master.
+        if !ov_fills.is_empty() && ov_fills != master_fills {
             overrides.push(Override {
                 target_path: path.clone(),
                 target_prop: BoundProp::FillColor { index: 0 },
@@ -276,13 +300,16 @@ fn apply_symbol_overrides(
             });
         }
         if has_stroke_fields(ov) {
-            overrides.push(Override {
-                target_path: path.clone(),
-                target_prop: BoundProp::StrokeColor { index: 0 },
-                value: OverrideValue::Strokes {
-                    strokes: build_stroke(ov).into_iter().collect(),
-                },
-            });
+            let ov_strokes = build_stroke(ov);
+            if ov_strokes != master_strokes {
+                overrides.push(Override {
+                    target_path: path.clone(),
+                    target_prop: BoundProp::StrokeColor { index: 0 },
+                    value: OverrideValue::Strokes {
+                        strokes: ov_strokes.into_iter().collect(),
+                    },
+                });
+            }
         }
         // Visibility override.
         if let Some(KiwiValue::Bool(visible)) = ov.get("visible") {
@@ -344,20 +371,31 @@ fn apply_own_surface_fill(
     master_root: NodeId,
     overrides: &mut Vec<Override>,
 ) {
-    if !po.own_fills.is_empty()
-        && matches!(
-            doc.scene.get(master_root).map(|n| &n.data),
-            Some(NodeData::Group(g)) if g.background.is_some()
-        )
-    {
-        overrides.push(Override {
-            target_path: OverridePath::new(), // the expanded master root
-            target_prop: BoundProp::FillColor { index: 0 },
-            value: OverrideValue::Fills {
-                fills: po.own_fills.iter().cloned().collect(),
-            },
-        });
+    if po.own_fills.is_empty() {
+        return;
     }
+    let Some(NodeData::Group(g)) = doc.scene.get(master_root).map(|node| &node.data) else {
+        return;
+    };
+    // Only recolor a surface-bearing frame; never invent one.
+    let Some(background) = &g.background else {
+        return;
+    };
+    // A surface fill equal to the master's own background is a snapshot no-op:
+    // emitting it would pin the instance and block a master fill edit from ever
+    // reaching it. Keep it only when the instance genuinely differs (e.g. a dark
+    // instance over a light master).
+    let own: Vec<Fill> = po.own_fills.iter().cloned().collect();
+    if own.as_slice() == std::slice::from_ref(background) {
+        return;
+    }
+    overrides.push(Override {
+        target_path: OverridePath::new(), // the expanded master root
+        target_prop: BoundProp::FillColor { index: 0 },
+        value: OverrideValue::Fills {
+            fills: own.into_iter().collect(),
+        },
+    });
 }
 
 fn apply_own_surface_strokes(
@@ -369,18 +407,24 @@ fn apply_own_surface_strokes(
     let Some(strokes) = &po.own_strokes else {
         return;
     };
-    if matches!(
-        doc.scene.get(master_root).map(|n| &n.data),
-        Some(NodeData::Group(g)) if !g.strokes.is_empty()
-    ) {
-        overrides.push(Override {
-            target_path: OverridePath::new(),
-            target_prop: BoundProp::StrokeColor { index: 0 },
-            value: OverrideValue::Strokes {
-                strokes: strokes.iter().cloned().collect(),
-            },
-        });
+    let Some(NodeData::Group(g)) = doc.scene.get(master_root).map(|node| &node.data) else {
+        return;
+    };
+    if g.strokes.is_empty() {
+        return;
     }
+    // Same snapshot-no-op drop as the surface fill above.
+    let own: Vec<Stroke> = strokes.iter().cloned().collect();
+    if own.as_slice() == g.strokes.as_slice() {
+        return;
+    }
+    overrides.push(Override {
+        target_path: OverridePath::new(),
+        target_prop: BoundProp::StrokeColor { index: 0 },
+        value: OverrideValue::Strokes {
+            strokes: own.into_iter().collect(),
+        },
+    });
 }
 
 /// Mechanism 2 — `componentPropAssignments` (defID → value). Figma component

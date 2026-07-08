@@ -68,6 +68,7 @@ fn build_scene() -> (
         corner_radius: Some(10.0),
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     master.name = "Card".into();
     master.transform = Transform2D::translation(10_000.0, 0.0);
@@ -116,6 +117,7 @@ fn build_scene() -> (
         corner_radius: None,
         corner_radii: Some([0.0, 20.0, 0.0, 20.0]),
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     shape.name = "Tile".into();
     shape.transform = Transform2D::translation(20.0, 70.0);

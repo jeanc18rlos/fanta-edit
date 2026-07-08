@@ -305,6 +305,86 @@ fn instance_own_surface_fill_overrides_master_root_background() {
 }
 
 #[test]
+fn instance_own_surface_fill_equal_to_master_records_no_override() {
+    // The flip side of the `_Header` fix: when the instance's own surface fill
+    // is the SAME as the master's (a Figma snapshot no-op, e.g. a plain white
+    // card over a white master), the importer must NOT bake a redundant fill
+    // override. Otherwise editing the master's fill would never reach the
+    // instance — the pin would keep re-applying the old value.
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 0)),
+                ("type", KiwiValue::Enum("DOCUMENT".to_owned())),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("parentIndex", parent_index(0, 0)),
+                ("type", KiwiValue::Enum("CANVAS".to_owned())),
+            ],
+        ),
+        // SYMBOL master: a frame with a WHITE background.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 10)),
+                ("parentIndex", parent_index(0, 1)),
+                ("type", KiwiValue::Enum("SYMBOL".to_owned())),
+                ("name", KiwiValue::String("Card".to_owned())),
+                ("size", vector(100.0, 40.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                ),
+            ],
+        ),
+        // INSTANCE whose own surface fill is ALSO white — equal to the master.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 20)),
+                ("parentIndex", parent_index(0, 1)),
+                ("type", KiwiValue::Enum("INSTANCE".to_owned())),
+                ("name", KiwiValue::String("Card".to_owned())),
+                ("size", vector(100.0, 40.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                ),
+                (
+                    "symbolData",
+                    o("SymbolData", vec![("symbolID", guid(0, 10))]),
+                ),
+            ],
+        ),
+    ]);
+    let (doc, _report, _) = fig_to_doc(&fig).unwrap();
+    let instance = doc
+        .scene
+        .roots()
+        .iter()
+        .flat_map(|root| doc.scene.descendants_of(*root).collect::<Vec<_>>())
+        .find_map(|id| match doc.scene.get(id).map(|node| &node.data) {
+            Some(NodeData::Instance(inst)) => Some(inst.clone()),
+            _ => None,
+        })
+        .expect("an instance node");
+    assert!(
+        !instance
+            .overrides
+            .iter()
+            .any(|ov| matches!(ov.value, fanta_doc::OverrideValue::Fills { .. })),
+        "a surface fill equal to the master must not be baked as an override, \
+         got: {:?}",
+        instance.overrides,
+    );
+}
+
+#[test]
 fn frame_with_only_background_paints_uses_them_as_background() {
     // A FRAME with NO fillPaints but a `backgroundPaints` must paint that as its
     // group background (op2's `mapFigmaFills(fillPaints) ?? backgroundPaints`).

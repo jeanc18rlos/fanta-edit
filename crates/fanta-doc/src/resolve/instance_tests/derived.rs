@@ -126,6 +126,66 @@ fn expand_applies_derived_geometry_fills_and_stroke_to_vector() {
 }
 
 #[test]
+fn editing_the_master_makes_instances_ignore_baked_derived_and_go_live() {
+    use crate::node::DerivedOverride;
+    let mut scene = Scene::new();
+    let (mut lib, comp_id, _root_id, rect_id) = master_with_vector(&mut scene);
+    // Figma baked this instance's rect fill to BLACK (the master rect is WHITE).
+    let inst = InstanceNode {
+        component: comp_id,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: vec![DerivedOverride {
+            path: smallvec![rect_id],
+            transform: None,
+            size: None,
+            fills: Some(smallvec![crate::style::Fill::solid(Color::BLACK)]),
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        }],
+        local_size: [100.0, 100.0],
+    };
+
+    let fill_of = |scene: &Scene, lib: &ComponentLibrary| {
+        let expanded = expand_instance(scene, lib, &inst);
+        match &expanded
+            .iter()
+            .find(|e| e.def_path.as_slice() == [rect_id])
+            .unwrap()
+            .node
+            .data
+        {
+            NodeData::Vector(v) => v.fills[0].clone(),
+            other => panic!("expected vector, got {other:?}"),
+        }
+    };
+
+    // Pristine master (rev 0): the baked derived fill wins — full Figma fidelity.
+    assert_eq!(
+        fill_of(&scene, &lib),
+        crate::style::Fill::solid(Color::BLACK)
+    );
+
+    // The user edits the master: recolor its rect RED and bump the def rev the
+    // way `OpCtx::bump_revs` does on any master-subtree edit.
+    if let NodeData::Vector(v) = &mut scene.get_mut(rect_id).unwrap().data {
+        v.fills = smallvec![crate::style::Fill::solid(Color::rgb(255, 0, 0))];
+    }
+    lib.defs.get_mut(&comp_id).unwrap().rev += 1;
+
+    // Now the instance must derive LIVE from the edited master (RED), not stay
+    // pinned to the baked BLACK — this is the "master edit reaches its
+    // instances" behavior a component system requires.
+    assert_eq!(
+        fill_of(&scene, &lib),
+        crate::style::Fill::solid(Color::rgb(255, 0, 0)),
+        "an edited master's fill must propagate to its instances"
+    );
+}
+
+#[test]
 fn derived_fill_geometry_without_stroke_clears_master_stroke() {
     use crate::node::DerivedOverride;
     use crate::path::PathData;
@@ -195,6 +255,7 @@ fn expand_keeps_stroked_vector_path_when_derived_stroke_path_is_present() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     line.parent = Some(root_id);
     let line_id = line.id;
@@ -270,6 +331,113 @@ fn override_fills_set_background_on_a_group_frame_root() {
             "frame override fill must land in background"
         ),
         other => panic!("expected group, got {other:?}"),
+    }
+}
+
+#[test]
+fn strip_redundant_instance_overrides_drops_master_equal_paints_only() {
+    // The load-time normalization that makes master edits reach instances:
+    // an override restating the master's own fill is a snapshot to drop, while
+    // a genuinely different fill is a per-instance delta to keep.
+    let mut scene = Scene::new();
+    let (lib, comp_id, _root_id, rect_id) = master_with_vector(&mut scene); // rect is WHITE
+    let fills_override = |color| Override {
+        target_path: smallvec![rect_id],
+        target_prop: crate::binding::BoundProp::FillColor { index: 0 },
+        value: OverrideValue::Fills {
+            fills: smallvec![crate::style::Fill::solid(color)],
+        },
+    };
+    let instance_with = |overrides| {
+        CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: comp_id,
+            overrides,
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [100.0, 100.0],
+        }))
+    };
+    let redundant = instance_with(vec![fills_override(Color::WHITE)]); // == master
+    let redundant_id = redundant.id;
+    scene.insert(redundant).unwrap();
+    let genuine = instance_with(vec![fills_override(Color::rgb(0, 0, 255))]); // differs
+    let genuine_id = genuine.id;
+    scene.insert(genuine).unwrap();
+
+    crate::strip_redundant_instance_overrides(&mut scene, &lib);
+
+    let overrides_of = |scene: &Scene, id| match &scene.get(id).unwrap().data {
+        NodeData::Instance(i) => i.overrides.clone(),
+        other => panic!("expected instance, got {other:?}"),
+    };
+    assert!(
+        overrides_of(&scene, redundant_id).is_empty(),
+        "an override equal to the master must be stripped so master edits propagate"
+    );
+    assert_eq!(
+        overrides_of(&scene, genuine_id).len(),
+        1,
+        "a genuine per-instance recolor must be kept"
+    );
+}
+
+#[test]
+fn editing_a_master_keeps_the_instances_baked_size_but_propagates_fill() {
+    use crate::node::DerivedOverride;
+    let mut scene = Scene::new();
+    let (mut lib, comp_id, _root_id, rect_id) = master_with_vector(&mut scene); // 10×10 white rect
+    // Figma baked this instance's rect to a 64×18 box (its resolved per-placement
+    // size) — no baked fill, so the master's fill flows through.
+    let inst = InstanceNode {
+        component: comp_id,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: vec![DerivedOverride {
+            path: smallvec![rect_id],
+            transform: None,
+            size: Some([64.0, 18.0]),
+            fills: None,
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        }],
+        local_size: [100.0, 100.0],
+    };
+    let rect_clone = |scene: &Scene, lib: &ComponentLibrary| {
+        expand_instance(scene, lib, &inst)
+            .into_iter()
+            .find(|e| e.def_path.as_slice() == [rect_id])
+            .map(|e| e.node.data)
+            .expect("the rect clone")
+    };
+    let size_of = |data: &NodeData| match data {
+        NodeData::Vector(v) => v.path.rough_bounds().map(|b| (b.width(), b.height())),
+        _ => None,
+    };
+
+    // Edit the master: recolor its rect red and bump the rev the way a real edit
+    // would.
+    if let NodeData::Vector(v) = &mut scene.get_mut(rect_id).unwrap().data {
+        v.fills = smallvec![crate::style::Fill::solid(Color::rgb(255, 0, 0))];
+    }
+    lib.defs.get_mut(&comp_id).unwrap().rev += 1;
+
+    let data = rect_clone(&scene, &lib);
+    // The baked 64×18 size is PRESERVED (not distorted back to the master's 10×10).
+    let (w, h) = size_of(&data).expect("vector size");
+    assert!(
+        (w - 64.0).abs() < 1e-6 && (h - 18.0).abs() < 1e-6,
+        "editing the master must not resize the instance to the master box, got {w}×{h}"
+    );
+    // …while the master's new fill still reaches the instance.
+    match data {
+        NodeData::Vector(v) => assert_eq!(
+            v.fills.as_slice(),
+            [crate::style::Fill::solid(Color::rgb(255, 0, 0))].as_slice(),
+            "the master fill edit propagates to the instance"
+        ),
+        other => panic!("expected vector, got {other:?}"),
     }
 }
 
@@ -503,4 +671,82 @@ fn expand_dangling_component_yields_empty() {
         local_size: [10.0, 10.0],
     };
     assert!(expand_instance(&scene, &lib, &inst).is_empty());
+}
+
+#[test]
+fn backfill_infers_a_viewport_for_legacy_origin_anchored_vectors() {
+    let mut scene = Scene::new();
+    // A legacy vector (no viewport) authored at the local origin.
+    let a = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        40.0,
+        30.0,
+        Color::BLACK,
+    )));
+    let a_id = a.id;
+    scene.insert(a).unwrap();
+    // One authored LEFT of the origin: its box can't be inferred from geometry,
+    // so it stays unclipped rather than risk a misaligned clip.
+    let b = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        -5.0,
+        0.0,
+        20.0,
+        20.0,
+        Color::BLACK,
+    )));
+    let b_id = b.id;
+    scene.insert(b).unwrap();
+
+    backfill_vector_viewports(&mut scene);
+
+    let size = |id| match &scene.get(id).unwrap().data {
+        NodeData::Vector(v) => v.local_size,
+        _ => unreachable!(),
+    };
+    assert_eq!(size(a_id), Some([40.0, 30.0]));
+    assert_eq!(size(b_id), None);
+}
+
+#[test]
+fn backfill_fills_lacking_vectors_even_beside_viewport_aware_ones() {
+    // A MIXED doc (e.g. a project saved mid-migration): each vector is decided
+    // on its own, so a `None` vector still gets a box even though a sibling
+    // already carries a viewport. Regression test for the mixed-state bug where
+    // an early-return skipped the rest of the pass.
+    let mut scene = Scene::new();
+    // A vector that already has a viewport (must be preserved verbatim),
+    // inserted BEFORE the lacking one so the old early-return would bail first.
+    let mut vb = VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, Color::BLACK);
+    vb.local_size = Some([999.0, 999.0]);
+    let b_node = CanvasNode::new(NodeData::Vector(vb));
+    let b_id = b_node.id;
+    scene.insert(b_node).unwrap();
+    // A vector that lacks one.
+    let a = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        40.0,
+        30.0,
+        Color::BLACK,
+    )));
+    let a_id = a.id;
+    scene.insert(a).unwrap();
+
+    backfill_vector_viewports(&mut scene);
+
+    let size = |id| match &scene.get(id).unwrap().data {
+        NodeData::Vector(v) => v.local_size,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        size(a_id),
+        Some([40.0, 30.0]),
+        "lacking vector must be filled"
+    );
+    assert_eq!(
+        size(b_id),
+        Some([999.0, 999.0]),
+        "existing viewport preserved"
+    );
 }

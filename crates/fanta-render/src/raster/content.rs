@@ -222,6 +222,15 @@ pub(crate) fn paint_node_content(
             }
         }
         NodeData::Vector(v) => {
+            // SVG viewport: clip the vector to its authored box so geometry that
+            // spills past it — chiefly a stroke thickened beyond the box — is
+            // cropped instead of growing the shape. The canvas already carries the
+            // node's transform, so `[0,0,w,h]` is the box in local coordinates.
+            let viewport = v.local_size;
+            if let Some([w, h]) = viewport {
+                canvas.save();
+                canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
+            }
             draw_vector(
                 canvas,
                 &v.path,
@@ -232,6 +241,9 @@ pub(crate) fn paint_node_content(
                 v.corner_smoothing,
                 ctx,
             );
+            if viewport.is_some() {
+                canvas.restore();
+            }
         }
         NodeData::Text(t) => {
             // Real glyph rendering: shape `t.content` through `fanta-text`'s

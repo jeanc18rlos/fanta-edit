@@ -82,7 +82,8 @@ pub use op::{ModeScope, OpCtx, Operation};
 pub use path::{FillRule, PathData, PathSegment, SvgPathError};
 pub use replay::{Divergence, ReplayResult, diff_snapshots, replay_ops};
 pub use resolve::{
-    ExpandedNode, def_local_path, expand_instance, resolve_bound_value, resolve_effective_mode,
+    ExpandedNode, backfill_vector_viewports, def_local_path, expand_instance, resolve_bound_value,
+    resolve_effective_mode, resolved_component_rev, strip_redundant_instance_overrides,
 };
 pub use scene::{Ancestors, Descendants, Scene, SceneError};
 pub use selection::Selection;

@@ -107,8 +107,18 @@ pub fn expand_instance(
     // derived entry sets the resolved *layout* of that same run. Only the fields
     // an entry populates are written; the rest stay at the master value. Deeper
     // paths route onto the nested instance's `derived` exactly like overrides.
+    //
+    // Once the user edits the master (`rev != 0`, bumped on every master-subtree
+    // edit and omitted from JSON when zero), the baked PAINT is stale: a master
+    // fill change must reach the instance. But the baked GEOMETRY (transform,
+    // size, resolved path, stroke weight) is the instance's correct per-placement
+    // layout — dropping it would resize the vector to the master's box and
+    // distort it. So an edited master keeps the baked geometry and only lets the
+    // fill fall through to the (edited) master value. `apply_derived` takes the
+    // `edited` flag and skips exactly the fill write.
+    let edited = def.rev != 0;
     for d in &instance.derived {
-        if !apply_at_path(&mut out, &d.path, |node| apply_derived(node, d)) {
+        if !apply_at_path(&mut out, &d.path, |node| apply_derived(node, d, edited)) {
             route_nested(&mut out, &d.path, |remainder, inst| {
                 let mut nested = d.clone();
                 nested.path = remainder.iter().copied().collect();
@@ -117,6 +127,143 @@ pub fn expand_instance(
         }
     }
     out
+}
+
+/// The revision of the [`ComponentDef`] an `instance` resolves to (its master,
+/// or the selected member of a variant set), or `0` when the master is missing.
+/// `0` means "never edited since import"; any higher value means the master has
+/// been edited, so callers should derive the instance live rather than trust the
+/// baked `derivedSymbolData`. See [`expand_instance`].
+pub fn resolved_component_rev(components: &ComponentLibrary, instance: &InstanceNode) -> u64 {
+    resolve_instance_def(components, instance).map_or(0, |def| def.rev)
+}
+
+/// Drop every instance sparse override whose fill/stroke merely RESTATES the
+/// master's own value at that node. Figma bakes each instance's fully-resolved
+/// paint state into its overrides, so these snapshots are no-ops at import — but
+/// once the user edits the master they would pin the instance to the stale value
+/// and stop the edit from ever reaching it. Removing them lets a master paint
+/// edit propagate to unmodified instances while a genuine per-instance recolor
+/// (a value that differs from the master) is kept.
+///
+/// Runs once at load over both `.fig` imports and Fanta-project loads, and is
+/// idempotent. Bumps the scene revision only for instances it actually trims.
+pub fn strip_redundant_instance_overrides(scene: &mut Scene, components: &ComponentLibrary) {
+    if components.defs.is_empty() {
+        return;
+    }
+    let all_ids: Vec<NodeId> = scene
+        .roots()
+        .to_vec()
+        .into_iter()
+        .flat_map(|root| scene.descendants_of(root).collect::<Vec<_>>())
+        .collect();
+    let mut trimmed: Vec<(NodeId, Vec<Override>)> = Vec::new();
+    for id in all_ids {
+        let Some(node) = scene.get(id) else { continue };
+        let NodeData::Instance(instance) = &node.data else {
+            continue;
+        };
+        if instance.overrides.is_empty() {
+            continue;
+        }
+        let Some(def) = resolve_instance_def(components, instance) else {
+            continue;
+        };
+        let master_root = def.root;
+        let kept: Vec<Override> = instance
+            .overrides
+            .iter()
+            .filter(|ov| {
+                let master_node = ov.target_path.last().copied().unwrap_or(master_root);
+                !override_restates_master(scene, master_node, &ov.value)
+            })
+            .cloned()
+            .collect();
+        if kept.len() != instance.overrides.len() {
+            trimmed.push((id, kept));
+        }
+    }
+    for (id, kept) in trimmed {
+        if let Some(node) = scene.get_mut(id)
+            && let NodeData::Instance(instance) = &mut node.data
+        {
+            instance.overrides = kept;
+        }
+    }
+}
+
+/// Backfill an SVG viewport ([`VectorNode::local_size`]) onto any vector that
+/// lacks one, inferring its box from the path bounds. This is for documents saved
+/// before viewports were recorded (older materialized projects) — and, crucially,
+/// for docs in a MIXED state where some vectors have a viewport and others don't
+/// (e.g. a project saved mid-migration): each vector is decided INDEPENDENTLY, so
+/// a `None` vector is filled even when a sibling already carries a `local_size`.
+///
+/// Vectors that already have a viewport are left untouched (the importer's exact
+/// Figma `size`, or a prior backfill). Only an origin-anchored, non-degenerate
+/// path gets a box — one starting left of / above the local origin, or with a
+/// zero-area bound (an axis-aligned `LINE`), can't have its authored box inferred
+/// from geometry, so it stays unclipped rather than risk a misaligned clip.
+///
+/// Masters live in the scene (embedded or on the hidden Components page), so this
+/// reaches instance sources too: an instance clones the master's `local_size`
+/// when it expands.
+pub fn backfill_vector_viewports(scene: &mut Scene) {
+    let all_ids: Vec<NodeId> = scene
+        .roots()
+        .to_vec()
+        .into_iter()
+        .flat_map(|root| scene.descendants_of(root).collect::<Vec<_>>())
+        .collect();
+    let mut boxes: Vec<(NodeId, [f64; 2])> = Vec::new();
+    for id in &all_ids {
+        let Some(node) = scene.get(*id) else { continue };
+        if let NodeData::Vector(v) = &node.data {
+            if v.local_size.is_some() {
+                continue; // already has a viewport — decide each vector on its own
+            }
+            let Some(b) = v.path.rough_bounds() else {
+                continue;
+            };
+            if b.min_x < -0.5 || b.min_y < -0.5 || b.max_x <= 0.0 || b.max_y <= 0.0 {
+                continue;
+            }
+            boxes.push((*id, [b.max_x, b.max_y]));
+        }
+    }
+    for (id, size) in boxes {
+        if let Some(node) = scene.get_mut(id)
+            && let NodeData::Vector(v) = &mut node.data
+        {
+            v.local_size = Some(size);
+        }
+    }
+}
+
+/// Whether a fill/stroke override value equals the master node's own paint (so
+/// the override is a redundant snapshot). Only fill/stroke override kinds can be
+/// redundant this way; every other kind is kept.
+fn override_restates_master(scene: &Scene, master_node: NodeId, value: &OverrideValue) -> bool {
+    let Some(node) = scene.get(master_node) else {
+        return false;
+    };
+    match value {
+        OverrideValue::Fills { fills } => match &node.data {
+            NodeData::Vector(v) => v.fills.as_slice() == fills.as_slice(),
+            NodeData::Group(g) => match &g.background {
+                Some(background) => fills.as_slice() == std::slice::from_ref(background),
+                None => fills.is_empty(),
+            },
+            _ => false,
+        },
+        OverrideValue::Strokes { strokes } => match &node.data {
+            NodeData::Vector(v) => v.strokes.as_slice() == strokes.as_slice(),
+            NodeData::Group(g) => g.strokes.as_slice() == strokes.as_slice(),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// mergeSymbolProps (op2 `mergeSymbolProps`): the expansion root is the placed
@@ -286,15 +433,18 @@ fn route_nested(
 /// model's best-effort writes.
 ///
 /// [`DerivedOverride`]: crate::node::DerivedOverride
-fn apply_derived(node: &mut CanvasNode, d: &crate::node::DerivedOverride) {
-    // Position / scale: Figma bakes the resolved local transform here.
+fn apply_derived(node: &mut CanvasNode, d: &crate::node::DerivedOverride, edited: bool) {
+    // Position / scale: Figma bakes the resolved local transform here. Geometry
+    // (transform, size, path) is applied regardless of `edited` — it is the
+    // instance's correct per-placement layout; only the baked FILL is skipped
+    // when the master has been edited, so a master fill change shows through.
     if let Some(t) = d.transform {
         node.transform = t;
     }
     if let Some(size) = d.size {
         apply_derived_size(&mut node.data, size);
     }
-    apply_derived_geometry(&mut node.data, d);
+    apply_derived_geometry(&mut node.data, d, edited);
     // Baked text layout: resolved content + font size / line height / spacing,
     // plus the per-instance resolved theme color / weight / family. The color is
     // the headline fix: a label on a Dark page must render in its real (light)
@@ -331,6 +481,14 @@ fn apply_derived_size(data: &mut NodeData, [w, h]: [f64; 2]) {
                         .scale_about(bounds.min_x, bounds.min_y, scale_x, scale_y);
                 }
             }
+            // Keep the SVG viewport in sync with the resized path so the clip
+            // still matches the instance's box (else an enlarged instance would
+            // be cropped to the master's smaller viewport). Only when the master
+            // actually carries a viewport — never introduce a clip on a vector
+            // that had none.
+            if v.local_size.is_some() {
+                v.local_size = Some([w, h]);
+            }
         }
         NodeData::Text(t) => t.local_size = [w, h],
         NodeData::Bitmap(b) => b.local_size = [w, h],
@@ -347,7 +505,7 @@ fn apply_derived_size(data: &mut NodeData, [w, h]: [f64; 2]) {
 
 /// Write the baked resolved geometry (vector path/fills/stroke, or a frame's
 /// background fill) onto the node.
-fn apply_derived_geometry(data: &mut NodeData, d: &crate::node::DerivedOverride) {
+fn apply_derived_geometry(data: &mut NodeData, d: &crate::node::DerivedOverride, edited: bool) {
     match data {
         NodeData::Vector(v) => {
             // Resolved fill geometry replaces the master path outright.
@@ -359,8 +517,9 @@ fn apply_derived_geometry(data: &mut NodeData, d: &crate::node::DerivedOverride)
             }
             // Baked per-instance fills, when present (uncommon — theme fills
             // usually flow through variable/mode resolution, not the baked
-            // entry).
-            if let Some(fills) = &d.fills {
+            // entry). Skipped once the master is edited so a master fill change
+            // reaches the instance instead of being overwritten by the snapshot.
+            if !edited && let Some(fills) = &d.fills {
                 v.fills = fills.clone();
             }
             // Resolved stroke weight updates the first stroke's width.
@@ -374,7 +533,7 @@ fn apply_derived_geometry(data: &mut NodeData, d: &crate::node::DerivedOverride)
         // fill on a frame lands there (a frame's resolved theme background is
         // the literal "white header" bug when this arm is missing).
         NodeData::Group(g) => {
-            if let Some(fills) = &d.fills {
+            if !edited && let Some(fills) = &d.fills {
                 g.background = fills.first().cloned();
             }
         }

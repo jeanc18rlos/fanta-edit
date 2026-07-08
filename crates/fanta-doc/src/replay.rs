@@ -212,6 +212,7 @@ mod tests {
             corner_radius: None,
             corner_radii: None,
             corner_smoothing: 0.0,
+            local_size: None,
         }));
         rect.parent = Some(frame);
         rect.transform = Transform2D::translation(x, y);

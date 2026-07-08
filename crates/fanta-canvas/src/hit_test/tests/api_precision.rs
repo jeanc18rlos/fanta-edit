@@ -110,6 +110,7 @@ fn bounds_precision_catches_inside_aabb_only_holes() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     };
     let mut doc = Doc::new();
     let n = CanvasNode::new(NodeData::Vector(v));

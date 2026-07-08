@@ -69,12 +69,11 @@ pub(crate) fn expand_instance_memoized(
     instance_id: NodeId,
     inst: &InstanceNode,
 ) -> Arc<Vec<ExpandedNode>> {
-    let rev = ctx
-        .inputs
-        .components
-        .def(inst.component)
-        .map(|d| d.rev)
-        .unwrap_or(0);
+    // The RESOLVED master's rev (a variant instance's `component` is the *set*
+    // id, which is not itself a def — `def(set)` is `None` and would wrongly
+    // report rev 0, never invalidating on a member edit). `> 0` also means the
+    // master was edited, which drives the live-solve decision below.
+    let rev = fanta_doc::resolved_component_rev(ctx.inputs.components, inst);
     let key = InstanceCacheKey {
         instance: instance_id,
         rev,
@@ -85,9 +84,12 @@ pub(crate) fn expand_instance_memoized(
         return Arc::clone(cached);
     }
     let mut expanded = expand_instance(ctx.scene, ctx.inputs.components, inst);
-    // Figma's `derivedSymbolData` is already a resolved per-instance subtree.
-    // Re-solving those clones moves icons/carets/text away from the baked
-    // geometry; only masters without derived data need our layout pass.
+    // Figma's `derivedSymbolData` is already a resolved per-instance subtree, so
+    // re-solving those clones moves icons/carets/text away from the baked
+    // geometry — only masters without derived data need our layout pass. An
+    // EDITED master keeps its baked geometry (only the fill falls through to the
+    // master), so we must NOT re-solve it — doing so would resize its vectors to
+    // the master box and distort them.
     if inst.derived.is_empty() {
         fanta_doc::solve_expanded(&mut expanded, &mut measure_text_node);
     }

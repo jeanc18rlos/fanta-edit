@@ -440,3 +440,98 @@ fn instance_master_root_outside_stroke_escapes_the_instance_box() {
         "interior must stay the master's white fill, got {interior:?}"
     );
 }
+
+/// Registering the master in `doc.components` (not a side library) so a
+/// `doc.apply` bumps its rev exactly like the app: build a red 20×20 master
+/// parked off-screen and register it, returning `(component id, root id)`.
+#[cfg(test)]
+fn registered_rect_master(doc: &mut Doc, color: Color) -> (ComponentId, NodeId) {
+    let mut master = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0, 0.0, 20.0, 20.0, color,
+    )));
+    master.transform = Transform2D::translation(10_000.0, 0.0);
+    let root = master.id;
+    doc.apply(Operation::create_node(master)).unwrap();
+    let comp = ComponentId::new();
+    doc.components
+        .defs
+        .insert(comp, ComponentDef::new(comp, root, "Rect"));
+    (comp, root)
+}
+
+/// Recolor the master rect through `doc.apply` (which bumps the owning def's
+/// rev via `bump_revs`, exactly as an inspector edit does).
+#[cfg(test)]
+fn recolor_master(doc: &mut Doc, root: NodeId, color: Color) {
+    let old = doc.scene.get(root).unwrap().data.clone();
+    let mut new = old.clone();
+    if let NodeData::Vector(v) = &mut new {
+        v.fills = smallvec::smallvec![fanta_doc::Fill::solid(color)];
+    }
+    doc.apply(fanta_doc::Operation::ReplaceData {
+        id: root,
+        old: Box::new(old),
+        new: Box::new(new),
+    })
+    .unwrap();
+}
+
+/// Editing a component master must repaint its (plain, no-derived) instance —
+/// the render must re-expand from the edited master, not serve a stale memo.
+#[test]
+fn editing_a_master_repaints_a_plain_instance() {
+    let mut doc = Doc::new();
+    let (comp, root) = registered_rect_master(&mut doc, Color::rgb(255, 0, 0));
+    let mut inst = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: comp,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [20.0, 20.0],
+    }));
+    inst.transform = Transform2D::translation(-10.0, -10.0);
+    doc.apply(Operation::create_node(inst)).unwrap();
+
+    let registry = VariableRegistry::new();
+    let modes = BTreeMap::new();
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+
+    // Frame 1: the instance paints the master's RED.
+    r.render_with(
+        &doc.scene,
+        &doc.viewport,
+        &RenderInputs {
+            components: &doc.components,
+            variables: &registry,
+            active_modes: &modes,
+            mode_generation: 0,
+            playback: None,
+            dark_ui: false,
+        },
+    );
+    let before = rgba_at(&r.copy_rgba(), 64, 32, 32);
+    assert!(
+        before[0] > 200 && before[1] < 40 && before[2] < 40,
+        "instance starts red (the master's fill), got {before:?}"
+    );
+
+    // Edit the master → BLUE, then re-render the SAME renderer.
+    recolor_master(&mut doc, root, Color::rgb(0, 0, 255));
+    r.render_with(
+        &doc.scene,
+        &doc.viewport,
+        &RenderInputs {
+            components: &doc.components,
+            variables: &registry,
+            active_modes: &modes,
+            mode_generation: 0,
+            playback: None,
+            dark_ui: false,
+        },
+    );
+    let after = rgba_at(&r.copy_rgba(), 64, 32, 32);
+    assert!(
+        after[2] > 200 && after[0] < 40 && after[1] < 40,
+        "editing the master must repaint the instance blue, got {after:?}"
+    );
+}

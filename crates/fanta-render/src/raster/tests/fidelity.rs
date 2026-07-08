@@ -354,6 +354,7 @@ fn mixed_subpath_rules_fill_each_group_by_its_own_rule() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(node)).unwrap();

@@ -27,5 +27,8 @@
 mod instance;
 mod variables;
 
-pub use instance::{ExpandedNode, def_local_path, expand_instance};
+pub use instance::{
+    ExpandedNode, backfill_vector_viewports, def_local_path, expand_instance,
+    resolved_component_rev, strip_redundant_instance_overrides,
+};
 pub use variables::{resolve_bound_value, resolve_effective_mode};

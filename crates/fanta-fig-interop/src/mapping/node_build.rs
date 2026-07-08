@@ -8,7 +8,7 @@ use super::{
     build_vector, corner_radii, corner_smoothing, first_fill, group_with_optional_clip, guid_key,
     has_independent_corners, make_shape, read_auto_layout, read_blurs, read_color_with_opacity,
     read_effects, read_fills, read_layout_child, read_mask, read_paint, read_size, read_transform,
-    text_case_of,
+    text_case_of, viewport,
 };
 
 /// The outcome of trying to turn a Figma node change into a Fantaisa node.
@@ -154,6 +154,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
                 corner_radius: None,
                 corner_radii: None,
                 corner_smoothing: 0.0,
+                local_size: viewport(size),
             })
         }
         // VECTOR-family geometry. STEP 2: decode the real path from the node's

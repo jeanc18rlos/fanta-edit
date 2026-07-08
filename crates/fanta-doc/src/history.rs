@@ -155,17 +155,24 @@ impl History {
     /// Open a transaction. If one is already open, it is committed first so
     /// that the caller's intent ("a new gesture starts here") is honored
     /// without dropping in-flight work.
-    pub fn begin(&mut self, label: impl Into<String>, scene: &mut Scene) -> Result<(), SceneError> {
+    ///
+    /// Infallible: `begin`/`commit` are transaction *markers*, they never
+    /// replay ops against the scene. `scene` is threaded through only to keep
+    /// the call-site signature stable for tools/app. Returning `Result` here
+    /// used to invite `let _ = history.begin(..)` at the call sites, which is
+    /// indistinguishable from discarding a real error.
+    pub fn begin(&mut self, label: impl Into<String>, scene: &mut Scene) {
         if self.open.is_some() {
-            self.commit(scene)?;
+            self.commit(scene);
         }
         self.open = Some(Transaction::new(label));
-        Ok(())
     }
 
     /// Commit the open transaction. No-op if no transaction is open. Empty
     /// transactions (begin-with-no-ops) are silently discarded.
-    pub fn commit(&mut self, _scene: &mut Scene) -> Result<(), SceneError> {
+    ///
+    /// Infallible, for the same reason as [`begin`](Self::begin).
+    pub fn commit(&mut self, _scene: &mut Scene) {
         if let Some(tx) = self.open.take() {
             if !tx.is_empty() {
                 self.emit(JournalEvent::Commit(tx.clone()));
@@ -173,7 +180,6 @@ impl History {
                 self.redo.clear();
             }
         }
-        Ok(())
     }
 
     /// Discard the open transaction, reverting any ops it has already applied
@@ -237,7 +243,7 @@ impl History {
         ctx: &mut OpCtx,
     ) -> Result<(), SceneError> {
         if self.open.is_some() {
-            self.commit(ctx.scene)?;
+            self.commit(ctx.scene);
         }
         if tx.is_empty() {
             return Ok(());
@@ -259,7 +265,7 @@ impl History {
             // Implicit commit; "undo while dragging" is a hard UX call. We
             // commit the partial gesture and then undo it, which feels least
             // surprising. `commit` only needs the scene.
-            self.commit(ctx.scene)?;
+            self.commit(ctx.scene);
         }
         let Some(mut tx) = self.undo.pop() else {
             return Ok(false);
@@ -380,7 +386,7 @@ mod tests {
 
         // `begin`/`commit` stay scene-only — proves those signatures are
         // unchanged for the tool/app call sites.
-        history.begin("Drag", &mut td.scene).unwrap();
+        history.begin("Drag", &mut td.scene);
         history
             .apply(
                 Operation::SetTransform {
@@ -401,7 +407,7 @@ mod tests {
                 &mut td.ctx(),
             )
             .unwrap();
-        history.commit(&mut td.scene).unwrap();
+        history.commit(&mut td.scene);
 
         assert_eq!(history.undo_depth(), 1);
         history.undo(&mut td.ctx()).unwrap();
@@ -416,7 +422,7 @@ mod tests {
         let id = node.id;
         td.scene.insert(node).unwrap();
 
-        history.begin("Drag", &mut td.scene).unwrap();
+        history.begin("Drag", &mut td.scene);
         history
             .apply(
                 Operation::SetTransform {

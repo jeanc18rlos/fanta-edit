@@ -68,6 +68,7 @@ pub(crate) fn make_shape(
         corner_radius,
         corner_radii,
         corner_smoothing: corner_smoothing(change),
+        local_size: viewport(size),
     }
 }
 
@@ -96,6 +97,7 @@ pub(crate) fn make_rect(
         corner_radius,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: viewport(size),
     }
 }
 
@@ -206,6 +208,15 @@ pub(crate) fn guid_key(guid: &KiwiValue) -> Option<String> {
     let session = guid.get("sessionID").and_then(KiwiValue::as_f64)? as u64;
     let local = guid.get("localID").and_then(KiwiValue::as_f64)? as u64;
     Some(format!("{session}:{local}"))
+}
+
+/// A vector's SVG-style viewport box for [`VectorNode::local_size`]: the node's
+/// declared `size`, used at render time to clip geometry that spills past the box
+/// (chiefly a stroke thickened beyond the authored size). `None` for a degenerate
+/// (zero width or height) box — a LINE reports one, and clipping to it would erase
+/// the whole stroke outline.
+pub(crate) fn viewport(size: (f64, f64)) -> Option<[f64; 2]> {
+    (size.0 > 0.0 && size.1 > 0.0).then_some([size.0, size.1])
 }
 
 /// Read the `size` (a Figma `Vector {x, y}`), defaulting to a 1x1 box.

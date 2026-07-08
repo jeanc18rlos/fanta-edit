@@ -27,6 +27,7 @@ fn stroked_rect_doc(align: fanta_doc::StrokeAlign) -> Doc {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     doc
@@ -113,6 +114,7 @@ fn per_side_border_draws_only_the_weighted_edges() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -167,6 +169,7 @@ fn per_side_border_respects_corner_radius() {
         corner_radius: Some(20.0),
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -218,6 +221,7 @@ fn per_side_border_on_square_box_keeps_hard_corner() {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
 
@@ -253,6 +257,7 @@ fn thick_inside_stroke_keeps_the_rounded_outer_corner() {
         corner_radius: Some(4.0),
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     }));
     doc.apply(Operation::create_node(n)).unwrap();
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -279,5 +284,77 @@ fn thick_inside_stroke_keeps_the_rounded_outer_corner() {
     assert!(
         centre[1] > 180 && centre[2] < 40,
         "interior must stay the green fill, got {centre:?}"
+    );
+}
+
+/// A 20×20 rect authored at the LOCAL origin `[0,0]` (so a `[0,0,w,h]` viewport
+/// clip aligns with it) with a wide centered stroke that spills 8px past every
+/// edge. `local_size` sets the SVG viewport used to clip that overflow.
+///
+/// Geometry (64×64, origin-centred viewport, zoom 1): world (x,y) → screen
+/// (x+32, y+32). The rect spans world (0,0)..(20,20) → screen (32,32)..(52,52).
+/// The width-16 centered stroke reaches world (−8,−8)..(28,28) → screen
+/// (24,24)..(60,60), so screen x = 56 lands under the outer stroke, 4px past the
+/// box's right edge (screen x = 52).
+fn viewport_stroked_rect_doc(local_size: Option<[f64; 2]>) -> Doc {
+    let mut strokes = smallvec::SmallVec::new();
+    strokes.push(fanta_doc::Stroke::solid(Color::rgb(0, 0, 255), 16.0));
+    let mut doc = Doc::new();
+    let n = CanvasNode::new(NodeData::Vector(VectorNode {
+        path: fanta_doc::PathData::rect(0.0, 0.0, 20.0, 20.0),
+        fills: smallvec_of(Fill::solid(Color::rgb(0, 200, 0))),
+        strokes,
+        corner_radius: None,
+        corner_radii: None,
+        corner_smoothing: 0.0,
+        local_size,
+    }));
+    doc.apply(Operation::create_node(n)).unwrap();
+    doc
+}
+
+#[test]
+fn without_a_viewport_a_thick_stroke_bleeds_past_the_box() {
+    // Baseline: no `local_size` → no clip → the centered stroke's outer half
+    // paints beyond the box edge, exactly the overflow the viewport must crop.
+    let doc = viewport_stroked_rect_doc(None);
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let buf = r.copy_rgba();
+    // Screen (56, 42): 4px past the right edge, under the outer stroke → blue.
+    let outside = rgba_at(&buf, 64, 56, 42);
+    assert!(
+        outside[2] > 200 && outside[3] > 200,
+        "without a viewport the thick stroke should bleed past the box, got {outside:?}"
+    );
+}
+
+#[test]
+fn a_viewport_clips_a_stroke_thickened_past_the_box() {
+    // With `local_size = [20,20]` the vector is clipped to its authored box, so
+    // the same over-thick stroke is cropped at the edge (SVG viewport
+    // semantics) — while content INSIDE the box is untouched.
+    let doc = viewport_stroked_rect_doc(Some([20.0, 20.0]));
+    let mut r = RasterRenderer::new(64, 64).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let buf = r.copy_rgba();
+    // Same pixel as the baseline, now OUTSIDE the viewport → cropped away.
+    let outside = rgba_at(&buf, 64, 56, 42);
+    assert!(
+        outside[3] < 40,
+        "a viewport must crop the stroke past the box edge, got {outside:?}"
+    );
+    // The stroke's inner half, just inside the right edge (screen x = 50 < 52),
+    // stays painted — the clip only removes what spills past the box.
+    let inside_band = rgba_at(&buf, 64, 50, 42);
+    assert!(
+        inside_band[2] > 200 && inside_band[3] > 200,
+        "the viewport must keep the stroke inside the box, got {inside_band:?}"
+    );
+    // Interior fill (screen (42,42) → world (10,10)) is well inside the box.
+    let interior = rgba_at(&buf, 64, 42, 42);
+    assert!(
+        interior[1] > 180 && interior[2] < 40,
+        "the viewport must leave the interior fill green, got {interior:?}"
     );
 }

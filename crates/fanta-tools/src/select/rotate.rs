@@ -97,7 +97,7 @@ impl SelectTool {
         if new == state.original_transform {
             return;
         }
-        let _ = ctx.doc.history.begin("Rotate", &mut ctx.doc.scene);
+        ctx.doc.history.begin("Rotate", &mut ctx.doc.scene);
         if let Some(n) = ctx.doc.scene.get_mut(state.node_id) {
             n.transform = state.original_transform;
         }
@@ -108,9 +108,7 @@ impl SelectTool {
         }) {
             tracing::warn!(target: "fanta-tools.select", "rotate commit op failed: {e}");
         }
-        if let Err(e) = ctx.doc.history.commit(&mut ctx.doc.scene) {
-            tracing::warn!(target: "fanta-tools.select", "commit rotate failed: {e}");
-        }
+        ctx.doc.history.commit(&mut ctx.doc.scene);
     }
 
     /// Abort a rotation with no transaction: restore the node's press-time

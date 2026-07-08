@@ -153,7 +153,7 @@ impl SelectTool {
         if new == state.original_transform && !data_changed {
             return;
         }
-        let _ = ctx.doc.history.begin("Resize", &mut ctx.doc.scene);
+        ctx.doc.history.begin("Resize", &mut ctx.doc.scene);
         // Reset both transform and data to their press-time values so the ops'
         // `apply` drives them back to `new` through the history chokepoint.
         if let Some(n) = ctx.doc.scene.get_mut(state.node_id) {
@@ -180,9 +180,7 @@ impl SelectTool {
                 tracing::warn!(target: "fanta-tools.select", "resize data op failed: {e}");
             }
         }
-        if let Err(e) = ctx.doc.history.commit(&mut ctx.doc.scene) {
-            tracing::warn!(target: "fanta-tools.select", "commit resize failed: {e}");
-        }
+        ctx.doc.history.commit(&mut ctx.doc.scene);
     }
 
     /// Abort a resize with no transaction: restore the node's press-time

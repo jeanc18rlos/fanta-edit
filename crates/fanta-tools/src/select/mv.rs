@@ -257,7 +257,7 @@ impl SelectTool {
     /// through history). Nodes whose final equals their original contribute no
     /// op, so a zero-distance drag commits an empty (discarded) transaction.
     pub(super) fn commit_move(&self, ctx: &mut ToolContext, sel: &MovingSelection) {
-        let _ = ctx.doc.history.begin("Move", &mut ctx.doc.scene);
+        ctx.doc.history.begin("Move", &mut ctx.doc.scene);
         for &(id, old) in sel.moving.iter() {
             let Some(new) = ctx.doc.scene.get(id).map(|n| n.transform) else {
                 continue;
@@ -285,9 +285,7 @@ impl SelectTool {
         for &(id, _) in sel.moving.iter() {
             Self::reparent_on_drop(ctx, id);
         }
-        if let Err(e) = ctx.doc.history.commit(&mut ctx.doc.scene) {
-            tracing::warn!(target: "fanta-tools.select", "commit move failed: {e}");
-        }
+        ctx.doc.history.commit(&mut ctx.doc.scene);
     }
 
     /// Abort a move with no transaction: restore each node's press-time

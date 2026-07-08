@@ -872,6 +872,7 @@ mod tests {
             corner_radius: None,
             corner_radii: None,
             corner_smoothing: 0.0,
+            local_size: None,
         }));
         let id = node.id;
         doc.apply(Operation::create_node(node)).expect("create");
@@ -1192,6 +1193,7 @@ mod tests {
             corner_radius: None,
             corner_radii: None,
             corner_smoothing: 0.0,
+            local_size: None,
         }));
         let id = node.id;
         doc.apply(Operation::create_node(node)).expect("create");
@@ -1223,6 +1225,7 @@ mod tests {
             corner_radius: None,
             corner_radii: None,
             corner_smoothing: 0.0,
+            local_size: None,
         }));
         let id = node.id;
         doc.apply(Operation::create_node(node)).expect("create");

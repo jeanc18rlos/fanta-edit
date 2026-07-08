@@ -42,6 +42,7 @@ fn diamond_doc(half: f64) -> Doc {
         corner_radius: None,
         corner_radii: None,
         corner_smoothing: 0.0,
+        local_size: None,
     };
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(CanvasNode::new(NodeData::Vector(
