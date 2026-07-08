@@ -72,4 +72,40 @@ pub use generic::GenericFamily;
 pub use resolver::FontResolver;
 pub use substitute::{ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RATIO};
 
+/// Pre-download (to the on-disk cache) every family a document uses that isn't
+/// bundled or covered by a proprietary→open substitute, WITHOUT constructing a
+/// Skia resolver — so it is `Send` and safe to run on a background thread at
+/// document open. The render-thread resolver then finds each font already
+/// cached (a process-memo / disk hit) and never stalls a paint on a network
+/// fetch (the fetch is otherwise triggered lazily on first shape, up to a
+/// multi-second timeout).
+///
+/// Returns the families actually fetched this call, deduped. Offline-safe and
+/// idempotent: a family that can't be downloaded — or has no network — is
+/// skipped, and repeat calls are memoized.
+pub fn prewarm_font_downloads<'a>(families: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut fetched: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for family in families {
+        let family = family.trim();
+        if family.is_empty() || seen.iter().any(|s| s.eq_ignore_ascii_case(family)) {
+            continue;
+        }
+        seen.push(family.to_string());
+        // Bundled (vendored glyph data) and proprietary→open substitutes never
+        // need a download — mirrors `FontResolver::prewarm`'s skip logic.
+        if bundled::BUNDLED
+            .iter()
+            .any(|b| b.name.eq_ignore_ascii_case(family))
+            || substitute::proprietary_substitute(family).is_some()
+        {
+            continue;
+        }
+        if download::fetch_google_font(family).is_some() {
+            fetched.push(family.to_string());
+        }
+    }
+    fetched
+}
+
 pub(crate) use resolver::font_style;

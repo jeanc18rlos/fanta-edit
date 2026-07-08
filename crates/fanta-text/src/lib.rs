@@ -60,7 +60,7 @@ pub use caret::{Caret, Selection};
 pub use font_resolver::{
     ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RATIO, FontResolver, GenericFamily,
     INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY,
-    bundled_family_names, bundled_preview_bytes,
+    bundled_family_names, bundled_preview_bytes, prewarm_font_downloads,
 };
 pub use layout::{LayoutEngine, LayoutOptions, LineMetrics, TextLayout};
 pub use style::{FontWeight, TextStyle};
