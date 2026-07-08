@@ -40,13 +40,18 @@ pub mod ink;
 pub mod line;
 pub mod node_edit;
 pub mod node_math;
+pub mod path_select;
 pub mod pen;
 pub mod pencil;
 pub mod polygon;
 pub mod rect;
+pub mod scale;
+pub mod section;
 pub mod select;
+pub mod slice;
 pub mod star;
 pub mod text;
+pub mod text_path;
 pub mod tool;
 
 // Flat re-exports for ergonomic call sites in `fanta-app`.
@@ -57,13 +62,18 @@ pub use frame::FrameTool;
 pub use hand::HandTool;
 pub use line::LineTool;
 pub use node_edit::NodeEditTool;
+pub use path_select::PathSelectTool;
 pub use pen::PenTool;
 pub use pencil::PencilTool;
 pub use polygon::PolygonTool;
 pub use rect::RectTool;
+pub use scale::ScaleTool;
+pub use section::SectionTool;
 pub use select::SelectTool;
+pub use slice::SliceTool;
 pub use star::StarTool;
 pub use text::TextTool;
+pub use text_path::TextPathTool;
 pub use tool::{
     CursorHint, MovingSelection, SnapGuide, SnapGuideAxis, Tool, ToolOverlay, ToolResponse,
     bounds_from_corners,
