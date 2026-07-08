@@ -65,15 +65,6 @@ actions!(
     ]
 );
 
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<FantaPropertiesPanel>(window, cx);
-        });
-    })
-    .detach();
-}
-
 const NO_DOCUMENT_MESSAGE: &str = "Open a Figma document to inspect properties";
 const MIXED_VALUE: &str = "–";
 const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217);
@@ -882,6 +873,15 @@ impl FantaPropertiesPanel {
         })
     }
 
+    pub(crate) fn new_embedded(
+        active_view: Entity<FigView>,
+        fs: Arc<dyn Fs>,
+        window: &mut Window,
+        cx: &mut Context<FigView>,
+    ) -> Entity<Self> {
+        cx.new(|cx| Self::build(fs, Some(active_view), window, cx, Vec::new()))
+    }
+
     fn new(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -905,37 +905,47 @@ impl FantaPropertiesPanel {
                     }
                 },
             );
-            let field_editor = cx.new(|cx| Editor::single_line(window, cx));
-            let editor_subscription = cx.subscribe_in(
-                &field_editor,
-                window,
-                |this: &mut Self, _, event: &EditorEvent, _window, cx| {
-                    if matches!(event, EditorEvent::Blurred) && this.editing_field.is_some() {
-                        this.stop_editing(cx);
-                    }
-                },
-            );
-            let mut this = Self {
-                focus_handle: cx.focus_handle(),
-                fs,
-                active_view: None,
-                width: None,
-                field_editor,
-                editing_field: None,
-                content_scroll: ScrollHandle::new(),
-                corner_radii_expanded: None,
-                scrub: None,
-                slider_tracks: [None; SLIDER_TRACK_COUNT],
-                hidden_paint_alpha: HashMap::new(),
-                picker: None,
-                gradient_editor: None,
-                swatch_press_dismissed: false,
-                _subscriptions: vec![workspace_subscription, editor_subscription],
-                _active_view_subscription: None,
-            };
-            this.set_active_view(initial_view, cx);
-            this
+            Self::build(fs, initial_view, window, cx, vec![workspace_subscription])
         })
+    }
+
+    fn build(
+        fs: Arc<dyn Fs>,
+        initial_view: Option<Entity<FigView>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        mut subscriptions: Vec<Subscription>,
+    ) -> Self {
+        let field_editor = cx.new(|cx| Editor::single_line(window, cx));
+        subscriptions.push(cx.subscribe_in(
+            &field_editor,
+            window,
+            |this: &mut Self, _, event: &EditorEvent, _window, cx| {
+                if matches!(event, EditorEvent::Blurred) && this.editing_field.is_some() {
+                    this.stop_editing(cx);
+                }
+            },
+        ));
+        let mut this = Self {
+            focus_handle: cx.focus_handle(),
+            fs,
+            active_view: None,
+            width: None,
+            field_editor,
+            editing_field: None,
+            content_scroll: ScrollHandle::new(),
+            corner_radii_expanded: None,
+            scrub: None,
+            slider_tracks: [None; SLIDER_TRACK_COUNT],
+            hidden_paint_alpha: HashMap::new(),
+            picker: None,
+            gradient_editor: None,
+            swatch_press_dismissed: false,
+            _subscriptions: subscriptions,
+            _active_view_subscription: None,
+        };
+        this.set_active_view(initial_view, cx);
+        this
     }
 
     fn update_active_view(

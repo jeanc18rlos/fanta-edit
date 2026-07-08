@@ -829,6 +829,10 @@ pub struct PanelSettingsContent {
     ///
     /// Default: true
     pub button: Option<bool>,
+    /// Whether to show the panel by default when it is embedded in a custom surface.
+    ///
+    /// Default: true
+    pub visible: Option<bool>,
     /// Where to dock the panel.
     ///
     /// Default: right (Agentic layout), left (Classic layout)

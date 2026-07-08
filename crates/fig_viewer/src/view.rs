@@ -13,14 +13,14 @@ use file_icons::FileIcons;
 use glam::DVec2;
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, UTF16Selection,
-    Window, actions, canvas, div, fill, point, px, size,
+    DragMoveEvent, ElementInputHandler, Empty, Entity, EntityInputHandler, EventEmitter,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
+    Subscription, Task, UTF16Selection, Window, actions, canvas, div, fill, point, px, size,
 };
 use language::Capability;
 use project::Project;
-use settings::Settings as _;
+use settings::{Settings as _, update_settings_file};
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
 use util::paths::PathExt;
 use workspace::{
@@ -29,7 +29,10 @@ use workspace::{
 };
 
 use crate::canvas::{CanvasElement, RenderedCanvas, bounds_size, screen_position_in_bounds};
+use crate::design_panel::FantaDesignPanel;
 use crate::document::{DocChange, FigItem, FigItemEvent};
+use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
+use crate::properties_panel::FantaPropertiesPanel;
 use crate::text_edit::{self, CARET_BLINK_INTERVAL, CanvasTextEdit, TextEditSession};
 use crate::tools::{
     TOOLBAR_GROUPS, ToolKind, ToolShell, key_event, move_event, pointer_button, press_event,
@@ -102,6 +105,10 @@ actions!(
         ActivatePathSelectTool,
         /// Activate the text-on-path tool (placeholder).
         ActivateTextPathTool,
+        /// Show or hide the embedded layers sidebar.
+        ToggleLayersSidebar,
+        /// Show or hide the embedded inspector sidebar.
+        ToggleInspectorSidebar,
     ]
 );
 
@@ -134,11 +141,38 @@ pub(crate) const MAX_ZOOM: f32 = 20.0;
 const ZOOM_STEP: f32 = 1.1;
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 pub(crate) const RENDER_PADDING: f64 = 48.0;
+const MIN_LAYERS_SIDEBAR_WIDTH: f32 = 220.0;
+const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 = 260.0;
+const MAX_SIDEBAR_WIDTH: f32 = 560.0;
+const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarKind {
+    Layers,
+    Inspector,
+}
+
+#[derive(Clone)]
+struct SidebarResizeDrag {
+    sidebar: SidebarKind,
+}
+
+impl Render for SidebarResizeDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
 
 pub struct FigView {
     item: Entity<FigItem>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
+    layers_sidebar: Entity<FantaDesignPanel>,
+    inspector_sidebar: Entity<FantaPropertiesPanel>,
+    layers_sidebar_visible: bool,
+    inspector_sidebar_visible: bool,
+    layers_sidebar_width: Pixels,
+    inspector_sidebar_width: Pixels,
     selected_page_index: Option<usize>,
     /// Root node of the explicitly selected page, used to re-resolve
     /// `selected_page_index` when a disk reload reorders or removes pages.
@@ -189,14 +223,35 @@ impl FigView {
     fn new(
         item: Entity<FigItem>,
         project: Entity<Project>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let item_subscription = Self::subscribe_to_item(&item, cx);
+        let (layers_sidebar_visible, layers_sidebar_width) = {
+            let settings = FantaDesignPanelSettings::get_global(cx);
+            (
+                settings.visible,
+                clamp_sidebar_width(settings.default_width, SidebarKind::Layers),
+            )
+        };
+        let (inspector_sidebar_visible, inspector_sidebar_width) = {
+            let settings = FantaPropertiesPanelSettings::get_global(cx);
+            (
+                settings.visible,
+                clamp_sidebar_width(settings.default_width, SidebarKind::Inspector),
+            )
+        };
+        let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
         Self {
             item,
             project,
             focus_handle: cx.focus_handle(),
+            layers_sidebar,
+            inspector_sidebar,
+            layers_sidebar_visible,
+            inspector_sidebar_visible,
+            layers_sidebar_width,
+            inspector_sidebar_width,
             selected_page_index: None,
             selected_page_root: None,
             viewport: None,
@@ -270,6 +325,19 @@ impl FigView {
             }
             cx.notify();
         })
+    }
+
+    fn new_embedded_sidebars(
+        project: &Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<FantaDesignPanel>, Entity<FantaPropertiesPanel>) {
+        let fs = project.read(cx).fs().clone();
+        let view = cx.entity();
+        (
+            FantaDesignPanel::new_embedded(view.clone(), fs.clone(), window, cx),
+            FantaPropertiesPanel::new_embedded(view, fs, window, cx),
+        )
     }
 
     pub fn item(&self) -> &Entity<FigItem> {
@@ -1683,6 +1751,123 @@ impl FigView {
         self.item.update(cx, |item, cx| item.save(cx))
     }
 
+    fn toggle_layers_sidebar(
+        &mut self,
+        _: &ToggleLayersSidebar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.layers_sidebar_visible = !self.layers_sidebar_visible;
+        self.persist_sidebar_layout(cx);
+        cx.notify();
+    }
+
+    fn toggle_inspector_sidebar(
+        &mut self,
+        _: &ToggleInspectorSidebar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inspector_sidebar_visible = !self.inspector_sidebar_visible;
+        self.persist_sidebar_layout(cx);
+        cx.notify();
+    }
+
+    fn persist_sidebar_layout(&self, cx: &mut Context<Self>) {
+        let fs = self.project.read(cx).fs().clone();
+        let layers_sidebar_visible = self.layers_sidebar_visible;
+        let inspector_sidebar_visible = self.inspector_sidebar_visible;
+        let layers_sidebar_width = self.layers_sidebar_width.as_f32();
+        let inspector_sidebar_width = self.inspector_sidebar_width.as_f32();
+        update_settings_file(fs, cx, move |settings, _| {
+            let design_panel = settings.fanta_design_panel.get_or_insert_default();
+            design_panel.visible = Some(layers_sidebar_visible);
+            design_panel.default_width = Some(layers_sidebar_width);
+
+            let properties_panel = settings.fanta_properties_panel.get_or_insert_default();
+            properties_panel.visible = Some(inspector_sidebar_visible);
+            properties_panel.default_width = Some(inspector_sidebar_width);
+        });
+    }
+
+    fn handle_sidebar_resize_drag(
+        &mut self,
+        event: &DragMoveEvent<SidebarResizeDrag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = event.drag(cx);
+        let pointer_x = event.event.position.x.as_f32();
+        let bounds_left = event.bounds.origin.x.as_f32();
+        let bounds_right = bounds_left + event.bounds.size.width.as_f32();
+        match drag.sidebar {
+            SidebarKind::Layers => {
+                self.layers_sidebar_width =
+                    clamp_sidebar_width(px(pointer_x - bounds_left), SidebarKind::Layers);
+            }
+            SidebarKind::Inspector => {
+                self.inspector_sidebar_width =
+                    clamp_sidebar_width(px(bounds_right - pointer_x), SidebarKind::Inspector);
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_layers_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("fanta-layers-sidebar")
+            .relative()
+            .h_full()
+            .w(self.layers_sidebar_width)
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(cx.theme().colors().border)
+            .child(self.layers_sidebar.clone())
+            .child(self.render_sidebar_resize_handle(SidebarKind::Layers))
+            .into_any_element()
+    }
+
+    fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("fanta-inspector-sidebar")
+            .relative()
+            .h_full()
+            .w(self.inspector_sidebar_width)
+            .flex_shrink_0()
+            .border_l_1()
+            .border_color(cx.theme().colors().border)
+            .child(self.inspector_sidebar.clone())
+            .child(self.render_sidebar_resize_handle(SidebarKind::Inspector))
+            .into_any_element()
+    }
+
+    fn render_sidebar_resize_handle(&self, sidebar: SidebarKind) -> AnyElement {
+        div()
+            .id(match sidebar {
+                SidebarKind::Layers => "fanta-layers-sidebar-resize-handle",
+                SidebarKind::Inspector => "fanta-inspector-sidebar-resize-handle",
+            })
+            .absolute()
+            .top(px(0.))
+            .when(sidebar == SidebarKind::Layers, |this| {
+                this.right(-SIDEBAR_RESIZE_HANDLE_SIZE / 2.)
+            })
+            .when(sidebar == SidebarKind::Inspector, |this| {
+                this.left(-SIDEBAR_RESIZE_HANDLE_SIZE / 2.)
+            })
+            .h_full()
+            .w(SIDEBAR_RESIZE_HANDLE_SIZE)
+            .cursor_col_resize()
+            .on_drag(SidebarResizeDrag { sidebar }, |drag, _, _, cx| {
+                cx.new(|_| drag.clone())
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .occlude()
+            .into_any_element()
+    }
+
     fn render_tool_pill(&self, cx: &mut Context<Self>) -> AnyElement {
         let editable = self.is_editable(cx);
         let active = self.tools.kind();
@@ -1847,6 +2032,57 @@ impl FigView {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.zoom_in(&ZoomIn, window, cx);
                             })),
+                    )
+                    .child(div().h(px(20.)).child(Divider::vertical()))
+                    .child(
+                        IconButton::new(
+                            "fig-toggle-layers-sidebar",
+                            if self.layers_sidebar_visible {
+                                IconName::ThreadsSidebarLeftOpen
+                            } else {
+                                IconName::ThreadsSidebarLeftClosed
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.layers_sidebar_visible)
+                        .icon_color(if self.layers_sidebar_visible {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        })
+                        .tooltip(Tooltip::text(if self.layers_sidebar_visible {
+                            "Hide Layers"
+                        } else {
+                            "Show Layers"
+                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx);
+                        })),
+                    )
+                    .child(
+                        IconButton::new(
+                            "fig-toggle-inspector-sidebar",
+                            if self.inspector_sidebar_visible {
+                                IconName::ThreadsSidebarRightOpen
+                            } else {
+                                IconName::ThreadsSidebarRightClosed
+                            },
+                        )
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.inspector_sidebar_visible)
+                        .icon_color(if self.inspector_sidebar_visible {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        })
+                        .tooltip(Tooltip::text(if self.inspector_sidebar_visible {
+                            "Hide Inspector"
+                        } else {
+                            "Show Inspector"
+                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
+                        })),
                     ),
             )
             .into_any_element()
@@ -1856,6 +2092,14 @@ impl FigView {
 struct FigViewSnapshot {
     loading_message: Option<SharedString>,
     error: Option<std::sync::Arc<anyhow::Error>>,
+}
+
+fn clamp_sidebar_width(width: Pixels, sidebar: SidebarKind) -> Pixels {
+    let minimum = match sidebar {
+        SidebarKind::Layers => MIN_LAYERS_SIDEBAR_WIDTH,
+        SidebarKind::Inspector => MIN_INSPECTOR_SIDEBAR_WIDTH,
+    };
+    px(width.as_f32().clamp(minimum, MAX_SIDEBAR_WIDTH))
 }
 
 impl Render for FigView {
@@ -1983,6 +2227,12 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivateTextPathTool, _, cx| {
                 this.activate_tool(ToolKind::TextPath, cx)
             }))
+            .on_action(cx.listener(Self::toggle_layers_sidebar))
+            .on_action(cx.listener(Self::toggle_inspector_sidebar))
+            .on_drag_move::<SidebarResizeDrag>(cx.listener(Self::handle_sidebar_resize_drag))
+            .on_drop(cx.listener(|this, _: &SidebarResizeDrag, _, cx| {
+                this.persist_sidebar_layout(cx);
+            }))
             .size_full()
             .relative()
             .bg(cx.theme().colors().editor_background)
@@ -2013,19 +2263,43 @@ impl Render for FigView {
             })
             .when(!has_error && !is_loading, |this| {
                 this.child(
-                    div()
-                        .id("fig-container")
+                    h_flex()
                         .size_full()
                         .overflow_hidden()
-                        .cursor(cursor_style)
-                        .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-                        .on_pinch(cx.listener(Self::handle_pinch))
-                        .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
-                        .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
-                        .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-                        .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
-                        .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                        .child(CanvasElement::new(cx.entity())),
+                        .children(
+                            self.layers_sidebar_visible
+                                .then(|| self.render_layers_sidebar(cx)),
+                        )
+                        .child(
+                            div()
+                                .id("fig-container")
+                                .flex_1()
+                                .min_w_0()
+                                .size_full()
+                                .overflow_hidden()
+                                .cursor(cursor_style)
+                                .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+                                .on_pinch(cx.listener(Self::handle_pinch))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::handle_mouse_down),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Middle,
+                                    cx.listener(Self::handle_mouse_down),
+                                )
+                                .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+                                .on_mouse_up(
+                                    MouseButton::Middle,
+                                    cx.listener(Self::handle_mouse_up),
+                                )
+                                .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                                .child(CanvasElement::new(cx.entity())),
+                        )
+                        .children(
+                            self.inspector_sidebar_visible
+                                .then(|| self.render_inspector_sidebar(cx)),
+                        ),
                 )
                 .child(self.render_tool_pill(cx))
                 .children(self.render_text_edit_overlay(cx))
@@ -2311,7 +2585,7 @@ impl Item for FigView {
     fn clone_on_split(
         &self,
         _workspace_id: Option<workspace::WorkspaceId>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>>
     where
@@ -2322,12 +2596,24 @@ impl Item for FigView {
         let viewport = self.viewport;
         let selected_page_index = self.selected_page_index;
         let selected_page_root = self.selected_page_root;
+        let layers_sidebar_visible = self.layers_sidebar_visible;
+        let inspector_sidebar_visible = self.inspector_sidebar_visible;
+        let layers_sidebar_width = self.layers_sidebar_width;
+        let inspector_sidebar_width = self.inspector_sidebar_width;
         Task::ready(Some(cx.new(|cx| {
             let item_subscription = Self::subscribe_to_item(&item, cx);
+            let (layers_sidebar, inspector_sidebar) =
+                Self::new_embedded_sidebars(&project, window, cx);
             Self {
                 item,
                 project,
                 focus_handle: cx.focus_handle(),
+                layers_sidebar,
+                inspector_sidebar,
+                layers_sidebar_visible,
+                inspector_sidebar_visible,
+                layers_sidebar_width,
+                inspector_sidebar_width,
                 selected_page_index,
                 selected_page_root,
                 viewport,

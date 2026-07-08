@@ -8,6 +8,7 @@ use workspace::dock::DockPosition;
 #[derive(Debug, RegisterSetting)]
 pub struct FantaDesignPanelSettings {
     pub button: bool,
+    pub visible: bool,
     pub dock: DockPosition,
     pub default_width: Pixels,
 }
@@ -17,6 +18,7 @@ impl Settings for FantaDesignPanelSettings {
         let panel = content.fanta_design_panel.as_ref().unwrap();
         Self {
             button: panel.button.unwrap(),
+            visible: panel.visible.unwrap_or(true),
             dock: panel.dock.unwrap().into(),
             default_width: panel.default_width.map(px).unwrap(),
         }
@@ -26,6 +28,7 @@ impl Settings for FantaDesignPanelSettings {
 #[derive(Debug, RegisterSetting)]
 pub struct FantaPropertiesPanelSettings {
     pub button: bool,
+    pub visible: bool,
     pub dock: DockPosition,
     pub default_width: Pixels,
 }
@@ -35,6 +38,7 @@ impl Settings for FantaPropertiesPanelSettings {
         let panel = content.fanta_properties_panel.as_ref().unwrap();
         Self {
             button: panel.button.unwrap(),
+            visible: panel.visible.unwrap_or(true),
             dock: panel.dock.unwrap().into(),
             default_width: panel.default_width.map(px).unwrap(),
         }

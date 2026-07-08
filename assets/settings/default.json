@@ -958,6 +958,8 @@
   "fanta_design_panel": {
     // Whether to show the Fanta design panel button in the status bar.
     "button": true,
+    // Whether to show the embedded Fanta layers sidebar by default.
+    "visible": true,
     // Where to dock the Fanta design panel. Can be 'left' or 'right'.
     "dock": "left",
     // Default width of the Fanta design panel.
@@ -966,6 +968,8 @@
   "fanta_properties_panel": {
     // Whether to show the Fanta properties panel button in the status bar.
     "button": true,
+    // Whether to show the embedded Fanta inspector sidebar by default.
+    "visible": true,
     // Where to dock the Fanta properties panel. Can be 'left' or 'right'.
     "dock": "right",
     // Default width of the Fanta properties panel.

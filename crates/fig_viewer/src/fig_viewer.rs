@@ -25,8 +25,6 @@ pub use view::{FigView, FigViewEvent};
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<FigView>(cx);
-    design_panel::init(cx);
-    properties_panel::init(cx);
 }
 
 pub async fn add_workspace_panels(

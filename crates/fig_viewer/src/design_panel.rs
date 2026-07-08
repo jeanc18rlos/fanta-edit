@@ -42,15 +42,6 @@ actions!(
     ]
 );
 
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<FantaDesignPanel>(window, cx);
-        });
-    })
-    .detach();
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Section {
     Pages,
@@ -255,6 +246,15 @@ impl FantaDesignPanel {
         })
     }
 
+    pub(crate) fn new_embedded(
+        active_view: Entity<FigView>,
+        fs: Arc<dyn Fs>,
+        window: &mut Window,
+        cx: &mut Context<FigView>,
+    ) -> Entity<Self> {
+        cx.new(|cx| Self::build(fs, Some(active_view), window, cx, Vec::new()))
+    }
+
     fn new(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -278,67 +278,73 @@ impl FantaDesignPanel {
                     }
                 },
             );
-            let filter_editor = cx.new(|cx| Editor::single_line(window, cx));
-            let filter_subscription = cx.subscribe(
-                &filter_editor,
-                |this: &mut Self, _, event: &EditorEvent, cx| {
-                    if matches!(event, EditorEvent::BufferEdited) {
-                        this.rebuild_layer_rows(cx);
-                        cx.notify();
-                    }
-                },
-            );
-            let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
-            // Clicking away from the rename field keeps the typed name (Figma /
-            // Finder behavior). Enter/Escape empty `renaming_page` first, so the
-            // blur they trigger is a no-op.
-            let rename_subscription = cx.subscribe_in(
-                &rename_editor,
-                window,
-                |this: &mut Self, _, event: &EditorEvent, window, cx| {
-                    if matches!(event, EditorEvent::Blurred) && this.renaming.is_some() {
-                        this.commit_rename(window, cx);
-                    }
-                },
-            );
-            let mut this = Self {
-                focus_handle: cx.focus_handle(),
-                fs,
-                active_view: None,
-                width: None,
-                expanded_nodes: HashSet::new(),
-                collapsed_sections: HashSet::new(),
-                layer_rows: Vec::new(),
-                pages_cache: Vec::new(),
-                components_cache: Vec::new(),
-                assets_cache: Vec::new(),
-                assets_source: None,
-                assets_names_revision: None,
-                visible_assets: Vec::new(),
-                current_page_index: None,
-                document_ready: false,
-                document_editable: false,
-                layers_scroll_handle: UniformListScrollHandle::new(),
-                last_reveal_anchor: None,
-                pages_height: DEFAULT_PAGES_HEIGHT,
-                components_height: DEFAULT_COMPONENTS_HEIGHT,
-                assets_height: DEFAULT_ASSETS_HEIGHT,
-                divider_drag: None,
-                filter_editor,
-                filter_target: None,
-                components_this_page: false,
-                renaming: None,
-                rename_editor,
-                _subscriptions: vec![
-                    workspace_subscription,
-                    filter_subscription,
-                    rename_subscription,
-                ],
-                _active_view_subscription: None,
-            };
-            this.set_active_view(initial_view, cx);
-            this
+            Self::build(fs, initial_view, window, cx, vec![workspace_subscription])
         })
+    }
+
+    fn build(
+        fs: Arc<dyn Fs>,
+        initial_view: Option<Entity<FigView>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        mut subscriptions: Vec<Subscription>,
+    ) -> Self {
+        let filter_editor = cx.new(|cx| Editor::single_line(window, cx));
+        subscriptions.push(cx.subscribe(
+            &filter_editor,
+            |this: &mut Self, _, event: &EditorEvent, cx| {
+                if matches!(event, EditorEvent::BufferEdited) {
+                    this.rebuild_layer_rows(cx);
+                    cx.notify();
+                }
+            },
+        ));
+        let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
+        // Clicking away from the rename field keeps the typed name (Figma /
+        // Finder behavior). Enter/Escape empty `renaming_page` first, so the
+        // blur they trigger is a no-op.
+        subscriptions.push(cx.subscribe_in(
+            &rename_editor,
+            window,
+            |this: &mut Self, _, event: &EditorEvent, window, cx| {
+                if matches!(event, EditorEvent::Blurred) && this.renaming.is_some() {
+                    this.commit_rename(window, cx);
+                }
+            },
+        ));
+        let mut this = Self {
+            focus_handle: cx.focus_handle(),
+            fs,
+            active_view: None,
+            width: None,
+            expanded_nodes: HashSet::new(),
+            collapsed_sections: HashSet::new(),
+            layer_rows: Vec::new(),
+            pages_cache: Vec::new(),
+            components_cache: Vec::new(),
+            assets_cache: Vec::new(),
+            assets_source: None,
+            assets_names_revision: None,
+            visible_assets: Vec::new(),
+            current_page_index: None,
+            document_ready: false,
+            document_editable: false,
+            layers_scroll_handle: UniformListScrollHandle::new(),
+            last_reveal_anchor: None,
+            pages_height: DEFAULT_PAGES_HEIGHT,
+            components_height: DEFAULT_COMPONENTS_HEIGHT,
+            assets_height: DEFAULT_ASSETS_HEIGHT,
+            divider_drag: None,
+            filter_editor,
+            filter_target: None,
+            components_this_page: false,
+            renaming: None,
+            rename_editor,
+            _subscriptions: subscriptions,
+            _active_view_subscription: None,
+        };
+        this.set_active_view(initial_view, cx);
+        this
     }
 
     fn update_active_view(
