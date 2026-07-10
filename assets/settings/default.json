@@ -1734,8 +1734,11 @@
   //      "load_direnv": "disabled"
   "load_direnv": "direct",
   "edit_predictions": {
-    // Which edit prediction provider to use.
-    "provider": "zed",
+    // Which edit prediction provider to use. Fanta serves self-hosted
+    // Zeta 2.1 (open weights) over an OpenAI-completions lane, metered.
+    // Reverts to "zed" (dead in this fork) or "copilot" if you prefer.
+    // The Fanta endpoint is configured in "open_ai_compatible_api" below.
+    "provider": "open_ai_compatible_api",
     // A list of globs representing files that edit predictions should be disabled for.
     // There's a sensible default list of globs already included.
     // Any addition to this list will be merged with the default list.
@@ -1784,11 +1787,14 @@
       "prompt_format": "infer",
       "max_output_tokens": 64,
     },
+    // Fanta self-hosted Zeta 2.1 edit predictions (metered). Set the key via
+    // ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY or the keychain. Point
+    // api_url elsewhere (or set provider above to "zed"/"copilot") to change.
     "open_ai_compatible_api": {
-      "api_url": "",
-      "model": "",
-      "prompt_format": "infer",
-      "max_output_tokens": 64,
+      "api_url": "https://api.fantaisa.com/v1",
+      "model": "fanta-zeta-1",
+      "prompt_format": "zeta2_1",
+      "max_output_tokens": 2048,
     },
     // Controls whether Zed may collect training data when using Zed's Edit Predictions.
     // Data is only captured when the project is detected as open source.
@@ -2445,7 +2451,45 @@
     "anthropic": {
       "api_url": "https://api.anthropic.com",
     },
-    "anthropic_compatible": {},
+    // Fanta managed provider (Anthropic Messages-compatible). Metered against
+    // your Fanta credits. Set the key via the provider UI or FANTA_API_KEY.
+    // Available but NOT the default (offline-first stays sacred) — switch
+    // agent.default_model.provider to "Fanta" after signing in.
+    "anthropic_compatible": {
+      "Fanta": {
+        "api_url": "https://api.fantaisa.com/v1",
+        "available_models": [
+          {
+            "name": "claude-sonnet-5",
+            "display_name": "Fanta Sonnet",
+            "max_tokens": 200000,
+            "max_output_tokens": 32000,
+            "capabilities": { "tools": true, "images": true, "prompt_caching": true }
+          },
+          {
+            "name": "claude-opus-4-8",
+            "display_name": "Fanta Opus",
+            "max_tokens": 200000,
+            "max_output_tokens": 32000,
+            "capabilities": { "tools": true, "images": true, "prompt_caching": true }
+          },
+          {
+            "name": "claude-haiku-4-5",
+            "display_name": "Fanta Haiku",
+            "max_tokens": 200000,
+            "max_output_tokens": 32000,
+            "capabilities": { "tools": true, "images": true, "prompt_caching": true }
+          },
+          {
+            "name": "glm-5.2-awq-v1",
+            "display_name": "Fanta Composer (GLM-5.2)",
+            "max_tokens": 131072,
+            "max_output_tokens": 64000,
+            "capabilities": { "tools": true, "images": false, "prompt_caching": false }
+          }
+        ]
+      }
+    },
     "bedrock": {},
     "google": {
       "api_url": "https://generativelanguage.googleapis.com",
@@ -2644,7 +2688,7 @@
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
-  "server_url": "https://fanta.dev",
+  "server_url": "https://fantaisa.com",
   // Settings overrides to use when using Zed Preview.
   // Mostly useful for developers who are managing multiple instances of Zed.
   "preview": {
@@ -2745,7 +2789,20 @@
   // Default: 60
   "context_server_timeout": 60,
   // Configures context servers for use by the agent.
-  "context_servers": {},
+  // Fanta generation tools (image/compose/vectorize/upscale/animate/…) over
+  // the hosted MCP server. Disabled by default because it needs your Fanta
+  // key: enable it and add your key in your user settings.json, e.g.
+  //   "context_servers": { "fanta": { "enabled": true,
+  //     "url": "https://api.fantaisa.com/mcp",
+  //     "headers": { "Authorization": "Bearer fnt_live_…" } } }
+  // (Header auth is a stopgap until the hosted MCP OAuth flow ships.)
+  "context_servers": {
+    "fanta": {
+      "enabled": false,
+      "url": "https://api.fantaisa.com/mcp",
+      "headers": {}
+    }
+  },
   // Configures agent servers available in the agent panel.
   "agent_servers": {},
   "debugger": {
