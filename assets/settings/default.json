@@ -1791,7 +1791,7 @@
     // ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY or the keychain. Point
     // api_url elsewhere (or set provider above to "zed"/"copilot") to change.
     "open_ai_compatible_api": {
-      "api_url": "https://api.fantaisa.com/v1",
+      "api_url": "https://api.fantaisa.net/v1",
       "model": "fanta-zeta-1",
       "prompt_format": "zeta2_1",
       "max_output_tokens": 2048,
@@ -2457,7 +2457,7 @@
     // agent.default_model.provider to "Fanta" after signing in.
     "anthropic_compatible": {
       "Fanta": {
-        "api_url": "https://api.fantaisa.com/v1",
+        "api_url": "https://api.fantaisa.net/v1",
         "available_models": [
           {
             "name": "claude-sonnet-5",
@@ -2688,7 +2688,7 @@
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
-  "server_url": "https://fantaisa.com",
+  "server_url": "https://fantaisa.net",
   // Settings overrides to use when using Zed Preview.
   // Mostly useful for developers who are managing multiple instances of Zed.
   "preview": {
@@ -2793,13 +2793,13 @@
   // the hosted MCP server. Disabled by default because it needs your Fanta
   // key: enable it and add your key in your user settings.json, e.g.
   //   "context_servers": { "fanta": { "enabled": true,
-  //     "url": "https://api.fantaisa.com/mcp",
+  //     "url": "https://api.fantaisa.net/mcp",
   //     "headers": { "Authorization": "Bearer fnt_live_…" } } }
   // (Header auth is a stopgap until the hosted MCP OAuth flow ships.)
   "context_servers": {
     "fanta": {
       "enabled": false,
-      "url": "https://api.fantaisa.com/mcp",
+      "url": "https://api.fantaisa.net/mcp",
       "headers": {}
     }
   },
