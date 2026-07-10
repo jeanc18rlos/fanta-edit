@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 
-if [ "$ZED_WSL_DEBUG_INFO" = true ]; then
+if [ "$FANTA_WSL_DEBUG_INFO" = true ] || [ "$ZED_WSL_DEBUG_INFO" = true ]; then
 	set -x
 fi
 
-ZED_PATH="$(dirname "$(realpath "$0")")"
+FANTA_PATH="$(dirname "$(realpath "$0")")"
 
 IN_WSL=false
 if [ -n "$WSL_DISTRO_NAME" ]; then
@@ -17,9 +17,9 @@ if [ $IN_WSL = true ]; then
     if [ -z "$WSL_USER" ]; then
         WSL_USER="$USERNAME"
     fi
-    "$ZED_PATH/zed.exe" --wsl "$WSL_USER@$WSL_DISTRO_NAME" "$@"
+    "$FANTA_PATH/fanta.exe" --wsl "$WSL_USER@$WSL_DISTRO_NAME" "$@"
     exit $?
 else
-    "$ZED_PATH/zed.exe" "$@"
+    "$FANTA_PATH/fanta.exe" "$@"
     exit $?
 fi

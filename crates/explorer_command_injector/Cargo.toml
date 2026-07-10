@@ -14,10 +14,11 @@ path = "src/explorer_command_injector.rs"
 doctest = false
 
 [features]
-default = ["nightly"]
+default = ["dev"]
 stable = []
 preview = []
 nightly = []
+dev = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows.workspace = true

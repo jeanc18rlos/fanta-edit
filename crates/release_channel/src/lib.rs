@@ -30,10 +30,10 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Dev => "Fanta-Dev",
+        ReleaseChannel::Nightly => "Fanta-Nightly",
+        ReleaseChannel::Preview => "Fanta-Preview",
+        ReleaseChannel::Stable => "Fanta-Stable",
     }
 }
 
@@ -191,10 +191,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "Fanta Dev",
+            ReleaseChannel::Nightly => "Fanta Nightly",
+            ReleaseChannel::Preview => "Fanta Preview",
+            ReleaseChannel::Stable => "Fanta",
         }
     }
 
@@ -210,7 +210,7 @@ impl ReleaseChannel {
 
     /// Returns the application ID that's used by Wayland as application ID
     /// and WM_CLASS on X11.
-    /// This also has to match the bundle identifier for Zed on macOS.
+    /// This also has to match the application identifiers in the Linux bundle.
     pub fn app_id(&self) -> &'static str {
         match self {
             ReleaseChannel::Dev => "dev.zed.Zed-Dev",
@@ -269,6 +269,12 @@ impl FromStr for ReleaseChannel {
 #[cfg(test)]
 mod tests {
     use super::ReleaseChannel;
+
+    #[test]
+    fn display_name_is_fanta_branded() {
+        assert_eq!(ReleaseChannel::Dev.display_name(), "Fanta Dev");
+        assert_eq!(ReleaseChannel::Stable.display_name(), "Fanta");
+    }
 
     #[test]
     fn test_docs_url_for_release_channel() {

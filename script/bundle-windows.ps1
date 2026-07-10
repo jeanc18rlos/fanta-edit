@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
 $buildSuccess = $false
+$installerPath = $null
 
 $OSArchitecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
@@ -100,10 +101,10 @@ function GenerateLicenses {
 }
 
 function BuildZedAndItsFriends {
-    Write-Output "Building Zed and its friends, for channel: $channel"
-    # Build zed.exe, cli.exe and auto_update_helper.exe
+    Write-Output "Building Fanta and its friends, for channel: $channel"
+    # Build fanta.exe, cli.exe and auto_update_helper.exe
     cargo build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
+    Copy-Item -Path ".\$CargoOutDir\fanta.exe" -Destination "$innoDir\Fanta.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
@@ -114,8 +115,11 @@ function BuildZedAndItsFriends {
         "preview" {
             cargo build --release --features preview --no-default-features --package explorer_command_injector --target $target
         }
-        default {
-            cargo build --release --package explorer_command_injector --target $target
+        "nightly" {
+            cargo build --release --features nightly --no-default-features --package explorer_command_injector --target $target
+        }
+        "dev" {
+            cargo build --release --features dev --no-default-features --package explorer_command_injector --target $target
         }
     }
     Copy-Item -Path ".\$CargoOutDir\explorer_command_injector.dll" -Destination "$innoDir\zed_explorer_command_injector.dll" -Force
@@ -188,8 +192,15 @@ function MakeAppx {
         "preview" {
             $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest-Preview.xml"
         }
-        default {
+        "nightly" {
             $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest-Nightly.xml"
+        }
+        "dev" {
+            $manifestFile = "$env:ZED_WORKSPACE\crates\explorer_command_injector\AppxManifest-Dev.xml"
+        }
+        default {
+            Write-Error "can't build explorer command package for $channel."
+            exit 1
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
@@ -204,7 +215,7 @@ function SignZedAndItsFriends {
         return
     }
 
-    $files = "$innoDir\Zed.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
+    $files = "$innoDir\Fanta.exe,$innoDir\cli.exe,$innoDir\auto_update_helper.exe,$innoDir\zed_explorer_command_injector.dll,$innoDir\zed_explorer_command_injector.appx"
     & "$innoDir\sign.ps1" $files
 }
 
@@ -228,8 +239,8 @@ function DownloadConpty {
 function CollectFiles {
     Move-Item -Path "$innoDir\zed_explorer_command_injector.appx" -Destination "$innoDir\appx\zed_explorer_command_injector.appx" -Force
     Move-Item -Path "$innoDir\zed_explorer_command_injector.dll" -Destination "$innoDir\appx\zed_explorer_command_injector.dll" -Force
-    Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\zed.exe" -Force
-    Move-Item -Path "$innoDir\zed.sh" -Destination "$innoDir\bin\zed" -Force
+    Move-Item -Path "$innoDir\cli.exe" -Destination "$innoDir\bin\fanta.exe" -Force
+    Move-Item -Path "$innoDir\fanta.sh" -Destination "$innoDir\bin\fanta" -Force
     Move-Item -Path "$innoDir\auto_update_helper.exe" -Destination "$innoDir\tools\auto_update_helper.exe" -Force
     if($Architecture -eq "aarch64") {
         New-Item -Type Directory -Path "$innoDir\arm64" -Force
@@ -252,58 +263,58 @@ function BuildInstaller {
         "stable" {
             $appId = "{{2DB0DA96-CA55-49BB-AF4F-64AF36A86712}"
             $appIconName = "app-icon"
-            $appName = "Zed"
-            $appDisplayName = "Zed"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Fanta"
+            $appDisplayName = "Fanta"
+            $appSetupName = "Fanta-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Stable-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "Zed"
-            $appUserId = "ZedIndustries.Zed"
-            $appShellNameShort = "Z&ed"
-            $appAppxFullName = "ZedIndustries.Zed_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Fanta-Stable-Instance-Mutex"
+            $appExeName = "Fanta"
+            $regValueName = "Fanta"
+            $appUserId = "Fanta.Fanta"
+            $appShellNameShort = "F&anta"
+            $appAppxFullName = "Fanta.Fanta_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "preview" {
             $appId = "{{F70E4811-D0E2-4D88-AC99-D63752799F95}"
             $appIconName = "app-icon-preview"
-            $appName = "Zed Preview"
-            $appDisplayName = "Zed Preview"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Fanta Preview"
+            $appDisplayName = "Fanta Preview"
+            $appSetupName = "Fanta-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Preview-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedPreview"
-            $appUserId = "ZedIndustries.Zed.Preview"
-            $appShellNameShort = "Z&ed Preview"
-            $appAppxFullName = "ZedIndustries.Zed.Preview_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Fanta-Preview-Instance-Mutex"
+            $appExeName = "Fanta"
+            $regValueName = "FantaPreview"
+            $appUserId = "Fanta.Fanta.Preview"
+            $appShellNameShort = "F&anta Preview"
+            $appAppxFullName = "Fanta.Fanta.Preview_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "nightly" {
             $appId = "{{1BDB21D3-14E7-433C-843C-9C97382B2FE0}"
             $appIconName = "app-icon-nightly"
-            $appName = "Zed Nightly"
-            $appDisplayName = "Zed Nightly"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Fanta Nightly"
+            $appDisplayName = "Fanta Nightly"
+            $appSetupName = "Fanta-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Nightly-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedNightly"
-            $appUserId = "ZedIndustries.Zed.Nightly"
-            $appShellNameShort = "Z&ed Editor Nightly"
-            $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Fanta-Nightly-Instance-Mutex"
+            $appExeName = "Fanta"
+            $regValueName = "FantaNightly"
+            $appUserId = "Fanta.Fanta.Nightly"
+            $appShellNameShort = "F&anta Nightly"
+            $appAppxFullName = "Fanta.Fanta.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
             $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
             $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
+            $appName = "Fanta Dev"
+            $appDisplayName = "Fanta Dev"
+            $appSetupName = "Fanta-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
-            $appMutex = "Zed-Dev-Instance-Mutex"
-            $appExeName = "Zed"
-            $regValueName = "ZedDev"
-            $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
-            $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
+            $appMutex = "Fanta-Dev-Instance-Mutex"
+            $appExeName = "Fanta"
+            $regValueName = "FantaDev"
+            $appUserId = "Fanta.Fanta.Dev"
+            $appShellNameShort = "F&anta Dev"
+            $appAppxFullName = "Fanta.Fanta.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {
             Write-Error "can't bundle installer for $channel."
@@ -353,6 +364,7 @@ function BuildInstaller {
         Write-Host "✅ Inno Setup successfully compiled the installer"
         Write-Output "SETUP_PATH=target/$appSetupName.exe" >> $env:GITHUB_ENV
         $script:buildSuccess = $true
+        $script:installerPath = "$env:ZED_WORKSPACE\target\$appSetupName.exe"
     }
     else {
         Write-Host "❌ Inno Setup failed: $($process.ExitCode)"
@@ -385,8 +397,8 @@ if($env:CI) {
 if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
-        Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        Write-Output "Installing Fanta..."
+        Start-Process -FilePath $installerPath
     }
     exit 0
 }

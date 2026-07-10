@@ -44,15 +44,15 @@ struct ExplorerCommandInjector;
 impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
     fn GetTitle(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
         let command_description =
-            retrieve_command_description().unwrap_or(HSTRING::from("Open with Zed"));
+            retrieve_command_description().unwrap_or(HSTRING::from("Open with Fanta"));
         unsafe { SHStrDupW(&command_description) }
     }
 
     fn GetIcon(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
-        let Some(zed_exe) = get_zed_exe_path() else {
+        let Some(fanta_exe) = get_fanta_exe_path() else {
             return Err(E_FAIL.into());
         };
-        unsafe { SHStrDupW(&HSTRING::from(zed_exe)) }
+        unsafe { SHStrDupW(&HSTRING::from(fanta_exe)) }
     }
 
     fn GetToolTip(&self, _: Ref<IShellItemArray>) -> Result<windows_core::PWSTR> {
@@ -69,7 +69,7 @@ impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
 
     fn Invoke(&self, psiitemarray: Ref<IShellItemArray>, _: Ref<IBindCtx>) -> Result<()> {
         let items = psiitemarray.ok()?;
-        let Some(zed_exe) = get_zed_exe_path() else {
+        let Some(fanta_exe) = get_fanta_exe_path() else {
             return Ok(());
         };
 
@@ -78,7 +78,7 @@ impl IExplorerCommand_Impl for ExplorerCommandInjector_Impl {
             let item = unsafe { items.GetItemAt(idx)? };
             let item_path = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH)?.to_string()? };
             #[allow(clippy::disallowed_methods, reason = "no async context in sight..")]
-            std::process::Command::new(&zed_exe)
+            std::process::Command::new(&fanta_exe)
                 .arg(&item_path)
                 .spawn()
                 .map_err(|_| E_INVALIDARG)?;
@@ -127,15 +127,42 @@ impl IClassFactory_Impl for ExplorerCommandInjectorFactory_Impl {
     }
 }
 
-#[cfg(all(feature = "stable", not(feature = "preview"), not(feature = "nightly")))]
+#[cfg(all(
+    feature = "stable",
+    not(feature = "preview"),
+    not(feature = "nightly"),
+    not(feature = "dev")
+))]
 const MODULE_ID: GUID = GUID::from_u128(0x6a1f6b13_3b82_48a1_9e06_7bb0a6d0bffd);
-#[cfg(all(feature = "preview", not(feature = "stable"), not(feature = "nightly")))]
+#[cfg(all(
+    feature = "preview",
+    not(feature = "stable"),
+    not(feature = "nightly"),
+    not(feature = "dev")
+))]
 const MODULE_ID: GUID = GUID::from_u128(0xaf8e85ea_fb20_4db2_93cf_56513c1ec697);
-#[cfg(all(feature = "nightly", not(feature = "stable"), not(feature = "preview")))]
+#[cfg(all(
+    feature = "nightly",
+    not(feature = "stable"),
+    not(feature = "preview"),
+    not(feature = "dev")
+))]
 const MODULE_ID: GUID = GUID::from_u128(0x266f2cfe_1653_42af_b55c_fe3590c83871);
+#[cfg(all(
+    feature = "dev",
+    not(feature = "stable"),
+    not(feature = "preview"),
+    not(feature = "nightly")
+))]
+const MODULE_ID: GUID = GUID::from_u128(0x988510d6_c1a9_4efd_b608_5cd11bc934a3);
 
 // Make cargo clippy happy
-#[cfg(all(feature = "nightly", feature = "stable", feature = "preview"))]
+#[cfg(all(
+    feature = "nightly",
+    feature = "stable",
+    feature = "preview",
+    feature = "dev"
+))]
 const MODULE_ID: GUID = GUID::from_u128(0x685f4d49_6718_4c55_b271_ebb5c6a48d6f);
 
 #[unsafe(no_mangle)]
@@ -160,7 +187,7 @@ extern "system" fn DllGetClassObject(
     }
 }
 
-fn get_zed_install_folder() -> Option<PathBuf> {
+fn get_fanta_install_folder() -> Option<PathBuf> {
     let mut buf = vec![0u16; MAX_PATH as usize];
     unsafe { GetModuleFileNameW(Some(DLL_INSTANCE.into()), &mut buf) };
 
@@ -177,22 +204,49 @@ fn get_zed_install_folder() -> Option<PathBuf> {
 }
 
 #[inline]
-fn get_zed_exe_path() -> Option<String> {
-    get_zed_install_folder().map(|path| path.join("Zed.exe").to_string_lossy().into_owned())
+fn get_fanta_exe_path() -> Option<String> {
+    get_fanta_install_folder().map(|path| path.join("Fanta.exe").to_string_lossy().into_owned())
 }
 
 #[inline]
 fn retrieve_command_description() -> Result<HSTRING> {
-    #[cfg(all(feature = "stable", not(feature = "preview"), not(feature = "nightly")))]
-    const REG_PATH: &str = "Software\\Classes\\ZedEditorContextMenu";
-    #[cfg(all(feature = "preview", not(feature = "stable"), not(feature = "nightly")))]
-    const REG_PATH: &str = "Software\\Classes\\ZedEditorPreviewContextMenu";
-    #[cfg(all(feature = "nightly", not(feature = "stable"), not(feature = "preview")))]
-    const REG_PATH: &str = "Software\\Classes\\ZedEditorNightlyContextMenu";
+    #[cfg(all(
+        feature = "stable",
+        not(feature = "preview"),
+        not(feature = "nightly"),
+        not(feature = "dev")
+    ))]
+    const REG_PATH: &str = "Software\\Classes\\FantaContextMenu";
+    #[cfg(all(
+        feature = "preview",
+        not(feature = "stable"),
+        not(feature = "nightly"),
+        not(feature = "dev")
+    ))]
+    const REG_PATH: &str = "Software\\Classes\\FantaPreviewContextMenu";
+    #[cfg(all(
+        feature = "nightly",
+        not(feature = "stable"),
+        not(feature = "preview"),
+        not(feature = "dev")
+    ))]
+    const REG_PATH: &str = "Software\\Classes\\FantaNightlyContextMenu";
+    #[cfg(all(
+        feature = "dev",
+        not(feature = "stable"),
+        not(feature = "preview"),
+        not(feature = "nightly")
+    ))]
+    const REG_PATH: &str = "Software\\Classes\\FantaDevContextMenu";
 
     // Make cargo clippy happy
-    #[cfg(all(feature = "nightly", feature = "stable", feature = "preview"))]
-    const REG_PATH: &str = "Software\\Classes\\ZedEditorClippyContextMenu";
+    #[cfg(all(
+        feature = "nightly",
+        feature = "stable",
+        feature = "preview",
+        feature = "dev"
+    ))]
+    const REG_PATH: &str = "Software\\Classes\\FantaClippyContextMenu";
 
     let key = windows_registry::CURRENT_USER.open(REG_PATH)?;
     key.get_hstring("Title")

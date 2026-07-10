@@ -278,7 +278,7 @@ repl = { workspace = true, features = ["test-support"] }
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
 identifier = "dev.fanta.Fanta-Dev"
-name = "Fanta Edit Dev"
+name = "Fanta Dev"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
@@ -286,7 +286,7 @@ osx_url_schemes = ["fanta"]
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
 identifier = "dev.fanta.Fanta-Nightly"
-name = "Fanta Edit Nightly"
+name = "Fanta Nightly"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
@@ -294,7 +294,7 @@ osx_url_schemes = ["fanta"]
 [package.metadata.bundle-preview]
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
 identifier = "dev.fanta.Fanta-Preview"
-name = "Fanta Edit Preview"
+name = "Fanta Preview"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
@@ -302,7 +302,7 @@ osx_url_schemes = ["fanta"]
 [package.metadata.bundle-stable]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
 identifier = "dev.fanta.Fanta"
-name = "Fanta Edit"
+name = "Fanta"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
