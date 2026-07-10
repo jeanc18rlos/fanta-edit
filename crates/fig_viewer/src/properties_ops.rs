@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use fanta_canvas::{
-    HAlign, ResizeHandle, VAlign, align_to_bounds_h, align_to_bounds_v,
+    HAlign, ResizeHandle, VAlign, align_to_bounds_h, align_to_bounds_v, resize_box_keep_rotation,
     resize_transform_keep_rotation, rotate_about, transform_angle,
 };
 use fanta_doc::{
     BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor, ComponentId,
     ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill, Gradient, GroupNode,
-    LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, Transform2D, UnitInterval,
-    VarValue, VariantAxis, Viewport, expand_instance,
+    LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, TextAutoResize,
+    Transform2D, UnitInterval, VarValue, VariantAxis, Viewport, expand_instance,
 };
 use fanta_render::{AssetResolver, RasterRenderer, RenderInputs};
 use glam::DVec2;
@@ -842,9 +842,8 @@ pub(crate) fn layout_padding_operations(
 }
 
 /// Change one oriented dimension of a node by pinning the opposite edge, the
-/// same math the canvas resize handles use so rotation is preserved. The world
-/// resize is rebased into the parent's frame to produce the new local
-/// transform.
+/// same math the canvas resize handles use so rotation is preserved. Text
+/// changes its content box and reflows; other node kinds resize their transform.
 pub(crate) fn resize_operations(
     doc: &Doc,
     id: NodeId,
@@ -880,6 +879,65 @@ pub(crate) fn resize_operations(
         )
     };
     let cursor_world = rotation.transform_point(cursor_frame);
+
+    if matches!(node.data, NodeData::Text(_)) {
+        let current_size = if horizontal {
+            frame_bounds.width()
+        } else {
+            frame_bounds.height()
+        };
+        if (new_size - current_size).abs() <= f64::EPSILON {
+            return Vec::new();
+        }
+
+        let parent_world = node
+            .parent
+            .and_then(|parent| scene.world_transform(parent))
+            .unwrap_or(Transform2D::IDENTITY);
+        let parent_determinant = parent_world.0.matrix2.determinant();
+        if !parent_determinant.is_finite() || parent_determinant.abs() <= f64::EPSILON {
+            return Vec::new();
+        }
+        let (new_world, width, height) =
+            resize_box_keep_rotation(world_transform, local, handle, cursor_world, false, false);
+        let new_local = new_world.then(&parent_world.inverse());
+        if !new_local
+            .to_components()
+            .iter()
+            .all(|component| component.is_finite())
+        {
+            return Vec::new();
+        }
+
+        let mut new_data = node.data.clone();
+        let NodeData::Text(text) = &mut new_data else {
+            return Vec::new();
+        };
+        text.local_size = [width, height];
+        text.auto_resize = if horizontal {
+            TextAutoResize::Height
+        } else {
+            TextAutoResize::None
+        };
+
+        let mut operations = Vec::with_capacity(2);
+        if new_local != node.transform {
+            operations.push(Operation::SetTransform {
+                id,
+                old: node.transform,
+                new: new_local,
+            });
+        }
+        if new_data != node.data {
+            operations.push(Operation::ReplaceData {
+                id,
+                old: Box::new(node.data.clone()),
+                new: Box::new(new_data),
+            });
+        }
+        return operations;
+    }
+
     let new_world =
         resize_transform_keep_rotation(world_transform, local, handle, cursor_world, false, false);
     let parent_world = node
@@ -1535,6 +1593,154 @@ mod tests {
             .get(id)
             .map(|node| node.blurs.to_vec())
             .unwrap_or_default()
+    }
+
+    fn text_data(doc: &Doc, id: NodeId) -> &fanta_doc::TextNode {
+        let node = doc.scene.get(id).expect("the test text node");
+        let NodeData::Text(text) = &node.data else {
+            panic!("expected text data");
+        };
+        text
+    }
+
+    #[test]
+    fn width_field_resizes_and_reflows_the_text_box_without_scaling_glyphs() {
+        use fanta_text::{LayoutEngine, TextBuffer, TextStyle};
+
+        let content = "one two three four five six seven eight";
+        let mut text = fanta_doc::TextNode::new(content, 160.0, 90.0);
+        text.auto_resize = TextAutoResize::WidthAndHeight;
+        let (mut doc, id) = doc_with_node(NodeData::Text(text));
+        let angle: f64 = 0.4;
+        doc.scene.get_mut(id).expect("the text node").transform = Transform2D::from_components([
+            angle.cos(),
+            angle.sin(),
+            -angle.sin(),
+            angle.cos(),
+            24.0,
+            12.0,
+        ]);
+        let original_transform = doc.scene.get(id).expect("the text node").transform;
+        let buffer = TextBuffer::from_str(content, TextStyle::default());
+        let layout_engine = LayoutEngine::new();
+        let original_lines = layout_engine.layout(&buffer, 160.0).line_count();
+
+        let operations = field_operations(&doc, &InspectorField::Width(id), "70");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::ReplaceData { .. })),
+            "a text width edit must replace its box data"
+        );
+        for operation in operations {
+            doc.apply(operation).expect("applying the text width edit");
+        }
+
+        let node = doc.scene.get(id).expect("the resized text node");
+        assert_eq!(
+            &node.transform.to_components()[..4],
+            &original_transform.to_components()[..4],
+            "the glyph transform's linear part must stay unchanged"
+        );
+        let text = text_data(&doc, id);
+        assert!((text.local_size[0] - 70.0).abs() < 1e-6);
+        assert!((text.local_size[1] - 90.0).abs() < 1e-6);
+        assert_eq!(text.auto_resize, TextAutoResize::Height);
+        assert_eq!(text.style.size_px, 16.0);
+        assert!(
+            layout_engine
+                .layout(&buffer, text.local_size[0])
+                .line_count()
+                > original_lines,
+            "the narrower fixed-width box must produce more wrapped lines"
+        );
+    }
+
+    #[test]
+    fn height_field_fixes_the_text_box_without_scaling_glyphs() {
+        let mut text = fanta_doc::TextNode::new("Hello", 100.0, 24.0);
+        text.auto_resize = TextAutoResize::Height;
+        let (mut doc, id) = doc_with_node(NodeData::Text(text));
+        let original_transform = doc.scene.get(id).expect("the text node").transform;
+
+        for operation in field_operations(&doc, &InspectorField::Height(id), "60") {
+            doc.apply(operation).expect("applying the text height edit");
+        }
+
+        let node = doc.scene.get(id).expect("the resized text node");
+        assert_eq!(
+            &node.transform.to_components()[..4],
+            &original_transform.to_components()[..4],
+            "the glyph transform's linear part must stay unchanged"
+        );
+        let text = text_data(&doc, id);
+        assert_eq!(text.local_size, [100.0, 60.0]);
+        assert_eq!(text.auto_resize, TextAutoResize::None);
+    }
+
+    #[test]
+    fn outlined_text_keeps_vector_transform_resize_semantics() {
+        let vector = fanta_doc::VectorNode::rect_solid(0.0, 0.0, 100.0, 40.0, FantaColor::BLACK);
+        let (doc, id) = doc_with_node(NodeData::Vector(vector));
+
+        let operations = field_operations(&doc, &InspectorField::Width(id), "200");
+        assert!(
+            operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::SetTransform { .. }))
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|operation| !matches!(operation, Operation::ReplaceData { .. })),
+            "vector outlines should remain normally distortable"
+        );
+    }
+
+    #[test]
+    fn text_width_scrub_previews_live_and_commits_as_one_undo_step() {
+        let mut text = fanta_doc::TextNode::new("one two three four", 120.0, 48.0);
+        text.auto_resize = TextAutoResize::WidthAndHeight;
+        let (mut doc, id) = doc_with_node(NodeData::Text(text));
+        let node = doc.scene.get(id).expect("the text node");
+        let snapshot = NodeSnapshot {
+            id,
+            transform: node.transform,
+            opacity: node.opacity,
+            data: Box::new(node.data.clone()),
+            effects: node.effects.clone(),
+            blurs: node.blurs.clone(),
+        };
+
+        for operation in field_operations(&doc, &InspectorField::Width(id), "72") {
+            apply_preview_operation(&mut doc, &operation);
+        }
+        assert_eq!(text_data(&doc, id).local_size, [72.0, 48.0]);
+        assert_eq!(
+            doc.history.undo_depth(),
+            0,
+            "a scrub preview must stay out of history"
+        );
+
+        restore_snapshot(&mut doc, &snapshot);
+        assert_eq!(text_data(&doc, id).local_size, [120.0, 48.0]);
+        let operations = field_operations(&doc, &InspectorField::Width(id), "84");
+        doc.history.begin("Resize", &mut doc.scene);
+        for operation in operations {
+            doc.apply(operation)
+                .expect("committing the text width scrub");
+        }
+        doc.history.commit(&mut doc.scene);
+        assert_eq!(doc.history.undo_depth(), 1);
+        assert_eq!(text_data(&doc, id).local_size, [84.0, 48.0]);
+
+        assert!(doc.undo().expect("undoing the text width scrub"));
+        assert_eq!(text_data(&doc, id).local_size, [120.0, 48.0]);
+        assert_eq!(
+            text_data(&doc, id).auto_resize,
+            TextAutoResize::WidthAndHeight
+        );
+        assert!(!doc.undo().expect("checking for a second undo step"));
     }
 
     #[test]
