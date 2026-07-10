@@ -981,6 +981,37 @@ pub(crate) fn caret_screen_segment(
     caret_segment_core(text, world, byte, viewport, screen_size)
 }
 
+fn baseline_segment_core(
+    text: &TextNode,
+    world: Transform2D,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> (DVec2, DVec2) {
+    let baseline = fanta_render::text_first_baseline(text);
+    let width = text.local_size[0].max(1.0);
+    let project = |local: DVec2| {
+        fanta_canvas::world_to_screen(world.transform_point(local), viewport, screen_size)
+    };
+    (
+        project(DVec2::new(0.0, baseline)),
+        project(DVec2::new(width, baseline)),
+    )
+}
+
+pub(crate) fn baseline_screen_segment(
+    doc: &Doc,
+    node_id: NodeId,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    let node = doc.scene.get(node_id)?;
+    let NodeData::Text(text) = &node.data else {
+        return None;
+    };
+    let world = doc.scene.world_transform(node_id)?;
+    Some(baseline_segment_core(text, world, viewport, screen_size))
+}
+
 /// Selection highlight as screen-space rects `[x, y, w, h]`. Axis-aligned:
 /// exact under translate + scale, a bounding box under rotation.
 pub(crate) fn selection_screen_rects(
@@ -1069,6 +1100,23 @@ pub(crate) fn session_caret_segment(
             screen_size,
         ),
         None => caret_screen_segment(doc, session.node_id(), byte, viewport, screen_size),
+    }
+}
+
+pub(crate) fn session_baseline_segment(
+    doc: &Doc,
+    session: &TextEditSession,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    match session.instance() {
+        Some(instance) => Some(baseline_segment_core(
+            &session.live_text(),
+            instance.world,
+            viewport,
+            screen_size,
+        )),
+        None => baseline_screen_segment(doc, session.node_id(), viewport, screen_size),
     }
 }
 
@@ -1837,6 +1885,33 @@ mod tests {
             (bottom - expected_bottom).length() < 1e-6,
             "bottom {bottom:?} vs {expected_bottom:?}"
         );
+    }
+
+    #[test]
+    fn baseline_segment_uses_text_width_and_full_node_transform() {
+        let mut doc = Doc::new();
+        let mut text = TextNode::new("Guide", 120.0, 48.0);
+        text.style.size_px = 18.0;
+        let baseline = fanta_render::text_first_baseline(&text);
+        let mut node = CanvasNode::new(NodeData::Text(text));
+        node.transform = Transform2D::translation(15.0, -8.0);
+        let id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("creating a text node");
+        let viewport = Viewport {
+            center: [0.0, 0.0],
+            zoom: 2.0,
+        };
+        let screen_size = DVec2::new(800.0, 600.0);
+
+        let (start, end) = baseline_screen_segment(&doc, id, &viewport, screen_size)
+            .expect("text baseline geometry");
+
+        assert!((start.x - 430.0).abs() < 1e-6);
+        assert!((end.x - 670.0).abs() < 1e-6);
+        let expected_y = 300.0 + (-8.0 + baseline) * 2.0;
+        assert!((start.y - expected_y).abs() < 1e-6);
+        assert!((end.y - expected_y).abs() < 1e-6);
     }
 
     #[test]

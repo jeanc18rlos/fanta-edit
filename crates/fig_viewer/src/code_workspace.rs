@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
+use buffer_diff::BufferDiff;
 use editor::Editor;
 use fanta_doc::NodeId;
 use gpui::{
@@ -58,6 +61,10 @@ pub struct FantaCodeWorkspace {
     fnx_load_task: Option<Task<()>>,
     json_load_task: Option<Task<()>>,
     validation_task: Option<Task<()>>,
+    canvas_diff: Option<Entity<BufferDiff>>,
+    canvas_diff_task: Option<Task<()>>,
+    previous_fnx_diff: Option<Entity<BufferDiff>>,
+    canvas_diff_visible: bool,
     source_save_in_progress: bool,
     fnx_subscription: Option<Subscription>,
     _item_subscription: Subscription,
@@ -87,6 +94,13 @@ impl FantaCodeWorkspace {
                         this.refresh_from_item(window, cx);
                     }
                 }
+                if matches!(event, FigItemEvent::StateChanged) {
+                    if this.has_local_canvas_source_conflict(cx) && this.canvas_diff_visible {
+                        this.show_canvas_diff(cx);
+                    } else if !this.has_local_canvas_source_conflict(cx) {
+                        this.hide_canvas_diff(cx);
+                    }
+                }
                 cx.notify();
             },
         );
@@ -110,6 +124,10 @@ impl FantaCodeWorkspace {
             fnx_load_task: None,
             json_load_task: None,
             validation_task: None,
+            canvas_diff: None,
+            canvas_diff_task: None,
+            previous_fnx_diff: None,
+            canvas_diff_visible: false,
             source_save_in_progress: false,
             fnx_subscription: None,
             _item_subscription: item_subscription,
@@ -146,6 +164,190 @@ impl FantaCodeWorkspace {
         self.fnx_buffer
             .as_ref()
             .is_some_and(|buffer| buffer.read(cx).is_dirty())
+    }
+
+    pub(crate) fn has_source_conflict(&self, cx: &App) -> bool {
+        let item = self.item.read(cx);
+        item.has_conflict() || (item.is_dirty() && self.source_is_dirty(cx))
+    }
+
+    fn has_local_canvas_source_conflict(&self, cx: &App) -> bool {
+        let item = self.item.read(cx);
+        is_exclusively_local_canvas_source_conflict(
+            item.has_conflict(),
+            item.is_dirty(),
+            self.source_is_dirty(cx),
+        )
+    }
+
+    pub(crate) fn discard_source_edit(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.source_save_in_progress {
+            return Task::ready(Err(anyhow!(
+                "wait for the current FNX save to finish before discarding it"
+            )));
+        }
+        let Some(buffer) = self.fnx_buffer.clone() else {
+            self.item
+                .update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+            return Task::ready(Ok(()));
+        };
+        if !buffer.read(cx).is_dirty() {
+            self.item
+                .update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+            self.validation_task = None;
+            self.validation_message = None;
+            self.error_message = None;
+            cx.notify();
+            return Task::ready(Ok(()));
+        }
+
+        self.validation_task = None;
+        self.validation_message = Some("Discarding FNX changes…".into());
+        self.error_message = None;
+        let reload = self.project.update(cx, |project, cx| {
+            project.reload_buffers(std::iter::once(buffer.clone()).collect(), false, cx)
+        });
+        let item = self.item.clone();
+        cx.spawn(async move |this, cx| {
+            reload.await.context("reloading FNX from disk")?;
+            let source_is_dirty = buffer.read_with(cx, |buffer, _| buffer.is_dirty());
+            item.update(cx, |item, cx| {
+                item.set_source_edit_locked(source_is_dirty, cx)
+            });
+            this.update(cx, |this, cx| {
+                this.validation_message = None;
+                if source_is_dirty {
+                    this.error_message =
+                        Some("FNX changed again while its edits were being discarded.".into());
+                } else {
+                    this.error_message = None;
+                }
+                cx.notify();
+            })?;
+            if source_is_dirty {
+                Err(anyhow!("FNX changed while its edits were being discarded"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn current_canvas_source(&self, cx: &App) -> Result<String> {
+        let item = self.item.read(cx);
+        let document = item.doc().context("the canvas document is unavailable")?;
+        let root = self
+            .requested_page
+            .or_else(|| document.active_page())
+            .context("the current page is unavailable")?;
+        let root_node = document
+            .scene
+            .get(root)
+            .context("the current page root is unavailable")?;
+        let component_roots: HashSet<_> = document
+            .components
+            .defs
+            .values()
+            .map(|component| component.root)
+            .collect();
+        let nodes = document
+            .scene
+            .descendants_of(root)
+            .filter(|node| {
+                !component_roots.contains(node)
+                    && !document
+                        .scene
+                        .ancestors_of(*node)
+                        .any(|ancestor| component_roots.contains(&ancestor.id))
+            })
+            .filter_map(|node| document.scene.get(node))
+            .map(serde_json::to_value)
+            .collect::<serde_json::Result<Vec<_>>>()
+            .context("serializing the canvas page")?;
+        let function_name = root_node.name.trim();
+        let function_name = if function_name.is_empty() {
+            "Page"
+        } else {
+            function_name
+        };
+        let (source, _) = fanta_fnx::encode_subtree(&nodes, function_name)
+            .map_err(|error| anyhow!("encoding the canvas page as FNX: {error}"))?;
+        Ok(source)
+    }
+
+    fn show_canvas_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.has_local_canvas_source_conflict(cx) {
+            self.hide_canvas_diff(cx);
+            return;
+        }
+        let Some(buffer) = self.fnx_buffer.clone() else {
+            self.error_message = Some("The FNX buffer is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(editor) = self.fnx_editor.clone() else {
+            self.error_message = Some("The FNX editor is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let source = match self.current_canvas_source(cx) {
+            Ok(source) => source,
+            Err(error) => {
+                self.error_message =
+                    Some(format!("Could not compare with canvas: {error:#}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let buffer_snapshot = buffer.read(cx).text_snapshot();
+        let diff = self
+            .canvas_diff
+            .clone()
+            .unwrap_or_else(|| cx.new(|cx| BufferDiff::new(&buffer_snapshot, None, None, cx)));
+        if !self.canvas_diff_visible {
+            let multi_buffer = editor.read(cx).buffer().clone();
+            self.previous_fnx_diff = multi_buffer
+                .read(cx)
+                .diff_for(buffer_snapshot.remote_id())
+                .filter(|existing| existing.entity_id() != diff.entity_id());
+            multi_buffer.update(cx, |multi_buffer, cx| {
+                multi_buffer.add_diff(diff.clone(), cx);
+                multi_buffer.set_all_diff_hunks_expanded(cx);
+            });
+            self.canvas_diff_visible = true;
+        }
+        self.canvas_diff = Some(diff.clone());
+        self.canvas_diff_task = Some(diff.update(cx, |diff, cx| {
+            diff.set_base_text(Some(Arc::from(source)), buffer_snapshot, cx)
+        }));
+        cx.notify();
+    }
+
+    fn hide_canvas_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.canvas_diff_visible {
+            return;
+        }
+        let Some(buffer) = self.fnx_buffer.clone() else {
+            self.canvas_diff_visible = false;
+            self.previous_fnx_diff = None;
+            return;
+        };
+        let Some(editor) = self.fnx_editor.clone() else {
+            self.canvas_diff_visible = false;
+            self.previous_fnx_diff = None;
+            return;
+        };
+        let multi_buffer = editor.read(cx).buffer().clone();
+        if let Some(previous) = self.previous_fnx_diff.take() {
+            multi_buffer.update(cx, |multi_buffer, cx| {
+                multi_buffer.add_diff(previous, cx);
+            });
+        } else if let Some(diff) = self.canvas_diff.clone() {
+            let buffer_snapshot = buffer.read(cx).text_snapshot();
+            self.canvas_diff_task =
+                Some(diff.update(cx, |diff, cx| diff.set_base_text(None, buffer_snapshot, cx)));
+        }
+        self.canvas_diff_visible = false;
+        cx.notify();
     }
 
     /// Persist the dirty FNX buffer through the format layer's validated,
@@ -314,6 +516,10 @@ impl FantaCodeWorkspace {
                 self.json_editor = None;
                 self.fnx_subscription = None;
                 self.validation_task = None;
+                self.canvas_diff = None;
+                self.canvas_diff_task = None;
+                self.previous_fnx_diff = None;
+                self.canvas_diff_visible = false;
                 self.source_save_in_progress = false;
                 self.error_message = Some("This document has no page source to display.".into());
             }
@@ -333,6 +539,10 @@ impl FantaCodeWorkspace {
         self.fnx_load_task = None;
         self.json_load_task = None;
         self.validation_task = None;
+        self.canvas_diff = None;
+        self.canvas_diff_task = None;
+        self.previous_fnx_diff = None;
+        self.canvas_diff_visible = false;
         self.source_save_in_progress = false;
         self.fnx_subscription = None;
     }
@@ -357,6 +567,10 @@ impl FantaCodeWorkspace {
         self.fnx_editor = None;
         self.fnx_subscription = None;
         self.validation_task = None;
+        self.canvas_diff = None;
+        self.canvas_diff_task = None;
+        self.previous_fnx_diff = None;
+        self.canvas_diff_visible = false;
         self.loading_fnx = true;
         self.error_message = None;
         let open_task = self
@@ -429,12 +643,28 @@ impl FantaCodeWorkspace {
                 self.item.update(cx, |item, cx| {
                     item.set_source_edit_locked(source_is_dirty, cx)
                 });
+                if self.canvas_diff_visible {
+                    self.show_canvas_diff(cx);
+                }
                 self.schedule_source_validation(cx);
             }
             BufferEvent::Reloaded => {
-                self.item
-                    .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
-                self.schedule_source_validation(cx);
+                let source_is_dirty = buffer.read(cx).is_dirty();
+                self.item.update(cx, |item, cx| {
+                    item.set_source_edit_locked(source_is_dirty, cx)
+                });
+                if source_is_dirty {
+                    if self.canvas_diff_visible {
+                        self.show_canvas_diff(cx);
+                    }
+                    self.schedule_source_validation(cx);
+                } else {
+                    self.hide_canvas_diff(cx);
+                    self.validation_task = None;
+                    self.validation_message = None;
+                    self.error_message = None;
+                    cx.notify();
+                }
             }
             BufferEvent::Saved => {
                 if self.source_save_in_progress {
@@ -811,6 +1041,14 @@ impl FantaCodeWorkspace {
     }
 }
 
+fn is_exclusively_local_canvas_source_conflict(
+    has_project_conflict: bool,
+    canvas_is_dirty: bool,
+    source_is_dirty: bool,
+) -> bool {
+    !has_project_conflict && canvas_is_dirty && source_is_dirty
+}
+
 impl Focusable for FantaCodeWorkspace {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.active_editor()
@@ -821,6 +1059,8 @@ impl Focusable for FantaCodeWorkspace {
 
 impl Render for FantaCodeWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_conflict = self.has_source_conflict(cx);
+        let has_local_canvas_source_conflict = self.has_local_canvas_source_conflict(cx);
         let status = self
             .error_message
             .clone()
@@ -846,13 +1086,46 @@ impl Render for FantaCodeWorkspace {
                     .child(self.render_selector(cx))
                     .when_some(status, |this, (message, color)| {
                         this.child(
-                            Label::new(message)
-                                .size(LabelSize::Small)
-                                .color(color)
-                                .single_line(),
+                            div().flex_1().min_w_0().overflow_hidden().child(
+                                Label::new(message)
+                                    .size(LabelSize::Small)
+                                    .color(color)
+                                    .single_line(),
+                            ),
                         )
                     }),
             )
+            .when(has_conflict, |this| {
+                let conflict_message = if has_local_canvas_source_conflict {
+                    "Canvas and FNX source changed independently. Compare them before choosing Overwrite or Discard."
+                } else {
+                    "Project files changed on disk while this document had unsaved edits. Choose Overwrite to keep the current edits or Discard to reload the project."
+                };
+                this.child(
+                    h_flex()
+                        .flex_none()
+                        .min_h(px(38.0))
+                        .px_3()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(Color::Warning.color(cx))
+                        .bg(cx.theme().status().warning_background)
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Label::new(conflict_message).size(LabelSize::Small),
+                            ),
+                        )
+                        .when(has_local_canvas_source_conflict, |bar| {
+                            bar.child(
+                                Button::new("fanta-code-compare-canvas", "Compare with canvas")
+                                    .size(ButtonSize::Compact)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_canvas_diff(cx)
+                                    })),
+                            )
+                        }),
+                )
+            })
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
     }
 }
@@ -1011,6 +1284,190 @@ mod tests {
             page_json_path(root, page),
             root.join("pages").join(page.to_string()).join("page.json")
         );
+    }
+
+    #[test]
+    fn active_page_compare_is_hidden_when_an_external_project_conflict_coexists() {
+        assert!(is_exclusively_local_canvas_source_conflict(
+            false, true, true
+        ));
+        assert!(!is_exclusively_local_canvas_source_conflict(
+            true, true, true
+        ));
+        assert!(!is_exclusively_local_canvas_source_conflict(
+            false, true, false
+        ));
+    }
+
+    #[gpui::test]
+    async fn clean_fnx_reload_does_not_transiently_lock_the_canvas(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        write_project(temporary.path());
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        let buffer = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.fnx_buffer.clone().expect("FNX buffer")
+            })
+            .expect("read code workspace");
+        buffer.read_with(cx, |buffer, _| assert!(!buffer.is_dirty()));
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_fnx_buffer_event(buffer, &BufferEvent::Reloaded, window, cx);
+            })
+            .expect("handle clean reload");
+
+        item.read_with(cx, |item, _| assert!(!item.source_edit_locked()));
+        workspace
+            .read_with(cx, |workspace, _| {
+                assert!(workspace.validation_task.is_none());
+                assert!(workspace.validation_message.is_none());
+            })
+            .expect("read settled workspace");
+    }
+
+    #[gpui::test]
+    async fn canvas_diff_requires_local_divergence_and_uses_current_canvas_fnx_as_its_base(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source = std::fs::read_to_string(page_source_path(temporary.path(), page))
+            .expect("read generated FNX source");
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Original".into(),
+                    new: "Canvas edit".into(),
+                },
+                cx,
+            )
+        })
+        .expect("edit canvas");
+
+        workspace
+            .update(cx, |workspace, _window, cx| workspace.show_canvas_diff(cx))
+            .expect("ignore canvas-only comparison");
+        workspace
+            .read_with(cx, |workspace, _| assert!(!workspace.canvas_diff_visible))
+            .expect("read hidden canvas diff");
+
+        replace_workspace_source(
+            workspace,
+            source.replace("name=\"Original\"", "name=\"FNX edit\""),
+            cx,
+        );
+
+        workspace
+            .update(cx, |workspace, _window, cx| workspace.show_canvas_diff(cx))
+            .expect("show canvas diff");
+        cx.run_until_parked();
+        let diff = workspace
+            .read_with(cx, |workspace, _| {
+                assert!(workspace.canvas_diff_visible);
+                workspace.canvas_diff.clone().expect("canvas diff")
+            })
+            .expect("read code workspace");
+        diff.read_with(cx, |diff, cx| {
+            let base = diff.base_text_string(cx).expect("canvas FNX base text");
+            assert!(base.contains("name=\"Canvas edit\""));
+            assert!(base.contains("@jsxRuntime classic"));
+        });
+
+        workspace
+            .update(cx, |workspace, _window, cx| workspace.hide_canvas_diff(cx))
+            .expect("hide canvas diff");
+        cx.run_until_parked();
+        workspace
+            .read_with(cx, |workspace, _| assert!(!workspace.canvas_diff_visible))
+            .expect("read hidden canvas diff");
+    }
+
+    #[gpui::test]
+    async fn discarding_fnx_then_reloading_restores_disk_without_a_lock_error(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let original_source =
+            std::fs::read_to_string(&source_path).expect("read generated FNX source");
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        replace_workspace_source(
+            workspace,
+            original_source.replace("name=\"Original\"", "name=\"Discard me\""),
+            cx,
+        );
+        assert_eq!(page_name(&item, page, cx), "Discard me");
+        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
+
+        let discard = workspace
+            .update(cx, |workspace, _window, cx| {
+                workspace.discard_source_edit(cx)
+            })
+            .expect("start source discard");
+        discard.await.expect("discard source edit");
+        let reload = item.update(cx, |item, cx| item.reload_from_disk(cx));
+        reload.await.expect("reload canvas from disk");
+        cx.run_until_parked();
+
+        assert_eq!(page_name(&item, page, cx), "Original");
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(!item.has_conflict());
+        });
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(!workspace.source_is_dirty(cx));
+                assert!(workspace.validation_error().is_none());
+            })
+            .expect("read reconciled workspace");
+        assert_eq!(
+            std::fs::read_to_string(source_path).expect("source remains unchanged"),
+            original_source
+        );
+    }
+
+    #[gpui::test]
+    async fn simultaneous_canvas_and_fnx_edits_are_reported_as_a_conflict(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let original_source =
+            std::fs::read_to_string(&source_path).expect("read generated FNX source");
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Original".into(),
+                    new: "Canvas edit".into(),
+                },
+                cx,
+            )
+        })
+        .expect("canvas edit");
+        replace_workspace_source(
+            workspace,
+            original_source.replace("name=\"Original\"", "name=\"FNX edit\""),
+            cx,
+        );
+
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(workspace.source_is_dirty(cx));
+                assert!(workspace.has_source_conflict(cx));
+            })
+            .expect("read source conflict");
+        assert_eq!(page_name(&item, page, cx), "Canvas edit");
     }
 
     #[gpui::test]

@@ -1,7 +1,8 @@
 use std::cell::Cell;
 
 use fanta_doc::{
-    AnimationClipId, AnimationTrackId, Doc, Keyframe, KeyframeId, MotionTarget, Operation,
+    AnimationClipId, AnimationTrackId, Doc, Easing, Interpolation, Keyframe, KeyframeId,
+    MotionTarget, Operation,
 };
 
 use crate::timeline::TimelineKeyframeSelection;
@@ -44,6 +45,27 @@ impl MotionKeyframeDragSession {
     }
 
     pub(crate) fn preview(&mut self, doc: &mut Doc, time_us: i64) -> bool {
+        let Some(duration_ms) = doc
+            .motion
+            .clips
+            .get(&self.clip)
+            .map(|clip| clip.duration_ms)
+        else {
+            self.commit_allowed.set(false);
+            return false;
+        };
+        let time_ms = timeline_us_to_ms(time_us, duration_ms);
+        self.preview_update(doc, |keyframe| keyframe.time_ms = time_ms)
+    }
+
+    pub(crate) fn preview_easing(&mut self, doc: &mut Doc, easing: Easing) -> bool {
+        let Some(easing) = normalize_easing(easing) else {
+            return false;
+        };
+        self.preview_update(doc, |keyframe| keyframe.easing = easing)
+    }
+
+    fn preview_update(&mut self, doc: &mut Doc, update: impl FnOnce(&mut Keyframe)) -> bool {
         if !self.commit_allowed.get() {
             return false;
         }
@@ -51,10 +73,6 @@ impl MotionKeyframeDragSession {
             self.commit_allowed.set(false);
             return false;
         };
-        let time_ms = timeline_us_to_ms(time_us, clip.duration_ms);
-        if self.current.time_ms == time_ms {
-            return false;
-        }
         let Some(track) = clip.tracks.get_mut(&self.track) else {
             self.commit_allowed.set(false);
             return false;
@@ -71,7 +89,12 @@ impl MotionKeyframeDragSession {
             self.commit_allowed.set(false);
             return false;
         }
-        self.current.time_ms = time_ms;
+        let mut next = self.current.clone();
+        update(&mut next);
+        if next == self.current {
+            return false;
+        }
+        self.current = next;
         track.keyframes.insert(self.keyframe, self.current.clone());
         true
     }
@@ -116,6 +139,66 @@ impl MotionKeyframeDragSession {
                 new: Some(self.current.clone()),
             }
         })
+    }
+}
+
+pub(crate) fn set_keyframe_interpolation_operation(
+    doc: &Doc,
+    clip: AnimationClipId,
+    selection: &TimelineKeyframeSelection,
+    interpolation: Interpolation,
+) -> Option<Operation> {
+    edit_keyframe_operation(doc, clip, selection, |keyframe| {
+        keyframe.interpolation = interpolation
+    })
+}
+
+pub(crate) fn set_keyframe_easing_operation(
+    doc: &Doc,
+    clip: AnimationClipId,
+    selection: &TimelineKeyframeSelection,
+    easing: Easing,
+) -> Option<Operation> {
+    let easing = normalize_easing(easing)?;
+    edit_keyframe_operation(doc, clip, selection, |keyframe| keyframe.easing = easing)
+}
+
+fn edit_keyframe_operation(
+    doc: &Doc,
+    clip: AnimationClipId,
+    selection: &TimelineKeyframeSelection,
+    edit: impl FnOnce(&mut Keyframe),
+) -> Option<Operation> {
+    let track_id = selection.track_id.parse::<AnimationTrackId>().ok()?;
+    let keyframe_id = selection.keyframe_id.parse::<KeyframeId>().ok()?;
+    let track = doc.motion.clip(clip)?.tracks.get(&track_id)?;
+    let old = track.keyframes.get(&keyframe_id)?.clone();
+    let mut new = old.clone();
+    edit(&mut new);
+    (new != old).then_some(Operation::SetKeyframe {
+        clip,
+        track: track_id,
+        target: track.target,
+        keyframe: keyframe_id,
+        old: Some(old),
+        new: Some(new),
+    })
+}
+
+fn normalize_easing(easing: Easing) -> Option<Easing> {
+    match easing {
+        Easing::CubicBezier { x1, y1, x2, y2 } => {
+            if ![x1, y1, x2, y2].into_iter().all(f32::is_finite) {
+                return None;
+            }
+            Some(Easing::CubicBezier {
+                x1: x1.clamp(0.0, 1.0),
+                y1: y1.clamp(-10.0, 10.0),
+                x2: x2.clamp(0.0, 1.0),
+                y2: y2.clamp(-10.0, 10.0),
+            })
+        }
+        easing => Some(easing),
     }
 }
 
@@ -328,5 +411,93 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn easing_preview_clamps_points_and_commits_as_one_undo_step() {
+        let (mut doc, clip_id, track_id, keyframe_id, selection) = motion_doc();
+        let mut edit = MotionKeyframeDragSession::begin(&doc, clip_id, &selection)
+            .expect("keyframe easing session");
+        let requested = Easing::CubicBezier {
+            x1: -2.0,
+            y1: -20.0,
+            x2: 4.0,
+            y2: 20.0,
+        };
+
+        assert!(edit.preview_easing(&mut doc, requested));
+        let expected = Easing::CubicBezier {
+            x1: 0.0,
+            y1: -10.0,
+            x2: 1.0,
+            y2: 10.0,
+        };
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].easing,
+            expected
+        );
+        assert!(edit.restore(&mut doc));
+        doc.apply(edit.operation().expect("one easing operation"))
+            .expect("commit easing");
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].easing,
+            expected
+        );
+        assert!(doc.undo().expect("undo easing"));
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].easing,
+            Easing::EaseInOut
+        );
+        assert!(doc.redo().expect("redo easing"));
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].easing,
+            expected
+        );
+    }
+
+    #[test]
+    fn invalid_easing_does_not_poison_a_live_edit_session() {
+        let (mut doc, clip_id, track_id, keyframe_id, selection) = motion_doc();
+        let mut edit = MotionKeyframeDragSession::begin(&doc, clip_id, &selection)
+            .expect("keyframe easing session");
+
+        assert!(!edit.preview_easing(
+            &mut doc,
+            Easing::CubicBezier {
+                x1: f32::NAN,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+            }
+        ));
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].easing,
+            Easing::EaseInOut
+        );
+        assert!(edit.preview_easing(&mut doc, Easing::EaseOut));
+        assert!(edit.operation().is_some());
+    }
+
+    #[test]
+    fn interpolation_and_preset_easing_build_reversible_keyframe_operations() {
+        let (mut doc, clip_id, track_id, keyframe_id, selection) = motion_doc();
+        let interpolation =
+            set_keyframe_interpolation_operation(&doc, clip_id, &selection, Interpolation::Hold)
+                .expect("interpolation operation");
+        doc.apply(interpolation).expect("set interpolation");
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].interpolation,
+            Interpolation::Hold
+        );
+        assert!(doc.undo().expect("undo interpolation"));
+
+        let easing = set_keyframe_easing_operation(&doc, clip_id, &selection, Easing::EaseIn)
+            .expect("easing operation");
+        doc.apply(easing).expect("set easing");
+        assert_eq!(
+            doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].easing,
+            Easing::EaseIn
+        );
+        assert!(doc.undo().expect("undo easing"));
     }
 }

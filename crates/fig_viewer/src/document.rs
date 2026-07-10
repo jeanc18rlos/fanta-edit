@@ -701,6 +701,17 @@ impl FigItem {
                 "save or discard the current FNX edit before reloading the canvas"
             )));
         }
+        self.reload_from_disk_unchecked(cx)
+    }
+
+    pub(crate) fn discard_canvas_edits_for_source_resolution(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.reload_from_disk_unchecked(cx)
+    }
+
+    fn reload_from_disk_unchecked(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let Some(root) = self.project_root.clone() else {
             return Task::ready(Ok(()));
         };

@@ -1,14 +1,9 @@
 //! Mutation half of the Fanta properties panel: free functions that turn a
 //! committed field edit into document [`Operation`]s, transient-preview
 //! plumbing for scrubs and picker sessions, direct `NodeData` mutators shared
-//! by those builders, the PNG export job, and the panel's number/color
-//! formatting helpers. The read-only snapshot model lives in
-//! `properties_snapshot`.
+//! by those builders, and the panel's number/color formatting helpers. The
+//! read-only snapshot model lives in `properties_snapshot`.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
-use anyhow::{Context as _, Result};
 use fanta_canvas::{
     HAlign, ResizeHandle, VAlign, align_to_bounds_h, align_to_bounds_v, resize_box_keep_rotation,
     resize_transform_keep_rotation, rotate_about, transform_angle,
@@ -17,9 +12,8 @@ use fanta_doc::{
     BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor, ComponentId,
     ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill, Gradient, GroupNode,
     LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, TextAutoResize,
-    Transform2D, UnitInterval, VarValue, VariantAxis, Viewport, expand_instance,
+    Transform2D, UnitInterval, VarValue, VariantAxis, expand_instance,
 };
-use fanta_render::{AssetResolver, RasterRenderer, RenderInputs};
 use glam::DVec2;
 use gpui::Rgba;
 use smallvec::SmallVec;
@@ -29,10 +23,6 @@ use crate::properties_snapshot::{
     CornerRadiusValue, FONT_WEIGHTS, InspectorField, NodeSnapshot, PaintKind, auto_layout_snapshot,
     corner_radius_value, corner_smoothing_value, master_roots, resolved_instance_def,
 };
-
-/// Cap on either export dimension: bounds this large produce surfaces Skia (and
-/// memory) cannot reasonably back, so the export zoom is reduced to fit instead.
-pub(crate) const MAX_EXPORT_PIXELS: u32 = 8192;
 
 pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217);
 
@@ -289,6 +279,12 @@ pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) ->
         InspectorField::LayoutGapV(id) => layout_gap_operations(doc, *id, text, false),
         InspectorField::LayoutPadH(id) => layout_padding_operations(doc, *id, text, true),
         InspectorField::LayoutPadV(id) => layout_padding_operations(doc, *id, text, false),
+        InspectorField::LayoutMinWidth(id) => layout_limit_operations(doc, *id, text, true, true),
+        InspectorField::LayoutMaxWidth(id) => layout_limit_operations(doc, *id, text, true, false),
+        InspectorField::LayoutMinHeight(id) => layout_limit_operations(doc, *id, text, false, true),
+        InspectorField::LayoutMaxHeight(id) => {
+            layout_limit_operations(doc, *id, text, false, false)
+        }
         InspectorField::EffectOffsetX { id, index } => {
             let index = *index;
             parse_number(text)
@@ -476,6 +472,21 @@ pub(crate) fn read_field_text(doc: &Doc, field: &InspectorField) -> Option<Strin
             };
             Some(pad.map(format_number).unwrap_or_default())
         }
+        InspectorField::LayoutMinWidth(id)
+        | InspectorField::LayoutMaxWidth(id)
+        | InspectorField::LayoutMinHeight(id)
+        | InspectorField::LayoutMaxHeight(id) => {
+            let node = scene.get(*id)?;
+            let layout = auto_layout_snapshot(node)?;
+            let value = match field {
+                InspectorField::LayoutMinWidth(_) => layout.min_width,
+                InspectorField::LayoutMaxWidth(_) => layout.max_width,
+                InspectorField::LayoutMinHeight(_) => layout.min_height,
+                InspectorField::LayoutMaxHeight(_) => layout.max_height,
+                _ => return None,
+            };
+            Some(value.map(format_number).unwrap_or_default())
+        }
         InspectorField::EffectOffsetX { id, index } => {
             effect_value(scene, *id, *index, |shadow| shadow.offset[0])
         }
@@ -535,6 +546,35 @@ pub(crate) fn replace_data_operation(
         old: Box::new(old),
         new: Box::new(new),
     }]
+}
+
+pub(crate) fn set_clip_content_meta_operation(
+    doc: &Doc,
+    id: NodeId,
+    enabled: bool,
+) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    let old = node.meta.clone();
+    let mut new = match &old {
+        serde_json::Value::Object(map) => serde_json::Value::Object(map.clone()),
+        _ => serde_json::json!({}),
+    };
+    let Some(meta) = new.as_object_mut() else {
+        return Vec::new();
+    };
+    if enabled {
+        // Presence historically meant clipping enabled. Keep authored files
+        // compatible by using that canonical default rather than storing true.
+        meta.remove("clip_content");
+    } else {
+        meta.insert("clip_content".to_string(), serde_json::Value::Bool(false));
+    }
+    (new != old)
+        .then_some(Operation::SetMeta { id, old, new })
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn effects_operations(
@@ -837,6 +877,53 @@ pub(crate) fn layout_padding_operations(
                 layout.padding[0] = padding;
                 layout.padding[2] = padding;
             }
+        }
+    })
+}
+
+pub(crate) fn layout_limit_operations(
+    doc: &Doc,
+    id: NodeId,
+    text: &str,
+    horizontal: bool,
+    minimum: bool,
+) -> Vec<Operation> {
+    let value = if text.trim().is_empty() {
+        None
+    } else {
+        let Some(value) = parse_number(text).map(|value| value.max(0.0)) else {
+            return Vec::new();
+        };
+        Some(value)
+    };
+    replace_data_operation(doc, id, |data| {
+        if let NodeData::Group(group) = data
+            && let Some(layout) = group.auto_layout.as_mut()
+        {
+            let [mut minimum_width, mut minimum_height] = layout.min_size;
+            let [mut maximum_width, mut maximum_height] = layout.max_size;
+            let (minimum_limit, maximum_limit) = if horizontal {
+                (&mut minimum_width, &mut maximum_width)
+            } else {
+                (&mut minimum_height, &mut maximum_height)
+            };
+            if minimum {
+                *minimum_limit = value;
+                if let (Some(minimum), Some(maximum)) = (*minimum_limit, *maximum_limit)
+                    && maximum < minimum
+                {
+                    *maximum_limit = Some(minimum);
+                }
+            } else {
+                *maximum_limit = value;
+                if let (Some(minimum), Some(maximum)) = (*minimum_limit, *maximum_limit)
+                    && minimum > maximum
+                {
+                    *minimum_limit = Some(maximum);
+                }
+            }
+            layout.min_size = [minimum_width, minimum_height];
+            layout.max_size = [maximum_width, maximum_height];
         }
     })
 }
@@ -1275,87 +1362,6 @@ pub(crate) fn default_shadow() -> Shadow {
 /// Figma's default blur radius for a freshly added layer / background blur.
 pub(crate) fn default_blur(kind: BlurKind) -> Blur {
     Blur { kind, radius: 4.0 }
-}
-
-// =============================================================================
-// PNG export
-// =============================================================================
-
-pub(crate) struct ExportJob {
-    pub(crate) doc: Doc,
-    pub(crate) asset_resolver: Option<Arc<dyn AssetResolver>>,
-    /// Subtree to render: the selected node, the page root, or `None` for
-    /// every root (a document without explicit pages).
-    pub(crate) root: Option<NodeId>,
-    pub(crate) name: String,
-    pub(crate) bounds: FantaBounds,
-    pub(crate) project_root: PathBuf,
-}
-
-pub(crate) fn run_png_export(job: &ExportJob) -> Result<PathBuf> {
-    const EXPORT_SCALE: f64 = 2.0;
-    let width = ((job.bounds.width() * EXPORT_SCALE).ceil() as u32).clamp(1, MAX_EXPORT_PIXELS);
-    let height = ((job.bounds.height() * EXPORT_SCALE).ceil() as u32).clamp(1, MAX_EXPORT_PIXELS);
-    // When a dimension got clamped, shrink the zoom so the whole subject
-    // still fits in frame instead of cropping it.
-    let zoom = (f64::from(width) / job.bounds.width())
-        .min(f64::from(height) / job.bounds.height())
-        .min(EXPORT_SCALE);
-
-    let mut renderer = RasterRenderer::new(width, height)
-        .map_err(|error| anyhow::anyhow!("creating {width}x{height} export surface: {error}"))?;
-    if let Some(asset_resolver) = job.asset_resolver.clone() {
-        renderer.set_asset_resolver(asset_resolver);
-    }
-    let center = job.bounds.center();
-    let viewport = Viewport {
-        center: [center.x, center.y],
-        zoom,
-    };
-    let inputs = RenderInputs {
-        components: &job.doc.components,
-        variables: &job.doc.variables,
-        active_modes: &job.doc.active_modes,
-        mode_generation: 0,
-        motion: None,
-        playback: None,
-        dark_ui: false,
-    };
-    renderer.render_page_with(&job.doc.scene, &viewport, job.root, &inputs);
-    let png = renderer
-        .encode_png()
-        .map_err(|error| anyhow::anyhow!("encoding export PNG: {error}"))?;
-
-    let exports_dir = job.project_root.join("exports");
-    std::fs::create_dir_all(&exports_dir)
-        .with_context(|| format!("creating {}", exports_dir.display()))?;
-    let path = exports_dir.join(format!("{}.png", sanitize_file_name(&job.name)));
-    std::fs::write(&path, png).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
-}
-
-pub(crate) fn sanitize_file_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|character| {
-            if character.is_control()
-                || matches!(
-                    character,
-                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
-                )
-            {
-                '-'
-            } else {
-                character
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim().trim_matches('.');
-    if trimmed.is_empty() {
-        "export".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 // =============================================================================

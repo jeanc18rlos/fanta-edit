@@ -9,8 +9,8 @@ use fanta_doc::{NodeData, NodeId};
 use glam::DVec2;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, ElementInputHandler,
-    EntityInputHandler, KeyDownEvent, MouseDownEvent, Pixels, Point, UTF16Selection, Window,
-    canvas, fill, point, px, size,
+    EntityInputHandler, KeyDownEvent, MouseDownEvent, PathBuilder, Pixels, Point, UTF16Selection,
+    Window, canvas, fill, point, px, size,
 };
 use ui::prelude::*;
 
@@ -820,6 +820,7 @@ impl FigView {
                     (bottom.y - top.y).abs().max(1.0),
                 ])
             });
+        let baseline = text_edit::session_baseline_segment(doc, session, &viewport, screen_size);
 
         // The selection/caret rects from the helpers are in "viewport screen"
         // space (0,0 at top-left of the container's content area). The overlay
@@ -848,6 +849,23 @@ impl FigView {
                         }),
                         |window| {
                             let offset = container_origin;
+                            if let Some((start, end)) = baseline {
+                                let mut builder = PathBuilder::stroke(px(1.));
+                                builder.move_to(point(
+                                    offset.x + px(start.x as f32),
+                                    offset.y + px(start.y as f32),
+                                ));
+                                builder.line_to(point(
+                                    offset.x + px(end.x as f32),
+                                    offset.y + px(end.y as f32),
+                                ));
+                                match builder.build() {
+                                    Ok(path) => window.paint_path(path, caret_color),
+                                    Err(error) => {
+                                        log::warn!("failed to build text baseline guide: {error:#}")
+                                    }
+                                }
+                            }
                             for rect in selection_rects {
                                 let rect = Bounds {
                                     origin: offset + rect.origin,

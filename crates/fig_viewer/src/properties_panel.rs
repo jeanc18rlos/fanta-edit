@@ -5,7 +5,6 @@
 //! picker.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -21,8 +20,8 @@ use fanta_text::TextBuffer;
 use fs::Fs;
 use gpui::{
     App, AsyncWindowContext, Bounds, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyDownEvent, Pixels, Point, ScrollHandle, Subscription, WeakEntity, Window,
-    actions, px,
+    Focusable, KeyDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, Task,
+    WeakEntity, Window, actions, px,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::Divider;
@@ -39,14 +38,16 @@ use crate::component_properties::{
     set_component_property_binding_operations,
 };
 use crate::document::{DocChange, FigItem};
+use crate::export::{prepare_png_export_jobs, run_png_export_jobs};
 use crate::inspector_widgets::{PanelDrag, TextDecorationGlyph, scrub_value, track_value};
+use crate::mode_overrides::mode_override_operation;
 use crate::panel_settings::FantaPropertiesPanelSettings;
 use crate::properties_ops::{
-    ExportJob, add_fill, apply_preview_operation, blurs_operations, combine_as_variants_operations,
+    add_fill, apply_preview_operation, blurs_operations, combine_as_variants_operations,
     convert_paint_kind, default_blur, default_shadow, detach_instance_operations,
     effects_operations, field_operations, finite_transform_operations, format_number,
     paint_slot_mut, parse_number, read_field_text, remove_fill, replace_data_operation,
-    restore_snapshot, run_png_export, set_paint_gradient, stroke_list_mut,
+    restore_snapshot, set_clip_content_meta_operation, set_paint_gradient, stroke_list_mut,
     variant_select_operations,
 };
 use crate::properties_snapshot::{
@@ -125,6 +126,19 @@ pub(crate) struct GradientSession {
     _subscription: Subscription,
 }
 
+#[derive(Clone)]
+struct ExportFeedback {
+    message: SharedString,
+    kind: ExportFeedbackKind,
+}
+
+#[derive(Clone, Copy)]
+enum ExportFeedbackKind {
+    Running,
+    Success,
+    Error,
+}
+
 pub struct FantaPropertiesPanel {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) fs: Arc<dyn Fs>,
@@ -171,6 +185,8 @@ pub struct FantaPropertiesPanel {
     /// swatch toggle its popover shut. Only one popover is open at a time, so a
     /// single flag covers both the color and gradient swatches.
     pub(crate) swatch_press_dismissed: bool,
+    export_feedback: Option<ExportFeedback>,
+    export_task: Option<Task<()>>,
     pub(crate) _subscriptions: Vec<Subscription>,
     pub(crate) _active_view_subscription: Option<Subscription>,
 }
@@ -271,6 +287,8 @@ impl FantaPropertiesPanel {
             picker: None,
             gradient_editor: None,
             swatch_press_dismissed: false,
+            export_feedback: None,
+            export_task: None,
             _subscriptions: subscriptions,
             _active_view_subscription: None,
         };
@@ -364,6 +382,8 @@ impl FantaPropertiesPanel {
                     self.content_scroll.set_offset(gpui::Point::default());
                     self.corner_radii_expanded = None;
                     self.hidden_paint_alpha.clear();
+                    self.export_feedback = None;
+                    self.export_task = None;
                 }
             }
             None => {
@@ -386,6 +406,7 @@ impl FantaPropertiesPanel {
         self.content_scroll.set_offset(gpui::Point::default());
         self.corner_radii_expanded = None;
         self.hidden_paint_alpha.clear();
+        self.export_feedback = None;
     }
 
     fn active_view(&self, _cx: &App) -> Option<Entity<FigView>> {
@@ -1034,15 +1055,31 @@ impl FantaPropertiesPanel {
             let local_size = doc
                 .scene
                 .local_bounds(id)
-                .map(|bounds| [bounds.width(), bounds.height()]);
-            replace_data_operation(doc, id, move |data| {
+                .map(|bounds| [bounds.width(), bounds.height()])
+                .unwrap_or([0.0, 0.0]);
+            let needs_size_box = doc.scene.get(id).is_some_and(
+                |node| matches!(&node.data, NodeData::Group(group) if group.clip_size.is_none()),
+            );
+            let was_clipping = doc.scene.get(id).is_some_and(|node| {
+                matches!(&node.data, NodeData::Group(group) if group.clip_size.is_some())
+                    && node
+                        .meta
+                        .get("clip_content")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(true)
+            });
+            let mut operations = replace_data_operation(doc, id, move |data| {
                 if let NodeData::Group(group) = data {
                     group.auto_layout = enable.then(AutoLayout::default);
                     if enable && group.clip_size.is_none() {
-                        group.clip_size = local_size;
+                        group.clip_size = Some(local_size);
                     }
                 }
-            })
+            });
+            if enable && needs_size_box && !was_clipping {
+                operations.extend(set_clip_content_meta_operation(doc, id, false));
+            }
+            operations
         });
     }
 
@@ -1151,19 +1188,33 @@ impl FantaPropertiesPanel {
 
     pub(crate) fn toggle_clip_content(&mut self, id: NodeId, cx: &mut Context<Self>) {
         self.apply_document_ops(cx, move |doc| {
+            let Some(node) = doc.scene.get(id) else {
+                return Vec::new();
+            };
+            let NodeData::Group(group) = &node.data else {
+                return Vec::new();
+            };
+            let currently_clips = group.clip_size.is_some()
+                && node
+                    .meta
+                    .get("clip_content")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
             let local_size = doc
                 .scene
                 .local_bounds(id)
                 .map(|bounds| [bounds.width(), bounds.height()])
                 .unwrap_or([0.0, 0.0]);
-            replace_data_operation(doc, id, |data| {
-                if let NodeData::Group(group) = data {
-                    group.clip_size = match group.clip_size {
-                        Some(_) => None,
-                        None => Some(local_size),
-                    };
-                }
-            })
+            let mut operations = Vec::new();
+            if !currently_clips && group.clip_size.is_none() {
+                operations.extend(replace_data_operation(doc, id, |data| {
+                    if let NodeData::Group(group) = data {
+                        group.clip_size = Some(local_size);
+                    }
+                }));
+            }
+            operations.extend(set_clip_content_meta_operation(doc, id, !currently_clips));
+            operations
         });
     }
 
@@ -1288,6 +1339,25 @@ impl FantaPropertiesPanel {
         });
     }
 
+    pub(crate) fn set_mode_override(
+        &mut self,
+        scope: fanta_doc::ModeScope,
+        collection: fanta_doc::VariableCollectionId,
+        mode: Option<fanta_doc::ModeId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_document_ops(cx, move |doc| {
+            match mode_override_operation(doc, scope, collection, mode) {
+                Ok(Some(operation)) => vec![operation],
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    log::error!("setting variable mode override failed: {error}");
+                    Vec::new()
+                }
+            }
+        });
+    }
+
     pub(crate) fn select_variant_axis(
         &mut self,
         id: NodeId,
@@ -1376,72 +1446,140 @@ impl FantaPropertiesPanel {
 
     // === Export ===========================================================
 
-    /// Render the selected node (or the whole page when nothing is selected)
-    /// at 2x into `<project_root>/exports/<name>.png` on a background thread.
+    /// Render every selected node (or the whole page when nothing is selected)
+    /// at 2x into the project's `exports` directory on a background thread.
     pub(crate) fn export_png(&mut self, cx: &mut Context<Self>) {
         let Some(view) = self.active_view(cx) else {
+            self.show_export_error("The canvas is no longer available.", cx);
             return;
         };
         let (item, selected_page_index) = {
             let view = view.read(cx);
             (view.item().clone(), view.selected_page_index())
         };
-        let job = {
+        let jobs = {
             let item = item.read(cx);
-            let Some(project_root) = item.project_root().map(PathBuf::from) else {
-                log::error!("Fanta PNG export requires a Fanta project on disk");
+            let Some(project_root) = item.project_root().map(|path| path.to_path_buf()) else {
+                self.show_export_error("Save this canvas as a Fanta project before exporting.", cx);
                 return;
             };
             let Some(document) = item.document() else {
+                self.show_export_error("The document is not ready to export.", cx);
                 return;
             };
-            let doc = &document.doc;
-            let selected = doc
-                .selection
-                .iter()
-                .copied()
-                .find(|id| doc.scene.contains(*id));
-            let (root, name, bounds) = match selected {
-                Some(id) => {
-                    let Some(bounds) = doc.scene.world_bounds(id).filter(|bounds| {
-                        bounds.is_finite() && bounds.width() > 0.0 && bounds.height() > 0.0
-                    }) else {
-                        log::error!("Fanta PNG export skipped: the selected node has no bounds");
-                        return;
-                    };
-                    let name = doc
-                        .scene
-                        .get(id)
-                        .map(|node| node.name.clone())
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| "Untitled".to_string());
-                    (Some(id), name, bounds)
-                }
-                None => {
-                    let page = document.page(selected_page_index);
-                    let root = page.and_then(|page| page.root);
-                    let name = page
-                        .map(|page| page.name.to_string())
-                        .unwrap_or_else(|| "Page".to_string());
-                    (root, name, crate::document::page_bounds(doc, root))
-                }
-            };
-            ExportJob {
-                doc: doc.clone(),
-                asset_resolver: document.asset_resolver.clone(),
-                root,
-                name,
-                bounds,
+            prepare_png_export_jobs(
+                &document.doc,
+                document.asset_resolver.clone(),
+                document.page(selected_page_index),
                 project_root,
+            )
+        };
+        let jobs = match jobs {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                self.show_export_error(format!("Export failed: {error:#}"), cx);
+                return;
             }
         };
-        cx.background_spawn(async move {
-            match run_png_export(&job) {
-                Ok(path) => log::info!("Fanta PNG export written to {}", path.display()),
-                Err(error) => log::error!("Fanta PNG export failed: {error:#}"),
+
+        let job_count = jobs.len();
+        self.export_feedback = Some(ExportFeedback {
+            message: if job_count == 1 {
+                "Exporting PNG…".into()
+            } else {
+                format!("Exporting {job_count} PNG files…").into()
+            },
+            kind: ExportFeedbackKind::Running,
+        });
+        cx.notify();
+        self.export_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { run_png_export_jobs(jobs) })
+                .await;
+            if let Err(update_error) = this.update(cx, |this, cx| {
+                this.export_task = None;
+                match result {
+                    Ok(paths) => {
+                        for path in &paths {
+                            log::info!("Fanta PNG export written to {}", path.display());
+                        }
+                        let message = if let [path] = paths.as_slice() {
+                            format!("Exported {}", path.display())
+                        } else {
+                            let directory = paths
+                                .first()
+                                .and_then(|path| path.parent())
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "the exports directory".to_string());
+                            format!("Exported {} PNG files to {directory}", paths.len())
+                        };
+                        this.export_feedback = Some(ExportFeedback {
+                            message: message.into(),
+                            kind: ExportFeedbackKind::Success,
+                        });
+                    }
+                    Err(error) => {
+                        log::error!("Fanta PNG export failed: {error:#}");
+                        this.export_feedback = Some(ExportFeedback {
+                            message: format!("Export failed: {error:#}").into(),
+                            kind: ExportFeedbackKind::Error,
+                        });
+                    }
+                }
+                cx.notify();
+            }) {
+                log::debug!("dropping PNG export result for a closed inspector: {update_error:#}");
             }
-        })
-        .detach();
+        }));
+    }
+
+    fn show_export_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
+        log::error!("Fanta PNG export failed: {message}");
+        self.export_feedback = Some(ExportFeedback {
+            message,
+            kind: ExportFeedbackKind::Error,
+        });
+        cx.notify();
+    }
+
+    fn render_export_block(
+        &self,
+        can_export: bool,
+        preview_icon: Option<IconName>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let feedback = self.export_feedback.clone();
+        v_flex()
+            .child(self.render_export_section(
+                can_export && self.export_task.is_none(),
+                preview_icon,
+                cx,
+            ))
+            .when_some(feedback, |section, feedback| {
+                let (icon, color) = match feedback.kind {
+                    ExportFeedbackKind::Running => (IconName::ArrowCircle, Color::Info),
+                    ExportFeedbackKind::Success => (IconName::Check, Color::Success),
+                    ExportFeedbackKind::Error => (IconName::XCircle, Color::Error),
+                };
+                section.child(
+                    h_flex()
+                        .px_4()
+                        .pb_2()
+                        .min_w_0()
+                        .items_start()
+                        .gap_2()
+                        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                        .child(
+                            Label::new(feedback.message)
+                                .flex_1()
+                                .line_clamp(3)
+                                .size(LabelSize::XSmall)
+                                .color(color),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     // === Inline editing ===================================================
@@ -2303,6 +2441,10 @@ impl Render for FantaPropertiesPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let render_started = std::time::Instant::now();
         let snapshot = self.build_snapshot(cx);
+        let can_export = self.active_item(cx).is_some_and(|item| {
+            let item = item.read(cx);
+            item.project_root().is_some() && item.document().is_some()
+        });
         crate::report_slow("properties panel snapshot", render_started);
 
         // A scrub whose drag ended outside the panel gets no drop event; the
@@ -2356,7 +2498,12 @@ impl Render for FantaPropertiesPanel {
                         ));
                         sections.push(self.render_align_section(selection_len, editable, cx));
                         sections.push(self.render_page_properties(&page, editable, cx));
-                        sections.push(self.render_export_section(editable, None, cx));
+                        if let Some(section) =
+                            self.render_mode_overrides_section(page.id, editable, window, cx)
+                        {
+                            sections.push(section);
+                        }
+                        sections.push(self.render_export_block(can_export, None, cx));
                     }
                     InspectorBody::Node(node) => {
                         use NodeKind::*;
@@ -2438,6 +2585,12 @@ impl Render for FantaPropertiesPanel {
                             sections
                                 .push(self.render_layout_section(id, layout, editable, window, cx));
                         }
+                        if matches!(kind, Frame | Group | Component)
+                            && let Some(section) =
+                                self.render_mode_overrides_section(Some(id), editable, window, cx)
+                        {
+                            sections.push(section);
+                        }
                         // A master is never a child of an auto-layout frame in
                         // the scene sense the inspector cares about.
                         if kind != Component
@@ -2494,8 +2647,8 @@ impl Render for FantaPropertiesPanel {
                         if !node.bindings.is_empty() {
                             sections.push(self.render_bindings_section(&node.bindings));
                         }
-                        sections.push(self.render_export_section(
-                            editable,
+                        sections.push(self.render_export_block(
+                            can_export,
                             Some(node.type_icon),
                             cx,
                         ));
@@ -2519,6 +2672,7 @@ impl Render for FantaPropertiesPanel {
                             sections
                                 .push(self.render_combine_variants_section(multi.master_count, cx));
                         }
+                        sections.push(self.render_export_block(can_export, None, cx));
                     }
                 }
                 for section in sections {
@@ -2785,6 +2939,35 @@ mod panel_integration_tests {
         init_test(cx);
         let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
         draw(harness.panel, cx);
+    }
+
+    #[gpui::test]
+    async fn export_action_writes_every_selected_layer_and_reports_completion(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.vector_id, harness.text_id], cx);
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.export_png(cx))
+            .expect("export action is dispatched");
+        cx.run_until_parked();
+
+        let exports = harness._temp.path().join("exports");
+        assert!(exports.join("Gradient Rect.png").is_file());
+        assert!(exports.join("Label.png").is_file());
+        harness
+            .panel
+            .read_with(cx, |panel, _| {
+                assert!(panel.export_task.is_none());
+                assert!(matches!(
+                    panel.export_feedback.as_ref().map(|feedback| feedback.kind),
+                    Some(ExportFeedbackKind::Success)
+                ));
+            })
+            .expect("properties panel remains open");
     }
 
     #[gpui::test]
@@ -4290,7 +4473,7 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
-    async fn enabling_auto_layout_on_a_clip_less_group_seeds_its_clip_box(cx: &mut TestAppContext) {
+    async fn auto_layout_and_clip_toggle_keep_frame_geometry_independent(cx: &mut TestAppContext) {
         init_test(cx);
         // The page root is a plain Group (no clip_size, no background) with two
         // children — exactly the clip-less group the review flagged.
@@ -4341,27 +4524,163 @@ mod panel_integration_tests {
 
         // Enabling auto layout must seed a clip box from the content bounds, or
         // a later Hug sizing would collapse it to zero and hide every child.
-        let (has_auto_layout, clip_size) = harness._view.read_with(cx, |view, cx| {
-            match &view
-                .item()
-                .read(cx)
-                .document()
-                .unwrap()
-                .doc
-                .scene
-                .get(page_id)
-                .unwrap()
-                .data
-            {
-                NodeData::Group(group) => (group.auto_layout.is_some(), group.clip_size),
-                _ => unreachable!(),
-            }
-        });
+        let (has_auto_layout, clip_size, clip_content, inspector_clip) =
+            harness._view.read_with(cx, |view, cx| {
+                let item = view.item().read(cx);
+                let node = item
+                    .document()
+                    .expect("ready")
+                    .doc
+                    .scene
+                    .get(page_id)
+                    .expect("page");
+                let NodeData::Group(group) = &node.data else {
+                    panic!("the page root is a group");
+                };
+                (
+                    group.auto_layout.is_some(),
+                    group.clip_size,
+                    node.meta
+                        .get("clip_content")
+                        .and_then(|value| value.as_bool()),
+                    crate::properties_snapshot::layout_snapshot(node)
+                        .expect("layout snapshot")
+                        .clip,
+                )
+            });
         assert!(has_auto_layout, "auto layout is enabled");
         let clip = clip_size.expect("clip_size is seeded when auto layout is enabled");
         assert!(
-            clip[0] > 0.0 && clip[1] > 0.0,
+            clip.into_iter().all(|extent| extent > 0.0),
             "the seeded clip box wraps the content instead of collapsing to zero: {clip:?}"
         );
+        assert_eq!(clip_content, Some(false));
+        assert!(
+            !inspector_clip,
+            "adding layout preserves unclipped overflow"
+        );
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.toggle_clip_content(page_id, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let enabled = harness._view.read_with(cx, |view, cx| {
+            let item = view.item().read(cx);
+            let node = item.document().unwrap().doc.scene.get(page_id).unwrap();
+            let NodeData::Group(group) = &node.data else {
+                panic!("the page root is a group");
+            };
+            (
+                group.clip_size,
+                group.auto_layout,
+                crate::properties_snapshot::layout_snapshot(node)
+                    .unwrap()
+                    .clip,
+            )
+        });
+        assert_eq!(enabled.0, Some(clip));
+        assert!(enabled.1.is_some());
+        assert!(enabled.2);
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.toggle_clip_content(page_id, cx))
+            .unwrap();
+        cx.run_until_parked();
+        let disabled = harness._view.read_with(cx, |view, cx| {
+            let item = view.item().read(cx);
+            let node = item.document().unwrap().doc.scene.get(page_id).unwrap();
+            let NodeData::Group(group) = &node.data else {
+                panic!("the page root is a group");
+            };
+            (
+                group.clip_size,
+                group.auto_layout,
+                crate::properties_snapshot::layout_snapshot(node)
+                    .unwrap()
+                    .clip,
+            )
+        });
+        assert_eq!(disabled.0, Some(clip));
+        assert_eq!(disabled.1, enabled.1);
+        assert!(!disabled.2);
+    }
+
+    #[gpui::test]
+    async fn auto_layout_min_max_fields_are_editable_and_normalized(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let page_id = harness._view.read_with(cx, |view, cx| {
+            view.item()
+                .read(cx)
+                .document()
+                .expect("ready")
+                .doc
+                .pages()
+                .first()
+                .copied()
+                .expect("one page")
+        });
+        harness.select(&[page_id], cx);
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_auto_layout(page_id, true, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.apply_document_ops(cx, |doc| {
+                    field_operations(doc, &InspectorField::LayoutMinWidth(page_id), "500")
+                });
+            })
+            .unwrap();
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.apply_document_ops(cx, |doc| {
+                    field_operations(doc, &InspectorField::LayoutMaxWidth(page_id), "300")
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let limits = harness._view.read_with(cx, |view, cx| {
+            let item = view.item().read(cx);
+            let node = item.document().unwrap().doc.scene.get(page_id).unwrap();
+            let NodeData::Group(group) = &node.data else {
+                panic!("the page root is a group");
+            };
+            let layout = group.auto_layout.expect("auto layout");
+            (layout.min_size, layout.max_size)
+        });
+        let [minimum_width, _] = limits.0;
+        let [maximum_width, _] = limits.1;
+        assert_eq!(minimum_width, Some(300.0));
+        assert_eq!(maximum_width, Some(300.0));
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.apply_document_ops(cx, |doc| {
+                    field_operations(doc, &InspectorField::LayoutMinWidth(page_id), "")
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let minimum = harness._view.read_with(cx, |view, cx| {
+            let item = view.item().read(cx);
+            let node = item.document().unwrap().doc.scene.get(page_id).unwrap();
+            let NodeData::Group(group) = &node.data else {
+                panic!("the page root is a group");
+            };
+            let [minimum_width, _] = group.auto_layout.expect("auto layout").min_size;
+            minimum_width
+        });
+        assert_eq!(minimum, None);
     }
 }

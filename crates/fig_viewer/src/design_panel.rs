@@ -12,8 +12,8 @@ use editor::{
     actions::{Cancel, SelectAll},
 };
 use fanta_doc::{
-    AssetId, CanvasNode, ComponentId, Doc, Fill, GroupNode, NodeData, NodeFlags, NodeId, Operation,
-    Scene,
+    AssetId, CanvasNode, ComponentId, Doc, Fill, GroupNode, IndexKey, NodeData, NodeFlags, NodeId,
+    Operation, Scene,
 };
 use fs::Fs;
 use gpui::{
@@ -121,12 +121,26 @@ enum LayerDropError {
     MissingDragged,
     MissingTarget,
     TargetIsNotContainer,
+    TargetParentIsNotContainer,
     SelfDrop,
     DescendantCycle,
+    PageRoot,
     ContainsComponentMaster,
     RecursiveComponentInstance,
     NonInvertibleTarget,
-    AlreadyLastChild,
+    AlreadyInPosition,
+    IndexPrecisionExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerDropPlacement {
+    /// Above the target row, which is later (higher) in paint order because
+    /// layer rows display the scene's bottom-first child order in reverse.
+    Above,
+    /// As the target container's topmost child.
+    Inside,
+    /// Below the target row, which is earlier (lower) in paint order.
+    Below,
 }
 
 fn node_is_within(scene: &Scene, node: NodeId, ancestor: NodeId) -> bool {
@@ -136,10 +150,38 @@ fn node_is_within(scene: &Scene, node: NodeId, ancestor: NodeId) -> bool {
             .any(|candidate| candidate.id == ancestor)
 }
 
-fn layer_reparent_operations(
+fn insertion_index(
+    scene: &Scene,
+    siblings_without_dragged: &[NodeId],
+    insertion_position: usize,
+) -> std::result::Result<IndexKey, LayerDropError> {
+    let previous = insertion_position
+        .checked_sub(1)
+        .and_then(|index| siblings_without_dragged.get(index))
+        .and_then(|id| scene.get(*id))
+        .map(|node| node.index);
+    let next = siblings_without_dragged
+        .get(insertion_position)
+        .and_then(|id| scene.get(*id))
+        .map(|node| node.index);
+    match (previous, next) {
+        (Some(previous), Some(next)) => {
+            if IndexKey::near_precision_limit(previous, next) {
+                return Err(LayerDropError::IndexPrecisionExhausted);
+            }
+            Ok(IndexKey::between(previous, next))
+        }
+        (Some(previous), None) => Ok(IndexKey::after(previous)),
+        (None, Some(next)) => Ok(IndexKey::before(next)),
+        (None, None) => Ok(IndexKey::FIRST),
+    }
+}
+
+fn layer_move_operations(
     doc: &Doc,
     dragged: NodeId,
     target: NodeId,
+    placement: LayerDropPlacement,
 ) -> std::result::Result<Vec<Operation>, LayerDropError> {
     let dragged_node = doc
         .scene
@@ -149,10 +191,57 @@ fn layer_reparent_operations(
     if dragged == target {
         return Err(LayerDropError::SelfDrop);
     }
-    if !target_node.can_have_children() {
-        return Err(LayerDropError::TargetIsNotContainer);
+    if doc.pages().contains(&dragged) {
+        return Err(LayerDropError::PageRoot);
     }
-    if node_is_within(&doc.scene, target, dragged) {
+
+    let (new_parent, siblings_without_dragged, insertion_position) = match placement {
+        LayerDropPlacement::Inside => {
+            if !matches!(target_node.data, NodeData::Group(_)) {
+                return Err(LayerDropError::TargetIsNotContainer);
+            }
+            let siblings: Vec<_> = doc
+                .scene
+                .children_of(Some(target))
+                .iter()
+                .copied()
+                .filter(|id| *id != dragged)
+                .collect();
+            let position = siblings.len();
+            (Some(target), siblings, position)
+        }
+        LayerDropPlacement::Above | LayerDropPlacement::Below => {
+            let parent = target_node.parent;
+            if dragged_node.parent != parent
+                && let Some(parent) = parent
+                && !matches!(
+                    doc.scene.get(parent).map(|node| &node.data),
+                    Some(NodeData::Group(_))
+                )
+            {
+                return Err(LayerDropError::TargetParentIsNotContainer);
+            }
+            let siblings: Vec<_> = doc
+                .scene
+                .children_of(parent)
+                .iter()
+                .copied()
+                .filter(|id| *id != dragged)
+                .collect();
+            let target_position = siblings
+                .iter()
+                .position(|id| *id == target)
+                .ok_or(LayerDropError::MissingTarget)?;
+            let position = if placement == LayerDropPlacement::Above {
+                target_position + 1
+            } else {
+                target_position
+            };
+            (parent, siblings, position)
+        }
+    };
+
+    if new_parent.is_some_and(|parent| node_is_within(&doc.scene, parent, dragged)) {
         return Err(LayerDropError::DescendantCycle);
     }
     if doc
@@ -164,11 +253,14 @@ fn layer_reparent_operations(
         return Err(LayerDropError::ContainsComponentMaster);
     }
 
-    let target_components: Vec<_> = doc
-        .components
-        .defs
-        .values()
-        .filter(|definition| node_is_within(&doc.scene, target, definition.root))
+    let target_components: Vec<_> = new_parent
+        .into_iter()
+        .flat_map(|parent| {
+            doc.components
+                .defs
+                .values()
+                .filter(move |definition| node_is_within(&doc.scene, parent, definition.root))
+        })
         .collect();
     if !target_components.is_empty() {
         let creates_recursive_instance = doc.scene.descendants_of(dragged).any(|node_id| {
@@ -189,20 +281,64 @@ fn layer_reparent_operations(
         }
     }
 
-    let new_index = doc.scene.next_child_index(Some(target));
-    if dragged_node.parent == Some(target)
-        && doc.scene.children_of(Some(target)).last().copied() == Some(dragged)
-    {
-        return Err(LayerDropError::AlreadyLastChild);
+    let mut requested_order = siblings_without_dragged.clone();
+    requested_order.insert(insertion_position, dragged);
+    if dragged_node.parent == new_parent {
+        if requested_order == doc.scene.children_of(new_parent) {
+            return Err(LayerDropError::AlreadyInPosition);
+        }
     }
+
+    let (new_index, mut normalization_operations) =
+        match insertion_index(&doc.scene, &siblings_without_dragged, insertion_position) {
+            Ok(index) => (index, Vec::new()),
+            Err(LayerDropError::IndexPrecisionExhausted) => {
+                let mut operations = Vec::new();
+                let mut dragged_index = IndexKey::FIRST;
+                for (position, id) in requested_order.iter().copied().enumerate() {
+                    let normalized = IndexKey::from_raw(position as f64 + 1.0);
+                    if id == dragged {
+                        dragged_index = normalized;
+                        continue;
+                    }
+                    let Some(node) = doc.scene.get(id) else {
+                        return Err(LayerDropError::MissingTarget);
+                    };
+                    if node.index != normalized {
+                        operations.push(Operation::SetIndex {
+                            id,
+                            old: node.index,
+                            new: normalized,
+                        });
+                    }
+                }
+                (dragged_index, operations)
+            }
+            Err(error) => return Err(error),
+        };
+
+    if dragged_node.parent == new_parent {
+        if dragged_node.index != new_index {
+            normalization_operations.push(Operation::SetIndex {
+                id: dragged,
+                old: dragged_node.index,
+                new: new_index,
+            });
+        }
+        return Ok(normalization_operations);
+    }
+
     let world = doc
         .scene
         .world_transform(dragged)
         .ok_or(LayerDropError::MissingDragged)?;
-    let target_world = doc
-        .scene
-        .world_transform(target)
-        .ok_or(LayerDropError::MissingTarget)?;
+    let target_world = match new_parent {
+        Some(parent) => doc
+            .scene
+            .world_transform(parent)
+            .ok_or(LayerDropError::MissingTarget)?,
+        None => fanta_doc::Transform2D::IDENTITY,
+    };
     let [a, b, c, d, _, _] = target_world.to_components();
     let determinant = a * d - b * c;
     if !target_world.is_finite() || !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
@@ -213,21 +349,21 @@ fn layer_reparent_operations(
         return Err(LayerDropError::NonInvertibleTarget);
     }
 
-    let mut operations = vec![Operation::Reparent {
+    normalization_operations.push(Operation::Reparent {
         id: dragged,
         old_parent: dragged_node.parent,
         old_index: dragged_node.index,
-        new_parent: Some(target),
+        new_parent,
         new_index,
-    }];
+    });
     if new_local != dragged_node.transform {
-        operations.push(Operation::SetTransform {
+        normalization_operations.push(Operation::SetTransform {
             id: dragged,
             old: dragged_node.transform,
             new: new_local,
         });
     }
-    Ok(operations)
+    Ok(normalization_operations)
 }
 
 #[derive(Clone, Copy)]
@@ -741,7 +877,13 @@ impl FantaDesignPanel {
         }
     }
 
-    fn drop_layer_onto(&mut self, dragged: NodeId, target: NodeId, cx: &mut Context<Self>) {
+    fn drop_layer(
+        &mut self,
+        dragged: NodeId,
+        target: NodeId,
+        placement: LayerDropPlacement,
+        cx: &mut Context<Self>,
+    ) {
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -754,10 +896,11 @@ impl FantaDesignPanel {
                 return Ok(false);
             }
             item.with_document(cx, |document| {
-                let operations = match layer_reparent_operations(&document.doc, dragged, target) {
-                    Ok(operations) => operations,
-                    Err(_) => return (Ok(false), DocChange::None),
-                };
+                let operations =
+                    match layer_move_operations(&document.doc, dragged, target, placement) {
+                        Ok(operations) => operations,
+                        Err(_) => return (Ok(false), DocChange::None),
+                    };
                 let doc = &mut document.doc;
                 doc.history.begin("Move layer", &mut doc.scene);
                 for operation in operations {
@@ -779,7 +922,9 @@ impl FantaDesignPanel {
         });
         match result {
             Ok(true) => {
-                self.expanded_nodes.insert(target);
+                if placement == LayerDropPlacement::Inside {
+                    self.expanded_nodes.insert(target);
+                }
                 self.rebuild_layer_rows(cx);
                 cx.notify();
             }
@@ -1956,10 +2101,15 @@ impl FantaDesignPanel {
         }
     }
 
-    fn render_layer_row(&self, index: usize, row: &LayerRow, cx: &mut Context<Self>) -> AnyElement {
+    fn render_layer_row(
+        &self,
+        _index: usize,
+        row: &LayerRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let id = row.id;
         if matches!(self.renaming, Some(RenameTarget::Layer { node }) if node == id) {
-            return ListItem::new(("fanta-layer", index))
+            return ListItem::new(format!("fanta-layer-{id}"))
                 .indent_level(row.depth + 1)
                 .indent_step_size(SECTION_INDENT_STEP)
                 .spacing(ListItemSpacing::ExtraDense)
@@ -1980,21 +2130,11 @@ impl FantaDesignPanel {
             Color::Muted
         };
 
-        let mut item = ListItem::new(("fanta-layer", index))
+        let mut item = ListItem::new(format!("fanta-layer-{id}"))
             .indent_level(row.depth + 1)
             .indent_step_size(SECTION_INDENT_STEP)
             .spacing(ListItemSpacing::ExtraDense)
             .toggle_state(row.selected)
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                // Double-click renames the layer in place; a single click
-                // selects it (Shift/Cmd extends the selection).
-                if event.click_count() >= 2 {
-                    this.begin_layer_rename(id, window, cx);
-                } else {
-                    let modifiers = event.modifiers();
-                    this.select_node(id, modifiers.secondary() || modifiers.shift, cx);
-                }
-            }))
             .child(
                 h_flex()
                     .gap_1()
@@ -2011,7 +2151,7 @@ impl FantaDesignPanel {
 
         if self.document_editable {
             let eye_button = IconButton::new(
-                ("fanta-layer-eye", index),
+                format!("fanta-layer-eye-{id}"),
                 if row.hidden {
                     IconName::EyeOff
                 } else {
@@ -2035,7 +2175,7 @@ impl FantaDesignPanel {
             .when(!row.hidden, |button| button.visible_on_hover("list_item"));
 
             let lock_button = IconButton::new(
-                ("fanta-layer-lock", index),
+                format!("fanta-layer-lock-{id}"),
                 if row.locked {
                     IconName::Lock
                 } else {
@@ -2073,10 +2213,26 @@ impl FantaDesignPanel {
         let active_item = self
             .active_view(cx)
             .map(|view| view.read(cx).item().clone());
+        let inside_item = active_item.clone();
+        let above_item = active_item.clone();
+        let below_item = active_item;
         div()
-            .id(("fanta-layer-drop", index))
+            .id(format!("fanta-layer-drop-{id}"))
+            .relative()
             .w_full()
             .cursor_move()
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                // Keep the whole row as the drag source. A click that lands on
+                // one of the thin before/after drop hitboxes still bubbles here
+                // and selects exactly like a click on the row's content.
+                if event.click_count() >= 2 {
+                    this.begin_layer_rename(id, window, cx);
+                } else {
+                    let modifiers = event.modifiers();
+                    this.select_node(id, modifiers.secondary() || modifiers.shift, cx);
+                }
+                cx.stop_propagation();
+            }))
             .on_drag(DraggedLayer(id), |dragged, _, _, cx| {
                 cx.new(|_| dragged.clone())
             })
@@ -2084,23 +2240,103 @@ impl FantaDesignPanel {
                 let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
                     return false;
                 };
-                let Some(item) = active_item.as_ref() else {
+                let Some(item) = inside_item.as_ref() else {
                     return false;
                 };
                 let item = item.read(cx);
                 item.is_editable()
                     && item.document().is_some_and(|document| {
-                        layer_reparent_operations(&document.doc, dragged.0, id).is_ok()
+                        layer_move_operations(
+                            &document.doc,
+                            dragged.0,
+                            id,
+                            LayerDropPlacement::Inside,
+                        )
+                        .is_ok()
                     })
             })
             .drag_over::<DraggedLayer>(|style, _, _, cx| {
                 style.bg(cx.theme().colors().drop_target_background)
             })
             .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                this.drop_layer_onto(dragged.0, id, cx);
+                this.drop_layer(dragged.0, id, LayerDropPlacement::Inside, cx);
                 cx.stop_propagation();
             }))
             .child(item)
+            .child(
+                div()
+                    .id(format!("fanta-layer-drop-above-{id}"))
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(6.))
+                    .can_drop(move |value, _, cx| {
+                        let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
+                            return false;
+                        };
+                        let Some(item) = above_item.as_ref() else {
+                            return false;
+                        };
+                        let item = item.read(cx);
+                        item.is_editable()
+                            && item.document().is_some_and(|document| {
+                                layer_move_operations(
+                                    &document.doc,
+                                    dragged.0,
+                                    id,
+                                    LayerDropPlacement::Above,
+                                )
+                                .is_ok()
+                            })
+                    })
+                    .drag_over::<DraggedLayer>(|style, _, _, cx| {
+                        style
+                            .border_t_2()
+                            .border_color(cx.theme().colors().drop_target_border)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
+                        this.drop_layer(dragged.0, id, LayerDropPlacement::Above, cx);
+                        cx.stop_propagation();
+                    })),
+            )
+            .child(
+                div()
+                    .id(format!("fanta-layer-drop-below-{id}"))
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(6.))
+                    .can_drop(move |value, _, cx| {
+                        let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
+                            return false;
+                        };
+                        let Some(item) = below_item.as_ref() else {
+                            return false;
+                        };
+                        let item = item.read(cx);
+                        item.is_editable()
+                            && item.document().is_some_and(|document| {
+                                layer_move_operations(
+                                    &document.doc,
+                                    dragged.0,
+                                    id,
+                                    LayerDropPlacement::Below,
+                                )
+                                .is_ok()
+                            })
+                    })
+                    .drag_over::<DraggedLayer>(|style, _, _, cx| {
+                        style
+                            .border_b_2()
+                            .border_color(cx.theme().colors().drop_target_border)
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
+                        this.drop_layer(dragged.0, id, LayerDropPlacement::Below, cx);
+                        cx.stop_propagation();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -2556,7 +2792,7 @@ mod tests {
             .expect("dragged node should have a world transform");
         let expected_index = doc.scene.next_child_index(Some(target));
 
-        let operations = layer_reparent_operations(&doc, dragged, target)
+        let operations = layer_move_operations(&doc, dragged, target, LayerDropPlacement::Inside)
             .expect("the layer drop should be valid");
         assert!(matches!(
             operations.first(),
@@ -2592,9 +2828,9 @@ mod tests {
             world_before,
         );
         assert_eq!(
-            layer_reparent_operations(&doc, dragged, target)
+            layer_move_operations(&doc, dragged, target, LayerDropPlacement::Inside)
                 .expect_err("the last child is already in the requested position"),
-            LayerDropError::AlreadyLastChild
+            LayerDropError::AlreadyInPosition
         );
 
         assert!(doc.undo().expect("move should undo"));
@@ -2614,6 +2850,157 @@ mod tests {
     }
 
     #[test]
+    fn layer_drop_above_and_below_reorders_visual_z_index() {
+        let mut doc = Doc::new();
+        let parent = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
+        let bottom = insert_node(&mut doc, vector_node(Some(parent), Transform2D::IDENTITY));
+        let middle = insert_node(&mut doc, vector_node(Some(parent), Transform2D::IDENTITY));
+        let top = insert_node(&mut doc, vector_node(Some(parent), Transform2D::IDENTITY));
+
+        let operations = layer_move_operations(&doc, bottom, middle, LayerDropPlacement::Above)
+            .expect("a lower sibling can move above the target row");
+        assert!(matches!(operations.as_slice(), [Operation::SetIndex { id, .. }] if *id == bottom));
+        for operation in operations {
+            doc.apply(operation).expect("reorder should apply");
+        }
+        assert_eq!(
+            doc.scene.children_of(Some(parent)),
+            &[middle, bottom, top],
+            "scene order is bottom-first, while Above means visually above the row"
+        );
+
+        let operations = layer_move_operations(&doc, top, middle, LayerDropPlacement::Below)
+            .expect("a higher sibling can move below the target row");
+        for operation in operations {
+            doc.apply(operation).expect("reorder should apply");
+        }
+        assert_eq!(doc.scene.children_of(Some(parent)), &[top, middle, bottom]);
+        assert_eq!(
+            layer_move_operations(&doc, top, middle, LayerDropPlacement::Below)
+                .expect_err("dropping into the current visual slot is a no-op"),
+            LayerDropError::AlreadyInPosition
+        );
+    }
+
+    #[test]
+    fn layer_drop_rebalances_an_exhausted_fractional_index_gap() {
+        let mut doc = Doc::new();
+        let parent = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
+        let mut lower = vector_node(Some(parent), Transform2D::IDENTITY);
+        lower.index = IndexKey::from_raw(1.0);
+        let lower = {
+            let id = lower.id;
+            doc.scene.insert(lower).expect("lower node is valid");
+            id
+        };
+        let mut upper = vector_node(Some(parent), Transform2D::IDENTITY);
+        upper.index = IndexKey::from_raw(1.0 + f64::EPSILON);
+        let upper = {
+            let id = upper.id;
+            doc.scene.insert(upper).expect("upper node is valid");
+            id
+        };
+        let dragged = insert_node(&mut doc, vector_node(Some(parent), Transform2D::IDENTITY));
+
+        let operations = layer_move_operations(&doc, dragged, lower, LayerDropPlacement::Above)
+            .expect("an exhausted gap should be normalized instead of rejecting the drop");
+        assert!(
+            !operations.is_empty(),
+            "normalization updates at least one adjacent key"
+        );
+        for operation in operations {
+            doc.apply(operation)
+                .expect("normalized reorder should apply");
+        }
+        assert_eq!(
+            doc.scene.children_of(Some(parent)),
+            &[lower, dragged, upper]
+        );
+        doc.scene
+            .validate()
+            .expect("normalizing z-order preserves scene invariants");
+    }
+
+    #[test]
+    fn layer_drop_between_rows_reparents_at_that_slot_and_preserves_world_transform() {
+        let mut doc = Doc::new();
+        let old_parent = insert_node(
+            &mut doc,
+            group_node(None, Transform2D::translation(40.0, -20.0)),
+        );
+        let new_parent = insert_node(
+            &mut doc,
+            group_node(
+                None,
+                Transform2D::scale_xy(1.5, 0.5).then(&Transform2D::translation(-80.0, 60.0)),
+            ),
+        );
+        let target = insert_node(
+            &mut doc,
+            vector_node(Some(new_parent), Transform2D::IDENTITY),
+        );
+        let top = insert_node(
+            &mut doc,
+            vector_node(Some(new_parent), Transform2D::IDENTITY),
+        );
+        let dragged = insert_node(
+            &mut doc,
+            vector_node(
+                Some(old_parent),
+                Transform2D::rotation(0.2).then(&Transform2D::translation(12.0, 30.0)),
+            ),
+        );
+        let world_before = doc
+            .scene
+            .world_transform(dragged)
+            .expect("dragged node has world geometry");
+
+        let operations = layer_move_operations(&doc, dragged, target, LayerDropPlacement::Above)
+            .expect("a row can move between children of another group");
+        assert!(matches!(
+            operations.first(),
+            Some(Operation::Reparent {
+                id,
+                new_parent: Some(parent),
+                ..
+            }) if *id == dragged && *parent == new_parent
+        ));
+        for operation in operations {
+            doc.apply(operation).expect("reparent should apply");
+        }
+        assert_eq!(
+            doc.scene.children_of(Some(new_parent)),
+            &[target, dragged, top]
+        );
+        assert_transform_close(
+            doc.scene
+                .world_transform(dragged)
+                .expect("reparented node retains world geometry"),
+            world_before,
+        );
+    }
+
+    #[test]
+    fn layer_drop_rejects_page_roots_and_relative_descendant_cycles() {
+        let mut doc = Doc::new();
+        let page = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
+        doc.add_page(page);
+        let parent = insert_node(&mut doc, group_node(Some(page), Transform2D::IDENTITY));
+        let child = insert_node(&mut doc, vector_node(Some(parent), Transform2D::IDENTITY));
+
+        assert_eq!(
+            layer_move_operations(&doc, page, parent, LayerDropPlacement::Above)
+                .expect_err("page roots are managed by the Pages section"),
+            LayerDropError::PageRoot
+        );
+        assert_eq!(
+            layer_move_operations(&doc, parent, child, LayerDropPlacement::Above)
+                .expect_err("a row cannot be moved beside a descendant under itself"),
+            LayerDropError::DescendantCycle
+        );
+    }
+
+    #[test]
     fn layer_drop_rejects_self_descendant_and_non_container_targets() {
         let mut doc = Doc::new();
         let parent = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
@@ -2623,22 +3010,22 @@ mod tests {
         let instance_target = insert_node(&mut doc, instance_node(None, ComponentId::new()));
 
         assert_eq!(
-            layer_reparent_operations(&doc, parent, parent)
+            layer_move_operations(&doc, parent, parent, LayerDropPlacement::Inside)
                 .expect_err("a node cannot be dropped on itself"),
             LayerDropError::SelfDrop
         );
         assert_eq!(
-            layer_reparent_operations(&doc, parent, child)
+            layer_move_operations(&doc, parent, child, LayerDropPlacement::Inside)
                 .expect_err("a node cannot be dropped into its descendant"),
             LayerDropError::DescendantCycle
         );
         assert_eq!(
-            layer_reparent_operations(&doc, other, leaf)
+            layer_move_operations(&doc, other, leaf, LayerDropPlacement::Inside)
                 .expect_err("a vector cannot accept children"),
             LayerDropError::TargetIsNotContainer
         );
         assert_eq!(
-            layer_reparent_operations(&doc, other, instance_target)
+            layer_move_operations(&doc, other, instance_target, LayerDropPlacement::Inside)
                 .expect_err("an instance cannot accept real scene children"),
             LayerDropError::TargetIsNotContainer
         );
@@ -2656,12 +3043,12 @@ mod tests {
         let instance = insert_node(&mut doc, instance_node(None, component));
 
         assert_eq!(
-            layer_reparent_operations(&doc, master, other_container)
+            layer_move_operations(&doc, master, other_container, LayerDropPlacement::Inside)
                 .expect_err("a component master cannot leave the component library"),
             LayerDropError::ContainsComponentMaster
         );
         assert_eq!(
-            layer_reparent_operations(&doc, instance, master)
+            layer_move_operations(&doc, instance, master, LayerDropPlacement::Inside)
                 .expect_err("a component cannot contain an instance of itself"),
             LayerDropError::RecursiveComponentInstance
         );

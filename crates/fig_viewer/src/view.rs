@@ -42,7 +42,8 @@ use crate::editor_session::{
 };
 use crate::motion_edit::{
     MotionKeyframeDragSession, delete_keyframe_operation, rename_clip_operation,
-    set_clip_duration_operation,
+    set_clip_duration_operation, set_keyframe_easing_operation,
+    set_keyframe_interpolation_operation,
 };
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 use crate::properties_panel::FantaPropertiesPanel;
@@ -517,7 +518,14 @@ impl FigView {
             }
             _ => {}
         }
-        self.finish_motion_keyframe_drag(cx);
+        let cancelled_easing = self
+            .timeline_shell
+            .update(cx, |timeline, cx| timeline.cancel_easing_edit(cx));
+        if cancelled_easing {
+            self.cancel_motion_keyframe_drag(cx);
+        } else {
+            self.finish_motion_keyframe_drag(cx);
+        }
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.reset_keyframe_drag(cx));
         self.sync_motion_timeline(cx);
@@ -616,6 +624,40 @@ impl FigView {
                     .log_err();
                 });
             }
+            TimelineEvent::SetKeyframeInterpolation {
+                keyframe,
+                interpolation,
+            } => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| {
+                        view.set_motion_keyframe_interpolation(keyframe, interpolation, cx)
+                    })
+                    .log_err();
+                });
+            }
+            TimelineEvent::SetKeyframeEasing { keyframe, easing } => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| {
+                        view.set_motion_keyframe_easing(keyframe, easing, cx)
+                    })
+                    .log_err();
+                });
+            }
+            TimelineEvent::EditKeyframeEasing {
+                keyframe,
+                easing,
+                phase,
+            } => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| {
+                        view.edit_motion_keyframe_easing(keyframe, easing, phase, cx)
+                    })
+                    .log_err();
+                });
+            }
             TimelineEvent::DeleteKeyframe(keyframe) => {
                 let view = cx.weak_entity();
                 cx.defer(move |cx| {
@@ -654,6 +696,62 @@ impl FigView {
             TimelineEditPhase::Begin => self.begin_motion_keyframe_drag(&keyframe, cx),
             TimelineEditPhase::Preview => self.preview_motion_keyframe_drag(&keyframe, time_us, cx),
             TimelineEditPhase::Commit => self.commit_motion_keyframe_drag(&keyframe, time_us, cx),
+            TimelineEditPhase::Cancel => self.cancel_motion_keyframe_drag(cx),
+        }
+    }
+
+    fn set_motion_keyframe_interpolation(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        interpolation: Interpolation,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_motion_keyframe_drag(cx);
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let operation = self.item.read(cx).document().and_then(|document| {
+            set_keyframe_interpolation_operation(&document.doc, clip_id, &keyframe, interpolation)
+        });
+        self.apply_motion_operation(operation, "setting keyframe interpolation", cx);
+    }
+
+    fn set_motion_keyframe_easing(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        easing: Easing,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_motion_keyframe_drag(cx);
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let operation = self.item.read(cx).document().and_then(|document| {
+            set_keyframe_easing_operation(&document.doc, clip_id, &keyframe, easing)
+        });
+        self.apply_motion_operation(operation, "setting keyframe easing", cx);
+    }
+
+    fn edit_motion_keyframe_easing(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        easing: Easing,
+        phase: TimelineEditPhase,
+        cx: &mut Context<Self>,
+    ) {
+        match phase {
+            TimelineEditPhase::Begin => self.begin_motion_keyframe_drag(&keyframe, cx),
+            TimelineEditPhase::Preview => {
+                self.preview_motion_keyframe_easing(&keyframe, easing, cx)
+            }
+            TimelineEditPhase::Commit => self.commit_motion_keyframe_easing(&keyframe, easing, cx),
+            TimelineEditPhase::Cancel => self.cancel_motion_keyframe_drag(cx),
         }
     }
 
@@ -706,6 +804,36 @@ impl FigView {
         });
     }
 
+    fn preview_motion_keyframe_easing(
+        &mut self,
+        keyframe: &TimelineKeyframeSelection,
+        easing: Easing,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx) {
+            self.cancel_motion_keyframe_drag(cx);
+            return;
+        }
+        let item = self.item.clone();
+        let Some(session) = self
+            .motion_keyframe_drag
+            .as_mut()
+            .filter(|session| session.matches(keyframe))
+        else {
+            return;
+        };
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let change = if session.preview_easing(&mut document.doc, easing) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+        });
+    }
+
     fn commit_motion_keyframe_drag(
         &mut self,
         keyframe: &TimelineKeyframeSelection,
@@ -736,6 +864,40 @@ impl FigView {
             if let Err(error) = item.apply(operation, cx) {
                 item.finish_content_preview(false, cx);
                 log::error!("moving motion keyframe failed: {error:#}");
+            }
+        });
+    }
+
+    fn commit_motion_keyframe_easing(
+        &mut self,
+        keyframe: &TimelineKeyframeSelection,
+        easing: Easing,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut session) = self.motion_keyframe_drag.take() else {
+            return;
+        };
+        if !session.matches(keyframe) || !self.is_editable(cx) {
+            self.restore_motion_keyframe_drag(session, cx);
+            return;
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                session.preview_easing(&mut document.doc, easing);
+                let change = if session.restore(&mut document.doc) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            let Some(operation) = session.operation() else {
+                item.finish_content_preview(false, cx);
+                return;
+            };
+            if let Err(error) = item.apply(operation, cx) {
+                item.finish_content_preview(false, cx);
+                log::error!("editing motion keyframe easing failed: {error:#}");
             }
         });
     }
@@ -1440,7 +1602,8 @@ impl FigView {
         // enter-text-edit gesture. The pair's first press already ran
         // selection through the tool; this press is consumed here.
         if event.button == MouseButton::Left
-            && event.click_count == 2
+            && event.click_count >= 2
+            && event.click_count.is_multiple_of(2)
             && self.editor_mode(cx) == EditorMode::Design
             && self.tools.kind() == ToolKind::Select
             && self.is_editable(cx)
@@ -1448,14 +1611,26 @@ impl FigView {
         {
             let screen = screen_position_in_bounds(event.position, bounds);
             if let Some(node) = self.text_node_at(screen, cx) {
-                self.open_text_edit(node, TextEditSeed::WordAt(screen), window, cx);
-                return;
-            }
-            // No real text under the cursor — try text inside a component
-            // instance (a virtual clone, edited via an override).
-            if let Some(target) = self.instance_text_at(screen, cx) {
-                self.open_instance_text_edit(target, TextEditSeed::WordAt(screen), window, cx);
-                return;
+                // A wrapped text layer first has to be drilled into by the
+                // select tool. Only a text layer that is already the sole
+                // selection enters editing on this press. Standalone text is
+                // selected by the first press in the double-click pair, so it
+                // still opens on an ordinary double-click.
+                if self.single_selected_text_node(cx) == Some(node) {
+                    self.open_text_edit(node, TextEditSeed::WordAt(screen), window, cx);
+                    return;
+                }
+            } else if let Some(target) = self.instance_text_at(screen, cx) {
+                // Instance text is virtual and cannot become its own scene
+                // selection; selecting the wrapping instance is the equivalent
+                // prerequisite before opening an override editor.
+                let instance_selected = self.item.read(cx).document().is_some_and(|document| {
+                    document.doc.selection.as_slice() == [target.instance_id]
+                });
+                if instance_selected {
+                    self.open_instance_text_edit(target, TextEditSeed::WordAt(screen), window, cx);
+                    return;
+                }
             }
         }
 
@@ -2067,12 +2242,14 @@ impl FigView {
             .top(px(48.))
             .left_0()
             .right_0()
+            .px_4()
             .justify_center()
             .child(
                 h_flex()
                     .occlude()
+                    .w_full()
+                    .min_w_0()
                     .max_w(px(620.))
-                    .mx_4()
                     .px_3()
                     .py_1p5()
                     .gap_2()
@@ -2086,10 +2263,13 @@ impl FigView {
                             .color(Color::Warning),
                     )
                     .child(
-                        Label::new(
-                            "Canvas editing is locked while FNX has unsaved changes. Pan and selection remain available; save FNX to resume editing.",
-                        )
-                        .size(LabelSize::Small),
+                        div().flex_1().min_w_0().child(
+                            Label::new(
+                                "Canvas editing is locked while FNX has unsaved changes. Pan and selection remain available; save FNX to resume editing.",
+                            )
+                            .size(LabelSize::Small)
+                            .line_clamp(2),
+                        ),
                     ),
             )
             .into_any_element()
@@ -2764,6 +2944,8 @@ fn motion_timeline_model(
                     .map(|keyframe| TimelineKeyframeViewModel {
                         id: keyframe.id.to_string().into(),
                         time_us: i64::from(keyframe.time_ms) * 1_000,
+                        interpolation: keyframe.interpolation,
+                        easing: keyframe.easing,
                     })
                     .collect(),
             }
@@ -2842,7 +3024,7 @@ impl Item for FigView {
     }
 
     fn has_conflict(&self, cx: &App) -> bool {
-        self.item.read(cx).has_conflict()
+        self.code_workspace.read(cx).has_source_conflict(cx)
     }
 
     fn can_save(&self, cx: &App) -> bool {
@@ -2856,6 +3038,49 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        let source_is_dirty = self.code_workspace.read(cx).source_is_dirty(cx);
+        let canvas_is_dirty = self.item.read(cx).is_dirty();
+        if source_is_dirty && canvas_is_dirty {
+            if self.editor_workspace(cx) == EditorWorkspace::Code {
+                let discard_canvas = self.item.update(cx, |item, cx| {
+                    item.discard_canvas_edits_for_source_resolution(cx)
+                });
+                let code_workspace = self.code_workspace.clone();
+                return cx.spawn(async move |_, cx| {
+                    discard_canvas.await?;
+                    let save_source = code_workspace.update(cx, |workspace, cx| {
+                        workspace
+                            .save_source_edit(cx)
+                            .unwrap_or_else(|| Task::ready(Ok(())))
+                    });
+                    save_source.await
+                });
+            }
+
+            self.finish_document_edits(cx);
+            let discard_source = self
+                .code_workspace
+                .update(cx, |workspace, cx| workspace.discard_source_edit(cx));
+            let item = self.item.clone();
+            let project = self.project.clone();
+            return cx.spawn(async move |_, cx| {
+                discard_source.await?;
+                let save_document = item.update(cx, |item, cx| item.save(cx));
+                let Some(root) = save_document.await? else {
+                    return Ok(());
+                };
+                let worktree = project.update(cx, |project, cx| {
+                    project.find_or_create_worktree(root.clone(), true, cx)
+                });
+                if let Err(error) = worktree.await {
+                    log::error!(
+                        "adding materialized Fanta project {} to the workspace failed: {error:#}",
+                        root.display()
+                    );
+                }
+                Ok(())
+            });
+        }
         if let Some(source_save) = self
             .code_workspace
             .update(cx, |workspace, cx| workspace.save_source_edit(cx))
@@ -2894,7 +3119,14 @@ impl Item for FigView {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| item.reload_from_disk(cx))
+        let discard_source = self
+            .code_workspace
+            .update(cx, |workspace, cx| workspace.discard_source_edit(cx));
+        let item = self.item.clone();
+        cx.spawn(async move |_, cx| {
+            discard_source.await?;
+            item.update(cx, |item, cx| item.reload_from_disk(cx)).await
+        })
     }
 
     fn can_split(&self) -> bool {
@@ -3073,8 +3305,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use fanta_doc::{
-        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, VarValue, Variable,
-        VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode,
+        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, TextNode, Transform2D,
+        VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
+        VectorNode,
     };
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
@@ -3097,6 +3330,70 @@ mod tests {
         doc.add_page(root);
         doc.set_active_page(Some(root));
         doc
+    }
+
+    fn text_selection_doc(wrapped: bool) -> (fanta_doc::Doc, NodeId, Option<NodeId>) {
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let frame = wrapped.then(|| {
+            let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([200.0, 100.0]),
+                ..GroupNode::default()
+            }));
+            frame.parent = Some(page);
+            frame.transform = Transform2D::translation(-100.0, -50.0);
+            let id = frame.id;
+            doc.apply(Operation::create_node(frame))
+                .expect("create text wrapper");
+            id
+        });
+        let mut text = CanvasNode::new(NodeData::Text(TextNode::new("Hello world", 120.0, 40.0)));
+        text.parent = Some(frame.unwrap_or(page));
+        text.transform = if wrapped {
+            Transform2D::translation(20.0, 20.0)
+        } else {
+            Transform2D::translation(-60.0, -20.0)
+        };
+        let text_id = text.id;
+        doc.apply(Operation::create_node(text))
+            .expect("create text layer");
+        (doc, text_id, frame)
+    }
+
+    fn send_canvas_click(
+        scratch: gpui::WindowHandle<gpui::Empty>,
+        view: &Entity<FigView>,
+        position: Point<Pixels>,
+        click_count: usize,
+        cx: &mut TestAppContext,
+    ) {
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.handle_mouse_down(
+                        &MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: gpui::Modifiers::default(),
+                            click_count,
+                            first_mouse: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    view.handle_mouse_up(
+                        &MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: gpui::Modifiers::default(),
+                            click_count,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("dispatch canvas click");
     }
 
     #[test]
@@ -3258,10 +3555,15 @@ mod tests {
             MotionTarget::new(node_id, MotionProperty::PositionX),
         );
         let keyframe_id = KeyframeId::new();
-        track.keyframes.insert(
-            keyframe_id,
-            Keyframe::new(keyframe_id, 250, ResolvedVarValue::Float { value: 10.0 }),
-        );
+        let mut keyframe = Keyframe::new(keyframe_id, 250, ResolvedVarValue::Float { value: 10.0 });
+        keyframe.interpolation = Interpolation::Hold;
+        keyframe.easing = Easing::CubicBezier {
+            x1: 0.25,
+            y1: -0.5,
+            x2: 0.75,
+            y2: 1.5,
+        };
+        track.keyframes.insert(keyframe_id, keyframe);
         let mut clip = AnimationClip::new(clip_id, "Entrance", 1_500);
         clip.tracks.insert(track_id, track);
         doc.motion.clips.insert(clip_id, clip);
@@ -3277,6 +3579,19 @@ mod tests {
             keyframe_id.to_string()
         );
         assert_eq!(model.tracks[0].keyframes[0].time_us, 250_000);
+        assert_eq!(
+            model.tracks[0].keyframes[0].interpolation,
+            Interpolation::Hold
+        );
+        assert_eq!(
+            model.tracks[0].keyframes[0].easing,
+            Easing::CubicBezier {
+                x1: 0.25,
+                y1: -0.5,
+                x2: 0.75,
+                y2: 1.5,
+            }
+        );
     }
 
     #[gpui::test]
@@ -3396,6 +3711,125 @@ mod tests {
             assert_eq!(view.active_tool(), ToolKind::Select);
             view.activate_tool(ToolKind::Text, cx);
             assert_eq!(view.active_tool(), ToolKind::Text);
+        });
+    }
+
+    #[gpui::test]
+    async fn standalone_text_selects_on_single_click_and_edits_on_double_click(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, text_id, _) = text_selection_doc(false);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/StandaloneText.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        view.update(cx, |view, _| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+        });
+        let position = point(px(360.0), px(295.0));
+
+        send_canvas_click(scratch, &view, position, 1, cx);
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").selection.as_slice(),
+                &[text_id]
+            );
+        });
+        view.read_with(cx, |view, _| assert!(view.text_edit.is_none()));
+
+        send_canvas_click(scratch, &view, position, 2, cx);
+        view.read_with(cx, |view, _| {
+            let edit = view.text_edit.as_ref().expect("text editor opened");
+            let range = edit.session.selected_range();
+            assert!(range.start < range.end, "double-click selects a word");
+            assert!(range.end - range.start < "Hello world".len());
+        });
+    }
+
+    #[gpui::test]
+    async fn wrapped_text_requires_drill_in_before_a_second_double_click_edits(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, text_id, frame) = text_selection_doc(true);
+        let frame = frame.expect("text wrapper");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/WrappedText.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        view.update(cx, |view, _| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+        });
+        let position = point(px(340.0), px(285.0));
+
+        send_canvas_click(scratch, &view, position, 1, cx);
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").selection.as_slice(), &[frame]);
+        });
+
+        send_canvas_click(scratch, &view, position, 2, cx);
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").selection.as_slice(),
+                &[text_id]
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.text_edit.is_none(),
+                "the first double-click only drills into the wrapper"
+            );
+        });
+
+        send_canvas_click(scratch, &view, position, 3, cx);
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").selection.as_slice(),
+                &[text_id]
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.text_edit.is_none(),
+                "the first click in the second pair keeps the text selected"
+            );
+        });
+
+        send_canvas_click(scratch, &view, position, 4, cx);
+        view.read_with(cx, |view, _| {
+            let edit = view
+                .text_edit
+                .as_ref()
+                .expect("second double-click opens text editing");
+            let range = edit.session.selected_range();
+            assert!(range.start < range.end, "word selection stays intact");
         });
     }
 

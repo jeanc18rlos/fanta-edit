@@ -97,6 +97,10 @@ pub(crate) enum InspectorField {
     LayoutGapV(NodeId),
     LayoutPadH(NodeId),
     LayoutPadV(NodeId),
+    LayoutMinWidth(NodeId),
+    LayoutMaxWidth(NodeId),
+    LayoutMinHeight(NodeId),
+    LayoutMaxHeight(NodeId),
     EffectOffsetX {
         id: NodeId,
         index: usize,
@@ -169,6 +173,10 @@ pub(crate) fn field_node(field: &InspectorField) -> Option<NodeId> {
         | InspectorField::LayoutGapV(id)
         | InspectorField::LayoutPadH(id)
         | InspectorField::LayoutPadV(id)
+        | InspectorField::LayoutMinWidth(id)
+        | InspectorField::LayoutMaxWidth(id)
+        | InspectorField::LayoutMinHeight(id)
+        | InspectorField::LayoutMaxHeight(id)
         | InspectorField::PageBackground(id)
         | InspectorField::CornerRadiusCorner { id, .. }
         | InspectorField::FillColor { id, .. }
@@ -212,6 +220,10 @@ pub(crate) fn paired_field(field: &InspectorField) -> Option<InspectorField> {
         InspectorField::LayoutGapV(id) => InspectorField::LayoutGapH(*id),
         InspectorField::LayoutPadV(id) => InspectorField::LayoutPadH(*id),
         InspectorField::LayoutPadH(id) => InspectorField::LayoutPadV(*id),
+        InspectorField::LayoutMinWidth(id) => InspectorField::LayoutMaxWidth(*id),
+        InspectorField::LayoutMaxWidth(id) => InspectorField::LayoutMinWidth(*id),
+        InspectorField::LayoutMinHeight(id) => InspectorField::LayoutMaxHeight(*id),
+        InspectorField::LayoutMaxHeight(id) => InspectorField::LayoutMinHeight(*id),
         InspectorField::EffectOffsetX { id, index } => InspectorField::EffectOffsetY {
             id: *id,
             index: *index,
@@ -251,7 +263,11 @@ pub(crate) fn clamp_field_value(field: &InspectorField, value: f64) -> f64 {
         | InspectorField::LayoutGapH(_)
         | InspectorField::LayoutGapV(_)
         | InspectorField::LayoutPadH(_)
-        | InspectorField::LayoutPadV(_) => value.max(0.0),
+        | InspectorField::LayoutPadV(_)
+        | InspectorField::LayoutMinWidth(_)
+        | InspectorField::LayoutMaxWidth(_)
+        | InspectorField::LayoutMinHeight(_)
+        | InspectorField::LayoutMaxHeight(_) => value.max(0.0),
         _ => value,
     }
 }
@@ -268,7 +284,7 @@ pub(crate) enum AlignCommand {
     DistributeVertical,
 }
 
-pub(crate) const ALIGN_BUTTONS: [(AlignGlyph, &str, AlignCommand); 6] = [
+pub(crate) const HORIZONTAL_ALIGN_BUTTONS: [(AlignGlyph, &str, AlignCommand); 3] = [
     (AlignGlyph::Left, "Align Left", AlignCommand::Left),
     (
         AlignGlyph::CenterH,
@@ -276,6 +292,9 @@ pub(crate) const ALIGN_BUTTONS: [(AlignGlyph, &str, AlignCommand); 6] = [
         AlignCommand::CenterHorizontal,
     ),
     (AlignGlyph::Right, "Align Right", AlignCommand::Right),
+];
+
+pub(crate) const VERTICAL_ALIGN_BUTTONS: [(AlignGlyph, &str, AlignCommand); 3] = [
     (AlignGlyph::Top, "Align Top", AlignCommand::Top),
     (
         AlignGlyph::CenterV,
@@ -537,6 +556,10 @@ pub(crate) struct AutoLayoutSnapshot {
     pub(crate) counter_align: CounterAlign,
     pub(crate) primary_sizing: AxisSizing,
     pub(crate) counter_sizing: AxisSizing,
+    pub(crate) min_width: Option<f64>,
+    pub(crate) max_width: Option<f64>,
+    pub(crate) min_height: Option<f64>,
+    pub(crate) max_height: Option<f64>,
     pub(crate) wrap: bool,
     pub(crate) reverse_z: bool,
 }
@@ -923,7 +946,12 @@ pub(crate) fn layout_snapshot(node: &CanvasNode) -> Option<LayoutSnapshot> {
         return None;
     };
     Some(LayoutSnapshot {
-        clip: group.clip_size.is_some(),
+        clip: group.clip_size.is_some()
+            && node
+                .meta
+                .get("clip_content")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
         auto_layout: auto_layout_snapshot(node),
     })
 }
@@ -941,6 +969,8 @@ pub(crate) fn auto_layout_snapshot(node: &CanvasNode) -> Option<AutoLayoutSnapsh
         LayoutMode::Vertical => (layout.counter_spacing, layout.spacing),
     };
     let [top, right, bottom, left] = layout.padding;
+    let [min_width, min_height] = layout.min_size;
+    let [max_width, max_height] = layout.max_size;
     Some(AutoLayoutSnapshot {
         mode: layout.mode,
         gap_h,
@@ -951,6 +981,10 @@ pub(crate) fn auto_layout_snapshot(node: &CanvasNode) -> Option<AutoLayoutSnapsh
         counter_align: layout.counter_align,
         primary_sizing: layout.primary_sizing,
         counter_sizing: layout.counter_sizing,
+        min_width,
+        max_width,
+        min_height,
+        max_height,
         wrap: layout.wrap,
         reverse_z: layout.reverse_z,
     })

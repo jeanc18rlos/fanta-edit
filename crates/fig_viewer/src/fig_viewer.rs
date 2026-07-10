@@ -3,19 +3,21 @@
 //! panels and the floating canvas toolbar.
 
 mod canvas;
+mod code_workspace;
 mod color_picker;
 mod comments;
 mod comments_panel;
 mod comments_ui;
-mod code_workspace;
 mod component_properties;
 mod design_panel;
 mod document;
 mod editor_session;
+mod export;
 mod fnx_editor;
 mod inspector_components;
 mod inspector_widgets;
 mod instance_text;
+mod mode_overrides;
 mod motion_edit;
 mod panel_settings;
 mod properties_ops;
@@ -34,8 +36,8 @@ mod view_text;
 use gpui::{App, AsyncWindowContext, Entity, WeakEntity};
 use workspace::{Panel, Workspace};
 
-pub use design_panel::FantaDesignPanel;
 pub use code_workspace::{CodeWorkspaceFile, FantaCodeWorkspace};
+pub use design_panel::FantaDesignPanel;
 pub use document::{DocChange, FigDocument, FigItem, FigItemEvent, FigPage};
 pub use editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorSessionEvent, EditorWorkspace,

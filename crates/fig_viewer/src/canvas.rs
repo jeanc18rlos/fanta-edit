@@ -992,6 +992,7 @@ struct OverlayData {
     frame_labels: Vec<FrameLabel>,
     hovered_bounds: Option<fanta_doc::Bounds>,
     selected_bounds: Vec<fanta_doc::Bounds>,
+    text_baselines: Vec<(DVec2, DVec2)>,
     /// Union of every selected node's world bounds, for the size badge.
     selection_union: Option<fanta_doc::Bounds>,
     /// The selection's world size shown in the badge, once nodes are selected.
@@ -1022,6 +1023,7 @@ impl CanvasElement {
             frame_labels: Vec::new(),
             hovered_bounds: None,
             selected_bounds: Vec::new(),
+            text_baselines: Vec::new(),
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
@@ -1061,6 +1063,7 @@ impl CanvasElement {
         }
 
         // Selection union + size badge.
+        let editing_node = view.text_edit.as_ref().map(|edit| edit.session.node_id());
         for &id in doc.selection.iter() {
             if let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) {
                 data.selected_bounds.push(world);
@@ -1068,6 +1071,17 @@ impl CanvasElement {
                     Some(existing) => existing.union(&world),
                     None => world,
                 });
+            }
+            if editing_node != Some(id)
+                && let Some(node) = doc.scene.get(id)
+                && let fanta_doc::NodeData::Text(text) = &node.data
+                && let Some(transform) = evaluated_world_transform(&doc.scene, id, motion.as_ref())
+            {
+                let baseline = fanta_render::text_first_baseline(text);
+                data.text_baselines.push((
+                    transform.transform_point(DVec2::new(0.0, baseline)),
+                    transform.transform_point(DVec2::new(text.local_size[0].max(1.0), baseline)),
+                ));
             }
         }
         if let Some(union) = data.selection_union {
@@ -1161,6 +1175,9 @@ impl CanvasElement {
                     accent,
                     BorderStyle::Solid,
                 ));
+            }
+            for (start, end) in &overlay_data.text_baselines {
+                paint_line(project(*start), project(*end), accent, window);
             }
 
             // Resize handles on the selection box, Figma-style, only for the

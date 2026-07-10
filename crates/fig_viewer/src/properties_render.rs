@@ -8,15 +8,15 @@ use fanta_doc::{
     NodeFlags, NodeId, StrokeAlign, TextAlign, VAlign as TextVAlign, VarValue,
 };
 use gpui::{
-    Anchor, Context, Div, MouseButton, MouseDownEvent, anchored, canvas, deferred, point, px,
-    relative,
+    Anchor, Context, Div, MouseButton, MouseDownEvent, Window, anchored, canvas, deferred, point,
+    px, relative,
 };
 use util::ResultExt as _;
 
 use ui::prelude::*;
 use ui::{
-    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, PopoverMenu, Switch,
-    ToggleState, Tooltip,
+    ContextMenu, ContextMenuEntry, DropdownMenu, DropdownStyle, PopoverMenu, Switch, ToggleState,
+    Tooltip,
 };
 
 use crate::color_picker::gradient_preview_strip;
@@ -26,17 +26,18 @@ use crate::inspector_widgets::{
     AlignGlyph, PanelDrag, TextAlignGlyph, TextDecorationGlyph, align_glyph, text_align_glyph,
     text_decoration_glyph,
 };
+use crate::mode_overrides::{ModeOverridesControl, mode_overrides_model};
 use crate::properties_ops::{fanta_color_rgba, font_weight_label, format_number};
 use crate::properties_panel::{FantaPropertiesPanel, SliderTrack};
 use crate::properties_snapshot::{
-    ALIGN_BUTTONS, AXIS_SIZINGS, AlignCommand, AutoLayoutSnapshot, BLEND_MODES, BLUR_KINDS,
-    BindingSnapshot, BlurSnapshot, COUNTER_ALIGNS, ComponentBindingSection, CornerRadiusValue,
-    DISTRIBUTE_BUTTONS, EffectSnapshot, FONT_WEIGHTS, IMAGE_FIT_MODES, InspectorField,
+    AXIS_SIZINGS, AlignCommand, AutoLayoutSnapshot, BLEND_MODES, BLUR_KINDS, BindingSnapshot,
+    BlurSnapshot, COUNTER_ALIGNS, ComponentBindingSection, CornerRadiusValue, DISTRIBUTE_BUTTONS,
+    EffectSnapshot, FONT_WEIGHTS, HORIZONTAL_ALIGN_BUTTONS, IMAGE_FIT_MODES, InspectorField,
     InstanceSection, LAYOUT_CHILD_RESIZES, LAYOUT_MODES, LayoutChildSnapshot, LayoutSnapshot,
     MIXED_VALUE, MasterSection, MultiSection, NodeSection, PAINT_KINDS, PRIMARY_ALIGNS,
     PageBackgroundValue, PageSection, PaintKind, PaintSnapshot, PropValueSnapshot, SHADOW_KINDS,
     STACKING_ORDERS, STROKE_ALIGNS, SelectionColorSnapshot, TEXT_RESIZE_MODES, TypographySnapshot,
-    align_grid_active_cell, paint_kind_label,
+    VERTICAL_ALIGN_BUTTONS, align_grid_active_cell, paint_kind_label,
 };
 use crate::variable_binding::{VariableBindingControl, variable_binding_model};
 
@@ -130,6 +131,61 @@ impl FantaPropertiesPanel {
             })
             .disabled(!editable)
             .into_any_element(),
+        )
+    }
+
+    pub(crate) fn render_mode_overrides_section(
+        &self,
+        node: Option<NodeId>,
+        editable: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let item = self.active_item.as_ref()?.upgrade()?;
+        let model = item
+            .read(cx)
+            .doc()
+            .and_then(|doc| mode_overrides_model(doc, node))?;
+        if model.rows.is_empty() {
+            return None;
+        }
+        let scope = model.scope.clone();
+        let scope_name = model.scope_name.clone();
+        let panel = cx.weak_entity();
+        Some(
+            v_flex()
+                .child(Self::render_section_header("Variable modes", None))
+                .child(
+                    v_flex()
+                        .px_4()
+                        .pb_2()
+                        .gap_2()
+                        .child(
+                            Label::new(format!("Overrides for {scope_name}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            ModeOverridesControl::new(
+                                "fanta-properties-mode-overrides",
+                                model,
+                                move |collection, mode, _, cx| {
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            panel.set_mode_override(
+                                                scope.clone(),
+                                                collection,
+                                                mode,
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                },
+                            )
+                            .disabled(!editable),
+                        ),
+                )
+                .into_any_element(),
         )
     }
 
@@ -977,9 +1033,9 @@ impl FantaPropertiesPanel {
         header.into_any_element()
     }
 
-    /// The Align section: 6 edge-align buttons (enabled at 2+ selected) plus,
-    /// at 3+ selected, the 2 distribute buttons — evenly spread across the
-    /// panel like the original's alignment row.
+    /// The Align section: one three-button group per visual axis, matching
+    /// Figma's horizontal/vertical grouping. Distribution stays separate and
+    /// appears when three or more nodes are selected.
     pub(crate) fn render_align_section(
         &self,
         selection_len: usize,
@@ -988,21 +1044,41 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         let align_enabled = editable && selection_len >= 2;
         let distribute_enabled = editable && selection_len >= 3;
-        let mut row = h_flex().px_4().h(px(34.)).items_center().justify_between();
-        for (index, (glyph, tooltip, command)) in ALIGN_BUTTONS.iter().enumerate() {
-            row = row.child(self.render_align_button(
-                ("fanta-align", index),
-                *glyph,
-                tooltip,
-                *command,
-                align_enabled,
-                cx,
-            ));
-        }
+        let colors = cx.theme().colors().clone();
+        let horizontal = self.render_align_button_group(
+            "fanta-align-horizontal",
+            &HORIZONTAL_ALIGN_BUTTONS,
+            align_enabled,
+            cx,
+        );
+        let vertical = self.render_align_button_group(
+            "fanta-align-vertical",
+            &VERTICAL_ALIGN_BUTTONS,
+            align_enabled,
+            cx,
+        );
+        let mut section = v_flex()
+            .py_1()
+            .child(Self::render_section_header("Align", None))
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_1()
+                    .gap_2()
+                    .child(horizontal)
+                    .child(vertical),
+            );
         if selection_len >= 3 {
-            row = row.child(Divider::vertical());
+            let mut distribute = h_flex()
+                .flex_1()
+                .h(px(30.))
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_background)
+                .justify_around();
             for (index, (glyph, tooltip, command)) in DISTRIBUTE_BUTTONS.iter().enumerate() {
-                row = row.child(self.render_align_button(
+                distribute = distribute.child(self.render_align_button(
                     ("fanta-distribute", index),
                     *glyph,
                     tooltip,
@@ -1011,12 +1087,38 @@ impl FantaPropertiesPanel {
                     cx,
                 ));
             }
+            section = section.child(h_flex().px_4().pb_1().child(distribute));
         }
-        v_flex()
-            .py_1()
-            .child(Self::render_section_header("Align", None))
-            .child(row)
-            .into_any_element()
+        section.into_any_element()
+    }
+
+    fn render_align_button_group(
+        &self,
+        id_prefix: &'static str,
+        buttons: &[(AlignGlyph, &'static str, AlignCommand)],
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let mut group = h_flex()
+            .flex_1()
+            .h(px(30.))
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .justify_around();
+        for (index, (glyph, tooltip, command)) in buttons.iter().enumerate() {
+            group = group.child(self.render_align_button(
+                (id_prefix, index),
+                *glyph,
+                tooltip,
+                *command,
+                enabled,
+                cx,
+            ));
+        }
+        group.into_any_element()
     }
 
     fn render_align_button(
@@ -1522,6 +1624,56 @@ impl FantaPropertiesPanel {
                 window,
                 cx,
             ))
+            .child(
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .child(self.render_numeric_cell(
+                        "fanta-layout-width-limit",
+                        0,
+                        Some("Min W".into()),
+                        InspectorField::LayoutMinWidth(id),
+                        layout.min_width,
+                        None,
+                        editable,
+                        cx,
+                    ))
+                    .child(self.render_numeric_cell(
+                        "fanta-layout-width-limit",
+                        1,
+                        Some("Max W".into()),
+                        InspectorField::LayoutMaxWidth(id),
+                        layout.max_width,
+                        None,
+                        editable,
+                        cx,
+                    )),
+            )
+            .child(
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .child(self.render_numeric_cell(
+                        "fanta-layout-height-limit",
+                        0,
+                        Some("Min H".into()),
+                        InspectorField::LayoutMinHeight(id),
+                        layout.min_height,
+                        None,
+                        editable,
+                        cx,
+                    ))
+                    .child(self.render_numeric_cell(
+                        "fanta-layout-height-limit",
+                        1,
+                        Some("Max H".into()),
+                        InspectorField::LayoutMaxHeight(id),
+                        layout.max_height,
+                        None,
+                        editable,
+                        cx,
+                    )),
+            )
             .child(self.render_switch_row(
                 "fanta-layout-wrap",
                 "Wrap",

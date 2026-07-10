@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent, actions::SelectAll};
+use fanta_doc::{Easing, Interpolation};
 use gpui::{
     App, Bounds, Context, Entity, EventEmitter, Focusable, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Subscription, Task,
@@ -14,7 +15,7 @@ const DEFAULT_DURATION_US: i64 = 5_000_000;
 pub(crate) const TIMELINE_HEIGHT: Pixels = px(188.);
 const TRACK_LABEL_WIDTH: Pixels = px(112.);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TimelineViewModel {
     pub clip_name: Option<SharedString>,
     pub duration_us: i64,
@@ -53,17 +54,19 @@ impl Default for TimelineViewModel {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TimelineTrackViewModel {
     pub id: SharedString,
     pub label: SharedString,
     pub keyframes: Vec<TimelineKeyframeViewModel>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TimelineKeyframeViewModel {
     pub id: SharedString,
     pub time_us: i64,
+    pub interpolation: Interpolation,
+    pub easing: Easing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -77,9 +80,10 @@ pub enum TimelineEditPhase {
     Begin,
     Preview,
     Commit,
+    Cancel,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TimelineEvent {
     PlayheadChanged(i64),
     PlaybackChanged(bool),
@@ -89,6 +93,19 @@ pub enum TimelineEvent {
     EditKeyframeTime {
         keyframe: TimelineKeyframeSelection,
         time_us: i64,
+        phase: TimelineEditPhase,
+    },
+    SetKeyframeInterpolation {
+        keyframe: TimelineKeyframeSelection,
+        interpolation: Interpolation,
+    },
+    SetKeyframeEasing {
+        keyframe: TimelineKeyframeSelection,
+        easing: Easing,
+    },
+    EditKeyframeEasing {
+        keyframe: TimelineKeyframeSelection,
+        easing: Easing,
         phase: TimelineEditPhase,
     },
     DeleteKeyframe(TimelineKeyframeSelection),
@@ -115,10 +132,26 @@ struct TimelineKeyframeDrag {
     current_time_us: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct TimelineEasingEdit {
+    keyframe: TimelineKeyframeSelection,
+    original: Easing,
+    current: Easing,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimelineClipField {
     Name,
     Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineEasingPreset {
+    Linear,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+    Custom,
 }
 
 pub struct TimelineShell {
@@ -136,6 +169,9 @@ pub struct TimelineShell {
     clip_edit_error: Option<SharedString>,
     clip_name_editor: Option<Entity<Editor>>,
     clip_duration_editor: Option<Entity<Editor>>,
+    easing_editor: Option<Entity<Editor>>,
+    easing_edit: Option<TimelineEasingEdit>,
+    easing_edit_error: Option<SharedString>,
     _editor_subscriptions: Vec<Subscription>,
 }
 
@@ -156,6 +192,9 @@ impl TimelineShell {
             clip_edit_error: None,
             clip_name_editor: None,
             clip_duration_editor: None,
+            easing_editor: None,
+            easing_edit: None,
+            easing_edit_error: None,
             _editor_subscriptions: Vec::new(),
         }
     }
@@ -170,6 +209,11 @@ impl TimelineShell {
             duration_us: model.duration_us.max(1),
             tracks: model.tracks,
         };
+        if self.easing_edit.as_ref().is_some_and(|edit| {
+            model_keyframe_easing(&self.model, &edit.keyframe) != Some(edit.current)
+        }) {
+            self.cancel_easing_edit(cx);
+        }
         if self
             .selected_keyframe
             .as_ref()
@@ -216,6 +260,7 @@ impl TimelineShell {
 
     pub(crate) fn cancel_authoring_gestures(&mut self, cx: &mut Context<Self>) {
         let mut changed = self.reset_keyframe_drag_inner();
+        changed |= self.cancel_easing_edit(cx);
         self.scrubbing = false;
         if self.editing_clip_field.take().is_some() {
             changed = true;
@@ -246,12 +291,16 @@ impl TimelineShell {
     }
 
     fn ensure_clip_editors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.clip_name_editor.is_some() && self.clip_duration_editor.is_some() {
+        if self.clip_name_editor.is_some()
+            && self.clip_duration_editor.is_some()
+            && self.easing_editor.is_some()
+        {
             return;
         }
 
         let clip_name_editor = cx.new(|cx| Editor::single_line(window, cx));
         let clip_duration_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let easing_editor = cx.new(|cx| Editor::single_line(window, cx));
         let name_subscription = cx.subscribe_in(
             &clip_name_editor,
             window,
@@ -278,10 +327,170 @@ impl TimelineShell {
                 }
             },
         );
+        let easing_subscription = cx.subscribe_in(
+            &easing_editor,
+            window,
+            |timeline: &mut Self, _, event: &EditorEvent, _window, cx| {
+                if timeline.easing_edit.is_some() {
+                    if matches!(event, EditorEvent::Edited { .. }) {
+                        timeline.preview_easing_edit(cx);
+                    } else if matches!(event, EditorEvent::Blurred) {
+                        timeline.commit_easing_edit(cx);
+                    }
+                }
+            },
+        );
         self.clip_name_editor = Some(clip_name_editor);
         self.clip_duration_editor = Some(clip_duration_editor);
-        self._editor_subscriptions
-            .extend([name_subscription, duration_subscription]);
+        self.easing_editor = Some(easing_editor);
+        self._editor_subscriptions.extend([
+            name_subscription,
+            duration_subscription,
+            easing_subscription,
+        ]);
+    }
+
+    fn begin_easing_edit(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        easing: Easing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.authoring_enabled || !matches!(easing, Easing::CubicBezier { .. }) {
+            return;
+        }
+        self.cancel_easing_edit(cx);
+        self.ensure_clip_editors(window, cx);
+        let Some(editor) = self.easing_editor.clone() else {
+            return;
+        };
+        self.easing_edit = Some(TimelineEasingEdit {
+            keyframe: keyframe.clone(),
+            original: easing,
+            current: easing,
+        });
+        self.easing_edit_error = None;
+        editor.update(cx, |editor, cx| {
+            editor.set_text(format_cubic_bezier(easing), window, cx);
+            editor.select_all(&SelectAll, window, cx);
+        });
+        editor.focus_handle(cx).focus(window, cx);
+        cx.emit(TimelineEvent::EditKeyframeEasing {
+            keyframe,
+            easing,
+            phase: TimelineEditPhase::Begin,
+        });
+        cx.notify();
+    }
+
+    fn preview_easing_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.easing_editor.as_ref() else {
+            return;
+        };
+        let text = editor.read(cx).text(cx);
+        let easing = match parse_cubic_bezier(&text) {
+            Ok(easing) => easing,
+            Err(error) => {
+                self.easing_edit_error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let Some(edit) = self.easing_edit.as_ref() else {
+            return;
+        };
+        if model_keyframe_easing(&self.model, &edit.keyframe) != Some(edit.current) {
+            self.cancel_easing_edit(cx);
+            self.easing_edit_error = Some("The keyframe changed; reopen the easing editor".into());
+            cx.notify();
+            return;
+        }
+        self.easing_edit_error = None;
+        if edit.current == easing {
+            cx.notify();
+            return;
+        }
+        let keyframe = edit.keyframe.clone();
+        if !set_model_keyframe_easing(&mut self.model, &keyframe, easing) {
+            return;
+        }
+        if let Some(edit) = self.easing_edit.as_mut() {
+            edit.current = easing;
+        }
+        cx.emit(TimelineEvent::EditKeyframeEasing {
+            keyframe,
+            easing,
+            phase: TimelineEditPhase::Preview,
+        });
+        cx.notify();
+    }
+
+    fn commit_easing_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.authoring_enabled {
+            self.cancel_easing_edit(cx);
+            return false;
+        }
+        let Some(editor) = self.easing_editor.as_ref() else {
+            return false;
+        };
+        let text = editor.read(cx).text(cx);
+        if let Err(error) = parse_cubic_bezier(&text) {
+            self.easing_edit_error = Some(error);
+            cx.notify();
+            return false;
+        }
+        self.preview_easing_edit(cx);
+        if self.easing_edit_error.is_some() {
+            return false;
+        }
+        let Some(edit) = self.easing_edit.take() else {
+            return false;
+        };
+        self.easing_edit_error = None;
+        cx.emit(TimelineEvent::EditKeyframeEasing {
+            keyframe: edit.keyframe,
+            easing: edit.current,
+            phase: TimelineEditPhase::Commit,
+        });
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn cancel_easing_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(edit) = self.easing_edit.take() else {
+            return self.easing_edit_error.take().is_some();
+        };
+        if model_keyframe_easing(&self.model, &edit.keyframe) == Some(edit.current) {
+            set_model_keyframe_easing(&mut self.model, &edit.keyframe, edit.original);
+        }
+        self.easing_edit_error = None;
+        cx.emit(TimelineEvent::EditKeyframeEasing {
+            keyframe: edit.keyframe,
+            easing: edit.original,
+            phase: TimelineEditPhase::Cancel,
+        });
+        cx.notify();
+        true
+    }
+
+    fn handle_easing_editor_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_easing_edit(cx);
+            }
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_easing_edit(cx);
+            }
+            _ => {}
+        }
     }
 
     fn begin_clip_edit(
@@ -503,6 +712,7 @@ impl TimelineShell {
         if !self.authoring_enabled {
             return;
         }
+        self.cancel_easing_edit(cx);
         let Some(time_us) = model_keyframe_time(&self.model, &keyframe) else {
             return;
         };
@@ -615,6 +825,7 @@ impl TimelineShell {
         let Some(keyframe) = self.selected_keyframe.take() else {
             return;
         };
+        self.cancel_easing_edit(cx);
         self.keyframe_drag = None;
         cx.emit(TimelineEvent::KeyframeSelectionChanged(None));
         cx.emit(TimelineEvent::DeleteKeyframe(keyframe));
@@ -678,6 +889,43 @@ impl TimelineShell {
         if self.authoring_enabled {
             cx.emit(TimelineEvent::AddKeyframe(property));
         }
+    }
+
+    fn set_selected_interpolation(&mut self, interpolation: Interpolation, cx: &mut Context<Self>) {
+        if !self.authoring_enabled {
+            return;
+        }
+        let Some(keyframe) = self.selected_keyframe.clone() else {
+            return;
+        };
+        let Some(current) = model_keyframe(&self.model, &keyframe) else {
+            return;
+        };
+        if current.interpolation == interpolation {
+            return;
+        }
+        cx.emit(TimelineEvent::SetKeyframeInterpolation {
+            keyframe,
+            interpolation,
+        });
+    }
+
+    fn set_selected_easing(&mut self, preset: TimelineEasingPreset, cx: &mut Context<Self>) {
+        if !self.authoring_enabled {
+            return;
+        }
+        let Some(keyframe) = self.selected_keyframe.clone() else {
+            return;
+        };
+        let Some(current) = model_keyframe_easing(&self.model, &keyframe) else {
+            return;
+        };
+        let easing = easing_for_preset(preset, current);
+        if current == easing {
+            return;
+        }
+        self.cancel_easing_edit(cx);
+        cx.emit(TimelineEvent::SetKeyframeEasing { keyframe, easing });
     }
 
     fn bounds_probe(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -875,11 +1123,182 @@ impl TimelineShell {
             )
             .into_any_element()
     }
+
+    fn render_interpolation_dropdown(
+        &self,
+        selection: &TimelineKeyframeSelection,
+        current: Interpolation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let timeline = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for (interpolation, label) in [
+                (Interpolation::Linear, "Linear"),
+                (Interpolation::Hold, "Hold"),
+            ] {
+                let timeline = timeline.clone();
+                menu.push_item(
+                    ContextMenuEntry::new(label)
+                        .toggleable(IconPosition::End, interpolation == current)
+                        .handler(move |_, cx| {
+                            timeline
+                                .update(cx, |timeline, cx| {
+                                    timeline.set_selected_interpolation(interpolation, cx)
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(
+            format!(
+                "fanta-motion-interpolation-{}-{}",
+                selection.track_id, selection.keyframe_id
+            ),
+            interpolation_label(current),
+            menu,
+        )
+        .style(DropdownStyle::Outlined)
+        .trigger_size(ButtonSize::Compact)
+        .disabled(!self.authoring_enabled)
+        .into_any_element()
+    }
+
+    fn render_easing_dropdown(
+        &self,
+        selection: &TimelineKeyframeSelection,
+        current: Easing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let timeline = cx.weak_entity();
+        let current_preset = easing_preset(current);
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for (preset, label) in [
+                (TimelineEasingPreset::Linear, "Linear"),
+                (TimelineEasingPreset::EaseIn, "Ease in"),
+                (TimelineEasingPreset::EaseOut, "Ease out"),
+                (TimelineEasingPreset::EaseInOut, "Ease in and out"),
+                (TimelineEasingPreset::Custom, "Custom cubic-bezier"),
+            ] {
+                let timeline = timeline.clone();
+                menu.push_item(
+                    ContextMenuEntry::new(label)
+                        .toggleable(IconPosition::End, preset == current_preset)
+                        .handler(move |_, cx| {
+                            timeline
+                                .update(cx, |timeline, cx| timeline.set_selected_easing(preset, cx))
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(
+            format!(
+                "fanta-motion-easing-{}-{}",
+                selection.track_id, selection.keyframe_id
+            ),
+            easing_label(current),
+            menu,
+        )
+        .style(DropdownStyle::Outlined)
+        .trigger_size(ButtonSize::Compact)
+        .disabled(!self.authoring_enabled)
+        .into_any_element()
+    }
+
+    fn render_custom_easing_editor(
+        &self,
+        selection: &TimelineKeyframeSelection,
+        easing: Easing,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = format!(
+            "fanta-motion-cubic-bezier-{}-{}",
+            selection.track_id, selection.keyframe_id
+        );
+        let editing = self
+            .easing_edit
+            .as_ref()
+            .is_some_and(|edit| edit.keyframe == *selection);
+        let mut field = div()
+            .id(id)
+            .w(px(164.))
+            .h(px(24.))
+            .px_1p5()
+            .rounded_sm()
+            .border_1()
+            .border_color(if editing {
+                cx.theme().colors().border_focused
+            } else {
+                cx.theme().colors().border_variant
+            })
+            .bg(cx.theme().colors().editor_background)
+            .overflow_hidden();
+        if editing && let Some(editor) = self.easing_editor.clone() {
+            return field
+                .on_key_down(cx.listener(Self::handle_easing_editor_key_down))
+                .child(editor)
+                .into_any_element();
+        }
+        if self.authoring_enabled {
+            let selection = selection.clone();
+            field = field
+                .cursor_text()
+                .on_click(cx.listener(move |timeline, _, window, cx| {
+                    timeline.begin_easing_edit(selection.clone(), easing, window, cx)
+                }));
+        }
+        field
+            .child(
+                Label::new(format_cubic_bezier(easing))
+                    .size(LabelSize::XSmall)
+                    .single_line(),
+            )
+            .tooltip(Tooltip::text("Edit x1, y1, x2, y2"))
+            .into_any_element()
+    }
+
+    fn render_selected_keyframe_controls(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let selection = self.selected_keyframe.as_ref()?;
+        let keyframe = model_keyframe(&self.model, selection)?;
+        let interpolation =
+            self.render_interpolation_dropdown(selection, keyframe.interpolation, window, cx);
+        let easing = self.render_easing_dropdown(selection, keyframe.easing, window, cx);
+        let mut controls = h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                Label::new("Interpolation")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(interpolation)
+            .child(
+                Label::new("Easing")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(easing);
+        if matches!(keyframe.easing, Easing::CubicBezier { .. }) {
+            controls =
+                controls.child(self.render_custom_easing_editor(selection, keyframe.easing, cx));
+        }
+        Some(controls.into_any_element())
+    }
 }
 
 impl Render for TimelineShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_clip_editors(window, cx);
+        let keyframe_controls = self.render_selected_keyframe_controls(window, cx);
         let mut tracks = v_flex()
             .id("fanta-motion-tracks")
             .flex_1()
@@ -971,6 +1390,7 @@ impl Render for TimelineShell {
                             )
                             .into_any_element()
                     })
+                    .when_some(keyframe_controls, |header, controls| header.child(controls))
                     .when(self.selected_keyframe.is_some(), |header| {
                         header.child(
                             IconButton::new("fanta-motion-delete-keyframe", IconName::Trash)
@@ -983,6 +1403,14 @@ impl Render for TimelineShell {
                         )
                     })
                     .when_some(self.clip_edit_error.clone(), |header, error| {
+                        header.child(
+                            Label::new(error)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                                .single_line(),
+                        )
+                    })
+                    .when_some(self.easing_edit_error.clone(), |header, error| {
                         header.child(
                             Label::new(error)
                                 .size(LabelSize::XSmall)
@@ -1024,6 +1452,19 @@ fn model_contains_keyframe(
     model_keyframe_time(model, selection).is_some()
 }
 
+fn model_keyframe<'a>(
+    model: &'a TimelineViewModel,
+    selection: &TimelineKeyframeSelection,
+) -> Option<&'a TimelineKeyframeViewModel> {
+    model
+        .tracks
+        .iter()
+        .find(|track| track.id == selection.track_id)?
+        .keyframes
+        .iter()
+        .find(|keyframe| keyframe.id == selection.keyframe_id)
+}
+
 fn model_keyframe_time(
     model: &TimelineViewModel,
     selection: &TimelineKeyframeSelection,
@@ -1036,6 +1477,45 @@ fn model_keyframe_time(
         .iter()
         .find(|keyframe| keyframe.id == selection.keyframe_id)
         .map(|keyframe| keyframe.time_us)
+}
+
+fn model_keyframe_easing(
+    model: &TimelineViewModel,
+    selection: &TimelineKeyframeSelection,
+) -> Option<Easing> {
+    model
+        .tracks
+        .iter()
+        .find(|track| track.id == selection.track_id)?
+        .keyframes
+        .iter()
+        .find(|keyframe| keyframe.id == selection.keyframe_id)
+        .map(|keyframe| keyframe.easing)
+}
+
+fn set_model_keyframe_easing(
+    model: &mut TimelineViewModel,
+    selection: &TimelineKeyframeSelection,
+    easing: Easing,
+) -> bool {
+    let Some(keyframe) = model
+        .tracks
+        .iter_mut()
+        .find(|track| track.id == selection.track_id)
+        .and_then(|track| {
+            track
+                .keyframes
+                .iter_mut()
+                .find(|keyframe| keyframe.id == selection.keyframe_id)
+        })
+    else {
+        return false;
+    };
+    if keyframe.easing == easing {
+        return false;
+    }
+    keyframe.easing = easing;
+    true
 }
 
 fn set_model_keyframe_time(
@@ -1089,6 +1569,110 @@ fn parse_duration_us(text: &str) -> Option<i64> {
     Some((duration_us as i64).max(1))
 }
 
+fn format_cubic_bezier(easing: Easing) -> String {
+    let Easing::CubicBezier { x1, y1, x2, y2 } = easing else {
+        return "0.42, 0, 0.58, 1".to_owned();
+    };
+    format!("{x1:.3}, {y1:.3}, {x2:.3}, {y2:.3}")
+}
+
+fn interpolation_label(interpolation: Interpolation) -> &'static str {
+    match interpolation {
+        Interpolation::Linear => "Linear",
+        Interpolation::Hold => "Hold",
+    }
+}
+
+fn easing_label(easing: Easing) -> &'static str {
+    match easing {
+        Easing::Linear => "Linear",
+        Easing::EaseIn => "Ease in",
+        Easing::EaseOut => "Ease out",
+        Easing::EaseInOut => "Ease in/out",
+        Easing::CubicBezier { .. } => "Custom",
+    }
+}
+
+fn easing_preset(easing: Easing) -> TimelineEasingPreset {
+    match easing {
+        Easing::Linear => TimelineEasingPreset::Linear,
+        Easing::EaseIn => TimelineEasingPreset::EaseIn,
+        Easing::EaseOut => TimelineEasingPreset::EaseOut,
+        Easing::EaseInOut => TimelineEasingPreset::EaseInOut,
+        Easing::CubicBezier { .. } => TimelineEasingPreset::Custom,
+    }
+}
+
+fn easing_for_preset(preset: TimelineEasingPreset, current: Easing) -> Easing {
+    match preset {
+        TimelineEasingPreset::Linear => Easing::Linear,
+        TimelineEasingPreset::EaseIn => Easing::EaseIn,
+        TimelineEasingPreset::EaseOut => Easing::EaseOut,
+        TimelineEasingPreset::EaseInOut => Easing::EaseInOut,
+        TimelineEasingPreset::Custom => match current {
+            Easing::CubicBezier { .. } => current,
+            Easing::Linear => Easing::CubicBezier {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+            },
+            Easing::EaseIn => Easing::CubicBezier {
+                x1: 0.42,
+                y1: 0.0,
+                x2: 1.0,
+                y2: 1.0,
+            },
+            Easing::EaseOut => Easing::CubicBezier {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 0.58,
+                y2: 1.0,
+            },
+            Easing::EaseInOut => Easing::CubicBezier {
+                x1: 0.42,
+                y1: 0.0,
+                x2: 0.58,
+                y2: 1.0,
+            },
+        },
+    }
+}
+
+fn parse_cubic_bezier(text: &str) -> Result<Easing, SharedString> {
+    let trimmed = text.trim();
+    let values = if let Some(inner) = trimmed
+        .strip_prefix("cubic-bezier(")
+        .and_then(|inner| inner.strip_suffix(')'))
+    {
+        inner
+    } else {
+        trimmed
+    };
+    let mut values = values.split(',').map(str::trim);
+    let parse_value =
+        |value: Option<&str>, minimum: f32, maximum: f32| -> Result<f32, SharedString> {
+            let Some(value) = value else {
+                return Err("Enter four comma-separated control points".into());
+            };
+            let value = value
+                .parse::<f32>()
+                .map_err(|_| SharedString::from("Control points must be numbers"))?;
+            if !value.is_finite() {
+                return Err("Control points must be finite".into());
+            }
+            Ok(value.clamp(minimum, maximum))
+        };
+    let x1 = parse_value(values.next(), 0.0, 1.0)?;
+    let y1 = parse_value(values.next(), -10.0, 10.0)?;
+    let x2 = parse_value(values.next(), 0.0, 1.0)?;
+    let y2 = parse_value(values.next(), -10.0, 10.0)?;
+    if values.next().is_some() {
+        return Err("Enter exactly four control points".into());
+    }
+    Ok(Easing::CubicBezier { x1, y1, x2, y2 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1110,6 +1694,23 @@ mod tests {
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
         });
+    }
+
+    fn easing_model(selection: &TimelineKeyframeSelection, easing: Easing) -> TimelineViewModel {
+        TimelineViewModel::for_clip(
+            "Entrance",
+            1_000_000,
+            vec![TimelineTrackViewModel {
+                id: selection.track_id.clone(),
+                label: "Layer · Position X".into(),
+                keyframes: vec![TimelineKeyframeViewModel {
+                    id: selection.keyframe_id.clone(),
+                    time_us: 250_000,
+                    interpolation: Interpolation::Linear,
+                    easing,
+                }],
+            }],
+        )
     }
 
     #[test]
@@ -1143,6 +1744,8 @@ mod tests {
                 keyframes: vec![TimelineKeyframeViewModel {
                     id: selection.keyframe_id.clone(),
                     time_us: 250_000,
+                    interpolation: Interpolation::Linear,
+                    easing: Easing::EaseInOut,
                 }],
             }],
         );
@@ -1157,6 +1760,30 @@ mod tests {
         assert_eq!(parse_duration_us("2.5s"), Some(2_500_000));
         assert_eq!(parse_duration_us("0"), None);
         assert_eq!(parse_duration_us("not a duration"), None);
+    }
+
+    #[test]
+    fn cubic_bezier_parser_clamps_x_and_preserves_safe_y_overshoot() {
+        assert_eq!(
+            parse_cubic_bezier("-2, -3, 4, 5"),
+            Ok(Easing::CubicBezier {
+                x1: 0.0,
+                y1: -3.0,
+                x2: 1.0,
+                y2: 5.0,
+            })
+        );
+        assert_eq!(
+            parse_cubic_bezier("0.2, -20, 0.8, 20"),
+            Ok(Easing::CubicBezier {
+                x1: 0.2,
+                y1: -10.0,
+                x2: 0.8,
+                y2: 10.0,
+            })
+        );
+        assert!(parse_cubic_bezier("NaN, 0, 1, 1").is_err());
+        assert!(parse_cubic_bezier("0, 1, 1").is_err());
     }
 
     #[gpui::test]
@@ -1177,6 +1804,8 @@ mod tests {
                         keyframes: vec![TimelineKeyframeViewModel {
                             id: selection.keyframe_id.clone(),
                             time_us: 250_000,
+                            interpolation: Interpolation::Linear,
+                            easing: Easing::EaseInOut,
                         }],
                     }],
                 ),
@@ -1302,6 +1931,132 @@ mod tests {
             })
             .expect("update timeline window");
         assert!(recorder.read_with(cx, |recorder, _| recorder.events.is_empty()));
+    }
+
+    #[gpui::test]
+    fn custom_easing_editor_keeps_invalid_text_and_emits_one_live_gesture(cx: &mut TestAppContext) {
+        init_editor_test(cx);
+        let selection = TimelineKeyframeSelection {
+            track_id: "track-1".into(),
+            keyframe_id: "keyframe-1".into(),
+        };
+        let original = Easing::CubicBezier {
+            x1: 0.42,
+            y1: 0.0,
+            x2: 0.58,
+            y2: 1.0,
+        };
+        let timeline = cx.add_window(|_, _| TimelineShell::new());
+        let timeline_entity = timeline.entity(cx).expect("timeline entity");
+        let recorder = cx.new(|cx| TimelineEventRecorder {
+            events: Vec::new(),
+            _subscription: cx.subscribe(
+                &timeline_entity,
+                |recorder: &mut TimelineEventRecorder, _, event: &TimelineEvent, _| {
+                    recorder.events.push(event.clone())
+                },
+            ),
+        });
+
+        timeline
+            .update(cx, |timeline, window, cx| {
+                timeline.set_model(easing_model(&selection, original), cx);
+                timeline.selected_keyframe = Some(selection.clone());
+                timeline.begin_easing_edit(selection.clone(), original, window, cx);
+                let editor = timeline.easing_editor.clone().expect("easing editor");
+                editor.update(cx, |editor, cx| editor.set_text("NaN, 0, 1, 1", window, cx));
+                timeline.preview_easing_edit(cx);
+                assert_eq!(
+                    timeline.easing_edit_error.as_deref(),
+                    Some("Control points must be finite")
+                );
+                assert_eq!(
+                    model_keyframe_easing(&timeline.model, &selection),
+                    Some(original)
+                );
+                assert_eq!(editor.read(cx).text(cx), "NaN, 0, 1, 1");
+
+                editor.update(cx, |editor, cx| editor.set_text("-2, -3, 4, 5", window, cx));
+                timeline.preview_easing_edit(cx);
+                let expected = Easing::CubicBezier {
+                    x1: 0.0,
+                    y1: -3.0,
+                    x2: 1.0,
+                    y2: 5.0,
+                };
+                assert_eq!(
+                    model_keyframe_easing(&timeline.model, &selection),
+                    Some(expected)
+                );
+                assert!(timeline.commit_easing_edit(cx));
+                assert!(timeline.easing_edit.is_none());
+                assert!(timeline.easing_edit_error.is_none());
+            })
+            .expect("update timeline window");
+
+        let phases = recorder.read_with(cx, |recorder, _| {
+            recorder
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    TimelineEvent::EditKeyframeEasing { phase, .. } => Some(*phase),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            phases,
+            vec![
+                TimelineEditPhase::Begin,
+                TimelineEditPhase::Preview,
+                TimelineEditPhase::Commit,
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn disabling_authoring_cancels_easing_without_clobbering_divergence(cx: &mut TestAppContext) {
+        init_editor_test(cx);
+        let selection = TimelineKeyframeSelection {
+            track_id: "track-1".into(),
+            keyframe_id: "keyframe-1".into(),
+        };
+        let original = Easing::CubicBezier {
+            x1: 0.42,
+            y1: 0.0,
+            x2: 0.58,
+            y2: 1.0,
+        };
+        let external = Easing::EaseOut;
+        let timeline = cx.add_window(|_, _| TimelineShell::new());
+
+        timeline
+            .update(cx, |timeline, window, cx| {
+                timeline.set_model(easing_model(&selection, original), cx);
+                timeline.selected_keyframe = Some(selection.clone());
+                timeline.begin_easing_edit(selection.clone(), original, window, cx);
+                let editor = timeline.easing_editor.clone().expect("easing editor");
+                editor.update(cx, |editor, cx| editor.set_text("0, -2, 1, 3", window, cx));
+                timeline.preview_easing_edit(cx);
+                assert_ne!(
+                    model_keyframe_easing(&timeline.model, &selection),
+                    Some(original)
+                );
+
+                assert!(set_model_keyframe_easing(
+                    &mut timeline.model,
+                    &selection,
+                    external
+                ));
+                timeline.set_authoring_enabled(false, cx);
+
+                assert!(timeline.easing_edit.is_none());
+                assert_eq!(
+                    model_keyframe_easing(&timeline.model, &selection),
+                    Some(external)
+                );
+            })
+            .expect("update timeline window");
     }
 
     #[gpui::test]

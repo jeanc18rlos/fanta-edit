@@ -1591,7 +1591,7 @@
     },
   },
   {
-    "context": "FigViewer",
+    "context": "FigViewer && !Editor",
     "use_key_equivalents": true,
     "bindings": {
       "cmd-=": "fig_viewer::ZoomIn",

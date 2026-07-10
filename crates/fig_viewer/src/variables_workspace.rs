@@ -17,6 +17,7 @@ use util::ResultExt as _;
 
 use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::inspector_components::{InspectorMessage, InspectorSectionHeader};
+use crate::mode_overrides::mode_override_operation;
 use crate::variable_binding::{
     VariableBindingOption, bindable_properties, variable_binding_model, variable_binding_operation,
 };
@@ -1404,33 +1405,7 @@ fn set_active_mode_operation(
     collection: VariableCollectionId,
     new: Option<ModeId>,
 ) -> Result<Option<Operation>, &'static str> {
-    let collection_data = doc
-        .variables
-        .collections
-        .get(&collection)
-        .ok_or("The collection no longer exists")?;
-    if new.is_some_and(|mode| !collection_data.has_mode(mode)) {
-        return Err("The selected mode no longer exists");
-    }
-    let old = match &scope {
-        ModeScope::Doc => doc.active_modes.get(&collection).copied(),
-        ModeScope::Frame { node } => {
-            let node = doc
-                .scene
-                .get(*node)
-                .ok_or("The mode container no longer exists")?;
-            let NodeData::Group(group) = &node.data else {
-                return Err("Only pages and containers can override modes");
-            };
-            group.explicit_modes.get(&collection).copied()
-        }
-    };
-    Ok((old != new).then_some(Operation::SetActiveMode {
-        scope,
-        collection,
-        old,
-        new,
-    }))
+    mode_override_operation(doc, scope, collection, new)
 }
 
 fn collection_snapshot(doc: &Doc, collection: &VariableCollection) -> CollectionSnapshot {
