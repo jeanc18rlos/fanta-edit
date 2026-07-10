@@ -58,6 +58,7 @@ pub struct FantaCodeWorkspace {
     fnx_load_task: Option<Task<()>>,
     json_load_task: Option<Task<()>>,
     validation_task: Option<Task<()>>,
+    source_save_in_progress: bool,
     fnx_subscription: Option<Subscription>,
     _item_subscription: Subscription,
 }
@@ -109,6 +110,7 @@ impl FantaCodeWorkspace {
             fnx_load_task: None,
             json_load_task: None,
             validation_task: None,
+            source_save_in_progress: false,
             fnx_subscription: None,
             _item_subscription: item_subscription,
         };
@@ -173,6 +175,14 @@ impl FantaCodeWorkspace {
         let Some(buffer) = self.fnx_buffer.clone() else {
             return Some(Task::ready(Err(anyhow!("the FNX buffer is unavailable"))));
         };
+        if !self
+            .item
+            .update(cx, |item, _| item.try_begin_source_edit_pipeline())
+        {
+            return Some(Task::ready(Err(anyhow!(
+                "another FNX save or reconciliation is already in progress"
+            ))));
+        }
 
         let (source, version) = {
             let buffer = buffer.read(cx);
@@ -181,8 +191,7 @@ impl FantaCodeWorkspace {
         self.validation_task = None;
         self.error_message = None;
         self.validation_message = Some("Saving FNX…".into());
-        self.item
-            .update(cx, |item, _| item.begin_source_edit_save());
+        self.source_save_in_progress = true;
         let item = self.item.clone();
         let project = self.project.clone();
 
@@ -196,7 +205,9 @@ impl FantaCodeWorkspace {
             let source_edit = match source_edit {
                 Ok(source_edit) => source_edit,
                 Err(error) => {
+                    item.update(cx, |item, _| item.finish_source_edit_pipeline());
                     this.update(cx, |this, cx| {
+                        this.source_save_in_progress = false;
                         this.validation_message = None;
                         this.error_message = Some(format!("Could not save FNX: {error}").into());
                         cx.notify();
@@ -209,7 +220,9 @@ impl FantaCodeWorkspace {
             if !buffer_unchanged {
                 // The validated snapshot is now safely on disk, but a newer
                 // edit owns the live preview and must remain dirty/locked.
+                item.update(cx, |item, _| item.finish_source_edit_pipeline());
                 this.update(cx, |this, cx| {
+                    this.source_save_in_progress = false;
                     if this.validation_message.as_deref() == Some("Saving FNX…") {
                         this.validation_message = None;
                     }
@@ -224,7 +237,9 @@ impl FantaCodeWorkspace {
             let save_buffer =
                 project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
             if let Err(error) = save_buffer.await {
+                item.update(cx, |item, _| item.finish_source_edit_pipeline());
                 this.update(cx, |this, cx| {
+                    this.source_save_in_progress = false;
                     this.validation_message = None;
                     this.error_message = Some(
                         format!(
@@ -236,7 +251,30 @@ impl FantaCodeWorkspace {
                 })?;
                 return Err(error).context("recording the saved FNX buffer version");
             }
+            let reload_json = match this.update(cx, |this, cx| this.reload_json_buffer(cx)) {
+                Ok(reload_json) => reload_json,
+                Err(error) => {
+                    item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                    return Err(error).context("refreshing JSON after saving FNX");
+                }
+            };
+            if let Some(reload_json) = reload_json
+                && let Err(error) = reload_json.await
+            {
+                item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                this.update(cx, |this, cx| {
+                    this.source_save_in_progress = false;
+                    this.validation_message = None;
+                    this.error_message = Some(
+                        format!("FNX was saved, but JSON could not refresh: {error:#}").into(),
+                    );
+                    cx.notify();
+                })?;
+                return Ok(());
+            }
+            item.update(cx, |item, _| item.finish_source_edit_pipeline());
             this.update(cx, |this, cx| {
+                this.source_save_in_progress = false;
                 this.validation_message = None;
                 this.error_message = None;
                 cx.notify();
@@ -276,6 +314,7 @@ impl FantaCodeWorkspace {
                 self.json_editor = None;
                 self.fnx_subscription = None;
                 self.validation_task = None;
+                self.source_save_in_progress = false;
                 self.error_message = Some("This document has no page source to display.".into());
             }
         }
@@ -294,6 +333,7 @@ impl FantaCodeWorkspace {
         self.fnx_load_task = None;
         self.json_load_task = None;
         self.validation_task = None;
+        self.source_save_in_progress = false;
         self.fnx_subscription = None;
     }
 
@@ -349,6 +389,11 @@ impl FantaCodeWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let migration_error = crate::fnx_editor::upgrade_legacy_fnx_buffer(&buffer, cx).err();
+        if let Some(error) = &migration_error {
+            self.error_message =
+                Some(format!("Could not prepare the legacy FNX source: {error:#}").into());
+        }
         let editor =
             cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(self.project.clone()), window, cx));
         let source_is_dirty = buffer.read(cx).is_dirty();
@@ -359,29 +404,223 @@ impl FantaCodeWorkspace {
             &buffer,
             window,
             |this: &mut Self, buffer, event: &BufferEvent, window, cx| {
-                if matches!(
-                    event,
-                    BufferEvent::Edited { .. } | BufferEvent::Reloaded | BufferEvent::Saved
-                ) {
-                    let source_is_dirty = buffer.read(cx).is_dirty();
-                    this.item.update(cx, |item, cx| {
-                        item.set_source_edit_locked(source_is_dirty, cx)
-                    });
-                }
-                if matches!(event, BufferEvent::Edited { .. } | BufferEvent::Reloaded) {
-                    this.schedule_source_validation(cx);
-                }
-                if matches!(event, BufferEvent::Saved) {
-                    let active_page = this.item.read(cx).doc().and_then(|doc| doc.active_page());
-                    if active_page != this.requested_page {
-                        this.refresh_page(active_page, window, cx);
-                    }
-                }
+                this.handle_fnx_buffer_event(buffer.clone(), event, window, cx);
             },
         ));
         self.fnx_buffer = Some(buffer);
         self.fnx_editor = Some(editor);
+        if source_is_dirty {
+            self.schedule_source_validation(cx);
+        } else if migration_error.is_none() {
+            self.error_message = None;
+        }
+    }
+
+    fn handle_fnx_buffer_event(
+        &mut self,
+        buffer: Entity<Buffer>,
+        event: &BufferEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            BufferEvent::Edited { .. } => {
+                let source_is_dirty = buffer.read(cx).is_dirty();
+                self.item.update(cx, |item, cx| {
+                    item.set_source_edit_locked(source_is_dirty, cx)
+                });
+                self.schedule_source_validation(cx);
+            }
+            BufferEvent::Reloaded => {
+                self.item
+                    .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+                self.schedule_source_validation(cx);
+            }
+            BufferEvent::Saved => {
+                if self.source_save_in_progress {
+                    let source_is_dirty = buffer.read(cx).is_dirty();
+                    self.item.update(cx, |item, cx| {
+                        item.set_source_edit_locked(source_is_dirty, cx)
+                    });
+                } else {
+                    self.validation_task = None;
+                    let owns_reconciliation = self
+                        .item
+                        .update(cx, |item, _| item.try_begin_source_edit_pipeline());
+                    if owns_reconciliation {
+                        self.item
+                            .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+                        self.reconcile_saved_source(cx);
+                    }
+                }
+                let active_page = self.item.read(cx).doc().and_then(|doc| doc.active_page());
+                if active_page != self.requested_page {
+                    self.refresh_page(active_page, window, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reconcile_saved_source(&mut self, cx: &mut Context<Self>) {
+        self.validation_task = None;
+        if self.item.read(cx).is_dirty() {
+            self.item
+                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.validation_message = None;
+            self.error_message = Some(
+                "FNX was saved outside the canvas while canvas changes were unsaved. Reload or save the canvas before reconciling the source."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(project_root) = self.item.read(cx).project_root().map(Path::to_path_buf) else {
+            self.item
+                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.validation_message = None;
+            self.error_message = Some("The FNX project root is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(source_path) = self.fnx_path.clone() else {
+            self.item
+                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.validation_message = None;
+            self.error_message = Some("The saved FNX source path is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let Some(buffer) = self.fnx_buffer.clone() else {
+            self.item
+                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.validation_message = None;
+            self.error_message = Some("The saved FNX buffer is unavailable.".into());
+            cx.notify();
+            return;
+        };
+        let (source, version) = {
+            let buffer = buffer.read(cx);
+            (buffer.text(), buffer.version())
+        };
+
         self.error_message = None;
+        self.validation_message = Some("Reconciling saved FNX…".into());
+        let item = self.item.clone();
+        cx.spawn(async move |this, cx| {
+            let apply_path = source_path.clone();
+            let reconciliation = cx
+                .background_spawn(async move {
+                    fanta_format::apply_project_source_edit(&project_root, &apply_path, &source)
+                })
+                .await;
+
+            let source_edit = match reconciliation {
+                Ok(source_edit) => source_edit,
+                Err(error) => {
+                    item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                    if let Err(update_error) = this.update(cx, |this, cx| {
+                        this.validation_message = None;
+                        this.error_message = Some(
+                            format!(
+                                "Saved FNX could not be reconciled; the canvas is keeping its last valid state: {error}"
+                            )
+                            .into(),
+                        );
+                        cx.notify();
+                    }) {
+                        log::debug!(
+                            "dropping saved FNX reconciliation for closed workspace: {update_error:#}"
+                        );
+                    }
+                    return;
+                }
+            };
+
+            let source_is_current = match this.read_with(cx, |this, cx| {
+                this.fnx_path.as_ref() == Some(&source_path)
+                    && buffer.read(cx).version() == version
+                    && !buffer.read(cx).is_dirty()
+            }) {
+                Ok(source_is_current) => source_is_current,
+                Err(error) => {
+                    item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                    log::debug!(
+                        "dropping saved FNX reconciliation for closed workspace: {error:#}"
+                    );
+                    return;
+                }
+            };
+            if !source_is_current {
+                item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                if let Err(error) = this.update(cx, |this, cx| {
+                    if this.validation_message.as_deref() == Some("Reconciling saved FNX…") {
+                        this.validation_message = None;
+                    }
+                    cx.notify();
+                }) {
+                    log::debug!(
+                        "dropping saved FNX reconciliation for closed workspace: {error:#}"
+                    );
+                }
+                return;
+            }
+
+            item.update(cx, |item, cx| {
+                item.adopt_saved_source_edit(source_edit, cx);
+                item.set_source_edit_locked(false, cx);
+                item.finish_source_edit_pipeline();
+            });
+            let reload_json = match this.update(cx, |this, cx| {
+                this.validation_message = None;
+                this.error_message = None;
+                let reload_json = this.reload_json_buffer(cx);
+                cx.notify();
+                reload_json
+            }) {
+                Ok(reload_json) => reload_json,
+                Err(error) => {
+                    log::debug!(
+                        "dropping saved FNX reconciliation for closed workspace: {error:#}"
+                    );
+                    return;
+                }
+            };
+
+            if let Some(reload_json) = reload_json
+                && let Err(error) = reload_json.await
+                && let Err(update_error) = this.update(cx, |this, cx| {
+                    this.error_message = Some(
+                        format!("FNX was reconciled, but JSON could not refresh: {error:#}").into(),
+                    );
+                    cx.notify();
+                })
+            {
+                log::debug!(
+                    "dropping JSON refresh error for closed workspace: {update_error:#}"
+                );
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn reload_json_buffer(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
+        let buffer = self.json_buffer.clone()?;
+        if buffer.read(cx).is_dirty() {
+            return Some(Task::ready(Err(anyhow!(
+                "the JSON buffer has unsaved changes"
+            ))));
+        }
+        let reload = self.project.update(cx, |project, cx| {
+            project.reload_buffers(std::iter::once(buffer).collect(), false, cx)
+        });
+        Some(cx.spawn(async move |_, _| {
+            reload
+                .await
+                .context("reloading the generated JSON buffer")?;
+            Ok(())
+        }))
     }
 
     fn open_json(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -445,7 +684,10 @@ impl FantaCodeWorkspace {
             cx.notify();
             return;
         }
-        let source = buffer.read(cx).text();
+        let (source, version) = {
+            let buffer = buffer.read(cx);
+            (buffer.text(), buffer.version())
+        };
         self.validation_message = Some("Checking FNX…".into());
         self.validation_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -468,6 +710,9 @@ impl FantaCodeWorkspace {
                 }
                 match validation {
                     Ok(source_edit) => {
+                        if buffer.read(cx).version() != version {
+                            return;
+                        }
                         if this.item.read(cx).is_dirty() {
                             this.error_message = Some(
                                 "Canvas content changed while FNX was being checked; save or discard it before retrying."
@@ -478,8 +723,16 @@ impl FantaCodeWorkspace {
                         }
                         this.error_message = None;
                         let item = this.item.clone();
+                        let expected_version = version.clone();
                         cx.defer(move |cx| {
-                            item.update(cx, |item, cx| item.adopt_source_edit(source_edit, cx));
+                            if buffer.read(cx).version() != expected_version {
+                                return;
+                            }
+                            let source_is_dirty = buffer.read(cx).is_dirty();
+                            item.update(cx, |item, cx| {
+                                item.adopt_source_edit(source_edit, cx);
+                                item.set_source_edit_locked(source_is_dirty, cx);
+                            });
                         });
                     }
                     Err(error) => {
@@ -638,6 +891,7 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
+            crate::fnx_editor::init(cx);
         });
     }
 
@@ -653,16 +907,15 @@ mod tests {
         page_id
     }
 
-    async fn open_code_workspace(
-        root: &Path,
-        cx: &mut TestAppContext,
-    ) -> (
-        Entity<Project>,
-        Entity<FigItem>,
-        gpui::WindowHandle<FantaCodeWorkspace>,
-    ) {
+    async fn open_test_project(root: &Path, cx: &mut TestAppContext) -> Entity<Project> {
         let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
-        let project = Project::test(file_system, [root], cx).await;
+        Project::test(file_system, [root], cx).await
+    }
+
+    async fn open_code_workspace_for_project(
+        project: Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<FigItem>, gpui::WindowHandle<FantaCodeWorkspace>) {
         let worktree_id = project.update(cx, |project, cx| {
             project
                 .worktrees(cx)
@@ -687,6 +940,19 @@ mod tests {
             FantaCodeWorkspace::new(workspace_item, workspace_project, window, cx)
         });
         cx.run_until_parked();
+        (item, workspace)
+    }
+
+    async fn open_code_workspace(
+        root: &Path,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Project>,
+        Entity<FigItem>,
+        gpui::WindowHandle<FantaCodeWorkspace>,
+    ) {
+        let project = open_test_project(root, cx).await;
+        let (item, workspace) = open_code_workspace_for_project(project.clone(), cx).await;
         (project, item, workspace)
     }
 
@@ -719,6 +985,20 @@ mod tests {
         })
     }
 
+    fn remove_editor_prelude(source: &str) -> String {
+        let mut legacy = source
+            .lines()
+            .filter(|line| {
+                !line.contains("@jsxRuntime classic")
+                    && !line.contains("@jsx fnxElement")
+                    && !(line.starts_with("import {") && line.ends_with("from \"../../fnx\";"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        legacy.push('\n');
+        legacy
+    }
+
     #[test]
     fn source_paths_follow_the_project_layout() {
         let root = Path::new("/tmp/design");
@@ -731,6 +1011,174 @@ mod tests {
             page_json_path(root, page),
             root.join("pages").join(page.to_string()).join("page.json")
         );
+    }
+
+    #[gpui::test]
+    async fn ordinary_editor_migrates_shared_fnx_and_reconciles_its_save(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let json_path = page_json_path(temporary.path(), page);
+        let generated_source =
+            std::fs::read_to_string(&source_path).expect("read generated FNX source");
+        let legacy_source = remove_editor_prelude(&generated_source);
+        assert_ne!(legacy_source, generated_source);
+        std::fs::write(&source_path, &legacy_source).expect("write legacy FNX source");
+        let editor_types_path = temporary.path().join("fnx.d.ts");
+        if editor_types_path.exists() {
+            std::fs::remove_file(&editor_types_path).expect("remove editor types");
+        }
+        let formatter_settings_path = temporary.path().join(".prettierrc.json");
+        if formatter_settings_path.exists() {
+            std::fs::remove_file(&formatter_settings_path).expect("remove formatter settings");
+        }
+
+        let project = open_test_project(temporary.path(), cx).await;
+        let open_buffer = project.update(cx, |project, cx| {
+            project.open_local_buffer(&source_path, cx)
+        });
+        let buffer = open_buffer.await.expect("open ordinary FNX buffer");
+        let ordinary_project = project.clone();
+        let ordinary_buffer = buffer.clone();
+        let ordinary_editor = cx.add_window(move |window, cx| {
+            Editor::for_buffer(ordinary_buffer, Some(ordinary_project), window, cx)
+        });
+        cx.run_until_parked();
+
+        let canonical_source = buffer.read_with(cx, |buffer, _| {
+            assert!(buffer.is_dirty());
+            buffer.text()
+        });
+        assert!(canonical_source.contains("@jsxRuntime classic"));
+        assert!(canonical_source.contains("from \"../../fnx\";"));
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("source stays implicit-write free"),
+            legacy_source
+        );
+        assert!(temporary.path().join("fnx.d.ts").is_file());
+        assert!(temporary.path().join(".prettierrc.json").is_file());
+
+        let (item, workspace) = open_code_workspace_for_project(project.clone(), cx).await;
+        let shared_buffer = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.fnx_buffer.clone().expect("workspace FNX buffer")
+            })
+            .expect("read code workspace");
+        assert_eq!(shared_buffer.entity_id(), buffer.entity_id());
+        cx.executor()
+            .advance_clock(SOURCE_VALIDATION_DEBOUNCE + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(page_name(&item, page, cx), "Original");
+        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
+
+        let changed_source = canonical_source.replace("name=\"Original\"", "name=\"External\"");
+        assert_ne!(changed_source, canonical_source);
+        ordinary_editor
+            .update(cx, |editor, window, cx| {
+                editor.set_text(changed_source.clone(), window, cx)
+            })
+            .expect("edit ordinary FNX editor");
+        cx.executor()
+            .advance_clock(SOURCE_VALIDATION_DEBOUNCE + Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(page_name(&item, page, cx), "External");
+
+        let json_before = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace
+                    .json_buffer
+                    .as_ref()
+                    .expect("JSON buffer")
+                    .read(cx)
+                    .text()
+            })
+            .expect("read JSON buffer");
+        assert!(json_before.contains("Original"));
+        std::fs::write(
+            &json_path,
+            "{\n  \"name\": \"Disk JSON Refresh\",\n  \"order\": 0\n}\n",
+        )
+        .expect("change JSON on disk");
+
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .expect("ordinary editor save");
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("read saved FNX source"),
+            changed_source
+        );
+        assert_eq!(page_name(&item, page, cx), "External");
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(item.is_editable());
+        });
+        buffer.read_with(cx, |buffer, _| assert!(!buffer.is_dirty()));
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(workspace.validation_error().is_none());
+                assert!(
+                    workspace
+                        .json_buffer
+                        .as_ref()
+                        .expect("JSON buffer")
+                        .read(cx)
+                        .text()
+                        .contains("Disk JSON Refresh")
+                );
+            })
+            .expect("read reconciled workspace");
+    }
+
+    #[gpui::test]
+    async fn ordinary_editor_invalid_save_keeps_canvas_locked_with_an_error(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let (project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        let buffer = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.fnx_buffer.clone().expect("FNX buffer")
+            })
+            .expect("read code workspace");
+
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX editor")
+                    .update(cx, |editor, cx| editor.set_text("<Frame>", window, cx));
+            })
+            .expect("edit invalid FNX");
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .expect("ordinary editor writes its buffer");
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("read invalid saved source"),
+            "<Frame>"
+        );
+        assert_eq!(page_name(&item, page, cx), "Original");
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert!(!item.is_editable());
+        });
+        workspace
+            .read_with(cx, |workspace, _| {
+                assert!(workspace.validation_error().is_some_and(|message| {
+                    message.starts_with("Saved FNX could not be reconciled")
+                }));
+            })
+            .expect("read invalid-save error");
     }
 
     #[gpui::test]

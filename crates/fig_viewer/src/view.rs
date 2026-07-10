@@ -40,12 +40,17 @@ use crate::document::{DocChange, FigDocument, FigItem, FigItemEvent};
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
+use crate::motion_edit::{
+    MotionKeyframeDragSession, delete_keyframe_operation, rename_clip_operation,
+    set_clip_duration_operation,
+};
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 use crate::properties_panel::FantaPropertiesPanel;
 use crate::prototype_panel::FantaPrototypePanel;
 use crate::text_edit::CanvasTextEdit;
 use crate::timeline::{
-    TIMELINE_HEIGHT, TimelineEvent, TimelineProperty, TimelineShell, TimelineTrackViewModel,
+    TIMELINE_HEIGHT, TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection,
+    TimelineKeyframeViewModel, TimelineProperty, TimelineShell, TimelineTrackViewModel,
     TimelineViewModel,
 };
 use crate::tools::{
@@ -194,6 +199,7 @@ pub struct FigView {
     code_workspace: Entity<FantaCodeWorkspace>,
     timeline_shell: Entity<TimelineShell>,
     active_motion_clip: Option<AnimationClipId>,
+    motion_keyframe_drag: Option<MotionKeyframeDragSession>,
     layers_sidebar_visible: bool,
     inspector_sidebar_visible: bool,
     layers_sidebar_width: Pixels,
@@ -278,10 +284,14 @@ impl FigView {
             cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
         let code_workspace =
             cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-        let timeline_shell = cx.new(|_| TimelineShell::new());
+        let timeline_shell = cx.new(|cx| {
+            let mut timeline = TimelineShell::new();
+            timeline.set_authoring_enabled(false, cx);
+            timeline
+        });
         let timeline_subscription =
             cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
-                this.handle_timeline_event(*event, cx);
+                this.handle_timeline_event(event.clone(), cx);
             });
         let focus_handle = cx.focus_handle();
         // A space held across a focus change (panel click, window switch, a
@@ -308,6 +318,7 @@ impl FigView {
             code_workspace,
             timeline_shell,
             active_motion_clip: None,
+            motion_keyframe_drag: None,
             layers_sidebar_visible,
             inspector_sidebar_visible,
             layers_sidebar_width,
@@ -366,6 +377,9 @@ impl FigView {
                     // A (re)loaded document restarts its scene revision
                     // counter, so cached frames keyed by revision must go.
                     this.invalidate_canvas_cache();
+                    this.motion_keyframe_drag = None;
+                    this.timeline_shell
+                        .update(cx, |timeline, cx| timeline.cancel_authoring_gestures(cx));
                     this.active_motion_clip = None;
                     this.sync_motion_timeline(cx);
                     // A disk reload swaps the node tree out from under the
@@ -390,15 +404,17 @@ impl FigView {
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::SourceEditLockChanged => {
-                    if this.item.read(cx).source_edit_locked() {
-                        let view = cx.weak_entity();
-                        cx.defer(move |cx| {
-                            view.update(cx, |view, cx| {
-                                view.cancel_canvas_edits_for_source_lock(cx)
-                            })
-                            .log_err();
-                        });
-                    }
+                    let source_edit_locked = this.item.read(cx).source_edit_locked();
+                    let view = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        view.update(cx, |view, cx| {
+                            if source_edit_locked {
+                                view.cancel_canvas_edits_for_source_lock(cx);
+                            }
+                            view.sync_motion_timeline(cx);
+                        })
+                        .log_err();
+                    });
                     cx.emit(FigViewEvent::Edited);
                 }
             }
@@ -411,6 +427,9 @@ impl FigView {
             return;
         }
 
+        self.cancel_motion_keyframe_drag(cx);
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.set_authoring_enabled(false, cx));
         self.primary_pressed = false;
         self.pending_text_edit = None;
         let text_session = self.text_edit.take().map(|edit| edit.session);
@@ -481,11 +500,27 @@ impl FigView {
             .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
         self.variables_workspace
             .update(cx, |workspace, cx| workspace.finish_value_edit(cx));
+        self.prototype_sidebar
+            .update(cx, |panel, cx| panel.finish_parameter_edit(cx));
     }
 
     fn finish_document_edits(&mut self, cx: &mut Context<Self>) {
         self.finish_panel_edits(cx);
         self.commit_text_edit(cx);
+        let clip_edit = self
+            .timeline_shell
+            .update(cx, |timeline, cx| timeline.finish_clip_edit(cx));
+        match clip_edit {
+            Some(TimelineEvent::RenameClip(name)) => self.rename_motion_clip(&name, cx),
+            Some(TimelineEvent::SetClipDuration(duration_us)) => {
+                self.set_motion_clip_duration(duration_us, cx)
+            }
+            _ => {}
+        }
+        self.finish_motion_keyframe_drag(cx);
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.reset_keyframe_drag(cx));
+        self.sync_motion_timeline(cx);
     }
 
     pub(crate) fn finish_document_edits_for_external_change(&mut self, cx: &mut Context<Self>) {
@@ -503,6 +538,7 @@ impl FigView {
         }
         self.editor_session
             .update(cx, |session, cx| session.set_workspace(workspace, cx));
+        self.sync_motion_timeline(cx);
         self.invalidate_canvas_cache();
         cx.notify();
     }
@@ -521,9 +557,7 @@ impl FigView {
         }
         self.editor_session
             .update(cx, |session, cx| session.set_mode(mode, cx));
-        if mode == EditorMode::Motion {
-            self.sync_motion_timeline(cx);
-        }
+        self.sync_motion_timeline(cx);
         self.invalidate_canvas_cache();
         cx.notify();
     }
@@ -568,8 +602,262 @@ impl FigView {
                         .log_err();
                 });
             }
+            TimelineEvent::KeyframeSelectionChanged(_) => {}
+            TimelineEvent::EditKeyframeTime {
+                keyframe,
+                time_us,
+                phase,
+            } => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| {
+                        view.edit_motion_keyframe_time(keyframe, time_us, phase, cx)
+                    })
+                    .log_err();
+                });
+            }
+            TimelineEvent::DeleteKeyframe(keyframe) => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| view.delete_motion_keyframe(keyframe, cx))
+                        .log_err();
+                });
+            }
+            TimelineEvent::RenameClip(name) => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| view.rename_motion_clip(&name, cx))
+                        .log_err();
+                });
+            }
+            TimelineEvent::SetClipDuration(duration_us) => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| {
+                        view.set_motion_clip_duration(duration_us, cx)
+                    })
+                    .log_err();
+                });
+            }
         }
         cx.notify();
+    }
+
+    fn edit_motion_keyframe_time(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        time_us: i64,
+        phase: TimelineEditPhase,
+        cx: &mut Context<Self>,
+    ) {
+        match phase {
+            TimelineEditPhase::Begin => self.begin_motion_keyframe_drag(&keyframe, cx),
+            TimelineEditPhase::Preview => self.preview_motion_keyframe_drag(&keyframe, time_us, cx),
+            TimelineEditPhase::Commit => self.commit_motion_keyframe_drag(&keyframe, time_us, cx),
+        }
+    }
+
+    fn begin_motion_keyframe_drag(
+        &mut self,
+        keyframe: &TimelineKeyframeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_panel_edits(cx);
+        self.commit_text_edit(cx);
+        self.cancel_motion_keyframe_drag(cx);
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        self.motion_keyframe_drag = self.item.read(cx).document().and_then(|document| {
+            MotionKeyframeDragSession::begin(&document.doc, clip_id, keyframe)
+        });
+    }
+
+    fn preview_motion_keyframe_drag(
+        &mut self,
+        keyframe: &TimelineKeyframeSelection,
+        time_us: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx) {
+            self.cancel_motion_keyframe_drag(cx);
+            return;
+        }
+        let item = self.item.clone();
+        let Some(session) = self
+            .motion_keyframe_drag
+            .as_mut()
+            .filter(|session| session.matches(keyframe))
+        else {
+            return;
+        };
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let change = if session.preview(&mut document.doc, time_us) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+        });
+    }
+
+    fn commit_motion_keyframe_drag(
+        &mut self,
+        keyframe: &TimelineKeyframeSelection,
+        time_us: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut session) = self.motion_keyframe_drag.take() else {
+            return;
+        };
+        if !session.matches(keyframe) || !self.is_editable(cx) {
+            self.restore_motion_keyframe_drag(session, cx);
+            return;
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                session.preview(&mut document.doc, time_us);
+                let change = if session.restore(&mut document.doc) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            let Some(operation) = session.operation() else {
+                item.finish_content_preview(false, cx);
+                return;
+            };
+            if let Err(error) = item.apply(operation, cx) {
+                item.finish_content_preview(false, cx);
+                log::error!("moving motion keyframe failed: {error:#}");
+            }
+        });
+    }
+
+    fn finish_motion_keyframe_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.motion_keyframe_drag.take() else {
+            return;
+        };
+        if !self.is_editable(cx) {
+            self.restore_motion_keyframe_drag(session, cx);
+            return;
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let change = if session.restore(&mut document.doc) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            let Some(operation) = session.operation() else {
+                item.finish_content_preview(false, cx);
+                return;
+            };
+            if let Err(error) = item.apply(operation, cx) {
+                item.finish_content_preview(false, cx);
+                log::error!("finishing motion keyframe drag failed: {error:#}");
+            }
+        });
+    }
+
+    fn cancel_motion_keyframe_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.motion_keyframe_drag.take() else {
+            return;
+        };
+        self.restore_motion_keyframe_drag(session, cx);
+    }
+
+    fn restore_motion_keyframe_drag(
+        &self,
+        session: MotionKeyframeDragSession,
+        cx: &mut Context<Self>,
+    ) {
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let change = if session.restore(&mut document.doc) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            item.finish_content_preview(false, cx);
+        });
+    }
+
+    fn apply_motion_operation(
+        &self,
+        operation: Option<Operation>,
+        action: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(operation) = operation else {
+            return;
+        };
+        self.item.update(cx, |item, cx| {
+            if let Err(error) = item.apply(operation, cx) {
+                log::error!("{action} failed: {error:#}");
+            }
+        });
+    }
+
+    fn delete_motion_keyframe(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_motion_keyframe_drag(cx);
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let operation = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| delete_keyframe_operation(&document.doc, clip_id, &keyframe));
+        self.apply_motion_operation(operation, "deleting motion keyframe", cx);
+    }
+
+    fn rename_motion_clip(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.finish_motion_keyframe_drag(cx);
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let operation = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| rename_clip_operation(&document.doc, clip_id, name));
+        self.apply_motion_operation(operation, "renaming motion clip", cx);
+    }
+
+    fn set_motion_clip_duration(&mut self, duration_us: i64, cx: &mut Context<Self>) {
+        self.finish_motion_keyframe_drag(cx);
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let operation =
+            self.item.read(cx).document().and_then(|document| {
+                set_clip_duration_operation(&document.doc, clip_id, duration_us)
+            });
+        self.apply_motion_operation(operation, "changing motion clip duration", cx);
     }
 
     fn create_motion_clip(&mut self, cx: &mut Context<Self>) {
@@ -676,18 +964,27 @@ impl FigView {
     }
 
     fn sync_motion_timeline(&mut self, cx: &mut Context<Self>) {
-        let Some(document) = self.item.read(cx).document() else {
-            return;
+        let authoring_enabled = self.is_editable(cx)
+            && self.editor_workspace(cx) == EditorWorkspace::Canvas
+            && self.editor_mode(cx) == EditorMode::Motion;
+        let model = if let Some(document) = self.item.read(cx).document() {
+            if self
+                .active_motion_clip
+                .is_none_or(|clip| document.doc.motion.clip(clip).is_none())
+            {
+                self.active_motion_clip = document.doc.motion.clips.keys().next().copied();
+            }
+            motion_timeline_model(&document.doc, self.active_motion_clip)
+        } else {
+            self.active_motion_clip = None;
+            TimelineViewModel::empty()
         };
-        if self
-            .active_motion_clip
-            .is_none_or(|clip| document.doc.motion.clip(clip).is_none())
-        {
-            self.active_motion_clip = document.doc.motion.clips.keys().next().copied();
-        }
-        let model = motion_timeline_model(&document.doc, self.active_motion_clip);
-        self.timeline_shell
-            .update(cx, |timeline, cx| timeline.set_model(model, cx));
+        self.timeline_shell.update(cx, |timeline, cx| {
+            if timeline.authoring_enabled() != authoring_enabled {
+                timeline.set_authoring_enabled(authoring_enabled, cx);
+            }
+            timeline.set_model(model, cx);
+        });
     }
 
     pub fn selected_page_index(&self) -> Option<usize> {
@@ -2372,6 +2669,8 @@ fn motion_property(property: TimelineProperty) -> MotionProperty {
         TimelineProperty::PositionX => MotionProperty::PositionX,
         TimelineProperty::PositionY => MotionProperty::PositionY,
         TimelineProperty::Rotation => MotionProperty::Rotation,
+        TimelineProperty::ScaleX => MotionProperty::ScaleX,
+        TimelineProperty::ScaleY => MotionProperty::ScaleY,
         TimelineProperty::Opacity => MotionProperty::bound(BoundProp::Opacity),
         TimelineProperty::FillColor => MotionProperty::bound(BoundProp::FillColor { index: 0 }),
     }
@@ -2459,10 +2758,13 @@ fn motion_timeline_model(
                     motion_property_label(track.target.property)
                 )
                 .into(),
-                keyframes_us: track
+                keyframes: track
                     .keyframes
                     .values()
-                    .map(|keyframe| i64::from(keyframe.time_ms) * 1_000)
+                    .map(|keyframe| TimelineKeyframeViewModel {
+                        id: keyframe.id.to_string().into(),
+                        time_us: i64::from(keyframe.time_ms) * 1_000,
+                    })
                     .collect(),
             }
         })
@@ -2619,6 +2921,9 @@ impl Item for FigView {
         let inspector_sidebar_width = self.inspector_sidebar_width;
         let editor_mode = self.editor_mode(cx);
         let editor_workspace = self.editor_workspace(cx);
+        let timeline_authoring_enabled = self.is_editable(cx)
+            && editor_workspace == EditorWorkspace::Canvas
+            && editor_mode == EditorMode::Motion;
         let active_motion_clip = self.active_motion_clip;
         let timeline_model = self.timeline_shell.read(cx).view_model().clone();
         Task::ready(Some(cx.new(|cx| {
@@ -2635,12 +2940,13 @@ impl Item for FigView {
                 cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
             let timeline_shell = cx.new(|cx| {
                 let mut timeline = TimelineShell::new();
+                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
                 timeline.set_model(timeline_model, cx);
                 timeline
             });
             let timeline_subscription =
                 cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
-                    this.handle_timeline_event(*event, cx);
+                    this.handle_timeline_event(event.clone(), cx);
                 });
             Self {
                 item,
@@ -2654,6 +2960,7 @@ impl Item for FigView {
                 code_workspace,
                 timeline_shell,
                 active_motion_clip,
+                motion_keyframe_drag: None,
                 layers_sidebar_visible,
                 inspector_sidebar_visible,
                 layers_sidebar_width,
@@ -2851,6 +3158,14 @@ mod tests {
             Some(ResolvedVarValue::Float { value: 12.0 })
         );
         assert_eq!(
+            motion_property(TimelineProperty::ScaleX),
+            MotionProperty::ScaleX
+        );
+        assert_eq!(
+            motion_property(TimelineProperty::ScaleY),
+            MotionProperty::ScaleY
+        );
+        assert_eq!(
             motion_value(
                 &node,
                 MotionProperty::bound(BoundProp::FillColor { index: 0 })
@@ -2956,7 +3271,108 @@ mod tests {
         assert_eq!(model.duration_us, 1_500_000);
         assert_eq!(model.tracks.len(), 1);
         assert_eq!(model.tracks[0].label.as_ref(), "Star · Position X");
-        assert_eq!(model.tracks[0].keyframes_us, [250_000]);
+        assert_eq!(model.tracks[0].keyframes.len(), 1);
+        assert_eq!(
+            model.tracks[0].keyframes[0].id.as_ref(),
+            keyframe_id.to_string()
+        );
+        assert_eq!(model.tracks[0].keyframes[0].time_us, 250_000);
+    }
+
+    #[gpui::test]
+    async fn timeline_drag_previews_realtime_and_commits_one_undo_step(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let clip_id = AnimationClipId::from_u128(100);
+        let track_id = AnimationTrackId::from_u128(101);
+        let keyframe_id = KeyframeId::from_u128(102);
+        let target = MotionTarget::new(
+            doc.active_page().expect("active page"),
+            MotionProperty::PositionX,
+        );
+        let mut track = AnimationTrack::new(track_id, target);
+        track.keyframes.insert(
+            keyframe_id,
+            Keyframe::new(keyframe_id, 250, ResolvedVarValue::Float { value: 10.0 }),
+        );
+        let mut clip = AnimationClip::new(clip_id, "Entrance", 1_000);
+        clip.tracks.insert(track_id, track);
+        doc.motion.clips.insert(clip_id, clip);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("scratch window");
+        let selection = TimelineKeyframeSelection {
+            track_id: track_id.to_string().into(),
+            keyframe_id: keyframe_id.to_string().into(),
+        };
+
+        view.update(cx, |view, cx| {
+            view.active_motion_clip = Some(clip_id);
+            view.begin_motion_keyframe_drag(&selection, cx);
+            view.preview_motion_keyframe_drag(&selection, 700_000, cx);
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(
+                doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].time_ms,
+                700
+            );
+        });
+
+        view.update(cx, |view, cx| {
+            view.commit_motion_keyframe_drag(&selection, 700_000, cx)
+        });
+        item.update(cx, |item, cx| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert_eq!(
+                doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].time_ms,
+                700
+            );
+            assert!(item.undo(cx).expect("undo motion drag"));
+            let doc = item.doc().expect("ready document");
+            assert_eq!(
+                doc.motion.clips[&clip_id].tracks[&track_id].keyframes[&keyframe_id].time_ms,
+                250
+            );
+        });
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.begin_motion_keyframe_drag(&selection, cx);
+            view.preview_motion_keyframe_drag(&selection, 800_000, cx);
+        });
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.motion_keyframe_drag.is_none());
+            assert!(!view.timeline_shell.read(cx).authoring_enabled());
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("ready document").motion.clips[&clip_id].tracks[&track_id]
+                    .keyframes[&keyframe_id]
+                    .time_ms,
+                250
+            );
+        });
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.timeline_shell.read(cx).authoring_enabled());
+        });
     }
 
     #[gpui::test]

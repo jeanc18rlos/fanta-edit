@@ -1,18 +1,20 @@
+use editor::{Editor, EditorEvent, actions::SelectAll};
 use fanta_doc::{
-    Action, Direction, Doc, Easing, NodeData, NodeId, Operation, OverlayPosition, OverlaySettings,
-    Reaction, ReactionId, Transition, TransitionStyle, Trigger,
+    Action, Color as FantaColor, ComponentId, Direction, Doc, Easing, NodeData, NodeId, Operation,
+    OverlayPosition, OverlaySettings, Reaction, ReactionId, Transition, TransitionStyle, Trigger,
+    VarValue, VariableId, VariableType,
 };
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
-    Subscription, Window,
+    AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyDownEvent, Render, SharedString, Subscription, Window,
 };
 use ui::{
-    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, Tooltip,
-    prelude::*,
+    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, Switch,
+    ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt;
 
-use crate::document::{FigItem, FigItemEvent};
+use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::inspector_components::{InspectorMessage, InspectorPropertyRow, InspectorSectionHeader};
 
 const DEFAULT_TRANSITION_DURATION_MS: u32 = 300;
@@ -20,6 +22,18 @@ const DEFAULT_TRANSITION_DURATION_MS: u32 = 300;
 #[derive(Clone)]
 struct PrototypeTarget {
     id: NodeId,
+    name: SharedString,
+}
+
+#[derive(Clone)]
+struct PrototypeVariable {
+    id: VariableId,
+    name: SharedString,
+}
+
+#[derive(Clone)]
+struct PrototypeComponent {
+    id: ComponentId,
     name: SharedString,
 }
 
@@ -33,6 +47,8 @@ enum PrototypeSnapshot {
         is_flow_start: bool,
         reactions: Vec<Reaction>,
         targets: Vec<PrototypeTarget>,
+        variables: Vec<PrototypeVariable>,
+        components: Vec<PrototypeComponent>,
     },
 }
 
@@ -86,14 +102,20 @@ enum ActionChoice {
     Navigate,
     OpenOverlay,
     ScrollTo,
+    SetVariable,
+    UpdateVariant,
+    OpenLink,
     Back,
     Close,
 }
 
-const ACTION_CHOICES: [(ActionChoice, &str); 5] = [
+const ACTION_CHOICES: [(ActionChoice, &str); 8] = [
     (ActionChoice::Navigate, "Navigate to"),
     (ActionChoice::OpenOverlay, "Open overlay"),
     (ActionChoice::ScrollTo, "Scroll to"),
+    (ActionChoice::SetVariable, "Set variable"),
+    (ActionChoice::UpdateVariant, "Change variant"),
+    (ActionChoice::OpenLink, "Open link"),
     (ActionChoice::Back, "Back"),
     (ActionChoice::Close, "Close"),
 ];
@@ -104,13 +126,76 @@ impl ActionChoice {
             Action::Navigate { .. } => Some(Self::Navigate),
             Action::OpenOverlay { .. } => Some(Self::OpenOverlay),
             Action::ScrollTo { .. } => Some(Self::ScrollTo),
+            Action::SetVariable { .. } => Some(Self::SetVariable),
+            Action::UpdateVariant { .. } => Some(Self::UpdateVariant),
+            Action::OpenLink { .. } => Some(Self::OpenLink),
             Action::Back => Some(Self::Back),
             Action::Close => Some(Self::Close),
-            Action::SetVariable { .. } | Action::UpdateVariant { .. } | Action::OpenLink { .. } => {
-                None
-            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayPositionChoice {
+    Center,
+    Manual,
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+const OVERLAY_POSITION_CHOICES: [(OverlayPositionChoice, &str); 8] = [
+    (OverlayPositionChoice::Center, "Center"),
+    (OverlayPositionChoice::Manual, "Manual"),
+    (OverlayPositionChoice::TopLeft, "Top left"),
+    (OverlayPositionChoice::TopCenter, "Top center"),
+    (OverlayPositionChoice::TopRight, "Top right"),
+    (OverlayPositionChoice::BottomLeft, "Bottom left"),
+    (OverlayPositionChoice::BottomCenter, "Bottom center"),
+    (OverlayPositionChoice::BottomRight, "Bottom right"),
+];
+
+impl OverlayPositionChoice {
+    fn from_position(position: &OverlayPosition) -> Self {
+        match position {
+            OverlayPosition::Center => Self::Center,
+            OverlayPosition::Manual { .. } => Self::Manual,
+            OverlayPosition::TopLeft => Self::TopLeft,
+            OverlayPosition::TopCenter => Self::TopCenter,
+            OverlayPosition::TopRight => Self::TopRight,
+            OverlayPosition::BottomLeft => Self::BottomLeft,
+            OverlayPosition::BottomCenter => Self::BottomCenter,
+            OverlayPosition::BottomRight => Self::BottomRight,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        OVERLAY_POSITION_CHOICES
+            .iter()
+            .find_map(|(choice, label)| (*choice == self).then_some(*label))
+            .unwrap_or("Center")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParameterKind {
+    Delay,
+    Keys,
+    VariableValue,
+    Variant,
+    Url,
+    OverlayOffsetX,
+    OverlayOffsetY,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReactionParameter {
+    node: NodeId,
+    reaction: ReactionId,
+    kind: ParameterKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,16 +330,353 @@ impl DirectionChoice {
 pub struct FantaPrototypePanel {
     item: Entity<FigItem>,
     focus_handle: FocusHandle,
+    parameter_editor: Option<Entity<Editor>>,
+    editing_parameter: Option<ReactionParameter>,
+    parameter_edit_baseline: Option<Reaction>,
+    parameter_edit_expected: Option<Reaction>,
+    parameter_edit_previewed: bool,
+    suppress_parameter_editor_events: bool,
+    parameter_error: Option<SharedString>,
+    parameter_editor_subscription: Option<Subscription>,
     _item_subscription: Subscription,
 }
 
 impl FantaPrototypePanel {
     pub fn new(item: Entity<FigItem>, cx: &mut Context<Self>) -> Self {
-        let item_subscription = cx.subscribe(&item, |_, _, _: &FigItemEvent, cx| cx.notify());
+        let item_subscription =
+            cx.subscribe(&item, |this: &mut Self, item, event: &FigItemEvent, cx| {
+                let restore = if matches!(event, FigItemEvent::StateChanged) {
+                    Some(false)
+                } else if matches!(event, FigItemEvent::SourceEditLockChanged)
+                    && item.read(cx).source_edit_locked()
+                {
+                    Some(true)
+                } else {
+                    None
+                };
+                if let Some(restore) = restore
+                    && this.editing_parameter.is_some()
+                {
+                    let panel = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.abandon_parameter_edit(restore, cx))
+                            .log_err();
+                    });
+                }
+                cx.notify();
+            });
         Self {
             item,
             focus_handle: cx.focus_handle(),
+            parameter_editor: None,
+            editing_parameter: None,
+            parameter_edit_baseline: None,
+            parameter_edit_expected: None,
+            parameter_edit_previewed: false,
+            suppress_parameter_editor_events: false,
+            parameter_error: None,
+            parameter_editor_subscription: None,
             _item_subscription: item_subscription,
+        }
+    }
+
+    fn ensure_parameter_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.parameter_editor.is_some() {
+            return;
+        }
+        let editor = cx.new(|cx| Editor::single_line(window, cx));
+        let subscription = cx.subscribe_in(
+            &editor,
+            window,
+            |this: &mut Self, _, event: &EditorEvent, _, cx| match event {
+                EditorEvent::BufferEdited if this.editing_parameter.is_some() => {
+                    this.preview_parameter_edit(cx);
+                }
+                EditorEvent::Blurred if this.editing_parameter.is_some() => {
+                    this.commit_parameter_edit_value(cx);
+                }
+                _ => {}
+            },
+        );
+        self.parameter_editor = Some(editor);
+        self.parameter_editor_subscription = Some(subscription);
+    }
+
+    fn start_parameter_edit(
+        &mut self,
+        parameter: ReactionParameter,
+        initial: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.commit_parameter_edit_value(cx) {
+            self.abandon_parameter_edit(true, cx);
+        }
+        let baseline = {
+            let item = self.item.read(cx);
+            if !item.is_editable() {
+                return;
+            }
+            let Some(document) = item.document() else {
+                return;
+            };
+            reaction_by_id(&document.doc, parameter.node, parameter.reaction).cloned()
+        };
+        let (Some(editor), Some(baseline)) = (self.parameter_editor.clone(), baseline) else {
+            return;
+        };
+        self.editing_parameter = Some(parameter);
+        self.parameter_edit_baseline = Some(baseline.clone());
+        self.parameter_edit_expected = Some(baseline);
+        self.parameter_edit_previewed = false;
+        self.parameter_error = None;
+        self.suppress_parameter_editor_events = true;
+        editor.update(cx, |editor, cx| {
+            editor.set_text(initial, window, cx);
+            editor.select_all(&SelectAll, window, cx);
+        });
+        self.suppress_parameter_editor_events = false;
+        editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn preview_parameter_edit(&mut self, cx: &mut Context<Self>) {
+        if self.suppress_parameter_editor_events {
+            return;
+        }
+        let editable = self.item.read(cx).is_editable();
+        if !editable {
+            self.abandon_parameter_edit(true, cx);
+            return;
+        }
+        let (Some(parameter), Some(baseline), Some(expected), Some(editor)) = (
+            self.editing_parameter,
+            self.parameter_edit_baseline.clone(),
+            self.parameter_edit_expected.clone(),
+            self.parameter_editor.clone(),
+        ) else {
+            return;
+        };
+        let text = editor.read(cx).text(cx);
+        let reaction = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document() else {
+                self.parameter_error = Some("The document is no longer available".into());
+                cx.notify();
+                return;
+            };
+            parameter_reaction_from_text(&document.doc, &baseline, parameter.kind, text.as_ref())
+        };
+        let reaction = match reaction {
+            Ok(reaction) => reaction,
+            Err(error) => {
+                self.parameter_error = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        let preview_result = self.item.update(cx, |item, cx| {
+            if !item.is_editable() {
+                return None;
+            }
+            item.with_document(cx, |document| {
+                let result = replace_reaction_preview_if_current(
+                    &mut document.doc,
+                    parameter.node,
+                    parameter.reaction,
+                    &expected,
+                    reaction.clone(),
+                );
+                let change = if result == Some(true) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                (result, change)
+            })
+            .flatten()
+        });
+        match preview_result {
+            Some(changed) => {
+                self.parameter_edit_expected = Some(reaction);
+                self.parameter_edit_previewed |= changed;
+                self.parameter_error = None;
+            }
+            None => {
+                self.abandon_parameter_edit(false, cx);
+                self.parameter_error =
+                    Some("The interaction changed elsewhere; reopen the field to continue".into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn commit_parameter_edit_value(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.suppress_parameter_editor_events {
+            return false;
+        }
+        let editable = self.item.read(cx).is_editable();
+        if !editable {
+            self.abandon_parameter_edit(true, cx);
+            return true;
+        }
+        let (Some(parameter), Some(baseline), Some(editor)) = (
+            self.editing_parameter,
+            self.parameter_edit_baseline.clone(),
+            self.parameter_editor.clone(),
+        ) else {
+            return true;
+        };
+        let text = editor.read(cx).text(cx);
+        let reaction = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document() else {
+                self.parameter_error = Some("The document is no longer available".into());
+                cx.notify();
+                return false;
+            };
+            parameter_reaction_from_text(&document.doc, &baseline, parameter.kind, text.as_ref())
+        };
+        let reaction = match reaction {
+            Ok(reaction) => reaction,
+            Err(error) => {
+                self.parameter_error = Some(error.into());
+                cx.notify();
+                return false;
+            }
+        };
+        let previewed = self.parameter_edit_previewed;
+        if previewed && !self.restore_parameter_preview(cx) {
+            self.abandon_parameter_edit(false, cx);
+            self.parameter_error =
+                Some("The interaction changed elsewhere; your preview was not restored".into());
+            cx.notify();
+            return true;
+        }
+        let still_matches_baseline = self.item.read(cx).document().is_some_and(|document| {
+            reaction_by_id(&document.doc, parameter.node, parameter.reaction) == Some(&baseline)
+        });
+        if !still_matches_baseline {
+            self.abandon_parameter_edit(false, cx);
+            self.parameter_error =
+                Some("The interaction changed elsewhere; reopen the field to continue".into());
+            cx.notify();
+            return true;
+        }
+        self.editing_parameter = None;
+        self.parameter_edit_baseline = None;
+        self.parameter_edit_expected = None;
+        self.parameter_edit_previewed = false;
+        self.parameter_error = None;
+        let committed = self.apply_operation(
+            |doc| {
+                if reaction_by_id(doc, parameter.node, parameter.reaction) != Some(&baseline) {
+                    return None;
+                }
+                set_reaction_operation(doc, parameter.node, parameter.reaction, |current| {
+                    *current = reaction;
+                })
+            },
+            cx,
+        );
+        if previewed {
+            self.item.update(cx, |item, cx| {
+                item.finish_content_preview(committed, cx);
+            });
+        }
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn finish_parameter_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.commit_parameter_edit_value(cx) {
+            self.abandon_parameter_edit(true, cx);
+        }
+    }
+
+    fn restore_parameter_preview(&mut self, cx: &mut Context<Self>) -> bool {
+        let (Some(parameter), Some(baseline), Some(expected)) = (
+            self.editing_parameter,
+            self.parameter_edit_baseline.clone(),
+            self.parameter_edit_expected.clone(),
+        ) else {
+            return false;
+        };
+        let result = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let result = replace_reaction_preview_if_current(
+                    &mut document.doc,
+                    parameter.node,
+                    parameter.reaction,
+                    &expected,
+                    baseline.clone(),
+                );
+                let change = if result == Some(true) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                (result, change)
+            })
+            .flatten()
+        });
+        if result.is_some() {
+            self.parameter_edit_expected = Some(baseline);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn abandon_parameter_edit(&mut self, restore: bool, cx: &mut Context<Self>) {
+        let previewed = self.parameter_edit_previewed;
+        if restore && previewed {
+            self.restore_parameter_preview(cx);
+        }
+        self.editing_parameter = None;
+        self.parameter_edit_baseline = None;
+        self.parameter_edit_expected = None;
+        self.parameter_edit_previewed = false;
+        self.parameter_error = None;
+        if previewed {
+            self.item.update(cx, |item, cx| {
+                item.finish_content_preview(false, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn commit_parameter_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commit_parameter_edit_value(cx) && self.editing_parameter.is_none() {
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
+    fn cancel_parameter_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.abandon_parameter_edit(true, cx);
+        self.focus_handle.focus(window, cx);
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_parameter.is_none() {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_parameter_edit(window, cx);
+            }
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_parameter_edit(window, cx);
+            }
+            _ => {}
         }
     }
 
@@ -283,6 +705,8 @@ impl FantaPrototypePanel {
             return PrototypeSnapshot::Message("The selected layer no longer exists".into());
         };
         let targets = prototype_targets(doc, node_id);
+        let variables = prototype_variables(doc);
+        let components = prototype_components(doc);
         PrototypeSnapshot::Selection {
             editable: item.is_editable(),
             node: node_id,
@@ -291,6 +715,8 @@ impl FantaPrototypePanel {
             is_flow_start: doc.flow_start() == Some(node_id),
             reactions: node.reactions.clone(),
             targets,
+            variables,
+            components,
         }
     }
 
@@ -298,25 +724,31 @@ impl FantaPrototypePanel {
         &mut self,
         build: impl FnOnce(&Doc) -> Option<Operation>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        if self.editing_parameter.is_some() {
+            self.finish_parameter_edit(cx);
+        }
         let operation = {
             let item = self.item.read(cx);
             if !item.is_editable() {
-                return;
+                return false;
             }
             let Some(document) = item.document() else {
-                return;
+                return false;
             };
             build(&document.doc)
         };
         let Some(operation) = operation else {
-            return;
+            return false;
         };
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.apply(operation, cx) {
-                log::error!("Fanta prototype panel failed to apply operation: {error:#}");
-            }
-        });
+        self.item
+            .update(cx, |item, cx| match item.apply(operation, cx) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::error!("Fanta prototype panel failed to apply operation: {error:#}");
+                    false
+                }
+            })
     }
 
     fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) {
@@ -357,19 +789,117 @@ impl FantaPrototypePanel {
     ) {
         self.apply_operation(
             |doc| {
-                let target = prototype_targets(doc, node).first().map(|target| target.id);
-                let action = match choice {
-                    ActionChoice::Navigate => Action::Navigate { to: target? },
-                    ActionChoice::OpenOverlay => Action::OpenOverlay {
-                        frame: target?,
-                        overlay: default_overlay_settings(),
-                    },
-                    ActionChoice::ScrollTo => Action::ScrollTo { target: target? },
-                    ActionChoice::Back => Action::Back,
-                    ActionChoice::Close => Action::Close,
-                };
+                let action = action_for_choice(doc, node, choice)?;
                 set_reaction_operation(doc, node, reaction, |reaction| {
                     reaction.action = action;
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_action_variable(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        variable: VariableId,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                let value = variable_literal_default(doc, variable)?;
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    reaction.action = Action::SetVariable { variable, value };
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_action_component(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        component: ComponentId,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                let variant = default_variant_value(doc, component);
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    reaction.action = Action::UpdateVariant { component, variant };
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_overlay_position(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        choice: OverlayPositionChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    let Action::OpenOverlay { overlay, .. } = &mut reaction.action else {
+                        return;
+                    };
+                    overlay.position = match choice {
+                        OverlayPositionChoice::Center => OverlayPosition::Center,
+                        OverlayPositionChoice::Manual => match &overlay.position {
+                            OverlayPosition::Manual { offset } => {
+                                OverlayPosition::Manual { offset: *offset }
+                            }
+                            _ => OverlayPosition::Manual { offset: [0.0, 0.0] },
+                        },
+                        OverlayPositionChoice::TopLeft => OverlayPosition::TopLeft,
+                        OverlayPositionChoice::TopCenter => OverlayPosition::TopCenter,
+                        OverlayPositionChoice::TopRight => OverlayPosition::TopRight,
+                        OverlayPositionChoice::BottomLeft => OverlayPosition::BottomLeft,
+                        OverlayPositionChoice::BottomCenter => OverlayPosition::BottomCenter,
+                        OverlayPositionChoice::BottomRight => OverlayPosition::BottomRight,
+                    };
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_overlay_background_dim(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    if let Action::OpenOverlay { overlay, .. } = &mut reaction.action {
+                        overlay.background_dim = enabled;
+                    }
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_overlay_close_outside(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    if let Action::OpenOverlay { overlay, .. } = &mut reaction.action {
+                        overlay.close_on_click_outside = enabled;
+                    }
                 })
             },
             cx,
@@ -496,7 +1026,7 @@ impl FantaPrototypePanel {
     fn render_choice_dropdown<T: Copy + PartialEq + 'static>(
         &self,
         key: &'static str,
-        index: usize,
+        _index: usize,
         aria_label: &'static str,
         label: SharedString,
         node: NodeId,
@@ -525,7 +1055,7 @@ impl FantaPrototypePanel {
             }
             menu
         });
-        DropdownMenu::new((key, index), label, menu)
+        DropdownMenu::new(reaction_element_id(key, reaction), label, menu)
             .style(DropdownStyle::Outlined)
             .trigger_size(ButtonSize::Compact)
             .full_width(true)
@@ -536,7 +1066,7 @@ impl FantaPrototypePanel {
 
     fn render_target_dropdown(
         &self,
-        index: usize,
+        _index: usize,
         node: NodeId,
         reaction: &Reaction,
         targets: &[PrototypeTarget],
@@ -572,14 +1102,200 @@ impl FantaPrototypePanel {
             menu
         });
         Some(
-            DropdownMenu::new(("fanta-prototype-target", index), label, menu)
-                .style(DropdownStyle::Outlined)
-                .trigger_size(ButtonSize::Compact)
-                .full_width(true)
-                .disabled(!editable || targets.is_empty())
-                .aria_label("Prototype target")
-                .into_any_element(),
+            DropdownMenu::new(
+                reaction_element_id("fanta-prototype-target", reaction.id),
+                label,
+                menu,
+            )
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!editable || targets.is_empty())
+            .aria_label("Prototype target")
+            .into_any_element(),
         )
+    }
+
+    fn render_variable_dropdown(
+        &self,
+        _index: usize,
+        node: NodeId,
+        reaction: &Reaction,
+        variables: &[PrototypeVariable],
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let Action::SetVariable { variable, .. } = &reaction.action else {
+            return None;
+        };
+        let current = *variable;
+        let label = variables
+            .iter()
+            .find(|variable| variable.id == current)
+            .map(|variable| variable.name.clone())
+            .unwrap_or_else(|| "Missing variable".into());
+        let panel = cx.weak_entity();
+        let reaction_id = reaction.id;
+        let choices = variables.to_vec();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for variable in &choices {
+                let panel = panel.clone();
+                let variable_id = variable.id;
+                menu.push_item(
+                    ContextMenuEntry::new(variable.name.clone())
+                        .toggleable(IconPosition::End, variable_id == current)
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.set_action_variable(node, reaction_id, variable_id, cx)
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        Some(
+            DropdownMenu::new(
+                reaction_element_id("fanta-prototype-variable", reaction.id),
+                label,
+                menu,
+            )
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!editable || variables.is_empty())
+            .aria_label("Prototype variable")
+            .into_any_element(),
+        )
+    }
+
+    fn render_component_dropdown(
+        &self,
+        _index: usize,
+        node: NodeId,
+        reaction: &Reaction,
+        components: &[PrototypeComponent],
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let Action::UpdateVariant { component, .. } = &reaction.action else {
+            return None;
+        };
+        let current = *component;
+        let label = components
+            .iter()
+            .find(|component| component.id == current)
+            .map(|component| component.name.clone())
+            .unwrap_or_else(|| "Missing component".into());
+        let panel = cx.weak_entity();
+        let reaction_id = reaction.id;
+        let choices = components.to_vec();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for component in &choices {
+                let panel = panel.clone();
+                let component_id = component.id;
+                menu.push_item(
+                    ContextMenuEntry::new(component.name.clone())
+                        .toggleable(IconPosition::End, component_id == current)
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.set_action_component(node, reaction_id, component_id, cx)
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        Some(
+            DropdownMenu::new(
+                reaction_element_id("fanta-prototype-component", reaction.id),
+                label,
+                menu,
+            )
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!editable || components.is_empty())
+            .aria_label("Prototype component")
+            .into_any_element(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_inline_parameter(
+        &self,
+        _index: usize,
+        node: NodeId,
+        reaction: ReactionId,
+        kind: ParameterKind,
+        current: String,
+        placeholder: &'static str,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let parameter = ReactionParameter {
+            node,
+            reaction,
+            kind,
+        };
+        let key = parameter_key(kind);
+        if self.editing_parameter == Some(parameter)
+            && let Some(editor) = self.parameter_editor.as_ref()
+        {
+            return div()
+                .id(reaction_element_id(key, reaction))
+                .h(px(28.0))
+                .w_full()
+                .px_1()
+                .py_0p5()
+                .rounded_sm()
+                .border_1()
+                .border_color(cx.theme().colors().border_focused)
+                .child(editor.clone())
+                .into_any_element();
+        }
+        let display: SharedString = if current.is_empty() {
+            placeholder.into()
+        } else {
+            current.clone().into()
+        };
+        Button::new(reaction_element_id(key, reaction), display)
+            .style(ButtonStyle::Subtle)
+            .size(ButtonSize::Compact)
+            .full_width()
+            .disabled(!editable)
+            .on_click(cx.listener(move |panel, _, window, cx| {
+                panel.start_parameter_edit(parameter, current.clone(), window, cx)
+            }))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_switch_parameter(
+        &self,
+        key: &'static str,
+        _index: usize,
+        node: NodeId,
+        reaction: ReactionId,
+        enabled: bool,
+        editable: bool,
+        apply: fn(&mut Self, NodeId, ReactionId, bool, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        Switch::new(
+            reaction_element_id(key, reaction),
+            ToggleState::from(enabled),
+        )
+        .disabled(!editable)
+        .on_click(cx.listener(move |panel, _: &ToggleState, _, cx| {
+            apply(panel, node, reaction, !enabled, cx)
+        }))
+        .into_any_element()
     }
 
     fn render_reaction(
@@ -588,6 +1304,8 @@ impl FantaPrototypePanel {
         node: NodeId,
         reaction: &Reaction,
         targets: &[PrototypeTarget],
+        variables: &[PrototypeVariable],
+        components: &[PrototypeComponent],
         editable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -597,6 +1315,7 @@ impl FantaPrototypePanel {
         let transition = TransitionChoice::from_transition(reaction.transition.as_ref());
         let reaction_id = reaction.id;
         let mut card = v_flex()
+            .id(reaction_element_id("fanta-prototype-reaction", reaction_id))
             .mx_3()
             .my_1()
             .p_2()
@@ -610,12 +1329,17 @@ impl FantaPrototypePanel {
                     .child(Label::new(format!("Interaction {}", index + 1)).size(LabelSize::Small))
                     .when(editable, |row| {
                         row.child(
-                            IconButton::new(("fanta-prototype-remove", index), IconName::Close)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Remove interaction"))
-                                .on_click(cx.listener(move |panel, _, _, cx| {
+                            IconButton::new(
+                                reaction_element_id("fanta-prototype-remove", reaction_id),
+                                IconName::Close,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Remove interaction"))
+                            .on_click(cx.listener(
+                                move |panel, _, _, cx| {
                                     panel.remove_interaction(node, reaction_id, cx)
-                                })),
+                                },
+                            )),
                         )
                     }),
             )
@@ -635,28 +1359,193 @@ impl FantaPrototypePanel {
                     window,
                     cx,
                 ),
-            ))
-            .child(self.render_labeled_row(
-                "Action",
-                self.render_choice_dropdown(
-                    "fanta-prototype-action",
+            ));
+        match &reaction.trigger {
+            Trigger::AfterDelay { delay_ms } => {
+                card = card.child(self.render_labeled_row(
+                    "Delay",
+                    self.render_inline_parameter(
+                        index,
+                        node,
+                        reaction.id,
+                        ParameterKind::Delay,
+                        delay_ms.to_string(),
+                        "Enter delay",
+                        editable,
+                        cx,
+                    ),
+                ));
+            }
+            Trigger::Key { keys } => {
+                card = card.child(self.render_labeled_row(
+                    "Keys",
+                    self.render_inline_parameter(
+                        index,
+                        node,
+                        reaction.id,
+                        ParameterKind::Keys,
+                        keys.join(" + "),
+                        "Enter keys",
+                        editable,
+                        cx,
+                    ),
+                ));
+            }
+            Trigger::Click | Trigger::Drag | Trigger::Hover | Trigger::WhilePressing => {}
+        }
+        card = card.child(self.render_labeled_row(
+            "Action",
+            self.render_choice_dropdown(
+                "fanta-prototype-action",
+                index,
+                "Prototype action",
+                action_label(&reaction.action).into(),
+                node,
+                reaction.id,
+                action,
+                &ACTION_CHOICES,
+                Self::set_action_choice,
+                editable,
+                window,
+                cx,
+            ),
+        ));
+        if let Some(target) =
+            self.render_target_dropdown(index, node, reaction, targets, editable, window, cx)
+        {
+            card = card.child(self.render_labeled_row("Destination", target));
+        }
+        if let Some(variable) =
+            self.render_variable_dropdown(index, node, reaction, variables, editable, window, cx)
+        {
+            card = card.child(self.render_labeled_row("Variable", variable));
+        }
+        if let Action::SetVariable { value, .. } = &reaction.action {
+            let (value_text, value_editable) = variable_value_text(value);
+            card = card.child(self.render_labeled_row(
+                "Value",
+                self.render_inline_parameter(
                     index,
-                    "Prototype action",
-                    action_label(&reaction.action).into(),
                     node,
                     reaction.id,
-                    action,
-                    &ACTION_CHOICES,
-                    Self::set_action_choice,
+                    ParameterKind::VariableValue,
+                    value_text,
+                    "Enter value",
+                    editable && value_editable,
+                    cx,
+                ),
+            ));
+        }
+        if let Some(component) =
+            self.render_component_dropdown(index, node, reaction, components, editable, window, cx)
+        {
+            card = card.child(self.render_labeled_row("Component", component));
+        }
+        if let Action::UpdateVariant { variant, .. } = &reaction.action {
+            card = card.child(self.render_labeled_row(
+                "Variant",
+                self.render_inline_parameter(
+                    index,
+                    node,
+                    reaction.id,
+                    ParameterKind::Variant,
+                    variant.clone(),
+                    "Enter variant",
+                    editable,
+                    cx,
+                ),
+            ));
+        }
+        if let Action::OpenLink { url } = &reaction.action {
+            card = card.child(self.render_labeled_row(
+                "URL",
+                self.render_inline_parameter(
+                    index,
+                    node,
+                    reaction.id,
+                    ParameterKind::Url,
+                    url.clone(),
+                    "Enter URL",
+                    editable,
+                    cx,
+                ),
+            ));
+        }
+        if let Action::OpenOverlay { overlay, .. } = &reaction.action {
+            let position = OverlayPositionChoice::from_position(&overlay.position);
+            card = card.child(self.render_labeled_row(
+                "Position",
+                self.render_choice_dropdown(
+                    "fanta-prototype-overlay-position",
+                    index,
+                    "Prototype overlay position",
+                    position.label().into(),
+                    node,
+                    reaction.id,
+                    Some(position),
+                    &OVERLAY_POSITION_CHOICES,
+                    Self::set_overlay_position,
                     editable,
                     window,
                     cx,
                 ),
             ));
-        if let Some(target) =
-            self.render_target_dropdown(index, node, reaction, targets, editable, window, cx)
-        {
-            card = card.child(self.render_labeled_row("Destination", target));
+            if let OverlayPosition::Manual { offset } = &overlay.position {
+                card = card
+                    .child(self.render_labeled_row(
+                        "Offset X",
+                        self.render_inline_parameter(
+                            index,
+                            node,
+                            reaction.id,
+                            ParameterKind::OverlayOffsetX,
+                            format_number(offset[0]),
+                            "0",
+                            editable,
+                            cx,
+                        ),
+                    ))
+                    .child(self.render_labeled_row(
+                        "Offset Y",
+                        self.render_inline_parameter(
+                            index,
+                            node,
+                            reaction.id,
+                            ParameterKind::OverlayOffsetY,
+                            format_number(offset[1]),
+                            "0",
+                            editable,
+                            cx,
+                        ),
+                    ));
+            }
+            card = card
+                .child(self.render_labeled_row(
+                    "Dim background",
+                    self.render_switch_parameter(
+                        "fanta-prototype-overlay-dim",
+                        index,
+                        node,
+                        reaction.id,
+                        overlay.background_dim,
+                        editable,
+                        Self::set_overlay_background_dim,
+                        cx,
+                    ),
+                ))
+                .child(self.render_labeled_row(
+                    "Close outside",
+                    self.render_switch_parameter(
+                        "fanta-prototype-overlay-close-outside",
+                        index,
+                        node,
+                        reaction.id,
+                        overlay.close_on_click_outside,
+                        editable,
+                        Self::set_overlay_close_outside,
+                        cx,
+                    ),
+                ));
         }
         card = card.child(self.render_labeled_row(
             "Animation",
@@ -750,10 +1639,22 @@ impl FantaPrototypePanel {
 
 impl Render for FantaPrototypePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = v_flex()
+        self.ensure_parameter_editor(window, cx);
+        let mut root = v_flex()
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .bg(cx.theme().colors().panel_background);
+        if let Some(error) = self.parameter_error.clone() {
+            root = root.child(
+                h_flex()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .bg(cx.theme().status().error_background)
+                    .child(Label::new(error).size(LabelSize::Small)),
+            );
+        }
         match self.snapshot(cx) {
             PrototypeSnapshot::Message(message) => root.child(InspectorMessage::new(message)),
             PrototypeSnapshot::Selection {
@@ -764,6 +1665,8 @@ impl Render for FantaPrototypePanel {
                 is_flow_start,
                 reactions,
                 targets,
+                variables,
+                components,
             } => {
                 let header = v_flex()
                     .px_4()
@@ -829,7 +1732,15 @@ impl Render for FantaPrototypePanel {
                 } else {
                     for (index, reaction) in reactions.iter().enumerate() {
                         content = content.child(self.render_reaction(
-                            index, node, reaction, &targets, editable, window, cx,
+                            index,
+                            node,
+                            reaction,
+                            &targets,
+                            &variables,
+                            &components,
+                            editable,
+                            window,
+                            cx,
                         ));
                     }
                 }
@@ -844,6 +1755,363 @@ impl EventEmitter<()> for FantaPrototypePanel {}
 impl Focusable for FantaPrototypePanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+fn action_for_choice(doc: &Doc, node: NodeId, choice: ActionChoice) -> Option<Action> {
+    match choice {
+        ActionChoice::Navigate => prototype_targets(doc, node)
+            .first()
+            .map(|target| Action::Navigate { to: target.id }),
+        ActionChoice::OpenOverlay => {
+            prototype_targets(doc, node)
+                .first()
+                .map(|target| Action::OpenOverlay {
+                    frame: target.id,
+                    overlay: default_overlay_settings(),
+                })
+        }
+        ActionChoice::ScrollTo => prototype_targets(doc, node)
+            .first()
+            .map(|target| Action::ScrollTo { target: target.id }),
+        ActionChoice::SetVariable => {
+            let variable = doc
+                .variables
+                .variables
+                .values()
+                .find(|variable| variable.ty != VariableType::Typography)
+                .or_else(|| doc.variables.variables.values().next())?;
+            Some(Action::SetVariable {
+                variable: variable.id,
+                value: variable_literal_default(doc, variable.id)?,
+            })
+        }
+        ActionChoice::UpdateVariant => {
+            let component = doc.components.sets.keys().next().copied().or_else(|| {
+                doc.components
+                    .defs
+                    .values()
+                    .find(|component| component.variant_of.is_some())
+                    .map(|component| component.id)
+            })?;
+            Some(Action::UpdateVariant {
+                component,
+                variant: default_variant_value(doc, component),
+            })
+        }
+        ActionChoice::OpenLink => Some(Action::OpenLink { url: String::new() }),
+        ActionChoice::Back => Some(Action::Back),
+        ActionChoice::Close => Some(Action::Close),
+    }
+}
+
+fn prototype_variables(doc: &Doc) -> Vec<PrototypeVariable> {
+    doc.variables
+        .variables
+        .values()
+        .map(|variable| {
+            let collection_name = doc
+                .variables
+                .collections
+                .get(&variable.collection)
+                .map(|collection| collection.name.as_str())
+                .filter(|name| !name.is_empty());
+            let variable_name = if variable.name.is_empty() {
+                "Untitled variable"
+            } else {
+                variable.name.as_str()
+            };
+            let name = match collection_name {
+                Some(collection) => format!("{collection} / {variable_name}"),
+                None => variable_name.to_owned(),
+            };
+            PrototypeVariable {
+                id: variable.id,
+                name: name.into(),
+            }
+        })
+        .collect()
+}
+
+fn prototype_components(doc: &Doc) -> Vec<PrototypeComponent> {
+    let mut components = Vec::new();
+    for component in doc.components.sets.values() {
+        components.push(PrototypeComponent {
+            id: component.id,
+            name: if component.name.is_empty() {
+                "Untitled component set".into()
+            } else {
+                component.name.clone().into()
+            },
+        });
+    }
+    for component in doc
+        .components
+        .defs
+        .values()
+        .filter(|component| component.variant_of.is_some())
+    {
+        components.push(PrototypeComponent {
+            id: component.id,
+            name: if component.name.is_empty() {
+                "Untitled variant".into()
+            } else {
+                component.name.clone().into()
+            },
+        });
+    }
+    components
+}
+
+fn variable_literal_default(doc: &Doc, variable: VariableId) -> Option<VarValue> {
+    let variable = doc.variables.variables.get(&variable)?;
+    let default_mode = doc
+        .variables
+        .collections
+        .get(&variable.collection)
+        .map(|collection| collection.default_mode);
+    let stored = default_mode
+        .and_then(|mode| variable.values_by_mode.get(&mode))
+        .into_iter()
+        .chain(variable.values_by_mode.values())
+        .find(|value| {
+            !matches!(value, VarValue::Alias { .. }) && value.variable_type() == Some(variable.ty)
+        });
+    stored.cloned().or_else(|| {
+        Some(match variable.ty {
+            VariableType::Color => VarValue::Color {
+                value: FantaColor::BLACK,
+            },
+            VariableType::Float => VarValue::Float { value: 0.0 },
+            VariableType::String => VarValue::String {
+                value: String::new(),
+            },
+            VariableType::Boolean => VarValue::Boolean { value: false },
+            VariableType::Typography => VarValue::TextStyle {
+                value: fanta_doc::TextStyle::default(),
+            },
+        })
+    })
+}
+
+fn default_variant_value(doc: &Doc, component: ComponentId) -> String {
+    if let Some(set) = doc.components.sets.get(&component) {
+        return set
+            .axes
+            .iter()
+            .find_map(|axis| axis.values.first())
+            .cloned()
+            .or_else(|| {
+                doc.components
+                    .defs
+                    .get(&set.default_variant)
+                    .map(|component| component.name.clone())
+            })
+            .unwrap_or_default();
+    }
+    let Some(component) = doc.components.defs.get(&component) else {
+        return String::new();
+    };
+    component
+        .variant_of
+        .as_ref()
+        .and_then(|membership| membership.axis_values.values().next())
+        .cloned()
+        .unwrap_or_else(|| component.name.clone())
+}
+
+fn reaction_by_id(doc: &Doc, node: NodeId, reaction: ReactionId) -> Option<&Reaction> {
+    doc.scene
+        .get(node)?
+        .reactions
+        .iter()
+        .find(|candidate| candidate.id == reaction)
+}
+
+fn replace_reaction_preview_if_current(
+    doc: &mut Doc,
+    node: NodeId,
+    reaction: ReactionId,
+    expected: &Reaction,
+    mut replacement: Reaction,
+) -> Option<bool> {
+    let Some(node) = doc.scene.get_mut(node) else {
+        return None;
+    };
+    let Some(current) = node
+        .reactions
+        .iter_mut()
+        .find(|candidate| candidate.id == reaction)
+    else {
+        return None;
+    };
+    replacement.id = reaction;
+    if current != expected {
+        return None;
+    }
+    if *current == replacement {
+        return Some(false);
+    }
+    *current = replacement;
+    Some(true)
+}
+
+fn parameter_reaction_from_text(
+    doc: &Doc,
+    baseline: &Reaction,
+    kind: ParameterKind,
+    text: &str,
+) -> Result<Reaction, String> {
+    let mut reaction = baseline.clone();
+    match kind {
+        ParameterKind::Delay => {
+            let delay_ms = text
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "Enter a whole-number delay in milliseconds".to_owned())?;
+            let Trigger::AfterDelay { delay_ms: current } = &mut reaction.trigger else {
+                return Err("This interaction no longer uses an after-delay trigger".to_owned());
+            };
+            *current = delay_ms;
+        }
+        ParameterKind::Keys => {
+            let keys: Vec<String> = text
+                .split(|character| character == '+' || character == ',')
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if keys.is_empty() {
+                return Err("Enter at least one key".to_owned());
+            }
+            let Trigger::Key { keys: current } = &mut reaction.trigger else {
+                return Err("This interaction no longer uses a key trigger".to_owned());
+            };
+            *current = keys;
+        }
+        ParameterKind::VariableValue => {
+            let Action::SetVariable { variable, value } = &mut reaction.action else {
+                return Err("This interaction no longer sets a variable".to_owned());
+            };
+            *value = parse_variable_literal(doc, *variable, text)?;
+        }
+        ParameterKind::Variant => {
+            let variant = text.trim();
+            if variant.is_empty() {
+                return Err("Enter a variant value".to_owned());
+            }
+            let Action::UpdateVariant {
+                variant: current, ..
+            } = &mut reaction.action
+            else {
+                return Err("This interaction no longer changes a variant".to_owned());
+            };
+            *current = variant.to_owned();
+        }
+        ParameterKind::Url => {
+            let url = text.trim();
+            if url.is_empty() {
+                return Err("Enter a URL".to_owned());
+            }
+            let Action::OpenLink { url: current } = &mut reaction.action else {
+                return Err("This interaction no longer opens a link".to_owned());
+            };
+            *current = url.to_owned();
+        }
+        ParameterKind::OverlayOffsetX | ParameterKind::OverlayOffsetY => {
+            let value = text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| "Enter a finite overlay offset".to_owned())?;
+            let Action::OpenOverlay { overlay, .. } = &mut reaction.action else {
+                return Err("This interaction no longer opens an overlay".to_owned());
+            };
+            let OverlayPosition::Manual { offset } = &mut overlay.position else {
+                return Err("Choose manual overlay positioning first".to_owned());
+            };
+            let axis = if kind == ParameterKind::OverlayOffsetX {
+                0
+            } else {
+                1
+            };
+            offset[axis] = value;
+        }
+    }
+    reaction.id = baseline.id;
+    Ok(reaction)
+}
+
+fn parse_variable_literal(doc: &Doc, variable: VariableId, text: &str) -> Result<VarValue, String> {
+    let variable = doc
+        .variables
+        .variables
+        .get(&variable)
+        .ok_or_else(|| "The selected variable no longer exists".to_owned())?;
+    match variable.ty {
+        VariableType::Color => {
+            let text = text.trim();
+            let color = FantaColor::from_hex(text)
+                .or_else(|| FantaColor::from_hex(&format!("#{text}")))
+                .ok_or_else(|| "Enter a color as #RRGGBB or #RRGGBBAA".to_owned())?;
+            Ok(VarValue::Color { value: color })
+        }
+        VariableType::Float => {
+            let value = text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| "Enter a finite number".to_owned())?;
+            Ok(VarValue::Float { value })
+        }
+        VariableType::String => Ok(VarValue::String {
+            value: text.to_owned(),
+        }),
+        VariableType::Boolean => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(VarValue::Boolean { value: true }),
+            "false" => Ok(VarValue::Boolean { value: false }),
+            _ => Err("Enter true or false".to_owned()),
+        },
+        VariableType::Typography => {
+            Err("Typography action values are not editable as text".to_owned())
+        }
+    }
+}
+
+fn variable_value_text(value: &VarValue) -> (String, bool) {
+    match value {
+        VarValue::Color { value } => (value.to_hex(), true),
+        VarValue::Float { value } => (format_number(*value), true),
+        VarValue::String { value } => (value.clone(), true),
+        VarValue::Boolean { value } => (value.to_string(), true),
+        VarValue::TextStyle { .. } => ("Typography value".to_owned(), false),
+        VarValue::Alias { .. } => ("Variable alias".to_owned(), false),
+    }
+}
+
+fn reaction_element_id(key: &'static str, reaction: ReactionId) -> ElementId {
+    (ElementId::from(key), reaction.to_string()).into()
+}
+
+fn parameter_key(kind: ParameterKind) -> &'static str {
+    match kind {
+        ParameterKind::Delay => "fanta-prototype-delay",
+        ParameterKind::Keys => "fanta-prototype-keys",
+        ParameterKind::VariableValue => "fanta-prototype-variable-value",
+        ParameterKind::Variant => "fanta-prototype-variant",
+        ParameterKind::Url => "fanta-prototype-url",
+        ParameterKind::OverlayOffsetX => "fanta-prototype-overlay-offset-x",
+        ParameterKind::OverlayOffsetY => "fanta-prototype-overlay-offset-y",
+    }
+}
+
+fn format_number(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        value.to_string()
     }
 }
 
@@ -1013,7 +2281,27 @@ fn transition_label(transition: Option<&Transition>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{CanvasNode, GroupNode};
+    use crate::document::ready_item_for_test;
+    use fanta_doc::{
+        CanvasNode, ComponentSet, GroupNode, Mode, ModeId, Variable, VariableCollection,
+        VariableCollectionId, VariantAxis,
+    };
+    use gpui::TestAppContext;
+    use project::{FakeFs, Project};
+    use settings::SettingsStore;
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+    }
 
     fn document_with_two_frames() -> (Doc, NodeId, NodeId) {
         let mut doc = Doc::new();
@@ -1032,6 +2320,55 @@ mod tests {
         let second_id = second.id;
         doc.apply(Operation::create_node(second)).unwrap();
         (doc, first_id, second_id)
+    }
+
+    fn add_float_variable(doc: &mut Doc, value: f64) -> VariableId {
+        let collection = VariableCollectionId::new();
+        let mode = ModeId::new();
+        let variable = VariableId::new();
+        doc.variables.collections.insert(
+            collection,
+            VariableCollection {
+                id: collection,
+                name: "Prototype".into(),
+                modes: vec![Mode {
+                    id: mode,
+                    name: "Default".into(),
+                }],
+                default_mode: mode,
+                variable_order: vec![variable],
+            },
+        );
+        doc.variables.variables.insert(
+            variable,
+            Variable {
+                id: variable,
+                collection,
+                name: "Count".into(),
+                ty: VariableType::Float,
+                values_by_mode: BTreeMap::from([(mode, VarValue::Float { value })]),
+                scopes: Vec::new(),
+            },
+        );
+        variable
+    }
+
+    fn add_variant_set(doc: &mut Doc) -> ComponentId {
+        let component = ComponentId::new();
+        doc.components.sets.insert(
+            component,
+            ComponentSet {
+                id: component,
+                name: "Button".into(),
+                axes: vec![VariantAxis {
+                    name: "State".into(),
+                    values: vec!["Default".into(), "Hover".into()],
+                }],
+                members: Vec::new(),
+                default_variant: ComponentId::new(),
+            },
+        );
+        component
     }
 
     #[test]
@@ -1068,6 +2405,184 @@ mod tests {
         assert_eq!(
             doc.scene.get(first).unwrap().reactions[0].trigger,
             Trigger::Hover
+        );
+    }
+
+    #[test]
+    fn new_action_defaults_use_document_compatible_parameters() {
+        let (mut doc, first, _) = document_with_two_frames();
+        let variable = add_float_variable(&mut doc, 42.5);
+        let component = add_variant_set(&mut doc);
+
+        assert_eq!(
+            action_for_choice(&doc, first, ActionChoice::SetVariable),
+            Some(Action::SetVariable {
+                variable,
+                value: VarValue::Float { value: 42.5 },
+            })
+        );
+        assert_eq!(
+            action_for_choice(&doc, first, ActionChoice::UpdateVariant),
+            Some(Action::UpdateVariant {
+                component,
+                variant: "Default".into(),
+            })
+        );
+        assert_eq!(
+            action_for_choice(&doc, first, ActionChoice::OpenLink),
+            Some(Action::OpenLink { url: String::new() })
+        );
+    }
+
+    #[test]
+    fn authored_parameters_preserve_reaction_identity_and_typed_values() {
+        let (mut doc, first, _) = document_with_two_frames();
+        let variable = add_float_variable(&mut doc, 1.0);
+        let reaction_id = ReactionId::new();
+        let baseline = Reaction {
+            id: reaction_id,
+            trigger: Trigger::AfterDelay { delay_ms: 300 },
+            action: Action::SetVariable {
+                variable,
+                value: VarValue::Float { value: 1.0 },
+            },
+            transition: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: baseline.clone(),
+        })
+        .expect("add reaction");
+
+        let delayed = parameter_reaction_from_text(&doc, &baseline, ParameterKind::Delay, "725")
+            .expect("valid delay");
+        assert_eq!(delayed.id, reaction_id);
+        assert_eq!(delayed.trigger, Trigger::AfterDelay { delay_ms: 725 });
+
+        let valued =
+            parameter_reaction_from_text(&doc, &baseline, ParameterKind::VariableValue, "12.5")
+                .expect("valid typed variable value");
+        assert_eq!(valued.id, reaction_id);
+        assert_eq!(
+            valued.action,
+            Action::SetVariable {
+                variable,
+                value: VarValue::Float { value: 12.5 },
+            }
+        );
+
+        let operation = set_reaction_operation(&doc, first, reaction_id, |reaction| {
+            *reaction = valued;
+        })
+        .expect("parameter edit changes reaction");
+        let Operation::SetReaction { old, new, .. } = &operation else {
+            panic!("expected a SetReaction operation");
+        };
+        assert_eq!(old.id, reaction_id);
+        assert_eq!(new.id, reaction_id);
+        doc.apply(operation).expect("apply parameter edit");
+        assert_eq!(
+            reaction_by_id(&doc, first, reaction_id).map(|reaction| reaction.id),
+            Some(reaction_id)
+        );
+    }
+
+    #[test]
+    fn preview_restore_refuses_to_overwrite_a_newer_reaction() {
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction_id = ReactionId::new();
+        let baseline = Reaction {
+            id: reaction_id,
+            trigger: Trigger::Click,
+            action: Action::Back,
+            transition: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: baseline.clone(),
+        })
+        .expect("add reaction");
+        let preview = Reaction {
+            trigger: Trigger::Hover,
+            ..baseline.clone()
+        };
+        assert_eq!(
+            replace_reaction_preview_if_current(
+                &mut doc,
+                first,
+                reaction_id,
+                &baseline,
+                preview.clone(),
+            ),
+            Some(true)
+        );
+        let newer = Reaction {
+            trigger: Trigger::WhilePressing,
+            ..baseline.clone()
+        };
+        doc.scene.get_mut(first).expect("selected frame").reactions[0] = newer.clone();
+
+        assert_eq!(
+            replace_reaction_preview_if_current(&mut doc, first, reaction_id, &preview, baseline,),
+            None
+        );
+        assert_eq!(reaction_by_id(&doc, first, reaction_id), Some(&newer));
+    }
+
+    #[test]
+    fn key_link_and_manual_overlay_parameters_are_editable() {
+        let (doc, _, _) = document_with_two_frames();
+        let reaction_id = ReactionId::new();
+        let key = Reaction {
+            id: reaction_id,
+            trigger: Trigger::Key {
+                keys: vec!["Enter".into()],
+            },
+            action: Action::OpenLink { url: String::new() },
+            transition: None,
+        };
+        let keyed = parameter_reaction_from_text(&doc, &key, ParameterKind::Keys, "Shift + K")
+            .expect("valid key chord");
+        assert_eq!(
+            keyed.trigger,
+            Trigger::Key {
+                keys: vec!["Shift".into(), "K".into()],
+            }
+        );
+        let linked =
+            parameter_reaction_from_text(&doc, &key, ParameterKind::Url, "https://example.com")
+                .expect("valid link");
+        assert_eq!(
+            linked.action,
+            Action::OpenLink {
+                url: "https://example.com".into(),
+            }
+        );
+
+        let overlay = Reaction {
+            id: reaction_id,
+            trigger: Trigger::Click,
+            action: Action::OpenOverlay {
+                frame: NodeId::new(),
+                overlay: OverlaySettings {
+                    position: OverlayPosition::Manual { offset: [0.0, 4.0] },
+                    background_dim: true,
+                    close_on_click_outside: true,
+                },
+            },
+            transition: None,
+        };
+        let offset =
+            parameter_reaction_from_text(&doc, &overlay, ParameterKind::OverlayOffsetX, "18.25")
+                .expect("valid manual offset");
+        let Action::OpenOverlay { overlay, .. } = offset.action else {
+            panic!("expected overlay action");
+        };
+        assert_eq!(
+            overlay.position,
+            OverlayPosition::Manual {
+                offset: [18.25, 4.0]
+            }
         );
     }
 
@@ -1123,5 +2638,320 @@ mod tests {
             direction_choice(transition.style),
             Some(DirectionChoice::Right)
         );
+    }
+
+    #[gpui::test]
+    async fn inline_parameter_previews_live_and_commits_as_one_stable_id_operation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction_id = ReactionId::new();
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: Reaction {
+                id: reaction_id,
+                trigger: Trigger::AfterDelay { delay_ms: 300 },
+                action: Action::Back,
+                transition: None,
+            },
+        })
+        .expect("add reaction");
+        doc.selection.select_only(first);
+
+        let file_system = FakeFs::new(cx.executor());
+        let roots: [&std::path::Path; 0] = [];
+        let project = Project::test(file_system, roots, cx).await;
+        let item = ready_item_for_test(&project, PathBuf::from("/tmp/Prototype.fanta"), doc, cx);
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        cx.update_window(panel.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .expect("draw prototype panel");
+
+        panel
+            .update(cx, |panel, window, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node: first,
+                        reaction: reaction_id,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+            })
+            .expect("start delay edit");
+        let editor = panel
+            .read_with(cx, |panel, _| panel.parameter_editor.clone())
+            .expect("read prototype panel")
+            .expect("parameter editor exists");
+        cx.update_window(panel.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("725", window, cx));
+        })
+        .expect("type a new delay");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let reaction = reaction_by_id(
+                &item.document().expect("ready document").doc,
+                first,
+                reaction_id,
+            )
+            .expect("reaction remains");
+            assert_eq!(reaction.id, reaction_id);
+            assert_eq!(reaction.trigger, Trigger::AfterDelay { delay_ms: 725 });
+        });
+
+        panel
+            .update(cx, |panel, _, cx| panel.commit_parameter_edit_value(cx))
+            .expect("commit delay edit");
+        cx.run_until_parked();
+        let undone = item
+            .update(cx, |item, cx| item.undo(cx))
+            .expect("undo delay edit");
+        assert!(undone, "the committed field edit should be one undo step");
+        item.read_with(cx, |item, _| {
+            let reaction = reaction_by_id(
+                &item.document().expect("ready document").doc,
+                first,
+                reaction_id,
+            )
+            .expect("reaction remains after undo");
+            assert_eq!(reaction.id, reaction_id);
+            assert_eq!(reaction.trigger, Trigger::AfterDelay { delay_ms: 300 });
+        });
+    }
+
+    #[gpui::test]
+    async fn explicit_finish_restores_the_last_valid_preview_when_input_is_invalid(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction_id = ReactionId::new();
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: Reaction {
+                id: reaction_id,
+                trigger: Trigger::AfterDelay { delay_ms: 300 },
+                action: Action::Back,
+                transition: None,
+            },
+        })
+        .expect("add reaction");
+        doc.selection.select_only(first);
+        doc.history = Default::default();
+
+        let file_system = FakeFs::new(cx.executor());
+        let roots: [&std::path::Path; 0] = [];
+        let project = Project::test(file_system, roots, cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeInvalidFinish.fanta"),
+            doc,
+            cx,
+        );
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        cx.update_window(panel.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .expect("draw prototype panel");
+        panel
+            .update(cx, |panel, window, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node: first,
+                        reaction: reaction_id,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+            })
+            .expect("start delay edit");
+        let editor = panel
+            .read_with(cx, |panel, _| panel.parameter_editor.clone())
+            .expect("read prototype panel")
+            .expect("parameter editor exists");
+        cx.update_window(panel.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("725", window, cx));
+        })
+        .expect("preview valid delay");
+        cx.run_until_parked();
+        cx.update_window(panel.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("invalid", window, cx));
+        })
+        .expect("type invalid delay");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                reaction_by_id(
+                    &item.document().expect("ready document").doc,
+                    first,
+                    reaction_id,
+                )
+                .map(|reaction| &reaction.trigger),
+                Some(&Trigger::AfterDelay { delay_ms: 725 })
+            );
+        });
+        panel
+            .update(cx, |panel, _, cx| panel.finish_parameter_edit(cx))
+            .expect("finish invalid delay edit");
+        cx.run_until_parked();
+
+        assert!(
+            panel
+                .read_with(cx, |panel, _| panel.editing_parameter.is_none())
+                .expect("read prototype panel")
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                reaction_by_id(doc, first, reaction_id).map(|reaction| &reaction.trigger),
+                Some(&Trigger::AfterDelay { delay_ms: 300 })
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(!item.is_dirty());
+        });
+
+        panel
+            .update(cx, |panel, window, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node: first,
+                        reaction: reaction_id,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+            })
+            .expect("restart delay edit");
+        cx.update_window(panel.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("725", window, cx));
+        })
+        .expect("preview another valid delay");
+        cx.run_until_parked();
+        cx.update_window(panel.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("invalid", window, cx));
+        })
+        .expect("type another invalid delay");
+        cx.run_until_parked();
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_transition_choice(first, reaction_id, TransitionChoice::Dissolve, cx)
+            })
+            .expect("apply a discrete reaction edit");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            let reaction = reaction_by_id(doc, first, reaction_id).expect("reaction remains");
+            assert_eq!(reaction.trigger, Trigger::AfterDelay { delay_ms: 300 });
+            assert_eq!(
+                reaction
+                    .transition
+                    .as_ref()
+                    .map(|transition| transition.style),
+                Some(TransitionStyle::Dissolve)
+            );
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo discrete edit")
+        );
+        item.read_with(cx, |item, _| {
+            let reaction = reaction_by_id(
+                &item.document().expect("ready document").doc,
+                first,
+                reaction_id,
+            )
+            .expect("reaction remains after undo");
+            assert_eq!(reaction.trigger, Trigger::AfterDelay { delay_ms: 300 });
+            assert!(reaction.transition.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn source_lock_cancels_and_restores_an_active_parameter_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction_id = ReactionId::new();
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: Reaction {
+                id: reaction_id,
+                trigger: Trigger::AfterDelay { delay_ms: 300 },
+                action: Action::Back,
+                transition: None,
+            },
+        })
+        .expect("add reaction");
+        doc.selection.select_only(first);
+
+        let file_system = FakeFs::new(cx.executor());
+        let roots: [&std::path::Path; 0] = [];
+        let project = Project::test(file_system, roots, cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeLocked.fanta"),
+            doc,
+            cx,
+        );
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        cx.update_window(panel.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .expect("draw prototype panel");
+        panel
+            .update(cx, |panel, window, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node: first,
+                        reaction: reaction_id,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+            })
+            .expect("start delay edit");
+        let editor = panel
+            .read_with(cx, |panel, _| panel.parameter_editor.clone())
+            .expect("read prototype panel")
+            .expect("parameter editor exists");
+        cx.update_window(panel.into(), |_, window, cx| {
+            editor.update(cx, |editor, cx| editor.set_text("900", window, cx));
+        })
+        .expect("preview delay");
+        cx.run_until_parked();
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        assert!(
+            panel
+                .read_with(cx, |panel, _| panel.editing_parameter.is_none())
+                .expect("read prototype panel"),
+            "source locking should abandon the inline edit"
+        );
+        item.read_with(cx, |item, _| {
+            let reaction = reaction_by_id(
+                &item.document().expect("ready document").doc,
+                first,
+                reaction_id,
+            )
+            .expect("reaction remains");
+            assert_eq!(reaction.trigger, Trigger::AfterDelay { delay_ms: 300 });
+        });
     }
 }

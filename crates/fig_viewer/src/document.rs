@@ -47,6 +47,9 @@ pub struct FigItem {
     /// persisted project tree. The validated source may still be previewed,
     /// but canvas-authored content changes must not race it.
     source_edit_locked: bool,
+    /// Serializes source persistence/reconciliation across split views that
+    /// share this item and its project buffer.
+    source_edit_pipeline_in_progress: bool,
     /// Ignore worktree events until this instant; set around our own project
     /// writes so saving from the canvas does not trigger a self-reload.
     suppress_watcher_until: Option<Instant>,
@@ -420,6 +423,7 @@ impl project::ProjectItem for FigItem {
                     preview_dirty_before: None,
                     conflict: false,
                     source_edit_locked: false,
+                    source_edit_pipeline_in_progress: false,
                     suppress_watcher_until: None,
                     reload_task: None,
                     _load_task: Some(load_task),
@@ -485,8 +489,21 @@ impl FigItem {
         cx.notify();
     }
 
-    pub(crate) fn begin_source_edit_save(&mut self) {
+    fn begin_source_edit_save(&mut self) {
+        self.source_edit_pipeline_in_progress = true;
         self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+    }
+
+    pub(crate) fn try_begin_source_edit_pipeline(&mut self) -> bool {
+        if self.source_edit_pipeline_in_progress {
+            return false;
+        }
+        self.begin_source_edit_save();
+        true
+    }
+
+    pub(crate) fn finish_source_edit_pipeline(&mut self) {
+        self.source_edit_pipeline_in_progress = false;
     }
 
     pub fn project_root(&self) -> Option<&Path> {
@@ -949,6 +966,7 @@ pub(crate) fn ready_item_for_test(
             preview_dirty_before: None,
             conflict: false,
             source_edit_locked: false,
+            source_edit_pipeline_in_progress: false,
             suppress_watcher_until: None,
             reload_task: None,
             _load_task: None,
@@ -1504,12 +1522,31 @@ mod tests {
                 preview_dirty_before: None,
                 conflict: false,
                 source_edit_locked: false,
+                source_edit_pipeline_in_progress: false,
                 suppress_watcher_until: None,
                 reload_task: None,
                 _load_task: None,
                 _project_subscription: subscription,
             }
         })
+    }
+
+    #[gpui::test]
+    async fn source_pipeline_is_serialized_across_split_views(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/design/fanta.json"),
+            Some(PathBuf::from("/tmp/design")),
+            doc_with_one_page(),
+            cx,
+        );
+
+        assert!(item.update(cx, |item, _| item.try_begin_source_edit_pipeline()));
+        assert!(!item.update(cx, |item, _| item.try_begin_source_edit_pipeline()));
+        item.update(cx, |item, _| item.finish_source_edit_pipeline());
+        assert!(item.update(cx, |item, _| item.try_begin_source_edit_pipeline()));
+        item.update(cx, |item, _| item.finish_source_edit_pipeline());
     }
 
     #[gpui::test]

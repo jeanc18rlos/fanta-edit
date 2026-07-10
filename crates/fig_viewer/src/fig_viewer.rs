@@ -12,9 +12,11 @@ mod component_properties;
 mod design_panel;
 mod document;
 mod editor_session;
+mod fnx_editor;
 mod inspector_components;
 mod inspector_widgets;
 mod instance_text;
+mod motion_edit;
 mod panel_settings;
 mod properties_ops;
 mod properties_panel;
@@ -44,13 +46,15 @@ pub use panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings}
 pub use properties_panel::FantaPropertiesPanel;
 pub use prototype_panel::FantaPrototypePanel;
 pub use timeline::{
-    TimelineEvent, TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
+    TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection, TimelineKeyframeViewModel,
+    TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
 };
 pub use tools::ToolKind;
 pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{FigView, FigViewEvent};
 
 pub fn init(cx: &mut App) {
+    fnx_editor::init(cx);
     workspace::register_project_item::<FigView>(cx);
 }
 
