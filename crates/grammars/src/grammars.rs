@@ -87,9 +87,17 @@ pub fn get_file(path: &str) -> Option<rust_embed::EmbeddedFile> {
 /// Multiple `.scm` files with the same prefix (e.g. `highlights.scm` and
 /// `highlights_extra.scm`) are concatenated together with their contents appended.
 pub fn load_queries(name: &str) -> LanguageQueries {
+    // FNX is deliberately a TSX-shaped design language. Keeping one query
+    // source means highlighting, outlines, bracket matching, and indentation
+    // stay in lockstep with the bundled TSX grammar instead of slowly
+    // diverging as those queries evolve.
+    let query_name = if name == "fnx" { "tsx" } else { name };
     let mut result = LanguageQueries::default();
     for path in GrammarDir::iter() {
-        if let Some(remainder) = path.strip_prefix(name).and_then(|p| p.strip_prefix('/')) {
+        if let Some(remainder) = path
+            .strip_prefix(query_name)
+            .and_then(|path| path.strip_prefix('/'))
+        {
             if !remainder.ends_with(".scm") {
                 continue;
             }
@@ -105,4 +113,40 @@ pub fn load_queries(name: &str) -> LanguageQueries {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnx_uses_the_tsx_grammar_and_queries() {
+        let config = load_config("fnx");
+        assert_eq!(config.name.as_ref(), "FNX");
+        assert_eq!(config.grammar.as_deref(), Some("tsx"));
+        assert_eq!(config.matcher.path_suffixes, ["fnx"]);
+        assert_eq!(
+            load_queries("fnx").highlights,
+            load_queries("tsx").highlights
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "load-grammars")]
+    fn generated_fnx_shape_is_valid_tsx() {
+        let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TSX.into();
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&language).expect("set TSX grammar");
+        let source = r##"import type {} from "../../fnx";
+export default function Page() {
+  return (
+    <Frame background={{"kind": "solid", "color": fnxColor("#336699")}}>
+      <Text content="Hello" x={12.0} y={24.0} />
+    </Frame>
+  );
+}
+"##;
+        let tree = parser.parse(source, None).expect("parse FNX as TSX");
+        assert!(!tree.root_node().has_error(), "{:#?}", tree.root_node());
+    }
 }

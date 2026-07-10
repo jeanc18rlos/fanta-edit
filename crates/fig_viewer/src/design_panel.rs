@@ -12,7 +12,7 @@ use editor::{
     actions::{Cancel, SelectAll},
 };
 use fanta_doc::{
-    AssetId, CanvasNode, ComponentId, Fill, GroupNode, NodeData, NodeFlags, NodeId, Operation,
+    AssetId, CanvasNode, ComponentId, Doc, Fill, GroupNode, NodeData, NodeFlags, NodeId, Operation,
     Scene,
 };
 use fs::Fs;
@@ -105,6 +105,129 @@ impl Render for DraggedSectionDivider {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
     }
+}
+
+#[derive(Clone)]
+struct DraggedLayer(NodeId);
+
+impl Render for DraggedLayer {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerDropError {
+    MissingDragged,
+    MissingTarget,
+    TargetIsNotContainer,
+    SelfDrop,
+    DescendantCycle,
+    ContainsComponentMaster,
+    RecursiveComponentInstance,
+    NonInvertibleTarget,
+    AlreadyLastChild,
+}
+
+fn node_is_within(scene: &Scene, node: NodeId, ancestor: NodeId) -> bool {
+    node == ancestor
+        || scene
+            .ancestors_of(node)
+            .any(|candidate| candidate.id == ancestor)
+}
+
+fn layer_reparent_operations(
+    doc: &Doc,
+    dragged: NodeId,
+    target: NodeId,
+) -> std::result::Result<Vec<Operation>, LayerDropError> {
+    let dragged_node = doc
+        .scene
+        .get(dragged)
+        .ok_or(LayerDropError::MissingDragged)?;
+    let target_node = doc.scene.get(target).ok_or(LayerDropError::MissingTarget)?;
+    if dragged == target {
+        return Err(LayerDropError::SelfDrop);
+    }
+    if !target_node.can_have_children() {
+        return Err(LayerDropError::TargetIsNotContainer);
+    }
+    if node_is_within(&doc.scene, target, dragged) {
+        return Err(LayerDropError::DescendantCycle);
+    }
+    if doc
+        .components
+        .defs
+        .values()
+        .any(|definition| node_is_within(&doc.scene, definition.root, dragged))
+    {
+        return Err(LayerDropError::ContainsComponentMaster);
+    }
+
+    let target_components: Vec<_> = doc
+        .components
+        .defs
+        .values()
+        .filter(|definition| node_is_within(&doc.scene, target, definition.root))
+        .collect();
+    if !target_components.is_empty() {
+        let creates_recursive_instance = doc.scene.descendants_of(dragged).any(|node_id| {
+            let Some(NodeData::Instance(instance)) = doc.scene.get(node_id).map(|node| &node.data)
+            else {
+                return false;
+            };
+            target_components.iter().any(|definition| {
+                instance.component == definition.id
+                    || definition
+                        .variant_of
+                        .as_ref()
+                        .is_some_and(|membership| instance.component == membership.set)
+            })
+        });
+        if creates_recursive_instance {
+            return Err(LayerDropError::RecursiveComponentInstance);
+        }
+    }
+
+    let new_index = doc.scene.next_child_index(Some(target));
+    if dragged_node.parent == Some(target)
+        && doc.scene.children_of(Some(target)).last().copied() == Some(dragged)
+    {
+        return Err(LayerDropError::AlreadyLastChild);
+    }
+    let world = doc
+        .scene
+        .world_transform(dragged)
+        .ok_or(LayerDropError::MissingDragged)?;
+    let target_world = doc
+        .scene
+        .world_transform(target)
+        .ok_or(LayerDropError::MissingTarget)?;
+    let [a, b, c, d, _, _] = target_world.to_components();
+    let determinant = a * d - b * c;
+    if !target_world.is_finite() || !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return Err(LayerDropError::NonInvertibleTarget);
+    }
+    let new_local = world.then(&target_world.inverse());
+    if !new_local.is_finite() {
+        return Err(LayerDropError::NonInvertibleTarget);
+    }
+
+    let mut operations = vec![Operation::Reparent {
+        id: dragged,
+        old_parent: dragged_node.parent,
+        old_index: dragged_node.index,
+        new_parent: Some(target),
+        new_index,
+    }];
+    if new_local != dragged_node.transform {
+        operations.push(Operation::SetTransform {
+            id: dragged,
+            old: dragged_node.transform,
+            new: new_local,
+        });
+    }
+    Ok(operations)
 }
 
 #[derive(Clone, Copy)]
@@ -615,6 +738,53 @@ impl FantaDesignPanel {
         // shift-clicking down the list doesn't yank the viewport around.
         if !extend {
             view.update(cx, |view, cx| view.reveal_node_in_canvas(id, cx));
+        }
+    }
+
+    fn drop_layer_onto(&mut self, dragged: NodeId, target: NodeId, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
+        let item = view.read(cx).item().clone();
+        let result: Result<bool> = item.update(cx, |item, cx| {
+            if !item.is_editable() {
+                return Ok(false);
+            }
+            item.with_document(cx, |document| {
+                let operations = match layer_reparent_operations(&document.doc, dragged, target) {
+                    Ok(operations) => operations,
+                    Err(_) => return (Ok(false), DocChange::None),
+                };
+                let doc = &mut document.doc;
+                doc.history.begin("Move layer", &mut doc.scene);
+                for operation in operations {
+                    if let Err(error) = doc.apply(operation) {
+                        let rollback = doc.history.abort(&mut doc.scene);
+                        let error = match rollback {
+                            Ok(()) => anyhow::anyhow!("reparenting layer: {error}"),
+                            Err(rollback_error) => anyhow::anyhow!(
+                                "reparenting layer: {error}; rolling back: {rollback_error}"
+                            ),
+                        };
+                        return (Err(error), DocChange::None);
+                    }
+                }
+                doc.history.commit(&mut doc.scene);
+                (Ok(true), DocChange::Content)
+            })
+            .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
+        });
+        match result {
+            Ok(true) => {
+                self.expanded_nodes.insert(target);
+                self.rebuild_layer_rows(cx);
+                cx.notify();
+            }
+            Ok(false) => {}
+            Err(error) => log::error!("fanta design panel: failed to move layer: {error:#}"),
         }
     }
 
@@ -1897,7 +2067,41 @@ impl FantaDesignPanel {
             );
         }
 
-        item.into_any_element()
+        if !self.document_editable {
+            return item.into_any_element();
+        }
+        let active_item = self
+            .active_view(cx)
+            .map(|view| view.read(cx).item().clone());
+        div()
+            .id(("fanta-layer-drop", index))
+            .w_full()
+            .cursor_move()
+            .on_drag(DraggedLayer(id), |dragged, _, _, cx| {
+                cx.new(|_| dragged.clone())
+            })
+            .can_drop(move |value, _, cx| {
+                let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
+                    return false;
+                };
+                let Some(item) = active_item.as_ref() else {
+                    return false;
+                };
+                let item = item.read(cx);
+                item.is_editable()
+                    && item.document().is_some_and(|document| {
+                        layer_reparent_operations(&document.doc, dragged.0, id).is_ok()
+                    })
+            })
+            .drag_over::<DraggedLayer>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
+                this.drop_layer_onto(dragged.0, id, cx);
+                cx.stop_propagation();
+            }))
+            .child(item)
+            .into_any_element()
     }
 
     fn render_component_row(
@@ -2270,7 +2474,198 @@ impl Panel for FantaDesignPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{BitmapNode, BlendMode, ImageAdjust, ImageFitMode};
+    use fanta_doc::{
+        BitmapNode, BlendMode, ComponentDef, ImageAdjust, ImageFitMode, InstanceNode, Transform2D,
+        VectorNode,
+    };
+
+    fn insert_node(doc: &mut Doc, mut node: CanvasNode) -> NodeId {
+        node.index = doc.scene.next_child_index(node.parent);
+        let id = node.id;
+        doc.scene.insert(node).expect("test node should be valid");
+        id
+    }
+
+    fn group_node(parent: Option<NodeId>, transform: Transform2D) -> CanvasNode {
+        let mut node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        node.parent = parent;
+        node.transform = transform;
+        node
+    }
+
+    fn vector_node(parent: Option<NodeId>, transform: Transform2D) -> CanvasNode {
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::default()));
+        node.parent = parent;
+        node.transform = transform;
+        node
+    }
+
+    fn instance_node(parent: Option<NodeId>, component: ComponentId) -> CanvasNode {
+        let mut node = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [100.0, 100.0],
+        }));
+        node.parent = parent;
+        node
+    }
+
+    fn assert_transform_close(actual: Transform2D, expected: Transform2D) {
+        for (actual, expected) in actual
+            .to_components()
+            .into_iter()
+            .zip(expected.to_components())
+        {
+            assert!(
+                (actual - expected).abs() < 1e-9,
+                "transform component {actual} differs from {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn layer_drop_reparents_at_end_preserves_world_transform_and_undoes_once() {
+        let mut doc = Doc::new();
+        let old_parent = insert_node(
+            &mut doc,
+            group_node(None, Transform2D::translation(120.0, -30.0)),
+        );
+        let target = insert_node(
+            &mut doc,
+            group_node(
+                None,
+                Transform2D::scale_xy(1.5, 0.75).then(&Transform2D::translation(-40.0, 90.0)),
+            ),
+        );
+        let existing_target_child = insert_node(
+            &mut doc,
+            vector_node(Some(target), Transform2D::translation(5.0, 10.0)),
+        );
+        let old_local = Transform2D::rotation(0.25).then(&Transform2D::translation(16.0, 24.0));
+        let dragged = insert_node(&mut doc, vector_node(Some(old_parent), old_local));
+        let old_index = doc
+            .scene
+            .get(dragged)
+            .expect("dragged node should exist")
+            .index;
+        let world_before = doc
+            .scene
+            .world_transform(dragged)
+            .expect("dragged node should have a world transform");
+        let expected_index = doc.scene.next_child_index(Some(target));
+
+        let operations = layer_reparent_operations(&doc, dragged, target)
+            .expect("the layer drop should be valid");
+        assert!(matches!(
+            operations.first(),
+            Some(Operation::Reparent {
+                id,
+                new_parent: Some(parent),
+                new_index,
+                ..
+            }) if *id == dragged && *parent == target && *new_index == expected_index
+        ));
+        assert!(matches!(
+            operations.get(1),
+            Some(Operation::SetTransform { id, .. }) if *id == dragged
+        ));
+
+        let undo_depth = doc.history.undo_depth();
+        doc.history.begin("Move layer", &mut doc.scene);
+        for operation in operations {
+            doc.apply(operation)
+                .expect("reparent operation should apply");
+        }
+        doc.history.commit(&mut doc.scene);
+
+        assert_eq!(doc.history.undo_depth(), undo_depth + 1);
+        assert_eq!(
+            doc.scene.children_of(Some(target)),
+            &[existing_target_child, dragged]
+        );
+        assert_transform_close(
+            doc.scene
+                .world_transform(dragged)
+                .expect("dragged node should retain a world transform"),
+            world_before,
+        );
+        assert_eq!(
+            layer_reparent_operations(&doc, dragged, target)
+                .expect_err("the last child is already in the requested position"),
+            LayerDropError::AlreadyLastChild
+        );
+
+        assert!(doc.undo().expect("move should undo"));
+        let restored = doc
+            .scene
+            .get(dragged)
+            .expect("dragged node should still exist after undo");
+        assert_eq!(restored.parent, Some(old_parent));
+        assert_eq!(restored.index, old_index);
+        assert_eq!(restored.transform, old_local);
+        assert_transform_close(
+            doc.scene
+                .world_transform(dragged)
+                .expect("restored node should have a world transform"),
+            world_before,
+        );
+    }
+
+    #[test]
+    fn layer_drop_rejects_self_descendant_and_non_container_targets() {
+        let mut doc = Doc::new();
+        let parent = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
+        let child = insert_node(&mut doc, group_node(Some(parent), Transform2D::IDENTITY));
+        let leaf = insert_node(&mut doc, vector_node(Some(child), Transform2D::IDENTITY));
+        let other = insert_node(&mut doc, vector_node(None, Transform2D::IDENTITY));
+        let instance_target = insert_node(&mut doc, instance_node(None, ComponentId::new()));
+
+        assert_eq!(
+            layer_reparent_operations(&doc, parent, parent)
+                .expect_err("a node cannot be dropped on itself"),
+            LayerDropError::SelfDrop
+        );
+        assert_eq!(
+            layer_reparent_operations(&doc, parent, child)
+                .expect_err("a node cannot be dropped into its descendant"),
+            LayerDropError::DescendantCycle
+        );
+        assert_eq!(
+            layer_reparent_operations(&doc, other, leaf)
+                .expect_err("a vector cannot accept children"),
+            LayerDropError::TargetIsNotContainer
+        );
+        assert_eq!(
+            layer_reparent_operations(&doc, other, instance_target)
+                .expect_err("an instance cannot accept real scene children"),
+            LayerDropError::TargetIsNotContainer
+        );
+    }
+
+    #[test]
+    fn layer_drop_rejects_component_masters_and_recursive_instances() {
+        let mut doc = Doc::new();
+        let master = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
+        let other_container = insert_node(&mut doc, group_node(None, Transform2D::IDENTITY));
+        let component = ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, master, "Button"));
+        let instance = insert_node(&mut doc, instance_node(None, component));
+
+        assert_eq!(
+            layer_reparent_operations(&doc, master, other_container)
+                .expect_err("a component master cannot leave the component library"),
+            LayerDropError::ContainsComponentMaster
+        );
+        assert_eq!(
+            layer_reparent_operations(&doc, instance, master)
+                .expect_err("a component cannot contain an instance of itself"),
+            LayerDropError::RecursiveComponentInstance
+        );
+    }
 
     fn image_fill(asset: AssetId) -> Fill {
         Fill::Image {

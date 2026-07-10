@@ -2374,6 +2374,15 @@
         "allowed": true,
       },
     },
+    "FNX": {
+      "language_servers": ["!typescript-language-server", "vtsls", "..."],
+      "prettier": {
+        "allowed": true,
+        "parser": "typescript",
+        "quoteProps": "preserve",
+        "trailingComma": "none",
+      },
+    },
     "Starlark": {
       "format_on_save": "on",
       "language_servers": ["starpls", "!buck2-lsp", "!tilt", "..."],

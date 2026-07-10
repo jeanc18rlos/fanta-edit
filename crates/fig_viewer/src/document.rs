@@ -589,6 +589,50 @@ impl FigItem {
         cx.notify();
     }
 
+    pub(crate) fn adopt_source_edit(
+        &mut self,
+        source_edit: fanta_format::ProjectSourceEdit,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_page_root = self
+            .document
+            .ready()
+            .and_then(|current| current.doc.active_page());
+        let previous_selection = self
+            .document
+            .ready()
+            .map(|current| current.doc.selection.as_slice().to_vec())
+            .unwrap_or_default();
+        let previous_viewport = self
+            .document
+            .ready()
+            .map(|current| current.doc.viewport)
+            .unwrap_or_default();
+        let mut document = FigDocument::from_doc(source_edit.document, source_edit.assets);
+        if let Some(root) = previous_page_root
+            && let Some(index) = document
+                .pages
+                .iter()
+                .position(|page| page.root == Some(root))
+        {
+            document.ensure_page_solved(index);
+            document.doc.set_active_page(Some(root));
+            document.default_page_index = index;
+        }
+        let preserved_selection: Vec<_> = previous_selection
+            .into_iter()
+            .filter(|node| document.doc.scene.get(*node).is_some())
+            .collect();
+        document.doc.selection.replace_with(preserved_selection);
+        document.doc.viewport = previous_viewport;
+        self.document = FigDocumentState::Ready(document);
+        self.dirty = false;
+        self.preview_dirty_before = None;
+        self.set_conflict(false, cx);
+        cx.emit(FigItemEvent::StateChanged);
+        cx.notify();
+    }
+
     /// Reload the project from disk immediately, discarding unsaved canvas
     /// edits. This backs the workspace's "discard and reload" choice in the
     /// conflict prompt.
@@ -896,11 +940,7 @@ fn available_project_dir(fig_path: &Path) -> PathBuf {
     base
 }
 
-/// Whether an externally changed path should refresh the canvas: any file
-/// under the project root except the generated `previews/` and `exports/`
-/// outputs (which never feed back into the document) and the root `AGENTS.md`
-/// agent guide (a doc for the agent, not part of the design — editing it must
-/// not reload/replace the canvas).
+/// Whether an externally changed path is an input to the project document.
 fn is_relevant_project_change(project_root: &Path, abs_path: &Path) -> bool {
     let Ok(relative) = abs_path.strip_prefix(project_root) else {
         return false;
@@ -911,16 +951,11 @@ fn is_relevant_project_change(project_root: &Path, abs_path: &Path) -> bool {
     let Some(first_component) = components.next() else {
         return false;
     };
-    let first = first_component.as_os_str().to_str();
-    if matches!(first, Some("previews" | "exports")) {
-        return false;
+    match first_component.as_os_str().to_str() {
+        Some("fanta.json") => components.next().is_none(),
+        Some("doc" | "pages" | "components" | "assets") => true,
+        _ => false,
     }
-    // The agent guide lives at the project root (a single path component); a
-    // nested file that merely happens to be named AGENTS.md is still design.
-    if first == Some("AGENTS.md") && components.next().is_none() {
-        return false;
-    }
-    true
 }
 
 pub(crate) fn is_fig_file(path: &ProjectPath) -> bool {
@@ -1271,6 +1306,14 @@ mod tests {
             root,
             Path::new("/tmp/project/exports/page-1.svg")
         ));
+        assert!(!is_relevant_project_change(
+            root,
+            Path::new("/tmp/project/fnx.d.ts")
+        ));
+        assert!(!is_relevant_project_change(
+            root,
+            Path::new("/tmp/project/.prettierrc.json")
+        ));
         // The root AGENTS.md agent guide is documentation, not design: editing
         // it must not reload the canvas.
         assert!(!is_relevant_project_change(
@@ -1404,6 +1447,47 @@ mod tests {
                 _project_subscription: subscription,
             }
         })
+    }
+
+    #[gpui::test]
+    async fn source_edit_adoption_preserves_page_and_selection(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let mut document = doc_with_one_page();
+        let page = document.pages()[0];
+        document.selection.select_only(page);
+        document.viewport = Viewport {
+            center: [275.0, -42.0],
+            zoom: 2.5,
+        };
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/design/fanta.json"),
+            Some(PathBuf::from("/tmp/design")),
+            document.clone(),
+            cx,
+        );
+        document.scene.get_mut(page).expect("page node").name = "Edited source".to_owned();
+        let source_edit = fanta_format::ProjectSourceEdit {
+            document,
+            assets: BTreeMap::new(),
+            source_path: PathBuf::from("/tmp/design/pages/page/page.fnx"),
+        };
+
+        item.update(cx, |item, cx| item.adopt_source_edit(source_edit, cx));
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("adopted source document");
+            assert_eq!(document.doc.active_page(), Some(page));
+            assert_eq!(document.doc.selection.as_slice(), &[page]);
+            assert_eq!(
+                document.doc.viewport,
+                Viewport {
+                    center: [275.0, -42.0],
+                    zoom: 2.5,
+                }
+            );
+            assert_eq!(document.doc.scene.get(page).unwrap().name, "Edited source");
+            assert!(!item.is_dirty());
+        });
     }
 
     #[gpui::test]

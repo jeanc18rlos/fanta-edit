@@ -33,6 +33,8 @@ use crate::canvas::{
     CanvasElement, RenderedCanvas, bounds_size, evaluated_hit_test_screen,
     screen_position_in_bounds,
 };
+use crate::code_workspace::FantaCodeWorkspace;
+use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
 use crate::document::{DocChange, FigDocument, FigItem, FigItemEvent};
 use crate::editor_session::{
@@ -189,6 +191,7 @@ pub struct FigView {
     inspector_sidebar: Entity<FantaPropertiesPanel>,
     prototype_sidebar: Entity<FantaPrototypePanel>,
     variables_workspace: Entity<FantaVariablesWorkspace>,
+    code_workspace: Entity<FantaCodeWorkspace>,
     timeline_shell: Entity<TimelineShell>,
     active_motion_clip: Option<AnimationClipId>,
     layers_sidebar_visible: bool,
@@ -273,6 +276,8 @@ impl FigView {
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
         let variables_workspace =
             cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
+        let code_workspace =
+            cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
         let timeline_shell = cx.new(|_| TimelineShell::new());
         let timeline_subscription =
             cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
@@ -300,6 +305,7 @@ impl FigView {
             inspector_sidebar,
             prototype_sidebar,
             variables_workspace,
+            code_workspace,
             timeline_shell,
             active_motion_clip: None,
             layers_sidebar_visible,
@@ -438,7 +444,7 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        if workspace == EditorWorkspace::Variables {
+        if workspace != EditorWorkspace::Canvas {
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
@@ -1643,6 +1649,7 @@ impl FigView {
         });
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
+            EditorMode::Comments => self.render_comments_sidebar(cx),
             EditorMode::Design | EditorMode::Motion => {
                 self.inspector_sidebar.clone().into_any_element()
             }
@@ -1659,7 +1666,7 @@ impl FigView {
                 v_flex()
                     .size_full()
                     .overflow_hidden()
-                    .child(tabs)
+                    .child(h_flex().flex_none().justify_center().py_1().child(tabs))
                     .child(div().flex_1().min_h_0().child(body)),
             )
             .child(self.render_sidebar_resize_handle(SidebarKind::Inspector))
@@ -1675,12 +1682,32 @@ impl FigView {
         });
         h_flex()
             .absolute()
-            .top_0()
+            .top(px(8.0))
             .left_0()
             .right_0()
             .justify_center()
-            .child(div().w(px(220.)).occlude().child(tabs))
+            .child(div().occlude().child(tabs))
             .into_any_element()
+    }
+
+    fn render_comments_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self
+            .item
+            .read(cx)
+            .document()
+            .map(|document| document_comment_rows(&document.doc, &document.pages))
+            .unwrap_or_default();
+        let view = cx.weak_entity();
+        FantaCommentsPanel::new(rows, move |page_index, comment_id, window, cx| {
+            view.update(cx, |view, cx| {
+                view.select_page(page_index, cx);
+                if view.comment_state.open_thread.as_deref() != Some(comment_id.as_str()) {
+                    view.toggle_comment_thread(comment_id, window, cx);
+                }
+            })
+            .log_err();
+        })
+        .into_any_element()
     }
 
     fn render_sidebar_resize_handle(&self, sidebar: SidebarKind) -> AnyElement {
@@ -2133,85 +2160,109 @@ impl Render for FigView {
                 )
             })
             .when(!has_error && !is_loading, |this| {
-                if editor_workspace == EditorWorkspace::Variables {
-                    return this
-                        .child(self.variables_workspace.clone())
-                        .child(self.render_workspace_tabs(cx));
-                }
-                this.child(
-                    h_flex()
+                let workspace_body = if editor_workspace == EditorWorkspace::Variables {
+                    div()
+                        .id("fanta-variables-workspace-body")
                         .size_full()
                         .overflow_hidden()
-                        .children(
-                            self.layers_sidebar_visible
-                                .then(|| self.render_layers_sidebar(cx)),
-                        )
+                        .child(self.variables_workspace.clone())
+                        .into_any_element()
+                } else if editor_workspace == EditorWorkspace::Code {
+                    div()
+                        .id("fanta-code-workspace-body")
+                        .size_full()
+                        .overflow_hidden()
+                        .child(self.code_workspace.clone())
+                        .into_any_element()
+                } else {
+                    div()
+                        .id("fanta-canvas-workspace-body")
+                        .size_full()
+                        .relative()
+                        .overflow_hidden()
                         .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
+                            h_flex()
+                                .size_full()
                                 .overflow_hidden()
+                                .children(
+                                    self.layers_sidebar_visible
+                                        .then(|| self.render_layers_sidebar(cx)),
+                                )
                                 .child(
-                                    div()
-                                        .id("fig-container")
+                                    v_flex()
                                         .flex_1()
-                                        .min_h_0()
-                                        .w_full()
+                                        .min_w_0()
+                                        .h_full()
                                         .overflow_hidden()
-                                        .relative()
-                                        .cursor(cursor_style)
-                                        .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-                                        .on_pinch(cx.listener(Self::handle_pinch))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(Self::handle_mouse_down),
+                                        .child(
+                                            div()
+                                                .id("fig-container")
+                                                .flex_1()
+                                                .min_h_0()
+                                                .w_full()
+                                                .overflow_hidden()
+                                                .relative()
+                                                .cursor(cursor_style)
+                                                .on_scroll_wheel(
+                                                    cx.listener(Self::handle_scroll_wheel),
+                                                )
+                                                .on_pinch(cx.listener(Self::handle_pinch))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::handle_mouse_down),
+                                                )
+                                                .on_mouse_down(
+                                                    MouseButton::Middle,
+                                                    cx.listener(Self::handle_mouse_down),
+                                                )
+                                                .on_mouse_up(
+                                                    MouseButton::Left,
+                                                    cx.listener(Self::handle_mouse_up),
+                                                )
+                                                .on_mouse_up(
+                                                    MouseButton::Middle,
+                                                    cx.listener(Self::handle_mouse_up),
+                                                )
+                                                .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                                                .children({
+                                                    // Paint order = z-order: the rendered scene
+                                                    // surface goes on the BOTTOM, and the text-edit
+                                                    // overlay (caret bar + selection highlight) on
+                                                    // TOP — otherwise the opaque canvas covers the
+                                                    // caret/selection and they never show.
+                                                    let mut c: Vec<AnyElement> = vec![];
+                                                    c.push(
+                                                        CanvasElement::new(cx.entity())
+                                                            .into_any_element(),
+                                                    );
+                                                    if let Some(ov) =
+                                                        self.render_text_edit_overlay(cx)
+                                                    {
+                                                        c.push(ov);
+                                                    }
+                                                    if let Some(comments) =
+                                                        self.render_comment_overlay(cx)
+                                                    {
+                                                        c.push(comments);
+                                                    }
+                                                    c
+                                                }),
                                         )
-                                        .on_mouse_down(
-                                            MouseButton::Middle,
-                                            cx.listener(Self::handle_mouse_down),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(Self::handle_mouse_up),
-                                        )
-                                        .on_mouse_up(
-                                            MouseButton::Middle,
-                                            cx.listener(Self::handle_mouse_up),
-                                        )
-                                        .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                                        .children({
-                                            // Paint order = z-order: the rendered scene
-                                            // surface goes on the BOTTOM, and the text-edit
-                                            // overlay (caret bar + selection highlight) on
-                                            // TOP — otherwise the opaque canvas covers the
-                                            // caret/selection and they never show.
-                                            let mut c: Vec<AnyElement> = vec![];
-                                            c.push(
-                                                CanvasElement::new(cx.entity()).into_any_element(),
-                                            );
-                                            if let Some(ov) = self.render_text_edit_overlay(cx) {
-                                                c.push(ov);
-                                            }
-                                            if let Some(comments) = self.render_comment_overlay(cx)
-                                            {
-                                                c.push(comments);
-                                            }
-                                            c
-                                        }),
+                                        .children(
+                                            (editor_mode == EditorMode::Motion)
+                                                .then(|| self.timeline_shell.clone()),
+                                        ),
                                 )
                                 .children(
-                                    (editor_mode == EditorMode::Motion)
-                                        .then(|| self.timeline_shell.clone()),
+                                    self.inspector_sidebar_visible
+                                        .then(|| self.render_inspector_sidebar(cx)),
                                 ),
                         )
-                        .children(
-                            self.inspector_sidebar_visible
-                                .then(|| self.render_inspector_sidebar(cx)),
-                        ),
-                )
-                .child(self.render_tool_pill(cx))
-                .child(self.render_workspace_tabs(cx))
+                        .child(self.render_tool_pill(cx))
+                        .into_any_element()
+                };
+                this.child(workspace_body)
+                    .child(self.render_workspace_tabs(cx))
             })
     }
 }
@@ -2480,6 +2531,8 @@ impl Item for FigView {
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
             let variables_workspace =
                 cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
+            let code_workspace =
+                cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
             let timeline_shell = cx.new(|cx| {
                 let mut timeline = TimelineShell::new();
                 timeline.set_model(timeline_model, cx);
@@ -2498,6 +2551,7 @@ impl Item for FigView {
                 inspector_sidebar,
                 prototype_sidebar,
                 variables_workspace,
+                code_workspace,
                 timeline_shell,
                 active_motion_clip,
                 layers_sidebar_visible,

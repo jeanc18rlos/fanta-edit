@@ -1,7 +1,9 @@
 use std::rc::Rc;
 
 use gpui::{App, Context, EventEmitter, IntoElement, RenderOnce, Window};
-use ui::{Tab, TabBar, TabPosition, prelude::*};
+use ui::prelude::*;
+
+use crate::inspector_components::{CollapsibleIconTab, CollapsibleIconTabBar};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EditorMode {
@@ -9,6 +11,7 @@ pub enum EditorMode {
     Design,
     Prototype,
     Motion,
+    Comments,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -16,27 +19,52 @@ pub enum EditorWorkspace {
     #[default]
     Canvas,
     Variables,
+    Code,
 }
 
 impl EditorWorkspace {
-    pub const ALL: [Self; 2] = [Self::Canvas, Self::Variables];
+    pub const ALL: [Self; 3] = [Self::Canvas, Self::Variables, Self::Code];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Canvas => "Canvas",
             Self::Variables => "Variables",
+            Self::Code => "Code",
+        }
+    }
+
+    pub const fn icon(self) -> IconName {
+        match self {
+            Self::Canvas => IconName::ToolFrame,
+            Self::Variables => IconName::DatabaseZap,
+            Self::Code => IconName::FileCode,
         }
     }
 }
 
 impl EditorMode {
-    pub const ALL: [Self; 3] = [Self::Design, Self::Prototype, Self::Motion];
+    pub const ALL: [Self; 4] = [
+        Self::Design,
+        Self::Prototype,
+        Self::Motion,
+        Self::Comments,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Design => "Design",
             Self::Prototype => "Prototype",
             Self::Motion => "Motion",
+            Self::Comments => "Comments",
+        }
+    }
+
+    pub const fn icon(self) -> IconName {
+        match self {
+            Self::Design => IconName::Sliders,
+            Self::Prototype => IconName::PlayOutlined,
+            Self::Motion => IconName::FastForward,
+            Self::Comments => IconName::Chat,
         }
     }
 }
@@ -123,24 +151,18 @@ impl EditorModeTabs {
 
 impl RenderOnce for EditorModeTabs {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let selected_index = EditorMode::ALL
-            .iter()
-            .position(|mode| *mode == self.selected)
-            .unwrap_or(0);
-        let mut tabs = TabBar::new("fanta-editor-mode-tabs");
+        let mut tabs = CollapsibleIconTabBar::new("fanta-editor-mode-tabs");
         for (index, mode) in EditorMode::ALL.into_iter().enumerate() {
-            let position = match index {
-                0 => TabPosition::First,
-                2 => TabPosition::Last,
-                _ => TabPosition::Middle(index.cmp(&selected_index)),
-            };
             let on_select = self.on_select.clone();
-            tabs = tabs.child(
-                Tab::new(("fanta-editor-mode", index))
-                    .position(position)
-                    .toggle_state(mode == self.selected)
-                    .on_click(move |_, window, cx| on_select(mode, window, cx))
-                    .child(mode.label()),
+            tabs = tabs.tab(
+                CollapsibleIconTab::new(
+                    "fanta-editor-mode",
+                    index,
+                    mode.icon(),
+                    mode.label(),
+                    mode == self.selected,
+                    move |window, cx| on_select(mode, window, cx),
+                ),
             );
         }
         tabs
@@ -167,20 +189,18 @@ impl EditorWorkspaceTabs {
 
 impl RenderOnce for EditorWorkspaceTabs {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let mut tabs = TabBar::new("fanta-editor-workspace-tabs");
+        let mut tabs = CollapsibleIconTabBar::new("fanta-editor-workspace-tabs");
         for (index, workspace) in EditorWorkspace::ALL.into_iter().enumerate() {
-            let position = if index == 0 {
-                TabPosition::First
-            } else {
-                TabPosition::Last
-            };
             let on_select = self.on_select.clone();
-            tabs = tabs.child(
-                Tab::new(("fanta-editor-workspace", index))
-                    .position(position)
-                    .toggle_state(workspace == self.selected)
-                    .on_click(move |_, window, cx| on_select(workspace, window, cx))
-                    .child(workspace.label()),
+            tabs = tabs.tab(
+                CollapsibleIconTab::new(
+                    "fanta-editor-workspace",
+                    index,
+                    workspace.icon(),
+                    workspace.label(),
+                    workspace == self.selected,
+                    move |window, cx| on_select(workspace, window, cx),
+                ),
             );
         }
         tabs
@@ -199,12 +219,12 @@ mod tests {
     fn mode_order_and_labels_are_stable() {
         assert_eq!(
             EditorMode::ALL.map(EditorMode::label),
-            ["Design", "Prototype", "Motion"]
+            ["Design", "Prototype", "Motion", "Comments"]
         );
         assert_eq!(EditorMode::default(), EditorMode::Design);
         assert_eq!(
             EditorWorkspace::ALL.map(EditorWorkspace::label),
-            ["Canvas", "Variables"]
+            ["Canvas", "Variables", "Code"]
         );
     }
 

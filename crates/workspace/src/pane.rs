@@ -4196,7 +4196,14 @@ fn default_render_tab_bar_buttons(
     window: &mut Window,
     cx: &mut Context<Pane>,
 ) -> (Option<AnyElement>, Option<AnyElement>) {
-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
+    // Child-entity invalidation can briefly detach a focused item from the
+    // dispatch tree. The workspace keeps the pane active across that gap, so
+    // use its stable identity instead of removing interactive controls mid-click.
+    let is_active_pane = pane
+        .workspace
+        .upgrade()
+        .is_some_and(|workspace| workspace.read(cx).active_pane().entity_id() == cx.entity_id());
+    if !is_active_pane && !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
         return (None, None);
     }
     let (can_clone, can_split_move) = match pane.active_item() {
@@ -5024,6 +5031,44 @@ mod tests {
             }
             is_dragged_tab
         }
+    }
+
+    #[gpui::test]
+    async fn test_active_pane_tab_bar_buttons_survive_a_transient_focus_gap(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let item = add_labeled_item(&pane, "A", false, cx);
+
+        pane.update_in(cx, |pane, window, cx| {
+            pane.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("ICON-Maximize").is_some());
+
+        let transient_focus = cx.new(TestItem::new);
+        transient_focus.update_in(cx, |item, window, cx| {
+            item.focus_handle(cx).focus(window, cx);
+        });
+        item.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        assert!(!pane.update_in(cx, |pane, window, cx| pane.has_focus(window, cx)));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().entity_id()),
+            pane.entity_id()
+        );
+        let maximize_bounds = cx
+            .debug_bounds("ICON-Maximize")
+            .expect("the active pane controls should stay mounted while its item redraws");
+        cx.simulate_click(maximize_bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(pane.read_with(cx, |pane, _| pane.is_zoomed()));
     }
 
     #[gpui::test]

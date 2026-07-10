@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use editor::{Editor, EditorEvent};
 use fanta_doc::{
-    BoundProp, Color as FantaColor, Doc, Mode, ModeId, NodeId, Operation, VarValue, Variable,
-    VariableCollection, VariableCollectionId, VariableId, VariableType,
+    BoundProp, Color as FantaColor, Doc, Mode, ModeId, ModeScope, NodeData, NodeId, Operation,
+    VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
 };
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
-    SharedString, Subscription, Window, div, px,
+    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
+    KeyDownEvent, Render, SharedString, Subscription, Window, div, px,
 };
 use ui::{
     ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, Tooltip,
@@ -56,6 +56,7 @@ struct VariableRowSnapshot {
 
 #[derive(Debug, Clone)]
 struct CollectionSnapshot {
+    id: VariableCollectionId,
     name: SharedString,
     modes: Vec<Mode>,
     variables: Vec<VariableRowSnapshot>,
@@ -89,6 +90,23 @@ struct VariablesSnapshot {
     binding: Option<BindingSnapshot>,
 }
 
+#[derive(Debug, Clone)]
+struct ModeScopeSnapshot {
+    label: SharedString,
+    scope: ModeScope,
+    current: Option<ModeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableRenameTarget {
+    Collection(VariableCollectionId),
+    Variable(VariableId),
+    Mode {
+        collection: VariableCollectionId,
+        mode: ModeId,
+    },
+}
+
 pub struct FantaVariablesWorkspace {
     item: Entity<FigItem>,
     focus_handle: FocusHandle,
@@ -98,6 +116,8 @@ pub struct FantaVariablesWorkspace {
     value_edit_baseline: Option<VarValue>,
     value_edit_previewed: bool,
     value_editor: Entity<Editor>,
+    rename_target: Option<VariableRenameTarget>,
+    rename_editor: Entity<Editor>,
     suppress_editor_events: bool,
     error_message: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
@@ -106,6 +126,7 @@ pub struct FantaVariablesWorkspace {
 impl FantaVariablesWorkspace {
     pub fn new(item: Entity<FigItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let value_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
         let value_editor_subscription = cx.subscribe_in(
             &value_editor,
             window,
@@ -125,6 +146,7 @@ impl FantaVariablesWorkspace {
                     this.editing_cell = None;
                     this.value_edit_baseline = None;
                     this.value_edit_previewed = false;
+                    this.rename_target = None;
                 }
                 if matches!(
                     event,
@@ -136,6 +158,15 @@ impl FantaVariablesWorkspace {
                     cx.notify();
                 }
             });
+        let rename_editor_subscription = cx.subscribe_in(
+            &rename_editor,
+            window,
+            |this: &mut Self, _, event: &EditorEvent, window, cx| {
+                if matches!(event, EditorEvent::Blurred) && this.rename_target.is_some() {
+                    this.commit_rename(window, cx);
+                }
+            },
+        );
         let selected_collection = item
             .read(cx)
             .doc()
@@ -149,9 +180,15 @@ impl FantaVariablesWorkspace {
             value_edit_baseline: None,
             value_edit_previewed: false,
             value_editor,
+            rename_target: None,
+            rename_editor,
             suppress_editor_events: false,
             error_message: None,
-            _subscriptions: vec![value_editor_subscription, item_subscription],
+            _subscriptions: vec![
+                value_editor_subscription,
+                rename_editor_subscription,
+                item_subscription,
+            ],
         }
     }
 
@@ -189,6 +226,7 @@ impl FantaVariablesWorkspace {
         cx: &mut Context<Self>,
     ) {
         self.commit_value_edit_and_focus(window, cx);
+        self.commit_rename(window, cx);
         self.selected_collection = Some(collection);
         self.error_message = None;
         cx.notify();
@@ -208,6 +246,57 @@ impl FantaVariablesWorkspace {
                 false
             }
         }
+    }
+
+    fn start_rename(
+        &mut self,
+        target: VariableRenameTarget,
+        initial: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_value_edit_and_focus(window, cx);
+        self.commit_rename(window, cx);
+        self.suppress_editor_events = true;
+        self.rename_editor.update(cx, |editor, cx| {
+            editor.set_text(initial, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+        self.suppress_editor_events = false;
+        self.rename_target = Some(target);
+        self.error_message = None;
+        self.rename_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.rename_target.take() else {
+            return;
+        };
+        let new_name = self.rename_editor.read(cx).text(cx).trim().to_owned();
+        if new_name.is_empty() {
+            self.error_message = Some("Names cannot be empty".into());
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        let operation = {
+            let item = self.item.read(cx);
+            let Some(doc) = item.doc() else {
+                return;
+            };
+            rename_operation(doc, target, new_name)
+        };
+        self.apply_built_operation(operation, cx);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_target = None;
+        self.error_message = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
     }
 
     fn finish_content_preview(&self, committed: bool, cx: &mut Context<Self>) {
@@ -486,15 +575,20 @@ impl FantaVariablesWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.editing_cell.is_none() {
-            return;
-        }
         match event.keystroke.key.as_str() {
-            "enter" => {
+            "enter" if self.rename_target.is_some() => {
+                cx.stop_propagation();
+                self.commit_rename(window, cx);
+            }
+            "escape" if self.rename_target.is_some() => {
+                cx.stop_propagation();
+                self.cancel_rename(window, cx);
+            }
+            "enter" if self.editing_cell.is_some() => {
                 cx.stop_propagation();
                 self.commit_value_edit_and_focus(window, cx);
             }
-            "escape" => {
+            "escape" if self.editing_cell.is_some() => {
                 cx.stop_propagation();
                 self.cancel_value_edit(cx);
                 self.focus_handle.focus(window, cx);
@@ -527,6 +621,23 @@ impl FantaVariablesWorkspace {
                 return;
             };
             unbind_property_operation(doc, node, prop)
+        };
+        self.apply_built_operation(result, cx);
+    }
+
+    fn set_mode_scope(
+        &mut self,
+        scope: ModeScope,
+        collection: VariableCollectionId,
+        new: Option<ModeId>,
+        cx: &mut Context<Self>,
+    ) {
+        let result = {
+            let item = self.item.read(cx);
+            let Some(doc) = item.doc() else {
+                return;
+            };
+            set_active_mode_operation(doc, scope, collection, new)
         };
         self.apply_built_operation(result, cx);
     }
@@ -577,6 +688,117 @@ impl FantaVariablesWorkspace {
         .aria_label("New variable type")
     }
 
+    fn render_mode_scope_dropdown(
+        &self,
+        index: usize,
+        collection: &CollectionSnapshot,
+        scope: ModeScopeSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let inherited_label = match &scope.scope {
+            ModeScope::Doc => "Collection default",
+            ModeScope::Frame { .. } => "Inherit parent",
+        };
+        let current_name = scope
+            .current
+            .and_then(|current| {
+                collection
+                    .modes
+                    .iter()
+                    .find(|mode| mode.id == current)
+                    .map(|mode| mode.name.clone())
+            })
+            .unwrap_or_else(|| inherited_label.into());
+        let label: SharedString = format!("{} · {current_name}", scope.label).into();
+        let workspace = cx.weak_entity();
+        let collection_id = collection.id;
+        let selected = scope.current;
+        let mode_scope = scope.scope;
+        let modes = collection.modes.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let workspace_for_default = workspace.clone();
+            let default_scope = mode_scope.clone();
+            menu.push_item(
+                ContextMenuEntry::new(inherited_label)
+                    .toggleable(IconPosition::End, selected.is_none())
+                    .handler(move |_, cx| {
+                        workspace_for_default
+                            .update(cx, |workspace, cx| {
+                                workspace.set_mode_scope(
+                                    default_scope.clone(),
+                                    collection_id,
+                                    None,
+                                    cx,
+                                )
+                            })
+                            .log_err();
+                    }),
+            );
+            for mode in &modes {
+                let workspace = workspace.clone();
+                let scope = mode_scope.clone();
+                let mode_id = mode.id;
+                menu.push_item(
+                    ContextMenuEntry::new(mode.name.clone())
+                        .toggleable(IconPosition::End, selected == Some(mode_id))
+                        .handler(move |_, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.set_mode_scope(
+                                        scope.clone(),
+                                        collection_id,
+                                        Some(mode_id),
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(("fanta-variable-mode-scope", index), label, menu)
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .aria_label("Variable mode scope")
+    }
+
+    fn render_mode_scope_bar(
+        &self,
+        collection: &CollectionSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let scopes = self
+            .item
+            .read(cx)
+            .doc()
+            .map(|doc| mode_scope_snapshots(doc, collection.id))
+            .unwrap_or_default();
+        let dropdowns: Vec<AnyElement> = scopes
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                self.render_mode_scope_dropdown(index, collection, scope, window, cx)
+                    .into_any_element()
+            })
+            .collect();
+        h_flex()
+            .h(px(38.0))
+            .flex_none()
+            .px_3()
+            .gap_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                Label::new("Modes")
+                    .size(LabelSize::XSmall)
+                    .weight(gpui::FontWeight::BOLD),
+            )
+            .children(dropdowns)
+    }
+
     fn render_collections(
         &self,
         snapshot: &VariablesSnapshot,
@@ -612,6 +834,7 @@ impl FantaVariablesWorkspace {
         }
         for (index, collection) in snapshot.collections.iter().enumerate() {
             let collection_id = collection.id;
+            let collection_name = collection.name.clone();
             let selected = self.selected_collection == Some(collection_id);
             list = list.child(
                 Button::new(
@@ -621,25 +844,126 @@ impl FantaVariablesWorkspace {
                 .style(ButtonStyle::Subtle)
                 .toggle_state(selected)
                 .full_width()
-                .on_click(cx.listener(move |workspace, _, window, cx| {
-                    workspace.select_collection(collection_id, window, cx)
-                })),
+                .on_click(cx.listener(
+                    move |workspace, event: &ClickEvent, window, cx| {
+                        if event.click_count() >= 2 {
+                            workspace.start_rename(
+                                VariableRenameTarget::Collection(collection_id),
+                                collection_name.clone(),
+                                window,
+                                cx,
+                            );
+                        } else {
+                            workspace.select_collection(collection_id, window, cx);
+                        }
+                    },
+                )),
             );
         }
         list.into_any_element()
     }
 
-    fn render_table_header(&self, collection: &CollectionSnapshot) -> impl IntoElement {
+    fn render_table_header(
+        &self,
+        collection: &CollectionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let mut row = h_flex()
             .h(px(TABLE_ROW_HEIGHT))
             .flex_none()
             .border_b_1()
             .child(table_header_cell("Name", VARIABLE_NAME_WIDTH))
             .child(table_header_cell("Type", VARIABLE_TYPE_WIDTH));
-        for mode in &collection.modes {
-            row = row.child(table_header_cell(mode.name.clone(), MODE_WIDTH));
+        for (mode_index, mode) in collection.modes.iter().enumerate() {
+            let target = VariableRenameTarget::Mode {
+                collection: collection.id,
+                mode: mode.id,
+            };
+            if self.rename_target == Some(target) {
+                row = row.child(
+                    div()
+                        .w(px(MODE_WIDTH))
+                        .h(px(TABLE_ROW_HEIGHT))
+                        .flex_none()
+                        .px_1()
+                        .py_1()
+                        .border_l_1()
+                        .child(self.rename_editor.clone()),
+                );
+            } else {
+                let initial: SharedString = mode.name.clone().into();
+                row = row.child(
+                    div()
+                        .id(("fanta-variable-mode-name", mode_index))
+                        .w(px(MODE_WIDTH))
+                        .h(px(TABLE_ROW_HEIGHT))
+                        .flex_none()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .border_l_1()
+                        .border_color(cx.theme().colors().border)
+                        .cursor_text()
+                        .tooltip(Tooltip::text("Double-click to rename mode"))
+                        .on_click(cx.listener(
+                            move |workspace, event: &ClickEvent, window, cx| {
+                                if event.click_count() >= 2 {
+                                    workspace.start_rename(target, initial.clone(), window, cx);
+                                }
+                            },
+                        ))
+                        .child(
+                            Label::new(mode.name.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                );
+            }
         }
         row
+    }
+
+    fn render_variable_name_cell(
+        &self,
+        row_index: usize,
+        variable: &VariableRowSnapshot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let target = VariableRenameTarget::Variable(variable.id);
+        if self.rename_target == Some(target) {
+            return div()
+                .w(px(VARIABLE_NAME_WIDTH))
+                .h(px(TABLE_ROW_HEIGHT))
+                .flex_none()
+                .px_1()
+                .py_1()
+                .child(self.rename_editor.clone())
+                .into_any_element();
+        }
+        let initial = variable.name.clone();
+        div()
+            .id(("fanta-variable-name", row_index))
+            .w(px(VARIABLE_NAME_WIDTH))
+            .h(px(TABLE_ROW_HEIGHT))
+            .flex_none()
+            .px_2()
+            .flex()
+            .items_center()
+            .cursor_text()
+            .tooltip(Tooltip::text("Double-click to rename variable"))
+            .hover(|cell| cell.bg(cx.theme().colors().element_hover))
+            .on_click(cx.listener(move |workspace, event: &ClickEvent, window, cx| {
+                if event.click_count() >= 2 {
+                    workspace.start_rename(target, initial.clone(), window, cx);
+                }
+            }))
+            .child(
+                Label::new(variable.name.clone())
+                    .size(LabelSize::Small)
+                    .single_line(),
+            )
+            .into_any_element()
     }
 
     fn render_value_cell(
@@ -702,6 +1026,41 @@ impl FantaVariablesWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let collection_target = VariableRenameTarget::Collection(collection.id);
+        let collection_name = if self.rename_target == Some(collection_target) {
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(self.rename_editor.clone())
+                .into_any_element()
+        } else {
+            let initial = collection.name.clone();
+            v_flex()
+                .id("fanta-variable-collection-name")
+                .flex_1()
+                .min_w_0()
+                .cursor_text()
+                .tooltip(Tooltip::text("Double-click to rename collection"))
+                .on_click(cx.listener(
+                    move |workspace, event: &ClickEvent, window, cx| {
+                        if event.click_count() >= 2 {
+                            workspace.start_rename(
+                                collection_target,
+                                initial.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    },
+                ))
+                .child(Label::new(collection.name.clone()).single_line())
+                .child(
+                    Label::new(format!("{} variables", collection.variables.len()))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element()
+        };
         let toolbar = h_flex()
             .h(px(44.))
             .flex_none()
@@ -709,17 +1068,7 @@ impl FantaVariablesWorkspace {
             .gap_2()
             .border_b_1()
             .border_color(cx.theme().colors().border)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Label::new(collection.name.clone()).single_line())
-                    .child(
-                        Label::new(format!("{} variables", collection.variables.len()))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(collection_name)
             .child(self.render_variable_type_dropdown(window, cx))
             .child(
                 Button::new("fanta-variable-add-variable", "Create variable")
@@ -738,7 +1087,7 @@ impl FantaVariablesWorkspace {
             .min_w(px(VARIABLE_NAME_WIDTH
                 + VARIABLE_TYPE_WIDTH
                 + MODE_WIDTH * collection.modes.len() as f32))
-            .child(self.render_table_header(collection));
+            .child(self.render_table_header(collection, cx));
         if collection.variables.is_empty() {
             table = table.child(
                 h_flex().h(px(80.)).px_3().child(
@@ -754,7 +1103,7 @@ impl FantaVariablesWorkspace {
                     .flex_none()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(table_value_cell(variable.name.clone(), VARIABLE_NAME_WIDTH))
+                    .child(self.render_variable_name_cell(row_index, variable, cx))
                     .child(table_value_cell(
                         variable_type_label(variable.variable_type),
                         VARIABLE_TYPE_WIDTH,
@@ -772,6 +1121,7 @@ impl FantaVariablesWorkspace {
             .h_full()
             .overflow_hidden()
             .child(toolbar)
+            .child(self.render_mode_scope_bar(collection, window, cx))
             .child(
                 div()
                     .id("fanta-variable-table-scroll")
@@ -997,6 +1347,91 @@ fn variables_snapshot(doc: &Doc, selected: Option<VariableCollectionId>) -> Vari
     }
 }
 
+fn mode_scope_snapshots(
+    doc: &Doc,
+    collection: VariableCollectionId,
+) -> Vec<ModeScopeSnapshot> {
+    let mut scopes = vec![ModeScopeSnapshot {
+        label: "Project".into(),
+        scope: ModeScope::Doc,
+        current: doc.active_modes.get(&collection).copied(),
+    }];
+    let page = doc.active_page();
+    if let Some(page) = page
+        && let Some(node) = doc.scene.get(page)
+        && let NodeData::Group(group) = &node.data
+    {
+        scopes.push(ModeScopeSnapshot {
+            label: format!(
+                "Page: {}",
+                if node.name.trim().is_empty() {
+                    "Untitled"
+                } else {
+                    node.name.as_str()
+                }
+            )
+            .into(),
+            scope: ModeScope::Frame { node: page },
+            current: group.explicit_modes.get(&collection).copied(),
+        });
+    }
+    if let Some(selected) = doc.selection.anchor()
+        && Some(selected) != page
+        && let Some(node) = doc.scene.get(selected)
+        && let NodeData::Group(group) = &node.data
+    {
+        scopes.push(ModeScopeSnapshot {
+            label: format!(
+                "Container: {}",
+                if node.name.trim().is_empty() {
+                    "Untitled"
+                } else {
+                    node.name.as_str()
+                }
+            )
+            .into(),
+            scope: ModeScope::Frame { node: selected },
+            current: group.explicit_modes.get(&collection).copied(),
+        });
+    }
+    scopes
+}
+
+fn set_active_mode_operation(
+    doc: &Doc,
+    scope: ModeScope,
+    collection: VariableCollectionId,
+    new: Option<ModeId>,
+) -> Result<Option<Operation>, &'static str> {
+    let collection_data = doc
+        .variables
+        .collections
+        .get(&collection)
+        .ok_or("The collection no longer exists")?;
+    if new.is_some_and(|mode| !collection_data.has_mode(mode)) {
+        return Err("The selected mode no longer exists");
+    }
+    let old = match &scope {
+        ModeScope::Doc => doc.active_modes.get(&collection).copied(),
+        ModeScope::Frame { node } => {
+            let node = doc
+                .scene
+                .get(*node)
+                .ok_or("The mode container no longer exists")?;
+            let NodeData::Group(group) = &node.data else {
+                return Err("Only pages and containers can override modes");
+            };
+            group.explicit_modes.get(&collection).copied()
+        }
+    };
+    Ok((old != new).then_some(Operation::SetActiveMode {
+        scope,
+        collection,
+        old,
+        new,
+    }))
+}
+
 fn collection_snapshot(doc: &Doc, collection: &VariableCollection) -> CollectionSnapshot {
     let mut variable_ids = Vec::new();
     let mut included = BTreeSet::new();
@@ -1035,6 +1470,7 @@ fn collection_snapshot(doc: &Doc, collection: &VariableCollection) -> Collection
         })
         .collect();
     CollectionSnapshot {
+        id: collection.id,
         name: collection.name.clone().into(),
         modes: collection.modes.clone(),
         variables,
@@ -1106,6 +1542,67 @@ fn create_collection_operation(doc: &Doc) -> Operation {
             variable_order: Vec::new(),
         }),
     }
+}
+
+fn rename_operation(
+    doc: &Doc,
+    target: VariableRenameTarget,
+    new_name: String,
+) -> Result<Option<Operation>, &'static str> {
+    let operation = match target {
+        VariableRenameTarget::Collection(id) => {
+            let collection = doc
+                .variables
+                .collections
+                .get(&id)
+                .ok_or("The collection no longer exists")?;
+            if collection.name == new_name {
+                return Ok(None);
+            }
+            Operation::RenameVariableCollection {
+                id,
+                old: collection.name.clone(),
+                new: new_name,
+            }
+        }
+        VariableRenameTarget::Variable(id) => {
+            let variable = doc
+                .variables
+                .variables
+                .get(&id)
+                .ok_or("The variable no longer exists")?;
+            if variable.name == new_name {
+                return Ok(None);
+            }
+            Operation::RenameVariable {
+                id,
+                old: variable.name.clone(),
+                new: new_name,
+            }
+        }
+        VariableRenameTarget::Mode { collection, mode } => {
+            let collection_data = doc
+                .variables
+                .collections
+                .get(&collection)
+                .ok_or("The collection no longer exists")?;
+            let current = collection_data
+                .modes
+                .iter()
+                .find(|candidate| candidate.id == mode)
+                .ok_or("The mode no longer exists")?;
+            if current.name == new_name {
+                return Ok(None);
+            }
+            Operation::RenameMode {
+                collection,
+                mode,
+                old: current.name.clone(),
+                new: new_name,
+            }
+        }
+    };
+    Ok(Some(operation))
 }
 
 fn create_variable_operation(
@@ -1477,7 +1974,7 @@ fn table_value_cell(label: impl Into<SharedString>, width: f32) -> impl IntoElem
 mod tests {
     use super::*;
     use crate::document::ready_item_for_test;
-    use fanta_doc::{CanvasNode, NodeData, VectorNode};
+    use fanta_doc::{CanvasNode, GroupNode, NodeData, VectorNode};
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
     use settings::SettingsStore;
@@ -1544,6 +2041,92 @@ mod tests {
             doc.variables.collections[&collection].variable_order,
             vec![variable]
         );
+    }
+
+    #[test]
+    fn rename_builders_cover_collection_mode_and_variable_names() {
+        let (mut doc, collection, mode) = doc_with_collection();
+        let create = create_variable_operation(&doc, collection, VariableType::String)
+            .expect("create variable");
+        let variable = match &create {
+            Operation::CreateVariable { variable } => variable.id,
+            _ => panic!("expected variable"),
+        };
+        doc.apply(create).expect("apply variable");
+
+        for (target, expected) in [
+            (
+                VariableRenameTarget::Collection(collection),
+                "Theme collection",
+            ),
+            (
+                VariableRenameTarget::Mode { collection, mode },
+                "Dark mode",
+            ),
+            (VariableRenameTarget::Variable(variable), "surface/background"),
+        ] {
+            let operation = rename_operation(&doc, target, expected.into())
+                .expect("valid rename")
+                .expect("changed name");
+            doc.apply(operation).expect("apply rename");
+        }
+
+        assert_eq!(doc.variables.collections[&collection].name, "Theme collection");
+        assert_eq!(doc.variables.collections[&collection].modes[0].name, "Dark mode");
+        assert_eq!(doc.variables.variables[&variable].name, "surface/background");
+    }
+
+    #[test]
+    fn project_page_and_parent_mode_scopes_build_in_inheritance_order() {
+        let (mut doc, collection, default_mode) = doc_with_collection();
+        let alternate_mode = ModeId::new();
+        doc.apply(Operation::AddMode {
+            collection,
+            mode: Mode {
+                id: alternate_mode,
+                name: "Dark".into(),
+            },
+        })
+        .expect("add alternate mode");
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("create page");
+        doc.add_page(page_id);
+        let mut container = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        container.name = "Card".into();
+        container.parent = Some(page_id);
+        let container_id = container.id;
+        doc.apply(Operation::create_node(container))
+            .expect("create container");
+        doc.selection.select_only(container_id);
+
+        let project = set_active_mode_operation(
+            &doc,
+            ModeScope::Doc,
+            collection,
+            Some(default_mode),
+        )
+        .expect("project mode")
+        .expect("project change");
+        doc.apply(project).expect("apply project mode");
+        let page = set_active_mode_operation(
+            &doc,
+            ModeScope::Frame { node: page_id },
+            collection,
+            Some(alternate_mode),
+        )
+        .expect("page mode")
+        .expect("page change");
+        doc.apply(page).expect("apply page mode");
+
+        let scopes = mode_scope_snapshots(&doc, collection);
+        assert_eq!(scopes.len(), 3);
+        assert_eq!(scopes[0].current, Some(default_mode));
+        assert_eq!(scopes[1].current, Some(alternate_mode));
+        assert_eq!(scopes[2].current, None);
+        assert!(scopes[1].label.contains("Page 1"));
+        assert!(scopes[2].label.contains("Card"));
     }
 
     #[test]

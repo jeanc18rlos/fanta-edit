@@ -1622,6 +1622,24 @@ impl FantaPropertiesPanel {
                 window,
                 cx,
             ))
+            .when(editable, |section| {
+                section.child(
+                    h_flex().px_4().justify_end().child(
+                        Button::new("fanta-text-to-outlines", "Convert to outlines")
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .start_icon(
+                                Icon::new(IconName::ToolPathSelect).size(IconSize::XSmall),
+                            )
+                            .tooltip(Tooltip::text(
+                                "Replace editable text with stretchable filled vector paths",
+                            ))
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.convert_text_to_outlines(id, cx)
+                            })),
+                    ),
+                )
+            })
             .into_any_element()
     }
 

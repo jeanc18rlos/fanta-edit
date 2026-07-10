@@ -1,0 +1,31 @@
+{
+  "Frame": {
+    "prefix": ["frame", "Frame"],
+    "body": [
+      "<Frame name=\"${1:Frame}\" x={${2:0}} y={${3:0}}>",
+      "  $0",
+      "</Frame>"
+    ],
+    "description": "Create an FNX frame"
+  },
+  "Text": {
+    "prefix": ["text", "Text"],
+    "body": "<Text name=\"${1:Text}\" content=\"${2:Text}\" x={${3:0}} y={${4:0}} />$0",
+    "description": "Create an FNX text layer"
+  },
+  "Vector": {
+    "prefix": ["vector", "Vector"],
+    "body": "<Vector name=\"${1:Shape}\" fills={[{\"kind\": \"solid\", \"color\": fnxColor(\"${2:#000000}\")}]} x={${3:0}} y={${4:0}} />$0",
+    "description": "Create an FNX vector layer"
+  },
+  "Instance": {
+    "prefix": ["instance", "Instance"],
+    "body": "<Instance name=\"${1:Instance}\" component=\"${2:component-id}\" x={${3:0}} y={${4:0}} />$0",
+    "description": "Create an FNX component instance"
+  },
+  "Color": {
+    "prefix": ["color", "fnxColor"],
+    "body": "fnxColor(\"${1:#000000}\")$0",
+    "description": "Create an FNX color value"
+  }
+}

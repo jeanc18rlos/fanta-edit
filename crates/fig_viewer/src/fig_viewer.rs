@@ -5,7 +5,9 @@
 mod canvas;
 mod color_picker;
 mod comments;
+mod comments_panel;
 mod comments_ui;
+mod code_workspace;
 mod component_properties;
 mod design_panel;
 mod document;
@@ -30,6 +32,7 @@ use gpui::{App, AsyncWindowContext, Entity, WeakEntity};
 use workspace::{Panel, Workspace};
 
 pub use design_panel::FantaDesignPanel;
+pub use code_workspace::{CodeWorkspaceFile, FantaCodeWorkspace};
 pub use document::{DocChange, FigDocument, FigItem, FigItemEvent, FigPage};
 pub use editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorSessionEvent, EditorWorkspace,

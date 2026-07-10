@@ -15,7 +15,7 @@ use fanta_doc::{
     AutoLayout, AxisSizing, BlendMode, BlurKind, BoundProp, Color as FantaColor, ComponentId,
     ComponentPropId, CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode,
     NodeData, NodeFlags, NodeId, Operation, PrimaryAlign, ShadowKind, Stroke, StrokeAlign,
-    TextAlign, TextAutoResize, VAlign as TextVAlign, VarValue,
+    TextAlign, TextAutoResize, VAlign as TextVAlign, VarValue, VectorNode,
 };
 use fanta_text::TextBuffer;
 use fs::Fs;
@@ -127,6 +127,11 @@ pub struct FantaPropertiesPanel {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) fs: Arc<dyn Fs>,
     pub(crate) active_view: Option<WeakEntity<FigView>>,
+    /// Cached separately from `active_view` so a canvas event can finish an
+    /// inspector gesture while that `FigView` entity is itself being updated.
+    /// Reading the view just to recover its item in that path double-leases the
+    /// entity and panics.
+    pub(crate) active_item: Option<WeakEntity<FigItem>>,
     pub(crate) width: Option<Pixels>,
     pub(crate) field_editor: Entity<Editor>,
     pub(crate) editing_field: Option<InspectorField>,
@@ -248,6 +253,7 @@ impl FantaPropertiesPanel {
             focus_handle: cx.focus_handle(),
             fs,
             active_view: None,
+            active_item: None,
             width: None,
             field_editor,
             editing_field: None,
@@ -301,6 +307,20 @@ impl FantaPropertiesPanel {
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
                         |this, _, event: &crate::document::FigItemEvent, cx| {
+                            if matches!(
+                                event,
+                                crate::document::FigItemEvent::EditedTransient
+                                    | crate::document::FigItemEvent::TextSelectionChanged
+                            ) && (this.picker.is_some() || this.gradient_editor.is_some())
+                            {
+                                // The picker entities invalidate their own
+                                // deferred subtree. Re-rendering the parent
+                                // panel on every drag frame needlessly rebuilds
+                                // the popover anchor around that subtree and can
+                                // leave GPUI with a deferred parent node outside
+                                // the range it is trying to reuse.
+                                return;
+                            }
                             match event {
                                 crate::document::FigItemEvent::SelectionChanged => {
                                     this.reset_for_new_subject(true, cx);
@@ -318,6 +338,7 @@ impl FantaPropertiesPanel {
                             cx.notify();
                         },
                     ));
+                    self.active_item = Some(item.downgrade());
                     self.active_view = Some(view.downgrade());
                     self.editing_field = None;
                     self.field_edit_snapshot = None;
@@ -357,8 +378,8 @@ impl FantaPropertiesPanel {
         self.active_view.as_ref().and_then(|view| view.upgrade())
     }
 
-    fn active_item(&self, cx: &App) -> Option<Entity<FigItem>> {
-        Some(self.active_view(cx)?.read(cx).item().clone())
+    fn active_item(&self, _cx: &App) -> Option<Entity<FigItem>> {
+        self.active_item.as_ref()?.upgrade()
     }
 
     fn finish_content_preview(&self, committed: bool, cx: &mut Context<Self>) {
@@ -479,6 +500,30 @@ impl FantaPropertiesPanel {
         cx: &mut Context<Self>,
     ) {
         self.apply_document_ops(cx, move |doc| replace_data_operation(doc, id, mutate));
+    }
+
+    pub(crate) fn convert_text_to_outlines(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if let Some(view) = self.active_view(cx) {
+            view.update(cx, |view, cx| view.commit_text_edit(cx));
+        }
+        self.update_node_data(
+            id,
+            move |data| {
+                let NodeData::Text(text) = data else {
+                    return;
+                };
+                let Some(path) = fanta_render::text_node_outline(text) else {
+                    return;
+                };
+                let fill = Fill::solid(text.style.color);
+                *data = NodeData::Vector(VectorNode {
+                    path,
+                    fills: smallvec::smallvec![fill],
+                    ..VectorNode::default()
+                });
+            },
+            cx,
+        );
     }
 
     pub(crate) fn toggle_flag(&mut self, id: NodeId, flag: NodeFlags, cx: &mut Context<Self>) {
@@ -790,34 +835,6 @@ impl FantaPropertiesPanel {
                 .into_iter()
                 .collect()
         });
-    }
-
-    fn set_text_color(&mut self, id: NodeId, color: FantaColor, cx: &mut Context<Self>) {
-        // During active text edit with selection, apply only to the selected
-        // range (rich text). Falls back to whole-node for normal selection.
-        if self
-            .active_view
-            .as_ref()
-            .and_then(|w| w.upgrade())
-            .map_or(false, |v| {
-                v.update(cx, |view, cx| {
-                    view.with_text_selection_style(cx, |s| {
-                        s.color = color;
-                    })
-                })
-            })
-        {
-            return;
-        }
-        self.update_node_data(
-            id,
-            move |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.color = color;
-                }
-            },
-            cx,
-        );
     }
 
     pub(crate) fn toggle_text_decoration(
@@ -1442,14 +1459,17 @@ impl FantaPropertiesPanel {
         let snapshot = self.field_edit_snapshot.take();
         let text_buffer_snapshot = self.field_edit_text_buffer_snapshot.take();
         let previewed = std::mem::take(&mut self.field_edit_previewed);
-        if let Some(text_buffer_snapshot) = text_buffer_snapshot {
+        if text_buffer_snapshot.is_some() {
             // BufferEdited already left the live TextEditSession at the final
             // value. Applying the field again here would sample/replace runs a
             // second time and can collapse mixed typography.
             if previewed {
-                let committed = self
-                    .text_selection_buffer_for_field(&field, cx)
-                    .is_some_and(|buffer| buffer != text_buffer_snapshot);
+                // Do not read the active `FigView` here. Canvas clicks finish
+                // inspector gestures from inside that view's own update, and
+                // such a read would double-lease it. A previewed text-buffer
+                // edit is already staged in the live session; the snapshot's
+                // presence proves this was the selection-aware path.
+                let committed = true;
                 self.finish_content_preview(committed, cx);
             }
             cx.notify();
@@ -1727,10 +1747,12 @@ impl FantaPropertiesPanel {
         if !scrub.moved {
             return;
         }
-        if let Some(text_buffer_snapshot) = scrub.text_buffer_snapshot {
-            let committed = self
-                .text_selection_buffer_for_field(&scrub.field, cx)
-                .is_some_and(|buffer| buffer != text_buffer_snapshot);
+        if scrub.text_buffer_snapshot.is_some() {
+            // The live text buffer already contains the final scrubbed value.
+            // Avoid reading the active view while a canvas event is updating
+            // it; movement with a changed value is sufficient to decide
+            // whether this preview becomes committed state.
+            let committed = scrub.current_value != scrub.start_value;
             self.finish_content_preview(committed, cx);
             cx.notify();
             return;
@@ -1847,14 +1869,15 @@ impl FantaPropertiesPanel {
         };
         let text_buffer_snapshot = self.text_selection_buffer_for_field(&field, cx);
         let picker = cx.new(|cx| ColorPicker::new(current, window, cx));
-        let subscription = cx.subscribe(
-            &picker,
-            |this, _, event: &ColorPickerEvent, cx| match event {
-                ColorPickerEvent::Changed(color) => this.preview_picker_color(*color, cx),
-                ColorPickerEvent::Commit => this.close_color_picker(true, cx),
-                ColorPickerEvent::Cancel => this.close_color_picker(false, cx),
-            },
-        );
+        let subscription =
+            cx.subscribe(
+                &picker,
+                |this, picker, event: &ColorPickerEvent, cx| match event {
+                    ColorPickerEvent::Changed(color) => this.preview_picker_color(*color, cx),
+                    ColorPickerEvent::Commit => this.defer_close_color_picker(picker, true, cx),
+                    ColorPickerEvent::Cancel => this.defer_close_color_picker(picker, false, cx),
+                },
+            );
         // Focusing the picker would blur the canvas, and the text session
         // commits on focus-out — killing the sub-selection the picked color
         // should apply to. Keep canvas focus while a session is live (mouse
@@ -1873,6 +1896,28 @@ impl FantaPropertiesPanel {
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    fn defer_close_color_picker(
+        &self,
+        closing_picker: Entity<ColorPicker>,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            if let Err(error) =
+                this.update(cx, |this, cx| {
+                    if this.picker.as_ref().is_some_and(|session| {
+                        session.picker.entity_id() == closing_picker.entity_id()
+                    }) {
+                        this.close_color_picker(commit, cx);
+                    }
+                })
+            {
+                log::debug!("dropping deferred color-picker close: {error:#}");
+            }
+        });
     }
 
     /// Whether `field` is the glyph color of a text node with a live edit
@@ -1918,32 +1963,28 @@ impl FantaPropertiesPanel {
             return;
         };
         if session.changed {
-            let text_buffer_changed = session.text_buffer_snapshot.as_ref().and_then(|baseline| {
-                self.text_selection_buffer_for_field(&session.field, cx)
-                    .map(|buffer| buffer != *baseline)
-            });
-            if !commit && let Some(buffer) = session.text_buffer_snapshot.clone() {
-                self.restore_text_selection_buffer(&session.field, buffer, cx);
-            }
-            self.restore_snapshot_preview(&session.snapshot, cx);
-            let committed = if commit {
-                let final_color = session.picker.read(cx).color();
-                if text_buffer_changed == Some(true) {
-                    if let InspectorField::TextColor(id) = session.field {
-                        self.set_text_color(id, final_color, cx);
-                        true
-                    } else {
-                        false
-                    }
-                } else if text_buffer_changed.is_none() && final_color != session.original {
+            let selection_preview = session.text_buffer_snapshot.is_some();
+            let final_color = session.picker.read(cx).color();
+            let committed = if selection_preview {
+                if !commit && let Some(buffer) = session.text_buffer_snapshot {
+                    self.restore_text_selection_buffer(&session.field, buffer, cx);
+                }
+                // The live text session already wrote the selected runs into
+                // the document preview. Keep that preview in place on commit;
+                // restoring the node snapshot here makes the color visibly
+                // jump back until the next text edit, and was the source of
+                // the apparent lost-change behavior when another property was
+                // edited immediately afterwards.
+                commit && final_color != session.original
+            } else {
+                self.restore_snapshot_preview(&session.snapshot, cx);
+                if commit && final_color != session.original {
                     let field = session.field.clone();
                     let text = final_color.to_hex();
                     self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text))
                 } else {
                     false
                 }
-            } else {
-                false
             };
             self.finish_content_preview(committed, cx);
         }
@@ -1997,17 +2038,16 @@ impl FantaPropertiesPanel {
             return;
         };
         let editor = cx.new(|cx| GradientEditor::new(gradient.clone(), cx));
-        let subscription =
-            cx.subscribe(
-                &editor,
-                |this, _, event: &GradientEditorEvent, cx| match event {
-                    GradientEditorEvent::Changed(gradient) => {
-                        this.preview_gradient(gradient.clone(), cx)
-                    }
-                    GradientEditorEvent::Commit => this.close_gradient_editor(true, cx),
-                    GradientEditorEvent::Cancel => this.close_gradient_editor(false, cx),
-                },
-            );
+        let subscription = cx.subscribe(
+            &editor,
+            |this, editor, event: &GradientEditorEvent, cx| match event {
+                GradientEditorEvent::Changed(gradient) => {
+                    this.preview_gradient(gradient.clone(), cx)
+                }
+                GradientEditorEvent::Commit => this.defer_close_gradient_editor(editor, true, cx),
+                GradientEditorEvent::Cancel => this.defer_close_gradient_editor(editor, false, cx),
+            },
+        );
         self.gradient_editor = Some(GradientSession {
             field,
             original: gradient,
@@ -2017,6 +2057,28 @@ impl FantaPropertiesPanel {
             _subscription: subscription,
         });
         cx.notify();
+    }
+
+    fn defer_close_gradient_editor(
+        &self,
+        closing_editor: Entity<GradientEditor>,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            if let Err(error) =
+                this.update(cx, |this, cx| {
+                    if this.gradient_editor.as_ref().is_some_and(|session| {
+                        session.editor.entity_id() == closing_editor.entity_id()
+                    }) {
+                        this.close_gradient_editor(commit, cx);
+                    }
+                })
+            {
+                log::debug!("dropping deferred gradient-editor close: {error:#}");
+            }
+        });
     }
 
     fn preview_gradient(&mut self, gradient: Gradient, cx: &mut Context<Self>) {
@@ -3304,6 +3366,182 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn committing_a_text_color_picker_keeps_the_live_document_preview(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .expect("open text edit");
+
+        let picked = FantaColor::rgb(35, 120, 230);
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.toggle_color_picker(
+                    InspectorField::TextColor(text_id),
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+                let picker = panel
+                    .picker
+                    .as_ref()
+                    .expect("text color picker is open")
+                    .picker
+                    .clone();
+                picker.update(cx, |picker, cx| picker.set_test_color(picked, window, cx));
+            })
+            .expect("preview text color");
+        cx.run_until_parked();
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.close_color_picker(true, cx))
+            .expect("commit text color picker");
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .document()
+                .expect("loaded document")
+                .doc
+                .scene
+                .get(text_id)
+                .expect("text node")
+                .data
+            else {
+                panic!("expected text data");
+            };
+            assert!(!text.style_runs.is_empty());
+            assert!(text.style_runs.iter().all(|run| run.style.color == picked));
+        });
+    }
+
+    #[gpui::test]
+    async fn finishing_a_text_color_picker_from_the_canvas_view_does_not_double_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .expect("open text edit");
+
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.toggle_color_picker(
+                    InspectorField::TextColor(text_id),
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+                let picker = panel
+                    .picker
+                    .as_ref()
+                    .expect("text color picker is open")
+                    .picker
+                    .clone();
+                picker.update(cx, |picker, cx| {
+                    picker.set_test_color(FantaColor::rgb(12, 120, 240), window, cx);
+                });
+            })
+            .expect("preview text color");
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn real_text_color_drag_redraws_and_finishes_without_panicking(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .expect("open text edit");
+
+        let mut vcx = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        vcx.simulate_resize(gpui::size(px(360.), px(1600.)));
+        harness
+            .panel
+            .update(&mut vcx.cx, |panel, window, cx| {
+                panel.toggle_color_picker(
+                    InspectorField::TextColor(text_id),
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+            })
+            .expect("open text color picker");
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        let square = vcx
+            .debug_bounds("fanta-color-sv")
+            .expect("the text color picker is laid out");
+        let origin = square.center();
+        vcx.simulate_mouse_down(origin, MouseButton::Left, gpui::Modifiers::default());
+        for step in 1..=8 {
+            vcx.simulate_mouse_move(
+                origin + gpui::point(px(step as f32 * 3.), px(step as f32 * 2.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            vcx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+        }
+        vcx.simulate_mouse_up(
+            origin + gpui::point(px(24.), px(16.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        view.update(&mut vcx.cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+    }
+
+    #[gpui::test]
     async fn cancelling_a_text_color_pick_restores_the_exact_rich_text_buffer(
         cx: &mut TestAppContext,
     ) {
@@ -3522,6 +3760,94 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn changing_a_gradient_stop_color_then_dragging_the_stop_does_not_panic(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let vector_id = harness.vector_id;
+        let mut vcx = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        vcx.simulate_resize(gpui::size(px(360.), px(1600.)));
+        harness
+            .panel
+            .update(&mut vcx.cx, |panel, _, cx| {
+                panel.toggle_gradient_editor(vector_id, 0, false, linear_gradient_fill(), cx);
+            })
+            .expect("open gradient editor");
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        harness
+            .panel
+            .update(&mut vcx.cx, |panel, window, cx| {
+                let editor = panel
+                    .gradient_editor
+                    .as_ref()
+                    .expect("gradient editor remains open")
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| editor.open_stop_picker(0, window, cx));
+            })
+            .expect("open stop color picker");
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        let color_square = vcx
+            .debug_bounds("fanta-color-sv")
+            .expect("the stop color picker is laid out");
+        let color_origin = color_square.center();
+        vcx.simulate_mouse_down(color_origin, MouseButton::Left, gpui::Modifiers::default());
+        for step in 1..=6 {
+            vcx.simulate_mouse_move(
+                color_origin + gpui::point(px(step as f32 * 3.), px(step as f32 * 2.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            vcx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+        }
+        vcx.simulate_mouse_up(
+            color_origin + gpui::point(px(18.), px(12.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        let marker = vcx
+            .debug_bounds("fanta-gradient-stop-marker-0")
+            .expect("the edited gradient stop marker remains laid out");
+        let origin = marker.center();
+        vcx.simulate_mouse_down(origin, MouseButton::Left, gpui::Modifiers::default());
+        for step in 1..=8 {
+            vcx.simulate_mouse_move(
+                origin + gpui::point(px(step as f32 * 4.), px(0.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+            vcx.update(|window, cx| {
+                window.draw(cx).clear();
+            });
+        }
+        vcx.simulate_mouse_up(
+            origin + gpui::point(px(32.), px(0.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
     async fn selection_change_during_a_live_gradient_preview_does_not_panic(
         cx: &mut TestAppContext,
     ) {
@@ -3604,6 +3930,62 @@ mod panel_integration_tests {
         assert!(underline);
         assert_eq!(align, TextAlign::Justify);
         assert_eq!(auto_resize, TextAutoResize::Height);
+    }
+
+    #[gpui::test]
+    async fn converting_text_to_outlines_creates_filled_vector_and_is_undoable(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.convert_text_to_outlines(text_id, cx);
+            })
+            .expect("updating the properties panel");
+        cx.run_until_parked();
+
+        let item = harness
+            ._view
+            .read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let node = item
+                .document()
+                .expect("loaded document")
+                .doc
+                .scene
+                .get(text_id)
+                .expect("converted node remains in the scene");
+            let NodeData::Vector(vector) = &node.data else {
+                panic!("expected text to be converted to vector data");
+            };
+            assert!(
+                !vector.path.segments.is_empty(),
+                "outlined glyphs should contain path segments"
+            );
+            assert_eq!(vector.fills.as_slice(), &[Fill::solid(FantaColor::BLACK)]);
+        });
+
+        item.update(cx, |item, cx| item.undo(cx).expect("undoing conversion"));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let node = item
+                .document()
+                .expect("loaded document")
+                .doc
+                .scene
+                .get(text_id)
+                .expect("restored node remains in the scene");
+            let NodeData::Text(text) = &node.data else {
+                panic!("undo should restore text data");
+            };
+            assert_eq!(text.content, "Hello");
+            assert_eq!(text.style.color, FantaColor::BLACK);
+        });
     }
 
     #[gpui::test]

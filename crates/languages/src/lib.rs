@@ -183,6 +183,12 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             ..Default::default()
         },
         LanguageInfo {
+            name: "fnx",
+            adapters: vec![typescript_lsp_adapter.clone(), vtsls_adapter.clone()],
+            context: Some(typescript_context.clone()),
+            ..Default::default()
+        },
+        LanguageInfo {
             name: "typescript",
             adapters: vec![typescript_lsp_adapter.clone(), vtsls_adapter.clone()],
             context: Some(typescript_context.clone()),

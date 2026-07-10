@@ -8,9 +8,9 @@ use editor::{Editor, EditorEvent};
 use fanta_doc::{Color as FantaColor, Gradient, GradientStop};
 use gpui::prelude::*;
 use gpui::{
-    Anchor, App, Bounds, Context, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, Rgba,
-    Subscription, Window, canvas, div, linear_color_stop, linear_gradient, point, px,
+    App, Bounds, Context, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, Rgba, Subscription, Window,
+    canvas, div, linear_color_stop, linear_gradient, px,
 };
 use ui::Tooltip;
 use ui::prelude::*;
@@ -604,6 +604,7 @@ impl Render for ColorPicker {
         let sv_square = self.region_handlers(
             div()
                 .id("fanta-color-sv")
+                .debug_selector(|| "fanta-color-sv".to_owned())
                 .relative()
                 .w_full()
                 .h(px(132.))
@@ -685,6 +686,7 @@ impl Render for ColorPicker {
         let hue_strip = self.region_handlers(
             div()
                 .id("fanta-color-hue")
+                .debug_selector(|| "fanta-color-hue".to_owned())
                 .relative()
                 .w_full()
                 .h(px(10.))
@@ -700,6 +702,7 @@ impl Render for ColorPicker {
         let alpha_strip = self.region_handlers(
             div()
                 .id("fanta-color-alpha")
+                .debug_selector(|| "fanta-color-alpha".to_owned())
                 .relative()
                 .w_full()
                 .h(px(10.))
@@ -928,6 +931,12 @@ impl GradientEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.editing_stop == Some(index)
+            && let Some(picker) = self.stop_picker.as_ref()
+        {
+            picker.read(cx).focus_handle(cx).focus(window, cx);
+            return;
+        }
         let Some(stop) = gradient_stops(&self.gradient).get(index).copied() else {
             return;
         };
@@ -950,9 +959,9 @@ impl GradientEditor {
                             set_stop_color(&mut this.gradient, index, color);
                             this.emit_changed(cx);
                         }
-                        this.defer_close_stop_picker(cx);
+                        this.defer_close_stop_picker(picker, cx);
                     }
-                    ColorPickerEvent::Cancel => this.defer_close_stop_picker(cx),
+                    ColorPickerEvent::Cancel => this.defer_close_stop_picker(picker, cx),
                 }
             },
         );
@@ -963,11 +972,19 @@ impl GradientEditor {
         cx.notify();
     }
 
-    fn defer_close_stop_picker(&self, cx: &mut Context<Self>) {
+    fn defer_close_stop_picker(&self, closing_picker: Entity<ColorPicker>, cx: &mut Context<Self>) {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
-            this.update(cx, |this, cx| this.close_stop_picker(cx))
-                .log_err();
+            this.update(cx, |this, cx| {
+                if this
+                    .stop_picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.entity_id() == closing_picker.entity_id())
+                {
+                    this.close_stop_picker(cx);
+                }
+            })
+            .log_err();
         });
     }
 
@@ -1329,21 +1346,12 @@ impl Render for GradientEditor {
             })
             .child(self.render_stop_list(cx));
 
-        // Anchor the stop color sub-picker just to the right of the editor so
-        // both popovers stay visible at once.
+        // Keep the nested picker in the same deferred subtree as the gradient
+        // editor. A second deferred/anchored subtree can move the focused
+        // picker's dispatch node outside the editor's reused node range, which
+        // makes GPUI panic on the next redraw after a color drag.
         if let Some(picker) = &self.stop_picker {
-            body.child(
-                div().absolute().top_0().right_0().size_0().child(
-                    gpui::deferred(
-                        gpui::anchored()
-                            .anchor(Anchor::TopLeft)
-                            .snap_to_window_with_margin(px(8.))
-                            .offset(point(px(8.), px(0.)))
-                            .child(picker.clone()),
-                    )
-                    .with_priority(2),
-                ),
-            )
+            body.child(picker.clone())
         } else {
             body
         }
@@ -1550,6 +1558,54 @@ mod render_tests {
         cx.run_until_parked();
         let color = window.read_with(cx, |picker, _| picker.color()).unwrap();
         assert_eq!(color, FantaColor::rgb(0x12, 0x34, 0x56));
+    }
+
+    #[gpui::test]
+    fn stale_stop_picker_close_does_not_close_its_replacement(cx: &mut TestAppContext) {
+        init_test(cx);
+        let gradient = Gradient::Linear {
+            start: [0.0, 0.0],
+            end: [1.0, 0.0],
+            stops: vec![
+                GradientStop {
+                    position: 0.0,
+                    color: FantaColor::BLACK,
+                },
+                GradientStop {
+                    position: 1.0,
+                    color: FantaColor::WHITE,
+                },
+            ],
+        };
+        let window = cx.add_window(|_, cx| GradientEditor::new(gradient, cx));
+        let first_picker = window
+            .update(cx, |editor, window, cx| {
+                editor.open_stop_picker(0, window, cx);
+                editor
+                    .stop_picker_for_test()
+                    .expect("first stop picker is open")
+            })
+            .expect("open first stop picker");
+
+        let replacement = window
+            .update(cx, |editor, window, cx| {
+                editor.defer_close_stop_picker(first_picker.clone(), cx);
+                editor.open_stop_picker(1, window, cx);
+                editor
+                    .stop_picker_for_test()
+                    .expect("replacement stop picker is open")
+            })
+            .expect("open replacement stop picker");
+        cx.run_until_parked();
+
+        let current = window
+            .read_with(cx, |editor, _| {
+                editor
+                    .stop_picker_for_test()
+                    .expect("stale close must not dismiss replacement")
+            })
+            .expect("read gradient editor");
+        assert_eq!(current.entity_id(), replacement.entity_id());
     }
 }
 

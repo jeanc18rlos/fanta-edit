@@ -19,6 +19,10 @@ use util::ResultExt;
 
 pub fn init(cx: &mut App) {
     SnippetRegistry::init_global(cx);
+    let _fanta_snippets_registered = SnippetRegistry::global(cx)
+        .register_snippets(Path::new("fnx.json"), include_str!("fnx.json"))
+        .log_err()
+        .is_some();
     extension_snippet::init(cx);
 }
 
@@ -299,5 +303,15 @@ mod tests {
                 assert_eq!(1, provider.snippets_for(Some("ruby".to_owned()), cx).len());
             });
         });
+    }
+
+    #[test]
+    fn built_in_fnx_snippets_are_valid_and_scoped() {
+        let registry = SnippetRegistry::new();
+        registry
+            .register_snippets(Path::new("fnx.json"), include_str!("fnx.json"))
+            .expect("register FNX snippets");
+        assert_eq!(registry.get_snippets(&Some("fnx".to_owned())).len(), 5);
+        assert!(registry.get_snippets(&Some("tsx".to_owned())).is_empty());
     }
 }
