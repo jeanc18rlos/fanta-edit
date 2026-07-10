@@ -386,7 +386,11 @@ impl FantaDesignPanel {
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
                         |this, _, event: &crate::document::FigItemEvent, cx| {
-                            if !matches!(event, crate::document::FigItemEvent::EditedTransient) {
+                            if !matches!(
+                                event,
+                                crate::document::FigItemEvent::EditedTransient
+                                    | crate::document::FigItemEvent::TextSelectionChanged
+                            ) {
                                 this.rebuild_layer_rows(cx);
                                 cx.notify();
                             }
@@ -582,13 +586,19 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
-        view.update(cx, |view, cx| view.select_page(index, cx));
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+            view.select_page(index, cx);
+        });
     }
 
     fn select_node(&mut self, id: NodeId, extend: bool, cx: &mut Context<Self>) {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let item = view.read(cx).item().clone();
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
@@ -615,6 +625,9 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let item = view.read(cx).item().clone();
         let selected_page = view.read(cx).selected_page_index();
         let (page_index, current_index) = {
@@ -647,6 +660,9 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let item = view.read(cx).item().clone();
         item.update(cx, |item, cx| {
             if !item.is_editable() {
@@ -697,6 +713,9 @@ impl FantaDesignPanel {
         if !item.read(cx).is_editable() {
             return;
         }
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let Some((page_node, page_name)) = ({
             let fig_item = item.read(cx);
             fig_item.document().and_then(|document| {
@@ -752,6 +771,9 @@ impl FantaDesignPanel {
         if !item.read(cx).is_editable() {
             return;
         }
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let Some((root, snapshot)) = ({
             let fig_item = item.read(cx);
             fig_item.document().and_then(|document| {
@@ -1734,6 +1756,9 @@ impl FantaDesignPanel {
         if !item.read(cx).is_editable() {
             return;
         }
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let node = target.node();
         let old_name = item
             .read(cx)

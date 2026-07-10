@@ -6,8 +6,11 @@ mod canvas;
 mod color_picker;
 mod comments;
 mod comments_ui;
+mod component_properties;
 mod design_panel;
 mod document;
+mod editor_session;
+mod inspector_components;
 mod inspector_widgets;
 mod instance_text;
 mod panel_settings;
@@ -15,8 +18,11 @@ mod properties_ops;
 mod properties_panel;
 mod properties_render;
 mod properties_snapshot;
+mod prototype_panel;
 mod text_edit;
+mod timeline;
 mod tools;
+mod variables_workspace;
 mod view;
 mod view_text;
 
@@ -25,9 +31,19 @@ use workspace::{Panel, Workspace};
 
 pub use design_panel::FantaDesignPanel;
 pub use document::{DocChange, FigDocument, FigItem, FigItemEvent, FigPage};
+pub use editor_session::{
+    EditorMode, EditorModeTabs, EditorSession, EditorSessionEvent, EditorWorkspace,
+    EditorWorkspaceTabs,
+};
+pub use inspector_components::{InspectorMessage, InspectorPropertyRow, InspectorSectionHeader};
 pub use panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 pub use properties_panel::FantaPropertiesPanel;
+pub use prototype_panel::FantaPrototypePanel;
+pub use timeline::{
+    TimelineEvent, TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
+};
 pub use tools::ToolKind;
+pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{FigView, FigViewEvent};
 
 pub fn init(cx: &mut App) {

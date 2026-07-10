@@ -74,6 +74,7 @@ fn main() -> Result<()> {
         variables: &doc.variables,
         active_modes: &doc.active_modes,
         mode_generation: 0,
+        motion: None,
         playback: None,
         dark_ui: false,
     };

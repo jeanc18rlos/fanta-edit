@@ -22,7 +22,7 @@ use fanta_doc::{
     Color, Doc, NodeData, NodeId, Operation, Override, OverridePath, TextAlign, TextAutoResize,
     TextNode, TextStyleRun, Transform2D, VAlign, Viewport,
 };
-use fanta_text::{Caret, Selection, TextBuffer, TextStyle as EngineTextStyle};
+use fanta_text::{Caret, Selection, TextBuffer, TextError, TextStyle as EngineTextStyle};
 use glam::DVec2;
 use gpui::{Subscription, Task};
 
@@ -54,6 +54,10 @@ fn caret_visible_after(elapsed: Duration) -> bool {
 /// [`blink_reset_at`]: Self::blink_reset_at
 pub(crate) struct CanvasTextEdit {
     pub(crate) session: TextEditSession,
+    /// An inspector field can deliberately take focus while it continues to
+    /// edit this session's character selection. In that case the next focus
+    /// out must keep the session alive instead of committing it.
+    pub(crate) retain_on_next_focus_out: bool,
     /// When the current blink phase last restarted. The caret is solid for the
     /// first [`CARET_BLINK_INTERVAL`] after this instant, then alternates.
     pub(crate) blink_reset_at: Instant,
@@ -71,6 +75,7 @@ impl CanvasTextEdit {
     pub(crate) fn new(session: TextEditSession, focus_out_subscription: Subscription) -> Self {
         Self {
             session,
+            retain_on_next_focus_out: false,
             blink_reset_at: Instant::now(),
             blink_epoch: 0,
             blink_task: None,
@@ -233,8 +238,17 @@ impl TextEditSession {
         self.buffer.text()
     }
 
+    #[cfg(test)]
     pub(crate) fn text_buffer(&self) -> &fanta_text::TextBuffer {
         &self.buffer
+    }
+
+    pub(crate) fn buffer_snapshot(&self) -> TextBuffer {
+        self.buffer.clone()
+    }
+
+    pub(crate) fn restore_buffer_snapshot(&mut self, buffer: TextBuffer) {
+        self.buffer = buffer;
     }
 
     /// Whether the user changed anything since the session opened. Compared
@@ -308,6 +322,7 @@ impl TextEditSession {
 
     /// Apply a style change to the current selection (or set default for caret).
     /// This enables changing color, font, weight etc. on only the selected text.
+    #[cfg(test)]
     pub(crate) fn apply_style_to_selection(&mut self, style: EngineTextStyle) {
         // An instance override carries a single whole-node glyph color, so a
         // style change on an instance session applies to the whole node (the
@@ -323,6 +338,46 @@ impl TextEditSession {
         } else {
             self.buffer.set_default_style(style);
         }
+    }
+
+    /// Patch one typography property without replacing the other properties
+    /// carried by each selected run. A selection may span different font
+    /// sizes, weights, or colors; inspector edits must preserve those
+    /// differences unless that exact property is being changed.
+    pub(crate) fn patch_style_to_selection(
+        &mut self,
+        patch: impl Fn(&mut EngineTextStyle),
+    ) -> Result<(), TextError> {
+        if self.instance.is_some() {
+            let mut style = self.buffer.default_style().clone();
+            patch(&mut style);
+            self.buffer.set_default_style(style);
+            return Ok(());
+        }
+
+        let range = self.selected_range();
+        if range.is_empty() {
+            let mut style = self.buffer.style_at(self.caret()).clone();
+            patch(&mut style);
+            self.buffer.set_default_style(style);
+            return Ok(());
+        }
+
+        let selected_runs: Vec<_> = self
+            .buffer
+            .runs()
+            .iter()
+            .filter_map(|run| {
+                let start = run.start.max(range.start);
+                let end = run.end.min(range.end);
+                (start < end).then(|| (start..end, run.style.clone()))
+            })
+            .collect();
+        for (run_range, mut style) in selected_runs {
+            patch(&mut style);
+            self.buffer.set_style(run_range, style)?;
+        }
+        Ok(())
     }
 
     // -- selection / caret movement ----------------------------------------
@@ -365,7 +420,9 @@ impl TextEditSession {
             self.selection = Selection::caret(self.selection.start());
             return;
         }
-        let head = Caret::new(self.selection.head).move_left(self.buffer.text()).byte;
+        let head = Caret::new(self.selection.head)
+            .move_left(self.buffer.text())
+            .byte;
         self.move_to(head, extend);
     }
 
@@ -381,12 +438,16 @@ impl TextEditSession {
     }
 
     pub(crate) fn move_line_start(&mut self, extend: bool) {
-        let head = Caret::new(self.selection.head).move_home(self.buffer.text()).byte;
+        let head = Caret::new(self.selection.head)
+            .move_home(self.buffer.text())
+            .byte;
         self.move_to(head, extend);
     }
 
     pub(crate) fn move_line_end(&mut self, extend: bool) {
-        let head = Caret::new(self.selection.head).move_end(self.buffer.text()).byte;
+        let head = Caret::new(self.selection.head)
+            .move_end(self.buffer.text())
+            .byte;
         self.move_to(head, extend);
     }
 
@@ -633,9 +694,9 @@ pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
     hug_auto_resize(text);
 }
 
-/// Restore the pre-edit content (and the box size the preview re-hugged) so
-/// the committing [`Operation::ReplaceData`] drives the scene from its true
-/// old state to the final one through the history chokepoint — the same
+/// Restore the pre-edit content, rich-text styles, and box size so the
+/// committing [`Operation::ReplaceData`] drives the scene from its true old
+/// state to the final one through the history chokepoint — the same
 /// restore-then-apply staging as the select tool's move commit.
 pub(crate) fn rewind_preview(doc: &mut Doc, session: &TextEditSession) {
     if let Some(instance) = &session.instance {
@@ -654,12 +715,14 @@ pub(crate) fn rewind_preview(doc: &mut Doc, session: &TextEditSession) {
     };
     text.content = session.original.content.clone();
     text.local_size = session.original.local_size;
+    text.style = session.original.style.clone();
+    text.style_runs = session.original.style_runs.clone();
 }
 
 /// The single undoable operation committing the session, built against the
-/// REWOUND document (so `old` carries the pre-edit content while keeping any
-/// concurrent property edits). `None` when nothing changed or the node is
-/// gone.
+/// REWOUND document (so `old` carries the pre-edit text-session fields while
+/// keeping concurrent non-glyph property edits). `None` when nothing changed
+/// or the node is gone.
 pub(crate) fn commit_operation(doc: &Doc, session: &TextEditSession) -> Option<Operation> {
     if !session.is_changed() {
         return None;
@@ -784,7 +847,11 @@ fn caret_segment_core(
     screen_size: DVec2,
 ) -> Option<(DVec2, DVec2)> {
     let (x, y, height) = if text.content.is_empty() {
-        (empty_caret_x(text), 0.0, fanta_render::text_line_height(text))
+        (
+            empty_caret_x(text),
+            0.0,
+            fanta_render::text_line_height(text),
+        )
     } else {
         let [x, y, _, height] = fanta_render::text_caret_rect(text, byte);
         let height = if height > 0.0 {
@@ -817,7 +884,11 @@ fn selection_rects_core(
     }
     let dy = vertical_paint_offset(text);
     let project = |x: f64, y: f64| {
-        fanta_canvas::world_to_screen(world.transform_point(DVec2::new(x, y)), viewport, screen_size)
+        fanta_canvas::world_to_screen(
+            world.transform_point(DVec2::new(x, y)),
+            viewport,
+            screen_size,
+        )
     };
     fanta_render::text_selection_rects(text, range.start, range.end)
         .into_iter()
@@ -829,10 +900,21 @@ fn selection_rects_core(
                 project(x, y + dy + height),
             ];
             let min_x = corners.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
-            let max_x = corners.iter().map(|c| c.x).fold(f64::NEG_INFINITY, f64::max);
+            let max_x = corners
+                .iter()
+                .map(|c| c.x)
+                .fold(f64::NEG_INFINITY, f64::max);
             let min_y = corners.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
-            let max_y = corners.iter().map(|c| c.y).fold(f64::NEG_INFINITY, f64::max);
-            [min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0)]
+            let max_y = corners
+                .iter()
+                .map(|c| c.y)
+                .fold(f64::NEG_INFINITY, f64::max);
+            [
+                min_x,
+                min_y,
+                (max_x - min_x).max(0.0),
+                (max_y - min_y).max(0.0),
+            ]
         })
         .collect()
 }
@@ -869,9 +951,15 @@ fn contains_core(
     ]
     .map(|c| fanta_canvas::world_to_screen(world.transform_point(c), viewport, screen_size));
     let min_x = corners.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
-    let max_x = corners.iter().map(|c| c.x).fold(f64::NEG_INFINITY, f64::max);
+    let max_x = corners
+        .iter()
+        .map(|c| c.x)
+        .fold(f64::NEG_INFINITY, f64::max);
     let min_y = corners.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
-    let max_y = corners.iter().map(|c| c.y).fold(f64::NEG_INFINITY, f64::max);
+    let max_y = corners
+        .iter()
+        .map(|c| c.y)
+        .fold(f64::NEG_INFINITY, f64::max);
     screen.x >= min_x && screen.x <= max_x && screen.y >= min_y && screen.y <= max_y
 }
 
@@ -973,7 +1061,13 @@ pub(crate) fn session_caret_segment(
     screen_size: DVec2,
 ) -> Option<(DVec2, DVec2)> {
     match session.instance() {
-        Some(inst) => caret_segment_core(&session.live_text(), inst.world, byte, viewport, screen_size),
+        Some(inst) => caret_segment_core(
+            &session.live_text(),
+            inst.world,
+            byte,
+            viewport,
+            screen_size,
+        ),
         None => caret_screen_segment(doc, session.node_id(), byte, viewport, screen_size),
     }
 }
@@ -986,7 +1080,13 @@ pub(crate) fn session_selection_rects(
     screen_size: DVec2,
 ) -> Vec<[f64; 4]> {
     match session.instance() {
-        Some(inst) => selection_rects_core(&session.live_text(), inst.world, range, viewport, screen_size),
+        Some(inst) => selection_rects_core(
+            &session.live_text(),
+            inst.world,
+            range,
+            viewport,
+            screen_size,
+        ),
         None => selection_screen_rects(doc, session.node_id(), range, viewport, screen_size),
     }
 }
@@ -999,7 +1099,13 @@ pub(crate) fn session_byte_at_screen(
     screen_size: DVec2,
 ) -> Option<usize> {
     match session.instance() {
-        Some(inst) => Some(byte_at_core(&session.live_text(), inst.world, screen, viewport, screen_size)),
+        Some(inst) => Some(byte_at_core(
+            &session.live_text(),
+            inst.world,
+            screen,
+            viewport,
+            screen_size,
+        )),
         None => byte_at_screen(doc, session.node_id(), screen, viewport, screen_size),
     }
 }
@@ -1012,7 +1118,13 @@ pub(crate) fn session_contains_screen(
     screen_size: DVec2,
 ) -> bool {
     match session.instance() {
-        Some(inst) => contains_core(&session.live_text(), inst.world, screen, viewport, screen_size),
+        Some(inst) => contains_core(
+            &session.live_text(),
+            inst.world,
+            screen,
+            viewport,
+            screen_size,
+        ),
         None => node_contains_screen(doc, session.node_id(), screen, viewport, screen_size),
     }
 }
@@ -1130,7 +1242,8 @@ mod tests {
         }));
         let instance_id = instance.id;
         instance.transform = instance_transform;
-        doc.apply(Operation::create_node(instance)).expect("instance");
+        doc.apply(Operation::create_node(instance))
+            .expect("instance");
         doc.add_page(instance_id);
         (doc, instance_id)
     }
@@ -1303,8 +1416,7 @@ mod tests {
             zoom: 1.0,
         };
         let screen_size = DVec2::new(800.0, 600.0);
-        let to_screen =
-            |world: DVec2| fanta_canvas::world_to_screen(world, &viewport, screen_size);
+        let to_screen = |world: DVec2| fanta_canvas::world_to_screen(world, &viewport, screen_size);
 
         for local in [
             DVec2::new(80.0, 20.0),
@@ -1411,6 +1523,51 @@ mod tests {
         let caret = session.selection_typography();
         assert_ne!(caret.style.color, red);
         assert!(!caret.color_mixed);
+    }
+
+    #[test]
+    fn successive_selection_patches_preserve_prior_and_mixed_properties() {
+        let (doc, id) = doc_with_text_node("abcdef");
+        let mut session = TextEditSession::new(id, &text_node(&doc, id));
+        let red = fanta_doc::Color::rgb(255, 0, 0);
+
+        // A forward selection whose moving edge sits at a run seam used to
+        // sample the suffix style on every action. Changing size after color
+        // therefore restored the old color.
+        session.move_to(1, false);
+        session.move_to(3, true);
+        session
+            .patch_style_to_selection(|style| style.color = red)
+            .expect("patching selection color");
+        session
+            .patch_style_to_selection(|style| style.size_px = 40.0)
+            .expect("patching selection size");
+        session
+            .patch_style_to_selection(|style| style.strikethrough = true)
+            .expect("patching selection decoration");
+
+        let selected = session.text_buffer().style_at(1);
+        assert_eq!(selected.color, red);
+        assert_eq!(selected.size_px, 40.0);
+        assert!(selected.strikethrough);
+        assert_ne!(session.text_buffer().style_at(4).color, red);
+
+        // Patching one field across mixed runs must not flatten fields the
+        // user did not touch.
+        session.move_to(3, false);
+        session.move_to(5, true);
+        session
+            .patch_style_to_selection(|style| style.size_px = 18.0)
+            .expect("creating a second size run");
+        session.move_to(1, false);
+        session.move_to(5, true);
+        session
+            .patch_style_to_selection(|style| style.color = red)
+            .expect("coloring mixed-size runs");
+        assert_eq!(session.text_buffer().style_at(1).size_px, 40.0);
+        assert_eq!(session.text_buffer().style_at(3).size_px, 18.0);
+        assert_eq!(session.text_buffer().style_at(1).color, red);
+        assert_eq!(session.text_buffer().style_at(3).color, red);
     }
 
     /// A net-zero instance edit (type then delete back to the original) commits
@@ -1922,8 +2079,17 @@ mod tests {
         assert_eq!(previewed.content, "Hello world");
         assert_eq!(previewed.style.color, original_style.color); // base unchanged
         // set_style on "world" (6..11) of "Hello world" (len 11) splits into before(0..6) + selected; no after text
-        assert_eq!(previewed.style_runs.len(), 2, "runs: {:?}", previewed.style_runs);
-        let red_run = previewed.style_runs.iter().find(|r| r.style.color == red).expect("red run present");
+        assert_eq!(
+            previewed.style_runs.len(),
+            2,
+            "runs: {:?}",
+            previewed.style_runs
+        );
+        let red_run = previewed
+            .style_runs
+            .iter()
+            .find(|r| r.style.color == red)
+            .expect("red run present");
         assert_eq!(red_run.start, 6);
         assert_eq!(red_run.end, 11);
         assert_eq!(red_run.style.color, red);
@@ -1947,7 +2113,11 @@ mod tests {
         doc.apply(op).expect("apply commit");
         let committed = text_node(&doc, id);
         assert_eq!(committed.style_runs.len(), 2);
-        let red_run = committed.style_runs.iter().find(|r| r.style.color == red).expect("red run present after commit");
+        let red_run = committed
+            .style_runs
+            .iter()
+            .find(|r| r.style.color == red)
+            .expect("red run present after commit");
         assert_eq!(red_run.style.color, red);
         assert_eq!(committed.style.color, original_style.color);
     }

@@ -5,7 +5,11 @@
 
 use anyhow::Result;
 use fanta_canvas::HitPrecision;
-use fanta_doc::{NodeId, Viewport};
+use fanta_doc::{
+    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp, Easing,
+    Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, MotionTarget,
+    MotionTransform, NodeId, Operation, ResolvedVarValue, Transaction, Viewport,
+};
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
@@ -19,22 +23,34 @@ use language::Capability;
 use project::Project;
 use settings::{Settings as _, update_settings_file};
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
-use util::paths::PathExt;
+use util::{ResultExt, paths::PathExt};
 use workspace::{
     ItemSettings, Pane,
     item::{Item, ItemEvent, ProjectItem, SaveOptions, TabContentParams},
 };
 
-use crate::canvas::{CanvasElement, RenderedCanvas, bounds_size, screen_position_in_bounds};
+use crate::canvas::{
+    CanvasElement, RenderedCanvas, bounds_size, evaluated_hit_test_screen,
+    screen_position_in_bounds,
+};
 use crate::design_panel::FantaDesignPanel;
-use crate::document::{DocChange, FigItem, FigItemEvent};
+use crate::document::{DocChange, FigDocument, FigItem, FigItemEvent};
+use crate::editor_session::{
+    EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
+};
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 use crate::properties_panel::FantaPropertiesPanel;
+use crate::prototype_panel::FantaPrototypePanel;
 use crate::text_edit::CanvasTextEdit;
+use crate::timeline::{
+    TIMELINE_HEIGHT, TimelineEvent, TimelineProperty, TimelineShell, TimelineTrackViewModel,
+    TimelineViewModel,
+};
 use crate::tools::{
     TOOLBAR_GROUPS, ToolKind, ToolShell, key_event, move_event, pointer_button, press_event,
     release_event, tool_context,
 };
+use crate::variables_workspace::FantaVariablesWorkspace;
 
 #[cfg(target_os = "macos")]
 use crate::canvas::MacGpuRenderer;
@@ -168,8 +184,13 @@ pub struct FigView {
     pub(crate) item: Entity<FigItem>,
     project: Entity<Project>,
     pub(crate) focus_handle: FocusHandle,
+    editor_session: Entity<EditorSession>,
     layers_sidebar: Entity<FantaDesignPanel>,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
+    prototype_sidebar: Entity<FantaPrototypePanel>,
+    variables_workspace: Entity<FantaVariablesWorkspace>,
+    timeline_shell: Entity<TimelineShell>,
+    active_motion_clip: Option<AnimationClipId>,
     layers_sidebar_visible: bool,
     inspector_sidebar_visible: bool,
     layers_sidebar_width: Pixels,
@@ -204,6 +225,8 @@ pub struct FigView {
     /// which has no `Window`, so the session is opened on the next render.
     pending_text_edit: Option<NodeId>,
     _item_subscription: Subscription,
+    _editor_session_subscription: Subscription,
+    _timeline_subscription: Subscription,
 }
 
 pub enum FigViewEvent {
@@ -244,7 +267,17 @@ impl FigView {
                 clamp_sidebar_width(settings.default_width, SidebarKind::Inspector),
             )
         };
+        let editor_session = cx.new(|_| EditorSession::new());
+        let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
         let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
+        let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
+        let variables_workspace =
+            cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
+        let timeline_shell = cx.new(|_| TimelineShell::new());
+        let timeline_subscription =
+            cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
+                this.handle_timeline_event(*event, cx);
+            });
         let focus_handle = cx.focus_handle();
         // A space held across a focus change (panel click, window switch, a
         // text session opening) delivers its key-up elsewhere; without this
@@ -262,8 +295,13 @@ impl FigView {
             item,
             project,
             focus_handle,
+            editor_session,
             layers_sidebar,
             inspector_sidebar,
+            prototype_sidebar,
+            variables_workspace,
+            timeline_shell,
+            active_motion_clip: None,
             layers_sidebar_visible,
             inspector_sidebar_visible,
             layers_sidebar_width,
@@ -286,6 +324,8 @@ impl FigView {
             text_edit: None,
             pending_text_edit: None,
             _item_subscription: item_subscription,
+            _editor_session_subscription: editor_session_subscription,
+            _timeline_subscription: timeline_subscription,
         }
     }
 
@@ -294,6 +334,7 @@ impl FigView {
             match event {
                 FigItemEvent::Edited => {
                     this.invalidate_canvas_cache();
+                    this.sync_motion_timeline(cx);
                     this.hovered_node = None;
                     // The edit may have removed the node under the inline
                     // text editor (undo, layer delete); the overlay must not
@@ -308,7 +349,7 @@ impl FigView {
                     this.invalidate_canvas_cache();
                     cx.notify();
                 }
-                FigItemEvent::SelectionChanged => {}
+                FigItemEvent::SelectionChanged | FigItemEvent::TextSelectionChanged => {}
                 FigItemEvent::StateChanged => {
                     // The node tree may have been swapped out (disk reload)
                     // or persisted; committing the overlay's stale text into
@@ -319,6 +360,8 @@ impl FigView {
                     // A (re)loaded document restarts its scene revision
                     // counter, so cached frames keyed by revision must go.
                     this.invalidate_canvas_cache();
+                    this.active_motion_clip = None;
+                    this.sync_motion_timeline(cx);
                     // A disk reload swaps the node tree out from under the
                     // hover state and may reorder pages, so re-resolve the
                     // selected page by its root node.
@@ -360,6 +403,232 @@ impl FigView {
 
     pub fn item(&self) -> &Entity<FigItem> {
         &self.item
+    }
+
+    pub fn editor_session(&self) -> &Entity<EditorSession> {
+        &self.editor_session
+    }
+
+    pub fn editor_mode(&self, cx: &App) -> EditorMode {
+        self.editor_session.read(cx).mode()
+    }
+
+    pub fn editor_workspace(&self, cx: &App) -> EditorWorkspace {
+        self.editor_session.read(cx).workspace()
+    }
+
+    fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
+        self.inspector_sidebar
+            .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+        self.variables_workspace
+            .update(cx, |workspace, cx| workspace.finish_value_edit(cx));
+    }
+
+    fn finish_document_edits(&mut self, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
+        self.commit_text_edit(cx);
+    }
+
+    pub(crate) fn finish_document_edits_for_external_change(&mut self, cx: &mut Context<Self>) {
+        self.finish_document_edits(cx);
+    }
+
+    pub fn set_editor_workspace(&mut self, workspace: EditorWorkspace, cx: &mut Context<Self>) {
+        if self.editor_workspace(cx) == workspace {
+            return;
+        }
+        self.finish_document_edits(cx);
+        if workspace == EditorWorkspace::Variables {
+            self.timeline_shell
+                .update(cx, |timeline, cx| timeline.pause(cx));
+        }
+        self.editor_session
+            .update(cx, |session, cx| session.set_workspace(workspace, cx));
+        self.invalidate_canvas_cache();
+        cx.notify();
+    }
+
+    pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        if self.editor_mode(cx) == mode {
+            return;
+        }
+        self.finish_document_edits(cx);
+        if mode != EditorMode::Motion {
+            self.timeline_shell
+                .update(cx, |timeline, cx| timeline.pause(cx));
+        }
+        if mode != EditorMode::Design {
+            self.activate_tool(ToolKind::Select, cx);
+        }
+        self.editor_session
+            .update(cx, |session, cx| session.set_mode(mode, cx));
+        if mode == EditorMode::Motion {
+            self.sync_motion_timeline(cx);
+        }
+        self.invalidate_canvas_cache();
+        cx.notify();
+    }
+
+    pub(crate) fn motion_evaluation(
+        &self,
+        document: &FigDocument,
+        cx: &App,
+    ) -> Option<MotionEvaluation> {
+        if self.editor_mode(cx) != EditorMode::Motion {
+            return None;
+        }
+        let clip = self
+            .active_motion_clip
+            .or_else(|| document.doc.motion.clips.keys().next().copied())?;
+        let playhead_ms = self
+            .timeline_shell
+            .read(cx)
+            .playhead_us()
+            .max(0)
+            .div_euclid(1_000)
+            .min(i64::from(u32::MAX)) as u32;
+        document.doc.motion.evaluate(clip, playhead_ms)
+    }
+
+    fn handle_timeline_event(&mut self, event: TimelineEvent, cx: &mut Context<Self>) {
+        match event {
+            TimelineEvent::PlayheadChanged(_) | TimelineEvent::PlaybackChanged(_) => {
+                self.invalidate_canvas_cache();
+            }
+            TimelineEvent::CreateClip => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| view.create_motion_clip(cx))
+                        .log_err();
+                });
+            }
+            TimelineEvent::AddKeyframe(property) => {
+                let view = cx.weak_entity();
+                cx.defer(move |cx| {
+                    view.update(cx, |view, cx| view.add_motion_keyframe(property, cx))
+                        .log_err();
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn create_motion_clip(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        let clip_id = AnimationClipId::new();
+        self.active_motion_clip = Some(clip_id);
+        self.item.update(cx, |item, cx| {
+            if let Err(error) = item.apply(
+                Operation::CreateAnimationClip {
+                    clip: Box::new(AnimationClip::new(clip_id, "Animation 1", 5_000)),
+                },
+                cx,
+            ) {
+                log::error!("creating motion clip failed: {error:#}");
+            }
+        });
+        self.sync_motion_timeline(cx);
+    }
+
+    fn add_motion_keyframe(&mut self, property: TimelineProperty, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let playhead_ms = self
+            .timeline_shell
+            .read(cx)
+            .playhead_us()
+            .max(0)
+            .div_euclid(1_000)
+            .min(i64::from(u32::MAX)) as u32;
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let Some(node_id) = single_selection(&document.doc) else {
+                    return ((), DocChange::None);
+                };
+                let Some(node) = motion_source_node(&document.doc, node_id) else {
+                    return ((), DocChange::None);
+                };
+                let motion_property = motion_property(property);
+                let Some(value) = motion_value(&node, motion_property) else {
+                    return ((), DocChange::None);
+                };
+                let target = MotionTarget::new(node_id, motion_property);
+                let Some(clip) = document.doc.motion.clip(clip_id) else {
+                    return ((), DocChange::None);
+                };
+                let time_ms = playhead_ms.min(clip.duration_ms);
+                let mut transaction = Transaction::new("Add Keyframe");
+                let track_id = if let Some(track) = clip.track_for_target(target) {
+                    track.id
+                } else {
+                    let track_id = AnimationTrackId::new();
+                    transaction.push(Operation::SetAnimationTrack {
+                        clip: clip_id,
+                        track: track_id,
+                        old: None,
+                        new: Some(Box::new(AnimationTrack::new(track_id, target))),
+                    });
+                    track_id
+                };
+                let existing = clip
+                    .tracks
+                    .get(&track_id)
+                    .and_then(|track| {
+                        track
+                            .keyframes
+                            .values()
+                            .find(|keyframe| keyframe.time_ms == time_ms)
+                    })
+                    .cloned();
+                let keyframe_id = existing
+                    .as_ref()
+                    .map(|keyframe| keyframe.id)
+                    .unwrap_or_else(KeyframeId::new);
+                transaction.push(Operation::SetKeyframe {
+                    clip: clip_id,
+                    track: track_id,
+                    target,
+                    keyframe: keyframe_id,
+                    old: existing,
+                    new: Some(Keyframe {
+                        id: keyframe_id,
+                        time_ms,
+                        value,
+                        interpolation: Interpolation::Linear,
+                        easing: Easing::EaseInOut,
+                    }),
+                });
+                match document.doc.apply_transaction(transaction) {
+                    Ok(()) => ((), DocChange::Content),
+                    Err(error) => {
+                        log::error!("adding motion keyframe failed: {error:#}");
+                        ((), DocChange::None)
+                    }
+                }
+            });
+        });
+        self.sync_motion_timeline(cx);
+    }
+
+    fn sync_motion_timeline(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = self.item.read(cx).document() else {
+            return;
+        };
+        if self
+            .active_motion_clip
+            .is_none_or(|clip| document.doc.motion.clip(clip).is_none())
+        {
+            self.active_motion_clip = document.doc.motion.clips.keys().next().copied();
+        }
+        let model = motion_timeline_model(&document.doc, self.active_motion_clip);
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.set_model(model, cx));
     }
 
     pub fn selected_page_index(&self) -> Option<usize> {
@@ -525,6 +794,9 @@ impl FigView {
         let Some(viewport) = self.viewport else {
             return;
         };
+        if self.handle_motion_selection_event(event, viewport, cx) {
+            return;
+        }
         let editable = self.is_editable(cx);
         if !editable && self.tools.kind() != ToolKind::Hand {
             self.handle_read_only_event(event, cx);
@@ -612,6 +884,62 @@ impl FigView {
         }
     }
 
+    fn handle_motion_selection_event(
+        &mut self,
+        event: ToolEvent,
+        viewport: Viewport,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let ToolEvent::Pointer(fanta_tools::PointerEvent::Press {
+            screen,
+            button: ToolButton::Primary,
+            modifiers,
+            ..
+        }) = event
+        else {
+            return false;
+        };
+        if self.editor_mode(cx) != EditorMode::Motion || self.tools.kind() != ToolKind::Select {
+            return false;
+        }
+        let Some(bounds) = self.container_bounds else {
+            return false;
+        };
+        let hit = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document() else {
+                return false;
+            };
+            let Some(evaluation) = self.motion_evaluation(document, cx) else {
+                return false;
+            };
+            let (width, height) = bounds_size(bounds);
+            evaluated_hit_test_screen(
+                &document.doc.scene,
+                &evaluation,
+                &viewport,
+                DVec2::new(width, height),
+                DVec2::new(screen[0], screen[1]),
+                HitPrecision::Path,
+                document.doc.active_page(),
+            )
+        };
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                match hit {
+                    Some(node) if modifiers.extend_selection() => {
+                        document.doc.selection.toggle(node)
+                    }
+                    Some(node) => document.doc.selection.select_only(node),
+                    None if !modifiers.extend_selection() => document.doc.selection.clear(),
+                    None => {}
+                }
+                ((), DocChange::Selection)
+            });
+        });
+        true
+    }
+
     /// Read-only documents still support click selection so the properties
     /// and layers panels stay useful before a project exists.
     fn handle_read_only_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
@@ -661,9 +989,9 @@ impl FigView {
             self.comment_state.draft = None;
             self.comment_state.hovered_pin = None;
         }
-        // Switching tools (toolbar click) while typing ends the session the
-        // way any click-away does.
-        self.commit_text_edit(cx);
+        // Switching tools is a document edit boundary for every inspector and
+        // inline session, not only text.
+        self.finish_document_edits(cx);
         let Some((bounds, viewport)) = self.container_bounds.zip(self.viewport) else {
             self.tools.activate_without_context(kind);
             self.remember_tool_face(kind);
@@ -735,6 +1063,9 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Left {
+            self.finish_panel_edits(cx);
+        }
         // While a text session is live, a left press inside the edited node
         // repositions the caret (double-click selects the word, shift
         // extends, and a drag from here selects); a press outside commits
@@ -754,6 +1085,7 @@ impl FigView {
         // selection through the tool; this press is consumed here.
         if event.button == MouseButton::Left
             && event.click_count == 2
+            && self.editor_mode(cx) == EditorMode::Design
             && self.tools.kind() == ToolKind::Select
             && self.is_editable(cx)
             && let Some(bounds) = self.container_bounds
@@ -964,14 +1296,26 @@ impl FigView {
         let hovered = {
             let item = self.item.read(cx);
             item.document().and_then(|document| {
-                fanta_canvas::hit_test_screen(
-                    &document.doc.scene,
-                    &viewport,
-                    DVec2::new(width, height),
-                    screen,
-                    HitPrecision::Bounds,
-                    document.doc.active_page(),
-                )
+                if let Some(evaluation) = self.motion_evaluation(document, cx) {
+                    evaluated_hit_test_screen(
+                        &document.doc.scene,
+                        &evaluation,
+                        &viewport,
+                        DVec2::new(width, height),
+                        screen,
+                        HitPrecision::Bounds,
+                        document.doc.active_page(),
+                    )
+                } else {
+                    fanta_canvas::hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        DVec2::new(width, height),
+                        screen,
+                        HitPrecision::Bounds,
+                        document.doc.active_page(),
+                    )
+                }
             })
         };
         if hovered != self.hovered_node {
@@ -1079,6 +1423,7 @@ impl FigView {
         if !self.is_editable(cx) {
             return;
         }
+        self.finish_document_edits(cx);
         self.item.update(cx, |item, cx| {
             if let Err(error) = item.undo(cx) {
                 log::error!("fig_viewer undo failed: {error:#}");
@@ -1090,6 +1435,7 @@ impl FigView {
         if !self.is_editable(cx) {
             return;
         }
+        self.finish_document_edits(cx);
         self.item.update(cx, |item, cx| {
             if let Err(error) = item.redo(cx) {
                 log::error!("fig_viewer redo failed: {error:#}");
@@ -1136,6 +1482,7 @@ impl FigView {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
         if self.text_edit.is_some() {
             self.commit_text_edit(cx);
             return;
@@ -1160,12 +1507,14 @@ impl FigView {
         cx: &mut Context<Self>,
     ) {
         if self.is_editable(cx) {
+            self.finish_document_edits(cx);
             self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
         }
     }
 
     fn nudge(&mut self, key: LogicalKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_editable(cx) {
+            self.finish_document_edits(cx);
             self.dispatch_tool_event(key_event(key, window.modifiers()), cx);
         }
     }
@@ -1175,7 +1524,7 @@ impl FigView {
     pub fn select_page(&mut self, index: usize, cx: &mut Context<Self>) {
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
-        self.commit_text_edit(cx);
+        self.finish_document_edits(cx);
         let root = self
             .item
             .update(cx, |item, cx| {
@@ -1205,7 +1554,7 @@ impl FigView {
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<std::path::PathBuf>>> {
         // Persist committed state, not a transient preview mid-session.
-        self.commit_text_edit(cx);
+        self.finish_document_edits(cx);
         self.item.update(cx, |item, cx| item.save(cx))
     }
 
@@ -1286,6 +1635,18 @@ impl FigView {
     }
 
     fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mode = self.editor_mode(cx);
+        let view = cx.weak_entity();
+        let tabs = EditorModeTabs::new(mode, move |mode, _, cx| {
+            view.update(cx, |view, cx| view.set_editor_mode(mode, cx))
+                .log_err();
+        });
+        let body = match mode {
+            EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
+            EditorMode::Design | EditorMode::Motion => {
+                self.inspector_sidebar.clone().into_any_element()
+            }
+        };
         div()
             .id("fanta-inspector-sidebar")
             .relative()
@@ -1294,8 +1655,31 @@ impl FigView {
             .flex_shrink_0()
             .border_l_1()
             .border_color(cx.theme().colors().border)
-            .child(self.inspector_sidebar.clone())
+            .child(
+                v_flex()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(tabs)
+                    .child(div().flex_1().min_h_0().child(body)),
+            )
             .child(self.render_sidebar_resize_handle(SidebarKind::Inspector))
+            .into_any_element()
+    }
+
+    fn render_workspace_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let workspace = self.editor_workspace(cx);
+        let view = cx.weak_entity();
+        let tabs = EditorWorkspaceTabs::new(workspace, move |workspace, _, cx| {
+            view.update(cx, |view, cx| view.set_editor_workspace(workspace, cx))
+                .log_err();
+        });
+        h_flex()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .justify_center()
+            .child(div().w(px(220.)).occlude().child(tabs))
             .into_any_element()
     }
 
@@ -1359,7 +1743,11 @@ impl FigView {
 
         h_flex()
             .absolute()
-            .bottom_4()
+            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
+                TIMELINE_HEIGHT + px(16.)
+            } else {
+                px(16.)
+            })
             .left_0()
             .right_0()
             .justify_center()
@@ -1593,6 +1981,8 @@ impl Render for FigView {
         };
         let has_error = snapshot.error.is_some();
         let is_loading = snapshot.loading_message.is_some();
+        let editor_mode = self.editor_mode(cx);
+        let editor_workspace = self.editor_workspace(cx);
         let cursor_style = match &self.text_edit {
             // The I-beam over the edited text, an arrow elsewhere — clicking
             // away commits.
@@ -1743,6 +2133,11 @@ impl Render for FigView {
                 )
             })
             .when(!has_error && !is_loading, |this| {
+                if editor_workspace == EditorWorkspace::Variables {
+                    return this
+                        .child(self.variables_workspace.clone())
+                        .child(self.render_workspace_tabs(cx));
+                }
                 this.child(
                     h_flex()
                         .size_full()
@@ -1752,46 +2147,63 @@ impl Render for FigView {
                                 .then(|| self.render_layers_sidebar(cx)),
                         )
                         .child(
-                            div()
-                                .id("fig-container")
+                            v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .size_full()
+                                .h_full()
                                 .overflow_hidden()
-                                .relative()
-                                .cursor(cursor_style)
-                                .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-                                .on_pinch(cx.listener(Self::handle_pinch))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::handle_mouse_down),
+                                .child(
+                                    div()
+                                        .id("fig-container")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .w_full()
+                                        .overflow_hidden()
+                                        .relative()
+                                        .cursor(cursor_style)
+                                        .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+                                        .on_pinch(cx.listener(Self::handle_pinch))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(Self::handle_mouse_down),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Middle,
+                                            cx.listener(Self::handle_mouse_down),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(Self::handle_mouse_up),
+                                        )
+                                        .on_mouse_up(
+                                            MouseButton::Middle,
+                                            cx.listener(Self::handle_mouse_up),
+                                        )
+                                        .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                                        .children({
+                                            // Paint order = z-order: the rendered scene
+                                            // surface goes on the BOTTOM, and the text-edit
+                                            // overlay (caret bar + selection highlight) on
+                                            // TOP — otherwise the opaque canvas covers the
+                                            // caret/selection and they never show.
+                                            let mut c: Vec<AnyElement> = vec![];
+                                            c.push(
+                                                CanvasElement::new(cx.entity()).into_any_element(),
+                                            );
+                                            if let Some(ov) = self.render_text_edit_overlay(cx) {
+                                                c.push(ov);
+                                            }
+                                            if let Some(comments) = self.render_comment_overlay(cx)
+                                            {
+                                                c.push(comments);
+                                            }
+                                            c
+                                        }),
                                 )
-                                .on_mouse_down(
-                                    MouseButton::Middle,
-                                    cx.listener(Self::handle_mouse_down),
-                                )
-                                .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-                                .on_mouse_up(
-                                    MouseButton::Middle,
-                                    cx.listener(Self::handle_mouse_up),
-                                )
-                                .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                                .children({
-                                    // Paint order = z-order: the rendered scene
-                                    // surface goes on the BOTTOM, and the text-edit
-                                    // overlay (caret bar + selection highlight) on
-                                    // TOP — otherwise the opaque canvas covers the
-                                    // caret/selection and they never show.
-                                    let mut c: Vec<AnyElement> = vec![];
-                                    c.push(CanvasElement::new(cx.entity()).into_any_element());
-                                    if let Some(ov) = self.render_text_edit_overlay(cx) {
-                                        c.push(ov);
-                                    }
-                                    if let Some(comments) = self.render_comment_overlay(cx) {
-                                        c.push(comments);
-                                    }
-                                    c
-                                }),
+                                .children(
+                                    (editor_mode == EditorMode::Motion)
+                                        .then(|| self.timeline_shell.clone()),
+                                ),
                         )
                         .children(
                             self.inspector_sidebar_visible
@@ -1799,8 +2211,122 @@ impl Render for FigView {
                         ),
                 )
                 .child(self.render_tool_pill(cx))
+                .child(self.render_workspace_tabs(cx))
             })
     }
+}
+
+fn single_selection(doc: &fanta_doc::Doc) -> Option<NodeId> {
+    let mut selection = doc.selection.iter().copied();
+    let node = selection.next()?;
+    selection.next().is_none().then_some(node)
+}
+
+fn motion_property(property: TimelineProperty) -> MotionProperty {
+    match property {
+        TimelineProperty::PositionX => MotionProperty::PositionX,
+        TimelineProperty::PositionY => MotionProperty::PositionY,
+        TimelineProperty::Rotation => MotionProperty::Rotation,
+        TimelineProperty::Opacity => MotionProperty::bound(BoundProp::Opacity),
+        TimelineProperty::FillColor => MotionProperty::bound(BoundProp::FillColor { index: 0 }),
+    }
+}
+
+fn motion_value(
+    node: &fanta_doc::CanvasNode,
+    property: MotionProperty,
+) -> Option<ResolvedVarValue> {
+    match property {
+        MotionProperty::Bound { prop } => prop.read_resolved(node),
+        MotionProperty::PositionX
+        | MotionProperty::PositionY
+        | MotionProperty::Rotation
+        | MotionProperty::ScaleX
+        | MotionProperty::ScaleY => {
+            let transform = MotionTransform::decompose(node.transform)?;
+            let value = match property {
+                MotionProperty::PositionX => transform.position[0],
+                MotionProperty::PositionY => transform.position[1],
+                MotionProperty::Rotation => transform.rotation_radians,
+                MotionProperty::ScaleX => transform.scale[0],
+                MotionProperty::ScaleY => transform.scale[1],
+                MotionProperty::Bound { .. } => return None,
+            };
+            Some(ResolvedVarValue::Float { value })
+        }
+    }
+}
+
+fn motion_source_node(doc: &fanta_doc::Doc, node_id: NodeId) -> Option<fanta_doc::CanvasNode> {
+    let mut node = doc.scene.get(node_id)?.clone();
+    for (property, variable) in node.bindings.clone() {
+        if let Some(value) = fanta_doc::resolve_bound_value(
+            &doc.variables,
+            &doc.scene,
+            node_id,
+            &doc.active_modes,
+            variable,
+        ) {
+            property.apply_resolved(&mut node, value);
+        }
+    }
+    Some(node)
+}
+
+fn motion_property_label(property: MotionProperty) -> &'static str {
+    match property {
+        MotionProperty::PositionX => "Position X",
+        MotionProperty::PositionY => "Position Y",
+        MotionProperty::Rotation => "Rotation",
+        MotionProperty::ScaleX => "Scale X",
+        MotionProperty::ScaleY => "Scale Y",
+        MotionProperty::Bound {
+            prop: BoundProp::Opacity,
+        } => "Opacity",
+        MotionProperty::Bound {
+            prop: BoundProp::FillColor { .. },
+        } => "Fill color",
+        MotionProperty::Bound { .. } => "Property",
+    }
+}
+
+fn motion_timeline_model(
+    doc: &fanta_doc::Doc,
+    clip_id: Option<AnimationClipId>,
+) -> TimelineViewModel {
+    let Some(clip) = clip_id.and_then(|clip| doc.motion.clip(clip)) else {
+        return TimelineViewModel::empty();
+    };
+    let tracks = clip
+        .tracks
+        .values()
+        .map(|track| {
+            let node_name = doc
+                .scene
+                .get(track.target.node)
+                .map(|node| node.name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("Layer");
+            TimelineTrackViewModel {
+                id: track.id.to_string().into(),
+                label: format!(
+                    "{node_name} · {}",
+                    motion_property_label(track.target.property)
+                )
+                .into(),
+                keyframes_us: track
+                    .keyframes
+                    .values()
+                    .map(|keyframe| i64::from(keyframe.time_ms) * 1_000)
+                    .collect(),
+            }
+        })
+        .collect();
+    TimelineViewModel::for_clip(
+        clip.name.clone(),
+        i64::from(clip.duration_ms) * 1_000,
+        tracks,
+    )
 }
 
 impl Item for FigView {
@@ -1914,6 +2440,7 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        self.finish_document_edits(cx);
         self.item.update(cx, |item, cx| item.reload_from_disk(cx))
     }
 
@@ -1939,16 +2466,40 @@ impl Item for FigView {
         let inspector_sidebar_visible = self.inspector_sidebar_visible;
         let layers_sidebar_width = self.layers_sidebar_width;
         let inspector_sidebar_width = self.inspector_sidebar_width;
+        let editor_mode = self.editor_mode(cx);
+        let editor_workspace = self.editor_workspace(cx);
+        let active_motion_clip = self.active_motion_clip;
+        let timeline_model = self.timeline_shell.read(cx).view_model().clone();
         Task::ready(Some(cx.new(|cx| {
             let item_subscription = Self::subscribe_to_item(&item, cx);
+            let editor_session =
+                cx.new(|_| EditorSession::with_state(editor_mode, editor_workspace));
+            let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
             let (layers_sidebar, inspector_sidebar) =
                 Self::new_embedded_sidebars(&project, window, cx);
+            let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
+            let variables_workspace =
+                cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
+            let timeline_shell = cx.new(|cx| {
+                let mut timeline = TimelineShell::new();
+                timeline.set_model(timeline_model, cx);
+                timeline
+            });
+            let timeline_subscription =
+                cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
+                    this.handle_timeline_event(*event, cx);
+                });
             Self {
                 item,
                 project,
                 focus_handle: cx.focus_handle(),
+                editor_session,
                 layers_sidebar,
                 inspector_sidebar,
+                prototype_sidebar,
+                variables_workspace,
+                timeline_shell,
+                active_motion_clip,
                 layers_sidebar_visible,
                 inspector_sidebar_visible,
                 layers_sidebar_width,
@@ -1964,13 +2515,15 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 gpu_renderer: None,
                 tools: ToolShell::new(),
-            comment_state: crate::comments_ui::CommentState::default(),
+                comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
                 fonts_prewarmed: false,
                 hovered_node: None,
                 text_edit: None,
                 pending_text_edit: None,
                 _item_subscription: item_subscription,
+                _editor_session_subscription: editor_session_subscription,
+                _timeline_subscription: timeline_subscription,
             }
         })))
     }
@@ -2056,7 +2609,12 @@ fn zoom_viewport_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{CanvasNode, GroupNode, NodeData, Operation};
+    use std::collections::BTreeMap;
+
+    use fanta_doc::{
+        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, VarValue, Variable,
+        VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode,
+    };
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
@@ -2121,6 +2679,130 @@ mod tests {
         assert!((panned.center[0] - (10.0 - 15.0)).abs() < 1e-9);
         assert!((panned.center[1] - (20.0 + 5.0)).abs() < 1e-9);
         assert!((panned.zoom - viewport.zoom).abs() < 1e-9);
+    }
+
+    #[test]
+    fn motion_values_are_sampled_from_authored_node_state() {
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Color::rgb(12, 34, 56),
+        )));
+        node.transform = fanta_doc::Transform2D::translation(12.0, 34.0);
+
+        assert_eq!(
+            motion_value(&node, MotionProperty::PositionX),
+            Some(ResolvedVarValue::Float { value: 12.0 })
+        );
+        assert_eq!(
+            motion_value(
+                &node,
+                MotionProperty::bound(BoundProp::FillColor { index: 0 })
+            ),
+            Some(ResolvedVarValue::Color {
+                value: Color::rgb(12, 34, 56)
+            })
+        );
+    }
+
+    #[test]
+    fn motion_keyframes_sample_the_variable_resolved_value() {
+        let collection_id = VariableCollectionId::new();
+        let mode_id = ModeId::new();
+        let variable_id = VariableId::new();
+        let mut doc = fanta_doc::Doc::new();
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".to_owned(),
+                modes: vec![Mode {
+                    id: mode_id,
+                    name: "Default".to_owned(),
+                }],
+                default_mode: mode_id,
+                variable_order: vec![variable_id],
+            },
+        );
+        doc.variables.variables.insert(
+            variable_id,
+            Variable {
+                id: variable_id,
+                collection: collection_id,
+                name: "Accent".to_owned(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([(
+                    mode_id,
+                    VarValue::Color {
+                        value: Color::rgb(255, 0, 0),
+                    },
+                )]),
+                scopes: Vec::new(),
+            },
+        );
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Color::WHITE,
+        )));
+        node.bindings
+            .insert(BoundProp::FillColor { index: 0 }, variable_id);
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create bound node");
+
+        let resolved = motion_source_node(&doc, node_id).expect("resolved node");
+        assert_eq!(
+            motion_value(
+                &resolved,
+                MotionProperty::bound(BoundProp::FillColor { index: 0 })
+            ),
+            Some(ResolvedVarValue::Color {
+                value: Color::rgb(255, 0, 0)
+            })
+        );
+    }
+
+    #[test]
+    fn timeline_model_projects_engine_milliseconds_to_ui_microseconds() {
+        let mut doc = fanta_doc::Doc::new();
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Color::WHITE,
+        )));
+        node.name = "Star".to_owned();
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create motion target");
+
+        let clip_id = AnimationClipId::new();
+        let track_id = AnimationTrackId::new();
+        let mut track = AnimationTrack::new(
+            track_id,
+            MotionTarget::new(node_id, MotionProperty::PositionX),
+        );
+        let keyframe_id = KeyframeId::new();
+        track.keyframes.insert(
+            keyframe_id,
+            Keyframe::new(keyframe_id, 250, ResolvedVarValue::Float { value: 10.0 }),
+        );
+        let mut clip = AnimationClip::new(clip_id, "Entrance", 1_500);
+        clip.tracks.insert(track_id, track);
+        doc.motion.clips.insert(clip_id, clip);
+
+        let model = motion_timeline_model(&doc, Some(clip_id));
+        assert_eq!(model.clip_name.as_deref(), Some("Entrance"));
+        assert_eq!(model.duration_us, 1_500_000);
+        assert_eq!(model.tracks.len(), 1);
+        assert_eq!(model.tracks[0].label.as_ref(), "Star · Position X");
+        assert_eq!(model.tracks[0].keyframes_us, [250_000]);
     }
 
     #[gpui::test]

@@ -17,6 +17,9 @@ use smallvec::SmallVec;
 use ui::prelude::*;
 
 use crate::color_picker::GradientKind;
+use crate::component_properties::{
+    can_create_variant_property, component_binding_candidates, component_property_accepts_binding,
+};
 use crate::document::FigDocument;
 use crate::inspector_widgets::AlignGlyph;
 use crate::properties_ops::format_number;
@@ -333,6 +336,28 @@ pub(crate) const AXIS_SIZINGS: [(AxisSizing, &str); 2] = [
     (AxisSizing::Hug, "Hug contents"),
 ];
 
+pub(crate) const LAYOUT_CHILD_RESIZES: [(bool, &str); 2] =
+    [(false, "Fixed width"), (true, "Fill container")];
+
+pub(crate) const STACKING_ORDERS: [(bool, &str); 2] =
+    [(false, "Last on top"), (true, "First on top")];
+
+pub(crate) const TEXT_RESIZE_MODES: [(TextAutoResize, &str); 3] = [
+    (TextAutoResize::None, "Fixed"),
+    (TextAutoResize::WidthAndHeight, "Auto width"),
+    (TextAutoResize::Height, "Auto height"),
+];
+
+pub(crate) const SHADOW_KINDS: [(ShadowKind, &str); 2] = [
+    (ShadowKind::Drop, "Drop shadow"),
+    (ShadowKind::Inner, "Inner shadow"),
+];
+
+pub(crate) const BLUR_KINDS: [(BlurKind, &str); 2] = [
+    (BlurKind::Layer, "Layer blur"),
+    (BlurKind::Background, "Background blur"),
+];
+
 pub(crate) const BLEND_MODES: [(BlendMode, &str); 16] = [
     (BlendMode::Normal, "Normal"),
     (BlendMode::Multiply, "Multiply"),
@@ -363,37 +388,6 @@ pub(crate) const FONT_WEIGHTS: [(u16, &str); 6] = [
     (700, "Bold"),
     (800, "ExtraBold"),
 ];
-
-pub(crate) fn text_resize_label(resize: TextAutoResize) -> &'static str {
-    match resize {
-        TextAutoResize::None => "Fixed",
-        TextAutoResize::WidthAndHeight => "Auto width",
-        TextAutoResize::Height => "Auto height",
-    }
-}
-
-pub(crate) fn blur_kind_label(kind: BlurKind) -> &'static str {
-    match kind {
-        BlurKind::Layer => "Layer blur",
-        BlurKind::Background => "Background blur",
-    }
-}
-
-pub(crate) fn next_text_resize(resize: TextAutoResize) -> TextAutoResize {
-    match resize {
-        TextAutoResize::None => TextAutoResize::WidthAndHeight,
-        TextAutoResize::WidthAndHeight => TextAutoResize::Height,
-        TextAutoResize::Height => TextAutoResize::None,
-    }
-}
-
-pub(crate) fn stacking_label(reverse_z: bool) -> &'static str {
-    if reverse_z {
-        "First on top"
-    } else {
-        "Last on top"
-    }
-}
 
 /// The paint types the fill/stroke type selector offers, in cycle order.
 pub(crate) const PAINT_KINDS: [PaintKind; 5] = [
@@ -511,6 +505,9 @@ pub(crate) struct NodeSection {
     pub(crate) image_fit: Option<ImageFitMode>,
     pub(crate) instance: Option<InstanceSection>,
     pub(crate) master: Option<MasterSection>,
+    /// Component-property bindings offered when this node is a descendant of a
+    /// component master. Root selection uses `master` for schema authoring.
+    pub(crate) component_binding: Option<ComponentBindingSection>,
     pub(crate) effects: Vec<EffectSnapshot>,
     pub(crate) blurs: Vec<BlurSnapshot>,
     pub(crate) reactions: Vec<SharedString>,
@@ -573,14 +570,15 @@ pub(crate) struct InstanceTextSnapshot {
 }
 
 /// The master-side component info, shown when the selected node is the root of
-/// a [`ComponentDef`]. Read-only: editing the schema or the variant set needs
-/// `SetComponentProps` / `SetComponentSet` sub-editors (deferred).
+/// a [`ComponentDef`].
 pub(crate) struct MasterSection {
+    pub(crate) id: ComponentId,
     pub(crate) name: SharedString,
     /// `Some` when the master belongs to a component set: the set's name, axes,
     /// and this member's value on each axis.
     pub(crate) variant_set: Option<VariantSetSnapshot>,
     pub(crate) props: Vec<PropSchemaSnapshot>,
+    pub(crate) can_create_variant: bool,
 }
 
 pub(crate) struct VariantSetSnapshot {
@@ -601,11 +599,31 @@ pub(crate) struct PropSchemaSnapshot {
     pub(crate) name: SharedString,
     pub(crate) kind: SharedString,
     pub(crate) default: SharedString,
+    pub(crate) bindings: usize,
+}
+
+pub(crate) struct ComponentBindingSection {
+    pub(crate) component: ComponentId,
+    pub(crate) fields: Vec<ComponentBindingFieldSnapshot>,
+}
+
+pub(crate) struct ComponentBindingFieldSnapshot {
+    pub(crate) prop: BoundProp,
+    pub(crate) label: SharedString,
+    pub(crate) current: Option<ComponentBindingPropertySnapshot>,
+    pub(crate) choices: Vec<ComponentBindingPropertySnapshot>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ComponentBindingPropertySnapshot {
+    pub(crate) id: ComponentPropId,
+    pub(crate) name: SharedString,
 }
 
 pub(crate) struct VariantAxisSnapshot {
     pub(crate) axis: SharedString,
     pub(crate) value: SharedString,
+    pub(crate) options: Vec<SharedString>,
 }
 
 pub(crate) struct ComponentPropSnapshot {
@@ -753,7 +771,10 @@ pub(crate) struct NodeSnapshot {
 // Snapshot construction
 // =============================================================================
 
-pub(crate) fn page_section(document: &FigDocument, selected_page_index: Option<usize>) -> PageSection {
+pub(crate) fn page_section(
+    document: &FigDocument,
+    selected_page_index: Option<usize>,
+) -> PageSection {
     let page = document.page(selected_page_index);
     let root = page.and_then(|page| page.root);
     let doc = &document.doc;
@@ -872,6 +893,7 @@ pub(crate) fn node_section(
         },
         instance: instance_section(doc, node),
         master: master_id.and_then(|component| master_section(doc, component)),
+        component_binding: component_binding_section(doc, id, masters),
         effects: node
             .effects
             .iter()
@@ -1047,6 +1069,7 @@ pub(crate) fn instance_section(doc: &Doc, node: &CanvasNode) -> Option<InstanceS
             variants.push(VariantAxisSnapshot {
                 axis: axis.name.clone().into(),
                 value: value.into(),
+                options: axis.values.iter().cloned().map(Into::into).collect(),
             });
         }
     }
@@ -1127,6 +1150,7 @@ pub(crate) fn master_section(doc: &Doc, component: ComponentId) -> Option<Master
         })
     });
     Some(MasterSection {
+        id: component,
         name: def.name.clone().into(),
         variant_set,
         props: def
@@ -1136,9 +1160,61 @@ pub(crate) fn master_section(doc: &Doc, component: ComponentId) -> Option<Master
                 name: prop.name.clone().into(),
                 kind: prop_kind_label(&prop.kind).into(),
                 default: prop_default_label(&prop.default).into(),
+                bindings: prop.bindings.len(),
             })
             .collect(),
+        can_create_variant: can_create_variant_property(doc, component),
     })
+}
+
+fn component_binding_section(
+    doc: &Doc,
+    node_id: NodeId,
+    masters: &HashMap<NodeId, ComponentId>,
+) -> Option<ComponentBindingSection> {
+    let component = doc
+        .scene
+        .ancestors_of(node_id)
+        .find_map(|ancestor| masters.get(&ancestor.id).copied())?;
+    let definition = doc.components.def(component)?;
+    let node = doc.scene.get(node_id)?;
+    let path = fanta_doc::def_local_path(&doc.scene, definition.root, node_id);
+    let fields: Vec<ComponentBindingFieldSnapshot> = component_binding_candidates(node)
+        .into_iter()
+        .filter_map(|candidate| {
+            let choices: Vec<ComponentBindingPropertySnapshot> = definition
+                .props
+                .iter()
+                .filter(|property| {
+                    component_property_accepts_binding(&property.kind, candidate.prop)
+                })
+                .map(|property| ComponentBindingPropertySnapshot {
+                    id: property.id,
+                    name: property.name.clone().into(),
+                })
+                .collect();
+            if choices.is_empty() {
+                return None;
+            }
+            let current = definition.props.iter().find_map(|property| {
+                property
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.path == path && binding.prop == candidate.prop)
+                    .then(|| ComponentBindingPropertySnapshot {
+                        id: property.id,
+                        name: property.name.clone().into(),
+                    })
+            });
+            Some(ComponentBindingFieldSnapshot {
+                prop: candidate.prop,
+                label: candidate.label.into(),
+                current,
+                choices,
+            })
+        })
+        .collect();
+    (!fields.is_empty()).then_some(ComponentBindingSection { component, fields })
 }
 
 pub(crate) fn prop_kind_label(kind: &ComponentPropKind) -> String {
@@ -1669,22 +1745,6 @@ pub(crate) mod tests {
         assert_eq!(
             clamp_field_value(&InspectorField::BlurRadius { id, index: 0 }, -8.0),
             0.0
-        );
-    }
-
-    #[test]
-    fn text_resize_cycle_is_total() {
-        assert_eq!(
-            next_text_resize(TextAutoResize::None),
-            TextAutoResize::WidthAndHeight
-        );
-        assert_eq!(
-            next_text_resize(TextAutoResize::WidthAndHeight),
-            TextAutoResize::Height
-        );
-        assert_eq!(
-            next_text_resize(TextAutoResize::Height),
-            TextAutoResize::None
         );
     }
 

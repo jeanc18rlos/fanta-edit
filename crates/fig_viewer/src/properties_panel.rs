@@ -12,11 +12,12 @@ use anyhow::Result;
 use editor::{Editor, EditorEvent, actions::SelectAll};
 use fanta_canvas::{Axis, HAlign, VAlign, align_horizontal, align_vertical, distribute};
 use fanta_doc::{
-    AutoLayout, AxisSizing, BlendMode, BlurKind, Color as FantaColor, ComponentPropId,
-    CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode, NodeData, NodeFlags,
-    NodeId, Operation, PrimaryAlign, ShadowKind, Stroke, StrokeAlign, TextAlign,
-    VAlign as TextVAlign, VarValue,
+    AutoLayout, AxisSizing, BlendMode, BlurKind, BoundProp, Color as FantaColor, ComponentId,
+    ComponentPropId, CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode,
+    NodeData, NodeFlags, NodeId, Operation, PrimaryAlign, ShadowKind, Stroke, StrokeAlign,
+    TextAlign, TextAutoResize, VAlign as TextVAlign, VarValue,
 };
+use fanta_text::TextBuffer;
 use fs::Fs;
 use gpui::{
     App, AsyncWindowContext, Bounds, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
@@ -24,33 +25,36 @@ use gpui::{
     actions, px,
 };
 use settings::{Settings as _, update_settings_file};
-use ui::prelude::*;
 use ui::Divider;
+use ui::prelude::*;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
 use crate::color_picker::{ColorPicker, ColorPickerEvent, GradientEditor, GradientEditorEvent};
+use crate::component_properties::{
+    CreateComponentPropertyKind, create_component_property_operations,
+    set_component_property_binding_operations,
+};
 use crate::document::{DocChange, FigItem};
 use crate::inspector_widgets::{PanelDrag, TextDecorationGlyph, scrub_value, track_value};
 use crate::panel_settings::FantaPropertiesPanelSettings;
-use crate::view::FigView;
 use crate::properties_ops::{
-    ExportJob, add_fill, apply_preview_operation, blurs_operations,
-    combine_as_variants_operations, convert_paint_kind, default_blur, default_shadow,
-    detach_instance_operations, effects_operations, field_operations,
-    finite_transform_operations, format_number, paint_slot_mut, parse_number, read_field_text,
-    remove_fill,
-    replace_data_operation, restore_snapshot, run_png_export, set_paint_gradient,
-    stroke_list_mut, variant_cycle_operations,
+    ExportJob, add_fill, apply_preview_operation, blurs_operations, combine_as_variants_operations,
+    convert_paint_kind, default_blur, default_shadow, detach_instance_operations,
+    effects_operations, field_operations, finite_transform_operations, format_number,
+    paint_slot_mut, parse_number, read_field_text, remove_fill, replace_data_operation,
+    restore_snapshot, run_png_export, set_paint_gradient, stroke_list_mut,
+    variant_select_operations,
 };
 use crate::properties_snapshot::{
     AlignCommand, HiddenPaintAlpha, InspectorBody, InspectorField, InspectorSnapshot, NodeKind,
     NodeSnapshot, PaintKey, PaintKind, clamp_field_value, field_node, master_roots, multi_section,
-    next_text_resize, node_section, opaque_paint_alpha, page_section, paint_alpha,
-    paint_alpha_is_visible, paired_field, set_paint_alpha, zeroed_paint_alpha,
+    node_section, opaque_paint_alpha, page_section, paint_alpha, paint_alpha_is_visible,
+    paired_field, set_paint_alpha, zeroed_paint_alpha,
 };
+use crate::view::FigView;
 
 actions!(
     fanta_properties_panel,
@@ -91,6 +95,10 @@ pub(crate) struct ScrubState {
     start_value: f64,
     current_value: f64,
     moved: bool,
+    /// The live rich-text buffer at gesture start when this scrub targets a
+    /// character selection. Such scrubs preview through the text session, not
+    /// by replacing the whole text node's data.
+    text_buffer_snapshot: Option<TextBuffer>,
 }
 
 /// An open color-picker popover bound to one color field.
@@ -98,6 +106,7 @@ pub(crate) struct PickerSession {
     pub(crate) field: InspectorField,
     original: FantaColor,
     snapshot: NodeSnapshot,
+    text_buffer_snapshot: Option<TextBuffer>,
     changed: bool,
     pub(crate) picker: Entity<ColorPicker>,
     _subscription: Subscription,
@@ -121,6 +130,13 @@ pub struct FantaPropertiesPanel {
     pub(crate) width: Option<Pixels>,
     pub(crate) field_editor: Entity<Editor>,
     pub(crate) editing_field: Option<InspectorField>,
+    /// Baseline for the shared inline editor's transient BufferEdited previews.
+    /// Restored before the final operation so the whole typing gesture creates
+    /// one undo entry.
+    pub(crate) field_edit_snapshot: Option<NodeSnapshot>,
+    pub(crate) field_edit_text_buffer_snapshot: Option<TextBuffer>,
+    pub(crate) field_edit_previewed: bool,
+    pub(crate) suppress_field_editor_events: bool,
     /// Scroll state of the section stack. Reset whenever the inspected
     /// subject changes: a shorter inspector would otherwise keep the previous
     /// subject's offset and show blank space past its content.
@@ -218,10 +234,14 @@ impl FantaPropertiesPanel {
         subscriptions.push(cx.subscribe_in(
             &field_editor,
             window,
-            |this: &mut Self, _, event: &EditorEvent, _window, cx| {
-                if matches!(event, EditorEvent::Blurred) && this.editing_field.is_some() {
-                    this.stop_editing(cx);
+            |this: &mut Self, _, event: &EditorEvent, _window, cx| match event {
+                EditorEvent::BufferEdited if this.editing_field.is_some() => {
+                    this.preview_editing(cx);
                 }
+                EditorEvent::Blurred if this.editing_field.is_some() => {
+                    this.commit_editing_value(cx);
+                }
+                _ => {}
             },
         ));
         let mut this = Self {
@@ -231,6 +251,10 @@ impl FantaPropertiesPanel {
             width: None,
             field_editor,
             editing_field: None,
+            field_edit_snapshot: None,
+            field_edit_text_buffer_snapshot: None,
+            field_edit_previewed: false,
+            suppress_field_editor_events: false,
             content_scroll: ScrollHandle::new(),
             corner_radii_expanded: None,
             scrub: None,
@@ -281,6 +305,7 @@ impl FantaPropertiesPanel {
                                 crate::document::FigItemEvent::SelectionChanged => {
                                     this.reset_for_new_subject(true, cx);
                                 }
+                                crate::document::FigItemEvent::TextSelectionChanged => {}
                                 crate::document::FigItemEvent::StateChanged => {
                                     // The document may have been replaced from
                                     // disk; a stale snapshot restore would
@@ -295,6 +320,9 @@ impl FantaPropertiesPanel {
                     ));
                     self.active_view = Some(view.downgrade());
                     self.editing_field = None;
+                    self.field_edit_snapshot = None;
+                    self.field_edit_text_buffer_snapshot = None;
+                    self.field_edit_previewed = false;
                     self.scrub = None;
                     self.picker = None;
                     self.gradient_editor = None;
@@ -316,6 +344,7 @@ impl FantaPropertiesPanel {
     /// gesture-start state first (safe while the document is unchanged; not
     /// safe across a reload, where the snapshot would resurrect stale data).
     fn reset_for_new_subject(&mut self, restore_previews: bool, cx: &mut Context<Self>) {
+        self.abandon_editing(restore_previews, cx);
         self.cancel_scrub(restore_previews, cx);
         self.abandon_color_picker(restore_previews, cx);
         self.abandon_gradient_editor(restore_previews, cx);
@@ -332,7 +361,22 @@ impl FantaPropertiesPanel {
         Some(self.active_view(cx)?.read(cx).item().clone())
     }
 
+    fn finish_content_preview(&self, committed: bool, cx: &mut Context<Self>) {
+        if let Some(item) = self.active_item(cx) {
+            item.update(cx, |item, cx| {
+                item.finish_content_preview(committed, cx);
+            });
+        }
+    }
+
     // === Mutations ========================================================
+
+    pub(crate) fn finish_continuous_edits(&mut self, cx: &mut Context<Self>) {
+        self.commit_editing_value(cx);
+        self.finish_scrub(cx);
+        self.close_color_picker(true, cx);
+        self.close_gradient_editor(true, cx);
+    }
 
     /// Build operations against the current document and apply them through
     /// the item so undo history and dirty tracking stay correct.
@@ -345,33 +389,35 @@ impl FantaPropertiesPanel {
         &mut self,
         cx: &mut Context<Self>,
         build: impl FnOnce(&Doc) -> Vec<Operation>,
-    ) {
+    ) -> bool {
+        self.finish_continuous_edits(cx);
         let Some(item) = self.active_item(cx) else {
-            return;
+            return false;
         };
         let operations = {
             let item_state = item.read(cx);
             if !item_state.is_editable() {
-                return;
+                return false;
             }
             let Some(document) = item_state.document() else {
-                return;
+                return false;
             };
             finite_transform_operations(build(&document.doc))
         };
         match operations.len() {
-            0 => {}
-            1 => {
-                item.update(cx, |item, cx| {
-                    for operation in operations {
-                        if let Err(error) = item.apply(operation, cx) {
-                            log::error!(
-                                "Fanta properties panel failed to apply operation: {error:#}"
-                            );
-                        }
+            0 => false,
+            1 => item.update(cx, |item, cx| {
+                let mut applied = false;
+                for operation in operations {
+                    match item.apply(operation, cx) {
+                        Ok(()) => applied = true,
+                        Err(error) => log::error!(
+                            "Fanta properties panel failed to apply operation: {error:#}"
+                        ),
                     }
-                });
-            }
+                }
+                applied
+            }),
             _ => self.apply_document_transaction(&item, operations, cx),
         }
     }
@@ -384,7 +430,7 @@ impl FantaPropertiesPanel {
         item: &Entity<FigItem>,
         operations: Vec<Operation>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let label = operations
             .first()
             .map(|operation| operation.label().to_string())
@@ -405,7 +451,8 @@ impl FantaPropertiesPanel {
             if applied.is_none() {
                 log::debug!("dropping inspector edit: the document is not ready");
             }
-        });
+            applied.is_some()
+        })
     }
 
     pub(crate) fn apply_align(&mut self, command: AlignCommand, cx: &mut Context<Self>) {
@@ -447,7 +494,12 @@ impl FantaPropertiesPanel {
         });
     }
 
-    pub(crate) fn set_blend_mode(&mut self, id: NodeId, blend_mode: BlendMode, cx: &mut Context<Self>) {
+    pub(crate) fn set_blend_mode(
+        &mut self,
+        id: NodeId,
+        blend_mode: BlendMode,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_document_ops(cx, move |doc| {
             let Some(node) = doc.scene.get(id) else {
                 return Vec::new();
@@ -490,7 +542,13 @@ impl FantaPropertiesPanel {
             .retain(|key, _| !(key.id == id && key.is_stroke == is_stroke));
     }
 
-    pub(crate) fn remove_paint(&mut self, id: NodeId, index: usize, is_stroke: bool, cx: &mut Context<Self>) {
+    pub(crate) fn remove_paint(
+        &mut self,
+        id: NodeId,
+        index: usize,
+        is_stroke: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.forget_hidden_paint_alpha(id, is_stroke);
         self.update_node_data(
             id,
@@ -578,11 +636,21 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn set_font_weight(&mut self, id: NodeId, weight: u16, cx: &mut Context<Self>) {
+        self.finish_continuous_edits(cx);
         // During active text edit with selection, apply only to the selected
         // range (rich text support via the live TextBuffer in the session).
-        if self.active_view.as_ref().and_then(|w| w.upgrade()).map_or(false, |v| {
-            v.update(cx, |view, cx| view.with_text_selection_style(cx, |s| { s.weight = weight; }))
-        }) {
+        if self
+            .active_view
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map_or(false, |v| {
+                v.update(cx, |view, cx| {
+                    view.with_text_selection_style(cx, |s| {
+                        s.weight = weight;
+                    })
+                })
+            })
+        {
             return;
         }
         self.update_node_data(
@@ -651,6 +719,58 @@ impl FantaPropertiesPanel {
         })
     }
 
+    fn text_selection_buffer_for_field(
+        &self,
+        field: &InspectorField,
+        cx: &App,
+    ) -> Option<TextBuffer> {
+        let id = match field {
+            InspectorField::FontFamily(id)
+            | InspectorField::FontSize(id)
+            | InspectorField::LineHeight(id)
+            | InspectorField::LetterSpacing(id)
+            | InspectorField::TextColor(id) => *id,
+            _ => return None,
+        };
+        self.active_view
+            .as_ref()
+            .and_then(|view| view.upgrade())?
+            .read(cx)
+            .text_selection_buffer(id)
+    }
+
+    fn restore_text_selection_buffer(
+        &self,
+        field: &InspectorField,
+        buffer: TextBuffer,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(id) = field_node(field) else {
+            return false;
+        };
+        if let Some(view) = self.active_view.as_ref().and_then(|view| view.upgrade()) {
+            return view.update(cx, |view, cx| {
+                view.restore_text_selection_buffer(id, buffer, cx)
+            });
+        }
+        false
+    }
+
+    fn retain_text_selection_on_next_focus_out(
+        &self,
+        field: &InspectorField,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = field_node(field) else {
+            return;
+        };
+        if let Some(view) = self.active_view.as_ref().and_then(|view| view.upgrade()) {
+            view.update(cx, |view, _| {
+                view.retain_text_selection_on_next_focus_out(id);
+            });
+        }
+    }
+
     pub(crate) fn toggle_comment_resolved(
         &mut self,
         page: NodeId,
@@ -675,9 +795,18 @@ impl FantaPropertiesPanel {
     fn set_text_color(&mut self, id: NodeId, color: FantaColor, cx: &mut Context<Self>) {
         // During active text edit with selection, apply only to the selected
         // range (rich text). Falls back to whole-node for normal selection.
-        if self.active_view.as_ref().and_then(|w| w.upgrade()).map_or(false, |v| {
-            v.update(cx, |view, cx| view.with_text_selection_style(cx, |s| { s.color = color; }))
-        }) {
+        if self
+            .active_view
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map_or(false, |v| {
+                v.update(cx, |view, cx| {
+                    view.with_text_selection_style(cx, |s| {
+                        s.color = color;
+                    })
+                })
+            })
+        {
             return;
         }
         self.update_node_data(
@@ -697,18 +826,22 @@ impl FantaPropertiesPanel {
         decoration: TextDecorationGlyph,
         cx: &mut Context<Self>,
     ) {
+        self.finish_continuous_edits(cx);
         // Apply only to selection if text editing with active selection.
-        if self.active_view.as_ref().and_then(|w| w.upgrade()).map_or(false, |v| {
-            v.update(cx, |view, cx| {
-                view.with_text_selection_style(cx, |s| {
-                    match decoration {
+        if self
+            .active_view
+            .as_ref()
+            .and_then(|w| w.upgrade())
+            .map_or(false, |v| {
+                v.update(cx, |view, cx| {
+                    view.with_text_selection_style(cx, |s| match decoration {
                         TextDecorationGlyph::Italic => s.italic = !s.italic,
                         TextDecorationGlyph::Underline => s.underline = !s.underline,
                         TextDecorationGlyph::Strikethrough => s.strikethrough = !s.strikethrough,
-                    }
+                    })
                 })
             })
-        }) {
+        {
             return;
         }
         self.update_node_data(
@@ -739,7 +872,12 @@ impl FantaPropertiesPanel {
         );
     }
 
-    pub(crate) fn set_text_vertical_align(&mut self, id: NodeId, align: TextVAlign, cx: &mut Context<Self>) {
+    pub(crate) fn set_text_vertical_align(
+        &mut self,
+        id: NodeId,
+        align: TextVAlign,
+        cx: &mut Context<Self>,
+    ) {
         self.update_node_data(
             id,
             move |data| {
@@ -751,19 +889,29 @@ impl FantaPropertiesPanel {
         );
     }
 
-    pub(crate) fn cycle_text_resize(&mut self, id: NodeId, cx: &mut Context<Self>) {
+    pub(crate) fn set_text_resize(
+        &mut self,
+        id: NodeId,
+        auto_resize: TextAutoResize,
+        cx: &mut Context<Self>,
+    ) {
         self.update_node_data(
             id,
-            |data| {
+            move |data| {
                 if let NodeData::Text(text) = data {
-                    text.auto_resize = next_text_resize(text.auto_resize);
+                    text.auto_resize = auto_resize;
                 }
             },
             cx,
         );
     }
 
-    pub(crate) fn set_stroke_align(&mut self, id: NodeId, align: StrokeAlign, cx: &mut Context<Self>) {
+    pub(crate) fn set_stroke_align(
+        &mut self,
+        id: NodeId,
+        align: StrokeAlign,
+        cx: &mut Context<Self>,
+    ) {
         self.update_node_data(
             id,
             move |data| {
@@ -793,14 +941,17 @@ impl FantaPropertiesPanel {
         });
     }
 
-    pub(crate) fn toggle_effect_kind(&mut self, id: NodeId, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn set_effect_kind(
+        &mut self,
+        id: NodeId,
+        index: usize,
+        kind: ShadowKind,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_document_ops(cx, move |doc| {
             effects_operations(doc, id, |effects| {
                 if let Some(shadow) = effects.get_mut(index) {
-                    shadow.kind = match shadow.kind {
-                        ShadowKind::Drop => ShadowKind::Inner,
-                        ShadowKind::Inner => ShadowKind::Drop,
-                    };
+                    shadow.kind = kind;
                 }
             })
         });
@@ -822,7 +973,13 @@ impl FantaPropertiesPanel {
         });
     }
 
-    pub(crate) fn set_blur_kind(&mut self, id: NodeId, index: usize, kind: BlurKind, cx: &mut Context<Self>) {
+    pub(crate) fn set_blur_kind(
+        &mut self,
+        id: NodeId,
+        index: usize,
+        kind: BlurKind,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_document_ops(cx, move |doc| {
             blurs_operations(doc, id, |blurs| {
                 if let Some(blur) = blurs.get_mut(index) {
@@ -877,15 +1034,30 @@ impl FantaPropertiesPanel {
         );
     }
 
-    pub(crate) fn set_layout_direction(&mut self, id: NodeId, mode: LayoutMode, cx: &mut Context<Self>) {
+    pub(crate) fn set_layout_direction(
+        &mut self,
+        id: NodeId,
+        mode: LayoutMode,
+        cx: &mut Context<Self>,
+    ) {
         self.update_auto_layout(id, move |layout| layout.mode = mode, cx);
     }
 
-    pub(crate) fn set_primary_align(&mut self, id: NodeId, align: PrimaryAlign, cx: &mut Context<Self>) {
+    pub(crate) fn set_primary_align(
+        &mut self,
+        id: NodeId,
+        align: PrimaryAlign,
+        cx: &mut Context<Self>,
+    ) {
         self.update_auto_layout(id, |layout| layout.primary_align = align, cx);
     }
 
-    pub(crate) fn set_counter_align(&mut self, id: NodeId, align: CounterAlign, cx: &mut Context<Self>) {
+    pub(crate) fn set_counter_align(
+        &mut self,
+        id: NodeId,
+        align: CounterAlign,
+        cx: &mut Context<Self>,
+    ) {
         self.update_auto_layout(id, |layout| layout.counter_align = align, cx);
     }
 
@@ -915,11 +1087,21 @@ impl FantaPropertiesPanel {
         );
     }
 
-    pub(crate) fn set_primary_axis_sizing(&mut self, id: NodeId, sizing: AxisSizing, cx: &mut Context<Self>) {
+    pub(crate) fn set_primary_axis_sizing(
+        &mut self,
+        id: NodeId,
+        sizing: AxisSizing,
+        cx: &mut Context<Self>,
+    ) {
         self.update_auto_layout(id, move |layout| layout.primary_sizing = sizing, cx);
     }
 
-    pub(crate) fn set_counter_axis_sizing(&mut self, id: NodeId, sizing: AxisSizing, cx: &mut Context<Self>) {
+    pub(crate) fn set_counter_axis_sizing(
+        &mut self,
+        id: NodeId,
+        sizing: AxisSizing,
+        cx: &mut Context<Self>,
+    ) {
         self.update_auto_layout(id, move |layout| layout.counter_sizing = sizing, cx);
     }
 
@@ -927,8 +1109,13 @@ impl FantaPropertiesPanel {
         self.update_auto_layout(id, |layout| layout.wrap = !layout.wrap, cx);
     }
 
-    pub(crate) fn toggle_layout_stacking(&mut self, id: NodeId, cx: &mut Context<Self>) {
-        self.update_auto_layout(id, |layout| layout.reverse_z = !layout.reverse_z, cx);
+    pub(crate) fn set_layout_stacking(
+        &mut self,
+        id: NodeId,
+        reverse_z: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_auto_layout(id, move |layout| layout.reverse_z = reverse_z, cx);
     }
 
     pub(crate) fn toggle_clip_content(&mut self, id: NodeId, cx: &mut Context<Self>) {
@@ -974,6 +1161,19 @@ impl FantaPropertiesPanel {
         });
     }
 
+    pub(crate) fn set_layout_child_fill(
+        &mut self,
+        id: NodeId,
+        fills_container: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_layout_child(
+            id,
+            move |child| child.grow = if fills_container { 1.0 } else { 0.0 },
+            cx,
+        );
+    }
+
     pub(crate) fn set_image_fit(&mut self, id: NodeId, fit: ImageFitMode, cx: &mut Context<Self>) {
         self.update_node_data(
             id,
@@ -1008,9 +1208,45 @@ impl FantaPropertiesPanel {
         });
     }
 
-    pub(crate) fn cycle_variant_axis(&mut self, id: NodeId, axis: SharedString, cx: &mut Context<Self>) {
+    pub(crate) fn create_component_property(
+        &mut self,
+        component: ComponentId,
+        kind: CreateComponentPropertyKind,
+        cx: &mut Context<Self>,
+    ) {
         self.apply_document_ops(cx, move |doc| {
-            variant_cycle_operations(doc, id, axis.as_ref())
+            create_component_property_operations(doc, component, kind)
+        });
+    }
+
+    pub(crate) fn set_component_property_binding(
+        &mut self,
+        component: ComponentId,
+        target_node: NodeId,
+        target_prop: BoundProp,
+        property: Option<ComponentPropId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_document_ops(cx, move |doc| {
+            set_component_property_binding_operations(
+                doc,
+                component,
+                target_node,
+                target_prop,
+                property,
+            )
+        });
+    }
+
+    pub(crate) fn select_variant_axis(
+        &mut self,
+        id: NodeId,
+        axis: SharedString,
+        value: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_document_ops(cx, move |doc| {
+            variant_select_operations(doc, id, axis.as_ref(), value.as_ref())
         });
     }
 
@@ -1167,36 +1403,115 @@ impl FantaPropertiesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editing_field = Some(field);
+        self.finish_continuous_edits(cx);
+        self.finish_content_preview(true, cx);
+        let snapshot = self.snapshot_for_field(&field, cx);
+        let text_buffer_snapshot = self.text_selection_buffer_for_field(&field, cx);
+        if text_buffer_snapshot.is_some() {
+            self.retain_text_selection_on_next_focus_out(&field, cx);
+        }
+        self.suppress_field_editor_events = true;
         self.field_editor.update(cx, |editor, cx| {
             editor.set_text(initial, window, cx);
             editor.select_all(&SelectAll, window, cx);
         });
+        self.suppress_field_editor_events = false;
+        self.field_edit_snapshot = snapshot;
+        self.field_edit_text_buffer_snapshot = text_buffer_snapshot;
+        self.field_edit_previewed = false;
+        self.editing_field = Some(field);
         self.field_editor.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    fn stop_editing(&mut self, cx: &mut Context<Self>) {
-        self.editing_field = None;
-        cx.notify();
-    }
-
     fn cancel_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.stop_editing(cx);
+        self.abandon_editing(true, cx);
         self.focus_handle.focus(window, cx);
     }
 
     fn commit_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_editing_value(cx);
+        self.focus_handle.focus(window, cx);
+    }
+
+    fn commit_editing_value(&mut self, cx: &mut Context<Self>) {
         let Some(field) = self.editing_field.take() else {
             return;
         };
         let text = self.field_editor.read(cx).text(cx);
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-        if self.try_apply_text_selection_field(&field, text.trim(), cx) {
+        let snapshot = self.field_edit_snapshot.take();
+        let text_buffer_snapshot = self.field_edit_text_buffer_snapshot.take();
+        let previewed = std::mem::take(&mut self.field_edit_previewed);
+        if let Some(text_buffer_snapshot) = text_buffer_snapshot {
+            // BufferEdited already left the live TextEditSession at the final
+            // value. Applying the field again here would sample/replace runs a
+            // second time and can collapse mixed typography.
+            if previewed {
+                let committed = self
+                    .text_selection_buffer_for_field(&field, cx)
+                    .is_some_and(|buffer| buffer != text_buffer_snapshot);
+                self.finish_content_preview(committed, cx);
+            }
+            cx.notify();
             return;
         }
-        self.apply_document_ops(cx, |doc| field_operations(doc, &field, text.trim()));
+        if previewed && let Some(snapshot) = snapshot {
+            self.restore_snapshot_preview(&snapshot, cx);
+        }
+        cx.notify();
+        let committed = if self.try_apply_text_selection_field(&field, text.trim(), cx) {
+            true
+        } else {
+            self.apply_document_ops(cx, |doc| field_operations(doc, &field, text.trim()))
+        };
+        if previewed {
+            self.finish_content_preview(committed, cx);
+        }
+    }
+
+    fn preview_editing(&mut self, cx: &mut Context<Self>) {
+        if self.suppress_field_editor_events {
+            return;
+        }
+        let (Some(field), Some(snapshot)) =
+            (self.editing_field.clone(), self.field_edit_snapshot.clone())
+        else {
+            return;
+        };
+        let text = self.field_editor.read(cx).text(cx);
+        if let Some(buffer) = self.field_edit_text_buffer_snapshot.clone() {
+            if self.restore_text_selection_buffer(&field, buffer, cx)
+                && self.try_apply_text_selection_field(&field, text.trim(), cx)
+            {
+                self.field_edit_previewed = true;
+                return;
+            }
+            self.field_edit_text_buffer_snapshot = None;
+        }
+        self.preview_field_text(&field, &snapshot, text.trim(), cx);
+        self.field_edit_previewed = true;
+    }
+
+    fn abandon_editing(&mut self, restore: bool, cx: &mut Context<Self>) {
+        let field = self.editing_field.take();
+        let snapshot = self.field_edit_snapshot.take();
+        let text_buffer_snapshot = self.field_edit_text_buffer_snapshot.take();
+        let previewed = std::mem::take(&mut self.field_edit_previewed);
+        if restore && previewed {
+            let restored_text = match (field.as_ref(), text_buffer_snapshot) {
+                (Some(field), Some(buffer)) => {
+                    self.restore_text_selection_buffer(field, buffer, cx)
+                }
+                _ => false,
+            };
+            if !restored_text && let Some(snapshot) = snapshot {
+                self.restore_snapshot_preview(&snapshot, cx);
+            }
+        }
+        if previewed {
+            self.finish_content_preview(false, cx);
+        }
+        cx.notify();
     }
 
     /// The committed display text a field would show right now, used to seed
@@ -1299,10 +1614,12 @@ impl FantaPropertiesPanel {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.finish_scrub(cx);
+        self.finish_continuous_edits(cx);
+        self.finish_content_preview(true, cx);
         let Some(snapshot) = self.snapshot_for_field(&field, cx) else {
             return;
         };
+        let text_buffer_snapshot = self.text_selection_buffer_for_field(&field, cx);
         self.scrub = Some(ScrubState {
             field,
             snapshot,
@@ -1311,6 +1628,7 @@ impl FantaPropertiesPanel {
             start_value,
             current_value: start_value,
             moved: false,
+            text_buffer_snapshot,
         });
     }
 
@@ -1324,7 +1642,8 @@ impl FantaPropertiesPanel {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.finish_scrub(cx);
+        self.finish_continuous_edits(cx);
+        self.finish_content_preview(true, cx);
         let Some(bounds) = self.slider_tracks[track as usize] else {
             return;
         };
@@ -1353,6 +1672,7 @@ impl FantaPropertiesPanel {
             start_value: start_percent,
             current_value: value,
             moved: true,
+            text_buffer_snapshot: None,
         });
         self.preview_field_text(&field, &snapshot, &format_number(value), cx);
     }
@@ -1389,7 +1709,12 @@ impl FantaPropertiesPanel {
         scrub.current_value = value;
         let field = scrub.field.clone();
         let snapshot = scrub.snapshot.clone();
-        self.preview_field_text(&field, &snapshot, &format_number(value), cx);
+        let text = format_number(value);
+        if scrub.text_buffer_snapshot.is_some() {
+            self.try_apply_text_selection_field(&field, &text, cx);
+        } else {
+            self.preview_field_text(&field, &snapshot, &text, cx);
+        }
     }
 
     /// Commit an in-flight scrub as ONE undoable operation: restore the
@@ -1402,14 +1727,27 @@ impl FantaPropertiesPanel {
         if !scrub.moved {
             return;
         }
+        if let Some(text_buffer_snapshot) = scrub.text_buffer_snapshot {
+            let committed = self
+                .text_selection_buffer_for_field(&scrub.field, cx)
+                .is_some_and(|buffer| buffer != text_buffer_snapshot);
+            self.finish_content_preview(committed, cx);
+            cx.notify();
+            return;
+        }
         self.restore_snapshot_preview(&scrub.snapshot, cx);
-        if scrub.current_value != scrub.start_value {
+        let committed = if scrub.current_value != scrub.start_value {
             let field = scrub.field.clone();
             let text = format_number(scrub.current_value);
             if !self.try_apply_text_selection_field(&field, &text, cx) {
-                self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text));
+                self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text))
+            } else {
+                true
             }
-        }
+        } else {
+            false
+        };
+        self.finish_content_preview(committed, cx);
         cx.notify();
     }
 
@@ -1418,9 +1756,15 @@ impl FantaPropertiesPanel {
     fn cancel_scrub(&mut self, restore: bool, cx: &mut Context<Self>) {
         if let Some(scrub) = self.scrub.take()
             && scrub.moved
-            && restore
         {
-            self.restore_snapshot_preview(&scrub.snapshot, cx);
+            if restore {
+                if let Some(buffer) = scrub.text_buffer_snapshot {
+                    self.restore_text_selection_buffer(&scrub.field, buffer, cx);
+                } else {
+                    self.restore_snapshot_preview(&scrub.snapshot, cx);
+                }
+            }
+            self.finish_content_preview(false, cx);
         }
     }
 
@@ -1496,10 +1840,12 @@ impl FantaPropertiesPanel {
             self.close_color_picker(true, cx);
             return;
         }
-        self.close_color_picker(true, cx);
+        self.finish_continuous_edits(cx);
+        self.finish_content_preview(true, cx);
         let Some(snapshot) = self.snapshot_for_field(&field, cx) else {
             return;
         };
+        let text_buffer_snapshot = self.text_selection_buffer_for_field(&field, cx);
         let picker = cx.new(|cx| ColorPicker::new(current, window, cx));
         let subscription = cx.subscribe(
             &picker,
@@ -1521,6 +1867,7 @@ impl FantaPropertiesPanel {
             field,
             original: current,
             snapshot,
+            text_buffer_snapshot,
             changed: false,
             picker,
             _subscription: subscription,
@@ -1571,30 +1918,34 @@ impl FantaPropertiesPanel {
             return;
         };
         if session.changed {
-            // A cancelled pick on a live text sub-selection re-applies the
-            // pre-open color through the session (the node-snapshot restore
-            // below can't reach the session's buffer).
-            if !commit && self.text_selection_targets_field(&session.field, cx) {
-                if let Some(view) = self.active_view.as_ref().and_then(|weak| weak.upgrade()) {
-                    let original = session.original;
-                    view.update(cx, |view, cx| {
-                        view.with_text_selection_style(cx, |style| style.color = original);
-                    });
-                }
+            let text_buffer_changed = session.text_buffer_snapshot.as_ref().and_then(|baseline| {
+                self.text_selection_buffer_for_field(&session.field, cx)
+                    .map(|buffer| buffer != *baseline)
+            });
+            if !commit && let Some(buffer) = session.text_buffer_snapshot.clone() {
+                self.restore_text_selection_buffer(&session.field, buffer, cx);
             }
             self.restore_snapshot_preview(&session.snapshot, cx);
-            if commit {
+            let committed = if commit {
                 let final_color = session.picker.read(cx).color();
-                if final_color != session.original {
-                    let field = session.field.clone();
-                    if let InspectorField::TextColor(id) = &field {
-                        self.set_text_color(*id, final_color, cx);
+                if text_buffer_changed == Some(true) {
+                    if let InspectorField::TextColor(id) = session.field {
+                        self.set_text_color(id, final_color, cx);
+                        true
                     } else {
-                        let text = final_color.to_hex();
-                        self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text));
+                        false
                     }
+                } else if text_buffer_changed.is_none() && final_color != session.original {
+                    let field = session.field.clone();
+                    let text = final_color.to_hex();
+                    self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text))
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
+            self.finish_content_preview(committed, cx);
         }
         cx.notify();
     }
@@ -1606,7 +1957,11 @@ impl FantaPropertiesPanel {
             && session.changed
             && restore
         {
+            if let Some(buffer) = session.text_buffer_snapshot {
+                self.restore_text_selection_buffer(&session.field, buffer, cx);
+            }
             self.restore_snapshot_preview(&session.snapshot, cx);
+            self.finish_content_preview(false, cx);
         }
     }
 
@@ -1636,8 +1991,8 @@ impl FantaPropertiesPanel {
             self.close_gradient_editor(true, cx);
             return;
         }
-        self.close_color_picker(true, cx);
-        self.close_gradient_editor(true, cx);
+        self.finish_continuous_edits(cx);
+        self.finish_content_preview(true, cx);
         let Some(snapshot) = self.snapshot_for_field(&field, cx) else {
             return;
         };
@@ -1727,7 +2082,7 @@ impl FantaPropertiesPanel {
         };
         if session.changed {
             self.restore_snapshot_preview(&session.snapshot, cx);
-            if commit {
+            let committed = if commit {
                 let final_gradient = session.editor.read(cx).gradient();
                 if final_gradient != session.original
                     && let InspectorField::Gradient {
@@ -1736,13 +2091,18 @@ impl FantaPropertiesPanel {
                         is_stroke,
                     } = session.field
                 {
-                    self.update_node_data(
-                        id,
-                        move |data| set_paint_gradient(data, index, is_stroke, final_gradient),
-                        cx,
-                    );
+                    self.apply_document_ops(cx, move |doc| {
+                        replace_data_operation(doc, id, move |data| {
+                            set_paint_gradient(data, index, is_stroke, final_gradient)
+                        })
+                    })
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
+            self.finish_content_preview(committed, cx);
         }
         cx.notify();
     }
@@ -1755,6 +2115,7 @@ impl FantaPropertiesPanel {
             && restore
         {
             self.restore_snapshot_preview(&session.snapshot, cx);
+            self.finish_content_preview(false, cx);
         }
     }
 
@@ -1841,7 +2202,6 @@ impl FantaPropertiesPanel {
             body,
         }
     }
-
 }
 
 impl Render for FantaPropertiesPanel {
@@ -1946,11 +2306,18 @@ impl Render for FantaPropertiesPanel {
 
                         // Component master identity + variant set + schema.
                         if let Some(master) = &node.master {
-                            sections.push(self.render_master_section(master));
+                            sections.push(self.render_master_section(master, editable, cx));
+                        }
+                        if let Some(binding) = &node.component_binding {
+                            sections.push(self.render_component_binding_section(
+                                id, binding, editable, window, cx,
+                            ));
                         }
                         // Instance info: master, variants, props, detach.
                         if let Some(instance) = &node.instance {
-                            sections.push(self.render_instance_section(id, instance, editable, cx));
+                            sections.push(
+                                self.render_instance_section(id, instance, editable, window, cx),
+                            );
                         }
                         if kind == Text
                             && let Some(typography) = &node.typography
@@ -1985,6 +2352,7 @@ impl Render for FantaPropertiesPanel {
                                 id,
                                 layout_child,
                                 editable,
+                                window,
                                 cx,
                             ));
                         }
@@ -2022,6 +2390,7 @@ impl Render for FantaPropertiesPanel {
                             &node.effects,
                             &node.blurs,
                             editable,
+                            window,
                             cx,
                         ));
                         if !node.reactions.is_empty() {
@@ -2231,6 +2600,7 @@ mod panel_integration_tests {
         vector_id: NodeId,
         text_id: NodeId,
         _view: Entity<FigView>,
+        scratch: gpui::WindowHandle<gpui::Empty>,
         _temp: tempfile::TempDir,
     }
 
@@ -2292,29 +2662,10 @@ mod panel_integration_tests {
             .unwrap();
 
         let fs_dyn: std::sync::Arc<dyn fs::Fs> = fs;
-        let panel = cx.add_window(|window, cx| FantaPropertiesPanel {
-            focus_handle: cx.focus_handle(),
-            fs: fs_dyn,
-            active_view: None,
-            width: None,
-            field_editor: cx.new(|cx| Editor::single_line(window, cx)),
-            editing_field: None,
-            content_scroll: ScrollHandle::new(),
-            corner_radii_expanded: None,
-            scrub: None,
-            slider_tracks: [None; SLIDER_TRACK_COUNT],
-            hidden_paint_alpha: HashMap::new(),
-            picker: None,
-            gradient_editor: None,
-            swatch_press_dismissed: false,
-            _subscriptions: Vec::new(),
-            _active_view_subscription: None,
+        let panel_view = view.clone();
+        let panel = cx.add_window(move |window, cx| {
+            FantaPropertiesPanel::build(fs_dyn, Some(panel_view), window, cx, Vec::new())
         });
-        panel
-            .update(cx, |panel, _, cx| {
-                panel.set_active_view(Some(view.clone()), cx);
-            })
-            .unwrap();
         cx.run_until_parked();
 
         Harness {
@@ -2322,6 +2673,7 @@ mod panel_integration_tests {
             vector_id,
             text_id,
             _view: view,
+            scratch,
             _temp: temp,
         }
     }
@@ -2566,6 +2918,560 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn inline_field_edits_preview_live_and_commit_as_one_undo_step(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let start_x = node_x(&harness, cx);
+        let mut vcx = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        vcx.simulate_resize(gpui::size(px(360.), px(1600.)));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+
+        let field = vcx
+            .debug_bounds("scrub-fanta-x-0")
+            .expect("X field is laid out");
+        vcx.simulate_click(field.center(), gpui::Modifiers::default());
+        vcx.simulate_input("17");
+
+        let preview_x = node_x(&harness, &mut vcx.cx);
+        assert!(
+            (preview_x - 17.0).abs() < 0.01,
+            "BufferEdited should preview immediately, got {preview_x}"
+        );
+
+        vcx.simulate_keystrokes("enter");
+        let item = harness
+            ._view
+            .read_with(&vcx.cx, |view, _| view.item().clone());
+        item.update(&mut vcx.cx, |item, cx| item.undo(cx).unwrap());
+        vcx.run_until_parked();
+        let undone_x = node_x(&harness, &mut vcx.cx);
+        assert!(
+            (undone_x - start_x).abs() < 0.01,
+            "one undo should restore the gesture baseline ({start_x}), got {undone_x}"
+        );
+    }
+
+    #[gpui::test]
+    async fn inline_font_size_edits_preview_the_live_text_selection_without_flattening_runs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .unwrap();
+
+        let red = FantaColor::rgb(220, 20, 30);
+        let blue = FantaColor::rgb(20, 40, 220);
+        view.update(cx, |view, cx| {
+            {
+                let session = &mut view.text_edit.as_mut().unwrap().session;
+                session.move_to(0, false);
+                session.move_to(2, true);
+            }
+            assert!(view.with_text_selection_style(cx, |style| style.color = red));
+            {
+                let session = &mut view.text_edit.as_mut().unwrap().session;
+                session.move_to(2, false);
+                session.move_to(5, true);
+            }
+            assert!(view.with_text_selection_style(cx, |style| style.color = blue));
+            view.text_edit.as_mut().unwrap().session.select_all();
+        });
+        cx.run_until_parked();
+
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.start_editing(
+                    InspectorField::FontSize(text_id),
+                    "16".to_string(),
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        vcx.simulate_input("30");
+
+        let preview_styles = view.read_with(&vcx.cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("inspector focus keeps the text session alive")
+                .session
+                .text_buffer()
+                .runs()
+                .iter()
+                .map(|run| run.style.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            preview_styles.iter().all(|style| style.size_px == 30.0),
+            "BufferEdited should resize the selected runs immediately"
+        );
+        assert!(preview_styles.iter().any(|style| style.color == red));
+        assert!(preview_styles.iter().any(|style| style.color == blue));
+
+        vcx.simulate_keystrokes("enter");
+        let committed_styles = view.read_with(&vcx.cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("committing an inspector field keeps text editing active")
+                .session
+                .text_buffer()
+                .runs()
+                .iter()
+                .map(|run| run.style.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(committed_styles.iter().all(|style| style.size_px == 30.0));
+        assert!(committed_styles.iter().any(|style| style.color == red));
+        assert!(committed_styles.iter().any(|style| style.color == blue));
+    }
+
+    #[gpui::test]
+    async fn font_size_scrub_previews_the_text_selection_before_mouse_up(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let start_size = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .unwrap()
+                .session
+                .selection_typography()
+                .style
+                .size_px
+        });
+        let mut vcx = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        vcx.simulate_resize(gpui::size(px(360.), px(1600.)));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        let field = vcx
+            .debug_bounds("scrub-fanta-font-size-0")
+            .expect("font-size scrub field is laid out");
+        let origin = field.center();
+        vcx.simulate_mouse_down(origin, MouseButton::Left, gpui::Modifiers::default());
+        for step in 1..=6 {
+            vcx.simulate_mouse_move(
+                origin + gpui::point(px(step as f32 * 5.), px(0.)),
+                MouseButton::Left,
+                gpui::Modifiers::default(),
+            );
+        }
+
+        let live_size = view.read_with(&vcx.cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("the scrub keeps text editing active")
+                .session
+                .selection_typography()
+                .style
+                .size_px
+        });
+        assert!(
+            live_size > start_size,
+            "the selected run should resize during the drag, before release"
+        );
+        assert!(
+            harness
+                .panel
+                .read_with(&vcx.cx, |panel, _| panel.scrub.is_some())
+                .unwrap(),
+            "a text-selection refresh must not cancel the active scrub"
+        );
+
+        vcx.simulate_mouse_up(
+            origin + gpui::point(px(30.), px(0.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.run_until_parked();
+        let final_size = view.read_with(&vcx.cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .unwrap()
+                .session
+                .selection_typography()
+                .style
+                .size_px
+        });
+        assert_eq!(final_size, live_size);
+    }
+
+    #[gpui::test]
+    async fn text_selection_refresh_does_not_abandon_an_open_picker(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let vector_id = harness.vector_id;
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.set_paint_kind(vector_id, 0, false, PaintKind::Solid, cx);
+                panel.toggle_color_picker(
+                    InspectorField::FillColor {
+                        id: vector_id,
+                        index: 0,
+                    },
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |_, cx| {
+            cx.emit(crate::document::FigItemEvent::TextSelectionChanged);
+        });
+        cx.run_until_parked();
+        assert!(
+            harness
+                .panel
+                .read_with(cx, |panel, _| panel.picker.is_some())
+                .unwrap(),
+            "a text-selection refresh must not reset the inspected subject"
+        );
+
+        item.update(cx, |_, cx| {
+            cx.emit(crate::document::FigItemEvent::SelectionChanged);
+        });
+        cx.run_until_parked();
+        assert!(
+            harness
+                .panel
+                .read_with(cx, |panel, _| panel.picker.is_none())
+                .unwrap(),
+            "a real document selection change still abandons the picker"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_discrete_text_edit_finishes_a_live_color_pick_without_losing_either_change(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let picked = FantaColor::rgb(220, 30, 70);
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.toggle_color_picker(
+                    InspectorField::TextColor(text_id),
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+                let picker = panel.picker.as_ref().unwrap().picker.clone();
+                picker.update(cx, |picker, cx| {
+                    picker.set_test_color(picked, window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            harness
+                .panel
+                .read_with(cx, |panel, _| panel.picker.is_some())
+                .unwrap(),
+            "the color should still be a live picker preview"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.text_edit
+                    .as_ref()
+                    .unwrap()
+                    .session
+                    .selection_typography()
+                    .style
+                    .color
+            }),
+            picked
+        );
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_text_decoration(text_id, TextDecorationGlyph::Strikethrough, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let live_style = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .unwrap()
+                .session
+                .selection_typography()
+                .style
+        });
+        assert_eq!(live_style.color, picked);
+        assert!(live_style.strikethrough);
+        assert!(
+            harness
+                .panel
+                .read_with(cx, |panel, _| panel.picker.is_none())
+                .unwrap(),
+            "starting a discrete property edit should finish the picker first"
+        );
+
+        view.update(cx, |view, cx| view.commit_text_edit(cx));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let committed_styles = item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .document()
+                .unwrap()
+                .doc
+                .scene
+                .get(text_id)
+                .unwrap()
+                .data
+            else {
+                panic!("expected a text node");
+            };
+            text.style_runs
+                .iter()
+                .map(|run| run.style.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(!committed_styles.is_empty());
+        assert!(committed_styles.iter().all(|style| style.color == picked));
+        assert!(committed_styles.iter().all(|style| style.strikethrough));
+
+        item.update(cx, |item, cx| item.undo(cx).unwrap());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .document()
+                .unwrap()
+                .doc
+                .scene
+                .get(text_id)
+                .unwrap()
+                .data
+            else {
+                panic!("expected a text node");
+            };
+            assert_eq!(text.style.color, FantaColor::BLACK);
+            assert!(!text.style.strikethrough);
+            assert!(text.style_runs.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn cancelling_a_text_color_pick_restores_the_exact_rich_text_buffer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+            })
+            .expect("open text edit");
+
+        let red = FantaColor::rgb(220, 20, 30);
+        let blue = FantaColor::rgb(20, 40, 220);
+        view.update(cx, |view, cx| {
+            {
+                let session = &mut view
+                    .text_edit
+                    .as_mut()
+                    .expect("text edit remains open")
+                    .session;
+                session.move_to(0, false);
+                session.move_to(2, true);
+            }
+            assert!(view.with_text_selection_style(cx, |style| {
+                style.color = red;
+                style.weight = 350;
+            }));
+            {
+                let session = &mut view
+                    .text_edit
+                    .as_mut()
+                    .expect("text edit remains open")
+                    .session;
+                session.move_to(2, false);
+                session.move_to(5, true);
+            }
+            assert!(view.with_text_selection_style(cx, |style| {
+                style.color = blue;
+                style.weight = 750;
+            }));
+            view.text_edit
+                .as_mut()
+                .expect("text edit remains open")
+                .session
+                .select_all();
+        });
+        cx.run_until_parked();
+
+        let baseline = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("text edit remains open")
+                .session
+                .buffer_snapshot()
+        });
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let dirty_before_picker = item.read_with(cx, |item, _| item.is_dirty());
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.toggle_color_picker(
+                    InspectorField::TextColor(text_id),
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+                let picker = panel
+                    .picker
+                    .as_ref()
+                    .expect("picker is open")
+                    .picker
+                    .clone();
+                picker.update(cx, |picker, cx| {
+                    picker.set_test_color(FantaColor::rgb(10, 230, 80), window, cx);
+                });
+            })
+            .expect("preview text color");
+        cx.run_until_parked();
+
+        let preview = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("text edit remains open")
+                .session
+                .buffer_snapshot()
+        });
+        assert_ne!(preview, baseline, "the picker should stage a live preview");
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.close_color_picker(false, cx))
+            .expect("cancel text color picker");
+        cx.run_until_parked();
+
+        let restored = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("text edit remains open")
+                .session
+                .buffer_snapshot()
+        });
+        assert_eq!(restored, baseline);
+        assert_eq!(
+            item.read_with(cx, |item, _| item.is_dirty()),
+            dirty_before_picker,
+            "canceling the nested picker must preserve the prior preview's dirty state"
+        );
+    }
+
+    #[gpui::test]
+    async fn cancelling_a_gradient_preview_restores_a_clean_document(cx: &mut TestAppContext) {
+        init_test(cx);
+        let original = linear_gradient_fill();
+        let harness = open_panel_with_gradient(original.clone(), cx).await;
+        let vector_id = harness.vector_id;
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_gradient_editor(vector_id, 0, false, original.clone(), cx);
+                let editor = panel
+                    .gradient_editor
+                    .as_ref()
+                    .expect("gradient editor is open")
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_kind(crate::color_picker::GradientKind::Radial, cx);
+                });
+            })
+            .expect("preview a radial gradient");
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.is_dirty()));
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| panel.close_gradient_editor(false, cx))
+            .expect("cancel gradient preview");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            let node = item
+                .document()
+                .expect("ready document")
+                .doc
+                .scene
+                .get(vector_id)
+                .expect("gradient node");
+            let NodeData::Vector(vector) = &node.data else {
+                panic!("expected vector node");
+            };
+            let Some(Fill::Gradient { gradient, .. }) = vector.fills.first() else {
+                panic!("expected gradient fill");
+            };
+            assert_eq!(gradient, &original);
+        });
+    }
+
+    #[gpui::test]
     async fn real_drag_of_a_gradient_stop_does_not_panic(cx: &mut TestAppContext) {
         init_test(cx);
         let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
@@ -2675,22 +3581,55 @@ mod panel_integration_tests {
                 panel.toggle_text_decoration(text_id, TextDecorationGlyph::Underline, cx);
                 panel.set_font_weight(text_id, 800, cx);
                 panel.set_text_align(text_id, TextAlign::Justify, cx);
+                panel.set_text_resize(text_id, TextAutoResize::Height, cx);
             })
             .unwrap();
         cx.run_until_parked();
         draw(harness.panel, cx);
 
-        let (weight, underline, align) = harness._view.read_with(cx, |view, cx| {
+        let (weight, underline, align, auto_resize) = harness._view.read_with(cx, |view, cx| {
             let item = view.item().read(cx);
             let doc = &item.document().unwrap().doc;
             let NodeData::Text(text) = &doc.scene.get(text_id).unwrap().data else {
                 panic!("expected a text node");
             };
-            (text.style.weight, text.style.underline, text.align)
+            (
+                text.style.weight,
+                text.style.underline,
+                text.align,
+                text.auto_resize,
+            )
         });
         assert_eq!(weight, 800);
         assert!(underline);
         assert_eq!(align, TextAlign::Justify);
+        assert_eq!(auto_resize, TextAutoResize::Height);
+    }
+
+    #[gpui::test]
+    async fn effect_kind_selection_applies_the_exact_menu_value(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let vector_id = harness.vector_id;
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.add_effect(vector_id, cx);
+                panel.set_effect_kind(vector_id, 0, ShadowKind::Inner, cx);
+                panel.set_effect_kind(vector_id, 0, ShadowKind::Inner, cx);
+            })
+            .expect("updating the properties panel");
+        cx.run_until_parked();
+
+        let kind = harness._view.read_with(cx, |view, cx| {
+            let item = view.item().read(cx);
+            item.document()
+                .and_then(|document| document.doc.scene.get(vector_id))
+                .and_then(|node| node.effects.first())
+                .map(|effect| effect.kind)
+        });
+        assert_eq!(kind, Some(ShadowKind::Inner));
     }
 
     #[gpui::test]
@@ -2952,4 +3891,3 @@ mod panel_integration_tests {
         );
     }
 }
-

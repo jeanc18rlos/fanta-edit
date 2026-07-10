@@ -43,7 +43,8 @@ impl FigView {
             return Some(hit);
         }
         // Check ancestors (e.g. text containing other hittable nodes)
-        if let Some(text) = doc.scene
+        if let Some(text) = doc
+            .scene
             .ancestors_of(hit)
             .find(|node| matches!(node.data, NodeData::Text(_)))
             .map(|node| node.id)
@@ -56,7 +57,13 @@ impl FigView {
         for desc_id in doc.scene.descendants_of(hit) {
             if let Some(node) = doc.scene.get(desc_id) {
                 if matches!(node.data, NodeData::Text(_)) {
-                    let contains = text_edit::node_contains_screen(doc, desc_id, screen, &viewport, DVec2::new(width, height));
+                    let contains = text_edit::node_contains_screen(
+                        doc,
+                        desc_id,
+                        screen,
+                        &viewport,
+                        DVec2::new(width, height),
+                    );
                     if contains {
                         return Some(desc_id);
                     }
@@ -170,20 +177,17 @@ impl FigView {
             return;
         }
         if let Some(edit) = self.text_edit.as_ref() {
-            if edit
-                .session
-                .instance()
-                .is_some_and(|inst| inst.instance_id == target.instance_id && inst.def_path == target.def_path)
-            {
+            if edit.session.instance().is_some_and(|inst| {
+                inst.instance_id == target.instance_id && inst.def_path == target.def_path
+            }) {
                 return;
             }
             self.commit_text_edit(cx);
         }
-        let Some(base_overrides) = self
-            .item
-            .read(cx)
-            .document()
-            .map(|document| instance_text::snapshot_overrides(&document.doc, target.instance_id))
+        let Some(base_overrides) =
+            self.item.read(cx).document().map(|document| {
+                instance_text::snapshot_overrides(&document.doc, target.instance_id)
+            })
         else {
             return;
         };
@@ -198,20 +202,20 @@ impl FigView {
         match seed {
             TextEditSeed::SelectAll => session.select_all(),
             TextEditSeed::WordAt(screen) => {
-                let byte = self
-                    .viewport
-                    .zip(self.container_bounds)
-                    .and_then(|(viewport, bounds)| {
-                        let (width, height) = bounds_size(bounds);
-                        let document = self.item.read(cx).document()?;
-                        text_edit::session_byte_at_screen(
-                            &document.doc,
-                            session,
-                            screen,
-                            &viewport,
-                            DVec2::new(width, height),
-                        )
-                    });
+                let byte =
+                    self.viewport
+                        .zip(self.container_bounds)
+                        .and_then(|(viewport, bounds)| {
+                            let (width, height) = bounds_size(bounds);
+                            let document = self.item.read(cx).document()?;
+                            text_edit::session_byte_at_screen(
+                                &document.doc,
+                                session,
+                                screen,
+                                &viewport,
+                                DVec2::new(width, height),
+                            )
+                        });
                 if let Some(byte) = byte {
                     session.select_word_at(byte);
                 }
@@ -242,6 +246,11 @@ impl FigView {
         // Focus leaving the canvas (panel field, pane switch) commits the
         // session, matching Figma's click-away semantics.
         let focus_out = cx.on_focus_out(&self.focus_handle, window, |this, _, _, cx| {
+            if let Some(edit) = this.text_edit.as_mut()
+                && std::mem::take(&mut edit.retain_on_next_focus_out)
+            {
+                return;
+            }
             this.commit_text_edit(cx);
         });
         self.text_edit = Some(CanvasTextEdit::new(session, focus_out));
@@ -301,9 +310,7 @@ impl FigView {
                 .doc
                 .scene
                 .get(edit.session.node_id())
-                .is_some_and(|node| {
-                    is_instance || matches!(node.data, NodeData::Text(_))
-                })
+                .is_some_and(|node| is_instance || matches!(node.data, NodeData::Text(_)))
         });
         if !target_exists {
             // The node (and with it the preview content) is gone; there is
@@ -455,7 +462,7 @@ impl FigView {
     /// node-selection change emits for it to re-read the selection typography.
     fn notify_text_selection_changed(&mut self, cx: &mut Context<Self>) {
         self.item.update(cx, |_, cx| {
-            cx.emit(crate::document::FigItemEvent::SelectionChanged);
+            cx.emit(crate::document::FigItemEvent::TextSelectionChanged);
         });
     }
 
@@ -492,6 +499,45 @@ impl FigView {
         (edit.session.node_id() == node).then(|| edit.session.selection_typography())
     }
 
+    pub(crate) fn text_selection_buffer(
+        &self,
+        node: fanta_doc::NodeId,
+    ) -> Option<fanta_text::TextBuffer> {
+        let edit = self.text_edit.as_ref()?;
+        (edit.session.node_id() == node).then(|| edit.session.buffer_snapshot())
+    }
+
+    pub(crate) fn retain_text_selection_on_next_focus_out(
+        &mut self,
+        node: fanta_doc::NodeId,
+    ) -> bool {
+        let Some(edit) = self.text_edit.as_mut() else {
+            return false;
+        };
+        if edit.session.node_id() != node {
+            return false;
+        }
+        edit.retain_on_next_focus_out = true;
+        true
+    }
+
+    pub(crate) fn restore_text_selection_buffer(
+        &mut self,
+        node: fanta_doc::NodeId,
+        buffer: fanta_text::TextBuffer,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(edit) = self.text_edit.as_mut() else {
+            return false;
+        };
+        if edit.session.node_id() != node {
+            return false;
+        }
+        edit.session.restore_buffer_snapshot(buffer);
+        self.sync_text_preview(cx);
+        true
+    }
+
     /// If there is an active text edit session, apply style change only to the
     /// current selection (for rich text). Returns true if it was applied to a
     /// selection (caller can skip whole-node mutate). Use from properties for
@@ -499,13 +545,13 @@ impl FigView {
     pub(crate) fn with_text_selection_style(
         &mut self,
         cx: &mut Context<Self>,
-        patch: impl FnOnce(&mut fanta_text::TextStyle),
+        patch: impl Fn(&mut fanta_text::TextStyle),
     ) -> bool {
         if let Some(edit) = self.text_edit.as_mut() {
-            let caret = edit.session.caret();
-            let mut s = edit.session.text_buffer().style_at(caret).clone();
-            patch(&mut s);
-            edit.session.apply_style_to_selection(s);
+            if let Err(error) = edit.session.patch_style_to_selection(patch) {
+                log::error!("fig_viewer failed to style the text selection: {error}");
+                return false;
+            }
             self.sync_text_preview(cx);
             return true;
         }
@@ -755,7 +801,13 @@ impl FigView {
         let caret = edit
             .caret_visible()
             .then(|| {
-                text_edit::session_caret_segment(doc, session, session.caret(), &viewport, screen_size)
+                text_edit::session_caret_segment(
+                    doc,
+                    session,
+                    session.caret(),
+                    &viewport,
+                    screen_size,
+                )
             })
             .flatten()
             .map(|(top, bottom)| {

@@ -5,7 +5,7 @@
 
 use fanta_doc::{
     BlendMode, BlurKind, Color as FantaColor, Gradient, ImageFitMode, LayoutMode, NodeFlags,
-    NodeId, ShadowKind, StrokeAlign, TextAlign, VAlign as TextVAlign, VarValue,
+    NodeId, StrokeAlign, TextAlign, VAlign as TextVAlign, VarValue,
 };
 use gpui::{
     Anchor, Context, Div, MouseButton, MouseDownEvent, anchored, canvas, deferred, point, px,
@@ -20,6 +20,8 @@ use ui::{
 };
 
 use crate::color_picker::gradient_preview_strip;
+use crate::component_properties::CreateComponentPropertyKind;
+use crate::inspector_components::{InspectorPropertyRow, InspectorSectionHeader};
 use crate::inspector_widgets::{
     AlignGlyph, PanelDrag, TextAlignGlyph, TextDecorationGlyph, align_glyph, text_align_glyph,
     text_decoration_glyph,
@@ -27,24 +29,21 @@ use crate::inspector_widgets::{
 use crate::properties_ops::{fanta_color_rgba, font_weight_label, format_number};
 use crate::properties_panel::{FantaPropertiesPanel, SliderTrack};
 use crate::properties_snapshot::{
-    ALIGN_BUTTONS, AXIS_SIZINGS, AlignCommand, AutoLayoutSnapshot, BLEND_MODES, BindingSnapshot,
-    BlurSnapshot, COUNTER_ALIGNS, CornerRadiusValue, DISTRIBUTE_BUTTONS, EffectSnapshot,
-    FONT_WEIGHTS, IMAGE_FIT_MODES, InspectorField, InstanceSection, LAYOUT_MODES,
-    LayoutChildSnapshot, LayoutSnapshot, MIXED_VALUE, MasterSection, MultiSection, NodeSection,
-    PAINT_KINDS, PRIMARY_ALIGNS, PageBackgroundValue, PageSection, PaintKind, PaintSnapshot,
-    PropValueSnapshot, STROKE_ALIGNS, SelectionColorSnapshot, TypographySnapshot,
-    align_grid_active_cell, blur_kind_label, paint_kind_label, stacking_label,
-    text_resize_label,
+    ALIGN_BUTTONS, AXIS_SIZINGS, AlignCommand, AutoLayoutSnapshot, BLEND_MODES, BLUR_KINDS,
+    BindingSnapshot, BlurSnapshot, COUNTER_ALIGNS, ComponentBindingSection, CornerRadiusValue,
+    DISTRIBUTE_BUTTONS, EffectSnapshot, FONT_WEIGHTS, IMAGE_FIT_MODES, InspectorField,
+    InstanceSection, LAYOUT_CHILD_RESIZES, LAYOUT_MODES, LayoutChildSnapshot, LayoutSnapshot,
+    MIXED_VALUE, MasterSection, MultiSection, NodeSection, PAINT_KINDS, PRIMARY_ALIGNS,
+    PageBackgroundValue, PageSection, PaintKind, PaintSnapshot, PropValueSnapshot, SHADOW_KINDS,
+    STACKING_ORDERS, STROKE_ALIGNS, SelectionColorSnapshot, TEXT_RESIZE_MODES, TypographySnapshot,
+    align_grid_active_cell, paint_kind_label,
 };
-
 
 /// Height of a boxed field / pill / control, the panel's vertical rhythm unit
 /// (the original's 30px `FIELD_BOX_H` translated to Zed density).
 const FIELD_BOX_H: f32 = 28.0;
 /// Height of one fill / stroke list row (the original's 36px `LIST_ROW_H`).
 const LIST_ROW_H: f32 = 32.0;
-/// Height of a section-title header band (the original's `SECTION_HEADER_H`).
-const SECTION_HEADER_H: f32 = 28.0;
 /// The fixed label column width to the left of pills and sliders.
 const PILL_LABEL_W: f32 = 68.0;
 /// Side length of the auto-layout 3×3 alignment grid box.
@@ -59,18 +58,12 @@ impl FantaPropertiesPanel {
     /// optional action (the Fill/Stroke/Effects "+" box) hugging the right
     /// inset, matching the original's header anatomy.
     fn render_section_header(title: &'static str, action: Option<AnyElement>) -> AnyElement {
-        h_flex()
-            .px_4()
-            .h(px(SECTION_HEADER_H))
-            .items_center()
-            .justify_between()
-            .child(
-                Label::new(title)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .children(action)
-            .into_any_element()
+        match action {
+            Some(action) => InspectorSectionHeader::new(title)
+                .action(action)
+                .into_any_element(),
+            None => InspectorSectionHeader::new(title).into_any_element(),
+        }
     }
 
     fn section_add_button(
@@ -281,76 +274,6 @@ impl FantaPropertiesPanel {
         cell.into_any_element()
     }
 
-    /// A full-width click-to-cycle pill: value at the left, a chevron hinting
-    /// the cycle at the right — the original's dropdown-look cycle control.
-    fn render_pill(
-        &self,
-        id: impl Into<ElementId>,
-        value: SharedString,
-        tooltip: &'static str,
-        editable: bool,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let mut pill = h_flex()
-            .id(id)
-            .flex_1()
-            .min_w_0()
-            .h(px(FIELD_BOX_H))
-            .px_2()
-            .gap_1()
-            .justify_between()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
-            .child(
-                Label::new(value)
-                    .size(LabelSize::Small)
-                    .color(if editable {
-                        Color::Default
-                    } else {
-                        Color::Muted
-                    })
-                    .single_line(),
-            )
-            .child(
-                Icon::new(IconName::ChevronDown)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            );
-        if editable {
-            pill = pill
-                .cursor_pointer()
-                .hover(|style| style.bg(colors.element_hover))
-                .tooltip(Tooltip::text(tooltip))
-                .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)));
-        }
-        pill.into_any_element()
-    }
-
-    /// A labeled cycle-pill row: muted caption column + pill.
-    #[allow(clippy::too_many_arguments)]
-    fn render_pill_row(
-        &self,
-        id: impl Into<ElementId>,
-        label: &'static str,
-        value: SharedString,
-        tooltip: &'static str,
-        editable: bool,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        h_flex()
-            .px_4()
-            .gap_2()
-            .items_center()
-            .child(Self::pill_label(label))
-            .child(self.render_pill(id, value, tooltip, editable, on_click, cx))
-            .into_any_element()
-    }
-
     /// A labeled enum-choice row: a muted caption column beside a compact Zed
     /// [`DropdownMenu`]. The native equivalent of the old click-to-cycle pill.
     #[allow(clippy::too_many_arguments)]
@@ -367,15 +290,14 @@ impl FantaPropertiesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
-            .px_4()
-            .gap_2()
-            .items_center()
-            .child(Self::pill_label(label))
-            .child(self.render_choice_dropdown(
+        InspectorPropertyRow::new(
+            label,
+            self.render_choice_dropdown(
                 element_id, aria_label, id, current, options, apply, editable, window, cx,
-            ))
-            .into_any_element()
+            ),
+        )
+        .label_width(PILL_LABEL_W)
+        .into_any_element()
     }
 
     /// A labeled switch row (the original's toggle rows: Visible, Wrap, Clip
@@ -491,6 +413,101 @@ impl FantaPropertiesPanel {
                     .full_width(true)
                     .aria_label(aria_label),
             )
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_indexed_choice_dropdown<T: Copy + PartialEq + 'static>(
+        &self,
+        key: &'static str,
+        index: usize,
+        aria_label: &'static str,
+        id: NodeId,
+        current: T,
+        options: &'static [(T, &'static str)],
+        apply: fn(&mut Self, NodeId, usize, T, &mut Context<Self>),
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label: SharedString = options
+            .iter()
+            .find(|(value, _)| *value == current)
+            .map(|(_, label)| *label)
+            .unwrap_or(MIXED_VALUE)
+            .into();
+        let panel = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for (value, name) in options {
+                let panel = panel.clone();
+                let value = *value;
+                menu.push_item(
+                    ContextMenuEntry::new(*name)
+                        .toggleable(IconPosition::End, value == current)
+                        .handler(move |_, cx| {
+                            if let Err(error) = panel
+                                .update(cx, |panel, cx| apply(panel, id, index, value, cx))
+                            {
+                                log::debug!(
+                                    "dropping {aria_label} change for closed properties panel: {error:#}"
+                                );
+                            }
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new((key, index), label, menu)
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!editable)
+            .aria_label(aria_label)
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_variant_dropdown(
+        &self,
+        index: usize,
+        id: NodeId,
+        axis: SharedString,
+        current: SharedString,
+        options: Vec<SharedString>,
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel = cx.weak_entity();
+        let current_for_menu = current.clone();
+        let axis_for_menu = axis.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for option in &options {
+                let panel = panel.clone();
+                let axis = axis_for_menu.clone();
+                let value = option.clone();
+                menu.push_item(
+                    ContextMenuEntry::new(option.clone())
+                        .toggleable(IconPosition::End, *option == current_for_menu)
+                        .handler(move |_, cx| {
+                            if let Err(error) = panel.update(cx, |panel, cx| {
+                                panel.select_variant_axis(id, axis.clone(), value.clone(), cx)
+                            }) {
+                                log::debug!(
+                                    "dropping variant selection for closed properties panel: {error:#}"
+                                );
+                            }
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(("fanta-variant-axis", index), current, menu)
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!editable)
+            .aria_label(axis)
             .into_any_element()
     }
 
@@ -1068,31 +1085,24 @@ impl FantaPropertiesPanel {
         id: NodeId,
         layout_child: &LayoutChildSnapshot,
         editable: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let fills_container = layout_child.fills_container;
         let mut section = v_flex()
             .py_1()
             .gap_2()
             .child(Self::render_section_header("Auto layout child", None));
         if !layout_child.absolute {
-            section = section.child(self.render_pill_row(
+            section = section.child(self.render_choice_row(
                 "fanta-child-resize",
                 "Resize",
-                if fills_container {
-                    "Fill container".into()
-                } else {
-                    "Fixed width".into()
-                },
-                "Toggle Fixed Width / Fill Container",
+                "Auto-layout child resize",
+                id,
+                layout_child.fills_container,
+                &LAYOUT_CHILD_RESIZES,
+                Self::set_layout_child_fill,
                 editable,
-                move |this, cx| {
-                    this.update_layout_child(
-                        id,
-                        |child| child.grow = if fills_container { 0.0 } else { 1.0 },
-                        cx,
-                    );
-                },
+                window,
                 cx,
             ));
         }
@@ -1260,7 +1270,7 @@ impl FantaPropertiesPanel {
         section.into_any_element()
     }
 
-    /// The Auto layout controls: direction pill, the interactive 3×3 alignment
+    /// The Auto layout controls: direction menu, the interactive 3×3 alignment
     /// grid beside the align dropdowns, gap and padding pairs, per-axis
     /// sizing, wrap, and stacking — the original's full control set.
     fn render_auto_layout_section(
@@ -1447,13 +1457,16 @@ impl FantaPropertiesPanel {
                 move |this, cx| this.toggle_layout_wrap(id, cx),
                 cx,
             ))
-            .child(self.render_pill_row(
+            .child(self.render_choice_row(
                 "fanta-layout-stacking",
                 "Stacking",
-                stacking_label(layout.reverse_z).into(),
-                "Toggle Stacking Order",
+                "Auto-layout stacking order",
+                id,
+                layout.reverse_z,
+                &STACKING_ORDERS,
+                Self::set_layout_stacking,
                 editable,
-                move |this, cx| this.toggle_layout_stacking(id, cx),
+                window,
                 cx,
             ))
             .into_any_element()
@@ -1521,7 +1534,7 @@ impl FantaPropertiesPanel {
 
     /// The Typography section: family, weight + size, LH/LS, the independent
     /// italic / underline / strikethrough toggles, the 7-cell align strip
-    /// (4 horizontal incl. justify + 3 vertical), and the resize-mode pill.
+    /// (4 horizontal incl. justify + 3 vertical), and the resize-mode menu.
     pub(crate) fn render_typography_section(
         &self,
         id: NodeId,
@@ -1597,13 +1610,16 @@ impl FantaPropertiesPanel {
             )
             .child(self.render_text_decoration_row(id, typography, editable, cx))
             .child(self.render_text_align_row(id, typography, editable, cx))
-            .child(self.render_pill_row(
+            .child(self.render_choice_row(
                 "fanta-text-resize",
                 "Resize",
-                text_resize_label(typography.auto_resize).into(),
-                "Cycle Text Resize Mode",
+                "Text resize mode",
+                id,
+                typography.auto_resize,
+                &TEXT_RESIZE_MODES,
+                Self::set_text_resize,
                 editable,
-                move |this, cx| this.cycle_text_resize(id, cx),
+                window,
                 cx,
             ))
             .into_any_element()
@@ -1798,18 +1814,60 @@ impl FantaPropertiesPanel {
             .into_any_element()
     }
 
+    fn render_component_property_add_menu(
+        &self,
+        master: &MasterSection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel = cx.weak_entity();
+        let component = master.id;
+        let can_create_variant = master.can_create_variant;
+        PopoverMenu::new("fanta-create-component-property-menu")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                IconButton::new("fanta-create-component-property", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Create property")),
+            )
+            .menu(move |window, cx| {
+                let panel = panel.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for kind in CreateComponentPropertyKind::ALL {
+                        let panel = panel.clone();
+                        menu.push_item(
+                            ContextMenuEntry::new(kind.label())
+                                .disabled(
+                                    kind == CreateComponentPropertyKind::Variant
+                                        && !can_create_variant,
+                                )
+                                .handler(move |_, cx| {
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            panel.create_component_property(component, kind, cx)
+                                        })
+                                        .log_err();
+                                }),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .into_any_element()
+    }
+
     /// The component-master section: identity, the variant-set summary, and the
     /// exposed-properties schema.
-    ///
-    /// Read-only. Editing the schema (`SetComponentProps` + a per-kind default
-    /// editor + a descendant binding picker) or the variant set
-    /// (`SetComponentSet` + axis/value chips) is a large sub-editor apiece;
-    /// both are deferred.
-    pub(crate) fn render_master_section(&self, master: &MasterSection) -> AnyElement {
+    pub(crate) fn render_master_section(
+        &self,
+        master: &MasterSection,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let create_property = editable.then(|| self.render_component_property_add_menu(master, cx));
         let mut section = v_flex()
             .py_1()
             .gap_2()
-            .child(Self::render_section_header("Component", None))
+            .child(Self::render_section_header("Component", create_property))
             .child(
                 h_flex()
                     .px_4()
@@ -1890,6 +1948,21 @@ impl FantaPropertiesPanel {
             );
         }
         for prop in &master.props {
+            let trailing: SharedString = if prop.bindings == 0 {
+                prop.default.clone()
+            } else {
+                format!(
+                    "{} · {} {}",
+                    prop.default,
+                    prop.bindings,
+                    if prop.bindings == 1 {
+                        "binding"
+                    } else {
+                        "bindings"
+                    }
+                )
+                .into()
+            };
             section = section.child(
                 h_flex()
                     .px_4()
@@ -1911,7 +1984,7 @@ impl FantaPropertiesPanel {
                         ),
                     )
                     .child(
-                        Label::new(prop.default.clone())
+                        Label::new(trailing)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted)
                             .single_line(),
@@ -1921,14 +1994,96 @@ impl FantaPropertiesPanel {
         section.into_any_element()
     }
 
+    pub(crate) fn render_component_binding_section(
+        &self,
+        id: NodeId,
+        binding: &ComponentBindingSection,
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut section = v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Component properties", None));
+        for (index, field) in binding.fields.iter().enumerate() {
+            let current_id = field.current.as_ref().map(|property| property.id);
+            let current_label = field
+                .current
+                .as_ref()
+                .map(|property| property.name.clone())
+                .unwrap_or_else(|| "Not bound".into());
+            let panel = cx.weak_entity();
+            let choices = field.choices.clone();
+            let component = binding.component;
+            let target_prop = field.prop;
+            let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                let panel_for_none = panel.clone();
+                menu.push_item(
+                    ContextMenuEntry::new("Not bound")
+                        .toggleable(IconPosition::End, current_id.is_none())
+                        .handler(move |_, cx| {
+                            panel_for_none
+                                .update(cx, |panel, cx| {
+                                    panel.set_component_property_binding(
+                                        component,
+                                        id,
+                                        target_prop,
+                                        None,
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        }),
+                );
+                for choice in &choices {
+                    let panel = panel.clone();
+                    let property = choice.id;
+                    menu.push_item(
+                        ContextMenuEntry::new(choice.name.clone())
+                            .toggleable(IconPosition::End, current_id == Some(property))
+                            .handler(move |_, cx| {
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.set_component_property_binding(
+                                            component,
+                                            id,
+                                            target_prop,
+                                            Some(property),
+                                            cx,
+                                        )
+                                    })
+                                    .log_err();
+                            }),
+                    );
+                }
+                menu
+            });
+            section = section.child(
+                InspectorPropertyRow::new(
+                    field.label.clone(),
+                    DropdownMenu::new(("fanta-component-binding", index), current_label, menu)
+                        .style(DropdownStyle::Outlined)
+                        .trigger_size(ButtonSize::Compact)
+                        .full_width(true)
+                        .disabled(!editable)
+                        .aria_label(field.label.clone()),
+                )
+                .label_width(PILL_LABEL_W),
+            );
+        }
+        section.into_any_element()
+    }
+
     /// The component instance Properties section: an identity row that doubles
-    /// as "go to main component", one cycle pill per variant axis, editors for
+    /// as "go to main component", one choice menu per variant axis, editors for
     /// bool / text / number / color props, and the detach action.
     pub(crate) fn render_instance_section(
         &self,
         id: NodeId,
         component: &InstanceSection,
         editable: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut identity = h_flex()
@@ -1967,28 +2122,21 @@ impl FantaPropertiesPanel {
             .child(Self::render_section_header("Properties", None))
             .child(identity);
         for (index, variant) in component.variants.iter().enumerate() {
-            let axis = variant.axis.clone();
             section = section.child(
-                h_flex()
-                    .px_4()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div().w(px(PILL_LABEL_W)).flex_none().child(
-                            Label::new(variant.axis.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line(),
-                        ),
-                    )
-                    .child(self.render_pill(
-                        ("fanta-variant-axis", index),
+                InspectorPropertyRow::new(
+                    variant.axis.clone(),
+                    self.render_variant_dropdown(
+                        index,
+                        id,
+                        variant.axis.clone(),
                         variant.value.clone(),
-                        "Cycle Variant",
+                        variant.options.clone(),
                         editable,
-                        move |this, cx| this.cycle_variant_axis(id, axis.clone(), cx),
+                        window,
                         cx,
-                    )),
+                    ),
+                )
+                .label_width(PILL_LABEL_W),
             );
         }
         for (index, prop) in component.props.iter().enumerate() {
@@ -2663,13 +2811,14 @@ impl FantaPropertiesPanel {
     /// The Effects section: header "+" adds a drop shadow, a layer blur, or a
     /// background blur. Each shadow is an editable block — kind pill + remove ×,
     /// X/Y and Blur/Spread 2-ups, and a color row whose swatch opens the picker.
-    /// Each blur is a kind pill + radius cell + remove ×.
+    /// Each blur is a kind menu + radius cell + remove ×.
     pub(crate) fn render_effects_section(
         &self,
         id: NodeId,
         effects: &[EffectSnapshot],
         blurs: &[BlurSnapshot],
         editable: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let add_button = editable.then(|| self.render_effects_add_menu(id, cx));
@@ -2678,22 +2827,28 @@ impl FantaPropertiesPanel {
             .gap_2()
             .child(Self::render_section_header("Effects", add_button));
         for (index, effect) in effects.iter().enumerate() {
-            let kind_label: SharedString = match effect.kind {
-                ShadowKind::Drop => "Drop shadow".into(),
-                ShadowKind::Inner => "Inner shadow".into(),
-            };
-            let mut kind_row = h_flex()
-                .px_4()
-                .gap_2()
-                .items_center()
-                .child(self.render_pill(
-                    ("fanta-effect-kind", index),
-                    kind_label,
-                    "Toggle Drop / Inner Shadow",
-                    editable,
-                    move |this, cx| this.toggle_effect_kind(id, index, cx),
-                    cx,
-                ));
+            let mut kind_row =
+                h_flex()
+                    .px_4()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.render_indexed_choice_dropdown(
+                                "fanta-effect-kind",
+                                index,
+                                "Shadow kind",
+                                id,
+                                effect.kind,
+                                &SHADOW_KINDS,
+                                Self::set_effect_kind,
+                                editable,
+                                window,
+                                cx,
+                            )),
+                    );
             if editable {
                 kind_row = kind_row.child(
                     IconButton::new(("fanta-effect-remove", index), IconName::Close)
@@ -2790,25 +2945,27 @@ impl FantaPropertiesPanel {
                 );
         }
         for (index, blur) in blurs.iter().enumerate() {
-            let kind = blur.kind;
             let mut row = h_flex()
                 .px_4()
                 .gap_2()
                 .items_center()
-                .child(self.render_pill(
-                    ("fanta-blur-kind", index),
-                    blur_kind_label(kind).into(),
-                    "Toggle Layer / Background Blur",
-                    editable,
-                    move |this, cx| {
-                        let next = match kind {
-                            BlurKind::Layer => BlurKind::Background,
-                            BlurKind::Background => BlurKind::Layer,
-                        };
-                        this.set_blur_kind(id, index, next, cx);
-                    },
-                    cx,
-                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_indexed_choice_dropdown(
+                            "fanta-blur-kind",
+                            index,
+                            "Blur kind",
+                            id,
+                            blur.kind,
+                            &BLUR_KINDS,
+                            Self::set_blur_kind,
+                            editable,
+                            window,
+                            cx,
+                        )),
+                )
                 .child(div().w(px(72.)).flex_none().child(self.render_numeric_cell(
                     "fanta-blur-radius",
                     index,
@@ -3098,9 +3255,11 @@ impl FantaPropertiesPanel {
                                 "Resolve"
                             }))
                             .disabled(!editable)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_comment_resolved(page_id, resolve_id.clone(), cx);
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.toggle_comment_resolved(page_id, resolve_id.clone(), cx);
+                                },
+                            )),
                         )
                         .child(
                             IconButton::new(("fanta-comment-delete", row), IconName::Trash)

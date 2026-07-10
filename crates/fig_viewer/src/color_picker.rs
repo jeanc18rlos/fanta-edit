@@ -426,7 +426,7 @@ impl ColorPicker {
             &hex_editor,
             window,
             |this: &mut Self, _, event: &EditorEvent, window, cx| {
-                if matches!(event, EditorEvent::Blurred) {
+                if matches!(event, EditorEvent::BufferEdited | EditorEvent::Blurred) {
                     this.apply_hex_text(window, cx);
                 }
             },
@@ -448,14 +448,26 @@ impl ColorPicker {
     }
 
     fn set_hsva(&mut self, hsva: Hsva, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_hsva(hsva, true, window, cx);
+    }
+
+    fn update_hsva(
+        &mut self,
+        hsva: Hsva,
+        sync_hex_editor: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.hsva == hsva {
             return;
         }
         self.hsva = hsva;
-        let hex = self.color().to_hex();
-        self.hex_editor.update(cx, |editor, cx| {
-            editor.set_text(hex, window, cx);
-        });
+        if sync_hex_editor {
+            let hex = self.color().to_hex();
+            self.hex_editor.update(cx, |editor, cx| {
+                editor.set_text(hex, window, cx);
+            });
+        }
         cx.emit(ColorPickerEvent::Changed(self.color()));
         cx.notify();
     }
@@ -466,7 +478,9 @@ impl ColorPicker {
         let parsed =
             FantaColor::from_hex(trimmed).or_else(|| FantaColor::from_hex(&format!("#{trimmed}")));
         if let Some(color) = parsed {
-            self.set_hsva(rgb_to_hsv(color), window, cx);
+            // Keep the user's cursor and partially-entered spelling intact.
+            // Pointer-driven changes still synchronize the canonical hex text.
+            self.update_hsva(rgb_to_hsv(color), false, window, cx);
         }
     }
 
@@ -936,9 +950,9 @@ impl GradientEditor {
                             set_stop_color(&mut this.gradient, index, color);
                             this.emit_changed(cx);
                         }
-                        this.close_stop_picker(cx);
+                        this.defer_close_stop_picker(cx);
                     }
-                    ColorPickerEvent::Cancel => this.close_stop_picker(cx),
+                    ColorPickerEvent::Cancel => this.defer_close_stop_picker(cx),
                 }
             },
         );
@@ -947,6 +961,14 @@ impl GradientEditor {
         self.stop_picker = Some(picker);
         self._subscriptions = vec![subscription];
         cx.notify();
+    }
+
+    fn defer_close_stop_picker(&self, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            this.update(cx, |this, cx| this.close_stop_picker(cx))
+                .log_err();
+        });
     }
 
     fn close_stop_picker(&mut self, cx: &mut Context<Self>) {
@@ -1511,6 +1533,23 @@ mod render_tests {
                 });
             }
         }
+    }
+
+    #[gpui::test]
+    fn valid_hex_input_updates_the_picker_before_blur(cx: &mut TestAppContext) {
+        init_test(cx);
+        let window = cx.add_window(|window, cx| ColorPicker::new(FantaColor::BLACK, window, cx));
+        window
+            .update(cx, |picker, window, cx| {
+                let editor = picker.hex_editor.clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("#123456", window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let color = window.read_with(cx, |picker, _| picker.color()).unwrap();
+        assert_eq!(color, FantaColor::rgb(0x12, 0x34, 0x56));
     }
 }
 

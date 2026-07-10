@@ -14,10 +14,10 @@ use fanta_canvas::{
     resize_transform_keep_rotation, rotate_about, transform_angle,
 };
 use fanta_doc::{
-    BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor,
-    ComponentId, ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill, Gradient,
-    GroupNode, LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, Transform2D,
-    UnitInterval, VarValue, VariantAxis, Viewport, expand_instance,
+    BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor, ComponentId,
+    ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill, Gradient, GroupNode,
+    LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, Transform2D, UnitInterval,
+    VarValue, VariantAxis, Viewport, expand_instance,
 };
 use fanta_render::{AssetResolver, RasterRenderer, RenderInputs};
 use glam::DVec2;
@@ -26,15 +26,13 @@ use smallvec::SmallVec;
 
 use crate::color_picker::{representative_gradient_color, seed_gradient_from_color};
 use crate::properties_snapshot::{
-    CornerRadiusValue, FONT_WEIGHTS, InspectorField, NodeSnapshot, PaintKind,
-    auto_layout_snapshot, corner_radius_value, corner_smoothing_value, master_roots,
-    resolved_instance_def,
+    CornerRadiusValue, FONT_WEIGHTS, InspectorField, NodeSnapshot, PaintKind, auto_layout_snapshot,
+    corner_radius_value, corner_smoothing_value, master_roots, resolved_instance_def,
 };
 
 /// Cap on either export dimension: bounds this large produce surfaces Skia (and
 /// memory) cannot reasonably back, so the export zoom is reduced to fit instead.
 pub(crate) const MAX_EXPORT_PIXELS: u32 = 8192;
-
 
 pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217);
 
@@ -42,11 +40,15 @@ pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217)
 // Operations
 // =============================================================================
 
-/// Advance one variant axis of an instance to its next value by swapping the
-/// instance to the sibling member that carries it. Values are tried in cycle
-/// order until one names an existing member, so sparse variant grids still
-/// advance instead of dead-ending.
-pub(crate) fn variant_cycle_operations(doc: &Doc, id: NodeId, axis: &str) -> Vec<Operation> {
+/// Select one exact value on a component instance's variant axis. Other axis
+/// values stay unchanged; sparse variant sets reject combinations that do not
+/// name an existing member instead of silently cycling to a different value.
+pub(crate) fn variant_select_operations(
+    doc: &Doc,
+    id: NodeId,
+    axis: &str,
+    selected_value: &str,
+) -> Vec<Operation> {
     let Some(node) = doc.scene.get(id) else {
         return Vec::new();
     };
@@ -54,56 +56,48 @@ pub(crate) fn variant_cycle_operations(doc: &Doc, id: NodeId, axis: &str) -> Vec
         return Vec::new();
     };
     let components = &doc.components;
-    let Some(def) = resolved_instance_def(components, instance) else {
+    let Some(definition) = resolved_instance_def(components, instance) else {
         return Vec::new();
     };
-    let Some(membership) = &def.variant_of else {
+    let Some(membership) = &definition.variant_of else {
         return Vec::new();
     };
     let Some(set) = components.sets.get(&membership.set) else {
         return Vec::new();
     };
-    let Some(axis_def) = set.axes.iter().find(|candidate| candidate.name == axis) else {
+    let Some(axis_definition) = set.axes.iter().find(|candidate| candidate.name == axis) else {
         return Vec::new();
     };
-    if axis_def.values.is_empty() {
-        return Vec::new();
-    }
-    let current = membership
-        .axis_values
-        .get(axis)
-        .cloned()
-        .unwrap_or_default();
-    let current_index = axis_def
+    if !axis_definition
         .values
         .iter()
-        .position(|value| *value == current)
-        .unwrap_or(0);
-    for step in 1..=axis_def.values.len() {
-        let index = (current_index + step) % axis_def.values.len();
-        let Some(candidate_value) = axis_def.values.get(index) else {
-            continue;
-        };
-        let mut target_values = membership.axis_values.clone();
-        target_values.insert(axis.to_string(), candidate_value.clone());
-        let target = set.members.iter().copied().find(|member| {
-            components
-                .def(*member)
-                .and_then(|member_def| member_def.variant_of.as_ref())
-                .is_some_and(|member_membership| member_membership.axis_values == target_values)
-        });
-        if let Some(target) = target {
-            if target == instance.component {
-                return Vec::new();
-            }
-            return vec![Operation::SwapInstance {
-                id,
-                old: instance.component,
-                new: target,
-            }];
-        }
+        .any(|value| value == selected_value)
+        || membership
+            .axis_values
+            .get(axis)
+            .is_some_and(|value| value == selected_value)
+    {
+        return Vec::new();
     }
-    Vec::new()
+
+    let mut target_values = membership.axis_values.clone();
+    target_values.insert(axis.to_string(), selected_value.to_string());
+    let Some(target) = set.members.iter().copied().find(|member| {
+        components
+            .def(*member)
+            .and_then(|member_definition| member_definition.variant_of.as_ref())
+            .is_some_and(|member_membership| member_membership.axis_values == target_values)
+    }) else {
+        return Vec::new();
+    };
+    if target == instance.component {
+        return Vec::new();
+    }
+    vec![Operation::SwapInstance {
+        id,
+        old: instance.component,
+        new: target,
+    }]
 }
 
 pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operation> {
@@ -412,18 +406,14 @@ pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) ->
 pub(crate) fn read_field_text(doc: &Doc, field: &InspectorField) -> Option<String> {
     let scene = &doc.scene;
     match field {
-        InspectorField::InstanceText { id, path } => {
-            crate::instance_text::text_clones(doc, *id)
-                .into_iter()
-                .find(|(clone_path, ..)| clone_path == path)
-                .map(|(_, _, content)| content)
-        }
-        InspectorField::CommentText { page, id } => {
-            crate::comments::read_comments(doc, *page)
-                .into_iter()
-                .find(|comment| comment.id == *id)
-                .map(|comment| comment.text)
-        }
+        InspectorField::InstanceText { id, path } => crate::instance_text::text_clones(doc, *id)
+            .into_iter()
+            .find(|(clone_path, ..)| clone_path == path)
+            .map(|(_, _, content)| content),
+        InspectorField::CommentText { page, id } => crate::comments::read_comments(doc, *page)
+            .into_iter()
+            .find(|comment| comment.id == *id)
+            .map(|comment| comment.text),
         InspectorField::X(id) => scene.world_bounds(*id).map(|b| format_number(b.min_x)),
         InspectorField::Y(id) => scene.world_bounds(*id).map(|b| format_number(b.min_y)),
         InspectorField::Width(id) => scene
@@ -620,7 +610,11 @@ pub(crate) fn instance_prop_operations(
 /// Replace one solid color across every selected node — the multi-select
 /// "Selection colors" edit. One `ReplaceData` per node that actually uses the
 /// color; the caller batches them into a single undo step.
-pub(crate) fn selection_color_operations(doc: &Doc, from: FantaColor, to: FantaColor) -> Vec<Operation> {
+pub(crate) fn selection_color_operations(
+    doc: &Doc,
+    from: FantaColor,
+    to: FantaColor,
+) -> Vec<Operation> {
     doc.selection
         .iter()
         .copied()
@@ -799,7 +793,12 @@ pub(crate) fn combine_as_variants_operations(doc: &Doc) -> Vec<Operation> {
 /// Write one screen-axis gap of an auto-layout frame. The horizontal gap is
 /// the primary spacing of a horizontal stack but the counter (wrap) spacing of
 /// a vertical one; see [`auto_layout_snapshot`].
-pub(crate) fn layout_gap_operations(doc: &Doc, id: NodeId, text: &str, horizontal: bool) -> Vec<Operation> {
+pub(crate) fn layout_gap_operations(
+    doc: &Doc,
+    id: NodeId,
+    text: &str,
+    horizontal: bool,
+) -> Vec<Operation> {
     let Some(gap) = parse_number(text).map(|gap| gap.max(0.0)) else {
         return Vec::new();
     };
@@ -846,7 +845,12 @@ pub(crate) fn layout_padding_operations(
 /// same math the canvas resize handles use so rotation is preserved. The world
 /// resize is rebased into the parent's frame to produce the new local
 /// transform.
-pub(crate) fn resize_operations(doc: &Doc, id: NodeId, new_size: f64, horizontal: bool) -> Vec<Operation> {
+pub(crate) fn resize_operations(
+    doc: &Doc,
+    id: NodeId,
+    new_size: f64,
+    horizontal: bool,
+) -> Vec<Operation> {
     if new_size <= 0.0 {
         return Vec::new();
     }
@@ -1095,7 +1099,11 @@ pub(crate) fn set_fill_color(data: &mut NodeData, index: usize, color: FantaColo
 }
 
 /// A mutable handle to the paint at `index` in either the fill or stroke list.
-pub(crate) fn paint_slot_mut(data: &mut NodeData, index: usize, is_stroke: bool) -> Option<&mut Fill> {
+pub(crate) fn paint_slot_mut(
+    data: &mut NodeData,
+    index: usize,
+    is_stroke: bool,
+) -> Option<&mut Fill> {
     if is_stroke {
         stroke_list_mut(data)
             .and_then(|strokes| strokes.get_mut(index))
@@ -1107,7 +1115,12 @@ pub(crate) fn paint_slot_mut(data: &mut NodeData, index: usize, is_stroke: bool)
 
 /// Replace the paint at `index` with a gradient fill, preserving the paint's
 /// per-paint blend mode when it already carried one.
-pub(crate) fn set_paint_gradient(data: &mut NodeData, index: usize, is_stroke: bool, gradient: Gradient) {
+pub(crate) fn set_paint_gradient(
+    data: &mut NodeData,
+    index: usize,
+    is_stroke: bool,
+    gradient: Gradient,
+) {
     if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
         let blend = paint_blend(paint);
         *paint = Fill::Gradient { gradient, blend };
@@ -1117,7 +1130,12 @@ pub(crate) fn set_paint_gradient(data: &mut NodeData, index: usize, is_stroke: b
 /// Convert the paint at `index` to `kind`. Solid ⇄ gradient seeding matches
 /// Figma: a solid becomes a two-stop gradient seeded from its color, and a
 /// gradient flattens back to its representative (first-stop) color.
-pub(crate) fn convert_paint_kind(data: &mut NodeData, index: usize, is_stroke: bool, kind: PaintKind) {
+pub(crate) fn convert_paint_kind(
+    data: &mut NodeData,
+    index: usize,
+    is_stroke: bool,
+    kind: PaintKind,
+) {
     let Some(paint) = paint_slot_mut(data, index, is_stroke) else {
         return;
     };
@@ -1241,6 +1259,7 @@ pub(crate) fn run_png_export(job: &ExportJob) -> Result<PathBuf> {
         variables: &job.doc.variables,
         active_modes: &job.doc.active_modes,
         mode_generation: 0,
+        motion: None,
         playback: None,
         dark_ui: false,
     };
@@ -1340,11 +1359,11 @@ mod tests {
     use fanta_doc::{ComponentDef, ComponentPropKind, ImageFitMode, InstanceNode};
 
     use crate::color_picker::GradientKind;
+    use crate::properties_snapshot::tests::{frame_group, text_node, vector_with_fill};
     use crate::properties_snapshot::{
         HiddenPaintAlpha, opaque_paint_alpha, paint_alpha, paint_is_visible, set_paint_alpha,
         zeroed_paint_alpha,
     };
-    use crate::properties_snapshot::tests::{frame_group, text_node, vector_with_fill};
 
     #[test]
     fn font_weight_dropdown_labels_the_ladder_and_keeps_custom_weights() {
@@ -1787,6 +1806,63 @@ mod tests {
         doc.scene.insert(instance).expect("inserting the instance");
         let _ = child_id;
         (doc, component, master_root_id, instance_id)
+    }
+
+    #[test]
+    fn variant_dropdown_selects_the_exact_requested_member() {
+        let mut doc = Doc::new();
+        let set_id = ComponentId::new();
+        let mut members = Vec::new();
+        for value in ["Small", "Large"] {
+            let root = CanvasNode::new(NodeData::Group(frame_group()));
+            let root_id = root.id;
+            doc.scene.insert(root).expect("inserting a variant root");
+            let component_id = ComponentId::new();
+            let mut definition = ComponentDef::new(component_id, root_id, value);
+            definition.variant_of = Some(ComponentSetMembership {
+                set: set_id,
+                axis_values: std::collections::BTreeMap::from([(
+                    "Size".to_string(),
+                    value.to_string(),
+                )]),
+            });
+            doc.components.defs.insert(component_id, definition);
+            members.push(component_id);
+        }
+        let small = members.first().copied().expect("the small member");
+        let large = members.get(1).copied().expect("the large member");
+        doc.components.sets.insert(
+            set_id,
+            ComponentSet {
+                id: set_id,
+                name: "Button".to_string(),
+                axes: vec![VariantAxis {
+                    name: "Size".to_string(),
+                    values: vec!["Small".to_string(), "Large".to_string()],
+                }],
+                members: members.clone(),
+                default_variant: small,
+            },
+        );
+        let instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: small,
+            overrides: Vec::new(),
+            prop_values: std::collections::BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [120.0, 60.0],
+        }));
+        let instance_id = instance.id;
+        doc.scene.insert(instance).expect("inserting an instance");
+
+        let operations = variant_select_operations(&doc, instance_id, "Size", "Large");
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            operations.first(),
+            Some(Operation::SwapInstance { old, new, .. })
+                if *old == small && *new == large
+        ));
+        assert!(variant_select_operations(&doc, instance_id, "Size", "Small").is_empty());
+        assert!(variant_select_operations(&doc, instance_id, "Size", "Unknown").is_empty());
     }
 
     /// The panel's per-instance "Content" row: editing it writes a text

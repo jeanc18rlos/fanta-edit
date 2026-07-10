@@ -19,7 +19,7 @@ use core_video::{
     pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA},
 };
 use fanta_canvas::ResizeHandle;
-use fanta_doc::{NodeId, Viewport};
+use fanta_doc::{AnimationClipId, MotionEvaluation, NodeId, Viewport};
 use fanta_render::{RasterRenderer, RenderInputs};
 use fanta_tools::{SnapGuideAxis, ToolOverlay};
 #[cfg(target_os = "macos")]
@@ -80,7 +80,23 @@ pub(crate) struct RenderedCanvas {
     size: (u32, u32),
     viewport: Viewport,
     revision: u64,
+    motion_frame: Option<MotionFrameKey>,
     page_root: Option<NodeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MotionFrameKey {
+    clip: AnimationClipId,
+    playhead_ms: u32,
+}
+
+impl From<&MotionEvaluation> for MotionFrameKey {
+    fn from(evaluation: &MotionEvaluation) -> Self {
+        Self {
+            clip: evaluation.clip,
+            playhead_ms: evaluation.playhead_ms,
+        }
+    }
 }
 
 enum PaintCanvas {
@@ -127,6 +143,7 @@ struct SurfaceKey {
     viewport_zoom: f64,
     page_root: Option<NodeId>,
     revision: u64,
+    motion_frame: Option<MotionFrameKey>,
 }
 
 #[cfg(target_os = "macos")]
@@ -172,6 +189,7 @@ fn frame_decision(
     if cached.size == requested.size
         && cached.page_root == requested.page_root
         && cached.revision == requested.revision
+        && cached.motion_frame == requested.motion_frame
         && within_render_interval
     {
         let cached_zoom = cached.viewport_zoom.max(f64::EPSILON);
@@ -331,13 +349,15 @@ impl MacGpuRenderer {
         visible_logical: (f64, f64),
         viewport: Viewport,
         scale_factor: f32,
+        motion: Option<&MotionEvaluation>,
     ) -> Result<GpuFrame> {
         let key = SurfaceKey {
             size,
             viewport_center: viewport.center,
             viewport_zoom: viewport.zoom,
             page_root,
-            revision: document.doc.scene.revision(),
+            revision: document.render_generation(),
+            motion_frame: motion.map(MotionFrameKey::from),
         };
         if let Some(cached) = &self.cached {
             let within_render_interval = self
@@ -410,7 +430,8 @@ impl MacGpuRenderer {
             components: &document.doc.components,
             variables: &document.doc.variables,
             active_modes: &document.doc.active_modes,
-            mode_generation: 0,
+            mode_generation: document.render_generation(),
+            motion,
             playback: None,
             dark_ui: false,
         };
@@ -469,6 +490,7 @@ fn render_fig_canvas(
     height: u32,
     viewport: Viewport,
     scale_factor: f32,
+    motion: Option<&MotionEvaluation>,
 ) -> Result<Arc<RenderImage>> {
     let mut renderer =
         RasterRenderer::new(width, height).context("creating Skia raster surface")?;
@@ -484,7 +506,8 @@ fn render_fig_canvas(
         components: &document.doc.components,
         variables: &document.doc.variables,
         active_modes: &document.doc.active_modes,
-        mode_generation: 0,
+        mode_generation: document.render_generation(),
+        motion,
         playback: None,
         dark_ui: false,
     };
@@ -516,23 +539,35 @@ impl FigView {
         size: (u32, u32),
         viewport: Viewport,
         scale_factor: f32,
+        motion: Option<&MotionEvaluation>,
     ) -> Result<Arc<RenderImage>> {
-        let revision = document.doc.scene.revision();
+        let revision = document.render_generation();
+        let motion_frame = motion.map(MotionFrameKey::from);
         if let Some(rendered) = &self.rendered_canvas
             && rendered.size == size
             && rendered.page_root == page_root
             && rendered.revision == revision
+            && rendered.motion_frame == motion_frame
             && same_viewport(rendered.viewport, viewport)
         {
             return Ok(rendered.image.clone());
         }
 
-        let image = render_fig_canvas(document, page_root, size.0, size.1, viewport, scale_factor)?;
+        let image = render_fig_canvas(
+            document,
+            page_root,
+            size.0,
+            size.1,
+            viewport,
+            scale_factor,
+            motion,
+        )?;
         self.rendered_canvas = Some(RenderedCanvas {
             image: image.clone(),
             size,
             viewport,
             revision,
+            motion_frame,
             page_root,
         });
         Ok(image)
@@ -724,6 +759,7 @@ impl Element for CanvasElement {
                 .map(Some)
                 .or_else(|| document.page(this.selected_page_index()).map(|page| page.root))
                 .ok_or_else(|| anyhow!("Figma document has no renderable pages"))?;
+            let motion = this.motion_evaluation(document, cx);
 
             #[cfg(target_os = "macos")]
             {
@@ -739,6 +775,7 @@ impl Element for CanvasElement {
                     bounds_size(bounds),
                     viewport,
                     scale_factor,
+                    motion.as_ref(),
                 );
                 this.store_gpu_renderer(gpu_renderer);
                 match gpu_result {
@@ -760,7 +797,14 @@ impl Element for CanvasElement {
                 }
             }
 
-            this.render_cpu_canvas(document, page_root, render_size, viewport, scale_factor)
+            this.render_cpu_canvas(
+                document,
+                page_root,
+                render_size,
+                viewport,
+                scale_factor,
+                motion.as_ref(),
+            )
                 .map(PaintCanvas::Image)
         });
         crate::report_slow("canvas scene render", paint_started);
@@ -801,6 +845,138 @@ impl Element for CanvasElement {
     }
 }
 
+pub(crate) fn evaluated_world_transform(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    motion: Option<&MotionEvaluation>,
+) -> Option<fanta_doc::Transform2D> {
+    let node = scene.get(id)?;
+    let mut ancestors: Vec<_> = scene.ancestors_of(id).collect();
+    ancestors.reverse();
+
+    let mut world = fanta_doc::Transform2D::IDENTITY;
+    for ancestor in ancestors.into_iter().chain(std::iter::once(node)) {
+        let local = motion
+            .map(|motion| motion.apply_to_node(ancestor).transform)
+            .unwrap_or(ancestor.transform);
+        world = local.then(&world);
+    }
+    Some(world)
+}
+
+pub(crate) fn evaluated_world_bounds(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    motion: Option<&MotionEvaluation>,
+) -> Option<fanta_doc::Bounds> {
+    let node = scene.get(id)?;
+    let evaluated = motion.map(|motion| motion.apply_to_node(node));
+    let node = evaluated.as_ref().unwrap_or(node);
+    if let Some(local) = node.data.local_bounds() {
+        return local.try_transformed(&evaluated_world_transform(scene, id, motion)?);
+    }
+
+    let mut bounds: Option<fanta_doc::Bounds> = None;
+    for &child in scene.children_of(Some(id)) {
+        if let Some(child_bounds) = evaluated_world_bounds(scene, child, motion) {
+            bounds = Some(match bounds {
+                Some(bounds) => bounds.union(&child_bounds),
+                None => child_bounds,
+            });
+        }
+    }
+    bounds
+}
+
+pub(crate) fn evaluated_hit_test_screen(
+    scene: &fanta_doc::Scene,
+    motion: &MotionEvaluation,
+    viewport: &Viewport,
+    screen_size: DVec2,
+    screen_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
+    evaluated_hit_test(scene, motion, world_point, precision, active_page)
+}
+
+fn evaluated_hit_test(
+    scene: &fanta_doc::Scene,
+    motion: &MotionEvaluation,
+    world_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    if let Some(page) = active_page {
+        let exclude_root = scene.get(page).is_some_and(|node| node.parent.is_none());
+        return evaluated_hit_test_subtree(
+            scene,
+            motion,
+            page,
+            world_point,
+            precision,
+            exclude_root,
+        );
+    }
+
+    scene.roots().iter().rev().find_map(|root| {
+        evaluated_hit_test_subtree(scene, motion, *root, world_point, precision, false)
+    })
+}
+
+fn evaluated_hit_test_subtree(
+    scene: &fanta_doc::Scene,
+    motion: &MotionEvaluation,
+    id: NodeId,
+    world_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    exclude_self: bool,
+) -> Option<NodeId> {
+    let committed = scene.get(id)?;
+    let node = motion.apply_to_node(committed);
+    if node
+        .flags
+        .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED)
+    {
+        return None;
+    }
+    let bounds = evaluated_world_bounds(scene, id, Some(motion))?;
+    if !bounds.contains_point(world_point) {
+        return None;
+    }
+
+    if matches!(node.data, fanta_doc::NodeData::Boolean(_)) {
+        return (!exclude_self).then_some(id);
+    }
+    for &child in scene.children_of(Some(id)).iter().rev() {
+        if let Some(hit) =
+            evaluated_hit_test_subtree(scene, motion, child, world_point, precision, false)
+        {
+            return Some(hit);
+        }
+    }
+    if exclude_self {
+        return None;
+    }
+    if let fanta_doc::NodeData::Group(group) = &node.data {
+        return group.is_frame_surface().then_some(id);
+    }
+    if precision == fanta_canvas::HitPrecision::Path
+        && let fanta_doc::NodeData::Vector(vector) = &node.data
+    {
+        let transform = evaluated_world_transform(scene, id, Some(motion))?;
+        let [a, b, c, d, _, _] = transform.to_components();
+        let determinant = a * d - b * c;
+        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+            return None;
+        }
+        let local_point = transform.inverse().transform_point(world_point);
+        return fanta_canvas::point_in_path(&vector.path, local_point).then_some(id);
+    }
+    Some(id)
+}
+
 /// A top-level frame's name label to paint above its top-left corner.
 struct FrameLabel {
     /// The frame's world bounds; its projected top-left anchors the label.
@@ -814,6 +990,8 @@ struct FrameLabel {
 /// pass (which needs `&mut App` for text) no longer holds that borrow.
 struct OverlayData {
     frame_labels: Vec<FrameLabel>,
+    hovered_bounds: Option<fanta_doc::Bounds>,
+    selected_bounds: Vec<fanta_doc::Bounds>,
     /// Union of every selected node's world bounds, for the size badge.
     selection_union: Option<fanta_doc::Bounds>,
     /// The selection's world size shown in the badge, once nodes are selected.
@@ -842,6 +1020,8 @@ impl CanvasElement {
     fn collect_overlay_data(&self, cx: &App) -> OverlayData {
         let mut data = OverlayData {
             frame_labels: Vec::new(),
+            hovered_bounds: None,
+            selected_bounds: Vec::new(),
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
@@ -853,6 +1033,7 @@ impl CanvasElement {
             return data;
         };
         let doc = &document.doc;
+        let motion = view.motion_evaluation(document, cx);
 
         // Frame name labels: only frame-surface groups that are direct children
         // of the active page (top-level frames/sections, like Figma) — nested
@@ -867,7 +1048,7 @@ impl CanvasElement {
             if !is_frame {
                 continue;
             }
-            let Some(world) = doc.scene.world_bounds(id) else {
+            let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) else {
                 continue;
             };
             let name = node.name.trim();
@@ -881,7 +1062,8 @@ impl CanvasElement {
 
         // Selection union + size badge.
         for &id in doc.selection.iter() {
-            if let Some(world) = doc.scene.world_bounds(id) {
+            if let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) {
+                data.selected_bounds.push(world);
                 data.selection_union = Some(match data.selection_union {
                     Some(existing) => existing.union(&world),
                     None => world,
@@ -891,6 +1073,11 @@ impl CanvasElement {
         if let Some(union) = data.selection_union {
             data.selection_size = Some((union.width(), union.height()));
         }
+
+        data.hovered_bounds = view
+            .hovered_node()
+            .filter(|hovered| !doc.selection.contains(*hovered))
+            .and_then(|hovered| evaluated_world_bounds(&doc.scene, hovered, motion.as_ref()));
 
         // Comment pins for the active page (annotation overlay, not scene
         // content, so they paint above the rendered canvas like the badges).
@@ -913,8 +1100,10 @@ impl CanvasElement {
         if let (&[selected_id], Some(hovered_id)) = (doc.selection.as_slice(), view.hovered_node())
             && hovered_id != selected_id
             && !is_related(&doc.scene, selected_id, hovered_id)
-            && let Some(selected_world) = doc.scene.world_bounds(selected_id)
-            && let Some(hovered_world) = doc.scene.world_bounds(hovered_id)
+            && let Some(selected_world) =
+                evaluated_world_bounds(&doc.scene, selected_id, motion.as_ref())
+            && let Some(hovered_world) =
+                evaluated_world_bounds(&doc.scene, hovered_id, motion.as_ref())
         {
             data.measure_segments = edge_gaps(selected_world, hovered_world);
         }
@@ -927,10 +1116,6 @@ impl CanvasElement {
 
         let view = self.view.read(cx);
         let Some(viewport) = view.viewport() else {
-            return;
-        };
-        let item = view.item().read(cx);
-        let Some(document) = item.document() else {
             return;
         };
 
@@ -957,10 +1142,7 @@ impl CanvasElement {
 
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             // Hover highlight under the selection so the selected outline wins.
-            if let Some(hovered) = view.hovered_node()
-                && !document.doc.selection.contains(hovered)
-                && let Some(world) = document.doc.scene.world_bounds(hovered)
-            {
+            if let Some(world) = overlay_data.hovered_bounds {
                 window.paint_quad(gpui::outline(
                     project_bounds(world),
                     accent.opacity(0.55),
@@ -968,18 +1150,14 @@ impl CanvasElement {
                 ));
             }
 
-            let selected: Vec<NodeId> = document.doc.selection.iter().copied().collect();
             let mut selection_union: Option<fanta_doc::Bounds> = None;
-            for id in &selected {
-                let Some(world) = document.doc.scene.world_bounds(*id) else {
-                    continue;
-                };
+            for world in &overlay_data.selected_bounds {
                 selection_union = Some(match selection_union {
-                    Some(existing) => existing.union(&world),
-                    None => world,
+                    Some(existing) => existing.union(world),
+                    None => *world,
                 });
                 window.paint_quad(gpui::outline(
-                    project_bounds(world),
+                    project_bounds(*world),
                     accent,
                     BorderStyle::Solid,
                 ));
@@ -1216,7 +1394,11 @@ impl CanvasElement {
                 } else {
                     avatar_color(&pin.author)
                 };
-                let fill = if pin.resolved { fill.opacity(0.5) } else { fill };
+                let fill = if pin.resolved {
+                    fill.opacity(0.5)
+                } else {
+                    fill
+                };
                 paint_comment_pin(
                     anchor,
                     fill,
@@ -1462,12 +1644,9 @@ fn paint_comment_pin(
     let origin = point(anchor.x, anchor.y - px(size));
     let polygon = pin_unit_polygon();
     let build = |offset_y: f32| -> Option<gpui::Path<Pixels>> {
-        let mut points = polygon.iter().map(|(x, y)| {
-            point(
-                origin.x + px(x * size),
-                origin.y + px(y * size + offset_y),
-            )
-        });
+        let mut points = polygon
+            .iter()
+            .map(|(x, y)| point(origin.x + px(x * size), origin.y + px(y * size + offset_y)));
         let first = points.next()?;
         let mut builder = PathBuilder::fill();
         builder.move_to(first);
@@ -1533,7 +1712,8 @@ fn paint_comment_pin(
             size: gpui::size((chip_radius + px(1.6)) * 2.0, (chip_radius + px(1.6)) * 2.0),
         };
         window.paint_quad(
-            gpui::fill(underlay, gpui::white()).corner_radii(gpui::Corners::all(chip_radius + px(1.6))),
+            gpui::fill(underlay, gpui::white())
+                .corner_radii(gpui::Corners::all(chip_radius + px(1.6))),
         );
         let chip = Bounds {
             origin: point(chip_center.x - chip_radius, chip_center.y - chip_radius),
@@ -1641,7 +1821,104 @@ pub(crate) fn render_size_for_bounds(bounds: Bounds<Pixels>, scale_factor: f32) 
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
-    use fanta_doc::Bounds as WorldBounds;
+    use fanta_doc::{
+        AnimationClipId, Bounds as WorldBounds, CanvasNode, Color, GroupNode, MotionProperty,
+        MotionTarget, NodeData, ResolvedVarValue, Scene, Transform2D, VectorNode,
+    };
+    use std::collections::BTreeMap;
+
+    fn position_evaluation(node: NodeId, x: f64) -> MotionEvaluation {
+        MotionEvaluation {
+            clip: AnimationClipId::from_u128(1),
+            playhead_ms: 500,
+            overrides: BTreeMap::from([(
+                MotionTarget::new(node, MotionProperty::PositionX),
+                ResolvedVarValue::Float { value: x },
+            )]),
+        }
+    }
+
+    #[test]
+    fn evaluated_bounds_compose_motion_through_animated_ancestors()
+    -> Result<(), fanta_doc::SceneError> {
+        let mut scene = Scene::new();
+        let mut parent = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        parent.transform = Transform2D::translation(10.0, 20.0);
+        let parent_id = parent.id;
+        scene.insert(parent)?;
+
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::WHITE,
+        )));
+        child.parent = Some(parent_id);
+        child.transform = Transform2D::translation(5.0, 6.0);
+        let child_id = child.id;
+        scene.insert(child)?;
+
+        let motion = position_evaluation(parent_id, 100.0);
+        assert_eq!(
+            evaluated_world_bounds(&scene, child_id, Some(&motion)),
+            Some(WorldBounds::from_xywh(105.0, 26.0, 10.0, 10.0))
+        );
+        assert_eq!(
+            evaluated_world_bounds(&scene, parent_id, Some(&motion)),
+            Some(WorldBounds::from_xywh(105.0, 26.0, 10.0, 10.0))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn evaluated_hit_testing_uses_the_sampled_position_and_paint_order()
+    -> Result<(), fanta_doc::SceneError> {
+        let mut scene = Scene::new();
+        let lower = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::BLACK,
+        )));
+        let lower_id = lower.id;
+        scene.insert(lower)?;
+
+        let mut animated = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::WHITE,
+        )));
+        animated.index = scene.next_root_index();
+        let animated_id = animated.id;
+        scene.insert(animated)?;
+        let motion = position_evaluation(animated_id, 100.0);
+
+        assert_eq!(
+            evaluated_hit_test(
+                &scene,
+                &motion,
+                DVec2::new(5.0, 5.0),
+                fanta_canvas::HitPrecision::Bounds,
+                None,
+            ),
+            Some(lower_id)
+        );
+        assert_eq!(
+            evaluated_hit_test(
+                &scene,
+                &motion,
+                DVec2::new(105.0, 5.0),
+                fanta_canvas::HitPrecision::Bounds,
+                None,
+            ),
+            Some(animated_id)
+        );
+        Ok(())
+    }
 
     #[test]
     fn side_by_side_boxes_have_one_horizontal_gap() {
@@ -1773,6 +2050,7 @@ mod tests {
             viewport_zoom: zoom,
             page_root: None,
             revision,
+            motion_frame: None,
         }
     }
 
@@ -1797,6 +2075,24 @@ mod tests {
         // frame would show stale content.
         let cached = surface_key([0.0, 0.0], 1.0, 7);
         let requested = surface_key([0.0, 0.0], 1.0, 8);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn a_new_motion_sample_always_renders_fresh() {
+        let mut cached = surface_key([0.0, 0.0], 1.0, 7);
+        cached.motion_frame = Some(MotionFrameKey {
+            clip: AnimationClipId::from_u128(11),
+            playhead_ms: 100,
+        });
+        let mut requested = cached;
+        requested.motion_frame = Some(MotionFrameKey {
+            clip: AnimationClipId::from_u128(11),
+            playhead_ms: 116,
+        });
         assert_eq!(
             frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::RenderFresh

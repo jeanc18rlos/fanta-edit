@@ -37,6 +37,10 @@ pub struct FigItem {
     pub(crate) document: FigDocumentState,
     project_root: Option<PathBuf>,
     dirty: bool,
+    /// Dirty state before the first transient preview frame. Cleared by a
+    /// committed edit; canceling a preview restores it so opening and closing
+    /// an inspector gesture without a change does not dirty the document.
+    preview_dirty_before: Option<bool>,
     /// The project changed on disk while the canvas had unsaved edits.
     conflict: bool,
     /// Ignore worktree events until this instant; set around our own project
@@ -57,6 +61,10 @@ pub enum FigItemEvent {
     EditedTransient,
     /// The selection or another non-persistent view state changed.
     SelectionChanged,
+    /// The caret or character selection inside an active text-edit session
+    /// changed, or its effective typography changed. This refreshes inspector
+    /// values without changing which document node the inspector is bound to.
+    TextSelectionChanged,
     /// The document finished (re)loading or was saved.
     StateChanged,
     /// The project diverged from disk while the canvas had unsaved edits, or
@@ -129,6 +137,10 @@ pub struct FigDocument {
     /// edit, which includes text measurement and is far too slow to run per
     /// interaction on large pages.
     uses_auto_layout: bool,
+    /// Monotonic render epoch for every persistent or transient document
+    /// mutation, including variables and motion edits that do not change the
+    /// scene graph's own revision.
+    render_generation: u64,
 }
 
 pub struct FigPage {
@@ -191,7 +203,16 @@ impl FigDocument {
             raw_assets: Arc::new(raw_assets),
             gpui_images,
             uses_auto_layout,
+            render_generation: 0,
         }
+    }
+
+    pub(crate) fn render_generation(&self) -> u64 {
+        self.render_generation
+    }
+
+    fn advance_render_generation(&mut self) {
+        self.render_generation = self.render_generation.wrapping_add(1);
     }
 
     /// Every distinct font family the document's text nodes reference (node
@@ -390,6 +411,7 @@ impl project::ProjectItem for FigItem {
                     },
                     project_root,
                     dirty: false,
+                    preview_dirty_before: None,
                     conflict: false,
                     suppress_watcher_until: None,
                     reload_task: None,
@@ -561,6 +583,7 @@ impl FigItem {
         }
         self.document = FigDocumentState::Ready(document);
         self.dirty = false;
+        self.preview_dirty_before = None;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
         cx.notify();
@@ -621,6 +644,8 @@ impl FigItem {
         }
         let active_page = document.doc.active_page();
         document.resolve_after_edit(active_page);
+        document.advance_render_generation();
+        self.preview_dirty_before = None;
         self.mark_edited(false, cx);
         Ok(())
     }
@@ -651,9 +676,15 @@ impl FigItem {
                 }
                 let active_page = document.doc.active_page();
                 document.resolve_after_edit(active_page);
+                document.advance_render_generation();
+                self.preview_dirty_before = None;
                 self.mark_edited(false, cx);
             }
             DocChange::ContentPreview => {
+                if self.preview_dirty_before.is_none() {
+                    self.preview_dirty_before = Some(self.dirty);
+                }
+                document.advance_render_generation();
                 self.mark_edited(true, cx);
             }
         }
@@ -669,6 +700,8 @@ impl FigItem {
         if did {
             let active_page = document.doc.active_page();
             document.resolve_after_edit(active_page);
+            document.advance_render_generation();
+            self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
         Ok(did)
@@ -683,6 +716,8 @@ impl FigItem {
         if did {
             let active_page = document.doc.active_page();
             document.resolve_after_edit(active_page);
+            document.advance_render_generation();
+            self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
         Ok(did)
@@ -701,6 +736,17 @@ impl FigItem {
             cx.emit(FigItemEvent::Edited);
         }
         cx.notify();
+    }
+
+    pub(crate) fn finish_content_preview(&mut self, committed: bool, cx: &mut Context<Self>) {
+        let Some(dirty_before) = self.preview_dirty_before.take() else {
+            return;
+        };
+        if !committed && self.dirty != dirty_before {
+            self.dirty = dirty_before;
+            cx.emit(FigItemEvent::Edited);
+            cx.notify();
+        }
     }
 
     /// Persist the current document state, materializing an on-disk Fanta
@@ -760,6 +806,7 @@ impl FigItem {
                         this.project_root = Some(target.clone());
                     }
                     this.dirty = false;
+                    this.preview_dirty_before = None;
                     this.set_conflict(false, cx);
                     cx.emit(FigItemEvent::StateChanged);
                     cx.notify();
@@ -794,6 +841,7 @@ pub(crate) fn ready_item_for_test(
             document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
             project_root: None,
             dirty: false,
+            preview_dirty_before: None,
             conflict: false,
             suppress_watcher_until: None,
             reload_task: None,
@@ -1348,6 +1396,7 @@ mod tests {
                 document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
                 project_root,
                 dirty: false,
+                preview_dirty_before: None,
                 conflict: false,
                 suppress_watcher_until: None,
                 reload_task: None,
@@ -1509,6 +1558,81 @@ mod tests {
                 item.document().expect("ready").uses_auto_layout,
                 "introducing the first auto layout must open the re-solve gate"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn render_generation_tracks_content_but_not_selection_changes(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            doc_with_one_page(),
+            cx,
+        );
+
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("ready")
+                .render_generation()),
+            0
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |_| ((), DocChange::Selection));
+        });
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("ready")
+                .render_generation()),
+            0
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+        });
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("ready")
+                .render_generation()),
+            1
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |_| ((), DocChange::Content));
+        });
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("ready")
+                .render_generation()),
+            2
+        );
+    }
+
+    #[gpui::test]
+    async fn canceling_a_content_preview_restores_the_prior_dirty_state(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            doc_with_one_page(),
+            cx,
+        );
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+            assert!(item.dirty);
+            item.finish_content_preview(false, cx);
+            assert!(!item.dirty);
+
+            item.with_document(cx, |_| ((), DocChange::Content));
+            assert!(item.dirty);
+            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+            item.finish_content_preview(false, cx);
+            assert!(item.dirty);
         });
     }
 }
