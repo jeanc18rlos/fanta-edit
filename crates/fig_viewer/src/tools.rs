@@ -15,8 +15,10 @@ use glam::DVec2;
 use gpui::{CursorStyle, Modifiers, MouseButton};
 use ui::IconName;
 
-/// Fill assigned to newly drawn shapes until the shell grows a color palette.
-const NEW_SHAPE_FILL: Color = Color::rgb(0xD9, 0xD9, 0xD9);
+/// Fill (and text color) assigned to newly drawn shapes/text until the shell
+/// grows a full color palette UI. Black default so newly added elements land
+/// with visible/opaque color (not low-contrast gray or "without color").
+const NEW_SHAPE_FILL: Color = Color::BLACK;
 
 /// The floating toolbar's tools, grouped Figma-style. Each group renders as one
 /// button showing the group's active/last-used tool plus a caret that opens a
@@ -185,6 +187,21 @@ impl ToolShell {
         self.kind = kind;
         self.tool = kind.build();
         self.tool.activate(ctx);
+        self.overlays.clear();
+        self.cursor = None;
+    }
+
+    /// Switch tools when the canvas has not produced bounds/viewport yet.
+    ///
+    /// Toolbar state should still update immediately during initial layout or
+    /// after a document reload; the next real tool event will be delivered with
+    /// a full [`ToolContext`].
+    pub fn activate_without_context(&mut self, kind: ToolKind) {
+        if self.kind == kind {
+            return;
+        }
+        self.kind = kind;
+        self.tool = kind.build();
         self.overlays.clear();
         self.cursor = None;
     }

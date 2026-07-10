@@ -6509,7 +6509,6 @@ dependencies = [
  "fanta-doc",
  "glam 0.32.1",
  "serde",
- "serde_json",
  "smallvec",
 ]
 
@@ -6533,7 +6532,6 @@ version = "0.1.0"
 dependencies = [
  "fanta-doc",
  "flate2",
- "serde",
  "serde_json",
  "thiserror 2.0.17",
  "tracing",
@@ -6545,7 +6543,6 @@ dependencies = [
 name = "fanta-fnx"
 version = "0.1.0"
 dependencies = [
- "fanta-doc",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -6560,7 +6557,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror 2.0.17",
  "tracing",
  "zip 2.4.2",
@@ -6572,10 +6568,8 @@ version = "0.1.0"
 dependencies = [
  "fanta-doc",
  "fanta-text",
- "image",
  "serde_json",
  "skia-safe",
- "smallvec",
  "thiserror 2.0.17",
 ]
 
@@ -6586,9 +6580,9 @@ dependencies = [
  "dirs",
  "fanta-doc",
  "serde",
- "serde_json",
  "skia-safe",
  "thiserror 2.0.17",
+ "tracing",
  "unicode-segmentation",
  "ureq",
  "zip 2.4.2",

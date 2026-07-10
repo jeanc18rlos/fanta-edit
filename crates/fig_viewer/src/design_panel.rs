@@ -252,7 +252,16 @@ impl FantaDesignPanel {
         window: &mut Window,
         cx: &mut Context<FigView>,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::build(fs, Some(active_view), window, cx, Vec::new()))
+        let panel = cx.new(|cx| Self::build(fs, None, window, cx, Vec::new()));
+        cx.defer({
+            let panel = panel.clone();
+            move |cx| {
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.set_active_view(Some(active_view), cx);
+                });
+            }
+        });
+        panel
     }
 
     fn new(
@@ -2109,6 +2118,7 @@ fn layer_icon(node: &CanvasNode) -> IconName {
         NodeData::Video(_) => IconName::PlayOutlined,
         NodeData::Audio(_) => IconName::AudioOn,
         NodeData::Instance(_) => IconName::Sparkle,
+        NodeData::Boolean(_) => IconName::Blocks,
         NodeData::NodeGraph(_)
         | NodeData::Model3d(_)
         | NodeData::AiArtifact(_)
@@ -2235,7 +2245,7 @@ impl Panel for FantaDesignPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{BitmapNode, BlendMode, ImageFitMode};
+    use fanta_doc::{BitmapNode, BlendMode, ImageAdjust, ImageFitMode};
 
     fn image_fill(asset: AssetId) -> Fill {
         Fill::Image {
@@ -2246,6 +2256,7 @@ mod tests {
             scale: None,
             rotation: None,
             blend: BlendMode::Normal,
+            adjust: ImageAdjust::default(),
         }
     }
 

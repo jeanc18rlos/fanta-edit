@@ -156,7 +156,7 @@ fn dump_node(doc: &Doc, node: &CanvasNode, depth: usize, def_path: Option<&[Node
                 hidden,
                 mask,
                 world,
-                node.opacity,
+                node.opacity.get(),
                 node.blend_mode,
                 group.strokes.len(),
                 stroke_details(&group.strokes),
@@ -181,7 +181,7 @@ fn dump_node(doc: &Doc, node: &CanvasNode, depth: usize, def_path: Option<&[Node
                 hidden,
                 mask,
                 world,
-                node.opacity,
+                node.opacity.get(),
                 node.blend_mode,
                 vector.fills.len(),
                 vector.strokes.len(),
@@ -209,7 +209,7 @@ fn dump_node(doc: &Doc, node: &CanvasNode, depth: usize, def_path: Option<&[Node
                 hidden,
                 mask,
                 world,
-                node.opacity,
+                node.opacity.get(),
                 node.blend_mode,
                 text.content,
                 text.style.font_family,
@@ -247,7 +247,7 @@ fn dump_node(doc: &Doc, node: &CanvasNode, depth: usize, def_path: Option<&[Node
                 hidden,
                 mask,
                 world,
-                node.opacity,
+                node.opacity.get(),
                 node.blend_mode,
                 instance.local_size[0],
                 instance.local_size[1],
@@ -339,7 +339,7 @@ fn stroke_details(strokes: &[Stroke]) -> String {
         .iter()
         .map(|stroke| {
             let paint = match &stroke.paint {
-                Fill::Solid { color } => color.to_hex(),
+                Fill::Solid { color, .. } => color.to_hex(),
                 Fill::Gradient { .. } => "gradient".to_string(),
                 Fill::Image { .. } => "image".to_string(),
             };
@@ -366,6 +366,7 @@ fn node_kind(node: &CanvasNode) -> &'static str {
         NodeData::Model3d(_) => "model3d",
         NodeData::AiArtifact(_) => "ai_artifact",
         NodeData::Embed(_) => "embed",
+        NodeData::Boolean(_) => "boolean",
     }
 }
 

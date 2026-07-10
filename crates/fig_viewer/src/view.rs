@@ -112,8 +112,9 @@ actions!(
     ]
 );
 
-/// The action that activates a given tool, so a toolbar dropdown row can both
-/// dispatch it and display its keybinding.
+/// The action that represents a tool, so a toolbar dropdown row can display
+/// its keybinding while the click path still activates the owning FigView
+/// directly.
 fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
     match kind {
         ToolKind::Select => Box::new(ActivateSelectTool),
@@ -276,16 +277,21 @@ impl FigView {
         cx.subscribe(item, |this, _, event: &FigItemEvent, cx| {
             match event {
                 FigItemEvent::Edited => {
+                    this.invalidate_canvas_cache();
                     this.hovered_node = None;
                     // The edit may have removed the node under the inline
                     // text editor (undo, layer delete); the overlay must not
                     // outlive its target.
                     this.drop_text_edit_if_target_gone(cx);
                     cx.emit(FigViewEvent::Edited);
+                    cx.notify();
                 }
                 // Preview frames only need a canvas repaint; emitting an item
                 // event per pointer move would spam tab updates.
-                FigItemEvent::EditedTransient => {}
+                FigItemEvent::EditedTransient => {
+                    this.invalidate_canvas_cache();
+                    cx.notify();
+                }
                 FigItemEvent::SelectionChanged => {}
                 FigItemEvent::StateChanged => {
                     // The node tree may have been swapped out (disk reload)
@@ -296,11 +302,7 @@ impl FigView {
                     this.pending_text_edit = None;
                     // A (re)loaded document restarts its scene revision
                     // counter, so cached frames keyed by revision must go.
-                    this.rendered_canvas = None;
-                    #[cfg(target_os = "macos")]
-                    if let Some(renderer) = this.gpu_renderer.as_mut() {
-                        renderer.invalidate();
-                    }
+                    this.invalidate_canvas_cache();
                     // A disk reload swaps the node tree out from under the
                     // hover state and may reorder pages, so re-resolve the
                     // selected page by its root node.
@@ -389,6 +391,14 @@ impl FigView {
 
     pub(crate) fn clear_rendered_canvas(&mut self) {
         self.rendered_canvas = None;
+    }
+
+    fn invalidate_canvas_cache(&mut self) {
+        self.rendered_canvas = None;
+        #[cfg(target_os = "macos")]
+        if let Some(renderer) = self.gpu_renderer.as_mut() {
+            renderer.invalidate();
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -520,6 +530,7 @@ impl FigView {
 
         let tools = &mut self.tools;
         let mut wants_exit = false;
+        let mut content_changed = false;
         let item = self.item.clone();
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
@@ -532,6 +543,7 @@ impl FigView {
                 wants_exit = response.wants_exit;
 
                 let revision_changed = document.doc.scene.revision() != revision_before;
+                content_changed = revision_changed;
                 let selection_changed = !document
                     .doc
                     .selection
@@ -554,12 +566,18 @@ impl FigView {
         });
 
         self.viewport = Some(viewport);
+        if content_changed {
+            self.invalidate_canvas_cache();
+        }
         if wants_exit {
             let was_text_tool = self.tools.kind() == ToolKind::Text;
+            let text_node = was_text_tool
+                .then(|| self.selection_anchor_text_node(cx))
+                .flatten();
             self.activate_tool(ToolKind::Select, cx);
             // The text tool commits its node and selects it before asking to
             // exit; drop the user straight into typing on it, like Figma.
-            if was_text_tool && let Some(node) = self.selection_anchor_text_node(cx) {
+            if let Some(node) = text_node {
                 self.pending_text_edit = Some(node);
                 cx.notify();
             }
@@ -569,7 +587,8 @@ impl FigView {
         // event stream; only repaint here when something view-local changed.
         // An unconditional notify would re-render the whole view (and wake
         // observers) on every idle mouse move.
-        if !crate::canvas::same_viewport(viewport_before, viewport)
+        if content_changed
+            || !crate::canvas::same_viewport(viewport_before, viewport)
             || self.tools.overlays != overlays_before
             || self.tools.cursor != cursor_before
         {
@@ -625,10 +644,10 @@ impl FigView {
         // Switching tools (toolbar click) while typing ends the session the
         // way any click-away does.
         self.commit_text_edit(cx);
-        let Some(bounds) = self.container_bounds else {
-            return;
-        };
-        let Some(viewport) = self.viewport else {
+        let Some((bounds, viewport)) = self.container_bounds.zip(self.viewport) else {
+            self.tools.activate_without_context(kind);
+            self.remember_tool_face(kind);
+            cx.notify();
             return;
         };
         let (width, height) = bounds_size(bounds);
@@ -650,15 +669,17 @@ impl FigView {
                 ((), change)
             });
         });
-        // Remember this tool as its group's face so the group button keeps
-        // showing it after switching to another group (Figma behavior).
+        self.remember_tool_face(kind);
+        self.viewport = Some(viewport);
+        cx.notify();
+    }
+
+    fn remember_tool_face(&mut self, kind: ToolKind) {
         if let Some(index) = crate::tools::group_index_of(kind)
             && let Some(face) = self.group_faces.get_mut(index)
         {
             *face = kind;
         }
-        self.viewport = Some(viewport);
-        cx.notify();
     }
 
     /// Once the document is loaded, kick off a background download of every
@@ -1412,8 +1433,35 @@ impl FigView {
                 });
             });
         }
+        // Force the canvas caches (revision-keyed rendered images + GPU
+        // surfaces) to be discarded. Pure style/color changes on text runs
+        // during preview don't change geometry, so GPUI + our image caches
+        // can otherwise reuse a stale frame until a move or other delta
+        // dirties the canvas element. Clearing here makes the new color take
+        // effect on the very next paint.
+        self.invalidate_canvas_cache();
         self.reset_caret_blink(cx);
         cx.notify();
+    }
+
+    /// If there is an active text edit session, apply style change only to the
+    /// current selection (for rich text). Returns true if it was applied to a
+    /// selection (caller can skip whole-node mutate). Use from properties for
+    /// color/font etc on partial text.
+    pub(crate) fn with_text_selection_style(
+        &mut self,
+        cx: &mut Context<Self>,
+        patch: impl FnOnce(&mut fanta_text::TextStyle),
+    ) -> bool {
+        if let Some(edit) = self.text_edit.as_mut() {
+            let caret = edit.session.caret();
+            let mut s = edit.session.text_buffer().style_at(caret).clone();
+            patch(&mut s);
+            edit.session.apply_style_to_selection(s);
+            self.sync_text_preview(cx);
+            return true;
+        }
+        false
     }
 
     fn text_edit_insert(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1637,7 +1685,10 @@ impl FigView {
         // loaded theme regardless of the `selection` swatch's own alpha (a
         // theme whose selection color is near-transparent would otherwise make
         // the highlight invisible); the caret is forced fully opaque.
-        let selection_color = cx.theme().players().local().selection.alpha(0.3);
+        // Force a clearly visible highlight for text selection (blue-ish, semi
+        // transparent) so it always shows during edit, independent of theme
+        // player colors. Caret is solid accent.
+        let selection_color = gpui::hsla(0.6, 0.85, 0.55, 0.45);
         let caret_color = cx.theme().players().local().cursor.alpha(1.0);
 
         let to_bounds = |[x, y, w, h]: [f64; 4]| Bounds {
@@ -1671,6 +1722,16 @@ impl FigView {
                 ])
             });
 
+        // The selection/caret rects from the helpers are in "viewport screen"
+        // space (0,0 at top-left of the container's content area). The overlay
+        // element is absolute full-size at the outer level, so its canvas_bounds
+        // origin is the outer editor origin. Use the container's origin so the
+        // highlight quads land exactly over the text glyphs.
+        let container_origin = self
+            .container_bounds
+            .map(|b| b.origin)
+            .unwrap_or(point(px(0.), px(0.)));
+
         let entity = cx.entity();
         let focus_handle = self.focus_handle.clone();
         Some(
@@ -1687,7 +1748,7 @@ impl FigView {
                             bounds: canvas_bounds,
                         }),
                         |window| {
-                            let offset = canvas_bounds.origin;
+                            let offset = container_origin;
                             for rect in selection_rects {
                                 let rect = Bounds {
                                     origin: offset + rect.origin,
@@ -1897,6 +1958,7 @@ impl FigView {
         let zoom_label: SharedString = format!("{:.0}%", zoom * 100.0).into();
         // The last-used tool per group drives each group button's face.
         let faces = self.group_faces.clone();
+        let view = cx.weak_entity();
 
         h_flex()
             .absolute()
@@ -1958,6 +2020,7 @@ impl FigView {
                                     return children;
                                 }
                                 // Multi-tool group: face button + caret dropdown.
+                                let menu_view = view.clone();
                                 let caret = PopoverMenu::new(("fig-tool-group", group_index))
                                     .anchor(Anchor::BottomLeft)
                                     .trigger(
@@ -1969,11 +2032,13 @@ impl FigView {
                                         .icon_color(Color::Muted),
                                     )
                                     .menu(move |window, cx| {
+                                        let view = menu_view.clone();
                                         Some(ContextMenu::build(
                                             window,
                                             cx,
                                             move |mut menu, _window, _cx| {
                                                 for kind in group.iter().copied() {
+                                                    let view = view.clone();
                                                     let mut label = kind.label().to_string();
                                                     if kind.is_stub() {
                                                         label.push_str("  ·  soon");
@@ -1989,6 +2054,17 @@ impl FigView {
                                                                 kind == active,
                                                             )
                                                             .action(action_for_kind(kind))
+                                                            .handler(move |_window, cx| {
+                                                                if let Err(error) =
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.activate_tool(kind, cx);
+                                                                    })
+                                                                {
+                                                                    log::debug!(
+                                                                        "dropping toolbar tool activation for closed Figma view: {error:#}"
+                                                                    );
+                                                                }
+                                                            })
                                                             .disabled(disabled),
                                                     );
                                                 }
@@ -2277,6 +2353,7 @@ impl Render for FigView {
                                 .min_w_0()
                                 .size_full()
                                 .overflow_hidden()
+                                .relative()
                                 .cursor(cursor_style)
                                 .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
                                 .on_pinch(cx.listener(Self::handle_pinch))
@@ -2294,7 +2371,14 @@ impl Render for FigView {
                                     cx.listener(Self::handle_mouse_up),
                                 )
                                 .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                                .child(CanvasElement::new(cx.entity())),
+                                .children({
+                                    let mut c: Vec<AnyElement> = vec![];
+                                    if let Some(ov) = self.render_text_edit_overlay(cx) {
+                                        c.push(ov);
+                                    }
+                                    c.push(CanvasElement::new(cx.entity()));
+                                    c
+                                }),
                         )
                         .children(
                             self.inspector_sidebar_visible
@@ -2302,7 +2386,6 @@ impl Render for FigView {
                         ),
                 )
                 .child(self.render_tool_pill(cx))
-                .children(self.render_text_edit_overlay(cx))
             })
     }
 }
@@ -2716,6 +2799,29 @@ fn zoom_viewport_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fanta_doc::{CanvasNode, GroupNode, Operation};
+    use gpui::TestAppContext;
+    use project::FakeFs;
+    use settings::SettingsStore;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    fn doc_with_one_page() -> fanta_doc::Doc {
+        let mut doc = fanta_doc::Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let root = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page root node");
+        doc.add_page(root);
+        doc.set_active_page(Some(root));
+        doc
+    }
 
     #[test]
     fn zooming_at_an_anchor_keeps_the_anchored_world_point_fixed() {
@@ -2758,5 +2864,92 @@ mod tests {
         assert!((panned.center[0] - (10.0 - 15.0)).abs() < 1e-9);
         assert!((panned.center[1] - (20.0 + 5.0)).abs() < 1e-9);
         assert!((panned.zoom - viewport.zoom).abs() < 1e-9);
+    }
+
+    #[gpui::test]
+    async fn tool_activation_updates_before_canvas_viewport_exists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc_with_one_page(),
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .unwrap();
+
+        view.update(cx, |view, cx| {
+            assert_eq!(view.active_tool(), ToolKind::Select);
+            view.activate_tool(ToolKind::Text, cx);
+            assert_eq!(view.active_tool(), ToolKind::Text);
+        });
+    }
+
+    #[gpui::test]
+    async fn text_tool_click_creates_text_and_queues_inline_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc_with_one_page(),
+            cx,
+        );
+        let item_for_assert = item.clone();
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .unwrap();
+
+        view.update(cx, |view, cx| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+            view.activate_tool(ToolKind::Text, cx);
+            view.dispatch_tool_event(
+                press_event(
+                    DVec2::new(400.0, 300.0),
+                    ToolButton::Primary,
+                    gpui::Modifiers::default(),
+                    1,
+                ),
+                cx,
+            );
+            view.dispatch_tool_event(
+                release_event(
+                    DVec2::new(400.0, 300.0),
+                    ToolButton::Primary,
+                    gpui::Modifiers::default(),
+                ),
+                cx,
+            );
+
+            assert_eq!(view.active_tool(), ToolKind::Select);
+            assert!(
+                view.pending_text_edit.is_some(),
+                "new text should be queued for inline editing"
+            );
+        });
+
+        item_for_assert.read_with(cx, |item, _cx| {
+            let doc = &item.document().expect("ready document").doc;
+            let selected = doc.selection.as_slice();
+            assert_eq!(selected.len(), 1);
+            let text = doc
+                .scene
+                .get(selected[0])
+                .and_then(|node| node.data.as_text())
+                .expect("selected node should be newly created text");
+            assert_eq!(text.content, fanta_tools::text::PLACEHOLDER);
+        });
     }
 }

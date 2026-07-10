@@ -760,6 +760,39 @@ impl FigItem {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn ready_item_for_test(
+    project: &Entity<Project>,
+    abs_path: PathBuf,
+    doc: Doc,
+    cx: &mut gpui::TestAppContext,
+) -> Entity<FigItem> {
+    use util::rel_path::RelPath;
+
+    cx.new(|cx| {
+        let subscription = cx.subscribe(
+            project,
+            |_: &mut FigItem, _: Entity<Project>, _: &project::Event, _| {},
+        );
+        FigItem {
+            path: ProjectPath {
+                worktree_id: WorktreeId::from_usize(0),
+                path: RelPath::empty_arc(),
+            },
+            abs_path,
+            entry_id: None,
+            document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
+            project_root: None,
+            dirty: false,
+            conflict: false,
+            suppress_watcher_until: None,
+            reload_task: None,
+            _load_task: None,
+            _project_subscription: subscription,
+        }
+    })
+}
+
 /// How a scoped document mutation affects persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocChange {

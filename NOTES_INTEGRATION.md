@@ -1,0 +1,1 @@
+Integration note: engine placement fixes for new shapes (rect/ellipse/etc now set explicit transform + local path before place_new) to ensure correct world position after rebase under active page. New elements should now render visible. Rebuild fanta-edit to pick up via path dep to ../fanta-engine-migration .

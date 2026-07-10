@@ -19,9 +19,10 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use fanta_doc::{
-    Doc, NodeData, NodeId, Operation, TextAlign, TextAutoResize, TextNode, VAlign, Viewport,
+    Doc, NodeData, NodeId, Operation, TextAlign, TextAutoResize, TextNode, TextStyleRun, VAlign,
+    Viewport,
 };
-use fanta_text::{Caret, Selection};
+use fanta_text::{Caret, Selection, TextBuffer, TextStyle as EngineTextStyle};
 use glam::DVec2;
 use gpui::{Subscription, Task};
 
@@ -96,11 +97,10 @@ impl CanvasTextEdit {
 /// whole editing behavior is testable headlessly.
 pub(crate) struct TextEditSession {
     node_id: NodeId,
-    /// Full node data at open time: `content` is what a rewind restores and
-    /// what the committed operation records as `old`; `local_size` is rewound
-    /// too because the preview re-hugs auto-resize boxes while typing.
+    /// Full node data at open time for rewind.
     original: TextNode,
-    buffer: String,
+    /// Live rich text buffer supporting style runs over selections.
+    buffer: TextBuffer,
     /// Directed selection in byte offsets; collapsed (anchor == head) is the
     /// plain caret. The head is the moving end.
     selection: Selection,
@@ -116,10 +116,22 @@ pub(crate) struct TextEditSession {
 impl TextEditSession {
     pub(crate) fn new(node_id: NodeId, node: &TextNode) -> Self {
         let caret = node.content.len();
+        // Build rich buffer from node's base style + any existing style runs.
+        let base_style = map_doc_style_to_engine(&node.style);
+        let mut buf = if node.content.is_empty() {
+            TextBuffer::new()
+        } else {
+            TextBuffer::from_str(node.content.clone(), base_style.clone())
+        };
+        for run in &node.style_runs {
+            let run_style = map_doc_style_to_engine(&run.style);
+            let _ = buf.set_style(run.start..run.end, run_style);
+        }
+        buf.set_default_style(base_style);
         Self {
             node_id,
             original: node.clone(),
-            buffer: node.content.clone(),
+            buffer: buf,
             selection: Selection::caret(caret),
             marked_range: None,
             dragging: false,
@@ -132,11 +144,15 @@ impl TextEditSession {
     }
 
     pub(crate) fn buffer(&self) -> &str {
+        self.buffer.text()
+    }
+
+    pub(crate) fn text_buffer(&self) -> &fanta_text::TextBuffer {
         &self.buffer
     }
 
     pub(crate) fn is_changed(&self) -> bool {
-        self.buffer != self.original.content
+        self.buffer.text() != self.original.content
     }
 
     pub(crate) fn caret(&self) -> usize {
@@ -164,7 +180,18 @@ impl TextEditSession {
         if range.is_empty() {
             return None;
         }
-        self.buffer.get(range)
+        self.buffer.text().get(range)
+    }
+
+    /// Apply a style change to the current selection (or set default for caret).
+    /// This enables changing color, font, weight etc. on only the selected text.
+    pub(crate) fn apply_style_to_selection(&mut self, style: EngineTextStyle) {
+        let range = self.selected_range();
+        if !range.is_empty() {
+            let _ = self.buffer.set_style(range, style);
+        } else {
+            self.buffer.set_default_style(style);
+        }
     }
 
     // -- selection / caret movement ----------------------------------------
@@ -194,7 +221,7 @@ impl TextEditSession {
     }
 
     pub(crate) fn select_word_at(&mut self, byte: usize) {
-        let range = word_range(&self.buffer, self.clamp_offset(byte));
+        let range = word_range(self.buffer.text(), self.clamp_offset(byte));
         if range.is_empty() {
             self.selection = Selection::caret(range.start);
         } else {
@@ -207,7 +234,7 @@ impl TextEditSession {
             self.selection = Selection::caret(self.selection.start());
             return;
         }
-        let head = Caret::new(self.selection.head).move_left(&self.buffer).byte;
+        let head = Caret::new(self.selection.head).move_left(self.buffer.text()).byte;
         self.move_to(head, extend);
     }
 
@@ -217,18 +244,18 @@ impl TextEditSession {
             return;
         }
         let head = Caret::new(self.selection.head)
-            .move_right(&self.buffer)
+            .move_right(self.buffer.text())
             .byte;
         self.move_to(head, extend);
     }
 
     pub(crate) fn move_line_start(&mut self, extend: bool) {
-        let head = Caret::new(self.selection.head).move_home(&self.buffer).byte;
+        let head = Caret::new(self.selection.head).move_home(self.buffer.text()).byte;
         self.move_to(head, extend);
     }
 
     pub(crate) fn move_line_end(&mut self, extend: bool) {
-        let head = Caret::new(self.selection.head).move_end(&self.buffer).byte;
+        let head = Caret::new(self.selection.head).move_end(self.buffer.text()).byte;
         self.move_to(head, extend);
     }
 
@@ -241,7 +268,12 @@ impl TextEditSession {
 
     pub(crate) fn replace_range(&mut self, range: Range<usize>, text: &str) {
         let range = self.clamp_range(range);
-        self.buffer.replace_range(range.clone(), text);
+        if !range.is_empty() {
+            let _ = self.buffer.delete_range(range.clone());
+        }
+        if !text.is_empty() {
+            let _ = self.buffer.insert(range.start, text);
+        }
         self.selection = Selection::caret(range.start + text.len());
         self.marked_range = None;
     }
@@ -256,7 +288,12 @@ impl TextEditSession {
         relative_selection: Option<Range<usize>>,
     ) {
         let range = self.clamp_range(range);
-        self.buffer.replace_range(range.clone(), text);
+        if !range.is_empty() {
+            let _ = self.buffer.delete_range(range.clone());
+        }
+        if !text.is_empty() {
+            let _ = self.buffer.insert(range.start, text);
+        }
         self.marked_range = (!text.is_empty()).then(|| range.start..range.start + text.len());
         self.selection = match relative_selection {
             Some(relative) => Selection::new(
@@ -275,7 +312,7 @@ impl TextEditSession {
             return;
         }
         let caret = self.selection.head;
-        let previous = Caret::new(caret).move_left(&self.buffer).byte;
+        let previous = Caret::new(caret).move_left(self.buffer.text()).byte;
         if previous < caret {
             self.replace_range(previous..caret, "");
         }
@@ -289,7 +326,7 @@ impl TextEditSession {
             return;
         }
         let caret = self.selection.head;
-        let next = Caret::new(caret).move_right(&self.buffer).byte;
+        let next = Caret::new(caret).move_right(self.buffer.text()).byte;
         if next > caret {
             self.replace_range(caret..next, "");
         }
@@ -298,11 +335,11 @@ impl TextEditSession {
     // -- UTF-16 bridging for the platform input handler ----------------------
 
     pub(crate) fn offset_from_utf16(&self, offset_utf16: usize) -> usize {
-        offset_from_utf16(&self.buffer, offset_utf16)
+        offset_from_utf16(self.buffer.text(), offset_utf16)
     }
 
     pub(crate) fn offset_to_utf16(&self, offset: usize) -> usize {
-        offset_to_utf16(&self.buffer, offset)
+        offset_to_utf16(self.buffer.text(), offset)
     }
 
     pub(crate) fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -317,7 +354,7 @@ impl TextEditSession {
 
     fn clamp_offset(&self, byte: usize) -> usize {
         let mut byte = byte.min(self.buffer.len());
-        while byte > 0 && !self.buffer.is_char_boundary(byte) {
+        while byte > 0 && !self.buffer.text().is_char_boundary(byte) {
             byte -= 1;
         }
         byte
@@ -382,6 +419,40 @@ fn word_range(text: &str, byte: usize) -> Range<usize> {
     low..high
 }
 
+/// Map fanta_doc::TextStyle -> fanta_text::TextStyle for the live buffer.
+fn map_doc_style_to_engine(doc_style: &fanta_doc::TextStyle) -> EngineTextStyle {
+    EngineTextStyle {
+        font_family: doc_style.font_family.clone(),
+        size_px: doc_style.size_px,
+        weight: doc_style.weight,
+        italic: doc_style.italic,
+        underline: doc_style.underline,
+        strikethrough: doc_style.strikethrough,
+        color: doc_style.color,
+        letter_spacing: doc_style.letter_spacing,
+        line_height: doc_style.line_height,
+        line_height_auto_percent: doc_style.line_height_auto_percent,
+        font_variations: doc_style.font_variations.clone(),
+    }
+}
+
+/// Map back fanta_text::TextStyle -> fanta_doc::TextStyle.
+fn map_engine_style_to_doc(engine: &EngineTextStyle) -> fanta_doc::TextStyle {
+    fanta_doc::TextStyle {
+        font_family: engine.font_family.clone(),
+        size_px: engine.size_px,
+        weight: engine.weight,
+        italic: engine.italic,
+        underline: engine.underline,
+        strikethrough: engine.strikethrough,
+        color: engine.color,
+        letter_spacing: engine.letter_spacing,
+        line_height: engine.line_height,
+        line_height_auto_percent: engine.line_height_auto_percent,
+        font_variations: engine.font_variations.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Document preview / commit
 // ---------------------------------------------------------------------------
@@ -390,6 +461,7 @@ fn word_range(text: &str, byte: usize) -> Range<usize> {
 /// the canvas renders keystrokes as they land. Auto-resizing boxes are
 /// re-hugged to the new glyphs (through the renderer's shared shaped-layout
 /// cache, so the measure pre-warms the very paragraph the next paint draws).
+/// Also pushes the current style runs so partial styling is previewed.
 pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
     let Some(node) = doc.scene.get_mut(session.node_id) else {
         return;
@@ -397,7 +469,22 @@ pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
     let NodeData::Text(text) = &mut node.data else {
         return;
     };
-    text.content = session.buffer.clone();
+    text.content = session.buffer.text().to_string();
+    // Transfer the buffer's default style as the node's base style (for
+    // collapsed caret / typing style and overall), plus any explicit runs for
+    // partial/selection styling. This ensures color/font changes on a selection
+    // (or at caret) are previewed and committed correctly.
+    text.style = map_engine_style_to_doc(session.buffer.default_style());
+    text.style_runs = session
+        .buffer
+        .runs()
+        .iter()
+        .map(|r| TextStyleRun {
+            start: r.start,
+            end: r.end,
+            style: map_engine_style_to_doc(&r.style),
+        })
+        .collect();
     hug_auto_resize(text);
 }
 
@@ -429,7 +516,20 @@ pub(crate) fn commit_operation(doc: &Doc, session: &TextEditSession) -> Option<O
         return None;
     };
     let mut new_text = text.clone();
-    new_text.content = session.buffer.clone();
+    new_text.content = session.buffer.text().to_string();
+    // Transfer default + runs for rich text / partial styles in the final
+    // undoable ReplaceData (mirrors the preview transfer).
+    new_text.style = map_engine_style_to_doc(session.buffer.default_style());
+    new_text.style_runs = session
+        .buffer
+        .runs()
+        .iter()
+        .map(|r| TextStyleRun {
+            start: r.start,
+            end: r.end,
+            style: map_engine_style_to_doc(&r.style),
+        })
+        .collect();
     hug_auto_resize(&mut new_text);
     Some(Operation::ReplaceData {
         id: session.node_id,
@@ -569,13 +669,33 @@ pub(crate) fn selection_screen_rects(
     fanta_render::text_selection_rects(text, range.start, range.end)
         .into_iter()
         .map(|[x, y, width, height]| {
-            let a = project(x, y + dy);
-            let b = project(x + width, y + dy + height);
+            let corners = [
+                project(x, y + dy),
+                project(x + width, y + dy),
+                project(x + width, y + dy + height),
+                project(x, y + dy + height),
+            ];
+            let min_x = corners
+                .iter()
+                .map(|corner| corner.x)
+                .fold(f64::INFINITY, f64::min);
+            let max_x = corners
+                .iter()
+                .map(|corner| corner.x)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = corners
+                .iter()
+                .map(|corner| corner.y)
+                .fold(f64::INFINITY, f64::min);
+            let max_y = corners
+                .iter()
+                .map(|corner| corner.y)
+                .fold(f64::NEG_INFINITY, f64::max);
             [
-                a.x.min(b.x),
-                a.y.min(b.y),
-                (b.x - a.x).abs(),
-                (b.y - a.y).abs(),
+                min_x,
+                min_y,
+                (max_x - min_x).max(0.0),
+                (max_y - min_y).max(0.0),
             ]
         })
         .collect()
@@ -883,6 +1003,7 @@ mod tests {
             letter_spacing: style.letter_spacing,
             line_height: style.line_height,
             line_height_auto_percent: style.line_height_auto_percent,
+            font_variations: style.font_variations.clone(),
         };
         let buffer = fanta_text::TextBuffer::from_str("Hi", engine_style);
         let layout = fanta_text::LayoutEngine::new().layout(&buffer, 200.0);

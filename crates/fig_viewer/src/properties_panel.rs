@@ -20,8 +20,8 @@ use fanta_doc::{
     ComponentPropKind, ComponentSet, ComponentSetMembership, CounterAlign, Doc, Fill, Gradient,
     GroupNode, ImageFitMode, InstanceNode, LayoutChild, LayoutMode, NodeData, NodeFlags, NodeId,
     Operation, PrimaryAlign, Reaction, Shadow, ShadowKind, Stroke, StrokeAlign, TextAlign,
-    TextAutoResize, Transform2D, Trigger, VAlign as TextVAlign, VarValue, VariantAxis, Viewport,
-    expand_instance,
+    TextAutoResize, Transform2D, Trigger, UnitInterval, VAlign as TextVAlign, VarValue,
+    VariantAxis, Viewport, expand_instance,
 };
 use fanta_render::{AssetResolver, RasterRenderer, RenderInputs};
 use fs::Fs;
@@ -688,8 +688,7 @@ struct PaintSnapshot {
     /// The paint's own opacity as a whole percent — a solid's alpha, an image
     /// fill's `opacity`. `None` for gradients, whose alpha lives per stop.
     opacity_percent: Option<f64>,
-    /// The per-paint blend mode (Figma's paint-level `blendMode`). `None` for
-    /// solids, which carry no blend in this model.
+    /// The per-paint blend mode (Figma's paint-level `blendMode`).
     blend: Option<BlendMode>,
     /// Whether the paint currently contributes any coverage. Drives the eye.
     visible: bool,
@@ -767,7 +766,7 @@ struct MultiSection {
 struct NodeSnapshot {
     id: NodeId,
     transform: Transform2D,
-    opacity: f32,
+    opacity: UnitInterval,
     data: Box<NodeData>,
     effects: SmallVec<[Shadow; 0]>,
     blurs: SmallVec<[Blur; 0]>,
@@ -879,7 +878,16 @@ impl FantaPropertiesPanel {
         window: &mut Window,
         cx: &mut Context<FigView>,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::build(fs, Some(active_view), window, cx, Vec::new()))
+        let panel = cx.new(|cx| Self::build(fs, None, window, cx, Vec::new()));
+        cx.defer({
+            let panel = panel.clone();
+            move |cx| {
+                let _ = panel.update(cx, |panel, cx| {
+                    panel.set_active_view(Some(active_view), cx);
+                });
+            }
+        });
+        panel
     }
 
     fn new(
@@ -1280,11 +1288,37 @@ impl FantaPropertiesPanel {
     }
 
     fn set_font_weight(&mut self, id: NodeId, weight: u16, cx: &mut Context<Self>) {
+        // During active text edit with selection, apply only to the selected
+        // range (rich text support via the live TextBuffer in the session).
+        if self.active_view.as_ref().and_then(|w| w.upgrade()).map_or(false, |v| {
+            v.update(cx, |view, cx| view.with_text_selection_style(cx, |s| { s.weight = weight; }))
+        }) {
+            return;
+        }
         self.update_node_data(
             id,
             move |data| {
                 if let NodeData::Text(text) = data {
                     text.style.weight = weight;
+                }
+            },
+            cx,
+        );
+    }
+
+    fn set_text_color(&mut self, id: NodeId, color: FantaColor, cx: &mut Context<Self>) {
+        // During active text edit with selection, apply only to the selected
+        // range (rich text). Falls back to whole-node for normal selection.
+        if self.active_view.as_ref().and_then(|w| w.upgrade()).map_or(false, |v| {
+            v.update(cx, |view, cx| view.with_text_selection_style(cx, |s| { s.color = color; }))
+        }) {
+            return;
+        }
+        self.update_node_data(
+            id,
+            move |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.color = color;
                 }
             },
             cx,
@@ -1297,6 +1331,20 @@ impl FantaPropertiesPanel {
         decoration: TextDecorationGlyph,
         cx: &mut Context<Self>,
     ) {
+        // Apply only to selection if text editing with active selection.
+        if self.active_view.as_ref().and_then(|w| w.upgrade()).map_or(false, |v| {
+            v.update(cx, |view, cx| {
+                view.with_text_selection_style(cx, |s| {
+                    match decoration {
+                        TextDecorationGlyph::Italic => s.italic = !s.italic,
+                        TextDecorationGlyph::Underline => s.underline = !s.underline,
+                        TextDecorationGlyph::Strikethrough => s.strikethrough = !s.strikethrough,
+                    }
+                })
+            })
+        }) {
+            return;
+        }
         self.update_node_data(
             id,
             move |data| {
@@ -2125,8 +2173,12 @@ impl FantaPropertiesPanel {
                 let final_color = session.picker.read(cx).color();
                 if final_color != session.original {
                     let field = session.field.clone();
-                    let text = final_color.to_hex();
-                    self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text));
+                    if let InspectorField::TextColor(id) = &field {
+                        self.set_text_color(*id, final_color, cx);
+                    } else {
+                        let text = final_color.to_hex();
+                        self.apply_document_ops(cx, |doc| field_operations(doc, &field, &text));
+                    }
                 }
             }
         }
@@ -5728,7 +5780,7 @@ fn page_section(document: &FigDocument, selected_page_index: Option<usize>) -> P
     let background = root_node.and_then(|node| match &node.data {
         NodeData::Group(group) => Some(match &group.background {
             None => PageBackgroundValue::None,
-            Some(Fill::Solid { color }) => PageBackgroundValue::Solid(*color),
+            Some(Fill::Solid { color, .. }) => PageBackgroundValue::Solid(*color),
             Some(Fill::Gradient { .. }) => PageBackgroundValue::Other("Gradient".into()),
             Some(Fill::Image { .. }) => PageBackgroundValue::Other("Image".into()),
         }),
@@ -5803,7 +5855,7 @@ fn node_section(
             .is_corner_capable()
             .then(|| corner_smoothing_value(node))
             .flatten(),
-        opacity_percent: f64::from(node.opacity) * 100.0,
+        opacity_percent: f64::from(node.opacity.get()) * 100.0,
         blend_mode: node.blend_mode,
         fills: node_fills(node),
         strokes: node_strokes(node),
@@ -5890,7 +5942,7 @@ fn align_grid_active_cell(layout: &AutoLayoutSnapshot) -> Option<(u8, u8)> {
         PrimaryAlign::Start => 0u8,
         PrimaryAlign::Center => 1,
         PrimaryAlign::End => 2,
-        PrimaryAlign::SpaceBetween => return None,
+        PrimaryAlign::SpaceBetween | PrimaryAlign::SpaceEvenly => return None,
     };
     let counter_cell = match layout.counter_align {
         CounterAlign::Start => 0u8,
@@ -6108,6 +6160,7 @@ fn reaction_summary(reaction: &Reaction) -> SharedString {
         Trigger::Hover => "On hover".to_string(),
         Trigger::AfterDelay { delay_ms } => format!("After {delay_ms} ms"),
         Trigger::Key { keys } => format!("On key {}", keys.join(", ")),
+        Trigger::WhilePressing => "While pressing".to_string(),
     };
     let action = match &reaction.action {
         Action::Navigate { .. } => "navigate",
@@ -6116,6 +6169,8 @@ fn reaction_summary(reaction: &Reaction) -> SharedString {
         Action::OpenOverlay { .. } => "open overlay",
         Action::ScrollTo { .. } => "scroll to",
         Action::SetVariable { .. } => "set variable",
+        Action::UpdateVariant { .. } => "change variant",
+        Action::OpenLink { .. } => "open link",
     };
     format!("{trigger} → {action}").into()
 }
@@ -6144,6 +6199,7 @@ fn bound_prop_label(prop: &BoundProp) -> String {
         BoundProp::Opacity => "Opacity".to_string(),
         BoundProp::Visible => "Visibility".to_string(),
         BoundProp::TextContent => "Text".to_string(),
+        BoundProp::TextStyle => "Text style".to_string(),
         BoundProp::ClipWidth => "Width".to_string(),
         BoundProp::ClipHeight => "Height".to_string(),
     }
@@ -6209,7 +6265,7 @@ fn multi_section(
 /// text node's glyph color.
 fn node_solid_colors(node: &CanvasNode, out: &mut Vec<FantaColor>) {
     let mut push_fill = |fill: &Fill| {
-        if let Fill::Solid { color } = fill {
+        if let Fill::Solid { color, .. } = fill {
             out.push(*color);
         }
     };
@@ -6299,13 +6355,13 @@ fn corner_smoothing_value(node: &CanvasNode) -> Option<f64> {
 
 fn paint_snapshot(fill: &Fill, stroke_width: Option<f64>) -> PaintSnapshot {
     let (color, label, gradient, kind, opacity_percent, blend) = match fill {
-        Fill::Solid { color } => (
+        Fill::Solid { color, blend } => (
             Some(*color),
             SharedString::from(color.to_hex().trim_start_matches('#').to_string()),
             None,
             Some(PaintKind::Solid),
             Some(alpha_to_percent(color.a)),
-            None,
+            Some(*blend),
         ),
         Fill::Gradient { gradient, blend } => (
             None,
@@ -6345,7 +6401,7 @@ fn alpha_to_percent(alpha: u8) -> f64 {
 /// reflects, since the model carries no per-paint visible flag.
 fn paint_is_visible(fill: &Fill) -> bool {
     match fill {
-        Fill::Solid { color } => color.a != 0,
+        Fill::Solid { color, .. } => color.a != 0,
         Fill::Gradient { gradient, .. } => crate::color_picker::gradient_stops(gradient)
             .iter()
             .any(|stop| stop.color.a != 0),
@@ -6356,7 +6412,7 @@ fn paint_is_visible(fill: &Fill) -> bool {
 /// Snapshot a paint's alpha so the eye can restore it on show.
 fn paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
     match fill {
-        Fill::Solid { color } => HiddenPaintAlpha::Solid(color.a),
+        Fill::Solid { color, .. } => HiddenPaintAlpha::Solid(color.a),
         Fill::Gradient { gradient, .. } => HiddenPaintAlpha::Gradient(
             crate::color_picker::gradient_stops(gradient)
                 .iter()
@@ -6398,7 +6454,7 @@ fn opaque_paint_alpha(alpha: &HiddenPaintAlpha) -> HiddenPaintAlpha {
 /// gradient gained or lost stops while hidden) leaves the extra stops alone.
 fn set_paint_alpha(fill: &mut Fill, alpha: &HiddenPaintAlpha) {
     match (fill, alpha) {
-        (Fill::Solid { color }, HiddenPaintAlpha::Solid(a)) => color.a = *a,
+        (Fill::Solid { color, .. }, HiddenPaintAlpha::Solid(a)) => color.a = *a,
         (Fill::Gradient { gradient, .. }, HiddenPaintAlpha::Gradient(alphas)) => {
             for (stop, a) in crate::color_picker::gradient_stops_mut(gradient)
                 .iter_mut()
@@ -6608,13 +6664,13 @@ fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operat
                 return Vec::new();
             };
             let new = (percent / 100.0).clamp(0.0, 1.0) as f32;
-            if (new - node.opacity).abs() < f32::EPSILON {
+            if (new - node.opacity.get()).abs() < f32::EPSILON {
                 return Vec::new();
             }
             vec![Operation::SetOpacity {
                 id: *id,
                 old: node.opacity,
-                new,
+                new: UnitInterval::new(new),
             }]
         }
         InspectorField::FillColor { id, index } => {
@@ -6633,7 +6689,8 @@ fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operat
                         if let Some(strokes) = stroke_list_mut(data)
                             && let Some(stroke) = strokes.get_mut(index)
                         {
-                            stroke.paint = Fill::solid(color);
+                            let blend = paint_blend(&stroke.paint);
+                            stroke.paint = solid_fill_with_blend(color, blend);
                         }
                     })
                 })
@@ -6651,7 +6708,7 @@ fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operat
                     replace_data_operation(doc, *id, |data| {
                         if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
                             match paint {
-                                Fill::Solid { color } => {
+                                Fill::Solid { color, .. } => {
                                     color.a = (fraction * 255.0).round() as u8;
                                 }
                                 Fill::Image { opacity, .. } => *opacity = fraction as f32,
@@ -7045,7 +7102,7 @@ fn selection_color_operations(doc: &Doc, from: FantaColor, to: FantaColor) -> Ve
         .flat_map(|id| {
             replace_data_operation(doc, id, |data| {
                 let replace = |fill: &mut Fill| {
-                    if let Fill::Solid { color } = fill
+                    if let Fill::Solid { color, .. } = fill
                         && *color == from
                     {
                         *color = to;
@@ -7071,6 +7128,8 @@ fn selection_color_operations(doc: &Doc, from: FantaColor, to: FantaColor) -> Ve
                             .for_each(|stroke| replace(&mut stroke.paint));
                     }
                     NodeData::Text(text) => {
+                        // If live text edit with selection, the color change will have been
+                        // applied via with_text_selection_style already in the caller path.
                         if text.style.color == from {
                             text.style.color = to;
                         }
@@ -7120,8 +7179,8 @@ fn detach_instance_operations(doc: &Doc, id: NodeId) -> Vec<Operation> {
         new: Box::new(root.node.data.clone()),
         expanded: children,
     }];
-    let composed_opacity = node.opacity * root.node.opacity;
-    if (composed_opacity - node.opacity).abs() > f32::EPSILON {
+    let composed_opacity = UnitInterval::new(node.opacity.get() * root.node.opacity.get());
+    if (composed_opacity.get() - node.opacity.get()).abs() > f32::EPSILON {
         operations.push(Operation::SetOpacity {
             id,
             old: node.opacity,
@@ -7490,9 +7549,22 @@ fn fill_slot_mut(data: &mut NodeData, index: usize) -> Option<&mut Fill> {
     }
 }
 
+fn paint_blend(fill: &Fill) -> BlendMode {
+    match fill {
+        Fill::Solid { blend, .. } | Fill::Gradient { blend, .. } | Fill::Image { blend, .. } => {
+            *blend
+        }
+    }
+}
+
+fn solid_fill_with_blend(color: FantaColor, blend: BlendMode) -> Fill {
+    Fill::Solid { color, blend }
+}
+
 fn set_fill_color(data: &mut NodeData, index: usize, color: FantaColor) {
     if let Some(fill) = fill_slot_mut(data, index) {
-        *fill = Fill::solid(color);
+        let blend = paint_blend(fill);
+        *fill = solid_fill_with_blend(color, blend);
     }
 }
 
@@ -7511,10 +7583,7 @@ fn paint_slot_mut(data: &mut NodeData, index: usize, is_stroke: bool) -> Option<
 /// per-paint blend mode when it already carried one.
 fn set_paint_gradient(data: &mut NodeData, index: usize, is_stroke: bool, gradient: Gradient) {
     if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
-        let blend = match paint {
-            Fill::Gradient { blend, .. } => *blend,
-            _ => BlendMode::Normal,
-        };
+        let blend = paint_blend(paint);
         *paint = Fill::Gradient { gradient, blend };
     }
 }
@@ -7528,23 +7597,21 @@ fn convert_paint_kind(data: &mut NodeData, index: usize, is_stroke: bool, kind: 
     };
     match kind {
         PaintKind::Solid => {
+            let blend = paint_blend(paint);
             let color = match paint {
-                Fill::Solid { color } => *color,
+                Fill::Solid { color, .. } => *color,
                 Fill::Gradient { gradient, .. } => representative_gradient_color(gradient),
                 Fill::Image { .. } => return,
             };
-            *paint = Fill::solid(color);
+            *paint = solid_fill_with_blend(color, blend);
         }
         PaintKind::Gradient(gradient_kind) => {
-            let blend = match paint {
-                Fill::Gradient { blend, .. } => *blend,
-                _ => BlendMode::Normal,
-            };
+            let blend = paint_blend(paint);
             let gradient = match paint {
                 Fill::Gradient { gradient, .. } => {
                     crate::color_picker::convert_gradient_kind(gradient, gradient_kind)
                 }
-                Fill::Solid { color } => crate::color_picker::convert_gradient_kind(
+                Fill::Solid { color, .. } => crate::color_picker::convert_gradient_kind(
                     &seed_gradient_from_color(*color),
                     gradient_kind,
                 ),
@@ -8434,7 +8501,7 @@ mod panel_integration_tests {
                 {
                     let doc = &item.document().unwrap().doc;
                     replace_data_operation(doc, vector_id, |data| {
-                        if let Some(Fill::Solid { color }) = fill_slot_mut(data, 0) {
+                        if let Some(Fill::Solid { color, .. }) = fill_slot_mut(data, 0) {
                             color.a = 128;
                         }
                     })
@@ -8455,7 +8522,7 @@ mod panel_integration_tests {
                     panic!("expected a vector");
                 };
                 match vector.fills.first() {
-                    Some(Fill::Solid { color }) => color.a,
+                    Some(Fill::Solid { color, .. }) => color.a,
                     _ => panic!("expected a solid fill"),
                 }
             })
@@ -9243,6 +9310,7 @@ mod tests {
             scale: None,
             rotation: None,
             blend: BlendMode::Normal,
+            adjust: fanta_doc::ImageAdjust::default(),
         });
         let remembered = paint_alpha(fill_at(&image, 0).expect("a fill"));
         assert_eq!(remembered, HiddenPaintAlpha::Image(0.4));
@@ -9469,7 +9537,7 @@ mod tests {
         let Some(Operation::ReplaceData { new, .. }) = operations.first() else {
             panic!("expected a ReplaceData operation");
         };
-        let Some(Fill::Solid { color }) = fill_at(new, 0) else {
+        let Some(Fill::Solid { color, .. }) = fill_at(new, 0) else {
             panic!("expected a solid fill");
         };
         assert_eq!(color.a, 128);
@@ -9482,6 +9550,7 @@ mod tests {
             scale: None,
             rotation: None,
             blend: BlendMode::Normal,
+            adjust: fanta_doc::ImageAdjust::default(),
         }));
         let field = InspectorField::PaintOpacity {
             id,
