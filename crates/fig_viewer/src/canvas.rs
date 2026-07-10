@@ -135,6 +135,66 @@ struct CachedSurface {
     key: SurfaceKey,
 }
 
+/// What to do with the cached frame for a newly requested one.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum FrameDecision {
+    /// The cached frame matches the request exactly; hand it back as fresh.
+    ReuseCached,
+    /// The cached frame covers the requested view at a tolerable zoom ratio
+    /// and a fresh render is throttled; scale/offset it over the element.
+    Reproject,
+    /// Render the scene anew.
+    RenderFresh,
+}
+
+/// Decide whether `cached` satisfies `requested` as-is, can be reprojected
+/// over it, or a fresh render is due. Pure so the reproject-vs-fresh policy is
+/// unit-testable without a Metal device.
+///
+/// Mid-interaction (`within_render_interval`), the previous frame is reused
+/// reprojected instead of paying for a full scene render on every viewport
+/// tick — but only when the cached frame's world coverage still contains
+/// everything the element must show. A partially covering frame would flash
+/// background at the leading edges until the next fresh render, which reads as
+/// edge jumping while panning or zooming out.
+#[cfg(target_os = "macos")]
+fn frame_decision(
+    cached: &SurfaceKey,
+    requested: &SurfaceKey,
+    frame_logical: (f64, f64),
+    visible_logical: (f64, f64),
+    within_render_interval: bool,
+) -> FrameDecision {
+    if *cached == *requested {
+        return FrameDecision::ReuseCached;
+    }
+    if cached.size == requested.size
+        && cached.page_root == requested.page_root
+        && cached.revision == requested.revision
+        && within_render_interval
+    {
+        let cached_zoom = cached.viewport_zoom.max(f64::EPSILON);
+        let scale = requested.viewport_zoom / cached_zoom;
+        let covered_width = frame_logical.0 / cached_zoom;
+        let covered_height = frame_logical.1 / cached_zoom;
+        let needed_width = visible_logical.0 / requested.viewport_zoom.max(f64::EPSILON);
+        let needed_height = visible_logical.1 / requested.viewport_zoom.max(f64::EPSILON);
+        let slack_x = (covered_width - needed_width) * 0.5;
+        let slack_y = (covered_height - needed_height) * 0.5;
+        let offset_x = (cached.viewport_center[0] - requested.viewport_center[0]).abs();
+        let offset_y = (cached.viewport_center[1] - requested.viewport_center[1]).abs();
+        let covers_view = offset_x <= slack_x && offset_y <= slack_y;
+        if covers_view
+            && (1.0 / MacGpuRenderer::MAX_REPROJECT_SCALE..=MacGpuRenderer::MAX_REPROJECT_SCALE)
+                .contains(&scale)
+        {
+            return FrameDecision::Reproject;
+        }
+    }
+    FrameDecision::RenderFresh
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) struct MacGpuRenderer {
     raster_renderer: RasterRenderer,
@@ -279,47 +339,30 @@ impl MacGpuRenderer {
             page_root,
             revision: document.doc.scene.revision(),
         };
-        if let Some(cached) = &self.cached
-            && cached.key == key
-        {
-            return Ok(GpuFrame::Fresh(cached.buffer.clone()));
-        }
-
-        // Mid-interaction, reuse the previous frame reprojected instead of
-        // paying for a full scene render on every viewport tick — but only
-        // when the cached frame's world coverage still contains everything
-        // the element must show. A partially covering frame would flash
-        // background at the leading edges until the next fresh render, which
-        // reads as edge jumping while panning or zooming out.
-        if let Some(cached) = &self.cached
-            && cached.key.size == size
-            && cached.key.page_root == page_root
-            && cached.key.revision == key.revision
-            && self
+        if let Some(cached) = &self.cached {
+            let within_render_interval = self
                 .last_render_at
-                .is_some_and(|at| at.elapsed() < Self::MIN_RENDER_INTERVAL)
-        {
-            let cached_zoom = cached.key.viewport_zoom.max(f64::EPSILON);
-            let scale = viewport.zoom / cached_zoom;
-            let covered_width = frame_logical.0 / cached_zoom;
-            let covered_height = frame_logical.1 / cached_zoom;
-            let needed_width = visible_logical.0 / viewport.zoom.max(f64::EPSILON);
-            let needed_height = visible_logical.1 / viewport.zoom.max(f64::EPSILON);
-            let slack_x = (covered_width - needed_width) * 0.5;
-            let slack_y = (covered_height - needed_height) * 0.5;
-            let offset_x = (cached.key.viewport_center[0] - viewport.center[0]).abs();
-            let offset_y = (cached.key.viewport_center[1] - viewport.center[1]).abs();
-            let covers_view = offset_x <= slack_x && offset_y <= slack_y;
-            if covers_view
-                && (1.0 / Self::MAX_REPROJECT_SCALE..=Self::MAX_REPROJECT_SCALE).contains(&scale)
-            {
-                return Ok(GpuFrame::Reprojected {
-                    buffer: cached.buffer.clone(),
-                    viewport: Viewport {
-                        center: cached.key.viewport_center,
-                        zoom: cached.key.viewport_zoom,
-                    },
-                });
+                .is_some_and(|at| at.elapsed() < Self::MIN_RENDER_INTERVAL);
+            match frame_decision(
+                &cached.key,
+                &key,
+                frame_logical,
+                visible_logical,
+                within_render_interval,
+            ) {
+                FrameDecision::ReuseCached => {
+                    return Ok(GpuFrame::Fresh(cached.buffer.clone()));
+                }
+                FrameDecision::Reproject => {
+                    return Ok(GpuFrame::Reprojected {
+                        buffer: cached.buffer.clone(),
+                        viewport: Viewport {
+                            center: cached.key.viewport_center,
+                            zoom: cached.key.viewport_zoom,
+                        },
+                    });
+                }
+                FrameDecision::RenderFresh => {}
             }
         }
 
@@ -667,9 +710,19 @@ impl Element for CanvasElement {
             let document = item
                 .document()
                 .ok_or_else(|| anyhow!("Figma document is not ready"))?;
+            // Render the SAME page the tools parent into, hit-testing scopes to,
+            // and the selection overlay walks — `doc.active_page()`. Deriving the
+            // render root from `selected_page_index` instead let the two diverge
+            // (e.g. after a reload, or when the importer's active design page is
+            // not the first visible page), so a freshly-created shape was parented
+            // under `active_page` while the canvas rendered a different page —
+            // making new shapes and text render invisible. Fall back to the
+            // selected page's root only when no active page is set.
             let page_root = document
-                .page(this.selected_page_index())
-                .map(|page| page.root)
+                .doc
+                .active_page()
+                .map(Some)
+                .or_else(|| document.page(this.selected_page_index()).map(|page| page.root))
                 .ok_or_else(|| anyhow!("Figma document has no renderable pages"))?;
 
             #[cfg(target_os = "macos")]
@@ -768,6 +821,17 @@ struct OverlayData {
     /// Measurement gap segments between the single selection and the hovered
     /// node, when the alt-hover-style measure condition holds.
     measure_segments: Vec<GapSegment>,
+    /// Comment pins on the active page, in stored (oldest-first) order.
+    comment_pins: Vec<CommentPin>,
+}
+
+/// Prepaint snapshot of one comment pin (owned, so paint holds no doc borrow).
+pub(crate) struct CommentPin {
+    pub(crate) world: DVec2,
+    pub(crate) author: String,
+    pub(crate) resolved: bool,
+    pub(crate) from_agent: bool,
+    pub(crate) message_count: usize,
 }
 
 impl CanvasElement {
@@ -781,6 +845,7 @@ impl CanvasElement {
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
+            comment_pins: Vec::new(),
         };
         let view = self.view.read(cx);
         let item = view.item().read(cx);
@@ -825,6 +890,21 @@ impl CanvasElement {
         }
         if let Some(union) = data.selection_union {
             data.selection_size = Some((union.width(), union.height()));
+        }
+
+        // Comment pins for the active page (annotation overlay, not scene
+        // content, so they paint above the rendered canvas like the badges).
+        if let Some(page) = doc.active_page() {
+            data.comment_pins = crate::comments::read_comments(doc, page)
+                .into_iter()
+                .map(|comment| CommentPin {
+                    world: DVec2::new(comment.world[0], comment.world[1]),
+                    author: comment.author.clone(),
+                    resolved: comment.resolved,
+                    from_agent: comment.from_agent,
+                    message_count: comment.message_count(),
+                })
+                .collect();
         }
 
         // Measurements: exactly one node selected and a different, non-related
@@ -1125,6 +1205,28 @@ impl CanvasElement {
                 );
                 paint_pill(mid, &line, measure_red, window, cx);
             }
+
+            // Comment pins: the original fanta's teardrop — squared tail at
+            // the anchor's bottom-left, author-colored body, white monogram,
+            // and a message-count chip. Screen-fixed size across zoom.
+            for pin in &data.comment_pins {
+                let anchor = project(pin.world);
+                let fill = if pin.from_agent {
+                    accent
+                } else {
+                    avatar_color(&pin.author)
+                };
+                let fill = if pin.resolved { fill.opacity(0.5) } else { fill };
+                paint_comment_pin(
+                    anchor,
+                    fill,
+                    &pin.author,
+                    pin.message_count,
+                    &ui_font,
+                    window,
+                    cx,
+                );
+            }
         });
     }
 }
@@ -1252,6 +1354,211 @@ fn edge_gaps(selected: fanta_doc::Bounds, hovered: fanta_doc::Bounds) -> Vec<Gap
 /// Shape a single line of overlay text in the UI font at a fixed screen size.
 /// The whole overlay pass shapes only a handful of these (top-level frame names
 /// plus one badge and up to two measurement labels), so no caching is needed.
+/// Screen-fixed comment pin size, constant across zoom (matches the original).
+const COMMENT_PIN_SIZE: f32 = 30.0;
+
+/// The teardrop outline the original fanta uses: a 24-unit circle with three
+/// rounded corners and a SQUARED bottom-left tail (the anchor point). Cubics
+/// sampled at 10 steps each and normalized into the unit square, cached.
+fn pin_unit_polygon() -> &'static [(f32, f32)] {
+    use std::sync::OnceLock;
+    static POLY: OnceLock<Vec<(f32, f32)>> = OnceLock::new();
+    POLY.get_or_init(|| {
+        fn cubic(
+            points: &mut Vec<(f32, f32)>,
+            p0: (f32, f32),
+            p1: (f32, f32),
+            p2: (f32, f32),
+            p3: (f32, f32),
+        ) {
+            for step in 1..=10 {
+                let t = step as f32 / 10.0;
+                let u = 1.0 - t;
+                let x = u * u * u * p0.0
+                    + 3.0 * u * u * t * p1.0
+                    + 3.0 * u * t * t * p2.0
+                    + t * t * t * p3.0;
+                let y = u * u * u * p0.1
+                    + 3.0 * u * u * t * p1.1
+                    + 3.0 * u * t * t * p2.1
+                    + t * t * t * p3.1;
+                points.push((x, y));
+            }
+        }
+        let mut points: Vec<(f32, f32)> = Vec::with_capacity(44);
+        points.push((24.0, 12.098));
+        cubic(
+            &mut points,
+            (24.0, 12.098),
+            (24.0, 18.725),
+            (18.627, 24.098),
+            (12.0, 24.098),
+        );
+        points.push((1.146, 24.098));
+        cubic(
+            &mut points,
+            (1.146, 24.098),
+            (0.513, 24.098),
+            (0.0, 23.585),
+            (0.0, 22.952),
+        );
+        points.push((0.0, 12.098));
+        cubic(
+            &mut points,
+            (0.0, 12.098),
+            (0.0, 5.471),
+            (5.373, 0.098),
+            (12.0, 0.098),
+        );
+        cubic(
+            &mut points,
+            (12.0, 0.098),
+            (18.627, 0.098),
+            (24.0, 5.471),
+            (24.0, 12.098),
+        );
+        points
+            .into_iter()
+            .map(|(x, y)| (x / 24.0, (y - 0.098) / 24.0))
+            .collect()
+    })
+}
+
+/// Deterministic per-author pin/avatar color: FNV-1a over the normalized name
+/// hashed onto the hue wheel at the original's fixed saturation/value.
+fn avatar_color(author: &str) -> Hsla {
+    let normalized = author.trim().to_lowercase();
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in normalized.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let hue = (hash % 360) as f32 / 360.0;
+    // HSV(h, 0.52, 0.72) converted to HSL.
+    let value = 0.72;
+    let saturation_v = 0.52;
+    let lightness = value * (1.0 - saturation_v / 2.0);
+    let saturation = if lightness <= 0.0 || lightness >= 1.0 {
+        0.0
+    } else {
+        (value - lightness) / f32::min(lightness, 1.0 - lightness)
+    };
+    gpui::hsla(hue, saturation, lightness, 1.0)
+}
+
+/// One teardrop comment pin: drop shadow, author-colored body, hairline white
+/// stroke, monogram, and (for threads) a count chip at the top-right.
+fn paint_comment_pin(
+    anchor: Point<Pixels>,
+    fill: Hsla,
+    author: &str,
+    message_count: usize,
+    ui_font: &Font,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let size = COMMENT_PIN_SIZE;
+    // The anchor is the squared tail: the pin rect's bottom-left corner.
+    let origin = point(anchor.x, anchor.y - px(size));
+    let polygon = pin_unit_polygon();
+    let build = |offset_y: f32| -> Option<gpui::Path<Pixels>> {
+        let mut points = polygon.iter().map(|(x, y)| {
+            point(
+                origin.x + px(x * size),
+                origin.y + px(y * size + offset_y),
+            )
+        });
+        let first = points.next()?;
+        let mut builder = PathBuilder::fill();
+        builder.move_to(first);
+        for p in points {
+            builder.line_to(p);
+        }
+        builder.close();
+        builder.build().ok()
+    };
+    if let Some(shadow) = build(1.5) {
+        window.paint_path(shadow, gpui::black().opacity(0.18));
+    }
+    if let Some(body) = build(0.0) {
+        window.paint_path(body, fill);
+    }
+    // Hairline outline: re-trace the polygon as a stroke path.
+    {
+        let mut points = polygon
+            .iter()
+            .map(|(x, y)| point(origin.x + px(x * size), origin.y + px(y * size)));
+        if let Some(first) = points.next() {
+            let mut builder = PathBuilder::stroke(px(1.));
+            builder.move_to(first);
+            for p in points {
+                builder.line_to(p);
+            }
+            builder.close();
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, gpui::white().opacity(0.86));
+            }
+        }
+    }
+    // Monogram: first grapheme of the author, uppercased; nudged up because
+    // the tail eats the bottom-left.
+    let monogram: String = author
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let line = shape_label(&monogram, gpui::white(), ui_font, window);
+    let text_x = origin.x + px(size / 2.0) - line.width / 2.0;
+    let text_y = origin.y + px(size * 0.43) - px(LABEL_FONT_SIZE / 2.0);
+    if let Err(error) = line.paint(
+        point(text_x, text_y),
+        px(LABEL_FONT_SIZE * 1.2),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        log::warn!("failed to paint comment pin monogram: {error:#}");
+    }
+    // Thread size chip, only when there are replies.
+    if message_count > 1 {
+        let chip_center = point(origin.x + px(size * 0.92), origin.y + px(size * 0.08));
+        let chip_radius = px(size * 0.27);
+        let underlay = Bounds {
+            origin: point(
+                chip_center.x - chip_radius - px(1.6),
+                chip_center.y - chip_radius - px(1.6),
+            ),
+            size: gpui::size((chip_radius + px(1.6)) * 2.0, (chip_radius + px(1.6)) * 2.0),
+        };
+        window.paint_quad(
+            gpui::fill(underlay, gpui::white()).corner_radii(gpui::Corners::all(chip_radius + px(1.6))),
+        );
+        let chip = Bounds {
+            origin: point(chip_center.x - chip_radius, chip_center.y - chip_radius),
+            size: gpui::size(chip_radius * 2.0, chip_radius * 2.0),
+        };
+        window.paint_quad(
+            gpui::fill(chip, gpui::rgb(0x33343A)).corner_radii(gpui::Corners::all(chip_radius)),
+        );
+        let count = shape_label(&format!("{message_count}"), gpui::white(), ui_font, window);
+        if let Err(error) = count.paint(
+            point(
+                chip_center.x - count.width / 2.0,
+                chip_center.y - px(LABEL_FONT_SIZE / 2.0),
+            ),
+            px(LABEL_FONT_SIZE),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        ) {
+            log::warn!("failed to paint comment pin count: {error:#}");
+        }
+    }
+}
+
 fn shape_label(text: &str, color: Hsla, ui_font: &Font, window: &Window) -> ShapedLine {
     let text: gpui::SharedString = text.to_string().into();
     let run = TextRun {
@@ -1457,5 +1764,122 @@ mod tests {
         // Doubling the zoom doubles the old frame around the element center.
         assert!((f32::from(projected.size.width) - 200.0).abs() < 1e-4);
         assert!((f32::from(projected.origin.x) - -50.0).abs() < 1e-4);
+    }
+
+    fn surface_key(center: [f64; 2], zoom: f64, revision: u64) -> SurfaceKey {
+        SurfaceKey {
+            size: (1000, 1000),
+            viewport_center: center,
+            viewport_zoom: zoom,
+            page_root: None,
+            revision,
+        }
+    }
+
+    /// The frame is rendered with a 160-logical-px margin on each side of a
+    /// 1000×1000 element, so at zoom 1 the cached frame has 160 world units of
+    /// pan slack per axis.
+    const FRAME_LOGICAL: (f64, f64) = (1320.0, 1320.0);
+    const VISIBLE_LOGICAL: (f64, f64) = (1000.0, 1000.0);
+
+    #[test]
+    fn identical_key_reuses_the_cached_frame_even_outside_the_interval() {
+        let key = surface_key([0.0, 0.0], 1.0, 7);
+        assert_eq!(
+            frame_decision(&key, &key, FRAME_LOGICAL, VISIBLE_LOGICAL, false),
+            FrameDecision::ReuseCached
+        );
+    }
+
+    #[test]
+    fn a_revision_bump_always_renders_fresh() {
+        // Same viewport, mid-interaction: an edit landed, so a reprojected
+        // frame would show stale content.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let requested = surface_key([0.0, 0.0], 1.0, 8);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn a_small_pan_within_the_interval_reprojects() {
+        // 100 world units of pan at zoom 1 stays inside the 160-unit slack.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let requested = surface_key([100.0, 0.0], 1.0, 7);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::Reproject
+        );
+    }
+
+    #[test]
+    fn a_pan_beyond_the_margin_slack_renders_fresh() {
+        // 200 world units exceeds the 160-unit slack: the cached frame no
+        // longer covers the leading edge.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let requested = surface_key([200.0, 0.0], 1.0, 7);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn pan_slack_scales_with_the_cached_zoom() {
+        // At zoom 2 the cached frame covers 1320/2 = 660 world units against a
+        // needed 1000/2 = 500, leaving 80 units of slack per side.
+        let cached = surface_key([0.0, 0.0], 2.0, 7);
+        let just_inside = surface_key([0.0, 79.0], 2.0, 7);
+        let just_outside = surface_key([0.0, 81.0], 2.0, 7);
+        assert_eq!(
+            frame_decision(&cached, &just_inside, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::Reproject
+        );
+        assert_eq!(
+            frame_decision(&cached, &just_outside, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn a_zoom_ratio_beyond_the_reproject_cap_renders_fresh() {
+        // Zooming IN shrinks the needed world coverage, so the cached frame
+        // still covers the view — only the 3× scale cap forces the fresh
+        // render here.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let at_cap = surface_key([0.0, 0.0], MacGpuRenderer::MAX_REPROJECT_SCALE, 7);
+        let beyond_cap = surface_key([0.0, 0.0], MacGpuRenderer::MAX_REPROJECT_SCALE * 1.01, 7);
+        assert_eq!(
+            frame_decision(&cached, &at_cap, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::Reproject
+        );
+        assert_eq!(
+            frame_decision(&cached, &beyond_cap, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn outside_the_render_interval_a_pan_renders_fresh() {
+        // The throttle window has passed: pay for the sharp frame.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let requested = surface_key([1.0, 0.0], 1.0, 7);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, false),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn an_element_resize_renders_fresh() {
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let mut requested = surface_key([0.0, 0.0], 1.0, 7);
+        requested.size = (1200, 1000);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
     }
 }

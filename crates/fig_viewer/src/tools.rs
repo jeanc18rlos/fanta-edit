@@ -24,7 +24,7 @@ const NEW_SHAPE_FILL: Color = Color::BLACK;
 /// button showing the group's active/last-used tool plus a caret that opens a
 /// dropdown of the group's members; the zoom cluster is rendered separately.
 /// Order: navigation, layout, shape, line/vector, text.
-pub const TOOLBAR_GROUPS: [&[ToolKind]; 5] = [
+pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
     &[
         ToolKind::Select,
         ToolKind::PathSelect,
@@ -41,6 +41,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 5] = [
     ],
     &[ToolKind::NodeEdit, ToolKind::Pencil, ToolKind::Pen],
     &[ToolKind::Text, ToolKind::TextPath],
+    &[ToolKind::Comment],
 ];
 
 /// The default face (button icon) for each toolbar group before the user picks
@@ -77,6 +78,7 @@ pub enum ToolKind {
     Slice,
     Text,
     TextPath,
+    Comment,
 }
 
 impl ToolKind {
@@ -99,6 +101,7 @@ impl ToolKind {
             Self::Slice => "Slice",
             Self::Text => "Text",
             Self::TextPath => "Text on Path",
+            Self::Comment => "Comment",
         }
     }
 
@@ -121,6 +124,7 @@ impl ToolKind {
             Self::Slice => IconName::ToolSlice,
             Self::Text => IconName::ToolText,
             Self::TextPath => IconName::ToolTextPath,
+            Self::Comment => IconName::Chat,
         }
     }
 
@@ -150,6 +154,9 @@ impl ToolKind {
             Self::Slice => Box::new(SliceTool::new()),
             Self::Text => Box::new(TextTool::new()),
             Self::TextPath => Box::new(TextPathTool::new()),
+            // Comment mode is handled by the shell (click-to-pin); the select
+            // tool backs it so unconsumed events stay harmless.
+            Self::Comment => Box::new(SelectTool::new()),
         }
     }
 }
@@ -309,4 +316,154 @@ pub fn release_event(screen: DVec2, button: Button, modifiers: Modifiers) -> Too
 
 pub fn key_event(key: LogicalKey, modifiers: Modifiers) -> ToolEvent {
     ToolEvent::Key(KeyEvent::with_modifiers(key, modifier_keys(modifiers)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::NavigationDirection;
+
+    #[test]
+    fn pointer_buttons_map_and_navigation_buttons_are_dropped() {
+        assert_eq!(pointer_button(MouseButton::Left), Some(Button::Primary));
+        assert_eq!(pointer_button(MouseButton::Right), Some(Button::Secondary));
+        assert_eq!(pointer_button(MouseButton::Middle), Some(Button::Middle));
+        assert_eq!(
+            pointer_button(MouseButton::Navigate(NavigationDirection::Back)),
+            None
+        );
+        assert_eq!(
+            pointer_button(MouseButton::Navigate(NavigationDirection::Forward)),
+            None
+        );
+    }
+
+    #[test]
+    fn each_gpui_modifier_maps_to_its_tool_flag() {
+        assert_eq!(modifier_keys(Modifiers::default()), ModifierKeys::empty());
+        let cases = [
+            (
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                ModifierKeys::SHIFT,
+            ),
+            (
+                Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+                ModifierKeys::ALT,
+            ),
+            (
+                Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+                ModifierKeys::CTRL,
+            ),
+            (
+                Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
+                ModifierKeys::META,
+            ),
+        ];
+        for (gpui_modifiers, expected) in cases {
+            assert_eq!(modifier_keys(gpui_modifiers), expected);
+        }
+        let all = Modifiers {
+            shift: true,
+            alt: true,
+            control: true,
+            platform: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            modifier_keys(all),
+            ModifierKeys::SHIFT | ModifierKeys::ALT | ModifierKeys::CTRL | ModifierKeys::META
+        );
+    }
+
+    #[test]
+    fn the_function_modifier_maps_to_no_tool_flag() {
+        let function_only = Modifiers {
+            function: true,
+            ..Default::default()
+        };
+        assert_eq!(modifier_keys(function_only), ModifierKeys::empty());
+    }
+
+    #[test]
+    fn press_event_carries_position_button_modifiers_and_count() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let event = press_event(DVec2::new(12.5, -3.0), Button::Primary, shift, 2);
+        assert_eq!(
+            event,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: [12.5, -3.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::SHIFT,
+                count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn press_event_saturates_the_click_count_at_u8_max() {
+        let event = press_event(DVec2::ZERO, Button::Primary, Modifiers::default(), 300);
+        let ToolEvent::Pointer(PointerEvent::Press { count, .. }) = event else {
+            panic!("expected a pointer press");
+        };
+        assert_eq!(count, u8::MAX);
+    }
+
+    #[test]
+    fn move_release_and_key_events_map_their_fields() {
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            move_event(DVec2::new(1.0, 2.0), alt),
+            ToolEvent::Pointer(PointerEvent::Move {
+                screen: [1.0, 2.0],
+                modifiers: ModifierKeys::ALT,
+            })
+        );
+        assert_eq!(
+            release_event(DVec2::new(3.0, 4.0), Button::Secondary, alt),
+            ToolEvent::Pointer(PointerEvent::Release {
+                screen: [3.0, 4.0],
+                button: Button::Secondary,
+                modifiers: ModifierKeys::ALT,
+            })
+        );
+        assert_eq!(
+            key_event(LogicalKey::Escape, alt),
+            ToolEvent::Key(KeyEvent::with_modifiers(
+                LogicalKey::Escape,
+                ModifierKeys::ALT
+            ))
+        );
+    }
+
+    #[test]
+    fn every_toolbar_group_member_resolves_to_its_own_group() {
+        for (group_index, group) in TOOLBAR_GROUPS.iter().enumerate() {
+            for &kind in *group {
+                assert_eq!(
+                    group_index_of(kind),
+                    Some(group_index),
+                    "{kind:?} must resolve to group {group_index}"
+                );
+            }
+        }
+        assert_eq!(initial_group_faces().len(), TOOLBAR_GROUPS.len());
+    }
 }

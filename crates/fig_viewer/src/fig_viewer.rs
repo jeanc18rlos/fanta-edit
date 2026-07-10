@@ -4,14 +4,21 @@
 
 mod canvas;
 mod color_picker;
+mod comments;
+mod comments_ui;
 mod design_panel;
 mod document;
 mod inspector_widgets;
+mod instance_text;
 mod panel_settings;
+mod properties_ops;
 mod properties_panel;
+mod properties_render;
+mod properties_snapshot;
 mod text_edit;
 mod tools;
 mod view;
+mod view_text;
 
 use gpui::{App, AsyncWindowContext, Entity, WeakEntity};
 use workspace::{Panel, Workspace};

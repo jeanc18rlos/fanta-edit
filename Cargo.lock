@@ -6738,6 +6738,8 @@ dependencies = [
  "project",
  "release_channel",
  "semver",
+ "serde",
+ "serde_json",
  "settings",
  "skia-safe",
  "smallvec",

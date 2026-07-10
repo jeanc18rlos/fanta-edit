@@ -3,20 +3,17 @@
 //! and the `Item` integration that gives fanta projects text-editor-style
 //! dirty tracking and save.
 
-use std::ops::Range;
-
 use anyhow::Result;
 use fanta_canvas::HitPrecision;
-use fanta_doc::{NodeData, NodeId, Viewport};
+use fanta_doc::{NodeId, Viewport};
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle,
-    DragMoveEvent, ElementInputHandler, Empty, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Action, Anchor, AnyElement, App, Bounds, Context, CursorStyle, DragMoveEvent, Empty, Entity,
+    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    Subscription, Task, UTF16Selection, Window, actions, canvas, div, fill, point, px, size,
+    Subscription, Task, Window, actions, div, px,
 };
 use language::Capability;
 use project::Project;
@@ -33,7 +30,7 @@ use crate::design_panel::FantaDesignPanel;
 use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 use crate::properties_panel::FantaPropertiesPanel;
-use crate::text_edit::{self, CARET_BLINK_INTERVAL, CanvasTextEdit, TextEditSession};
+use crate::text_edit::CanvasTextEdit;
 use crate::tools::{
     TOOLBAR_GROUPS, ToolKind, ToolShell, key_event, move_event, pointer_button, press_event,
     release_event, tool_context,
@@ -105,6 +102,8 @@ actions!(
         ActivatePathSelectTool,
         /// Activate the text-on-path tool (placeholder).
         ActivateTextPathTool,
+        /// Activate the comment tool (click the canvas to pin a comment).
+        ActivateCommentTool,
         /// Show or hide the embedded layers sidebar.
         ToggleLayersSidebar,
         /// Show or hide the embedded inspector sidebar.
@@ -134,6 +133,7 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Slice => Box::new(ActivateSliceTool),
         ToolKind::Text => Box::new(ActivateTextTool),
         ToolKind::TextPath => Box::new(ActivateTextPathTool),
+        ToolKind::Comment => Box::new(ActivateCommentTool),
     }
 }
 
@@ -165,9 +165,9 @@ impl Render for SidebarResizeDrag {
 }
 
 pub struct FigView {
-    item: Entity<FigItem>,
+    pub(crate) item: Entity<FigItem>,
     project: Entity<Project>,
-    focus_handle: FocusHandle,
+    pub(crate) focus_handle: FocusHandle,
     layers_sidebar: Entity<FantaDesignPanel>,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
     layers_sidebar_visible: bool,
@@ -178,17 +178,18 @@ pub struct FigView {
     /// Root node of the explicitly selected page, used to re-resolve
     /// `selected_page_index` when a disk reload reorders or removes pages.
     selected_page_root: Option<NodeId>,
-    viewport: Option<Viewport>,
+    pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
     /// Space is held: the canvas temporarily pans with any active tool, the
     /// Figma/Illustrator "hold space to pan" gesture. Cleared on key-up.
     space_pan: bool,
-    container_bounds: Option<Bounds<Pixels>>,
+    pub(crate) container_bounds: Option<Bounds<Pixels>>,
     pub(crate) rendered_canvas: Option<RenderedCanvas>,
     #[cfg(target_os = "macos")]
     gpu_renderer: Option<MacGpuRenderer>,
-    tools: ToolShell,
+    pub(crate) tools: ToolShell,
+    pub(crate) comment_state: crate::comments_ui::CommentState,
     /// The last-used tool per toolbar group, so each group's button keeps
     /// showing the member you last picked (Figma behavior). Indexed by group.
     group_faces: Vec<ToolKind>,
@@ -197,7 +198,7 @@ pub struct FigView {
     fonts_prewarmed: bool,
     hovered_node: Option<NodeId>,
     /// The in-place text-editing session, when a text node is being edited.
-    text_edit: Option<CanvasTextEdit>,
+    pub(crate) text_edit: Option<CanvasTextEdit>,
     /// A text node waiting for a session to open. The text tool commits on
     /// a release delivered through the canvas's window-level mouse listener,
     /// which has no `Window`, so the session is opened on the next render.
@@ -215,7 +216,8 @@ impl EventEmitter<FigViewEvent> for FigView {}
 /// How a freshly opened text session seeds its selection: the text tool and
 /// enter-to-edit select everything (the first keystroke replaces it), a
 /// double-click selects the word under the cursor.
-enum TextEditSeed {
+#[derive(Debug)]
+pub(crate) enum TextEditSeed {
     SelectAll,
     WordAt(DVec2),
 }
@@ -243,10 +245,23 @@ impl FigView {
             )
         };
         let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
+        let focus_handle = cx.focus_handle();
+        // A space held across a focus change (panel click, window switch, a
+        // text session opening) delivers its key-up elsewhere; without this
+        // reset `space_pan` stays true and the Select tool pans with a hand
+        // cursor until space is pressed again.
+        cx.on_focus_out(&focus_handle, window, |this: &mut Self, _, _, cx| {
+            if this.space_pan || this.pan_last_position.is_some() {
+                this.space_pan = false;
+                this.pan_last_position = None;
+                cx.notify();
+            }
+        })
+        .detach();
         Self {
             item,
             project,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             layers_sidebar,
             inspector_sidebar,
             layers_sidebar_visible,
@@ -264,6 +279,7 @@ impl FigView {
             #[cfg(target_os = "macos")]
             gpu_renderer: None,
             tools: ToolShell::new(),
+            comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
             fonts_prewarmed: false,
             hovered_node: None,
@@ -393,7 +409,7 @@ impl FigView {
         self.rendered_canvas = None;
     }
 
-    fn invalidate_canvas_cache(&mut self) {
+    pub(crate) fn invalidate_canvas_cache(&mut self) {
         self.rendered_canvas = None;
         #[cfg(target_os = "macos")]
         if let Some(renderer) = self.gpu_renderer.as_mut() {
@@ -411,7 +427,7 @@ impl FigView {
         self.gpu_renderer = Some(renderer);
     }
 
-    fn is_editable(&self, cx: &App) -> bool {
+    pub(crate) fn is_editable(&self, cx: &App) -> bool {
         self.item.read(cx).is_editable()
     }
 
@@ -641,6 +657,10 @@ impl FigView {
         if kind.requires_editing() && !self.is_editable(cx) {
             return;
         }
+        if kind != ToolKind::Comment {
+            self.comment_state.draft = None;
+            self.comment_state.hovered_pin = None;
+        }
         // Switching tools (toolbar click) while typing ends the session the
         // way any click-away does.
         self.commit_text_edit(cx);
@@ -743,12 +763,27 @@ impl FigView {
                 self.open_text_edit(node, TextEditSeed::WordAt(screen), window, cx);
                 return;
             }
+            // No real text under the cursor — try text inside a component
+            // instance (a virtual clone, edited via an override).
+            if let Some(target) = self.instance_text_at(screen, cx) {
+                self.open_instance_text_edit(target, TextEditSeed::WordAt(screen), window, cx);
+                return;
+            }
         }
 
         self.focus_handle.focus(window, cx);
         let Some(bounds) = self.container_bounds else {
             return;
         };
+
+        // Comments: pin clicks open threads with any tool; in comment mode a
+        // canvas click opens the draft composer (nothing hits the doc until
+        // Send) — the original fanta flow.
+        if event.button == MouseButton::Left
+            && self.handle_comment_mouse_down(event.position, window, cx)
+        {
+            return;
+        }
 
         // Middle-drag, or a left-drag while space is held, pans regardless of
         // the active tool.
@@ -877,6 +912,7 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.handle_comment_mouse_move(event.position, cx);
         if self.is_panning() {
             if let Some(last_position) = self.pan_last_position {
                 let delta = event.position - last_position;
@@ -1062,6 +1098,17 @@ impl FigView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape while composing a comment discards the draft and exits the
+        // comment tool entirely (Figma-style), before any other cancel.
+        if self.cancel_comment_draft(cx) {
+            return;
+        }
+        if self.comment_state.open_thread.is_some() {
+            self.comment_state.open_thread = None;
+            self.comment_state.reply_editor = None;
+            cx.notify();
+            return;
+        }
         // Escape while editing text commits and exits the session (Figma
         // commits on escape); this normally arrives through the key-down
         // listener since the FigViewer keymap context is renamed while
@@ -1121,656 +1168,6 @@ impl FigView {
         if self.is_editable(cx) {
             self.dispatch_tool_event(key_event(key, window.modifiers()), cx);
         }
-    }
-
-    // === Inline text editing ==============================================
-
-    /// The topmost text node under `screen`, if any. The hit test returns
-    /// leaves, so a text node is normally hit directly; walk up the ancestor
-    /// chain for content nested under one (e.g. instance-expanded children).
-    fn text_node_at(&self, screen: DVec2, cx: &App) -> Option<NodeId> {
-        let bounds = self.container_bounds?;
-        let viewport = self.viewport?;
-        let (width, height) = bounds_size(bounds);
-        let item = self.item.read(cx);
-        let document = item.document()?;
-        let doc = &document.doc;
-        let hit = fanta_canvas::hit_test_screen(
-            &doc.scene,
-            &viewport,
-            DVec2::new(width, height),
-            screen,
-            HitPrecision::Path,
-            doc.active_page(),
-        )?;
-        if matches!(doc.scene.get(hit)?.data, NodeData::Text(_)) {
-            return Some(hit);
-        }
-        doc.scene
-            .ancestors_of(hit)
-            .find(|node| matches!(node.data, NodeData::Text(_)))
-            .map(|node| node.id)
-    }
-
-    /// The selection anchor, when it is a text node — the node the text tool
-    /// just committed and selected.
-    fn selection_anchor_text_node(&self, cx: &App) -> Option<NodeId> {
-        let item = self.item.read(cx);
-        let document = item.document()?;
-        let anchor = document.doc.selection.anchor()?;
-        matches!(document.doc.scene.get(anchor)?.data, NodeData::Text(_)).then_some(anchor)
-    }
-
-    /// The single selected node, when it is a text node — the target for
-    /// Figma's enter-to-edit.
-    fn single_selected_text_node(&self, cx: &App) -> Option<NodeId> {
-        let item = self.item.read(cx);
-        let document = item.document()?;
-        let &[node] = document.doc.selection.as_slice() else {
-            return None;
-        };
-        matches!(document.doc.scene.get(node)?.data, NodeData::Text(_)).then_some(node)
-    }
-
-    /// Open an in-place editing session on `node`, committing any session
-    /// already in flight on another node.
-    fn open_text_edit(
-        &mut self,
-        node: NodeId,
-        seed: TextEditSeed,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.is_editable(cx) {
-            return;
-        }
-        if let Some(edit) = self.text_edit.as_ref() {
-            if edit.session.node_id() == node {
-                return;
-            }
-            self.commit_text_edit(cx);
-        }
-        let text = self.item.read(cx).document().and_then(|document| {
-            match &document.doc.scene.get(node)?.data {
-                NodeData::Text(text) => Some(text.clone()),
-                _ => None,
-            }
-        });
-        let Some(text) = text else {
-            return;
-        };
-        let mut session = TextEditSession::new(node, &text);
-        match seed {
-            TextEditSeed::SelectAll => session.select_all(),
-            TextEditSeed::WordAt(screen) => {
-                let byte =
-                    self.viewport
-                        .zip(self.container_bounds)
-                        .and_then(|(viewport, bounds)| {
-                            let (width, height) = bounds_size(bounds);
-                            let document = self.item.read(cx).document()?;
-                            text_edit::byte_at_screen(
-                                &document.doc,
-                                node,
-                                screen,
-                                &viewport,
-                                DVec2::new(width, height),
-                            )
-                        });
-                if let Some(byte) = byte {
-                    session.select_word_at(byte);
-                }
-            }
-        }
-        self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                if document.doc.selection.as_slice() == [node] {
-                    ((), DocChange::None)
-                } else {
-                    document.doc.selection.select_only(node);
-                    ((), DocChange::Selection)
-                }
-            });
-        });
-        // Focus leaving the canvas (panel field, pane switch) commits the
-        // session, matching Figma's click-away semantics.
-        let focus_out = cx.on_focus_out(&self.focus_handle, window, |this, _, _, cx| {
-            this.commit_text_edit(cx);
-        });
-        self.text_edit = Some(CanvasTextEdit::new(session, focus_out));
-        self.focus_handle.focus(window, cx);
-        self.reset_caret_blink(cx);
-        cx.notify();
-    }
-
-    /// End the session and, when the text changed, write it back as ONE
-    /// undoable operation. The scene already holds the final content (the
-    /// transient preview wrote it per keystroke), so this stages the commit
-    /// like the select tool's drag: rewind to the pre-edit data, then apply
-    /// `ReplaceData { old: original, new: final }` through history.
-    pub(crate) fn commit_text_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.text_edit.take() else {
-            return;
-        };
-        cx.notify();
-        if !self.is_editable(cx) {
-            return;
-        }
-        let session = edit.session;
-        let operation = self
-            .item
-            .update(cx, |item, cx| {
-                item.with_document(cx, |document| {
-                    text_edit::rewind_preview(&mut document.doc, &session);
-                    let operation = text_edit::commit_operation(&document.doc, &session);
-                    // The rewind never reaches the screen: the apply below
-                    // repaints with the final content in the same cycle.
-                    (operation, DocChange::None)
-                })
-            })
-            .flatten();
-        let Some(operation) = operation else {
-            return;
-        };
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.apply(operation, cx) {
-                log::error!("fig_viewer text edit failed to commit: {error:#}");
-            }
-        });
-    }
-
-    fn drop_text_edit_if_target_gone(&mut self, cx: &App) {
-        let Some(edit) = self.text_edit.as_ref() else {
-            return;
-        };
-        let target_exists = self.item.read(cx).document().is_some_and(|document| {
-            document
-                .doc
-                .scene
-                .get(edit.session.node_id())
-                .is_some_and(|node| matches!(node.data, NodeData::Text(_)))
-        });
-        if !target_exists {
-            // The node (and with it the preview content) is gone; there is
-            // nothing to rewind or commit.
-            self.text_edit = None;
-        }
-    }
-
-    /// A left press while a session is live. Returns true when the press was
-    /// consumed (it landed inside the edited node and moved the caret);
-    /// false lets the press fall through to the tools — after committing the
-    /// session if the press was outside the node.
-    fn handle_text_edit_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some((viewport, bounds)) = self.viewport.zip(self.container_bounds) else {
-            return false;
-        };
-        let Some(node) = self.text_edit.as_ref().map(|edit| edit.session.node_id()) else {
-            return false;
-        };
-        let (width, height) = bounds_size(bounds);
-        let screen_size = DVec2::new(width, height);
-        let screen = screen_position_in_bounds(event.position, bounds);
-        let byte = {
-            let Some(document) = self.item.read(cx).document() else {
-                return false;
-            };
-            let doc = &document.doc;
-            if text_edit::node_contains_screen(doc, node, screen, &viewport, screen_size) {
-                text_edit::byte_at_screen(doc, node, screen, &viewport, screen_size)
-            } else {
-                None
-            }
-        };
-        let Some(byte) = byte else {
-            self.commit_text_edit(cx);
-            return false;
-        };
-        if let Some(edit) = self.text_edit.as_mut() {
-            if event.click_count >= 2 {
-                edit.session.select_word_at(byte);
-            } else {
-                edit.session.click(byte, event.modifiers.shift);
-            }
-            edit.session.dragging = true;
-        }
-        self.reset_caret_blink(cx);
-        cx.notify();
-        true
-    }
-
-    /// Pointer movement while a session is live: track whether the cursor is
-    /// over the edited node (for the I-beam) and extend a drag-selection.
-    /// Returns true when the move was consumed by a drag-selection.
-    fn handle_text_edit_mouse_move(&mut self, screen: DVec2, cx: &mut Context<Self>) -> bool {
-        let Some((viewport, bounds)) = self.viewport.zip(self.container_bounds) else {
-            return false;
-        };
-        let Some((node, dragging)) = self
-            .text_edit
-            .as_ref()
-            .map(|edit| (edit.session.node_id(), edit.session.dragging))
-        else {
-            return false;
-        };
-        let (width, height) = bounds_size(bounds);
-        let screen_size = DVec2::new(width, height);
-        let (inside, byte) = {
-            let Some(document) = self.item.read(cx).document() else {
-                return false;
-            };
-            let doc = &document.doc;
-            let inside = text_edit::node_contains_screen(doc, node, screen, &viewport, screen_size);
-            let byte = if dragging {
-                text_edit::byte_at_screen(doc, node, screen, &viewport, screen_size)
-            } else {
-                None
-            };
-            (inside, byte)
-        };
-        let Some(edit) = self.text_edit.as_mut() else {
-            return false;
-        };
-        if inside != edit.session.pointer_inside {
-            edit.session.pointer_inside = inside;
-            cx.notify();
-        }
-        if !dragging {
-            return false;
-        }
-        if let Some(byte) = byte {
-            edit.session.drag_to(byte);
-            self.reset_caret_blink(cx);
-            cx.notify();
-        }
-        true
-    }
-
-    /// Mutate the session's text, then push the new buffer into the document
-    /// as a transient preview frame — the canvas repaints it through the
-    /// normal renderer, which is what makes the editing view WYSIWYG.
-    fn with_text_session_edit(
-        &mut self,
-        cx: &mut Context<Self>,
-        edit_session: impl FnOnce(&mut TextEditSession),
-    ) {
-        {
-            let Some(edit) = self.text_edit.as_mut() else {
-                return;
-            };
-            edit_session(&mut edit.session);
-        }
-        self.sync_text_preview(cx);
-    }
-
-    /// Mutate only the session's caret/selection — no document write needed.
-    fn with_text_session_move(
-        &mut self,
-        cx: &mut Context<Self>,
-        move_session: impl FnOnce(&mut TextEditSession),
-    ) {
-        {
-            let Some(edit) = self.text_edit.as_mut() else {
-                return;
-            };
-            move_session(&mut edit.session);
-        }
-        self.reset_caret_blink(cx);
-        cx.notify();
-    }
-
-    fn sync_text_preview(&mut self, cx: &mut Context<Self>) {
-        let item = self.item.clone();
-        if let Some(edit) = self.text_edit.as_ref() {
-            item.update(cx, |item, cx| {
-                item.with_document(cx, |document| {
-                    text_edit::apply_preview(&mut document.doc, &edit.session);
-                    ((), DocChange::ContentPreview)
-                });
-            });
-        }
-        // Force the canvas caches (revision-keyed rendered images + GPU
-        // surfaces) to be discarded. Pure style/color changes on text runs
-        // during preview don't change geometry, so GPUI + our image caches
-        // can otherwise reuse a stale frame until a move or other delta
-        // dirties the canvas element. Clearing here makes the new color take
-        // effect on the very next paint.
-        self.invalidate_canvas_cache();
-        self.reset_caret_blink(cx);
-        cx.notify();
-    }
-
-    /// If there is an active text edit session, apply style change only to the
-    /// current selection (for rich text). Returns true if it was applied to a
-    /// selection (caller can skip whole-node mutate). Use from properties for
-    /// color/font etc on partial text.
-    pub(crate) fn with_text_selection_style(
-        &mut self,
-        cx: &mut Context<Self>,
-        patch: impl FnOnce(&mut fanta_text::TextStyle),
-    ) -> bool {
-        if let Some(edit) = self.text_edit.as_mut() {
-            let caret = edit.session.caret();
-            let mut s = edit.session.text_buffer().style_at(caret).clone();
-            patch(&mut s);
-            edit.session.apply_style_to_selection(s);
-            self.sync_text_preview(cx);
-            return true;
-        }
-        false
-    }
-
-    fn text_edit_insert(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.with_text_session_edit(cx, |session| session.insert(text));
-    }
-
-    fn text_edit_vertical_move(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
-        let target = {
-            let Some(edit) = self.text_edit.as_ref() else {
-                return;
-            };
-            let Some(document) = self.item.read(cx).document() else {
-                return;
-            };
-            text_edit::vertical_move_target(
-                &document.doc,
-                edit.session.node_id(),
-                edit.session.caret(),
-                down,
-            )
-        };
-        if let Some(target) = target {
-            self.with_text_session_move(cx, |session| session.move_to(target, extend));
-        }
-    }
-
-    fn text_edit_copy(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = self
-            .text_edit
-            .as_ref()
-            .and_then(|edit| edit.session.selected_text())
-        {
-            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-        }
-    }
-
-    fn text_edit_cut(&mut self, cx: &mut Context<Self>) {
-        self.text_edit_copy(cx);
-        let has_selection = self
-            .text_edit
-            .as_ref()
-            .is_some_and(|edit| !edit.session.selected_range().is_empty());
-        if has_selection {
-            self.text_edit_insert("", cx);
-        }
-    }
-
-    fn text_edit_paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return;
-        };
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.text_edit_insert(&text, cx);
-    }
-
-    /// Restart the caret blink phase (solid now, then blinking) and schedule
-    /// the repaints that animate it. Visibility itself is derived from elapsed
-    /// time in [`CanvasTextEdit::caret_visible`]; this task exists only to wake
-    /// the view at each phase boundary so the derived value is re-rendered. It
-    /// re-arms every cycle, so a single missed wake just slows the blink rather
-    /// than stalling it — and because the caret is solid until the first
-    /// boundary, it is always visible the moment editing starts, even if the
-    /// wake never fires.
-    fn reset_caret_blink(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.text_edit.as_mut() else {
-            return;
-        };
-        let epoch = edit.reset_blink();
-        edit.blink_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(CARET_BLINK_INTERVAL).await;
-                let still_blinking = this.update(cx, |this, cx| {
-                    let Some(edit) = this.text_edit.as_ref() else {
-                        return false;
-                    };
-                    if edit.blink_epoch != epoch {
-                        return false;
-                    }
-                    // The derived visibility flipped across this boundary;
-                    // repaint so the caret shows/hides.
-                    cx.notify();
-                    true
-                });
-                if !matches!(still_blinking, Ok(true)) {
-                    break;
-                }
-            }
-        }));
-    }
-
-    /// Keys the session resolves itself. These arrive here only when no key
-    /// binding claimed them: the FigViewer keymap context is renamed to
-    /// `FigViewerTextEdit` while a session is live (see `render`), which has
-    /// no bindings, so tool shortcuts and canvas keys are suppressed and
-    /// everything falls through — printable characters continue on to the
-    /// platform input handler (`EntityInputHandler`), which also carries IME
-    /// composition.
-    fn handle_text_edit_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.text_edit.is_none() {
-            return;
-        }
-        let keystroke = &event.keystroke;
-        let shift = keystroke.modifiers.shift;
-        let command = keystroke.modifiers.platform;
-        let handled = match keystroke.key.as_str() {
-            // Escape commits and exits — Figma commits on escape.
-            "escape" => {
-                self.commit_text_edit(cx);
-                true
-            }
-            "enter" if command => {
-                self.commit_text_edit(cx);
-                true
-            }
-            "enter" => {
-                self.text_edit_insert("\n", cx);
-                true
-            }
-            "backspace" => {
-                self.with_text_session_edit(cx, |session| session.backspace());
-                true
-            }
-            "delete" => {
-                self.with_text_session_edit(cx, |session| session.delete_forward());
-                true
-            }
-            "left" if command => {
-                self.with_text_session_move(cx, |session| session.move_line_start(shift));
-                true
-            }
-            "right" if command => {
-                self.with_text_session_move(cx, |session| session.move_line_end(shift));
-                true
-            }
-            "home" => {
-                self.with_text_session_move(cx, |session| session.move_line_start(shift));
-                true
-            }
-            "end" => {
-                self.with_text_session_move(cx, |session| session.move_line_end(shift));
-                true
-            }
-            "left" => {
-                self.with_text_session_move(cx, |session| session.move_left(shift));
-                true
-            }
-            "right" => {
-                self.with_text_session_move(cx, |session| session.move_right(shift));
-                true
-            }
-            "up" if command => {
-                self.with_text_session_move(cx, |session| session.move_to(0, shift));
-                true
-            }
-            "down" if command => {
-                self.with_text_session_move(cx, |session| {
-                    session.move_to(session.buffer().len(), shift)
-                });
-                true
-            }
-            "up" => {
-                self.text_edit_vertical_move(false, shift, cx);
-                true
-            }
-            "down" => {
-                self.text_edit_vertical_move(true, shift, cx);
-                true
-            }
-            "a" if command => {
-                self.with_text_session_move(cx, |session| session.select_all());
-                true
-            }
-            "c" if command => {
-                self.text_edit_copy(cx);
-                true
-            }
-            "x" if command => {
-                self.text_edit_cut(cx);
-                true
-            }
-            "v" if command => {
-                self.text_edit_paste(cx);
-                true
-            }
-            // Swallow document undo/redo while typing: the session has no
-            // per-keystroke history and a document undo would fight the
-            // transient preview.
-            "z" if command => true,
-            _ => false,
-        };
-        if handled {
-            cx.stop_propagation();
-        }
-    }
-
-    /// The caret + selection overlay, plus the element that registers this
-    /// view as the window's text-input handler while a session is live. The
-    /// glyphs themselves are painted by the canvas renderer from the live
-    /// (previewed) node content; only the caret bar and the selection
-    /// highlight are drawn here, at geometry measured from the same shaped
-    /// layout the renderer paints.
-    fn render_text_edit_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let edit = self.text_edit.as_ref()?;
-        let bounds = self.container_bounds?;
-        let viewport = self.viewport?;
-        let (width, height) = bounds_size(bounds);
-        let screen_size = DVec2::new(width, height);
-        let session = &edit.session;
-        let node = session.node_id();
-        let document = self.item.read(cx).document()?;
-        let doc = &document.doc;
-
-        // A translucent highlight behind the glyphs and an opaque caret bar,
-        // mirroring the original fanta-app (selection ~27% alpha, solid caret).
-        // `alpha` sets an ABSOLUTE alpha, so the highlight is visible under any
-        // loaded theme regardless of the `selection` swatch's own alpha (a
-        // theme whose selection color is near-transparent would otherwise make
-        // the highlight invisible); the caret is forced fully opaque.
-        // Force a clearly visible highlight for text selection (blue-ish, semi
-        // transparent) so it always shows during edit, independent of theme
-        // player colors. Caret is solid accent.
-        let selection_color = gpui::hsla(0.6, 0.85, 0.55, 0.45);
-        let caret_color = cx.theme().players().local().cursor.alpha(1.0);
-
-        let to_bounds = |[x, y, w, h]: [f64; 4]| Bounds {
-            origin: point(px(x as f32), px(y as f32)),
-            size: size(px(w as f32), px(h as f32)),
-        };
-        let selection_rects: Vec<Bounds<Pixels>> = text_edit::selection_screen_rects(
-            doc,
-            node,
-            session.selected_range(),
-            &viewport,
-            screen_size,
-        )
-        .into_iter()
-        .map(to_bounds)
-        .collect();
-        let caret = edit
-            .caret_visible()
-            .then(|| {
-                text_edit::caret_screen_segment(doc, node, session.caret(), &viewport, screen_size)
-            })
-            .flatten()
-            .map(|(top, bottom)| {
-                // A hairline bar that thickens slightly with zoom, like Figma.
-                let caret_width = (viewport.zoom * 1.5).clamp(1.0, 3.0);
-                to_bounds([
-                    top.x - caret_width * 0.5,
-                    top.y.min(bottom.y),
-                    caret_width,
-                    (bottom.y - top.y).abs().max(1.0),
-                ])
-            });
-
-        // The selection/caret rects from the helpers are in "viewport screen"
-        // space (0,0 at top-left of the container's content area). The overlay
-        // element is absolute full-size at the outer level, so its canvas_bounds
-        // origin is the outer editor origin. Use the container's origin so the
-        // highlight quads land exactly over the text glyphs.
-        let container_origin = self
-            .container_bounds
-            .map(|b| b.origin)
-            .unwrap_or(point(px(0.), px(0.)));
-
-        let entity = cx.entity();
-        let focus_handle = self.focus_handle.clone();
-        Some(
-            canvas(
-                |_, _, _| {},
-                move |canvas_bounds, _, window, cx| {
-                    window.handle_input(
-                        &focus_handle,
-                        ElementInputHandler::new(canvas_bounds, entity),
-                        cx,
-                    );
-                    window.with_content_mask(
-                        Some(ContentMask {
-                            bounds: canvas_bounds,
-                        }),
-                        |window| {
-                            let offset = container_origin;
-                            for rect in selection_rects {
-                                let rect = Bounds {
-                                    origin: offset + rect.origin,
-                                    size: rect.size,
-                                };
-                                window.paint_quad(fill(rect, selection_color));
-                            }
-                            if let Some(rect) = caret {
-                                let rect = Bounds {
-                                    origin: offset + rect.origin,
-                                    size: rect.size,
-                                };
-                                window.paint_quad(fill(rect, caret_color));
-                            }
-                        },
-                    );
-                },
-            )
-            .absolute()
-            .size_full()
-            .into_any_element(),
-        )
     }
 
     // === Pages ============================================================
@@ -2227,8 +1624,13 @@ impl Render for FigView {
                 // Space-hold pan: tracked only outside text editing, where a
                 // space is a literal character.
                 this.on_key_down(cx.listener(Self::handle_canvas_key_down))
-                    .on_key_up(cx.listener(Self::handle_canvas_key_up))
             })
+            // The space key-UP must be seen even if a text session opened (or
+            // any other state change swapped listeners) while the key was held.
+            // Gating it like the key-down left `space_pan` stuck when the
+            // release landed elsewhere — the Select tool then panned with a
+            // hand cursor until the user pressed space again.
+            .on_key_up(cx.listener(Self::handle_canvas_key_up))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::reset_zoom))
@@ -2299,6 +1701,9 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivatePathSelectTool, _, cx| {
                 this.activate_tool(ToolKind::PathSelect, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateCommentTool, _, cx| {
+                this.activate_tool(ToolKind::Comment, cx)
             }))
             .on_action(cx.listener(|this, _: &ActivateTextPathTool, _, cx| {
                 this.activate_tool(ToolKind::TextPath, cx)
@@ -2372,11 +1777,19 @@ impl Render for FigView {
                                 )
                                 .on_mouse_move(cx.listener(Self::handle_mouse_move))
                                 .children({
+                                    // Paint order = z-order: the rendered scene
+                                    // surface goes on the BOTTOM, and the text-edit
+                                    // overlay (caret bar + selection highlight) on
+                                    // TOP — otherwise the opaque canvas covers the
+                                    // caret/selection and they never show.
                                     let mut c: Vec<AnyElement> = vec![];
+                                    c.push(CanvasElement::new(cx.entity()).into_any_element());
                                     if let Some(ov) = self.render_text_edit_overlay(cx) {
                                         c.push(ov);
                                     }
-                                    c.push(CanvasElement::new(cx.entity()));
+                                    if let Some(comments) = self.render_comment_overlay(cx) {
+                                        c.push(comments);
+                                    }
                                     c
                                 }),
                         )
@@ -2387,163 +1800,6 @@ impl Render for FigView {
                 )
                 .child(self.render_tool_pill(cx))
             })
-    }
-}
-
-/// Platform text input (typing and IME composition) while a text session is
-/// live. Registered on the window by the overlay element during paint (see
-/// `render_text_edit_overlay`), so printable keystrokes, dead keys, and
-/// multi-stroke IME input all land in the session and preview onto the
-/// canvas.
-impl EntityInputHandler for FigView {
-    fn text_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        adjusted_range: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let session = &self.text_edit.as_ref()?.session;
-        let range = session.range_from_utf16(&range_utf16);
-        *adjusted_range = Some(session.range_to_utf16(&range));
-        session.buffer().get(range).map(str::to_string)
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let session = &self.text_edit.as_ref()?.session;
-        Some(UTF16Selection {
-            range: session.range_to_utf16(&session.selected_range()),
-            reversed: session.selection_reversed(),
-        })
-    }
-
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        let session = &self.text_edit.as_ref()?.session;
-        session
-            .marked_range()
-            .map(|range| session.range_to_utf16(&range))
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        if let Some(edit) = self.text_edit.as_mut() {
-            edit.session.clear_marked();
-        }
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        {
-            let Some(edit) = self.text_edit.as_mut() else {
-                return;
-            };
-            let range = range_utf16
-                .map(|range| edit.session.range_from_utf16(&range))
-                .or_else(|| edit.session.marked_range())
-                .unwrap_or_else(|| edit.session.selected_range());
-            edit.session.replace_range(range, text);
-        }
-        self.sync_text_preview(cx);
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range_utf16: Option<Range<usize>>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        {
-            let Some(edit) = self.text_edit.as_mut() else {
-                return;
-            };
-            let range = range_utf16
-                .map(|range| edit.session.range_from_utf16(&range))
-                .or_else(|| edit.session.marked_range())
-                .unwrap_or_else(|| edit.session.selected_range());
-            // The composition's requested selection is relative to the new
-            // marked text, so its UTF-16 offsets resolve against `new_text`.
-            let relative_selection = new_selected_range_utf16.map(|relative| {
-                text_edit::offset_from_utf16(new_text, relative.start)
-                    ..text_edit::offset_from_utf16(new_text, relative.end)
-            });
-            edit.session
-                .replace_and_mark(range, new_text, relative_selection);
-        }
-        self.sync_text_preview(cx);
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        let edit = self.text_edit.as_ref()?;
-        let session = &edit.session;
-        let byte = session.offset_from_utf16(range_utf16.start);
-        let viewport = self.viewport?;
-        let bounds = self.container_bounds?;
-        let (width, height) = bounds_size(bounds);
-        let document = self.item.read(cx).document()?;
-        let (top, bottom) = text_edit::caret_screen_segment(
-            &document.doc,
-            session.node_id(),
-            byte,
-            &viewport,
-            DVec2::new(width, height),
-        )?;
-        Some(Bounds::from_corners(
-            point(
-                element_bounds.origin.x + px(top.x as f32),
-                element_bounds.origin.y + px(top.y.min(bottom.y) as f32),
-            ),
-            point(
-                element_bounds.origin.x + px(top.x as f32 + 2.0),
-                element_bounds.origin.y + px(top.y.max(bottom.y) as f32),
-            ),
-        ))
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        position: Point<Pixels>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        let edit = self.text_edit.as_ref()?;
-        let viewport = self.viewport?;
-        let bounds = self.container_bounds?;
-        let (width, height) = bounds_size(bounds);
-        let screen = screen_position_in_bounds(position, bounds);
-        let document = self.item.read(cx).document()?;
-        let byte = text_edit::byte_at_screen(
-            &document.doc,
-            edit.session.node_id(),
-            screen,
-            &viewport,
-            DVec2::new(width, height),
-        )?;
-        Some(edit.session.offset_to_utf16(byte))
-    }
-
-    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        self.text_edit.is_some()
     }
 }
 
@@ -2708,6 +1964,7 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 gpu_renderer: None,
                 tools: ToolShell::new(),
+            comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
                 fonts_prewarmed: false,
                 hovered_node: None,
@@ -2799,8 +2056,8 @@ fn zoom_viewport_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{CanvasNode, GroupNode, Operation};
-    use gpui::TestAppContext;
+    use fanta_doc::{CanvasNode, GroupNode, NodeData, Operation};
+    use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
 

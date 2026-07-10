@@ -19,12 +19,14 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use fanta_doc::{
-    Doc, NodeData, NodeId, Operation, TextAlign, TextAutoResize, TextNode, TextStyleRun, VAlign,
-    Viewport,
+    Color, Doc, NodeData, NodeId, Operation, Override, OverridePath, TextAlign, TextAutoResize,
+    TextNode, TextStyleRun, Transform2D, VAlign, Viewport,
 };
 use fanta_text::{Caret, Selection, TextBuffer, TextStyle as EngineTextStyle};
 use glam::DVec2;
 use gpui::{Subscription, Task};
+
+use crate::instance_text;
 
 /// Half-period of the caret blink, matching the original fanta-app (~2×/sec):
 /// the caret is solid for one interval, then hidden for one interval.
@@ -92,15 +94,51 @@ impl CanvasTextEdit {
     }
 }
 
+/// When the edited text lives inside a component instance, the session targets
+/// a VIRTUAL clone (no scene node). The edit is persisted as an [`Override`] on
+/// the instance, and the caret/selection geometry is projected through the
+/// clone's reconstructed world transform rather than a scene lookup.
+#[derive(Clone)]
+pub(crate) struct InstanceEdit {
+    /// The instance scene node whose `overrides` the edit writes.
+    pub(crate) instance_id: NodeId,
+    /// Def-local path of the text clone (the override's `target_path`).
+    pub(crate) def_path: OverridePath,
+    /// Absolute world transform of the clone, for caret/selection geometry.
+    pub(crate) world: Transform2D,
+    /// The instance's pre-edit override vec, restored on rewind before the
+    /// undoable commit (mirrors the real-text rewind-then-`ReplaceData` stage).
+    pub(crate) base_overrides: Vec<Override>,
+}
+
+/// What the properties panel shows for a live text sub-selection: the style
+/// at the selection start, with `color_mixed` raised when the selected range
+/// spans runs whose glyph colors disagree.
+pub(crate) struct SelectionTypography {
+    pub(crate) style: EngineTextStyle,
+    pub(crate) color_mixed: bool,
+}
+
 /// The pure editing model: the live buffer, the directed selection, and the
 /// pre-edit node data the commit/rewind path restores. No GPUI types, so the
 /// whole editing behavior is testable headlessly.
 pub(crate) struct TextEditSession {
     node_id: NodeId,
-    /// Full node data at open time for rewind.
+    /// Full node data at open time for rewind. For an instance session this is
+    /// the resolved text CLONE (content/style reflect existing overrides).
     original: TextNode,
+    /// `Some` when editing text inside a component instance — the edit becomes
+    /// an override rather than a scene write.
+    instance: Option<InstanceEdit>,
     /// Live rich text buffer supporting style runs over selections.
     buffer: TextBuffer,
+    /// The buffer exactly as built at open. `is_changed` compares the live
+    /// buffer against THIS (same construction, same run representation) rather
+    /// than re-deriving runs from the node — deriving is lossy for partially
+    /// covered `style_runs` (the builder materializes base-style gap runs the
+    /// node convention omits), which read as a phantom change and committed a
+    /// no-op `ReplaceData` for a session that only opened and closed.
+    opened_buffer: TextBuffer,
     /// Directed selection in byte offsets; collapsed (anchor == head) is the
     /// plain caret. The head is the moving end.
     selection: Selection,
@@ -131,6 +169,8 @@ impl TextEditSession {
         Self {
             node_id,
             original: node.clone(),
+            instance: None,
+            opened_buffer: buf.clone(),
             buffer: buf,
             selection: Selection::caret(caret),
             marked_range: None,
@@ -139,8 +179,54 @@ impl TextEditSession {
         }
     }
 
+    /// Open a session on text inside a component instance. `target.text` is the
+    /// resolved clone; the edit persists as an override on `target.instance_id`.
+    pub(crate) fn new_instance(
+        target: instance_text::InstanceTextTarget,
+        base_overrides: Vec<Override>,
+    ) -> Self {
+        let mut session = Self::new(target.instance_id, &target.text);
+        session.instance = Some(InstanceEdit {
+            instance_id: target.instance_id,
+            def_path: target.def_path,
+            world: target.world,
+            base_overrides,
+        });
+        session
+    }
+
+    /// The scene node the session is anchored to: the text node for a real
+    /// session, or the wrapping INSTANCE node for an instance session (whose
+    /// existence gates the session and whose overrides the edit writes).
     pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub(crate) fn instance(&self) -> Option<&InstanceEdit> {
+        self.instance.as_ref()
+    }
+
+    /// A text node reflecting the LIVE buffer (content + glyph color), used for
+    /// instance-session caret/selection/hit geometry since the clone has no
+    /// scene entry. Auto-resizing boxes hug the new glyphs so the geometry
+    /// matches what the renderer paints from the previewed override.
+    fn live_text(&self) -> TextNode {
+        let mut text = self.original.clone();
+        text.content = self.buffer.text().to_string();
+        text.style = map_engine_style_to_doc(self.buffer.default_style());
+        // Instance overrides carry whole-content text + a single glyph color;
+        // partial style runs aren't part of the override model.
+        text.style_runs.clear();
+        hug_auto_resize(&mut text);
+        text
+    }
+
+    /// The glyph color the buffer currently carries — the value an instance
+    /// color override would install. `None` when unchanged from the clone's
+    /// original color (so no color override is emitted for a content-only edit).
+    fn changed_color(&self) -> Option<Color> {
+        let color = self.buffer.default_style().color;
+        (color != self.original.style.color).then_some(color)
     }
 
     pub(crate) fn buffer(&self) -> &str {
@@ -151,8 +237,13 @@ impl TextEditSession {
         &self.buffer
     }
 
+    /// Whether the user changed anything since the session opened. Compared
+    /// against [`opened_buffer`](Self::opened_buffer) — the same construction,
+    /// so a session that merely opened and closed is exactly equal, even for a
+    /// node whose partial `style_runs` the buffer builder had to materialize
+    /// into explicit gap runs.
     pub(crate) fn is_changed(&self) -> bool {
-        self.buffer.text() != self.original.content
+        self.buffer != self.opened_buffer
     }
 
     pub(crate) fn caret(&self) -> usize {
@@ -183,9 +274,49 @@ impl TextEditSession {
         self.buffer.text().get(range)
     }
 
+    /// The effective typography over the current selection, for the properties
+    /// panel: the style of the run at the selection start, plus a mixed flag
+    /// for the glyph color when the selection spans runs that disagree (the
+    /// panel shows that as mixed, like Figma). A collapsed caret reports the
+    /// typing style at the caret.
+    pub(crate) fn selection_typography(&self) -> SelectionTypography {
+        let range = self.selected_range();
+        if range.is_empty() {
+            return SelectionTypography {
+                style: self.buffer.style_at(self.caret()).clone(),
+                color_mixed: false,
+            };
+        }
+        let mut styles = self
+            .buffer
+            .runs()
+            .iter()
+            .filter(|run| run.start < range.end && run.end > range.start)
+            .map(|run| &run.style);
+        let Some(first) = styles.next() else {
+            return SelectionTypography {
+                style: self.buffer.default_style().clone(),
+                color_mixed: false,
+            };
+        };
+        let color_mixed = styles.any(|style| style.color != first.color);
+        SelectionTypography {
+            style: first.clone(),
+            color_mixed,
+        }
+    }
+
     /// Apply a style change to the current selection (or set default for caret).
     /// This enables changing color, font, weight etc. on only the selected text.
     pub(crate) fn apply_style_to_selection(&mut self, style: EngineTextStyle) {
+        // An instance override carries a single whole-node glyph color, so a
+        // style change on an instance session applies to the whole node (the
+        // default) rather than a sub-range run — otherwise the selection-run
+        // color would have no override to commit into.
+        if self.instance.is_some() {
+            self.buffer.set_default_style(style);
+            return;
+        }
         let range = self.selected_range();
         if !range.is_empty() {
             let _ = self.buffer.set_style(range, style);
@@ -463,6 +594,20 @@ fn map_engine_style_to_doc(engine: &EngineTextStyle) -> fanta_doc::TextStyle {
 /// cache, so the measure pre-warms the very paragraph the next paint draws).
 /// Also pushes the current style runs so partial styling is previewed.
 pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
+    // Instance session: the edited text is a virtual clone, so the preview is a
+    // transient rewrite of the instance's overrides (which re-expands the clone
+    // with the new content/color). The caller pairs this with a cache
+    // invalidation because a `get_mut` write doesn't bump the scene revision.
+    if let Some(instance) = &session.instance {
+        let overrides = instance_text::preview_overrides(
+            &instance.base_overrides,
+            &instance.def_path,
+            session.buffer.text(),
+            session.changed_color(),
+        );
+        instance_text::set_overrides_transient(doc, instance.instance_id, overrides);
+        return;
+    }
     let Some(node) = doc.scene.get_mut(session.node_id) else {
         return;
     };
@@ -493,6 +638,14 @@ pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
 /// old state to the final one through the history chokepoint — the same
 /// restore-then-apply staging as the select tool's move commit.
 pub(crate) fn rewind_preview(doc: &mut Doc, session: &TextEditSession) {
+    if let Some(instance) = &session.instance {
+        instance_text::set_overrides_transient(
+            doc,
+            instance.instance_id,
+            instance.base_overrides.clone(),
+        );
+        return;
+    }
     let Some(node) = doc.scene.get_mut(session.node_id) else {
         return;
     };
@@ -509,6 +662,11 @@ pub(crate) fn rewind_preview(doc: &mut Doc, session: &TextEditSession) {
 /// gone.
 pub(crate) fn commit_operation(doc: &Doc, session: &TextEditSession) -> Option<Operation> {
     if !session.is_changed() {
+        return None;
+    }
+    // Instance sessions commit through `commit_ops` (their edit is one or two
+    // `SetInstanceOverride`s, not a `ReplaceData`).
+    if session.instance.is_some() {
         return None;
     }
     let node = doc.scene.get(session.node_id)?;
@@ -536,6 +694,28 @@ pub(crate) fn commit_operation(doc: &Doc, session: &TextEditSession) -> Option<O
         old: Box::new(node.data.clone()),
         new: Box::new(NodeData::Text(new_text)),
     })
+}
+
+/// The undoable operation(s) committing the session against the REWOUND
+/// document. A real-text session yields at most one [`Operation::ReplaceData`];
+/// an instance session yields up to two [`Operation::SetInstanceOverride`]s (a
+/// text-content override, and a glyph-color override when the color changed).
+/// Empty when nothing changed.
+pub(crate) fn commit_ops(doc: &Doc, session: &TextEditSession) -> Vec<Operation> {
+    if !session.is_changed() {
+        return Vec::new();
+    }
+    let Some(instance) = &session.instance else {
+        return commit_operation(doc, session).into_iter().collect();
+    };
+    let content_changed = session.buffer.text() != session.original.content;
+    instance_text::commit_ops(
+        doc,
+        instance.instance_id,
+        &instance.def_path,
+        content_changed.then(|| session.buffer.text()),
+        session.changed_color(),
+    )
 }
 
 /// Resize an auto-resizing text box to hug its (non-empty) content, matching
@@ -593,6 +773,108 @@ fn empty_caret_x(text: &TextNode) -> f64 {
     }
 }
 
+/// Caret geometry projected through an explicit `world` transform (so the
+/// instance path can pass a virtual clone's reconstructed transform instead of
+/// a scene lookup). See [`caret_screen_segment`] for the scene-node wrapper.
+fn caret_segment_core(
+    text: &TextNode,
+    world: Transform2D,
+    byte: usize,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    let (x, y, height) = if text.content.is_empty() {
+        (empty_caret_x(text), 0.0, fanta_render::text_line_height(text))
+    } else {
+        let [x, y, _, height] = fanta_render::text_caret_rect(text, byte);
+        let height = if height > 0.0 {
+            height
+        } else {
+            fanta_render::text_line_height(text)
+        };
+        (x, y, height)
+    };
+    let dy = vertical_paint_offset(text);
+    let project = |local: DVec2| {
+        fanta_canvas::world_to_screen(world.transform_point(local), viewport, screen_size)
+    };
+    Some((
+        project(DVec2::new(x, y + dy)),
+        project(DVec2::new(x, y + dy + height)),
+    ))
+}
+
+/// Selection rects projected through an explicit `world` transform.
+fn selection_rects_core(
+    text: &TextNode,
+    world: Transform2D,
+    range: Range<usize>,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Vec<[f64; 4]> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let dy = vertical_paint_offset(text);
+    let project = |x: f64, y: f64| {
+        fanta_canvas::world_to_screen(world.transform_point(DVec2::new(x, y)), viewport, screen_size)
+    };
+    fanta_render::text_selection_rects(text, range.start, range.end)
+        .into_iter()
+        .map(|[x, y, width, height]| {
+            let corners = [
+                project(x, y + dy),
+                project(x + width, y + dy),
+                project(x + width, y + dy + height),
+                project(x, y + dy + height),
+            ];
+            let min_x = corners.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
+            let max_x = corners.iter().map(|c| c.x).fold(f64::NEG_INFINITY, f64::max);
+            let min_y = corners.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
+            let max_y = corners.iter().map(|c| c.y).fold(f64::NEG_INFINITY, f64::max);
+            [min_x, min_y, (max_x - min_x).max(0.0), (max_y - min_y).max(0.0)]
+        })
+        .collect()
+}
+
+/// Byte offset for a screen point via an explicit `world` transform.
+fn byte_at_core(
+    text: &TextNode,
+    world: Transform2D,
+    screen: DVec2,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> usize {
+    let world_point = fanta_canvas::screen_to_world(screen, viewport, screen_size);
+    let local = world.inverse().transform_point(world_point);
+    let dy = vertical_paint_offset(text);
+    fanta_render::text_hit_test(text, [local.x, local.y - dy])
+}
+
+/// Whether `screen` falls within the text box `[0,0]..local_size` transformed
+/// by `world` (axis-aligned box of the projected corners).
+fn contains_core(
+    text: &TextNode,
+    world: Transform2D,
+    screen: DVec2,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> bool {
+    let [w, h] = text.local_size;
+    let corners = [
+        DVec2::new(0.0, 0.0),
+        DVec2::new(w, 0.0),
+        DVec2::new(w, h),
+        DVec2::new(0.0, h),
+    ]
+    .map(|c| fanta_canvas::world_to_screen(world.transform_point(c), viewport, screen_size));
+    let min_x = corners.iter().map(|c| c.x).fold(f64::INFINITY, f64::min);
+    let max_x = corners.iter().map(|c| c.x).fold(f64::NEG_INFINITY, f64::max);
+    let min_y = corners.iter().map(|c| c.y).fold(f64::INFINITY, f64::min);
+    let max_y = corners.iter().map(|c| c.y).fold(f64::NEG_INFINITY, f64::max);
+    screen.x >= min_x && screen.x <= max_x && screen.y >= min_y && screen.y <= max_y
+}
+
 /// The caret at `byte` as a screen-space segment `(top, bottom)`, projected
 /// through the node's world transform and the viewport — so it lands exactly
 /// on the painted glyph edge at any zoom, pan, or node transform.
@@ -607,34 +889,8 @@ pub(crate) fn caret_screen_segment(
     let NodeData::Text(text) = &node.data else {
         return None;
     };
-    let (x, y, height) = if text.content.is_empty() {
-        (
-            empty_caret_x(text),
-            0.0,
-            fanta_render::text_line_height(text),
-        )
-    } else {
-        let [x, y, _, height] = fanta_render::text_caret_rect(text, byte);
-        let height = if height > 0.0 {
-            height
-        } else {
-            fanta_render::text_line_height(text)
-        };
-        (x, y, height)
-    };
-    let dy = vertical_paint_offset(text);
-    let world_transform = doc.scene.world_transform(node_id)?;
-    let project = |local: DVec2| {
-        fanta_canvas::world_to_screen(
-            world_transform.transform_point(local),
-            viewport,
-            screen_size,
-        )
-    };
-    Some((
-        project(DVec2::new(x, y + dy)),
-        project(DVec2::new(x, y + dy + height)),
-    ))
+    let world = doc.scene.world_transform(node_id)?;
+    caret_segment_core(text, world, byte, viewport, screen_size)
 }
 
 /// Selection highlight as screen-space rects `[x, y, w, h]`. Axis-aligned:
@@ -646,59 +902,16 @@ pub(crate) fn selection_screen_rects(
     viewport: &Viewport,
     screen_size: DVec2,
 ) -> Vec<[f64; 4]> {
-    if range.is_empty() {
-        return Vec::new();
-    }
     let Some(node) = doc.scene.get(node_id) else {
         return Vec::new();
     };
     let NodeData::Text(text) = &node.data else {
         return Vec::new();
     };
-    let Some(world_transform) = doc.scene.world_transform(node_id) else {
+    let Some(world) = doc.scene.world_transform(node_id) else {
         return Vec::new();
     };
-    let dy = vertical_paint_offset(text);
-    let project = |x: f64, y: f64| {
-        fanta_canvas::world_to_screen(
-            world_transform.transform_point(DVec2::new(x, y)),
-            viewport,
-            screen_size,
-        )
-    };
-    fanta_render::text_selection_rects(text, range.start, range.end)
-        .into_iter()
-        .map(|[x, y, width, height]| {
-            let corners = [
-                project(x, y + dy),
-                project(x + width, y + dy),
-                project(x + width, y + dy + height),
-                project(x, y + dy + height),
-            ];
-            let min_x = corners
-                .iter()
-                .map(|corner| corner.x)
-                .fold(f64::INFINITY, f64::min);
-            let max_x = corners
-                .iter()
-                .map(|corner| corner.x)
-                .fold(f64::NEG_INFINITY, f64::max);
-            let min_y = corners
-                .iter()
-                .map(|corner| corner.y)
-                .fold(f64::INFINITY, f64::min);
-            let max_y = corners
-                .iter()
-                .map(|corner| corner.y)
-                .fold(f64::NEG_INFINITY, f64::max);
-            [
-                min_x,
-                min_y,
-                (max_x - min_x).max(0.0),
-                (max_y - min_y).max(0.0),
-            ]
-        })
-        .collect()
+    selection_rects_core(text, world, range, viewport, screen_size)
 }
 
 /// Map a screen point to a byte offset in the node's text — what turns a
@@ -715,11 +928,8 @@ pub(crate) fn byte_at_screen(
     let NodeData::Text(text) = &node.data else {
         return None;
     };
-    let world_transform = doc.scene.world_transform(node_id)?;
-    let world = fanta_canvas::screen_to_world(screen, viewport, screen_size);
-    let local = world_transform.inverse().transform_point(world);
-    let dy = vertical_paint_offset(text);
-    Some(fanta_render::text_hit_test(text, [local.x, local.y - dy]))
+    let world = doc.scene.world_transform(node_id)?;
+    Some(byte_at_core(text, world, screen, viewport, screen_size))
 }
 
 /// Whether `screen` falls within the node's world bounds — distinguishes a
@@ -750,6 +960,63 @@ pub(crate) fn node_contains_screen(
         && screen.y <= a.y.max(b.y)
 }
 
+// ---------------------------------------------------------------------------
+// Session-dispatched geometry: real sessions read the scene node; instance
+// sessions project the live buffer through the clone's reconstructed transform.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn session_caret_segment(
+    doc: &Doc,
+    session: &TextEditSession,
+    byte: usize,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Option<(DVec2, DVec2)> {
+    match session.instance() {
+        Some(inst) => caret_segment_core(&session.live_text(), inst.world, byte, viewport, screen_size),
+        None => caret_screen_segment(doc, session.node_id(), byte, viewport, screen_size),
+    }
+}
+
+pub(crate) fn session_selection_rects(
+    doc: &Doc,
+    session: &TextEditSession,
+    range: Range<usize>,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Vec<[f64; 4]> {
+    match session.instance() {
+        Some(inst) => selection_rects_core(&session.live_text(), inst.world, range, viewport, screen_size),
+        None => selection_screen_rects(doc, session.node_id(), range, viewport, screen_size),
+    }
+}
+
+pub(crate) fn session_byte_at_screen(
+    doc: &Doc,
+    session: &TextEditSession,
+    screen: DVec2,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> Option<usize> {
+    match session.instance() {
+        Some(inst) => Some(byte_at_core(&session.live_text(), inst.world, screen, viewport, screen_size)),
+        None => byte_at_screen(doc, session.node_id(), screen, viewport, screen_size),
+    }
+}
+
+pub(crate) fn session_contains_screen(
+    doc: &Doc,
+    session: &TextEditSession,
+    screen: DVec2,
+    viewport: &Viewport,
+    screen_size: DVec2,
+) -> bool {
+    match session.instance() {
+        Some(inst) => contains_core(&session.live_text(), inst.world, screen, viewport, screen_size),
+        None => node_contains_screen(doc, session.node_id(), screen, viewport, screen_size),
+    }
+}
+
 /// The byte the caret lands on when moved one visual line up or down, via
 /// caret-rect + hit-test through the shaped layout (so wrapped lines work).
 /// On the first/last line it clamps to the text start/end, the standard
@@ -764,6 +1031,24 @@ pub(crate) fn vertical_move_target(
     let NodeData::Text(text) = &node.data else {
         return None;
     };
+    vertical_move_target_core(text, byte, down)
+}
+
+/// [`vertical_move_target`] dispatched by session: an instance session probes
+/// the live buffer's text (its clone has no scene node).
+pub(crate) fn session_vertical_move_target(
+    doc: &Doc,
+    session: &TextEditSession,
+    byte: usize,
+    down: bool,
+) -> Option<usize> {
+    match session.instance() {
+        Some(_) => vertical_move_target_core(&session.live_text(), byte, down),
+        None => vertical_move_target(doc, session.node_id(), byte, down),
+    }
+}
+
+fn vertical_move_target_core(text: &TextNode, byte: usize, down: bool) -> Option<usize> {
     if text.content.is_empty() {
         return None;
     }
@@ -808,6 +1093,340 @@ mod tests {
 
     fn content(doc: &Doc, id: NodeId) -> String {
         text_node(doc, id).content
+    }
+
+    /// A doc with a component master (group root + one text child at local
+    /// offset (8,12), box 160x40) and one instance of it placed with
+    /// `instance_transform`; returns the doc and the instance node id.
+    fn doc_with_instance_transform(
+        master_text: &str,
+        instance_transform: Transform2D,
+    ) -> (Doc, NodeId) {
+        use fanta_doc::{ComponentDef, ComponentId, GroupNode, InstanceNode};
+        use std::collections::BTreeMap;
+        let mut doc = Doc::new();
+
+        let mut root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let root_id = root.id;
+        root.transform = Transform2D::translation(2000.0, 0.0);
+        doc.apply(Operation::create_node(root)).expect("root");
+
+        let mut text = CanvasNode::new(NodeData::Text(TextNode::new(master_text, 160.0, 40.0)));
+        text.parent = Some(root_id);
+        text.transform = Transform2D::translation(8.0, 12.0);
+        doc.apply(Operation::create_node(text)).expect("text");
+
+        let component = ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, root_id, "Card"));
+
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [160.0, 40.0],
+        }));
+        let instance_id = instance.id;
+        instance.transform = instance_transform;
+        doc.apply(Operation::create_node(instance)).expect("instance");
+        doc.add_page(instance_id);
+        (doc, instance_id)
+    }
+
+    /// A doc with a component master (group root + one text child) and one
+    /// instance of it; returns the doc and the instance node id.
+    fn doc_with_instance(master_text: &str) -> (Doc, NodeId) {
+        doc_with_instance_transform(master_text, Transform2D::translation(400.0, 200.0))
+    }
+
+    fn instance_resolved_text(doc: &Doc, instance_id: NodeId) -> String {
+        instance_text::text_target_at(doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("a text clone inside the instance")
+            .text
+            .content
+    }
+
+    /// The full instance-text-editing flow the view drives: open a session on a
+    /// clone, type, preview (transient override), rewind, then commit the
+    /// undoable `SetInstanceOverride` — and undo back to the master text.
+    #[test]
+    fn instance_session_edits_content_through_an_override() {
+        let (mut doc, instance_id) = doc_with_instance("Master");
+        let target = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("hit the text clone");
+        let base = instance_text::snapshot_overrides(&doc, instance_id);
+        let mut session = TextEditSession::new_instance(target, base);
+        assert!(session.instance().is_some());
+        assert!(!session.is_changed());
+
+        session.select_all();
+        session.insert("Edited");
+        assert!(session.is_changed());
+
+        // Preview writes a transient override; the clone now resolves to "Edited".
+        apply_preview(&mut doc, &session);
+        assert_eq!(instance_resolved_text(&doc, instance_id), "Edited");
+
+        // Rewind restores the master text (no override yet).
+        rewind_preview(&mut doc, &session);
+        assert_eq!(instance_resolved_text(&doc, instance_id), "Master");
+
+        // Commit the undoable override op(s).
+        let undo_before = doc.history.undo_depth();
+        let ops = commit_ops(&doc, &session);
+        assert_eq!(ops.len(), 1, "content-only edit is one override op");
+        for op in ops {
+            doc.apply(op).expect("apply commit");
+        }
+        assert_eq!(instance_resolved_text(&doc, instance_id), "Edited");
+        assert_eq!(doc.history.undo_depth(), undo_before + 1);
+
+        // Undo returns to the master text.
+        assert!(doc.undo().expect("undo"));
+        assert_eq!(instance_resolved_text(&doc, instance_id), "Master");
+    }
+
+    /// Changing the glyph color of instance text (whole-node, as the override
+    /// model requires) previews and commits as a single color override, and
+    /// undoes back to the master color.
+    #[test]
+    fn instance_session_edits_color_through_an_override() {
+        let (mut doc, instance_id) = doc_with_instance("Label");
+        let target = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("hit the text clone");
+        let base = instance_text::snapshot_overrides(&doc, instance_id);
+        let mut session = TextEditSession::new_instance(target, base);
+
+        let red = Color::rgb(255, 0, 0);
+        let mut style = session.text_buffer().style_at(session.caret()).clone();
+        style.color = red;
+        session.apply_style_to_selection(style);
+        assert_eq!(session.changed_color(), Some(red));
+
+        apply_preview(&mut doc, &session);
+        let previewed = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("clone")
+            .text;
+        assert_eq!(previewed.content, "Label", "content unchanged");
+        assert_eq!(previewed.style.color, red);
+
+        rewind_preview(&mut doc, &session);
+        let ops = commit_ops(&doc, &session);
+        assert_eq!(ops.len(), 1, "color-only edit is one override op");
+        for op in ops {
+            doc.apply(op).expect("apply");
+        }
+        let committed = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("clone")
+            .text;
+        assert_eq!(committed.style.color, red);
+
+        assert!(doc.undo().expect("undo"));
+        let reverted = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("clone")
+            .text;
+        assert_ne!(reverted.style.color, red, "undo restores the master color");
+    }
+
+    /// Deleting the instance node out from under a live session must make the
+    /// rewind and commit no-ops rather than panics — the view drops such
+    /// sessions eagerly, but a commit can race the deletion (e.g. a focus-out
+    /// commit after an undo removed the instance).
+    #[test]
+    fn commit_on_a_deleted_instance_is_empty() {
+        let (mut doc, instance_id) = doc_with_instance("Master");
+        let target = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("hit the text clone");
+        let base = instance_text::snapshot_overrides(&doc, instance_id);
+        let mut session = TextEditSession::new_instance(target, base);
+        session.select_all();
+        session.insert("Edited");
+        assert!(session.is_changed());
+
+        let snapshot = vec![doc.scene.get(instance_id).expect("instance").clone()];
+        doc.apply(Operation::DeleteSubtree { snapshot })
+            .expect("delete the instance");
+        assert!(doc.scene.get(instance_id).is_none());
+
+        rewind_preview(&mut doc, &session);
+        assert!(
+            commit_ops(&doc, &session).is_empty(),
+            "a session whose instance is gone has nothing to commit"
+        );
+    }
+
+    /// The same race for a plain text session: the node vanished, so the
+    /// commit yields nothing instead of a `ReplaceData` against a ghost.
+    #[test]
+    fn commit_on_a_deleted_text_node_is_empty() {
+        let (mut doc, id) = doc_with_text_node("hello");
+        let mut session = TextEditSession::new(id, &text_node(&doc, id));
+        session.insert("!");
+        assert!(session.is_changed());
+
+        let snapshot = vec![doc.scene.get(id).expect("node").clone()];
+        doc.apply(Operation::DeleteSubtree { snapshot })
+            .expect("delete the text node");
+
+        rewind_preview(&mut doc, &session);
+        assert!(commit_operation(&doc, &session).is_none());
+        assert!(commit_ops(&doc, &session).is_empty());
+    }
+
+    /// `session_contains_screen` on an instance whose transform includes a
+    /// rotation must project the clone's box through the full transform (the
+    /// projected-corner bounding box), not assume an axis-aligned placement.
+    #[test]
+    fn rotated_instance_containment_agrees_with_obvious_points() {
+        let instance_transform = Transform2D::rotation(std::f64::consts::FRAC_PI_4)
+            .then(&Transform2D::translation(400.0, 200.0));
+        let (doc, instance_id) = doc_with_instance_transform("Spin", instance_transform);
+
+        // The clone's world transform: text-local offset under the rotated
+        // instance placement (the master root's transform is suppressed).
+        let clone_world = Transform2D::translation(8.0, 12.0).then(&instance_transform);
+        let center_world = clone_world.transform_point(DVec2::new(80.0, 20.0));
+
+        let target = instance_text::text_target_at(&doc, instance_id, center_world)
+            .expect("hit the rotated text clone at its center");
+        assert!(
+            (target.world.transform_point(DVec2::new(80.0, 20.0)) - center_world).length() < 1e-6,
+            "the resolved clone transform matches the composed expectation"
+        );
+        let base = instance_text::snapshot_overrides(&doc, instance_id);
+        let session = TextEditSession::new_instance(target, base);
+
+        let viewport = Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        };
+        let screen_size = DVec2::new(800.0, 600.0);
+        let to_screen =
+            |world: DVec2| fanta_canvas::world_to_screen(world, &viewport, screen_size);
+
+        for local in [
+            DVec2::new(80.0, 20.0),
+            DVec2::new(20.0, 20.0),
+            DVec2::new(140.0, 20.0),
+        ] {
+            let screen = to_screen(clone_world.transform_point(local));
+            assert!(
+                session_contains_screen(&doc, &session, screen, &viewport, screen_size),
+                "point at clone-local {local:?} must be inside"
+            );
+        }
+        for local in [DVec2::new(-200.0, -200.0), DVec2::new(400.0, 300.0)] {
+            let screen = to_screen(clone_world.transform_point(local));
+            assert!(
+                !session_contains_screen(&doc, &session, screen, &viewport, screen_size),
+                "point at clone-local {local:?} must be outside"
+            );
+        }
+        // The rotation took effect: a point the UNROTATED box would contain
+        // (near its far right edge, world ≈ (560, 216)) lies outside the
+        // rotated footprint's projected bounds (x ≤ ~510).
+        let unrotated_reach = to_screen(DVec2::new(560.0, 216.0));
+        assert!(!session_contains_screen(
+            &doc,
+            &session,
+            unrotated_reach,
+            &viewport,
+            screen_size
+        ));
+    }
+
+    /// Mixed typography in one paragraph: a size + family patch on a selection
+    /// commits as a style run over just that range (the panel's font-size /
+    /// family / line-height / letter-spacing fields route here during a
+    /// session), while the rest keeps the base style.
+    #[test]
+    fn mixed_typography_runs_commit_per_run() {
+        let (mut doc, id) = doc_with_text_node("Hello world");
+        let base_size = text_node(&doc, id).style.size_px;
+        let mut session = TextEditSession::new(id, &text_node(&doc, id));
+        session.move_to(6, false);
+        session.move_to(11, true);
+
+        let mut styled = session.text_buffer().style_at(6).clone();
+        styled.size_px = 40.0;
+        styled.font_family = "Menlo".to_string();
+        session.apply_style_to_selection(styled);
+
+        apply_preview(&mut doc, &session);
+        rewind_preview(&mut doc, &session);
+        let ops = commit_ops(&doc, &session);
+        assert!(!ops.is_empty());
+        for op in ops {
+            doc.apply(op).expect("apply mixed typography commit");
+        }
+
+        let committed = text_node(&doc, id);
+        assert_eq!(committed.style.size_px, base_size, "base style untouched");
+        let styled_run = committed
+            .style_runs
+            .iter()
+            .find(|run| run.start == 6 && run.end == 11)
+            .expect("the selection produced a dedicated run");
+        assert_eq!(styled_run.style.size_px, 40.0);
+        assert_eq!(styled_run.style.font_family, "Menlo");
+        let prefix_run = committed
+            .style_runs
+            .iter()
+            .find(|run| run.start == 0)
+            .expect("prefix run");
+        assert_eq!(prefix_run.style.size_px, base_size);
+    }
+
+    /// The panel's sub-selection binding: a selection inside a colored run
+    /// reports that run's color, a selection spanning disagreeing runs raises
+    /// `color_mixed`, and a collapsed caret reports the typing style.
+    #[test]
+    fn selection_typography_tracks_the_selected_runs() {
+        let (doc, id) = doc_with_text_node("yyyyyyyy");
+        let mut session = TextEditSession::new(id, &text_node(&doc, id));
+        let red = fanta_doc::Color::rgb(255, 0, 0);
+        session.move_to(2, false);
+        session.move_to(5, true);
+        let mut styled = session.text_buffer().style_at(2).clone();
+        styled.color = red;
+        session.apply_style_to_selection(styled);
+
+        // Inside the red run: red, not mixed.
+        session.move_to(3, false);
+        session.move_to(4, true);
+        let inside = session.selection_typography();
+        assert_eq!(inside.style.color, red);
+        assert!(!inside.color_mixed);
+
+        // Spanning black + red runs: mixed.
+        session.move_to(0, false);
+        session.move_to(6, true);
+        let spanning = session.selection_typography();
+        assert!(spanning.color_mixed);
+
+        // Collapsed caret in the black prefix: black typing style, not mixed.
+        session.move_to(1, false);
+        let caret = session.selection_typography();
+        assert_ne!(caret.style.color, red);
+        assert!(!caret.color_mixed);
+    }
+
+    /// A net-zero instance edit (type then delete back to the original) commits
+    /// nothing — no stray override is written.
+    #[test]
+    fn unchanged_instance_session_commits_nothing() {
+        let (doc, instance_id) = doc_with_instance("Hello");
+        let target = instance_text::text_target_at(&doc, instance_id, DVec2::new(420.0, 220.0))
+            .expect("hit the text clone");
+        let base = instance_text::snapshot_overrides(&doc, instance_id);
+        let mut session = TextEditSession::new_instance(target, base);
+        session.move_to(session.buffer().len(), false);
+        session.insert("!");
+        session.backspace();
+        assert!(!session.is_changed());
+        assert!(commit_ops(&doc, &session).is_empty());
     }
 
     #[test]
@@ -943,6 +1562,32 @@ mod tests {
         assert_eq!(content(&doc, id), "world!");
     }
 
+    /// A node whose `style_runs` only partially cover the content (the doc
+    /// convention leaves uncovered spans on the base style) opens into a buffer
+    /// with materialized gap runs. Merely opening and closing such a session
+    /// must not read as a change — the false-positive committed a no-op
+    /// `ReplaceData` and polluted undo history.
+    #[test]
+    fn untouched_partially_styled_session_commits_nothing() {
+        let (mut doc, id) = doc_with_text_node("Hello world");
+        {
+            let node = doc.scene.get_mut(id).expect("node");
+            let NodeData::Text(text) = &mut node.data else {
+                panic!("expected text");
+            };
+            let mut styled = text.style.clone();
+            styled.color = fanta_doc::Color::rgb(255, 0, 0);
+            text.style_runs.push(TextStyleRun {
+                start: 6,
+                end: 11,
+                style: styled,
+            });
+        }
+        let session = TextEditSession::new(id, &text_node(&doc, id));
+        assert!(!session.is_changed(), "an untouched session is unchanged");
+        assert!(commit_ops(&doc, &session).is_empty());
+    }
+
     #[test]
     fn unchanged_session_commits_nothing() {
         let (mut doc, id) = doc_with_text_node("hello");
@@ -1003,7 +1648,7 @@ mod tests {
             letter_spacing: style.letter_spacing,
             line_height: style.line_height,
             line_height_auto_percent: style.line_height_auto_percent,
-            font_variations: style.font_variations.clone(),
+            font_variations: style.font_variations,
         };
         let buffer = fanta_text::TextBuffer::from_str("Hi", engine_style);
         let layout = fanta_text::LayoutEngine::new().layout(&buffer, 200.0);
@@ -1238,5 +1883,72 @@ mod tests {
                 max.x
             );
         }
+    }
+
+    /// End-to-end harness for the text editor's partial styling (the core of
+    /// "modify only selection" in the inspector while a text session is live).
+    /// This exercises:
+    /// - Opening a session on a TextNode
+    /// - Setting a non-empty character selection
+    /// - Applying a style patch (color) only to the selection via the same
+    ///   path the properties panel + view use
+    /// - Preview updating the doc's style + style_runs
+    /// - Selection rects being non-empty (so the overlay would draw visible highlight)
+    /// - Commit producing the correct runs in the final doc
+    /// Run this with `cargo test -p fig_viewer text_editor_partial_style_harness`
+    /// and iterate ("loop") on failures.
+    #[test]
+    fn text_editor_partial_style_harness() {
+        let (mut doc, id) = doc_with_text_node("Hello world");
+        let original_style = text_node(&doc, id).style;
+
+        let mut session = TextEditSession::new(id, &text_node(&doc, id));
+        // Select "world" (bytes 6..11)
+        session.move_to(6, false);
+        session.move_to(11, true);
+        assert_eq!(session.selected_text(), Some("world"));
+        assert!(!session.selected_range().is_empty());
+
+        // Simulate inspector changing color on the *selection only*.
+        // (Mimics with_text_selection_style + apply_style_to_selection)
+        let red = fanta_doc::Color::rgb(255, 0, 0);
+        let mut s = session.text_buffer().style_at(session.caret()).clone();
+        s.color = red;
+        session.apply_style_to_selection(s);
+
+        // Preview should write runs (but keep base style)
+        apply_preview(&mut doc, &session);
+        let previewed = text_node(&doc, id);
+        assert_eq!(previewed.content, "Hello world");
+        assert_eq!(previewed.style.color, original_style.color); // base unchanged
+        // set_style on "world" (6..11) of "Hello world" (len 11) splits into before(0..6) + selected; no after text
+        assert_eq!(previewed.style_runs.len(), 2, "runs: {:?}", previewed.style_runs);
+        let red_run = previewed.style_runs.iter().find(|r| r.style.color == red).expect("red run present");
+        assert_eq!(red_run.start, 6);
+        assert_eq!(red_run.end, 11);
+        assert_eq!(red_run.style.color, red);
+
+        // The overlay should see a drawable selection
+        let viewport = Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        };
+        let screen_size = DVec2::new(800.0, 600.0);
+        let rects = selection_screen_rects(&doc, id, 6..11, &viewport, screen_size);
+        assert!(
+            !rects.is_empty(),
+            "partial selection must produce highlight rects for the overlay"
+        );
+        assert!(rects.iter().any(|r| r[2] > 0.0 && r[3] > 0.0));
+
+        // Commit path (rewind + ReplaceData) must preserve the partial style
+        rewind_preview(&mut doc, &session);
+        let op = commit_operation(&doc, &session).expect("should have changed");
+        doc.apply(op).expect("apply commit");
+        let committed = text_node(&doc, id);
+        assert_eq!(committed.style_runs.len(), 2);
+        let red_run = committed.style_runs.iter().find(|r| r.style.color == red).expect("red run present after commit");
+        assert_eq!(red_run.style.color, red);
+        assert_eq!(committed.style.color, original_style.color);
     }
 }

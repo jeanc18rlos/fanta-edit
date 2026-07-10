@@ -171,6 +171,16 @@ impl FigDocument {
             .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
             .or_else(|| pages.iter().position(|page| !page.hidden))
             .unwrap_or(0);
+        // The active page is runtime state, not persisted by the project tree,
+        // so a freshly loaded document has none until the user clicks a page.
+        // Every creation tool parents into `doc.active_page()` while the canvas
+        // renders it with a selected-page fallback — leaving it unset sends new
+        // shapes/text/frames to the scene root where the page-scoped render
+        // never paints them (invisible until a drag reparents them into the
+        // page). Default it to the page the canvas will show.
+        if doc.active_page().is_none() {
+            doc.set_active_page(pages.get(default_page_index).and_then(|page| page.root));
+        }
 
         Self {
             doc,
@@ -1277,6 +1287,40 @@ mod tests {
             .expect("create page root node");
         doc.add_page(root);
         doc
+    }
+
+    /// The active page is runtime state the project tree does not persist, so
+    /// loading must default it — the creation tools parent new nodes into
+    /// `doc.active_page()`, and with it unset every new shape/text/frame lands
+    /// at the scene root where the page-scoped canvas render never paints it
+    /// (invisible until a drag reparents it into the page).
+    #[test]
+    fn from_doc_defaults_the_active_page_to_the_default_page() {
+        let mut doc = doc_with_one_page();
+        let expected = doc.pages().first().copied();
+        // The project reader strips presence state, so a loaded doc arrives
+        // with no active page even though `add_page` set one in memory.
+        doc.set_active_page(None);
+        let document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(document.doc.active_page(), expected);
+        assert!(document.doc.active_page().is_some());
+    }
+
+    /// An already-set active page (e.g. carried by a `.fig` import) wins over
+    /// the default.
+    #[test]
+    fn from_doc_keeps_an_existing_active_page() {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData};
+        let mut doc = doc_with_one_page();
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.name = "Page 2".to_owned();
+        let second_root = second.id;
+        doc.apply(Operation::create_node(second))
+            .expect("create second page root");
+        doc.add_page(second_root);
+        doc.set_active_page(Some(second_root));
+        let document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(document.doc.active_page(), Some(second_root));
     }
 
     /// Build a `FigItem` around an already-parsed document, bypassing the async
