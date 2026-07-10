@@ -17,6 +17,9 @@ use util::ResultExt as _;
 
 use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::inspector_components::{InspectorMessage, InspectorSectionHeader};
+use crate::variable_binding::{
+    VariableBindingOption, bindable_properties, variable_binding_model, variable_binding_operation,
+};
 
 const COLLECTION_WIDTH: f32 = 220.0;
 const VARIABLE_NAME_WIDTH: f32 = 200.0;
@@ -63,17 +66,11 @@ struct CollectionSnapshot {
 }
 
 #[derive(Debug, Clone)]
-struct VariableChoice {
-    id: VariableId,
-    label: SharedString,
-}
-
-#[derive(Debug, Clone)]
 struct BindingRowSnapshot {
     prop: BoundProp,
-    label: &'static str,
+    label: SharedString,
     current: Option<VariableId>,
-    choices: Vec<VariableChoice>,
+    choices: Vec<VariableBindingOption>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,12 +138,22 @@ impl FantaVariablesWorkspace {
             },
         );
         let item_subscription =
-            cx.subscribe(&item, |this: &mut Self, _, event: &FigItemEvent, cx| {
+            cx.subscribe(&item, |this: &mut Self, item, event: &FigItemEvent, cx| {
                 if matches!(event, FigItemEvent::StateChanged) {
                     this.editing_cell = None;
                     this.value_edit_baseline = None;
                     this.value_edit_previewed = false;
                     this.rename_target = None;
+                }
+                if matches!(event, FigItemEvent::SourceEditLockChanged)
+                    && item.read(cx).source_edit_locked()
+                {
+                    let workspace = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        workspace
+                            .update(cx, |workspace, cx| workspace.cancel_value_edit(cx))
+                            .log_err();
+                    });
                 }
                 if matches!(
                     event,
@@ -609,7 +616,7 @@ impl FantaVariablesWorkspace {
             let Some(doc) = item.doc() else {
                 return;
             };
-            bind_property_operation(doc, node, prop, variable)
+            variable_binding_operation(doc, node, prop, Some(variable))
         };
         self.apply_built_operation(result, cx);
     }
@@ -620,7 +627,7 @@ impl FantaVariablesWorkspace {
             let Some(doc) = item.doc() else {
                 return;
             };
-            unbind_property_operation(doc, node, prop)
+            variable_binding_operation(doc, node, prop, None)
         };
         self.apply_built_operation(result, cx);
     }
@@ -905,13 +912,13 @@ impl FantaVariablesWorkspace {
                         .border_color(cx.theme().colors().border)
                         .cursor_text()
                         .tooltip(Tooltip::text("Double-click to rename mode"))
-                        .on_click(cx.listener(
-                            move |workspace, event: &ClickEvent, window, cx| {
+                        .on_click(
+                            cx.listener(move |workspace, event: &ClickEvent, window, cx| {
                                 if event.click_count() >= 2 {
                                     workspace.start_rename(target, initial.clone(), window, cx);
                                 }
-                            },
-                        ))
+                            }),
+                        )
                         .child(
                             Label::new(mode.name.clone())
                                 .size(LabelSize::XSmall)
@@ -953,11 +960,13 @@ impl FantaVariablesWorkspace {
             .cursor_text()
             .tooltip(Tooltip::text("Double-click to rename variable"))
             .hover(|cell| cell.bg(cx.theme().colors().element_hover))
-            .on_click(cx.listener(move |workspace, event: &ClickEvent, window, cx| {
-                if event.click_count() >= 2 {
-                    workspace.start_rename(target, initial.clone(), window, cx);
-                }
-            }))
+            .on_click(
+                cx.listener(move |workspace, event: &ClickEvent, window, cx| {
+                    if event.click_count() >= 2 {
+                        workspace.start_rename(target, initial.clone(), window, cx);
+                    }
+                }),
+            )
             .child(
                 Label::new(variable.name.clone())
                     .size(LabelSize::Small)
@@ -1041,18 +1050,13 @@ impl FantaVariablesWorkspace {
                 .min_w_0()
                 .cursor_text()
                 .tooltip(Tooltip::text("Double-click to rename collection"))
-                .on_click(cx.listener(
-                    move |workspace, event: &ClickEvent, window, cx| {
+                .on_click(
+                    cx.listener(move |workspace, event: &ClickEvent, window, cx| {
                         if event.click_count() >= 2 {
-                            workspace.start_rename(
-                                collection_target,
-                                initial.clone(),
-                                window,
-                                cx,
-                            );
+                            workspace.start_rename(collection_target, initial.clone(), window, cx);
                         }
-                    },
-                ))
+                    }),
+                )
                 .child(Label::new(collection.name.clone()).single_line())
                 .child(
                     Label::new(format!("{} variables", collection.variables.len()))
@@ -1194,7 +1198,7 @@ impl FantaVariablesWorkspace {
             .py_1()
             .gap_1()
             .child(
-                Label::new(row.label)
+                Label::new(row.label.clone())
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
@@ -1347,10 +1351,7 @@ fn variables_snapshot(doc: &Doc, selected: Option<VariableCollectionId>) -> Vari
     }
 }
 
-fn mode_scope_snapshots(
-    doc: &Doc,
-    collection: VariableCollectionId,
-) -> Vec<ModeScopeSnapshot> {
+fn mode_scope_snapshots(doc: &Doc, collection: VariableCollectionId) -> Vec<ModeScopeSnapshot> {
     let mut scopes = vec![ModeScopeSnapshot {
         label: "Project".into(),
         scope: ModeScope::Doc,
@@ -1480,44 +1481,16 @@ fn collection_snapshot(doc: &Doc, collection: &VariableCollection) -> Collection
 fn binding_snapshot(doc: &Doc) -> Option<BindingSnapshot> {
     let node_id = doc.selection.anchor()?;
     let node = doc.scene.get(node_id)?;
-    const PROPERTIES: [(BoundProp, &str); 7] = [
-        (BoundProp::Opacity, "Opacity"),
-        (BoundProp::Visible, "Visible"),
-        (BoundProp::FillColor { index: 0 }, "Fill color"),
-        (BoundProp::StrokeColor { index: 0 }, "Stroke color"),
-        (BoundProp::StrokeWidth { index: 0 }, "Stroke width"),
-        (BoundProp::CornerRadius, "Corner radius"),
-        (BoundProp::TextContent, "Text content"),
-    ];
-    let rows = PROPERTIES
+    let rows = bindable_properties(node)
         .into_iter()
-        .filter(|(prop, _)| prop.applies_to(node))
-        .map(|(prop, label)| {
-            let mut choices: Vec<_> = doc
-                .variables
-                .variables
-                .values()
-                .filter(|variable| prop.accepts_variable_type(variable.ty))
-                .map(|variable| {
-                    let collection = doc
-                        .variables
-                        .collections
-                        .get(&variable.collection)
-                        .map(|collection| collection.name.as_str())
-                        .unwrap_or("Missing collection");
-                    VariableChoice {
-                        id: variable.id,
-                        label: format!("{collection} / {}", variable.name).into(),
-                    }
-                })
-                .collect();
-            choices.sort_by(|left, right| left.label.cmp(&right.label));
-            BindingRowSnapshot {
-                prop,
-                label,
-                current: node.bindings.get(&prop).copied(),
-                choices,
-            }
+        .filter_map(|candidate| {
+            let model = variable_binding_model(doc, node_id, candidate.prop)?;
+            Some(BindingRowSnapshot {
+                prop: candidate.prop,
+                label: candidate.label,
+                current: model.current,
+                choices: model.options,
+            })
         })
         .collect();
     Some(BindingSnapshot {
@@ -1737,80 +1710,6 @@ fn restore_variable_value(doc: &mut Doc, cell: VariableCell, baseline: Option<Va
         }
     }
     true
-}
-
-fn bind_property_operation(
-    doc: &Doc,
-    node_id: NodeId,
-    prop: BoundProp,
-    variable_id: VariableId,
-) -> Result<Option<Operation>, &'static str> {
-    let node = doc
-        .scene
-        .get(node_id)
-        .ok_or("The selected layer no longer exists")?;
-    if !prop.applies_to(node) {
-        return Err("The property does not apply to the selected layer");
-    }
-    let variable = doc
-        .variables
-        .variables
-        .get(&variable_id)
-        .ok_or("The variable no longer exists")?;
-    if !doc.variables.collections.contains_key(&variable.collection) {
-        return Err("The variable's collection no longer exists");
-    }
-    if !prop.accepts_variable_type(variable.ty) {
-        return Err("The variable type is not compatible with this property");
-    }
-    let old = node.bindings.get(&prop).copied();
-    if old == Some(variable_id) {
-        return Ok(None);
-    }
-    Ok(Some(Operation::BindProperty {
-        node: node_id,
-        prop,
-        old,
-        new: variable_id,
-    }))
-}
-
-fn unbind_property_operation(
-    doc: &Doc,
-    node_id: NodeId,
-    prop: BoundProp,
-) -> Result<Option<Operation>, &'static str> {
-    let node = doc
-        .scene
-        .get(node_id)
-        .ok_or("The selected layer no longer exists")?;
-    let Some(variable) = node.bindings.get(&prop).copied() else {
-        return Ok(None);
-    };
-    let old_data = node.data.clone();
-    let old_opacity = node.opacity;
-    let old_flags = node.flags;
-    let mut baked = node.clone();
-    if let Some(value) = fanta_doc::resolve_bound_value(
-        &doc.variables,
-        &doc.scene,
-        node_id,
-        &doc.active_modes,
-        variable,
-    ) {
-        prop.apply_resolved(&mut baked, value);
-    }
-    Ok(Some(Operation::UnbindProperty {
-        node: node_id,
-        prop,
-        variable,
-        old_data: Box::new(old_data),
-        new_data: Box::new(baked.data),
-        old_opacity,
-        new_opacity: baked.opacity,
-        old_flags,
-        new_flags: baked.flags,
-    }))
 }
 
 fn unique_collection_name(doc: &Doc) -> String {
@@ -2059,11 +1958,11 @@ mod tests {
                 VariableRenameTarget::Collection(collection),
                 "Theme collection",
             ),
+            (VariableRenameTarget::Mode { collection, mode }, "Dark mode"),
             (
-                VariableRenameTarget::Mode { collection, mode },
-                "Dark mode",
+                VariableRenameTarget::Variable(variable),
+                "surface/background",
             ),
-            (VariableRenameTarget::Variable(variable), "surface/background"),
         ] {
             let operation = rename_operation(&doc, target, expected.into())
                 .expect("valid rename")
@@ -2071,9 +1970,18 @@ mod tests {
             doc.apply(operation).expect("apply rename");
         }
 
-        assert_eq!(doc.variables.collections[&collection].name, "Theme collection");
-        assert_eq!(doc.variables.collections[&collection].modes[0].name, "Dark mode");
-        assert_eq!(doc.variables.variables[&variable].name, "surface/background");
+        assert_eq!(
+            doc.variables.collections[&collection].name,
+            "Theme collection"
+        );
+        assert_eq!(
+            doc.variables.collections[&collection].modes[0].name,
+            "Dark mode"
+        );
+        assert_eq!(
+            doc.variables.variables[&variable].name,
+            "surface/background"
+        );
     }
 
     #[test]
@@ -2091,7 +1999,8 @@ mod tests {
         let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
         page.name = "Page 1".into();
         let page_id = page.id;
-        doc.apply(Operation::create_node(page)).expect("create page");
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
         doc.add_page(page_id);
         let mut container = CanvasNode::new(NodeData::Group(GroupNode::default()));
         container.name = "Card".into();
@@ -2101,14 +2010,10 @@ mod tests {
             .expect("create container");
         doc.selection.select_only(container_id);
 
-        let project = set_active_mode_operation(
-            &doc,
-            ModeScope::Doc,
-            collection,
-            Some(default_mode),
-        )
-        .expect("project mode")
-        .expect("project change");
+        let project =
+            set_active_mode_operation(&doc, ModeScope::Doc, collection, Some(default_mode))
+                .expect("project mode")
+                .expect("project change");
         doc.apply(project).expect("apply project mode");
         let page = set_active_mode_operation(
             &doc,
@@ -2286,11 +2191,11 @@ mod tests {
         let node_id = node.id;
         doc.apply(Operation::create_node(node))
             .expect("create node");
-        let bind = bind_property_operation(&doc, node_id, BoundProp::Opacity, variable)
+        let bind = variable_binding_operation(&doc, node_id, BoundProp::Opacity, Some(variable))
             .expect("valid binding")
             .expect("new binding");
         doc.apply(bind).expect("apply binding");
-        let unbind = unbind_property_operation(&doc, node_id, BoundProp::Opacity)
+        let unbind = variable_binding_operation(&doc, node_id, BoundProp::Opacity, None)
             .expect("valid unbind")
             .expect("bound property");
         doc.apply(unbind).expect("apply unbind");

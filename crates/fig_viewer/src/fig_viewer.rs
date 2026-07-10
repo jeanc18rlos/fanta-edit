@@ -24,6 +24,7 @@ mod prototype_panel;
 mod text_edit;
 mod timeline;
 mod tools;
+mod variable_binding;
 mod variables_workspace;
 mod view;
 mod view_text;

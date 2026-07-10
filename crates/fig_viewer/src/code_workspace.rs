@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::{Context as _, Result, anyhow};
 use editor::Editor;
 use fanta_doc::NodeId;
 use gpui::{
@@ -139,10 +140,109 @@ impl FantaCodeWorkspace {
         self.error_message.as_deref()
     }
 
-    fn source_is_dirty(&self, cx: &App) -> bool {
+    pub(crate) fn source_is_dirty(&self, cx: &App) -> bool {
         self.fnx_buffer
             .as_ref()
             .is_some_and(|buffer| buffer.read(cx).is_dirty())
+    }
+
+    /// Persist the dirty FNX buffer through the format layer's validated,
+    /// atomic source-edit path. The returned document is installed only after
+    /// that write succeeds, and the ordinary project-buffer save then records
+    /// the exact saved buffer version so Zed's dirty state and the canvas lock
+    /// converge with disk.
+    pub(crate) fn save_source_edit(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
+        if !self.source_is_dirty(cx) {
+            return None;
+        }
+        if self.item.read(cx).is_dirty() {
+            return Some(Task::ready(Err(anyhow!(
+                "save or discard canvas-authored changes before saving the FNX source"
+            ))));
+        }
+        let Some(project_root) = self.item.read(cx).project_root().map(Path::to_path_buf) else {
+            return Some(Task::ready(Err(anyhow!(
+                "save the canvas once before saving FNX source"
+            ))));
+        };
+        let Some(source_path) = self.fnx_path.clone() else {
+            return Some(Task::ready(Err(anyhow!(
+                "the FNX source path is unavailable"
+            ))));
+        };
+        let Some(buffer) = self.fnx_buffer.clone() else {
+            return Some(Task::ready(Err(anyhow!("the FNX buffer is unavailable"))));
+        };
+
+        let (source, version) = {
+            let buffer = buffer.read(cx);
+            (buffer.text(), buffer.version())
+        };
+        self.validation_task = None;
+        self.error_message = None;
+        self.validation_message = Some("Saving FNX…".into());
+        self.item
+            .update(cx, |item, _| item.begin_source_edit_save());
+        let item = self.item.clone();
+        let project = self.project.clone();
+
+        Some(cx.spawn(async move |this, cx| {
+            let apply_path = source_path.clone();
+            let source_edit = cx
+                .background_spawn(async move {
+                    fanta_format::apply_project_source_edit(&project_root, &apply_path, &source)
+                })
+                .await;
+            let source_edit = match source_edit {
+                Ok(source_edit) => source_edit,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.validation_message = None;
+                        this.error_message = Some(format!("Could not save FNX: {error}").into());
+                        cx.notify();
+                    })?;
+                    return Err(error).context("applying the FNX source edit");
+                }
+            };
+
+            let buffer_unchanged = buffer.read_with(cx, |buffer, _| buffer.version() == version);
+            if !buffer_unchanged {
+                // The validated snapshot is now safely on disk, but a newer
+                // edit owns the live preview and must remain dirty/locked.
+                this.update(cx, |this, cx| {
+                    if this.validation_message.as_deref() == Some("Saving FNX…") {
+                        this.validation_message = None;
+                    }
+                    cx.notify();
+                })?;
+                return Ok(());
+            }
+
+            item.update(cx, |item, cx| {
+                item.adopt_saved_source_edit(source_edit, cx);
+            });
+            let save_buffer =
+                project.update(cx, |project, cx| project.save_buffer(buffer.clone(), cx));
+            if let Err(error) = save_buffer.await {
+                this.update(cx, |this, cx| {
+                    this.validation_message = None;
+                    this.error_message = Some(
+                        format!(
+                            "FNX was written but its editor state could not be saved: {error:#}"
+                        )
+                        .into(),
+                    );
+                    cx.notify();
+                })?;
+                return Err(error).context("recording the saved FNX buffer version");
+            }
+            this.update(cx, |this, cx| {
+                this.validation_message = None;
+                this.error_message = None;
+                cx.notify();
+            })?;
+            Ok(())
+        }))
     }
 
     fn refresh_from_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -251,10 +351,23 @@ impl FantaCodeWorkspace {
     ) {
         let editor =
             cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(self.project.clone()), window, cx));
+        let source_is_dirty = buffer.read(cx).is_dirty();
+        self.item.update(cx, |item, cx| {
+            item.set_source_edit_locked(source_is_dirty, cx)
+        });
         self.fnx_subscription = Some(cx.subscribe_in(
             &buffer,
             window,
-            |this: &mut Self, _, event: &BufferEvent, window, cx| {
+            |this: &mut Self, buffer, event: &BufferEvent, window, cx| {
+                if matches!(
+                    event,
+                    BufferEvent::Edited { .. } | BufferEvent::Reloaded | BufferEvent::Saved
+                ) {
+                    let source_is_dirty = buffer.read(cx).is_dirty();
+                    this.item.update(cx, |item, cx| {
+                        item.set_source_edit_locked(source_is_dirty, cx)
+                    });
+                }
                 if matches!(event, BufferEvent::Edited { .. } | BufferEvent::Reloaded) {
                     this.schedule_source_validation(cx);
                 }
@@ -511,7 +624,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData};
+    use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData, Operation};
     use gpui::TestAppContext;
     use project::{ProjectItem as _, ProjectPath};
 
@@ -630,12 +743,37 @@ mod tests {
         let source_path = page_source_path(temporary.path(), page);
         let original_source =
             std::fs::read_to_string(&source_path).expect("read generated FNX source");
-        let (project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
 
         let changed_source = original_source.replace("name=\"Original\"", "name=\"Changed\"");
         assert_ne!(changed_source, original_source);
-        replace_workspace_source(workspace, changed_source.clone(), cx);
+        replace_workspace_source(workspace, changed_source, cx);
         assert_eq!(page_name(&item, page, cx), "Changed");
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert!(!item.is_editable());
+        });
+        let blocked_mutation = item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Changed".to_owned(),
+                    new: "Canvas overwrite".to_owned(),
+                },
+                cx,
+            )
+        });
+        assert!(blocked_mutation.is_err());
+        assert_eq!(page_name(&item, page, cx), "Changed");
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(page);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").selection.as_slice(), &[page]);
+        });
         assert_eq!(
             std::fs::read_to_string(&source_path).expect("source remains unsaved"),
             original_source
@@ -646,23 +784,9 @@ mod tests {
             })
             .expect("read code workspace");
 
-        let buffer = workspace
-            .read_with(cx, |workspace, _| {
-                workspace.fnx_buffer.clone().expect("FNX buffer")
-            })
-            .expect("read code workspace");
-        let save_task = project.update(cx, |project, cx| project.save_buffer(buffer, cx));
-        save_task.await.expect("save valid FNX buffer");
-        cx.run_until_parked();
-        assert_eq!(
-            std::fs::read_to_string(&source_path).expect("read saved source"),
-            changed_source
-        );
-        assert_eq!(page_name(&item, page, cx), "Changed");
-        item.read_with(cx, |item, _| assert!(!item.has_conflict()));
-
         replace_workspace_source(workspace, "<Frame>".to_owned(), cx);
         assert_eq!(page_name(&item, page, cx), "Changed");
+        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
         workspace
             .read_with(cx, |workspace, _| {
                 assert!(
@@ -670,6 +794,57 @@ mod tests {
                         .validation_error()
                         .is_some_and(|error| error.starts_with("FNX error:"))
                 );
+            })
+            .expect("read code workspace");
+    }
+
+    #[gpui::test]
+    async fn saving_fnx_applies_the_project_source_edit_and_unlocks_the_canvas(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let original_source =
+            std::fs::read_to_string(&source_path).expect("read generated FNX source");
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        let changed_source = original_source.replace("name=\"Original\"", "name=\"Saved\"");
+        replace_workspace_source(workspace, changed_source.clone(), cx);
+        assert_eq!(page_name(&item, page, cx), "Saved");
+        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
+
+        let save_task = workspace
+            .update(cx, |workspace, _window, cx| {
+                workspace
+                    .save_source_edit(cx)
+                    .expect("dirty source save task")
+            })
+            .expect("update code workspace");
+        save_task.await.expect("save valid FNX source edit");
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("read saved source"),
+            changed_source
+        );
+        let (persisted, _) =
+            fanta_format::read_project_tree(temporary.path()).expect("read converged project tree");
+        assert_eq!(
+            persisted.scene.get(page).expect("persisted page").name,
+            "Saved"
+        );
+        assert_eq!(page_name(&item, page, cx), "Saved");
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(item.is_editable());
+            assert!(!item.has_conflict());
+        });
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(!workspace.source_is_dirty(cx));
+                assert!(workspace.validation_error().is_none());
             })
             .expect("read code workspace");
     }

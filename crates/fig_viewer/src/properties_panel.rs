@@ -27,6 +27,7 @@ use gpui::{
 use settings::{Settings as _, update_settings_file};
 use ui::Divider;
 use ui::prelude::*;
+use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -54,6 +55,7 @@ use crate::properties_snapshot::{
     node_section, opaque_paint_alpha, page_section, paint_alpha, paint_alpha_is_visible,
     paired_field, set_paint_alpha, zeroed_paint_alpha,
 };
+use crate::variable_binding::variable_binding_operation;
 use crate::view::FigView;
 
 actions!(
@@ -306,7 +308,7 @@ impl FantaPropertiesPanel {
                     let item = view.read(cx).item().clone();
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
-                        |this, _, event: &crate::document::FigItemEvent, cx| {
+                        |this, item, event: &crate::document::FigItemEvent, cx| {
                             if matches!(
                                 event,
                                 crate::document::FigItemEvent::EditedTransient
@@ -332,6 +334,18 @@ impl FantaPropertiesPanel {
                                     // resurrect old content, so abandon any
                                     // preview without restoring.
                                     this.reset_for_new_subject(false, cx);
+                                }
+                                crate::document::FigItemEvent::SourceEditLockChanged
+                                    if item.read(cx).source_edit_locked() =>
+                                {
+                                    let panel = cx.weak_entity();
+                                    cx.defer(move |cx| {
+                                        panel
+                                            .update(cx, |panel, cx| {
+                                                panel.reset_for_new_subject(true, cx)
+                                            })
+                                            .log_err();
+                                    });
                                 }
                                 _ => {}
                             }
@@ -1252,6 +1266,25 @@ impl FantaPropertiesPanel {
                 target_prop,
                 property,
             )
+        });
+    }
+
+    pub(crate) fn set_variable_binding(
+        &mut self,
+        node: NodeId,
+        prop: BoundProp,
+        variable: Option<fanta_doc::VariableId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_document_ops(cx, move |doc| {
+            match variable_binding_operation(doc, node, prop, variable) {
+                Ok(Some(operation)) => vec![operation],
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    log::error!("binding inspector property to variable failed: {error}");
+                    Vec::new()
+                }
+            }
         });
     }
 
@@ -3892,6 +3925,67 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn source_edit_lock_cancels_a_live_gradient_preview_without_reentrant_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let original = linear_gradient_fill();
+        let harness = open_panel_with_gradient(original.clone(), cx).await;
+        let vector_id = harness.vector_id;
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_gradient_editor(vector_id, 0, false, original.clone(), cx);
+            })
+            .expect("open gradient editor");
+        cx.run_until_parked();
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                let editor = panel
+                    .gradient_editor
+                    .as_ref()
+                    .expect("gradient editor")
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_kind(crate::color_picker::GradientKind::Radial, cx);
+                });
+            })
+            .expect("preview gradient");
+        cx.run_until_parked();
+
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        draw(harness.panel, cx);
+
+        harness
+            .panel
+            .read_with(cx, |panel, _| assert!(panel.gradient_editor.is_none()))
+            .expect("read properties panel");
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert!(!item.is_dirty());
+            let NodeData::Vector(vector) = &item
+                .document()
+                .expect("document")
+                .doc
+                .scene
+                .get(vector_id)
+                .expect("vector")
+                .data
+            else {
+                panic!("expected vector")
+            };
+            assert!(matches!(
+                vector.fills.first(),
+                Some(Fill::Gradient { gradient, .. }) if gradient == &original
+            ));
+        });
+    }
+
+    #[gpui::test]
     async fn text_node_draws_typography_decorations_and_glyph_fill(cx: &mut TestAppContext) {
         init_test(cx);
         let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
@@ -3949,9 +4043,7 @@ mod panel_integration_tests {
             .expect("updating the properties panel");
         cx.run_until_parked();
 
-        let item = harness
-            ._view
-            .read_with(cx, |view, _| view.item().clone());
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
         item.read_with(cx, |item, _| {
             let node = item
                 .document()

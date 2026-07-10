@@ -389,9 +389,62 @@ impl FigView {
                 FigItemEvent::ConflictChanged => {
                     cx.emit(FigViewEvent::TitleChanged);
                 }
+                FigItemEvent::SourceEditLockChanged => {
+                    if this.item.read(cx).source_edit_locked() {
+                        let view = cx.weak_entity();
+                        cx.defer(move |cx| {
+                            view.update(cx, |view, cx| {
+                                view.cancel_canvas_edits_for_source_lock(cx)
+                            })
+                            .log_err();
+                        });
+                    }
+                    cx.emit(FigViewEvent::Edited);
+                }
             }
             cx.notify();
         })
+    }
+
+    fn cancel_canvas_edits_for_source_lock(&mut self, cx: &mut Context<Self>) {
+        if !self.item.read(cx).source_edit_locked() {
+            return;
+        }
+
+        self.primary_pressed = false;
+        self.pending_text_edit = None;
+        let text_session = self.text_edit.take().map(|edit| edit.session);
+        let mut viewport = self.viewport;
+        let screen_size = self.container_bounds.map(|bounds| {
+            let (width, height) = bounds_size(bounds);
+            DVec2::new(width, height)
+        });
+        let tools = &mut self.tools;
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let revision_before = document.doc.scene.revision();
+                if let Some(session) = text_session.as_ref() {
+                    crate::text_edit::rewind_preview(&mut document.doc, session);
+                }
+                if let (Some(viewport), Some(screen_size)) = (viewport.as_mut(), screen_size) {
+                    let mut tool_context = tool_context(&mut document.doc, viewport, screen_size);
+                    tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                } else {
+                    tools.activate_without_context(ToolKind::Select);
+                }
+                let change = if document.doc.scene.revision() != revision_before {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            item.finish_content_preview(false, cx);
+        });
+        self.viewport = viewport;
+        self.remember_tool_face(ToolKind::Select);
+        self.invalidate_canvas_cache();
+        cx.notify();
     }
 
     fn new_embedded_sidebars(
@@ -1710,6 +1763,41 @@ impl FigView {
         .into_any_element()
     }
 
+    fn render_source_edit_lock_banner(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .id("fanta-source-edit-lock-banner")
+            .absolute()
+            .top(px(48.))
+            .left_0()
+            .right_0()
+            .justify_center()
+            .child(
+                h_flex()
+                    .occlude()
+                    .max_w(px(620.))
+                    .mx_4()
+                    .px_3()
+                    .py_1p5()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(Color::Warning.color(cx))
+                    .bg(cx.theme().colors().panel_background)
+                    .child(
+                        Icon::new(IconName::Lock)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(
+                            "Canvas editing is locked while FNX has unsaved changes. Pan and selection remain available; save FNX to resume editing.",
+                        )
+                        .size(LabelSize::Small),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_sidebar_resize_handle(&self, sidebar: SidebarKind) -> AnyElement {
         div()
             .id(match sidebar {
@@ -2259,6 +2347,12 @@ impl Render for FigView {
                                 ),
                         )
                         .child(self.render_tool_pill(cx))
+                        .children(
+                            self.item
+                                .read(cx)
+                                .source_edit_locked()
+                                .then(|| self.render_source_edit_lock_banner(cx)),
+                        )
                         .into_any_element()
                 };
                 this.child(workspace_body)
@@ -2434,7 +2528,7 @@ impl Item for FigView {
     }
 
     fn capability(&self, cx: &App) -> Capability {
-        if self.item.read(cx).is_editable() {
+        if self.item.read(cx).has_ready_document() {
             Capability::ReadWrite
         } else {
             Capability::ReadOnly
@@ -2442,7 +2536,7 @@ impl Item for FigView {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.item.read(cx).is_dirty()
+        self.item.read(cx).is_dirty() || self.code_workspace.read(cx).source_is_dirty(cx)
     }
 
     fn has_conflict(&self, cx: &App) -> bool {
@@ -2450,7 +2544,7 @@ impl Item for FigView {
     }
 
     fn can_save(&self, cx: &App) -> bool {
-        self.item.read(cx).is_editable()
+        self.item.read(cx).has_ready_document()
     }
 
     fn save(
@@ -2460,6 +2554,12 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if let Some(source_save) = self
+            .code_workspace
+            .update(cx, |workspace, cx| workspace.save_source_edit(cx))
+        {
+            return source_save;
+        }
         let task = self.save_document(cx);
         let project = self.project.clone();
         cx.spawn(async move |_, cx| {

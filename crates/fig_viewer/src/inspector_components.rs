@@ -47,6 +47,15 @@ impl RenderOnce for CollapsibleIconTab {
         let collapsed_width = 32.0;
         let expanded_width = 36.0 + self.label.chars().count() as f32 * 7.0;
         let on_click = self.on_click;
+        let label = div().child(Label::new(self.label).size(LabelSize::Small).single_line());
+        #[cfg(test)]
+        let label = label.debug_selector(|| {
+            format!("fanta-collapsible-tab-label-{}-{}", self.scope, self.index)
+        });
+        let label = div()
+            .min_w_0()
+            .overflow_hidden()
+            .when(selected, |container| container.child(label));
         let tab = h_flex()
             .id((self.scope, self.index))
             .h(px(28.0))
@@ -67,7 +76,7 @@ impl RenderOnce for CollapsibleIconTab {
             })
             .on_click(move |_, window, cx| on_click(window, cx))
             .child(Icon::new(self.icon).size(IconSize::Small))
-            .child(Label::new(self.label).size(LabelSize::Small).single_line());
+            .child(label);
         let animation_state = if selected { "expand" } else { "collapsed" };
 
         tab.with_animation(
@@ -85,6 +94,62 @@ impl RenderOnce for CollapsibleIconTab {
                 tab.w(px(width))
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use gpui::{Context, Render, TestAppContext};
+
+    use super::*;
+
+    struct TabHarness;
+
+    impl Render for TabHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            h_flex()
+                .child(CollapsibleIconTab::new(
+                    "collapsed-test",
+                    0,
+                    IconName::ToolFrame,
+                    "Canvas",
+                    false,
+                    |_, _| {},
+                ))
+                .child(CollapsibleIconTab::new(
+                    "selected-test",
+                    0,
+                    IconName::DatabaseZap,
+                    "Variables",
+                    true,
+                    |_, _| {},
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn collapsed_tab_omits_its_label_from_the_element_tree(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| TabHarness);
+        let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual_context.update(|window, cx| window.draw(cx).clear());
+
+        assert!(
+            visual_context
+                .debug_bounds("fanta-collapsible-tab-label-collapsed-test-0")
+                .is_none()
+        );
+        assert!(
+            visual_context
+                .debug_bounds("fanta-collapsible-tab-label-selected-test-0")
+                .is_some()
+        );
     }
 }
 

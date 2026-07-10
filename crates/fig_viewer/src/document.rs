@@ -43,6 +43,10 @@ pub struct FigItem {
     preview_dirty_before: Option<bool>,
     /// The project changed on disk while the canvas had unsaved edits.
     conflict: bool,
+    /// An open FNX buffer has edits that are not yet represented by the
+    /// persisted project tree. The validated source may still be previewed,
+    /// but canvas-authored content changes must not race it.
+    source_edit_locked: bool,
     /// Ignore worktree events until this instant; set around our own project
     /// writes so saving from the canvas does not trigger a self-reload.
     suppress_watcher_until: Option<Instant>,
@@ -70,6 +74,8 @@ pub enum FigItemEvent {
     /// The project diverged from disk while the canvas had unsaved edits, or
     /// that conflict was resolved by saving or reloading.
     ConflictChanged,
+    /// An FNX buffer became dirty or returned to its persisted version.
+    SourceEditLockChanged,
 }
 
 impl EventEmitter<FigItemEvent> for FigItem {}
@@ -413,6 +419,7 @@ impl project::ProjectItem for FigItem {
                     dirty: false,
                     preview_dirty_before: None,
                     conflict: false,
+                    source_edit_locked: false,
                     suppress_watcher_until: None,
                     reload_task: None,
                     _load_task: Some(load_task),
@@ -449,12 +456,37 @@ impl FigItem {
         &self.abs_path
     }
 
-    /// A document is editable as soon as it has parsed, whether or not it has
-    /// been materialized to an on-disk Fanta project yet. A freshly opened
-    /// `.fig` edits in memory from the first parse; the first save writes the
+    /// A document is editable as soon as it has parsed, unless a dirty FNX
+    /// buffer currently owns the source of truth. A freshly opened `.fig`
+    /// still edits in memory from the first parse; the first save writes the
     /// project directory (see [`FigItem::save`]).
     pub fn is_editable(&self) -> bool {
+        self.document.ready().is_some() && !self.source_edit_locked
+    }
+
+    pub fn has_ready_document(&self) -> bool {
         self.document.ready().is_some()
+    }
+
+    pub fn source_edit_locked(&self) -> bool {
+        self.source_edit_locked
+    }
+
+    pub(crate) fn set_source_edit_locked(
+        &mut self,
+        source_edit_locked: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.source_edit_locked == source_edit_locked {
+            return;
+        }
+        self.source_edit_locked = source_edit_locked;
+        cx.emit(FigItemEvent::SourceEditLockChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn begin_source_edit_save(&mut self) {
+        self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
     }
 
     pub fn project_root(&self) -> Option<&Path> {
@@ -511,9 +543,10 @@ impl FigItem {
         if !relevant {
             return;
         }
-        if self.dirty {
+        if self.dirty || self.source_edit_locked {
             // Unsaved canvas edits win over disk; surface the divergence as
-            // a conflict instead of clobbering them.
+            // a conflict instead of clobbering them. A dirty FNX buffer owns
+            // its live preview just as strongly as an operation-authored edit.
             self.set_conflict(true, cx);
         } else {
             self.schedule_reload(cx);
@@ -534,9 +567,9 @@ impl FigItem {
                 .background_spawn(async move { load_project_document(&root) })
                 .await;
             if let Err(error) = this.update(cx, |this, cx| {
-                if this.dirty {
-                    // Canvas edits landed while the reload was in flight;
-                    // keep them and flag the divergence.
+                if this.dirty || this.source_edit_locked {
+                    // Canvas or FNX edits landed while the reload was in
+                    // flight; keep them and flag the divergence.
                     this.set_conflict(true, cx);
                     return;
                 }
@@ -633,10 +666,24 @@ impl FigItem {
         cx.notify();
     }
 
+    pub(crate) fn adopt_saved_source_edit(
+        &mut self,
+        source_edit: fanta_format::ProjectSourceEdit,
+        cx: &mut Context<Self>,
+    ) {
+        self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+        self.adopt_source_edit(source_edit, cx);
+    }
+
     /// Reload the project from disk immediately, discarding unsaved canvas
     /// edits. This backs the workspace's "discard and reload" choice in the
     /// conflict prompt.
     pub fn reload_from_disk(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.source_edit_locked {
+            return Task::ready(Err(anyhow::anyhow!(
+                "save or discard the current FNX edit before reloading the canvas"
+            )));
+        }
         let Some(root) = self.project_root.clone() else {
             return Task::ready(Ok(()));
         };
@@ -666,6 +713,9 @@ impl FigItem {
     /// Apply an undoable operation to the document, re-solve the affected
     /// page's layout, and mark the item dirty.
     pub fn apply(&mut self, operation: Operation, cx: &mut Context<Self>) -> Result<()> {
+        if self.source_edit_locked {
+            anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
         let document = self
             .document
             .ready_mut()
@@ -736,6 +786,9 @@ impl FigItem {
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) -> Result<bool> {
+        if self.source_edit_locked {
+            anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
         let document = self
             .document
             .ready_mut()
@@ -752,6 +805,9 @@ impl FigItem {
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) -> Result<bool> {
+        if self.source_edit_locked {
+            anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
         let document = self
             .document
             .ready_mut()
@@ -769,7 +825,7 @@ impl FigItem {
 
     fn mark_edited(&mut self, transient: bool, cx: &mut Context<Self>) {
         let was_dirty = self.dirty;
-        if self.is_editable() {
+        if self.document.ready().is_some() {
             self.dirty = true;
         }
         // Preview frames fire per pointer move; once the dirty transition has
@@ -806,6 +862,11 @@ impl FigItem {
     /// creates it — so the view can add it to the workspace as a visible
     /// worktree — and `None` when the project already existed.
     pub fn save(&mut self, cx: &mut Context<Self>) -> Task<Result<Option<PathBuf>>> {
+        if self.source_edit_locked {
+            return Task::ready(Err(anyhow::anyhow!(
+                "the FNX source is dirty; save it through the code workspace before saving the canvas"
+            )));
+        }
         let Some(document) = self.document.ready() else {
             return Task::ready(Err(anyhow::anyhow!("the document is still loading")));
         };
@@ -887,6 +948,7 @@ pub(crate) fn ready_item_for_test(
             dirty: false,
             preview_dirty_before: None,
             conflict: false,
+            source_edit_locked: false,
             suppress_watcher_until: None,
             reload_task: None,
             _load_task: None,
@@ -1441,6 +1503,7 @@ mod tests {
                 dirty: false,
                 preview_dirty_before: None,
                 conflict: false,
+                source_edit_locked: false,
                 suppress_watcher_until: None,
                 reload_task: None,
                 _load_task: None,

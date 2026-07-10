@@ -213,6 +213,15 @@ impl ToolShell {
         self.cursor = None;
     }
 
+    pub fn cancel_and_activate(&mut self, kind: ToolKind, ctx: &mut ToolContext) {
+        self.tool.deactivate(ctx);
+        self.kind = kind;
+        self.tool = kind.build();
+        self.tool.activate(ctx);
+        self.overlays.clear();
+        self.cursor = None;
+    }
+
     /// Feed one event through the active tool and record its render hints.
     /// Returns the response so the caller can react to `wants_exit`.
     pub fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {

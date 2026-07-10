@@ -4,8 +4,8 @@
 //! mutation handlers, and the `Render` impl live in `properties_panel`.
 
 use fanta_doc::{
-    BlendMode, BlurKind, Color as FantaColor, Gradient, ImageFitMode, LayoutMode, NodeFlags,
-    NodeId, StrokeAlign, TextAlign, VAlign as TextVAlign, VarValue,
+    BlendMode, BlurKind, BoundProp, Color as FantaColor, Gradient, ImageFitMode, LayoutMode,
+    NodeFlags, NodeId, StrokeAlign, TextAlign, VAlign as TextVAlign, VarValue,
 };
 use gpui::{
     Anchor, Context, Div, MouseButton, MouseDownEvent, anchored, canvas, deferred, point, px,
@@ -38,6 +38,7 @@ use crate::properties_snapshot::{
     STACKING_ORDERS, STROKE_ALIGNS, SelectionColorSnapshot, TEXT_RESIZE_MODES, TypographySnapshot,
     align_grid_active_cell, paint_kind_label,
 };
+use crate::variable_binding::{VariableBindingControl, variable_binding_model};
 
 /// Height of a boxed field / pill / control, the panel's vertical rhythm unit
 /// (the original's 30px `FIELD_BOX_H` translated to Zed density).
@@ -50,6 +51,22 @@ const PILL_LABEL_W: f32 = 68.0;
 const ALIGN_GRID_SIZE: f32 = 64.0;
 /// Height of the export preview band (the original's `EXPORT_PREVIEW_H`).
 const EXPORT_PREVIEW_H: f32 = 84.0;
+
+fn inspector_field_binding(field: &InspectorField) -> Option<(NodeId, BoundProp)> {
+    match field {
+        InspectorField::Width(id) => Some((*id, BoundProp::ClipWidth)),
+        InspectorField::Height(id) => Some((*id, BoundProp::ClipHeight)),
+        InspectorField::CornerRadius(id) => Some((*id, BoundProp::CornerRadius)),
+        InspectorField::Opacity(id) => Some((*id, BoundProp::Opacity)),
+        InspectorField::StrokeWidth { id, index } => Some((
+            *id,
+            BoundProp::StrokeWidth {
+                index: u16::try_from(*index).ok()?,
+            },
+        )),
+        _ => None,
+    }
+}
 
 impl FantaPropertiesPanel {
     // === Rendering primitives =============================================
@@ -89,6 +106,33 @@ impl FantaPropertiesPanel {
             .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
     }
 
+    fn render_variable_binding_control(
+        &self,
+        element_id: impl Into<ElementId>,
+        node: NodeId,
+        prop: BoundProp,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let item = self.active_item.as_ref()?.upgrade()?;
+        let model = item
+            .read(cx)
+            .doc()
+            .and_then(|doc| variable_binding_model(doc, node, prop))?;
+        let panel = cx.weak_entity();
+        Some(
+            VariableBindingControl::new(element_id, model, move |variable, _, cx| {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.set_variable_binding(node, prop, variable, cx)
+                    })
+                    .log_err();
+            })
+            .disabled(!editable)
+            .into_any_element(),
+        )
+    }
+
     /// A 2-up numeric field box: the mini-label INSIDE the box at the left
     /// (the drag-to-scrub handle), the value (click-to-edit via the shared
     /// inline editor), and an optional dim unit suffix at the right.
@@ -106,6 +150,15 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let editing = self.editing_field.as_ref() == Some(&field);
+        let binding = inspector_field_binding(&field).and_then(|(node, prop)| {
+            self.render_variable_binding_control(
+                SharedString::from(format!("{key}-{ix}-variable-binding")),
+                node,
+                prop,
+                editable,
+                cx,
+            )
+        });
         // The whole field box is the scrub handle (Figma/Blender behaviour):
         // press-drag anywhere on it to scrub, a plain click focuses the editor.
         let scrubbable = editable && value.is_some() && !editing;
@@ -202,6 +255,9 @@ impl FantaPropertiesPanel {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.start_editing(edit_field.clone(), String::new(), window, cx);
                 }));
+        }
+        if let Some(binding) = binding {
+            cell = cell.child(binding);
         }
         cell.into_any_element()
     }
@@ -308,9 +364,19 @@ impl FantaPropertiesPanel {
         label: &'static str,
         on: bool,
         editable: bool,
+        binding: Option<(NodeId, BoundProp)>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let binding = binding.and_then(|(node, prop)| {
+            self.render_variable_binding_control(
+                SharedString::from(format!("{id}-variable-binding")),
+                node,
+                prop,
+                editable,
+                cx,
+            )
+        });
         h_flex()
             .px_4()
             .h(px(FIELD_BOX_H))
@@ -318,9 +384,13 @@ impl FantaPropertiesPanel {
             .justify_between()
             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
             .child(
-                Switch::new(id, ToggleState::from(on))
-                    .disabled(!editable)
-                    .on_click(cx.listener(move |this, _: &ToggleState, _, cx| on_click(this, cx))),
+                h_flex().gap_1().children(binding).child(
+                    Switch::new(id, ToggleState::from(on))
+                        .disabled(!editable)
+                        .on_click(
+                            cx.listener(move |this, _: &ToggleState, _, cx| on_click(this, cx)),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -1112,6 +1182,7 @@ impl FantaPropertiesPanel {
                 "Ignore auto layout",
                 layout_child.absolute,
                 editable,
+                None,
                 move |this, cx| {
                     this.update_layout_child(id, |child| child.absolute = !child.absolute, cx);
                 },
@@ -1247,6 +1318,7 @@ impl FantaPropertiesPanel {
                 "Clip content",
                 layout.clip,
                 editable,
+                None,
                 move |this, cx| this.toggle_clip_content(id, cx),
                 cx,
             ))
@@ -1255,6 +1327,7 @@ impl FantaPropertiesPanel {
                 "Auto layout",
                 auto_layout_on,
                 editable,
+                None,
                 move |this, cx| this.toggle_auto_layout(id, !auto_layout_on, cx),
                 cx,
             ));
@@ -1454,6 +1527,7 @@ impl FantaPropertiesPanel {
                 "Wrap",
                 layout.wrap,
                 editable,
+                None,
                 move |this, cx| this.toggle_layout_wrap(id, cx),
                 cx,
             ))
@@ -1543,10 +1617,20 @@ impl FantaPropertiesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let text_style_binding = self.render_variable_binding_control(
+            "fanta-text-style-variable-binding",
+            id,
+            BoundProp::TextStyle,
+            editable,
+            cx,
+        );
         v_flex()
             .py_1()
             .gap_2()
-            .child(Self::render_section_header("Typography", None))
+            .child(Self::render_section_header(
+                "Typography",
+                text_style_binding,
+            ))
             .child(h_flex().px_4().child(self.render_text_cell(
                 "fanta-font-family",
                 0,
@@ -1628,9 +1712,7 @@ impl FantaPropertiesPanel {
                         Button::new("fanta-text-to-outlines", "Convert to outlines")
                             .size(ButtonSize::Compact)
                             .style(ButtonStyle::Subtle)
-                            .start_icon(
-                                Icon::new(IconName::ToolPathSelect).size(IconSize::XSmall),
-                            )
+                            .start_icon(Icon::new(IconName::ToolPathSelect).size(IconSize::XSmall))
                             .tooltip(Tooltip::text(
                                 "Replace editable text with stretchable filled vector paths",
                             ))
@@ -2403,6 +2485,7 @@ impl FantaPropertiesPanel {
                 "Visible",
                 node.visible,
                 editable,
+                Some((id, BoundProp::Visible)),
                 move |this, cx| this.toggle_flag(id, NodeFlags::HIDDEN, cx),
                 cx,
             ))
@@ -2411,6 +2494,7 @@ impl FantaPropertiesPanel {
                 "Locked",
                 node.locked,
                 editable,
+                None,
                 move |this, cx| this.toggle_flag(id, NodeFlags::LOCKED, cx),
                 cx,
             ))
@@ -2604,6 +2688,23 @@ impl FantaPropertiesPanel {
                         (editable && entry.color.is_some()).then(|| entry.label.to_string()),
                         cx,
                     )));
+            }
+            if let Ok(index_u16) = u16::try_from(index) {
+                let prop = if is_stroke {
+                    BoundProp::StrokeColor { index: index_u16 }
+                } else {
+                    BoundProp::FillColor { index: index_u16 }
+                };
+                let binding_id = if is_stroke {
+                    ("fanta-stroke-color-variable-binding", index)
+                } else {
+                    ("fanta-fill-color-variable-binding", index)
+                };
+                if let Some(binding) =
+                    self.render_variable_binding_control(binding_id, id, prop, editable, cx)
+                {
+                    row = row.child(binding);
+                }
             }
             if let Some(kind) = entry.kind {
                 row =
