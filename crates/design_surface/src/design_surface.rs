@@ -153,8 +153,7 @@ pub trait DesignSurface: 'static {
 
     /// Apply a batch of ops as one undoable transaction. Returns created node
     /// ids and per-op status; on failure the batch is rolled back.
-    fn apply(&self, ops: Vec<DesignOp>, label: String, cx: &mut App)
-    -> Result<serde_json::Value>;
+    fn apply(&self, ops: Vec<DesignOp>, label: String, cx: &mut App) -> Result<serde_json::Value>;
 
     /// Render a PNG of a page or node region.
     fn screenshot(&self, target: ScreenshotTarget, cx: &mut App) -> Task<Result<Vec<u8>>>;

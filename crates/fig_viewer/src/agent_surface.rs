@@ -329,14 +329,22 @@ fn prepare_screenshot(
     item: &mut FigItem,
     target: &ScreenshotTarget,
     cx: &mut gpui::Context<FigItem>,
-) -> Result<(Doc, Option<Arc<dyn AssetResolver>>, Option<NodeId>, Option<NodeId>)> {
+) -> Result<(
+    Doc,
+    Option<Arc<dyn AssetResolver>>,
+    Option<NodeId>,
+    Option<NodeId>,
+)> {
     let node = target.node.as_deref().map(parse_node_id).transpose()?;
     let page_index = {
         let document = ready_document(item)?;
         match node {
             Some(node) => {
                 if doc_get(document, node).is_none() {
-                    bail!("node {} does not exist", target.node.as_deref().unwrap_or(""));
+                    bail!(
+                        "node {} does not exist",
+                        target.node.as_deref().unwrap_or("")
+                    );
                 }
                 document
                     .page_index_of_node(node)
@@ -376,7 +384,12 @@ fn list_source_files(root: &Path) -> Vec<String> {
         let mut found: Vec<String> = entries
             .flatten()
             .filter(|entry| entry.path().join(file_name).is_file())
-            .map(|entry| format!("{directory}/{}/{file_name}", entry.file_name().to_string_lossy()))
+            .map(|entry| {
+                format!(
+                    "{directory}/{}/{file_name}",
+                    entry.file_name().to_string_lossy()
+                )
+            })
             .collect();
         found.sort();
         files.append(&mut found);
@@ -521,11 +534,17 @@ fn apply_one(doc: &mut Doc, op: &DesignOp) -> Result<Applied> {
                         .push(Fill::solid(fill_color.unwrap_or(DEFAULT_FILL_COLOR)));
                     // The path is centered on the local origin, so the node
                     // transform points at the ellipse's center.
-                    (NodeData::Vector(vector), (x + width * 0.5, y + height * 0.5))
+                    (
+                        NodeData::Vector(vector),
+                        (x + width * 0.5, y + height * 0.5),
+                    )
                 }
                 DesignNodeType::Text => {
-                    let mut text_node =
-                        TextNode::new(text.clone().unwrap_or_else(|| "Text".to_string()), *width, *height);
+                    let mut text_node = TextNode::new(
+                        text.clone().unwrap_or_else(|| "Text".to_string()),
+                        *width,
+                        *height,
+                    );
                     if let Some(size) = font_size {
                         if !(size.is_finite() && *size > 0.0) {
                             bail!("font_size must be positive");
@@ -610,15 +629,14 @@ fn apply_one(doc: &mut Doc, op: &DesignOp) -> Result<Applied> {
                 let color = parse_fill_color(fill)?;
                 if !matches!(
                     node(doc)?.data,
-                    NodeData::Vector(_) | NodeData::Group(_) | NodeData::Boolean(_) | NodeData::Text(_)
+                    NodeData::Vector(_)
+                        | NodeData::Group(_)
+                        | NodeData::Boolean(_)
+                        | NodeData::Text(_)
                 ) {
-                    bail!(
-                        "cannot set a fill on a {} node",
-                        node(doc)?.data.kind_tag()
-                    );
+                    bail!("cannot set a fill on a {} node", node(doc)?.data.kind_tag());
                 }
-                for operation in
-                    replace_data_operation(doc, id, |data| set_solid_fill(data, color))
+                for operation in replace_data_operation(doc, id, |data| set_solid_fill(data, color))
                 {
                     doc.apply(operation)?;
                     applied_any = true;
