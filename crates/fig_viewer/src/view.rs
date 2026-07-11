@@ -3654,7 +3654,10 @@ impl Render for FigView {
                         .justify_center()
                         .gap_2()
                         .child(Label::new("Could not open Figma file").size(LabelSize::Large))
-                        .child(Label::new(error.to_string()).color(Color::Muted)),
+                        // `{:#}` prints the whole context chain, so the real
+                        // loader failure (auth, parse, missing file) is shown
+                        // instead of just the outermost wrapper.
+                        .child(Label::new(format!("{error:#}")).color(Color::Muted)),
                 )
             })
             .when_some(snapshot.loading_message, |this, message| {
