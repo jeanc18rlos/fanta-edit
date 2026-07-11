@@ -2255,6 +2255,7 @@ fn add_reaction_operation(doc: &Doc, node: NodeId) -> Option<Operation> {
             trigger: Trigger::Click,
             action,
             transition: None,
+            animation: None,
         },
     })
 }
@@ -2575,6 +2576,7 @@ mod tests {
                 trigger: Trigger::Click,
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .unwrap();
@@ -2628,6 +2630,7 @@ mod tests {
                 value: VarValue::Float { value: 1.0 },
             },
             transition: None,
+            animation: None,
         };
         doc.apply(Operation::AddReaction {
             node: first,
@@ -2677,6 +2680,7 @@ mod tests {
             trigger: Trigger::Click,
             action: Action::Back,
             transition: None,
+            animation: None,
         };
         doc.apply(Operation::AddReaction {
             node: first,
@@ -2721,6 +2725,7 @@ mod tests {
             },
             action: Action::OpenLink { url: String::new() },
             transition: None,
+            animation: None,
         };
         let keyed = parameter_reaction_from_text(&doc, &key, ParameterKind::Keys, "Shift + K")
             .expect("valid key chord");
@@ -2752,6 +2757,7 @@ mod tests {
                 },
             },
             transition: None,
+            animation: None,
         };
         let offset =
             parameter_reaction_from_text(&doc, &overlay, ParameterKind::OverlayOffsetX, "18.25")
@@ -2793,6 +2799,7 @@ mod tests {
                     duration_ms: 500,
                     easing: Easing::EaseOut,
                 }),
+                animation: None,
             },
         })
         .expect("add reaction");
@@ -2835,6 +2842,7 @@ mod tests {
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .expect("add reaction");
@@ -2920,6 +2928,7 @@ mod tests {
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .expect("add reaction");
@@ -3073,6 +3082,7 @@ mod tests {
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .expect("add reaction");
