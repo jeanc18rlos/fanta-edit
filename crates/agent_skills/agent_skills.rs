@@ -870,6 +870,22 @@ mod tests {
     use gpui::TestAppContext;
 
     #[test]
+    fn every_builtin_skill_parses_and_is_returned() {
+        // `builtin_skills` swallows parse failures, so a bad frontmatter edit
+        // would otherwise silently drop a built-in skill from the binary.
+        let skills = builtin_skills();
+        let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            BUILTIN_SKILL_ENTRIES.len(),
+            "a built-in SKILL.md failed to parse; parsed: {names:?}"
+        );
+        for (name, _) in BUILTIN_SKILL_ENTRIES {
+            assert!(names.contains(name), "built-in skill `{name}` is missing");
+        }
+    }
+
+    #[test]
     fn test_skill_source_precedence_is_total_and_ordered() {
         // Pin the hierarchy: project-local > global > built-in. Every
         // override and conflict-resolution site routes through this,
