@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use gpui::{App, IntoElement, RenderOnce, SharedString, Window, div};
+use gpui::{App, IntoElement, ObjectFit, RenderOnce, SharedString, Window, div, img};
 use ui::prelude::*;
 
 use crate::comments;
@@ -15,6 +15,9 @@ pub(crate) struct DocumentCommentRow {
     author: SharedString,
     body: SharedString,
     replies: usize,
+    attachments: Vec<comments::Attachment>,
+    mentions: usize,
+    skill: Option<SharedString>,
     resolved: bool,
 }
 
@@ -28,6 +31,18 @@ pub(crate) fn document_comment_rows(
             continue;
         };
         for comment in comments::read_comments(doc, page_root) {
+            let reply_attachments = comment
+                .replies
+                .iter()
+                .flat_map(|reply| reply.attachments.iter().cloned());
+            let reply_mentions = comment
+                .replies
+                .iter()
+                .map(|reply| reply.mentions.len())
+                .sum::<usize>();
+            let skill = comment
+                .skill
+                .or_else(|| comment.replies.iter().rev().find_map(|reply| reply.skill));
             rows.push(DocumentCommentRow {
                 page_index,
                 page_name: page.name.clone(),
@@ -39,6 +54,13 @@ pub(crate) fn document_comment_rows(
                 },
                 body: comment.text.into(),
                 replies: comment.replies.len(),
+                attachments: comment
+                    .attachments
+                    .into_iter()
+                    .chain(reply_attachments)
+                    .collect(),
+                mentions: comment.mentions.len() + reply_mentions,
+                skill: skill.map(|skill| skill.label().into()),
                 resolved: comment.resolved,
             });
         }
@@ -134,11 +156,13 @@ impl RenderOnce for FantaCommentsPanel {
                                             IconName::Chat
                                         })
                                         .size(IconSize::XSmall)
-                                        .color(if row.resolved {
-                                            Color::Success
-                                        } else {
-                                            Color::Accent
-                                        }),
+                                        .color(
+                                            if row.resolved {
+                                                Color::Success
+                                            } else {
+                                                Color::Accent
+                                            },
+                                        ),
                                     )
                                     .child(
                                         Label::new(row.page_name)
@@ -157,16 +181,52 @@ impl RenderOnce for FantaCommentsPanel {
                                     }),
                             ),
                     )
-                    .child(Label::new(row.body).size(LabelSize::Small))
+                    .when(!row.body.is_empty(), |this| {
+                        this.child(Label::new(row.body).size(LabelSize::Small))
+                    })
+                    .when_some(
+                        row.attachments.iter().find_map(|attachment| {
+                            attachment
+                                .path
+                                .as_ref()
+                                .filter(|path| previewable_image(path))
+                                .cloned()
+                        }),
+                        |this, path| {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .h(px(112.))
+                                    .rounded_md()
+                                    .overflow_hidden()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border_variant)
+                                    .child(img(path).size_full().object_fit(ObjectFit::Cover)),
+                            )
+                        },
+                    )
                     .child(
                         Label::new(format!(
-                            "{}{}",
+                            "{}{}{}{}",
                             row.author,
                             if row.replies == 0 {
                                 String::new()
                             } else {
                                 format!(" · {} replies", row.replies)
-                            }
+                            },
+                            if row.attachments.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" · {} attachments", row.attachments.len())
+                            },
+                            match (row.mentions, row.skill.as_deref()) {
+                                (0, None) => String::new(),
+                                (mentions, None) => format!(" · {mentions} mentions"),
+                                (0, Some(skill)) => format!(" · AI: {skill}"),
+                                (mentions, Some(skill)) => {
+                                    format!(" · {mentions} mentions · AI: {skill}")
+                                }
+                            },
                         ))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
@@ -175,6 +235,17 @@ impl RenderOnce for FantaCommentsPanel {
         }
         list.into_any_element()
     }
+}
+
+fn previewable_image(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "avif" | "gif" | "jpeg" | "jpg" | "png" | "webp"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -189,23 +260,40 @@ mod tests {
         let mut first = CanvasNode::new(NodeData::Group(GroupNode::default()));
         first.name = "First".into();
         let first_id = first.id;
-        doc.apply(Operation::create_node(first)).expect("first page");
+        doc.apply(Operation::create_node(first))
+            .expect("first page");
         doc.add_page(first_id);
-        let (_, add) = comments::add_comment_op(&doc, first_id, [1.0, 2.0], "Open")
-            .expect("open comment");
+        let (first_comment_id, add) =
+            comments::add_comment_op(&doc, first_id, [1.0, 2.0], "Open").expect("open comment");
         doc.apply(add).expect("add open comment");
+        doc.apply(
+            comments::reply_comment_full_op(
+                &doc,
+                first_id,
+                &first_comment_id,
+                "@Codex see the image",
+                comments::mentions_for_body(&doc, first_id, "@Codex see the image"),
+                vec![comments::Attachment {
+                    name: "reference.png".to_string(),
+                    path: Some("/tmp/reference.png".into()),
+                }],
+                Some(comments::CommentSkill::Search),
+            )
+            .expect("rich reply"),
+        )
+        .expect("apply rich reply");
 
         let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
         second.name = "Second".into();
         let second_id = second.id;
-        doc.apply(Operation::create_node(second)).expect("second page");
+        doc.apply(Operation::create_node(second))
+            .expect("second page");
         doc.add_page(second_id);
-        let (resolved_id, add) =
-            comments::add_comment_op(&doc, second_id, [3.0, 4.0], "Done")
-                .expect("resolved comment");
+        let (resolved_id, add) = comments::add_comment_op(&doc, second_id, [3.0, 4.0], "Done")
+            .expect("resolved comment");
         doc.apply(add).expect("add resolved comment");
-        let resolve = comments::toggle_resolved_op(&doc, second_id, &resolved_id)
-            .expect("resolve comment");
+        let resolve =
+            comments::toggle_resolved_op(&doc, second_id, &resolved_id).expect("resolve comment");
         doc.apply(resolve).expect("apply resolve");
 
         let pages = vec![
@@ -226,6 +314,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(!rows[0].resolved);
         assert!(rows[1].resolved);
+        assert_eq!(rows[0].replies, 1);
+        assert_eq!(rows[0].attachments.len(), 1);
+        assert_eq!(rows[0].mentions, 1);
         assert_eq!(rows[0].page_name.as_ref(), "First");
         assert_eq!(rows[1].page_name.as_ref(), "Second");
     }

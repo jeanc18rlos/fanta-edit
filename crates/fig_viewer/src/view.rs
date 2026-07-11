@@ -14,10 +14,10 @@ use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, Context, CursorStyle, DragMoveEvent, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PinchEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString,
-    Subscription, Task, Window, actions, div, px,
+    Action, Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
+    DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render, RenderImage,
+    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, Window, actions, div, px,
 };
 use language::Capability;
 use project::Project;
@@ -32,6 +32,10 @@ use workspace::{
 use crate::canvas::{
     CanvasElement, RenderedCanvas, bounds_size, evaluated_hit_test_screen,
     screen_position_in_bounds,
+};
+use crate::clipboard::{
+    CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
+    create_operations, delete_operations,
 };
 use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
@@ -48,6 +52,7 @@ use crate::motion_edit::{
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 use crate::properties_panel::FantaPropertiesPanel;
 use crate::prototype_panel::FantaPrototypePanel;
+use crate::prototype_player::PrototypePlayerState;
 use crate::text_edit::CanvasTextEdit;
 use crate::timeline::{
     TIMELINE_HEIGHT, TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection,
@@ -84,6 +89,24 @@ actions!(
         Confirm,
         /// Delete the selected nodes.
         DeleteSelection,
+        /// Copy the selected canvas subtrees.
+        CopySelection,
+        /// Cut the selected canvas subtrees.
+        CutSelection,
+        /// Paste canvas subtrees from the clipboard.
+        PasteSelection,
+        /// Duplicate the selected canvas subtrees.
+        DuplicateSelection,
+        /// Present the authored prototype from its configured starting frame.
+        PlayPrototype,
+        /// Leave prototype presentation and return to the editor.
+        ExitPrototype,
+        /// Restart prototype presentation from its starting frame.
+        RestartPrototype,
+        /// Show the previous top-level frame in prototype presentation.
+        PrototypePreviousFrame,
+        /// Show the next top-level frame in prototype presentation.
+        PrototypeNextFrame,
         /// Nudge the selection left.
         NudgeLeft,
         /// Nudge the selection right.
@@ -234,6 +257,15 @@ pub struct FigView {
     /// a release delivered through the canvas's window-level mouse listener,
     /// which has no `Window`, so the session is opened on the next render.
     pending_text_edit: Option<NodeId>,
+    prototype_player: Option<PrototypePlayerState>,
+    prototype_saved_viewport: Option<Viewport>,
+    prototype_tick_task: Option<Task<()>>,
+    prototype_last_tick: Option<std::time::Instant>,
+    prototype_pointer_down: Option<Point<Pixels>>,
+    prototype_drag_fired: bool,
+    prototype_suppress_click: bool,
+    prototype_render_cache: Option<PrototypeRenderCache>,
+    prototype_link_notice: Option<PrototypeLinkNotice>,
     _item_subscription: Subscription,
     _editor_session_subscription: Subscription,
     _timeline_subscription: Subscription,
@@ -242,6 +274,40 @@ pub struct FigView {
 pub enum FigViewEvent {
     Edited,
     TitleChanged,
+}
+
+struct PrototypeRenderCache {
+    logical_size: (u32, u32),
+    scale_bits: u32,
+    image: std::sync::Arc<RenderImage>,
+}
+
+#[derive(Clone)]
+enum PrototypeLinkNotice {
+    Confirm(url::Url),
+    Invalid(SharedString),
+}
+
+fn validate_prototype_link(raw: &str) -> std::result::Result<url::Url, SharedString> {
+    match url::Url::parse(raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(url),
+        Ok(url) => Err(format!(
+            "Blocked prototype link with unsupported {} scheme.",
+            url.scheme()
+        )
+        .into()),
+        Err(error) => Err(format!("Invalid prototype link: {error}").into()),
+    }
+}
+
+fn prototype_tick_elapsed(
+    last_tick: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> std::time::Duration {
+    last_tick
+        .replace(now)
+        .map(|previous| now.saturating_duration_since(previous))
+        .unwrap_or_else(|| std::time::Duration::from_millis(16))
 }
 
 impl EventEmitter<FigViewEvent> for FigView {}
@@ -341,6 +407,15 @@ impl FigView {
             hovered_node: None,
             text_edit: None,
             pending_text_edit: None,
+            prototype_player: None,
+            prototype_saved_viewport: None,
+            prototype_tick_task: None,
+            prototype_last_tick: None,
+            prototype_pointer_down: None,
+            prototype_drag_fired: false,
+            prototype_suppress_click: false,
+            prototype_render_cache: None,
+            prototype_link_notice: None,
             _item_subscription: item_subscription,
             _editor_session_subscription: editor_session_subscription,
             _timeline_subscription: timeline_subscription,
@@ -369,6 +444,19 @@ impl FigView {
                 }
                 FigItemEvent::SelectionChanged | FigItemEvent::TextSelectionChanged => {}
                 FigItemEvent::StateChanged => {
+                    // A reload replaces the document while prototype state
+                    // contains node/variable IDs from the previous tree. Drop
+                    // the session locally without trying to update the item
+                    // from inside its own event callback.
+                    if this.prototype_player.take().is_some() {
+                        this.prototype_tick_task = None;
+                        this.prototype_last_tick = None;
+                        this.prototype_pointer_down = None;
+                        this.prototype_drag_fired = false;
+                        this.prototype_suppress_click = false;
+                        this.prototype_link_notice = None;
+                        this.viewport = this.prototype_saved_viewport.take();
+                    }
                     // The node tree may have been swapped out (disk reload)
                     // or persisted; committing the overlay's stale text into
                     // the new tree could clobber external edits, so drop the
@@ -539,6 +627,9 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
+        if self.prototype_player.is_some() && workspace != EditorWorkspace::Canvas {
+            self.exit_prototype_session(cx);
+        }
         self.finish_document_edits(cx);
         if workspace != EditorWorkspace::Canvas {
             self.timeline_shell
@@ -554,6 +645,9 @@ impl FigView {
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
         if self.editor_mode(cx) == mode {
             return;
+        }
+        if self.prototype_player.is_some() && mode != EditorMode::Prototype {
+            self.exit_prototype_session(cx);
         }
         self.finish_document_edits(cx);
         if mode != EditorMode::Motion {
@@ -1198,6 +1292,7 @@ impl FigView {
 
     pub(crate) fn invalidate_canvas_cache(&mut self) {
         self.rendered_canvas = None;
+        self.prototype_render_cache = None;
         #[cfg(target_os = "macos")]
         if let Some(renderer) = self.gpu_renderer.as_mut() {
             renderer.invalidate();
@@ -1581,6 +1676,20 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.prototype_player.is_some() {
+            self.focus_handle.focus(window, cx);
+            if event.button == MouseButton::Left {
+                self.prototype_pointer_down = Some(event.position);
+                self.prototype_drag_fired = false;
+                let response = self.trigger_prototype_pointer(
+                    event.position,
+                    fanta_present::PointerEvent::Down,
+                    cx,
+                );
+                self.prototype_suppress_click = response.suppress_click;
+            }
+            return;
+        }
         if event.button == MouseButton::Left {
             self.finish_panel_edits(cx);
         }
@@ -1679,6 +1788,10 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.prototype_player.is_some() {
+            self.trigger_prototype_key(&event.keystroke.key, cx);
+            return;
+        }
         if event.keystroke.key == "space" && self.text_edit.is_none() && !self.space_pan {
             self.space_pan = true;
             cx.notify();
@@ -1707,6 +1820,19 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.prototype_player.is_some() {
+            if event.button == MouseButton::Left {
+                let should_click =
+                    self.prototype_pointer_down.take().is_some() && !self.prototype_drag_fired;
+                let suppress_click = std::mem::take(&mut self.prototype_suppress_click);
+                self.prototype_drag_fired = false;
+                self.trigger_prototype_pointer(event.position, fanta_present::PointerEvent::Up, cx);
+                if should_click && !suppress_click {
+                    self.trigger_prototype_click(event.position, cx);
+                }
+            }
+            return;
+        }
         if event.button == MouseButton::Middle {
             self.end_panning(cx);
         }
@@ -1775,6 +1901,27 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.prototype_player.is_some() {
+            if let Some(origin) = self.prototype_pointer_down {
+                let delta = event.position - origin;
+                let distance = f64::from(f32::from(delta.x)).hypot(f64::from(f32::from(delta.y)));
+                if !self.prototype_drag_fired && distance >= 4.0 {
+                    self.prototype_drag_fired = true;
+                    self.trigger_prototype_pointer(
+                        event.position,
+                        fanta_present::PointerEvent::DragStart,
+                        cx,
+                    );
+                }
+            } else {
+                self.trigger_prototype_pointer(
+                    event.position,
+                    fanta_present::PointerEvent::Move,
+                    cx,
+                );
+            }
+            return;
+        }
         self.handle_comment_mouse_move(event.position, cx);
         if self.is_panning() {
             if let Some(last_position) = self.pan_last_position {
@@ -1975,6 +2122,10 @@ impl FigView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+            return;
+        }
         // Escape while composing a comment discards the draft and exits the
         // comment tool entirely (Figma-style), before any other cancel.
         if self.cancel_comment_draft(cx) {
@@ -2013,6 +2164,10 @@ impl FigView {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prototype_player.is_some() {
+            self.trigger_prototype_key("enter", cx);
+            return;
+        }
         self.finish_panel_edits(cx);
         if self.text_edit.is_some() {
             self.commit_text_edit(cx);
@@ -2034,20 +2189,442 @@ impl FigView {
     fn delete_selection(
         &mut self,
         _: &DeleteSelection,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_editable(cx) {
-            self.finish_document_edits(cx);
-            self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
+        self.delete_selected_nodes(cx);
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+        self.copy_selected_nodes(cx);
+    }
+
+    fn cut_selection(&mut self, _: &CutSelection, _window: &mut Window, cx: &mut Context<Self>) {
+        self.cut_selected_nodes(cx);
+    }
+
+    fn paste_selection(
+        &mut self,
+        _: &PasteSelection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.paste_selected_nodes(cx);
+    }
+
+    fn duplicate_selection(
+        &mut self,
+        _: &DuplicateSelection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.duplicate_selected_nodes(cx);
+    }
+
+    pub(crate) fn copy_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        self.finish_document_edits(cx);
+        let payload = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| CanvasClipboard::capture(&document.doc));
+        if let Some(payload) = payload {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                payload.display_text(),
+                payload,
+            ));
+        }
+    }
+
+    pub(crate) fn cut_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        self.copy_selected_nodes(cx);
+        self.delete_selected_nodes(cx);
+    }
+
+    pub(crate) fn delete_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let result = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let operations = delete_operations(&document.doc);
+                match apply_canvas_transaction(&mut document.doc, "Delete", operations) {
+                    Ok(true) => {
+                        document.doc.selection.clear();
+                        (Ok(true), DocChange::Content)
+                    }
+                    Ok(false) => (Ok(false), DocChange::None),
+                    Err(error) => (Err(error), DocChange::None),
+                }
+            })
+            .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
+        });
+        if let Err(error) = result {
+            log::error!("deleting canvas selection failed: {error:#}");
+        }
+    }
+
+    pub(crate) fn paste_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        let payload = cx.read_from_clipboard().and_then(|clipboard| {
+            clipboard.entries.into_iter().find_map(|entry| match entry {
+                ClipboardEntry::String(string) => string.metadata_json::<CanvasClipboard>(),
+                ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_) => None,
+            })
+        });
+        let Some(payload) = payload else {
+            return;
+        };
+        self.finish_document_edits(cx);
+        self.insert_clipboard_payload(&payload, "Paste", 16.0, ClipboardPlacement::Paste, cx);
+    }
+
+    pub(crate) fn duplicate_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let payload = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| CanvasClipboard::capture(&document.doc));
+        if let Some(payload) = payload {
+            self.insert_clipboard_payload(
+                &payload,
+                "Duplicate",
+                16.0,
+                ClipboardPlacement::Duplicate,
+                cx,
+            );
+        }
+    }
+
+    fn insert_clipboard_payload(
+        &mut self,
+        payload: &CanvasClipboard,
+        label: &str,
+        offset: f64,
+        placement: ClipboardPlacement,
+        cx: &mut Context<Self>,
+    ) {
+        let result = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let pasted = match payload.instantiate(&document.doc, offset, placement) {
+                    Ok(pasted) => pasted,
+                    Err(error) => return (Err(error), DocChange::None),
+                };
+                match apply_canvas_transaction(&mut document.doc, label, create_operations(&pasted))
+                {
+                    Ok(true) => {
+                        document.doc.selection.replace_with(pasted.roots);
+                        (Ok(true), DocChange::Content)
+                    }
+                    Ok(false) => (Ok(false), DocChange::None),
+                    Err(error) => (Err(error), DocChange::None),
+                }
+            })
+            .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
+        });
+        if let Err(error) = result {
+            log::error!("{label} canvas selection failed: {error:#}");
         }
     }
 
     fn nudge(&mut self, key: LogicalKey, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prototype_player.is_some() {
+            match key {
+                LogicalKey::ArrowLeft => self.show_previous_prototype_frame(cx),
+                LogicalKey::ArrowRight => self.show_next_prototype_frame(cx),
+                LogicalKey::ArrowUp | LogicalKey::ArrowDown => {}
+                LogicalKey::Escape | LogicalKey::Enter | LogicalKey::Delete => {}
+            }
+            return;
+        }
         if self.is_editable(cx) {
             self.finish_document_edits(cx);
             self.dispatch_tool_event(key_event(key, window.modifiers()), cx);
         }
+    }
+
+    pub(crate) fn is_presenting_prototype(&self) -> bool {
+        self.prototype_player.is_some()
+    }
+
+    fn play_prototype(&mut self, _: &PlayPrototype, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prototype_player.is_some() {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let screen_size = self
+            .container_bounds
+            .map(bounds_size)
+            .map(|(width, height)| DVec2::new(width, height))
+            .unwrap_or_else(|| DVec2::new(960.0, 640.0));
+        let player = self
+            .item
+            .read(cx)
+            .document()
+            .ok_or_else(|| anyhow::anyhow!("The design is not ready yet"))
+            .and_then(|document| {
+                PrototypePlayerState::try_start(
+                    &document.doc,
+                    document.asset_resolver.clone(),
+                    screen_size,
+                )
+            });
+        let player = match player {
+            Ok(player) => player,
+            Err(error) => {
+                let detail = format!("{error:#}");
+                drop(window.prompt(
+                    gpui::PromptLevel::Warning,
+                    "Cannot present prototype",
+                    Some(&detail),
+                    &["OK"],
+                    cx,
+                ));
+                return;
+            }
+        };
+        if self.editor_workspace(cx) != EditorWorkspace::Canvas {
+            self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+        }
+        if self.editor_mode(cx) != EditorMode::Prototype {
+            self.set_editor_mode(EditorMode::Prototype, cx);
+        }
+        self.prototype_saved_viewport = self.viewport;
+        self.prototype_player = Some(player);
+        self.prototype_tick_task = None;
+        self.prototype_last_tick = Some(std::time::Instant::now());
+        self.prototype_pointer_down = None;
+        self.prototype_drag_fired = false;
+        self.prototype_suppress_click = false;
+        self.prototype_link_notice = None;
+        self.primary_pressed = false;
+        self.pan_last_position = None;
+        self.hovered_node = None;
+        self.invalidate_canvas_cache();
+        self.focus_handle.focus(window, cx);
+        self.start_prototype_clock(cx);
+        cx.notify();
+    }
+
+    fn exit_prototype(&mut self, _: &ExitPrototype, _window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_prototype_session(cx);
+    }
+
+    fn exit_prototype_session(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self.prototype_player.take() else {
+            return;
+        };
+        drop(player);
+        self.prototype_tick_task = None;
+        self.prototype_last_tick = None;
+        self.prototype_pointer_down = None;
+        self.prototype_drag_fired = false;
+        self.prototype_suppress_click = false;
+        self.prototype_link_notice = None;
+        self.viewport = self.prototype_saved_viewport.take();
+        self.invalidate_canvas_cache();
+        cx.notify();
+    }
+
+    fn restart_prototype(
+        &mut self,
+        _: &RestartPrototype,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(player) = self.prototype_player.as_mut() else {
+            return;
+        };
+        if player.restart() {
+            self.prototype_last_tick = Some(std::time::Instant::now());
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
+    }
+
+    fn prototype_previous_frame(
+        &mut self,
+        _: &PrototypePreviousFrame,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_previous_prototype_frame(cx);
+    }
+
+    fn prototype_next_frame(
+        &mut self,
+        _: &PrototypeNextFrame,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_next_prototype_frame(cx);
+    }
+
+    fn show_previous_prototype_frame(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self.prototype_player.as_mut() else {
+            return;
+        };
+        if player.show_previous_frame() {
+            self.prototype_last_tick = Some(std::time::Instant::now());
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
+    }
+
+    fn show_next_prototype_frame(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self.prototype_player.as_mut() else {
+            return;
+        };
+        if player.show_next_frame() {
+            self.prototype_last_tick = Some(std::time::Instant::now());
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
+    }
+
+    fn trigger_prototype_click(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.trigger_prototype_pointer(position, fanta_present::PointerEvent::Click, cx);
+    }
+
+    fn trigger_prototype_pointer(
+        &mut self,
+        position: Point<Pixels>,
+        event: fanta_present::PointerEvent,
+        cx: &mut Context<Self>,
+    ) -> fanta_present::PresentResponse {
+        let Some(bounds) = self.container_bounds else {
+            return fanta_present::PresentResponse::default();
+        };
+        let screen = screen_position_in_bounds(position, bounds);
+        let Some(player) = self.prototype_player.as_mut() else {
+            return fanta_present::PresentResponse::default();
+        };
+        let response = player.handle_pointer(screen, event);
+        self.handle_prototype_response(response, cx);
+        response
+    }
+
+    fn leave_prototype_surface(&mut self, cx: &mut Context<Self>) {
+        let Some(player) = self.prototype_player.as_mut() else {
+            return;
+        };
+        let response = player.handle_pointer(DVec2::ZERO, fanta_present::PointerEvent::Leave);
+        self.prototype_pointer_down = None;
+        self.prototype_drag_fired = false;
+        self.prototype_suppress_click = false;
+        self.handle_prototype_response(response, cx);
+    }
+
+    fn trigger_prototype_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(player) = self.prototype_player.as_mut() else {
+            return;
+        };
+        let response = player.handle_key(key);
+        self.handle_prototype_response(response, cx);
+    }
+
+    fn handle_prototype_response(
+        &mut self,
+        response: fanta_present::PresentResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(url) = self
+            .prototype_player
+            .as_mut()
+            .and_then(PrototypePlayerState::take_open_url)
+            .filter(|url| !url.trim().is_empty())
+        {
+            self.prototype_link_notice = Some(match validate_prototype_link(&url) {
+                Ok(url) => PrototypeLinkNotice::Confirm(url),
+                Err(error) => PrototypeLinkNotice::Invalid(error),
+            });
+            cx.notify();
+        }
+        if response.exited {
+            self.exit_prototype_session(cx);
+            return;
+        }
+        if response.navigated {
+            self.prototype_last_tick = Some(std::time::Instant::now());
+        }
+        if response.needs_redraw || response.navigated || response.media_updated {
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn render_prototype_rgba(
+        &mut self,
+        size: (u32, u32),
+        display_scale: f64,
+    ) -> anyhow::Result<(u32, u32, Vec<u8>)> {
+        let player = self
+            .prototype_player
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("prototype presentation is not active"))?;
+        player.resize(
+            DVec2::new(f64::from(size.0), f64::from(size.1)),
+            display_scale,
+        )?;
+        Ok(player.present_rgba())
+    }
+
+    pub(crate) fn render_prototype_image(
+        &mut self,
+        logical_size: (u32, u32),
+        display_scale: f32,
+    ) -> anyhow::Result<std::sync::Arc<RenderImage>> {
+        let scale_bits = display_scale.to_bits();
+        if let Some(cache) = &self.prototype_render_cache
+            && cache.logical_size == logical_size
+            && cache.scale_bits == scale_bits
+        {
+            return Ok(cache.image.clone());
+        }
+        let (width, height, pixels) =
+            self.render_prototype_rgba(logical_size, f64::from(display_scale))?;
+        let image = crate::canvas::render_image_from_rgba(width, height, pixels, display_scale)?;
+        self.prototype_render_cache = Some(PrototypeRenderCache {
+            logical_size,
+            scale_bits,
+            image: image.clone(),
+        });
+        Ok(image)
+    }
+
+    fn start_prototype_clock(&mut self, cx: &mut Context<Self>) {
+        self.prototype_tick_task = None;
+        self.prototype_last_tick = Some(std::time::Instant::now());
+        self.prototype_tick_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let keep_running = this.update(cx, |this, cx| {
+                    let Some(player) = this.prototype_player.as_mut() else {
+                        return false;
+                    };
+                    let now = std::time::Instant::now();
+                    let elapsed = prototype_tick_elapsed(&mut this.prototype_last_tick, now);
+                    let response = player.tick_elapsed(elapsed);
+                    this.handle_prototype_response(response, cx);
+                    this.prototype_player.is_some()
+                });
+                if !matches!(keep_running, Ok(true)) {
+                    break;
+                }
+            }
+        }));
     }
 
     // === Pages ============================================================
@@ -2084,6 +2661,9 @@ impl FigView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<std::path::PathBuf>>> {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+        }
         // Persist committed state, not a transient preview mid-session.
         self.finish_document_edits(cx);
         self.item.update(cx, |item, cx| item.save(cx))
@@ -2555,6 +3135,293 @@ fn clamp_sidebar_width(width: Pixels, sidebar: SidebarKind) -> Pixels {
     px(width.as_f32().clamp(minimum, MAX_SIDEBAR_WIDTH))
 }
 
+impl FigView {
+    fn render_prototype_play_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.weak_entity();
+        div()
+            .absolute()
+            .top_3()
+            .right_3()
+            .child(
+                Button::new("fanta-prototype-present", "Present")
+                    .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::Small))
+                    .style(ButtonStyle::Filled)
+                    .tooltip(Tooltip::text("Present prototype (⌥⌘↵)"))
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.play_prototype(&PlayPrototype, window, cx)
+                        })
+                        .log_err();
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_prototype_presentation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (title, position, can_go_back, can_go_forward) = self
+            .prototype_player
+            .as_ref()
+            .map(|player| {
+                let title = self
+                    .item
+                    .read(cx)
+                    .document()
+                    .and_then(|document| document.doc.scene.get(player.active_frame()))
+                    .map(|node| node.name.trim())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("Prototype")
+                    .to_string();
+                let position = player.frame_position();
+                let can_go_back = position.is_some_and(|(index, _)| index > 1);
+                let can_go_forward = position.is_some_and(|(index, count)| index < count);
+                (title, position, can_go_back, can_go_forward)
+            })
+            .unwrap_or_else(|| ("Prototype".to_string(), None, false, false));
+
+        let previous_view = cx.weak_entity();
+        let next_view = cx.weak_entity();
+        let restart_view = cx.weak_entity();
+        let exit_view = cx.weak_entity();
+        let link_notice = self.prototype_link_notice.clone();
+        let nav_label = position
+            .map(|(index, count)| format!("{index} / {count}"))
+            .unwrap_or_else(|| "—".to_string());
+        let chrome_border = cx.theme().colors().border;
+        let chrome_background = cx.theme().colors().panel_background;
+        let chrome = move |child: AnyElement| {
+            h_flex()
+                .h_9()
+                .px_2()
+                .gap_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(chrome_border)
+                .bg(chrome_background)
+                .shadow_sm()
+                .child(child)
+        };
+
+        div()
+            .id("fanta-prototype-presentation")
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                div()
+                    .id("fig-prototype-container")
+                    .absolute()
+                    .inset_0()
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                        if !*hovered {
+                            view.leave_prototype_surface(cx);
+                        }
+                    }))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+                    .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                    .child(CanvasElement::new(cx.entity())),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_3()
+                    .left_3()
+                    .right_3()
+                    .justify_between()
+                    .child(chrome(
+                        h_flex()
+                            .gap_2()
+                            .px_1()
+                            .child(Icon::new(IconName::PlayFilled).size(IconSize::Small))
+                            .child(Label::new(title).single_line())
+                            .into_any_element(),
+                    ))
+                    .child(chrome(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                IconButton::new(
+                                    "fanta-prototype-presentation-restart-top",
+                                    IconName::RotateCcw,
+                                )
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Restart prototype"))
+                                .on_click(move |_, _, cx| {
+                                    restart_view
+                                        .update(cx, |view, cx| {
+                                            let Some(player) = view.prototype_player.as_mut()
+                                            else {
+                                                return;
+                                            };
+                                            if player.restart() {
+                                                view.prototype_last_tick =
+                                                    Some(std::time::Instant::now());
+                                                view.invalidate_canvas_cache();
+                                                cx.notify();
+                                            }
+                                        })
+                                        .log_err();
+                                }),
+                            )
+                            .child(
+                                IconButton::new(
+                                    "fanta-prototype-presentation-close",
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Return to editor"))
+                                .on_click(move |_, _, cx| {
+                                    exit_view
+                                        .update(cx, |view, cx| view.exit_prototype_session(cx))
+                                        .log_err();
+                                }),
+                            )
+                            .into_any_element(),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .bottom_4()
+                    .left_0()
+                    .right_0()
+                    .justify_center()
+                    .child(chrome(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                IconButton::new(
+                                    "fanta-prototype-presentation-previous",
+                                    IconName::ArrowLeft,
+                                )
+                                .icon_size(IconSize::Small)
+                                .disabled(!can_go_back)
+                                .tooltip(Tooltip::text("Previous frame"))
+                                .on_click(move |_, _, cx| {
+                                    previous_view
+                                        .update(cx, |view, cx| {
+                                            view.show_previous_prototype_frame(cx)
+                                        })
+                                        .log_err();
+                                }),
+                            )
+                            .child(Label::new(nav_label).size(LabelSize::Small))
+                            .child(
+                                IconButton::new(
+                                    "fanta-prototype-presentation-next",
+                                    IconName::ArrowRight,
+                                )
+                                .icon_size(IconSize::Small)
+                                .disabled(!can_go_forward)
+                                .tooltip(Tooltip::text("Next frame"))
+                                .on_click(move |_, _, cx| {
+                                    next_view
+                                        .update(cx, |view, cx| view.show_next_prototype_frame(cx))
+                                        .log_err();
+                                }),
+                            )
+                            .into_any_element(),
+                    )),
+            )
+            .when_some(link_notice, |this, notice| {
+                let dismiss_view = cx.weak_entity();
+                let content = match notice {
+                    PrototypeLinkNotice::Confirm(url) => {
+                        let open_view = cx.weak_entity();
+                        let url_label = url.as_str().to_string();
+                        v_flex()
+                            .gap_3()
+                            .child(Label::new("Open external link?").size(LabelSize::Large))
+                            .child(
+                                Label::new(url_label)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .line_clamp(3),
+                            )
+                            .child(
+                                h_flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("fanta-prototype-link-cancel", "Cancel")
+                                            .on_click(move |_, _, cx| {
+                                                dismiss_view
+                                                    .update(cx, |view, cx| {
+                                                        view.prototype_link_notice = None;
+                                                        cx.notify();
+                                                    })
+                                                    .log_err();
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("fanta-prototype-link-open", "Open link")
+                                            .style(ButtonStyle::Filled)
+                                            .on_click(move |_, _, cx| {
+                                                cx.open_url(url.as_str());
+                                                open_view
+                                                    .update(cx, |view, cx| {
+                                                        view.prototype_link_notice = None;
+                                                        cx.notify();
+                                                    })
+                                                    .log_err();
+                                            }),
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                    PrototypeLinkNotice::Invalid(message) => v_flex()
+                        .gap_3()
+                        .child(Label::new("Link blocked").size(LabelSize::Large))
+                        .child(
+                            Label::new(message)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .line_clamp(3),
+                        )
+                        .child(h_flex().justify_end().child(
+                            Button::new("fanta-prototype-link-close", "Close").on_click(
+                                move |_, _, cx| {
+                                    dismiss_view
+                                        .update(cx, |view, cx| {
+                                            view.prototype_link_notice = None;
+                                            cx.notify();
+                                        })
+                                        .log_err();
+                                },
+                            ),
+                        ))
+                        .into_any_element(),
+                };
+                this.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.45))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            v_flex()
+                                .w(px(420.))
+                                .max_w_full()
+                                .p_4()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(chrome_border)
+                                .bg(chrome_background)
+                                .shadow_lg()
+                                .child(content),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+}
+
 impl Render for FigView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Deferred open from the text tool's commit, which arrives through a
@@ -2596,6 +3463,8 @@ impl Render for FigView {
             // printable characters continue to the platform input handler.
             .key_context(if self.text_edit.is_some() {
                 "FigViewerTextEdit"
+            } else if self.prototype_player.is_some() {
+                "FigViewerPrototype"
             } else {
                 "FigViewer"
             })
@@ -2622,6 +3491,15 @@ impl Render for FigView {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::delete_selection))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::cut_selection))
+            .on_action(cx.listener(Self::paste_selection))
+            .on_action(cx.listener(Self::duplicate_selection))
+            .on_action(cx.listener(Self::play_prototype))
+            .on_action(cx.listener(Self::exit_prototype))
+            .on_action(cx.listener(Self::restart_prototype))
+            .on_action(cx.listener(Self::prototype_previous_frame))
+            .on_action(cx.listener(Self::prototype_next_frame))
             .on_action(cx.listener(|this, _: &NudgeLeft, window, cx| {
                 this.nudge(LogicalKey::ArrowLeft, window, cx)
             }))
@@ -2725,7 +3603,10 @@ impl Render for FigView {
                 )
             })
             .when(!has_error && !is_loading, |this| {
-                let workspace_body = if editor_workspace == EditorWorkspace::Variables {
+                let presenting_prototype = self.prototype_player.is_some();
+                let workspace_body = if presenting_prototype {
+                    self.render_prototype_presentation(cx)
+                } else if editor_workspace == EditorWorkspace::Variables {
                     div()
                         .id("fanta-variables-workspace-body")
                         .size_full()
@@ -2810,6 +3691,11 @@ impl Render for FigView {
                                                     {
                                                         c.push(comments);
                                                     }
+                                                    if editor_mode == EditorMode::Prototype {
+                                                        c.push(
+                                                            self.render_prototype_play_button(cx),
+                                                        );
+                                                    }
                                                     c
                                                 }),
                                         )
@@ -2833,7 +3719,7 @@ impl Render for FigView {
                         .into_any_element()
                 };
                 this.child(workspace_body)
-                    .child(self.render_workspace_tabs(cx))
+                    .children((!presenting_prototype).then(|| self.render_workspace_tabs(cx)))
             })
     }
 }
@@ -3038,6 +3924,9 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+        }
         let source_is_dirty = self.code_workspace.read(cx).source_is_dirty(cx);
         let canvas_is_dirty = self.item.read(cx).is_dirty();
         if source_is_dirty && canvas_is_dirty {
@@ -3118,6 +4007,9 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+        }
         self.finish_document_edits(cx);
         let discard_source = self
             .code_workspace
@@ -3214,6 +4106,15 @@ impl Item for FigView {
                 hovered_node: None,
                 text_edit: None,
                 pending_text_edit: None,
+                prototype_player: None,
+                prototype_saved_viewport: None,
+                prototype_tick_task: None,
+                prototype_last_tick: None,
+                prototype_pointer_down: None,
+                prototype_drag_fired: false,
+                prototype_suppress_click: false,
+                prototype_render_cache: None,
+                prototype_link_notice: None,
                 _item_subscription: item_subscription,
                 _editor_session_subscription: editor_session_subscription,
                 _timeline_subscription: timeline_subscription,
@@ -3312,6 +4213,30 @@ mod tests {
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
+
+    #[test]
+    fn prototype_links_allow_web_urls_and_block_local_or_executable_schemes() {
+        assert!(validate_prototype_link("https://example.com/design").is_ok());
+        assert!(validate_prototype_link("http://example.com").is_ok());
+        assert!(validate_prototype_link("file:///tmp/private").is_err());
+        assert!(validate_prototype_link("javascript:alert(1)").is_err());
+        assert!(validate_prototype_link("not a url").is_err());
+    }
+
+    #[test]
+    fn prototype_clock_uses_measured_elapsed_time_and_resets_cleanly() {
+        let start = std::time::Instant::now();
+        let mut last_tick = Some(start);
+        assert_eq!(
+            prototype_tick_elapsed(&mut last_tick, start + std::time::Duration::from_millis(73)),
+            std::time::Duration::from_millis(73)
+        );
+        last_tick = None;
+        assert_eq!(
+            prototype_tick_elapsed(&mut last_tick, start),
+            std::time::Duration::from_millis(16)
+        );
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -3711,6 +4636,184 @@ mod tests {
             assert_eq!(view.active_tool(), ToolKind::Select);
             view.activate_tool(ToolKind::Text, cx);
             assert_eq!(view.active_tool(), ToolKind::Text);
+        });
+    }
+
+    #[gpui::test]
+    async fn prototype_presentation_navigates_and_restores_the_editor_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut first = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([320.0, 180.0]),
+            ..GroupNode::default()
+        }));
+        first.parent = Some(page);
+        first.name = "First".into();
+        doc.apply(Operation::create_node(first))
+            .expect("create first prototype frame");
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([320.0, 180.0]),
+            ..GroupNode::default()
+        }));
+        second.parent = Some(page);
+        second.name = "Second".into();
+        second.transform = Transform2D::translation(400.0, 0.0);
+        doc.apply(Operation::create_node(second))
+            .expect("create second prototype frame");
+        let ordered_frames = doc.scene.children_of(Some(page)).to_vec();
+        let start_id = ordered_frames[0];
+        let next_id = ordered_frames[1];
+        doc.apply(Operation::SetFlowStart {
+            old: doc.flow_start(),
+            new: Some(start_id),
+        })
+        .expect("set prototype starting point");
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Prototype.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        let editor_viewport = Viewport {
+            center: [42.0, 24.0],
+            zoom: 1.5,
+        };
+
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.viewport = Some(editor_viewport);
+                    view.play_prototype(&PlayPrototype, window, cx);
+                });
+            })
+            .expect("start prototype presentation");
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Prototype);
+            assert_eq!(
+                view.prototype_player
+                    .as_ref()
+                    .map(PrototypePlayerState::current_frame),
+                Some(start_id)
+            );
+        });
+
+        view.update(cx, |view, cx| view.show_next_prototype_frame(cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.prototype_player
+                    .as_ref()
+                    .map(PrototypePlayerState::current_frame),
+                Some(next_id)
+            );
+        });
+
+        view.update(cx, |view, cx| view.exit_prototype_session(cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.prototype_player.is_none());
+            let restored = view.viewport.expect("restored editor viewport");
+            assert_eq!(restored.center, editor_viewport.center);
+            assert_eq!(restored.zoom, editor_viewport.zoom);
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_copy_cut_paste_and_duplicate_preserve_subtrees_and_history(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([160.0, 90.0]),
+            ..Default::default()
+        }));
+        frame.parent = Some(page);
+        frame.transform = Transform2D::translation(30.0, 40.0);
+        let frame_id = frame.id;
+        doc.apply(Operation::create_node(frame)).unwrap();
+        let mut text = CanvasNode::new(NodeData::Text(TextNode::new("Clipboard", 100.0, 30.0)));
+        text.parent = Some(frame_id);
+        text.transform = Transform2D::translation(12.0, 16.0);
+        doc.apply(Operation::create_node(text)).unwrap();
+        doc.selection.select_only(frame_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Clipboard.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        view.update(cx, |view, cx| view.copy_selected_nodes(cx));
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|clipboard| {
+                clipboard.entries.into_iter().find_map(|entry| match entry {
+                    ClipboardEntry::String(string) => string.metadata_json::<CanvasClipboard>(),
+                    ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_) => None,
+                })
+            })
+            .expect("canvas clipboard metadata");
+        item.read_with(cx, |item, _| {
+            assert_eq!(copied.display_text(), "Group");
+            assert_eq!(item.doc().unwrap().scene.len(), 3);
+        });
+
+        view.update(cx, |view, cx| view.duplicate_selected_nodes(cx));
+        let duplicate_id = item.read_with(cx, |item, _| {
+            let doc = item.doc().unwrap();
+            assert_eq!(doc.scene.len(), 5);
+            assert_eq!(doc.history.undo_depth(), 1);
+            doc.selection.as_slice()[0]
+        });
+        assert_ne!(duplicate_id, frame_id);
+        item.update(cx, |item, cx| {
+            assert!(item.undo(cx).expect("undo duplicate"));
+            let doc = item.doc().unwrap();
+            assert!(!doc.scene.contains(duplicate_id));
+            assert!(
+                doc.selection.is_empty(),
+                "undo prunes deleted selection ids"
+            );
+            assert!(item.redo(cx).expect("redo duplicate"));
+            assert!(item.doc().unwrap().scene.contains(duplicate_id));
+        });
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(frame_id);
+                ((), DocChange::Selection)
+            });
+        });
+        view.update(cx, |view, cx| view.cut_selected_nodes(cx));
+        item.read_with(cx, |item, _| {
+            assert!(!item.doc().unwrap().scene.contains(frame_id));
+        });
+        view.update(cx, |view, cx| view.paste_selected_nodes(cx));
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().unwrap();
+            assert_eq!(doc.selection.len(), 1);
+            let pasted = doc.selection.as_slice()[0];
+            assert_ne!(pasted, frame_id);
+            assert_eq!(doc.scene.children_of(Some(pasted)).len(), 1);
         });
     }
 

@@ -1548,6 +1548,11 @@
       "enter": "fig_viewer::Confirm",
       "backspace": "fig_viewer::DeleteSelection",
       "delete": "fig_viewer::DeleteSelection",
+      "ctrl-c": "fig_viewer::CopySelection",
+      "ctrl-x": "fig_viewer::CutSelection",
+      "ctrl-v": "fig_viewer::PasteSelection",
+      "ctrl-d": "fig_viewer::DuplicateSelection",
+      "ctrl-alt-enter": "fig_viewer::PlayPrototype",
       "left": "fig_viewer::NudgeLeft",
       "right": "fig_viewer::NudgeRight",
       "up": "fig_viewer::NudgeUp",
@@ -1568,6 +1573,26 @@
       "t": "fig_viewer::ActivateTextTool",
       "shift-s": "fig_viewer::ActivateSectionTool",
       "s": "fig_viewer::ActivateSliceTool",
+    },
+  },
+  {
+    "context": "FigViewerPrototype && !Editor",
+    "bindings": {
+      "escape": "fig_viewer::ExitPrototype",
+      "left": "fig_viewer::PrototypePreviousFrame",
+      "right": "fig_viewer::PrototypeNextFrame",
+      "ctrl-alt-enter": "fig_viewer::ExitPrototype",
+    },
+  },
+  {
+    "context": "FantaDesignPanel && !Editor",
+    "bindings": {
+      "backspace": "fig_viewer::DeleteSelection",
+      "delete": "fig_viewer::DeleteSelection",
+      "ctrl-c": "fig_viewer::CopySelection",
+      "ctrl-x": "fig_viewer::CutSelection",
+      "ctrl-v": "fig_viewer::PasteSelection",
+      "ctrl-d": "fig_viewer::DuplicateSelection",
     },
   },
   {

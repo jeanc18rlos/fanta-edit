@@ -16,6 +16,8 @@ use util::ResultExt;
 
 use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::inspector_components::{InspectorMessage, InspectorPropertyRow, InspectorSectionHeader};
+use crate::prototype_player::prototype_entry_frame;
+use crate::view::PlayPrototype;
 
 const DEFAULT_TRANSITION_DURATION_MS: u32 = 300;
 
@@ -44,9 +46,11 @@ enum PrototypeSnapshot {
         node: NodeId,
         name: SharedString,
         can_start_flow: bool,
+        can_present: bool,
         is_flow_start: bool,
         reactions: Vec<Reaction>,
-        targets: Vec<PrototypeTarget>,
+        frame_targets: Vec<PrototypeTarget>,
+        scroll_targets: Vec<PrototypeTarget>,
         variables: Vec<PrototypeVariable>,
         components: Vec<PrototypeComponent>,
     },
@@ -704,7 +708,8 @@ impl FantaPrototypePanel {
         let Some(node) = doc.scene.get(node_id) else {
             return PrototypeSnapshot::Message("The selected layer no longer exists".into());
         };
-        let targets = prototype_targets(doc, node_id);
+        let frame_targets = prototype_frame_targets(doc, node_id);
+        let scroll_targets = prototype_scroll_targets(doc, node_id);
         let variables = prototype_variables(doc);
         let components = prototype_components(doc);
         PrototypeSnapshot::Selection {
@@ -712,9 +717,11 @@ impl FantaPrototypePanel {
             node: node_id,
             name: node.name.clone().into(),
             can_start_flow: matches!(&node.data, NodeData::Group(group) if group.is_frame_surface()),
+            can_present: prototype_entry_frame(doc).is_some(),
             is_flow_start: doc.flow_start() == Some(node_id),
             reactions: node.reactions.clone(),
-            targets,
+            frame_targets,
+            scroll_targets,
             variables,
             components,
         }
@@ -1303,7 +1310,8 @@ impl FantaPrototypePanel {
         index: usize,
         node: NodeId,
         reaction: &Reaction,
-        targets: &[PrototypeTarget],
+        frame_targets: &[PrototypeTarget],
+        scroll_targets: &[PrototypeTarget],
         variables: &[PrototypeVariable],
         components: &[PrototypeComponent],
         editable: bool,
@@ -1410,6 +1418,11 @@ impl FantaPrototypePanel {
                 cx,
             ),
         ));
+        let targets = if matches!(reaction.action, Action::ScrollTo { .. }) {
+            scroll_targets
+        } else {
+            frame_targets
+        };
         if let Some(target) =
             self.render_target_dropdown(index, node, reaction, targets, editable, window, cx)
         {
@@ -1662,9 +1675,11 @@ impl Render for FantaPrototypePanel {
                 node,
                 name,
                 can_start_flow,
+                can_present,
                 is_flow_start,
                 reactions,
-                targets,
+                frame_targets,
+                scroll_targets,
                 variables,
                 components,
             } => {
@@ -1677,7 +1692,24 @@ impl Render for FantaPrototypePanel {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
-                    .child(Label::new(name).single_line())
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .child(Label::new(name).single_line())
+                            .child(
+                                IconButton::new(
+                                    "fanta-prototype-present-from-panel",
+                                    IconName::PlayFilled,
+                                )
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("Present prototype"))
+                                .disabled(!can_present)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(PlayPrototype), cx);
+                                }),
+                            ),
+                    )
                     .when(can_start_flow, |header| {
                         header.child(
                             Button::new(
@@ -1723,11 +1755,34 @@ impl Render for FantaPrototypePanel {
                     .child(interactions_header);
                 if reactions.is_empty() {
                     content = content.child(
-                        h_flex().px_4().child(
-                            Label::new("No interactions")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
+                        v_flex()
+                            .px_4()
+                            .py_2()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(Label::new("Create a connection").size(LabelSize::Small))
+                                    .child(
+                                        Label::new(
+                                            "Add an interaction, then choose the destination frame and transition.",
+                                        )
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .child(Label::new("Run your prototype").size(LabelSize::Small))
+                                    .child(
+                                        Label::new(
+                                            "Use Present to play from the starting point. Frames remain browsable without connections.",
+                                        )
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    ),
+                            ),
                     );
                 } else {
                     for (index, reaction) in reactions.iter().enumerate() {
@@ -1735,7 +1790,8 @@ impl Render for FantaPrototypePanel {
                             index,
                             node,
                             reaction,
-                            &targets,
+                            &frame_targets,
+                            &scroll_targets,
                             &variables,
                             &components,
                             editable,
@@ -1760,18 +1816,18 @@ impl Focusable for FantaPrototypePanel {
 
 fn action_for_choice(doc: &Doc, node: NodeId, choice: ActionChoice) -> Option<Action> {
     match choice {
-        ActionChoice::Navigate => prototype_targets(doc, node)
+        ActionChoice::Navigate => prototype_frame_targets(doc, node)
             .first()
             .map(|target| Action::Navigate { to: target.id }),
         ActionChoice::OpenOverlay => {
-            prototype_targets(doc, node)
+            prototype_frame_targets(doc, node)
                 .first()
                 .map(|target| Action::OpenOverlay {
                     frame: target.id,
                     overlay: default_overlay_settings(),
                 })
         }
-        ActionChoice::ScrollTo => prototype_targets(doc, node)
+        ActionChoice::ScrollTo => prototype_scroll_targets(doc, node)
             .first()
             .map(|target| Action::ScrollTo { target: target.id }),
         ActionChoice::SetVariable => {
@@ -2115,34 +2171,80 @@ fn format_number(value: f64) -> String {
     }
 }
 
-fn prototype_targets(doc: &Doc, selected: NodeId) -> Vec<PrototypeTarget> {
-    let mut targets = Vec::new();
-    for root in doc.scene.roots() {
-        for id in doc.scene.descendants_of(*root) {
-            if id == selected {
-                continue;
-            }
-            let Some(node) = doc.scene.get(id) else {
-                continue;
-            };
-            if matches!(&node.data, NodeData::Group(group) if group.is_frame_surface()) {
-                targets.push(PrototypeTarget {
+fn prototype_frame_targets(doc: &Doc, selected: NodeId) -> Vec<PrototypeTarget> {
+    let containing_frame = containing_presentation_frame(doc, selected);
+    let candidates = page_root_for_node(doc, selected)
+        .map(|page| doc.scene.children_of(Some(page)).to_vec())
+        .unwrap_or_else(|| doc.scene.roots().to_vec());
+    candidates
+        .into_iter()
+        .filter(|id| *id != selected && Some(*id) != containing_frame)
+        .filter_map(|id| {
+            let node = doc.scene.get(id)?;
+            matches!(&node.data, NodeData::Group(group) if group.is_frame_surface()).then(|| {
+                PrototypeTarget {
                     id,
                     name: if node.name.is_empty() {
                         "Untitled frame".into()
                     } else {
                         node.name.clone().into()
                     },
-                });
-            }
-        }
-    }
-    targets
+                }
+            })
+        })
+        .collect()
+}
+
+fn prototype_scroll_targets(doc: &Doc, selected: NodeId) -> Vec<PrototypeTarget> {
+    let Some(frame) = containing_presentation_frame(doc, selected) else {
+        return Vec::new();
+    };
+    doc.scene
+        .descendants_of(frame)
+        .filter(|id| *id != selected && *id != frame)
+        .filter(|id| doc.scene.world_bounds(*id).is_some())
+        .filter_map(|id| {
+            let node = doc.scene.get(id)?;
+            Some(PrototypeTarget {
+                id,
+                name: if node.name.is_empty() {
+                    "Untitled layer".into()
+                } else {
+                    node.name.clone().into()
+                },
+            })
+        })
+        .collect()
+}
+
+fn containing_presentation_frame(doc: &Doc, node: NodeId) -> Option<NodeId> {
+    let page = page_root_for_node(doc, node);
+    std::iter::once(node)
+        .chain(doc.scene.ancestors_of(node).map(|ancestor| ancestor.id))
+        .find(|id| {
+            doc.scene.get(*id).is_some_and(|candidate| {
+                candidate.parent == page
+                    && matches!(
+                        &candidate.data,
+                        NodeData::Group(group) if group.is_frame_surface()
+                    )
+            })
+        })
+}
+
+fn page_root_for_node(doc: &Doc, node: NodeId) -> Option<NodeId> {
+    doc.pages().iter().copied().find(|page| {
+        *page == node
+            || doc
+                .scene
+                .ancestors_of(node)
+                .any(|ancestor| ancestor.id == *page)
+    })
 }
 
 fn add_reaction_operation(doc: &Doc, node: NodeId) -> Option<Operation> {
     let selected = doc.scene.get(node)?;
-    let action = prototype_targets(doc, node)
+    let action = prototype_frame_targets(doc, node)
         .first()
         .map(|target| Action::Navigate { to: target.id })
         .unwrap_or(Action::Back);
@@ -2320,6 +2422,85 @@ mod tests {
         let second_id = second.id;
         doc.apply(Operation::create_node(second)).unwrap();
         (doc, first_id, second_id)
+    }
+
+    #[test]
+    fn prototype_destinations_are_action_specific_and_page_scoped() {
+        let mut doc = Doc::new();
+        let page_one = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_one_id = page_one.id;
+        doc.apply(Operation::create_node(page_one)).unwrap();
+        doc.add_page(page_one_id);
+        let page_two = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_two_id = page_two.id;
+        doc.apply(Operation::create_node(page_two)).unwrap();
+        doc.add_page(page_two_id);
+
+        let mut selected = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        let selected_id = selected.id;
+        selected.parent = Some(page_one_id);
+        selected.name = "Selected".into();
+        doc.apply(Operation::create_node(selected)).unwrap();
+        let mut scroll_target = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([20.0, 20.0]),
+            ..GroupNode::default()
+        }));
+        let scroll_target_id = scroll_target.id;
+        scroll_target.parent = Some(selected_id);
+        scroll_target.name = "Scroll target".into();
+        doc.apply(Operation::create_node(scroll_target)).unwrap();
+        let mut sibling = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        let sibling_id = sibling.id;
+        sibling.parent = Some(page_one_id);
+        sibling.name = "Sibling".into();
+        doc.apply(Operation::create_node(sibling)).unwrap();
+        let mut sibling_child = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([10.0, 10.0]),
+            ..GroupNode::default()
+        }));
+        let sibling_child_id = sibling_child.id;
+        sibling_child.parent = Some(sibling_id);
+        sibling_child.name = "Sibling child".into();
+        doc.apply(Operation::create_node(sibling_child)).unwrap();
+        let mut other_page = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        let other_page_id = other_page.id;
+        other_page.parent = Some(page_two_id);
+        other_page.name = "Other page".into();
+        doc.apply(Operation::create_node(other_page)).unwrap();
+
+        let frames = prototype_frame_targets(&doc, selected_id);
+        assert_eq!(
+            frames.iter().map(|target| target.id).collect::<Vec<_>>(),
+            vec![sibling_id]
+        );
+        let scroll = prototype_scroll_targets(&doc, selected_id);
+        let scroll_ids = scroll.iter().map(|target| target.id).collect::<Vec<_>>();
+        assert!(scroll_ids.contains(&scroll_target_id));
+        assert!(!scroll_ids.contains(&sibling_child_id));
+        assert!(!scroll_ids.contains(&other_page_id));
+        assert_eq!(
+            prototype_frame_targets(&doc, scroll_target_id)
+                .iter()
+                .map(|target| target.id)
+                .collect::<Vec<_>>(),
+            vec![sibling_id],
+            "a child interaction must not default back to its containing frame"
+        );
+        assert_eq!(
+            action_for_choice(&doc, selected_id, ActionChoice::ScrollTo),
+            Some(Action::ScrollTo {
+                target: scroll_target_id
+            })
+        );
     }
 
     fn add_float_variable(doc: &mut Doc, value: f64) -> VariableId {

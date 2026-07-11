@@ -193,6 +193,7 @@ impl RenderOnce for CollapsibleIconTabBar {
 pub struct InspectorSectionHeader {
     title: SharedString,
     action: Option<AnyElement>,
+    top_border: bool,
 }
 
 impl InspectorSectionHeader {
@@ -200,11 +201,19 @@ impl InspectorSectionHeader {
         Self {
             title: title.into(),
             action: None,
+            top_border: true,
         }
     }
 
     pub fn action(mut self, action: impl IntoElement) -> Self {
         self.action = Some(action.into_any_element());
+        self
+    }
+
+    /// The owning panel supplies the separator. This prevents two adjacent
+    /// hairlines when section layout and the reusable header are composed.
+    pub fn without_top_border(mut self) -> Self {
+        self.top_border = false;
         self
     }
 }
@@ -216,8 +225,9 @@ impl RenderOnce for InspectorSectionHeader {
             .h(px(SECTION_HEADER_HEIGHT))
             .items_center()
             .justify_between()
-            .border_t_1()
-            .border_color(cx.theme().colors().border)
+            .when(self.top_border, |header| {
+                header.border_t_1().border_color(cx.theme().colors().border)
+            })
             .child(
                 Label::new(self.title)
                     .size(LabelSize::Small)
@@ -295,5 +305,20 @@ impl RenderOnce for InspectorMessage {
             .justify_center()
             .px_4()
             .child(Label::new(self.message).color(Color::Muted))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InspectorSectionHeader;
+
+    #[test]
+    fn section_owner_can_disable_the_headers_builtin_separator() {
+        assert!(InspectorSectionHeader::new("Standalone").top_border);
+        assert!(
+            !InspectorSectionHeader::new("Stacked")
+                .without_top_border()
+                .top_border
+        );
     }
 }

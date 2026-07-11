@@ -21,6 +21,7 @@ use ui::{
 
 use crate::color_picker::gradient_preview_strip;
 use crate::component_properties::CreateComponentPropertyKind;
+use crate::export::{EXPORT_FORMATS, EXPORT_SCALES};
 use crate::inspector_components::{InspectorPropertyRow, InspectorSectionHeader};
 use crate::inspector_widgets::{
     AlignGlyph, PanelDrag, TextAlignGlyph, TextDecorationGlyph, align_glyph, text_align_glyph,
@@ -39,6 +40,10 @@ use crate::properties_snapshot::{
     STACKING_ORDERS, STROKE_ALIGNS, SelectionColorSnapshot, TEXT_RESIZE_MODES, TypographySnapshot,
     VERTICAL_ALIGN_BUTTONS, align_grid_active_cell, paint_kind_label,
 };
+
+fn align_section_visible(selection_len: usize) -> bool {
+    selection_len >= 2
+}
 use crate::variable_binding::{VariableBindingControl, variable_binding_model};
 
 /// Height of a boxed field / pill / control, the panel's vertical rhythm unit
@@ -79,8 +84,11 @@ impl FantaPropertiesPanel {
         match action {
             Some(action) => InspectorSectionHeader::new(title)
                 .action(action)
+                .without_top_border()
                 .into_any_element(),
-            None => InspectorSectionHeader::new(title).into_any_element(),
+            None => InspectorSectionHeader::new(title)
+                .without_top_border()
+                .into_any_element(),
         }
     }
 
@@ -1041,7 +1049,10 @@ impl FantaPropertiesPanel {
         selection_len: usize,
         editable: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Option<AnyElement> {
+        if !align_section_visible(selection_len) {
+            return None;
+        }
         let align_enabled = editable && selection_len >= 2;
         let distribute_enabled = editable && selection_len >= 3;
         let colors = cx.theme().colors().clone();
@@ -1089,7 +1100,7 @@ impl FantaPropertiesPanel {
             }
             section = section.child(h_flex().px_4().pb_1().child(distribute));
         }
-        section.into_any_element()
+        Some(section.into_any_element())
     }
 
     fn render_align_button_group(
@@ -3324,50 +3335,173 @@ impl FantaPropertiesPanel {
         section.into_any_element()
     }
 
-    /// The Export section: format row + Export button, and the preview band —
-    /// a labeled panel with a thumbnail surface carrying the node's type
-    /// glyph, matching the original's export block.
     pub(crate) fn render_export_section(
         &self,
         can_export: bool,
         preview_icon: Option<IconName>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        v_flex()
-            .py_1()
-            .gap_2()
-            .child(Self::render_section_header("Export", None))
+        let controls_enabled = self.export_task.is_none();
+        let add = IconButton::new("fanta-export-add-preset", IconName::Plus)
+            .icon_size(IconSize::XSmall)
+            .aria_label("Add export setting")
+            .tooltip(Tooltip::text("Add export setting"))
+            .disabled(!controls_enabled)
+            .on_click(cx.listener(|this, _, _, cx| this.add_export_preset(cx)));
+        let mut section = v_flex().py_1().gap_2().child(Self::render_section_header(
+            "Export",
+            Some(add.into_any_element()),
+        ));
+
+        for (index, preset) in self.export_presets.iter().copied().enumerate() {
+            let panel = cx.weak_entity();
+            let format_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                for (format, label) in EXPORT_FORMATS {
+                    let panel = panel.clone();
+                    let format = *format;
+                    menu.push_item(
+                        ContextMenuEntry::new(*label)
+                            .toggleable(IconPosition::End, preset.format == format)
+                            .handler(move |_, cx| {
+                                if let Err(error) = panel.update(cx, |panel, cx| {
+                                    panel.set_export_format(index, format, cx)
+                                }) {
+                                    log::debug!(
+                                        "dropping export format change for closed inspector: {error:#}"
+                                    );
+                                }
+                            }),
+                    );
+                }
+                menu
+            });
+            let format = DropdownMenu::new(
+                ("fanta-export-format", index),
+                preset.format.label(),
+                format_menu,
+            )
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!controls_enabled)
+            .aria_label("Export format");
+
+            let scale = if preset.format.is_raster() {
+                let panel = cx.weak_entity();
+                let scale_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for (scale, label) in EXPORT_SCALES {
+                        let panel = panel.clone();
+                        let scale = *scale;
+                        menu.push_item(
+                            ContextMenuEntry::new(*label)
+                                .toggleable(IconPosition::End, preset.scale == scale)
+                                .handler(move |_, cx| {
+                                    if let Err(error) = panel.update(cx, |panel, cx| {
+                                        panel.set_export_scale(index, scale, cx)
+                                    }) {
+                                        log::debug!(
+                                            "dropping export scale change for closed inspector: {error:#}"
+                                        );
+                                    }
+                                }),
+                        );
+                    }
+                    menu
+                });
+                DropdownMenu::new(
+                    ("fanta-export-scale", index),
+                    preset.scale.label(),
+                    scale_menu,
+                )
+                .style(DropdownStyle::Outlined)
+                .trigger_size(ButtonSize::Compact)
+                .full_width(true)
+                .disabled(!controls_enabled)
+                .aria_label("Export scale")
+                .into_any_element()
+            } else {
+                h_flex()
+                    .h(px(FIELD_BOX_H))
+                    .px_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.editor_background)
+                    .child(
+                        Label::new("Vector")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element()
+            };
+            section = section.child(
+                h_flex()
+                    .px_4()
+                    .gap_1()
+                    .items_center()
+                    .child(div().flex_1().min_w_0().child(format))
+                    .child(div().w(px(68.)).flex_none().child(scale))
+                    .child(
+                        IconButton::new(("fanta-export-remove", index), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .aria_label("Remove export setting")
+                            .tooltip(Tooltip::text("Remove export setting"))
+                            .disabled(!controls_enabled)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_export_preset(index, cx);
+                            })),
+                    ),
+            );
+        }
+
+        let preset_count = self.export_presets.len();
+        let preset_summary = match preset_count {
+            0 => "Add an export setting".to_string(),
+            1 => "1 format per selected layer".to_string(),
+            count => format!("{count} formats per selected layer"),
+        };
+        let preview_summary = if self.export_presets.is_empty() {
+            "No export settings".to_string()
+        } else {
+            self.export_presets
+                .iter()
+                .map(|preset| {
+                    if preset.format.is_raster() {
+                        format!("{} {}", preset.format.label(), preset.scale.label())
+                    } else {
+                        preset.format.label().to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        section
             .child(
                 h_flex()
                     .px_4()
-                    .gap_2()
                     .items_center()
+                    .justify_between()
+                    .gap_2()
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(FIELD_BOX_H))
-                            .px_2()
-                            .gap_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .bg(colors.editor_background)
-                            .child(Label::new("PNG").size(LabelSize::Small))
-                            .child(Label::new("2x").size(LabelSize::XSmall).color(Color::Muted)),
+                        Label::new(preset_summary)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     )
                     .child(
-                        Button::new("fanta-export-png", "Export")
+                        Button::new("fanta-export-selection", "Export")
                             .size(ButtonSize::Compact)
                             .label_size(LabelSize::Small)
-                            .disabled(!can_export)
-                            .tooltip(Tooltip::text(if can_export {
+                            .disabled(!controls_enabled || !can_export || preset_count == 0)
+                            .tooltip(Tooltip::text(if !controls_enabled {
+                                "Export in progress"
+                            } else if can_export {
                                 "Export to <project>/exports"
                             } else {
                                 "Create a Fanta project to export"
                             }))
-                            .on_click(cx.listener(|this, _, _, cx| this.export_png(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.export_selection(cx))),
                     ),
             )
             .child(
@@ -3396,20 +3530,38 @@ impl FantaPropertiesPanel {
                                 .justify_center()
                                 .pt_3()
                                 .child(
-                                    div()
-                                        .w(px(96.))
-                                        .h(px(46.))
+                                    v_flex()
+                                        .max_w(px(180.))
+                                        .min_h(px(46.))
+                                        .px_3()
+                                        .py_2()
+                                        .gap_1()
                                         .rounded_md()
                                         .border_1()
                                         .border_color(colors.border_variant)
                                         .bg(colors.surface_background)
-                                        .flex()
                                         .items_center()
                                         .justify_center()
                                         .child(
-                                            Icon::new(preview_icon.unwrap_or(IconName::Image))
-                                                .size(IconSize::Small)
-                                                .color(Color::Muted),
+                                            Icon::new(
+                                                if self
+                                                    .export_presets
+                                                    .iter()
+                                                    .any(|preset| !preset.format.is_raster())
+                                                {
+                                                    IconName::FileCode
+                                                } else {
+                                                    preview_icon.unwrap_or(IconName::Image)
+                                                },
+                                            )
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new(preview_summary)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .line_clamp(1),
                                         ),
                                 ),
                         ),
@@ -3472,24 +3624,89 @@ impl FantaPropertiesPanel {
                 ),
             );
         }
-        // Canvas comments: one row per pin — editable text, resolve toggle,
-        // delete. All routed through undoable SetMeta ops on the page.
-        if let Some(page_id) = page.id
-            && !page.comments.is_empty()
-        {
-            section = section.child(Self::render_section_header("Comments", None));
-            for (row, comment) in page.comments.iter().enumerate() {
-                let comment_id = comment.id.clone();
-                let resolve_id = comment.id.clone();
-                let delete_id = comment.id.clone();
-                section = section.child(
-                    h_flex()
-                        .px_4()
-                        .gap_1p5()
-                        .items_center()
-                        .child(
-                            div().w(px(18.)).flex_none().child(
-                                Label::new(format!("{}", comment.number))
+        section.into_any_element()
+    }
+
+    pub(crate) fn render_page_comments_section(
+        &self,
+        page: &PageSection,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let page_id = page.id?;
+        if page.comments.is_empty() {
+            return None;
+        }
+
+        let colors = cx.theme().colors().clone();
+        let mut section = v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Comments", None));
+        for (row, comment) in page.comments.iter().enumerate() {
+            let edit_id = comment.id.clone();
+            let open_id = comment.id.clone();
+            let resolve_id = comment.id.clone();
+            let delete_id = comment.id.clone();
+            let mut details = Vec::new();
+            if comment.replies > 0 {
+                details.push(format!(
+                    "{} repl{}",
+                    comment.replies,
+                    if comment.replies == 1 { "y" } else { "ies" }
+                ));
+            }
+            if comment.attachments > 0 {
+                details.push(format!(
+                    "{} attachment{}",
+                    comment.attachments,
+                    if comment.attachments == 1 { "" } else { "s" }
+                ));
+            }
+            if comment.mentions > 0 {
+                details.push(format!(
+                    "{} mention{}",
+                    comment.mentions,
+                    if comment.mentions == 1 { "" } else { "s" }
+                ));
+            }
+            if let Some(skill) = &comment.skill {
+                details.push(format!("AI: {skill}"));
+            }
+            section = section.child(
+                v_flex()
+                    .mx_3()
+                    .p_2()
+                    .gap_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_1p5()
+                                    .child(
+                                        Label::new(format!("{}", comment.number))
+                                            .size(LabelSize::XSmall)
+                                            .color(if comment.resolved {
+                                                Color::Muted
+                                            } else {
+                                                Color::Accent
+                                            }),
+                                    )
+                                    .child(
+                                        Label::new(comment.author.clone())
+                                            .size(LabelSize::XSmall)
+                                            .single_line()
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(
+                                Label::new(if comment.resolved { "Resolved" } else { "Open" })
                                     .size(LabelSize::XSmall)
                                     .color(if comment.resolved {
                                         Color::Muted
@@ -3497,54 +3714,77 @@ impl FantaPropertiesPanel {
                                         Color::Accent
                                     }),
                             ),
+                    )
+                    .child(self.render_text_cell(
+                        "fanta-comment-text",
+                        row,
+                        None,
+                        InspectorField::CommentText {
+                            page: page_id,
+                            id: edit_id,
+                        },
+                        comment.text.clone(),
+                        editable.then(|| comment.text.to_string()),
+                        cx,
+                    ))
+                    .when(!details.is_empty(), |this| {
+                        this.child(
+                            Label::new(details.join(" · "))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
                         )
-                        .child(div().flex_1().min_w_0().child(self.render_text_cell(
-                            "fanta-comment-text",
-                            row,
-                            None,
-                            InspectorField::CommentText {
-                                page: page_id,
-                                id: comment_id,
-                            },
-                            comment.text.clone(),
-                            editable.then(|| comment.text.to_string()),
-                            cx,
-                        )))
-                        .child(
-                            IconButton::new(
-                                ("fanta-comment-resolve", row),
-                                if comment.resolved {
-                                    IconName::Undo
-                                } else {
-                                    IconName::Check
-                                },
+                    })
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_1()
+                            .child(
+                                Button::new(("fanta-comment-open", row), "Open thread")
+                                    .size(ButtonSize::Compact)
+                                    .label_size(LabelSize::XSmall)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_comment_thread(open_id.clone(), window, cx);
+                                    })),
                             )
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text(if comment.resolved {
-                                "Reopen"
-                            } else {
-                                "Resolve"
-                            }))
-                            .disabled(!editable)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.toggle_comment_resolved(page_id, resolve_id.clone(), cx);
-                                },
-                            )),
-                        )
-                        .child(
-                            IconButton::new(("fanta-comment-delete", row), IconName::Trash)
+                            .child(
+                                IconButton::new(
+                                    ("fanta-comment-resolve", row),
+                                    if comment.resolved {
+                                        IconName::Undo
+                                    } else {
+                                        IconName::Check
+                                    },
+                                )
                                 .icon_size(IconSize::XSmall)
-                                .tooltip(Tooltip::text("Delete Comment"))
+                                .tooltip(Tooltip::text(if comment.resolved {
+                                    "Reopen"
+                                } else {
+                                    "Resolve"
+                                }))
                                 .disabled(!editable)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.delete_comment(page_id, delete_id.clone(), cx);
-                                })),
-                        ),
-                );
-            }
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.toggle_comment_resolved(
+                                            page_id,
+                                            resolve_id.clone(),
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                IconButton::new(("fanta-comment-delete", row), IconName::Trash)
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(Tooltip::text("Delete thread"))
+                                    .disabled(!editable)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.delete_comment(page_id, delete_id.clone(), cx);
+                                    })),
+                            ),
+                    ),
+            );
         }
-        section.into_any_element()
+        Some(section.into_any_element())
     }
 
     pub(crate) fn render_multi_position_section(
@@ -3716,5 +3956,18 @@ impl FantaPropertiesPanel {
                 ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod section_visibility_tests {
+    use super::align_section_visible;
+
+    #[test]
+    fn align_is_not_a_phantom_page_or_single_selection_section() {
+        assert!(!align_section_visible(0));
+        assert!(!align_section_visible(1));
+        assert!(align_section_visible(2));
+        assert!(align_section_visible(3));
     }
 }

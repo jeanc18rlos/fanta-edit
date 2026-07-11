@@ -823,6 +823,14 @@ impl FigItem {
             .context("the document is still loading")?;
         let did = document.doc.undo().context("undoing canvas operation")?;
         if did {
+            let surviving_selection = document
+                .doc
+                .selection
+                .iter()
+                .copied()
+                .filter(|id| document.doc.scene.contains(*id))
+                .collect::<Vec<_>>();
+            document.doc.selection.replace_with(surviving_selection);
             let active_page = document.doc.active_page();
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
@@ -842,6 +850,14 @@ impl FigItem {
             .context("the document is still loading")?;
         let did = document.doc.redo().context("redoing canvas operation")?;
         if did {
+            let surviving_selection = document
+                .doc
+                .selection
+                .iter()
+                .copied()
+                .filter(|id| document.doc.scene.contains(*id))
+                .collect::<Vec<_>>();
+            document.doc.selection.replace_with(surviving_selection);
             let active_page = document.doc.active_page();
             document.resolve_after_edit(active_page);
             document.advance_render_generation();

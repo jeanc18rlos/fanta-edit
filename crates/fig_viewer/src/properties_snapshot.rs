@@ -22,7 +22,7 @@ use crate::component_properties::{
 };
 use crate::document::FigDocument;
 use crate::inspector_widgets::AlignGlyph;
-use crate::properties_ops::format_number;
+use crate::properties_ops::{format_number, inspector_world_size};
 
 pub(crate) const MIXED_VALUE: &str = "–";
 
@@ -452,6 +452,11 @@ pub(crate) struct CommentSnapshot {
     /// 1-based pin number shown on the canvas.
     pub(crate) number: usize,
     pub(crate) text: SharedString,
+    pub(crate) author: SharedString,
+    pub(crate) replies: usize,
+    pub(crate) attachments: usize,
+    pub(crate) mentions: usize,
+    pub(crate) skill: Option<SharedString>,
     pub(crate) resolved: bool,
 }
 
@@ -825,6 +830,28 @@ pub(crate) fn page_section(
                     id: comment.id,
                     number: index + 1,
                     text: comment.text.into(),
+                    author: if comment.author.trim().is_empty() {
+                        "Unknown".into()
+                    } else {
+                        comment.author.into()
+                    },
+                    replies: comment.replies.len(),
+                    attachments: comment.attachments.len()
+                        + comment
+                            .replies
+                            .iter()
+                            .map(|reply| reply.attachments.len())
+                            .sum::<usize>(),
+                    mentions: comment.mentions.len()
+                        + comment
+                            .replies
+                            .iter()
+                            .map(|reply| reply.mentions.len())
+                            .sum::<usize>(),
+                    skill: comment
+                        .skill
+                        .or_else(|| comment.replies.iter().rev().find_map(|reply| reply.skill))
+                        .map(|skill| skill.label().into()),
                     resolved: comment.resolved,
                 })
                 .collect()
@@ -879,9 +906,7 @@ pub(crate) fn node_section(
     let (x, y) = bounds
         .map(|bounds| (bounds.min_x, bounds.min_y))
         .unwrap_or((0.0, 0.0));
-    let (width, height) = doc
-        .scene
-        .world_obb_size(id)
+    let (width, height) = inspector_world_size(doc, id)
         .or_else(|| bounds.map(|bounds| (bounds.width(), bounds.height())))
         .unwrap_or((0.0, 0.0));
     Some(NodeSection {
@@ -894,7 +919,11 @@ pub(crate) fn node_section(
         y,
         width,
         height,
-        rotation_degrees: transform_angle(&node.transform).to_degrees(),
+        rotation_degrees: doc
+            .scene
+            .world_transform(id)
+            .map(|transform| transform_angle(&transform).to_degrees())
+            .unwrap_or_default(),
         corner_radius: corner_radius_value(node),
         corner_smoothing: kind
             .is_corner_capable()
@@ -1341,12 +1370,14 @@ pub(crate) fn multi_section(
             xs.push(bounds.min_x);
             ys.push(bounds.min_y);
         }
-        if let Some((width, height)) = doc.scene.world_obb_size(id) {
+        if let Some((width, height)) = inspector_world_size(doc, id) {
             widths.push(width);
             heights.push(height);
         }
         if let Some(node) = doc.scene.get(id) {
-            rotations.push(transform_angle(&node.transform).to_degrees());
+            if let Some(world_transform) = doc.scene.world_transform(id) {
+                rotations.push(transform_angle(&world_transform).to_degrees());
+            }
             node_solid_colors(node, &mut colors);
         }
     }

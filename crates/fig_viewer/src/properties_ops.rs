@@ -4,6 +4,8 @@
 //! by those builders, and the panel's number/color formatting helpers. The
 //! read-only snapshot model lives in `properties_snapshot`.
 
+use std::collections::HashMap;
+
 use fanta_canvas::{
     HAlign, ResizeHandle, VAlign, align_to_bounds_h, align_to_bounds_v, resize_box_keep_rotation,
     resize_transform_keep_rotation, rotate_about, transform_angle,
@@ -25,6 +27,30 @@ use crate::properties_snapshot::{
 };
 
 pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217);
+
+fn inspector_local_bounds(doc: &Doc, id: NodeId) -> Option<FantaBounds> {
+    let node = doc.scene.get(id)?;
+    match &node.data {
+        NodeData::Group(group) => group
+            .clip_size
+            .or(group.local_size)
+            .map(|[width, height]| FantaBounds::from_xywh(0.0, 0.0, width, height))
+            .or_else(|| doc.scene.local_bounds(id)),
+        _ => doc.scene.local_bounds(id),
+    }
+}
+
+pub(crate) fn inspector_world_size(doc: &Doc, id: NodeId) -> Option<(f64, f64)> {
+    let local = inspector_local_bounds(doc, id)?;
+    let transform = doc.scene.world_transform(id)?;
+    let top_left = transform.transform_point(DVec2::new(local.min_x, local.min_y));
+    let top_right = transform.transform_point(DVec2::new(local.max_x, local.min_y));
+    let bottom_left = transform.transform_point(DVec2::new(local.min_x, local.max_y));
+    Some((
+        (top_right - top_left).length(),
+        (bottom_left - top_left).length(),
+    ))
+}
 
 // =============================================================================
 // Operations
@@ -412,19 +438,17 @@ pub(crate) fn read_field_text(doc: &Doc, field: &InspectorField) -> Option<Strin
             .map(|comment| comment.text),
         InspectorField::X(id) => scene.world_bounds(*id).map(|b| format_number(b.min_x)),
         InspectorField::Y(id) => scene.world_bounds(*id).map(|b| format_number(b.min_y)),
-        InspectorField::Width(id) => scene
-            .world_obb_size(*id)
+        InspectorField::Width(id) => inspector_world_size(doc, *id)
             .map(|(w, _)| w)
             .or_else(|| scene.world_bounds(*id).map(|b| b.width()))
             .map(format_number),
-        InspectorField::Height(id) => scene
-            .world_obb_size(*id)
+        InspectorField::Height(id) => inspector_world_size(doc, *id)
             .map(|(_, h)| h)
             .or_else(|| scene.world_bounds(*id).map(|b| b.height()))
             .map(format_number),
         InspectorField::Rotation(id) => scene
-            .get(*id)
-            .map(|node| format_number(transform_angle(&node.transform).to_degrees())),
+            .world_transform(*id)
+            .map(|transform| format_number(transform_angle(&transform).to_degrees())),
         InspectorField::CornerRadius(id) => {
             let node = scene.get(*id)?;
             match corner_radius_value(node) {
@@ -930,7 +954,8 @@ pub(crate) fn layout_limit_operations(
 
 /// Change one oriented dimension of a node by pinning the opposite edge, the
 /// same math the canvas resize handles use so rotation is preserved. Text
-/// changes its content box and reflows; other node kinds resize their transform.
+/// changes its content box and reflows; groups change their own box without
+/// scaling descendants; leaf geometry resizes through its transform.
 pub(crate) fn resize_operations(
     doc: &Doc,
     id: NodeId,
@@ -944,11 +969,48 @@ pub(crate) fn resize_operations(
     let Some(node) = scene.get(id) else {
         return Vec::new();
     };
-    let Some(local) = scene.local_bounds(id) else {
+    let Some(scene_local) = scene.local_bounds(id) else {
         return Vec::new();
     };
-    let Some(world_transform) = scene.world_transform(id) else {
+    let Some(scene_world_transform) = scene.world_transform(id) else {
         return Vec::new();
+    };
+    let parent_world = node
+        .parent
+        .and_then(|parent| scene.world_transform(parent))
+        .unwrap_or(Transform2D::IDENTITY);
+    let parent_determinant = parent_world.0.matrix2.determinant();
+    if !parent_determinant.is_finite() || parent_determinant.abs() <= f64::EPSILON {
+        return Vec::new();
+    }
+    let mut normalized_children = HashMap::new();
+    let (local, world_transform) = match &node.data {
+        NodeData::Group(group) => match group.clip_size.or(group.local_size) {
+            Some([width, height]) => (
+                fanta_doc::Bounds::from_xywh(0.0, 0.0, width, height),
+                scene_world_transform,
+            ),
+            None => {
+                let origin = DVec2::new(scene_local.min_x, scene_local.min_y);
+                let inverse_origin = Transform2D::translation(-origin.x, -origin.y);
+                for child_id in scene.children_of(Some(id)) {
+                    if let Some(child) = scene.get(*child_id) {
+                        normalized_children
+                            .insert(*child_id, child.transform.then(&inverse_origin));
+                    }
+                }
+                (
+                    fanta_doc::Bounds::from_xywh(
+                        0.0,
+                        0.0,
+                        scene_local.width(),
+                        scene_local.height(),
+                    ),
+                    Transform2D::translation(origin.x, origin.y).then(&scene_world_transform),
+                )
+            }
+        },
+        _ => (scene_local, scene_world_transform),
     };
     let theta = transform_angle(&world_transform);
     let rotation = Transform2D::rotation(theta);
@@ -967,7 +1029,8 @@ pub(crate) fn resize_operations(
     };
     let cursor_world = rotation.transform_point(cursor_frame);
 
-    if matches!(node.data, NodeData::Text(_)) {
+    let resizes_content_box = matches!(node.data, NodeData::Text(_) | NodeData::Group(_));
+    if resizes_content_box {
         let current_size = if horizontal {
             frame_bounds.width()
         } else {
@@ -977,14 +1040,6 @@ pub(crate) fn resize_operations(
             return Vec::new();
         }
 
-        let parent_world = node
-            .parent
-            .and_then(|parent| scene.world_transform(parent))
-            .unwrap_or(Transform2D::IDENTITY);
-        let parent_determinant = parent_world.0.matrix2.determinant();
-        if !parent_determinant.is_finite() || parent_determinant.abs() <= f64::EPSILON {
-            return Vec::new();
-        }
         let (new_world, width, height) =
             resize_box_keep_rotation(world_transform, local, handle, cursor_world, false, false);
         let new_local = new_world.then(&parent_world.inverse());
@@ -997,17 +1052,26 @@ pub(crate) fn resize_operations(
         }
 
         let mut new_data = node.data.clone();
-        let NodeData::Text(text) = &mut new_data else {
-            return Vec::new();
-        };
-        text.local_size = [width, height];
-        text.auto_resize = if horizontal {
-            TextAutoResize::Height
-        } else {
-            TextAutoResize::None
-        };
+        match &mut new_data {
+            NodeData::Text(text) => {
+                text.local_size = [width, height];
+                text.auto_resize = if horizontal {
+                    TextAutoResize::Height
+                } else {
+                    TextAutoResize::None
+                };
+            }
+            NodeData::Group(group) => {
+                if group.clip_size.is_some() {
+                    group.clip_size = Some([width, height]);
+                } else {
+                    group.local_size = Some([width, height]);
+                }
+            }
+            _ => return Vec::new(),
+        }
 
-        let mut operations = Vec::with_capacity(2);
+        let mut operations = Vec::with_capacity(2 + normalized_children.len());
         if new_local != node.transform {
             operations.push(Operation::SetTransform {
                 id,
@@ -1022,15 +1086,43 @@ pub(crate) fn resize_operations(
                 new: Box::new(new_data),
             });
         }
+        if let NodeData::Group(group) = &node.data {
+            let old_size = group
+                .clip_size
+                .or(group.local_size)
+                .unwrap_or([local.width(), local.height()]);
+            let new_box_size = [width, height];
+            for child_id in scene.children_of(Some(id)) {
+                let Some(child) = scene.get(*child_id) else {
+                    continue;
+                };
+                let base_transform = normalized_children
+                    .get(child_id)
+                    .copied()
+                    .unwrap_or(child.transform);
+                let new_child_transform = if group.auto_layout.is_none() {
+                    let mut normalized_child = child.clone();
+                    normalized_child.transform = base_transform;
+                    normalized_child
+                        .apply_constraints(old_size, new_box_size)
+                        .unwrap_or(base_transform)
+                } else {
+                    base_transform
+                };
+                if new_child_transform != child.transform {
+                    operations.push(Operation::SetTransform {
+                        id: *child_id,
+                        old: child.transform,
+                        new: new_child_transform,
+                    });
+                }
+            }
+        }
         return operations;
     }
 
     let new_world =
         resize_transform_keep_rotation(world_transform, local, handle, cursor_world, false, false);
-    let parent_world = node
-        .parent
-        .and_then(|parent| scene.world_transform(parent))
-        .unwrap_or(Transform2D::IDENTITY);
     let new_local = new_world.then(&parent_world.inverse());
     vec![Operation::SetTransform {
         id,
@@ -1070,17 +1162,27 @@ pub(crate) fn rotation_operations(doc: &Doc, id: NodeId, degrees: f64) -> Vec<Op
     let Some(bounds) = scene.world_bounds(id) else {
         return Vec::new();
     };
+    let Some(world_transform) = scene.world_transform(id) else {
+        return Vec::new();
+    };
     let parent_world = node
         .parent
         .and_then(|parent| scene.world_transform(parent))
         .unwrap_or(Transform2D::IDENTITY);
-    let pivot = parent_world.inverse().transform_point(bounds.center());
-    let current = transform_angle(&node.transform);
+    let determinant = parent_world.0.matrix2.determinant();
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return Vec::new();
+    }
+    let pivot = inspector_local_bounds(doc, id)
+        .map(|local| world_transform.transform_point(local.center()))
+        .unwrap_or_else(|| bounds.center());
+    let current = transform_angle(&world_transform);
     let delta = degrees.to_radians() - current;
     if delta.abs() < 1e-9 {
         return Vec::new();
     }
-    let new = node.transform.then(&rotate_about(pivot, delta));
+    let new_world = world_transform.then(&rotate_about(pivot, delta));
+    let new = new_world.then(&parent_world.inverse());
     vec![Operation::SetTransform {
         id,
         old: node.transform,
@@ -1682,6 +1784,188 @@ mod tests {
         let text = text_data(&doc, id);
         assert_eq!(text.local_size, [100.0, 60.0]);
         assert_eq!(text.auto_resize, TextAutoResize::None);
+    }
+
+    #[test]
+    fn frame_width_field_resizes_box_without_scaling_child_text() {
+        let mut doc = Doc::new();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([120.0, 80.0]),
+            ..Default::default()
+        }));
+        frame.transform = Transform2D::translation(20.0, 30.0);
+        let frame_id = frame.id;
+        doc.scene.insert(frame).unwrap();
+        let mut text = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+            "Hello", 80.0, 24.0,
+        )));
+        text.parent = Some(frame_id);
+        text.transform = Transform2D::translation(12.0, 14.0);
+        let text_id = text.id;
+        doc.scene.insert(text).unwrap();
+        let child_world_before = doc.scene.world_transform(text_id).unwrap();
+
+        let operations = field_operations(&doc, &InspectorField::Width(frame_id), "240");
+        assert!(operations.iter().any(|operation| {
+            matches!(operation, Operation::ReplaceData { id, .. } if *id == frame_id)
+        }));
+        for operation in operations {
+            doc.apply(operation).unwrap();
+        }
+
+        let frame = doc.scene.get(frame_id).unwrap();
+        let NodeData::Group(group) = &frame.data else {
+            panic!("expected frame");
+        };
+        assert_eq!(group.clip_size, Some([240.0, 80.0]));
+        assert_eq!(&frame.transform.to_components()[..4], &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            doc.scene.world_transform(text_id).unwrap(),
+            child_world_before
+        );
+    }
+
+    #[test]
+    fn plain_group_width_uses_its_box_even_when_a_child_overflows() {
+        let mut doc = Doc::new();
+        let group = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([100.0, 80.0]),
+            ..Default::default()
+        }));
+        let group_id = group.id;
+        doc.scene.insert(group).unwrap();
+        let mut child = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            FantaColor::BLACK,
+        )));
+        child.parent = Some(group_id);
+        child.transform = Transform2D::translation(150.0, 10.0);
+        let child_transform = child.transform;
+        doc.scene.insert(child).unwrap();
+
+        for operation in resize_operations(&doc, group_id, 120.0, true) {
+            doc.apply(operation).unwrap();
+        }
+        let NodeData::Group(group) = &doc.scene.get(group_id).unwrap().data else {
+            panic!("expected group");
+        };
+        assert_eq!(group.local_size, Some([120.0, 80.0]));
+        assert_eq!(doc.scene.children_of(Some(group_id)).len(), 1);
+        assert_eq!(
+            doc.scene
+                .get(doc.scene.children_of(Some(group_id))[0])
+                .unwrap()
+                .transform,
+            child_transform
+        );
+    }
+
+    #[test]
+    fn legacy_plain_group_width_materializes_box_without_moving_children() {
+        let mut doc = Doc::new();
+        let group = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let group_id = group.id;
+        doc.scene.insert(group).unwrap();
+        let mut child = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+            "Legacy", 40.0, 20.0,
+        )));
+        child.parent = Some(group_id);
+        child.transform = Transform2D::translation(20.0, 30.0);
+        let child_id = child.id;
+        doc.scene.insert(child).unwrap();
+        let child_world_before = doc.scene.world_transform(child_id).unwrap();
+
+        for operation in resize_operations(&doc, group_id, 80.0, true) {
+            doc.apply(operation).unwrap();
+        }
+        let NodeData::Group(group) = &doc.scene.get(group_id).unwrap().data else {
+            panic!("expected group");
+        };
+        assert_eq!(group.local_size, Some([80.0, 20.0]));
+        assert_eq!(group.clip_size, None);
+        assert_eq!(
+            doc.scene.world_transform(child_id).unwrap(),
+            child_world_before
+        );
+    }
+
+    #[test]
+    fn rotation_field_composes_rigidly_in_world_space_under_scaled_parent() {
+        let mut doc = Doc::new();
+        let mut parent = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([300.0, 200.0]),
+            ..Default::default()
+        }));
+        parent.transform = Transform2D::from_components([2.0, 0.0, 0.0, 0.75, 10.0, 20.0]);
+        let parent_id = parent.id;
+        doc.scene.insert(parent).unwrap();
+        let mut child = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            60.0,
+            40.0,
+            FantaColor::BLACK,
+        )));
+        child.parent = Some(parent_id);
+        child.transform = Transform2D::translation(30.0, 40.0);
+        let child_id = child.id;
+        doc.scene.insert(child).unwrap();
+        let before = doc.scene.world_transform(child_id).unwrap();
+        let pivot = before.transform_point(DVec2::new(30.0, 20.0));
+
+        for operation in rotation_operations(&doc, child_id, 90.0) {
+            doc.apply(operation).unwrap();
+        }
+        let after = doc.scene.world_transform(child_id).unwrap();
+        let expected = before.then(&rotate_about(pivot, std::f64::consts::FRAC_PI_2));
+        for (actual, expected) in after.to_components().iter().zip(expected.to_components()) {
+            assert!((actual - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn rotation_field_displays_and_sets_world_angle_under_nonuniform_scale() {
+        let mut doc = Doc::new();
+        let mut parent = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([300.0, 200.0]),
+            ..Default::default()
+        }));
+        parent.transform = Transform2D::from_components([2.0, 0.0, 0.0, 0.5, 10.0, 20.0]);
+        let parent_id = parent.id;
+        doc.scene.insert(parent).unwrap();
+        let mut child = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            60.0,
+            40.0,
+            FantaColor::BLACK,
+        )));
+        child.parent = Some(parent_id);
+        child.transform = Transform2D::rotation(std::f64::consts::FRAC_PI_4)
+            .then(&Transform2D::translation(30.0, 40.0));
+        let child_id = child.id;
+        doc.scene.insert(child).unwrap();
+
+        let initial_world = doc.scene.world_transform(child_id).unwrap();
+        let initial_world_degrees = transform_angle(&initial_world).to_degrees();
+        let displayed = read_field_text(&doc, &InspectorField::Rotation(child_id))
+            .expect("rotation text")
+            .parse::<f64>()
+            .expect("numeric rotation");
+        assert!((displayed - initial_world_degrees).abs() < 0.01);
+        assert!(
+            (displayed - 45.0).abs() > 1.0,
+            "the parent scale skews the local angle"
+        );
+
+        for operation in rotation_operations(&doc, child_id, 45.0) {
+            doc.apply(operation).unwrap();
+        }
+        let world = doc.scene.world_transform(child_id).unwrap();
+        assert!((transform_angle(&world).to_degrees() - 45.0).abs() < 1e-9);
     }
 
     #[test]

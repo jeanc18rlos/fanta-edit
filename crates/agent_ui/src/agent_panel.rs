@@ -12786,6 +12786,42 @@ mod tests {
         (workspace, panel, cx)
     }
 
+    #[gpui::test]
+    async fn test_external_prompt_route_reveals_a_reviewable_agent_draft(cx: &mut TestAppContext) {
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+
+        cx.update(|window, cx| {
+            crate::open_external_prompt_for_review(
+                workspace.clone(),
+                "Search the selected canvas comment",
+                window,
+                cx,
+            )
+            .expect("external prompt should route to the registered panel");
+        });
+        cx.run_until_parked();
+
+        assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+        panel.read_with(&cx, |panel, cx| {
+            let thread_view = panel
+                .active_thread_view(cx)
+                .expect("routed draft should become active");
+            thread_view.read_with(cx, |thread_view, cx| {
+                assert_eq!(
+                    thread_view.message_editor.read(cx).text(cx),
+                    "Search the selected canvas comment"
+                );
+                assert!(thread_view.show_external_source_prompt_warning);
+                assert!(thread_view.thread.read(cx).entries().is_empty());
+            });
+        });
+    }
+
     /// Reproduces the retained-thread reset race:
     ///
     /// 1. Thread A is active and Connected.

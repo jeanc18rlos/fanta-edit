@@ -32,7 +32,9 @@ use workspace::{
 
 use crate::document::{DocChange, FigDocument, FigPage, page_bounds};
 use crate::panel_settings::FantaDesignPanelSettings;
-use crate::view::FigView;
+use crate::view::{
+    CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, PasteSelection,
+};
 
 actions!(
     fanta_design_panel,
@@ -2225,6 +2227,7 @@ impl FantaDesignPanel {
                 // Keep the whole row as the drag source. A click that lands on
                 // one of the thin before/after drop hitboxes still bubbles here
                 // and selects exactly like a click on the row's content.
+                this.focus_handle.focus(window, cx);
                 if event.click_count() >= 2 {
                     this.begin_layer_rename(id, window, cx);
                 } else {
@@ -2636,6 +2639,31 @@ impl Render for FantaDesignPanel {
         v_flex()
             .key_context("FantaDesignPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &DeleteSelection, _, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.delete_selected_nodes(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.copy_selected_nodes(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CutSelection, _, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.cut_selected_nodes(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PasteSelection, _, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.paste_selected_nodes(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DuplicateSelection, _, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.duplicate_selected_nodes(cx));
+                }
+            }))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)

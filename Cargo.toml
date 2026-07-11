@@ -344,6 +344,7 @@ fanta-fig-interop = { path = "../fanta-engine-migration/crates/fanta-fig-interop
 fanta-fnx = { path = "../fanta-engine-migration/crates/fanta-fnx" }
 fanta-format = { path = "../fanta-engine-migration/crates/fanta-format" }
 fanta-canvas = { path = "../fanta-engine-migration/crates/fanta-canvas" }
+fanta-present = { path = "../fanta-engine-migration/crates/fanta-present" }
 fanta-render = { path = "../fanta-engine-migration/crates/fanta-render" }
 fanta-tools = { path = "../fanta-engine-migration/crates/fanta-tools" }
 fanta-text = { path = "../fanta-engine-migration/crates/fanta-text" }

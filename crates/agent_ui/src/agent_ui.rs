@@ -91,6 +91,39 @@ pub use thread_import::{
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 
+/// Opens text supplied by another UI surface in a fresh Agent Panel draft.
+/// External prompts deliberately require a manual send so the originating
+/// surface cannot bypass the Agent Panel's review boundary.
+pub fn open_external_prompt_for_review(
+    workspace: Entity<Workspace>,
+    prompt: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    let prompt = ExternalSourcePrompt::new(prompt)
+        .ok_or_else(|| anyhow::anyhow!("the generated agent prompt was empty"))?;
+    if workspace.read(cx).root_paths(cx).is_empty() {
+        return Err(anyhow::anyhow!(
+            "the Agent Panel needs an open project before it can create a draft"
+        ));
+    }
+    let panel = workspace
+        .read(cx)
+        .panel::<AgentPanel>(cx)
+        .ok_or_else(|| anyhow::anyhow!("the Agent Panel is not available in this workspace"))?;
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.reveal_panel::<AgentPanel>(window, cx);
+    });
+    panel.update(cx, |panel, cx| {
+        panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
+    });
+    workspace.update(cx, |workspace, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    Ok(())
+}
+
 pub(crate) fn resolve_agent_image(
     dest_url: &str,
     worktree_roots: &[PathBuf],

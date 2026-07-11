@@ -19,7 +19,7 @@ use core_video::{
     pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA},
 };
 use fanta_canvas::ResizeHandle;
-use fanta_doc::{AnimationClipId, MotionEvaluation, NodeId, Viewport};
+use fanta_doc::{Action, AnimationClipId, MotionEvaluation, NodeId, Viewport};
 use fanta_render::{RasterRenderer, RenderInputs};
 use fanta_tools::{SnapGuideAxis, ToolOverlay};
 #[cfg(target_os = "macos")]
@@ -41,6 +41,7 @@ use smallvec::SmallVec;
 use ui::prelude::*;
 
 use crate::document::FigDocument;
+use crate::editor_session::EditorMode;
 use crate::view::FigView;
 
 const HANDLE_SIZE: f32 = 7.0;
@@ -515,7 +516,7 @@ fn render_fig_canvas(
     render_image_from_rgba(width, height, renderer.copy_rgba(), scale_factor)
 }
 
-fn render_image_from_rgba(
+pub(crate) fn render_image_from_rgba(
     width: u32,
     height: u32,
     mut pixels: Vec<u8>,
@@ -630,6 +631,15 @@ impl Element for CanvasElement {
         _window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        if self.view.read(cx).is_presenting_prototype() {
+            self.view.update(cx, |this, _| {
+                this.set_container_bounds(bounds);
+            });
+            return Some(DragListeners {
+                panning: false,
+                primary_drag: false,
+            });
+        }
         let logical_size = bounds_size(bounds);
         let (viewport, drag_listeners) = {
             let view = self.view.read(cx);
@@ -678,6 +688,31 @@ impl Element for CanvasElement {
         let Some(listeners) = prepaint.take() else {
             return;
         };
+
+        if self.view.read(cx).is_presenting_prototype() {
+            let (logical_width, logical_height) = bounds_size(bounds);
+            let size = (
+                logical_width.round().max(1.0) as u32,
+                logical_height.round().max(1.0) as u32,
+            );
+            let scale_factor = window.scale_factor();
+            let image = self.view.update(cx, |this, _| {
+                this.render_prototype_image(size, scale_factor)
+            });
+            match image {
+                Ok(image) => {
+                    if let Err(error) = window
+                        .with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                            window.paint_image(bounds, Default::default(), image, 0, false)
+                        })
+                    {
+                        log::warn!("failed to paint prototype presentation: {error:#}");
+                    }
+                }
+                Err(error) => log::warn!("failed to render prototype presentation: {error:#}"),
+            }
+            return;
+        }
 
         if listeners.panning {
             let view = self.view.downgrade();
@@ -992,6 +1027,10 @@ struct OverlayData {
     frame_labels: Vec<FrameLabel>,
     hovered_bounds: Option<fanta_doc::Bounds>,
     selected_bounds: Vec<fanta_doc::Bounds>,
+    /// A single selection follows its transformed local box instead of drawing
+    /// an axis-aligned world AABB. This keeps the box and handles attached to a
+    /// rotated node, including beneath transformed parents.
+    oriented_selection: Option<OrientedSelection>,
     text_baselines: Vec<(DVec2, DVec2)>,
     /// Union of every selected node's world bounds, for the size badge.
     selection_union: Option<fanta_doc::Bounds>,
@@ -1002,6 +1041,42 @@ struct OverlayData {
     measure_segments: Vec<GapSegment>,
     /// Comment pins on the active page, in stored (oldest-first) order.
     comment_pins: Vec<CommentPin>,
+    prototype_connections: Vec<(DVec2, DVec2)>,
+    prototype_handle: Option<DVec2>,
+    prototype_start: Option<DVec2>,
+}
+
+struct OrientedSelection {
+    corners: [DVec2; 4],
+    handles: [DVec2; 8],
+}
+
+fn oriented_selection(
+    local: fanta_doc::Bounds,
+    transform: fanta_doc::Transform2D,
+) -> OrientedSelection {
+    let corners = [
+        DVec2::new(local.min_x, local.min_y),
+        DVec2::new(local.max_x, local.min_y),
+        DVec2::new(local.max_x, local.max_y),
+        DVec2::new(local.min_x, local.max_y),
+    ]
+    .map(|point| transform.transform_point(point));
+    let handles =
+        ResizeHandle::ALL.map(|handle| transform.transform_point(handle.handle_world(local)));
+    OrientedSelection { corners, handles }
+}
+
+fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
+    let node = doc.scene.get(id)?;
+    match &node.data {
+        fanta_doc::NodeData::Group(group) => group
+            .clip_size
+            .or(group.local_size)
+            .map(|[width, height]| fanta_doc::Bounds::from_xywh(0.0, 0.0, width, height))
+            .or_else(|| doc.scene.local_bounds(id)),
+        _ => doc.scene.local_bounds(id),
+    }
 }
 
 /// Prepaint snapshot of one comment pin (owned, so paint holds no doc borrow).
@@ -1023,11 +1098,15 @@ impl CanvasElement {
             frame_labels: Vec::new(),
             hovered_bounds: None,
             selected_bounds: Vec::new(),
+            oriented_selection: None,
             text_baselines: Vec::new(),
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
             comment_pins: Vec::new(),
+            prototype_connections: Vec::new(),
+            prototype_handle: None,
+            prototype_start: None,
         };
         let view = self.view.read(cx);
         let item = view.item().read(cx);
@@ -1084,7 +1163,19 @@ impl CanvasElement {
                 ));
             }
         }
-        if let Some(union) = data.selection_union {
+        if let &[id] = doc.selection.as_slice()
+            && let (Some(local), Some(transform)) = (
+                authored_selection_bounds(doc, id),
+                evaluated_world_transform(&doc.scene, id, motion.as_ref()),
+            )
+        {
+            let oriented = oriented_selection(local, transform);
+            data.selection_size = Some((
+                (oriented.corners[1] - oriented.corners[0]).length(),
+                (oriented.corners[3] - oriented.corners[0]).length(),
+            ));
+            data.oriented_selection = Some(oriented);
+        } else if let Some(union) = data.selection_union {
             data.selection_size = Some((union.width(), union.height()));
         }
 
@@ -1108,6 +1199,50 @@ impl CanvasElement {
                 .collect();
         }
 
+        if view.editor_mode(cx) == EditorMode::Prototype {
+            if let Some(start) = doc.flow_start()
+                && doc.scene.get(start).is_some()
+                && let Some(bounds) = evaluated_world_bounds(&doc.scene, start, motion.as_ref())
+            {
+                data.prototype_start = Some(DVec2::new(bounds.min_x, bounds.min_y));
+            }
+            if let &[source] = doc.selection.as_slice()
+                && let Some(source_bounds) =
+                    evaluated_world_bounds(&doc.scene, source, motion.as_ref())
+            {
+                let source_point = DVec2::new(
+                    source_bounds.max_x,
+                    (source_bounds.min_y + source_bounds.max_y) * 0.5,
+                );
+                data.prototype_handle = Some(source_point);
+                if let Some(node) = doc.scene.get(source) {
+                    for reaction in &node.reactions {
+                        let target = match &reaction.action {
+                            Action::Navigate { to } => Some(*to),
+                            Action::OpenOverlay { frame, .. } => Some(*frame),
+                            Action::ScrollTo { target } => Some(*target),
+                            Action::Back
+                            | Action::Close
+                            | Action::SetVariable { .. }
+                            | Action::UpdateVariant { .. }
+                            | Action::OpenLink { .. } => None,
+                        };
+                        let Some(target_bounds) = target.and_then(|target| {
+                            evaluated_world_bounds(&doc.scene, target, motion.as_ref())
+                        }) else {
+                            continue;
+                        };
+                        let target_point = DVec2::new(
+                            target_bounds.min_x,
+                            (target_bounds.min_y + target_bounds.max_y) * 0.5,
+                        );
+                        data.prototype_connections
+                            .push((source_point, target_point));
+                    }
+                }
+            }
+        }
+
         // Measurements: exactly one node selected and a different, non-related
         // node hovered. The ancestor/descendant guard keeps the guides from
         // firing between a node and its own container (pure noise).
@@ -1126,6 +1261,9 @@ impl CanvasElement {
     }
 
     fn paint_overlays(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        if self.view.read(cx).is_presenting_prototype() {
+            return;
+        }
         let overlay_data = self.collect_overlay_data(cx);
 
         let view = self.view.read(cx);
@@ -1164,30 +1302,108 @@ impl CanvasElement {
                 ));
             }
 
-            let mut selection_union: Option<fanta_doc::Bounds> = None;
-            for world in &overlay_data.selected_bounds {
-                selection_union = Some(match selection_union {
-                    Some(existing) => existing.union(world),
-                    None => *world,
-                });
-                window.paint_quad(gpui::outline(
-                    project_bounds(*world),
-                    accent,
-                    BorderStyle::Solid,
-                ));
+            if let Some(oriented) = &overlay_data.oriented_selection {
+                for edge in 0..oriented.corners.len() {
+                    paint_line(
+                        project(oriented.corners[edge]),
+                        project(oriented.corners[(edge + 1) % oriented.corners.len()]),
+                        accent,
+                        window,
+                    );
+                }
+            } else {
+                for world in &overlay_data.selected_bounds {
+                    window.paint_quad(gpui::outline(
+                        project_bounds(*world),
+                        accent,
+                        BorderStyle::Solid,
+                    ));
+                }
             }
             for (start, end) in &overlay_data.text_baselines {
                 paint_line(project(*start), project(*end), accent, window);
             }
 
+            for (start, end) in &overlay_data.prototype_connections {
+                paint_line(project(*start), project(*end), accent, window);
+                let endpoint = project(*end);
+                let radius = px(4.);
+                window.paint_quad(gpui::quad(
+                    Bounds {
+                        origin: point(endpoint.x - radius, endpoint.y - radius),
+                        size: size(radius * 2., radius * 2.),
+                    },
+                    radius,
+                    accent,
+                    px(0.),
+                    gpui::transparent_black(),
+                    BorderStyle::Solid,
+                ));
+            }
+            if let Some(world) = overlay_data.prototype_handle {
+                let center = project(world);
+                let radius = px(5.);
+                window.paint_quad(gpui::quad(
+                    Bounds {
+                        origin: point(center.x - radius, center.y - radius),
+                        size: size(radius * 2., radius * 2.),
+                    },
+                    radius,
+                    gpui::white(),
+                    px(2.),
+                    accent,
+                    BorderStyle::Solid,
+                ));
+            }
+            if let Some(world) = overlay_data.prototype_start {
+                let anchor = project(world);
+                let diameter = px(16.);
+                let marker = Bounds {
+                    origin: point(anchor.x - diameter - px(6.), anchor.y - diameter - px(6.)),
+                    size: size(diameter, diameter),
+                };
+                window.paint_quad(gpui::quad(
+                    marker,
+                    diameter / 2.,
+                    accent,
+                    px(0.),
+                    gpui::transparent_black(),
+                    BorderStyle::Solid,
+                ));
+                let dot = px(4.);
+                window.paint_quad(gpui::quad(
+                    Bounds {
+                        origin: point(
+                            marker.origin.x + diameter / 2. - dot / 2.,
+                            marker.origin.y + diameter / 2. - dot / 2.,
+                        ),
+                        size: size(dot, dot),
+                    },
+                    dot / 2.,
+                    gpui::white(),
+                    px(0.),
+                    gpui::transparent_black(),
+                    BorderStyle::Solid,
+                ));
+            }
+
             // Resize handles on the selection box, Figma-style, only for the
             // select tool.
-            if view.tools().kind() == crate::tools::ToolKind::Select
-                && let Some(union) = selection_union
-            {
+            if view.tools().kind() == crate::tools::ToolKind::Select {
                 let handle_px = px(HANDLE_SIZE);
-                for handle in ResizeHandle::ALL {
-                    let world = handle.handle_world(union);
+                let handles = overlay_data
+                    .oriented_selection
+                    .as_ref()
+                    .map(|oriented| oriented.handles.to_vec())
+                    .or_else(|| {
+                        overlay_data.selection_union.map(|union| {
+                            ResizeHandle::ALL
+                                .map(|handle| handle.handle_world(union))
+                                .to_vec()
+                        })
+                    })
+                    .unwrap_or_default();
+                for world in handles {
                     let center = project(world);
                     let handle_bounds = Bounds {
                         origin: point(center.x - handle_px / 2., center.y - handle_px / 2.),
@@ -2019,6 +2235,55 @@ mod geometry_tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].axis, MeasureAxis::Horizontal);
         assert_eq!(segments[0].dist, 0.0);
+    }
+
+    #[test]
+    fn rotated_selection_corners_and_handles_follow_the_node_box() {
+        let local = WorldBounds::from_xywh(0.0, 0.0, 40.0, 20.0);
+        let transform = Transform2D::rotation(std::f64::consts::FRAC_PI_2)
+            .then(&Transform2D::translation(100.0, 50.0));
+        let oriented = oriented_selection(local, transform);
+        let expected_corners = [
+            DVec2::new(100.0, 50.0),
+            DVec2::new(100.0, 90.0),
+            DVec2::new(80.0, 90.0),
+            DVec2::new(80.0, 50.0),
+        ];
+        for (actual, expected) in oriented.corners.iter().zip(expected_corners) {
+            assert!((*actual - expected).length() < 1e-9);
+        }
+        assert_eq!(oriented.handles[0], expected_corners[0]);
+        assert_eq!(oriented.handles[4], expected_corners[2]);
+    }
+
+    #[test]
+    fn group_selection_handles_use_authored_box_not_overflow_bounds() {
+        let mut doc = fanta_doc::Doc::new();
+        let group = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([40.0, 20.0]),
+            ..Default::default()
+        }));
+        let group_id = group.id;
+        doc.scene.insert(group).unwrap();
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::WHITE,
+        )));
+        child.parent = Some(group_id);
+        child.transform = Transform2D::translation(100.0, 0.0);
+        doc.scene.insert(child).unwrap();
+
+        assert_eq!(
+            authored_selection_bounds(&doc, group_id),
+            Some(WorldBounds::from_xywh(0.0, 0.0, 40.0, 20.0))
+        );
+        assert_eq!(
+            doc.scene.local_bounds(group_id),
+            Some(WorldBounds::from_xywh(0.0, 0.0, 110.0, 20.0))
+        );
     }
 }
 

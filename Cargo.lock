@@ -6564,6 +6564,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-present"
+version = "0.1.0"
+dependencies = [
+ "fanta-canvas",
+ "fanta-doc",
+ "fanta-render",
+ "glam 0.32.1",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "fanta-render"
 version = "0.1.0"
 dependencies = [
@@ -6715,6 +6726,7 @@ dependencies = [
 name = "fig_viewer"
 version = "0.1.0"
 dependencies = [
+ "agent_ui",
  "anyhow",
  "assets",
  "buffer_diff",
@@ -6726,6 +6738,7 @@ dependencies = [
  "fanta-fig-interop",
  "fanta-fnx",
  "fanta-format",
+ "fanta-present",
  "fanta-render",
  "fanta-text",
  "fanta-tools",
@@ -6740,6 +6753,7 @@ dependencies = [
  "metal",
  "project",
  "release_channel",
+ "remote_connection",
  "semver",
  "serde",
  "serde_json",
@@ -6750,6 +6764,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "url",
  "util",
  "workspace",
  "worktree",

@@ -3,6 +3,7 @@
 //! panels and the floating canvas toolbar.
 
 mod canvas;
+mod clipboard;
 mod code_workspace;
 mod color_picker;
 mod comments;
@@ -25,6 +26,7 @@ mod properties_panel;
 mod properties_render;
 mod properties_snapshot;
 mod prototype_panel;
+mod prototype_player;
 mod text_edit;
 mod timeline;
 mod tools;
