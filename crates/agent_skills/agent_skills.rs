@@ -697,11 +697,19 @@ pub fn read_skill_body_from_content(
 /// Content of the built-in `create-skill` SKILL.md, embedded at compile time.
 const CREATE_SKILL_CONTENT: &str = include_str!("builtin/create-skill/SKILL.md");
 
+/// Content of the built-in `fanta-design` SKILL.md, embedded at compile time.
+const FANTA_DESIGN_SKILL_CONTENT: &str = include_str!("builtin/fanta-design/SKILL.md");
+
+/// Content of the built-in `fanta-media` SKILL.md, embedded at compile time.
+const FANTA_MEDIA_SKILL_CONTENT: &str = include_str!("builtin/fanta-media/SKILL.md");
+
 /// Returns the set of skills that are compiled into the Zed binary.
 pub fn builtin_skills() -> Vec<Skill> {
     let mut skills = Vec::new();
-    if let Ok(skill) = parse_builtin_skill("create-skill", CREATE_SKILL_CONTENT) {
-        skills.push(skill);
+    for (name, content) in BUILTIN_SKILL_ENTRIES {
+        if let Ok(skill) = parse_builtin_skill(name, content) {
+            skills.push(skill);
+        }
     }
     skills
 }
@@ -730,7 +738,11 @@ fn parse_builtin_skill(name: &str, content: &'static str) -> Result<Skill> {
 
 /// All built-in skills as `(name, raw_content)` pairs. Used by
 /// `builtin_skill_content` to serve the full SKILL.md without disk I/O.
-const BUILTIN_SKILL_ENTRIES: &[(&str, &str)] = &[("create-skill", CREATE_SKILL_CONTENT)];
+const BUILTIN_SKILL_ENTRIES: &[(&str, &str)] = &[
+    ("create-skill", CREATE_SKILL_CONTENT),
+    ("fanta-design", FANTA_DESIGN_SKILL_CONTENT),
+    ("fanta-media", FANTA_MEDIA_SKILL_CONTENT),
+];
 
 /// Look up the full embedded content of a built-in skill by its
 /// synthetic file path. Returns `None` if the path doesn't match any
