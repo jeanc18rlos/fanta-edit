@@ -965,6 +965,14 @@
     // Default width of the Fanta design panel.
     "default_width": 280,
   },
+  "fanta_live_mcp": {
+    // Whether to run a local MCP server exposing the focused design canvas
+    // (get_editor_state / batch_get / batch_design / get_screenshot /
+    // read_fnx_source) to external agents over a Unix socket. The socket
+    // path is advertised in `fanta_live_mcp.json` in the application
+    // support directory.
+    "enabled": false,
+  },
   "fanta_properties_panel": {
     // Whether to show the Fanta properties panel button in the status bar.
     "button": true,

@@ -209,6 +209,11 @@ pub struct SettingsContent {
 
     pub fanta_design_panel: Option<PanelSettingsContent>,
 
+    /// Settings for the Fanta live MCP server, which exposes the open design
+    /// canvas (state, node reads, edits, screenshots) to external MCP clients
+    /// over a local socket.
+    pub fanta_live_mcp: Option<FantaLiveMcpSettingsContent>,
+
     pub fanta_properties_panel: Option<PanelSettingsContent>,
 
     pub outline_panel: Option<OutlinePanelSettingsContent>,
@@ -267,6 +272,19 @@ pub struct SettingsContent {
     /// Settings for developer-oriented instrumentation tools (profilers,
     /// tracers, etc.) that can be toggled at runtime.
     pub instrumentation: Option<InstrumentationSettingsContent>,
+}
+
+/// Configuration for the Fanta live MCP server.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct FantaLiveMcpSettingsContent {
+    /// Whether to run a local MCP server exposing the focused design canvas
+    /// (get_editor_state / batch_get / batch_design / get_screenshot /
+    /// read_fnx_source) to external agents. The socket path is advertised in
+    /// a `fanta_live_mcp.json` file in the application support directory.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
 }
 
 /// Configuration for developer-oriented instrumentation tools that collect

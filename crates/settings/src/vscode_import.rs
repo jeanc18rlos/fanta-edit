@@ -196,6 +196,7 @@ impl VsCodeSettings {
             image_viewer: None,
             markdown_preview: None,
             fanta_design_panel: None,
+            fanta_live_mcp: None,
             fanta_properties_panel: None,
             journal: None,
             language_models: None,

@@ -19,6 +19,7 @@ mod fnx_editor;
 mod inspector_components;
 mod inspector_widgets;
 mod instance_text;
+mod live_mcp;
 mod mode_overrides;
 mod motion_edit;
 mod motion_panel;
@@ -63,6 +64,7 @@ pub use view::{FigView, FigViewEvent};
 pub fn init(cx: &mut App) {
     fnx_editor::init(cx);
     agent_surface::init(cx);
+    live_mcp::init(cx);
     workspace::register_project_item::<FigView>(cx);
 }
 
