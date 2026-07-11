@@ -46,6 +46,13 @@ user to open one.
   `#RRGGBBAA` (for text it's the glyph color); text nodes take `text` and
   `font_size`. Pass `parent` (a frame/group id) to nest — omit it and the
   node lands on the active page root.
+- `create_image` — place an image as a bitmap layer. `source` is base64 (or
+  a `data:image/...;base64,` URI) of the encoded bytes; it is ingested as a
+  project asset and persists to `assets/images/` on save. Omit
+  `width`/`height` for the natural pixel size (give one and the other keeps
+  the aspect ratio). For an image that lives at a URL — especially a
+  finished AI generation — use the `place_generation` tool instead, which
+  downloads and places in one step and records provenance.
 - `set_props` — change only the provided fields: `name`, `x`, `y`, `width`,
   `height`, `opacity`, `fill`, `corner_radius` (rectangles/frames), `text`
   (text nodes), `hidden`, `locked`.
@@ -78,12 +85,38 @@ For those, edit the project's `.fnx` sources directly with the normal
 - Sources live in the project directory: `pages/<page-id>/page.fnx` and
   `components/<cid>/master.fnx` (JSX-like: element = node, attributes = the
   node's serde fields). `design_state` (no args) reports `project_root`.
-- The canvas hot-reloads the file ~300ms after a save; then
-  `design_screenshot` to verify.
+- The canvas reloads from DISK, not from a dirty buffer: SAVE the FNX buffer
+  (or write with `edit_file`, which saves) to trigger the reload (~300ms
+  debounce); then `design_screenshot` to verify.
 - Do NOT mix lanes mid-flight: while an FNX buffer has unsaved edits the
   canvas is locked (`design_edit` will refuse with `source_edit_locked`).
 - A freshly opened `.fig` has no source tree until the user saves it as a
   Fanta project; canvas ops still work in memory.
+
+### FNX pitfalls (each of these has burned an agent before)
+
+- **Colors are `fnxColor("#RRGGBB[AA]")` calls, never bare hex.** A bare
+  `"#FF0000"` attribute value fails to parse; always wrap:
+  `fill={fnxColor("#2563EB")}` style, and inside JSON payloads use the same
+  call syntax wherever the canonical source shows it.
+- **Gradient fills are NESTED.** A fill of kind `gradient` wraps a `gradient`
+  object that has its own `kind`:
+  `{"kind": "gradient", "gradient": {"kind": "linear", "start": [0,0],
+  "end": [0,1], "stops": [...]}}` — not `{"kind": "linear", ...}` at the
+  fill level. Gradient kinds: `linear`, `radial`, `angular`, `diamond`;
+  coordinates are node-local 0–1 space.
+- **Shadow kinds are `drop` and `inner`** — NOT `drop_shadow` /
+  `inner_shadow`. A shadow effect needs `color`, `blur`, `spread`,
+  `offset: [dx, dy]`.
+- **`Image` nodes require `natural_size`** (`[width, height]` in pixels of
+  the source asset) alongside `asset` and `local_size`; omitting it fails
+  deserialization. There is no `fills` field on an image node — tinting is
+  the separate `tint` attribute.
+- **Asset id spelling is asymmetric.** In FNX/JSON attributes the `asset`
+  value is the BARE 26-char ULID (e.g. `01JC…`), but the file on disk and
+  human-facing names use the `a_<ULID>` display form
+  (`assets/images/a_01JC….png`). Strip or add the `a_` prefix accordingly;
+  never write `a_…` into an `asset` attribute.
 
 ## Depth & material — don't ship flat
 

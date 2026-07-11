@@ -28,27 +28,41 @@ than guessing at endpoints.
 3. **Poll** — `get_generation {generation_id}` until `status` is `succeeded`
    or `failed`. Space polls out (a few seconds apart); report failures
    honestly instead of retrying blindly.
-4. **Deliver** — a finished generation has an asset URL. Share it with the
-   user, and place it in the design if they want it there (see below).
+4. **Place** — a finished generation has an asset URL. Put it on the open
+   canvas with the native `place_generation` tool (see below), or just share
+   the URL when no design is open.
 
 Generations cost credits (`get_credits`); confirm with the user before
 batch-generating many variants.
 
-## Placing results in the open design — current limitations
+## Placing results in the open design
 
-The native canvas ops (`design_edit`) can NOT create image nodes yet — image
-placement is a planned op. Until it lands, be explicit about the options
-instead of pretending:
+Use the native **`place_generation`** tool — it downloads the URL, ingests
+the bytes as a project asset (persisted to `assets/images/` on save), creates
+the image layer, and records provenance in the node's metadata in one step:
 
-- **Project-asset route (works today):** download the generated file into the
-  open Fanta project's `assets/` directory (the project root is reported by
-  `design_state`), then reference it from the page's FNX source
-  (`pages/<page-id>/page.fnx`) — the canvas hot-reloads on save. Only do this
-  when an existing image node in the source shows you the exact attribute
-  shape to copy; otherwise prefer the next option.
-- **Hand off (always works):** give the user the asset URL and tell them to
-  drop the image onto the canvas; then continue styling around it with
-  `design_edit`.
+```json
+{
+  "url": "<asset URL from get_generation>",
+  "x": 120, "y": 80,
+  "width": 480,                  // omit both to keep natural pixel size
+  "parent": "<frame id>",        // omit for the active page root
+  "name": "hero-sunset",
+  "prompt": "<the prompt used>", // provenance — pass what you know
+  "model": "<model id>",
+  "generation_id": "<id>"
+}
+```
+
+- Coordinates are world-space; get frame ids and geometry from
+  `design_state`. Generated images are usually large — set `width` (or
+  `height`) to the size the layout needs instead of natural pixels.
+- Resize/reposition afterwards with `design_edit` `set_props`; the layer
+  behaves like any bitmap node and the placement is one undo step.
+- If you already have raw bytes (not a URL), `design_edit`'s `create_image`
+  op takes base64 directly.
+- A `.fig` file that was never saved as a Fanta project still places the
+  image in memory; remind the user to save so the asset lands on disk.
 
 Never claim an image was placed on the canvas unless a `design_screenshot`
 actually shows it.
