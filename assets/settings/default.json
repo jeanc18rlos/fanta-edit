@@ -1791,7 +1791,7 @@
     // ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY or the keychain. Point
     // api_url elsewhere (or set provider above to "zed"/"copilot") to change.
     "open_ai_compatible_api": {
-      "api_url": "https://api.fantaisa.net/v1",
+      "api_url": "https://api.fantaisa.net",
       "model": "fanta-zeta-1",
       "prompt_format": "zeta2_1",
       "max_output_tokens": 2048,
@@ -2457,7 +2457,7 @@
     // agent.default_model.provider to "Fanta" after signing in.
     "anthropic_compatible": {
       "Fanta": {
-        "api_url": "https://api.fantaisa.net/v1",
+        "api_url": "https://api.fantaisa.net",
         "available_models": [
           {
             "name": "claude-sonnet-5",
