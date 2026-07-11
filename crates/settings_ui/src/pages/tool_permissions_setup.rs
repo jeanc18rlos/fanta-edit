@@ -1404,6 +1404,11 @@ mod tests {
         const EXCLUDED_TOOLS: &[&str] = &[
             // Read-only / low-risk tools that don't call decide_permission_from_settings
             "apply_code_action",
+            // Design-canvas tools: reads plus in-memory, undoable document
+            // edits — no permission rules, gated by the agent profile.
+            "design_edit",
+            "design_screenshot",
+            "design_state",
             "diagnostics",
             "find_path",
             "find_references",

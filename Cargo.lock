@@ -249,6 +249,7 @@ dependencies = [
  "assets",
  "async-channel 2.5.0",
  "async-io",
+ "base64 0.22.1",
  "chrono",
  "client",
  "clock",
@@ -258,6 +259,7 @@ dependencies = [
  "context_server",
  "ctor",
  "db",
+ "design_surface",
  "editor",
  "env_logger 0.11.8",
  "eval_utils",
@@ -5194,6 +5196,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "design_surface"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dev_container"
 version = "0.1.0"
 dependencies = [
@@ -6748,6 +6761,7 @@ dependencies = [
  "buffer_diff",
  "core-foundation 0.10.0",
  "core-video",
+ "design_surface",
  "editor",
  "fanta-canvas",
  "fanta-doc",

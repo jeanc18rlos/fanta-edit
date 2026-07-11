@@ -2,6 +2,7 @@
 //! editable Fanta projects, plus the design (layers) and properties dock
 //! panels and the floating canvas toolbar.
 
+mod agent_surface;
 mod canvas;
 mod clipboard;
 mod code_workspace;
@@ -61,6 +62,7 @@ pub use view::{FigView, FigViewEvent};
 
 pub fn init(cx: &mut App) {
     fnx_editor::init(cx);
+    agent_surface::init(cx);
     workspace::register_project_item::<FigView>(cx);
 }
 
