@@ -336,5 +336,7 @@ cp target/${target_triple}/${target_dir}/fanta "${app_path}/Contents/MacOS/fanta
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
-sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+# Use the same profile dir the build above produced; hardcoding `release`
+# broke `-d` (debug) bundles, which never create the release binary.
+sign_binary "target/$target_triple/$target_dir/remote_server"
+gzip -f --stdout --best target/$target_triple/$target_dir/remote_server > target/zed-remote-server-macos-$arch_suffix.gz

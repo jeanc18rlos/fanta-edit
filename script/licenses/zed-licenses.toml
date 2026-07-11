@@ -20,6 +20,9 @@ accepted = [
     "Zlib",
     "BSL-1.0",
     "bzip2-1.0.6",
+    # webpki-roots 1.x ships the Mozilla CA bundle under CDLA-Permissive-2.0,
+    # a permissive data license (no copyleft, attribution-free use of the data).
+    "CDLA-Permissive-2.0",
 ]
 
 [procinfo.clarify]
