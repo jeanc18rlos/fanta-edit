@@ -20,6 +20,7 @@ mod inspector_widgets;
 mod instance_text;
 mod mode_overrides;
 mod motion_edit;
+mod motion_panel;
 mod panel_settings;
 mod properties_ops;
 mod properties_panel;
@@ -46,6 +47,7 @@ pub use editor_session::{
     EditorWorkspaceTabs,
 };
 pub use inspector_components::{InspectorMessage, InspectorPropertyRow, InspectorSectionHeader};
+pub use motion_panel::FantaMotionPanel;
 pub use panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
 pub use properties_panel::FantaPropertiesPanel;
 pub use prototype_panel::FantaPrototypePanel;

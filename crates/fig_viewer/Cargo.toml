@@ -26,6 +26,7 @@ fanta-present.workspace = true
 fanta-render.workspace = true
 fanta-text.workspace = true
 fanta-tools.workspace = true
+fanta_ui.workspace = true
 file_icons.workspace = true
 fs.workspace = true
 glam.workspace = true

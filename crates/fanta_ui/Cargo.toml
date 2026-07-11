@@ -1,0 +1,46 @@
+[package]
+name = "fanta_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fanta_ui.rs"
+doctest = false
+
+[features]
+test-support = [
+    "gpui/test-support",
+    "dep:settings",
+    "dep:theme",
+    "dep:theme_settings",
+]
+visual-tests = [
+    "test-support",
+    "dep:anyhow",
+    "dep:assets",
+    "dep:env_logger",
+    "dep:gpui_platform",
+    "dep:image",
+]
+
+[[bin]]
+name = "fanta_ui_visual_test_runner"
+path = "src/visual_test_runner.rs"
+required-features = ["visual-tests"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+assets = { workspace = true, optional = true }
+env_logger = { workspace = true, optional = true }
+gpui.workspace = true
+gpui_platform = { workspace = true, optional = true, features = ["font-kit", "test-support", "screen-capture"] }
+image = { workspace = true, optional = true }
+settings = { workspace = true, optional = true, features = ["test-support"] }
+theme = { workspace = true, optional = true, features = ["test-support"] }
+theme_settings = { workspace = true, optional = true }
+ui.workspace = true

@@ -1,19 +1,28 @@
 use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent, actions::SelectAll};
-use fanta_doc::{Easing, Interpolation};
+use fanta_doc::{Easing, Interpolation, NodeId};
+use fanta_ui::timeline::{
+    TIMELINE_MAX_ZOOM, TIMELINE_MIN_ZOOM, TIMELINE_ZOOM_STEP, TimelineGridLine, TimelinePlayhead,
+    TimelineRulerHeader, TimelineRulerTick, TimelineScale, TimelineTimecode, TimelineToolbarButton,
+    format_ruler_time, format_timecode,
+};
 use gpui::{
     App, Bounds, Context, Entity, EventEmitter, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Subscription, Task,
-    Window, canvas, px, relative,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollHandle, SharedString,
+    Subscription, Task, Window, canvas, px, relative,
 };
 use ui::prelude::*;
-use ui::{ContextMenu, ContextMenuEntry, DropdownMenu, DropdownStyle, Tooltip};
+use ui::{ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, Tooltip};
 use util::ResultExt;
 
 const DEFAULT_DURATION_US: i64 = 5_000_000;
-pub(crate) const TIMELINE_HEIGHT: Pixels = px(188.);
-const TRACK_LABEL_WIDTH: Pixels = px(112.);
+pub(crate) const TIMELINE_HEIGHT: Pixels = px(256.);
+const TRACK_LABEL_WIDTH: Pixels = px(220.);
+const TIMELINE_TOOLBAR_HEIGHT: Pixels = px(40.);
+const TIMELINE_RULER_HEIGHT: Pixels = px(32.);
+const TIMELINE_LAYER_HEIGHT: Pixels = px(30.);
+const TIMELINE_TRACK_HEIGHT: Pixels = px(28.);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineViewModel {
@@ -57,7 +66,9 @@ impl Default for TimelineViewModel {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineTrackViewModel {
     pub id: SharedString,
+    pub node_id: NodeId,
     pub label: SharedString,
+    pub selected: bool,
     pub keyframes: Vec<TimelineKeyframeViewModel>,
 }
 
@@ -159,6 +170,8 @@ pub struct TimelineShell {
     authoring_enabled: bool,
     playhead_us: i64,
     playing: bool,
+    loop_playback: bool,
+    zoom: f32,
     scrubbing: bool,
     selected_keyframe: Option<TimelineKeyframeSelection>,
     keyframe_drag: Option<TimelineKeyframeDrag>,
@@ -172,6 +185,7 @@ pub struct TimelineShell {
     easing_editor: Option<Entity<Editor>>,
     easing_edit: Option<TimelineEasingEdit>,
     easing_edit_error: Option<SharedString>,
+    horizontal_scroll_handle: ScrollHandle,
     _editor_subscriptions: Vec<Subscription>,
 }
 
@@ -182,6 +196,8 @@ impl TimelineShell {
             authoring_enabled: true,
             playhead_us: 0,
             playing: false,
+            loop_playback: false,
+            zoom: TIMELINE_MIN_ZOOM,
             scrubbing: false,
             selected_keyframe: None,
             keyframe_drag: None,
@@ -195,6 +211,7 @@ impl TimelineShell {
             easing_editor: None,
             easing_edit: None,
             easing_edit_error: None,
+            horizontal_scroll_handle: ScrollHandle::new(),
             _editor_subscriptions: Vec::new(),
         }
     }
@@ -384,6 +401,32 @@ impl TimelineShell {
         cx.notify();
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_easing_edit_for_test(
+        &mut self,
+        keyframe: TimelineKeyframeSelection,
+        easing: Easing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_easing_edit(keyframe, easing, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_easing_edit_text_for_test(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editor) = self.easing_editor.clone() else {
+            return false;
+        };
+        editor.update(cx, |editor, cx| editor.set_text(text, window, cx));
+        self.preview_easing_edit(cx);
+        true
+    }
+
     fn preview_easing_edit(&mut self, cx: &mut Context<Self>) {
         let Some(editor) = self.easing_editor.as_ref() else {
             return;
@@ -458,20 +501,65 @@ impl TimelineShell {
     }
 
     pub(crate) fn cancel_easing_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(event) = self.take_cancel_easing_event(cx) else {
+            return false;
+        };
+        cx.emit(event);
+        true
+    }
+
+    pub(crate) fn finish_easing_edit(&mut self, cx: &mut Context<Self>) -> Option<TimelineEvent> {
+        let edit = self.easing_edit.as_ref()?.clone();
+        let parsed = self
+            .authoring_enabled
+            .then(|| {
+                self.easing_editor
+                    .as_ref()
+                    .ok_or_else(|| "The easing editor is unavailable".into())
+                    .and_then(|editor| parse_cubic_bezier(&editor.read(cx).text(cx)))
+            })
+            .transpose();
+        let easing = match parsed {
+            Ok(Some(easing))
+                if model_keyframe_easing(&self.model, &edit.keyframe) == Some(edit.current) =>
+            {
+                easing
+            }
+            _ => return self.take_cancel_easing_event(cx),
+        };
+
+        if easing != edit.current
+            && !set_model_keyframe_easing(&mut self.model, &edit.keyframe, easing)
+        {
+            return self.take_cancel_easing_event(cx);
+        }
+        self.easing_edit = None;
+        self.easing_edit_error = None;
+        cx.notify();
+        Some(TimelineEvent::EditKeyframeEasing {
+            keyframe: edit.keyframe,
+            easing,
+            phase: TimelineEditPhase::Commit,
+        })
+    }
+
+    fn take_cancel_easing_event(&mut self, cx: &mut Context<Self>) -> Option<TimelineEvent> {
         let Some(edit) = self.easing_edit.take() else {
-            return self.easing_edit_error.take().is_some();
+            if self.easing_edit_error.take().is_some() {
+                cx.notify();
+            }
+            return None;
         };
         if model_keyframe_easing(&self.model, &edit.keyframe) == Some(edit.current) {
             set_model_keyframe_easing(&mut self.model, &edit.keyframe, edit.original);
         }
         self.easing_edit_error = None;
-        cx.emit(TimelineEvent::EditKeyframeEasing {
+        cx.notify();
+        Some(TimelineEvent::EditKeyframeEasing {
             keyframe: edit.keyframe,
             easing: edit.original,
             phase: TimelineEditPhase::Cancel,
-        });
-        cx.notify();
-        true
+        })
     }
 
     fn handle_easing_editor_key_down(
@@ -832,6 +920,41 @@ impl TimelineShell {
         cx.notify();
     }
 
+    fn timeline_scale(&self) -> TimelineScale {
+        TimelineScale::new(self.model.duration_us, self.zoom)
+    }
+
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM);
+        if (self.zoom - zoom).abs() <= f32::EPSILON {
+            return;
+        }
+        self.zoom = zoom;
+        cx.notify();
+    }
+
+    fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom + TIMELINE_ZOOM_STEP, cx);
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(self.zoom - TIMELINE_ZOOM_STEP, cx);
+    }
+
+    fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(TIMELINE_MIN_ZOOM, cx);
+    }
+
+    fn toggle_loop_playback(&mut self, cx: &mut Context<Self>) {
+        self.loop_playback = !self.loop_playback;
+        cx.notify();
+    }
+
+    fn jump_to_start(&mut self, cx: &mut Context<Self>) {
+        self.pause(cx);
+        self.set_playhead(0, cx);
+    }
+
     fn toggle_playback(&mut self, cx: &mut Context<Self>) {
         if self.playing {
             self.pause(cx);
@@ -862,6 +985,11 @@ impl TimelineShell {
                         i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
                     let next = start_playhead_us.saturating_add(elapsed_us);
                     if next >= timeline.model.duration_us {
+                        if timeline.loop_playback {
+                            let looped = next.rem_euclid(timeline.model.duration_us.max(1));
+                            timeline.set_playhead(looped, cx);
+                            return true;
+                        }
                         timeline.set_playhead(timeline.model.duration_us, cx);
                         timeline.playing = false;
                         cx.emit(TimelineEvent::PlaybackChanged(false));
@@ -942,61 +1070,233 @@ impl TimelineShell {
         .size_full()
     }
 
+    fn render_grid_lines(&self, scale: TimelineScale) -> Vec<AnyElement> {
+        (0..=scale.tick_count())
+            .map(|index| {
+                let major = index % 5 == 0;
+                TimelineGridLine::new(scale.tick_fraction(index), major).into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_playhead_line(&self) -> AnyElement {
+        TimelinePlayhead::new(progress(self.playhead_us, self.model.duration_us)).into_any_element()
+    }
+
     fn render_ruler(&self, cx: &mut Context<Self>) -> AnyElement {
-        let progress = progress(self.playhead_us, self.model.duration_us);
+        let scale = self.timeline_scale();
+        let label_rail = div().child(TimelineRulerHeader::new(TRACK_LABEL_WIDTH, "Layers", "ms"));
+        #[cfg(test)]
+        let label_rail = label_rail.debug_selector(|| "fanta-motion-label-rail".to_owned());
+
         let mut ruler = div()
             .id("fanta-motion-ruler")
             .relative()
-            .h(px(30.))
-            .ml(TRACK_LABEL_WIDTH)
-            .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
+            .h_full()
+            .min_w_full()
+            .w(relative(self.zoom))
             .cursor_col_resize()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_scrub))
             .on_mouse_move(cx.listener(Self::update_scrub))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_scrub))
-            .child(self.bounds_probe(cx));
-        for index in 0..=5 {
-            let fraction = index as f32 / 5.0;
-            let seconds = self.model.duration_us as f64 * f64::from(fraction) / 1_000_000.0;
-            ruler = ruler
-                .child(
-                    div()
-                        .absolute()
-                        .left(relative(fraction))
-                        .top_0()
-                        .h(px(7.))
-                        .w_px()
-                        .bg(cx.theme().colors().border),
-                )
-                .child(
-                    div().absolute().left(relative(fraction)).top(px(9.)).child(
-                        Label::new(format!("{seconds:.1}s"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                );
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_scrub))
+            .child(self.bounds_probe(cx))
+            .children(self.render_grid_lines(scale));
+        for index in 0..scale.tick_count() {
+            ruler = ruler.child(TimelineRulerTick::new(
+                scale.tick_fraction(index),
+                format_ruler_time(scale.tick_time_us(index)),
+            ));
         }
-        ruler
-            .child(
-                div()
-                    .absolute()
-                    .left(relative(progress))
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(cx.theme().colors().text_accent),
-            )
+        ruler = ruler.child(
+            TimelinePlayhead::new(progress(self.playhead_us, self.model.duration_us))
+                .with_cap(true),
+        );
+        #[cfg(test)]
+        let ruler = ruler.debug_selector(|| "fanta-motion-ruler-lane".to_owned());
+
+        let mut scrollable_ruler = div()
+            .id("fanta-motion-ruler-scroll")
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&self.horizontal_scroll_handle)
+            .child(ruler);
+        scrollable_ruler.style().restrict_scroll_to_axis = Some(true);
+
+        h_flex()
+            .h(TIMELINE_RULER_HEIGHT)
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(label_rail)
+            .child(scrollable_ruler)
             .into_any_element()
     }
 
-    fn render_track(&self, track: &TimelineTrackViewModel, cx: &mut Context<Self>) -> AnyElement {
+    fn render_layer_row(
+        &self,
+        group_index: usize,
+        layer: &SharedString,
+        tracks: &[&TimelineTrackViewModel],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scale = self.timeline_scale();
+        let extent = track_extent(tracks, self.model.duration_us);
+        let selected = tracks.iter().any(|track| track.selected);
+        let label = h_flex()
+            .h_full()
+            .w(TRACK_LABEL_WIDTH)
+            .flex_none()
+            .px_2()
+            .gap_1()
+            .border_r_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Icon::new(IconName::ToolFrame)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(layer.clone())
+                    .size(LabelSize::Small)
+                    .single_line(),
+            );
+
         let mut lane = div()
             .relative()
-            .flex_1()
             .h_full()
-            .border_l_1()
-            .border_color(cx.theme().colors().border_variant);
+            .min_w_full()
+            .w(relative(self.zoom))
+            .children(self.render_grid_lines(scale));
+        if let Some((start, end)) = extent {
+            lane = lane.child(
+                div()
+                    .absolute()
+                    .left(relative(progress(start, self.model.duration_us)))
+                    .right(relative(1.0 - progress(end, self.model.duration_us)))
+                    .top(px(8.))
+                    .h(px(14.))
+                    .min_w(px(3.))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().text_accent)
+                    .bg(cx.theme().colors().text_accent.opacity(0.2)),
+            );
+        }
+        lane = lane.child(self.render_playhead_line());
+
+        let mut scrollable_lane = div()
+            .id(("fanta-motion-layer-scroll", group_index))
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&self.horizontal_scroll_handle)
+            .child(lane);
+        scrollable_lane.style().restrict_scroll_to_axis = Some(true);
+
+        let row = h_flex()
+            .id(("fanta-motion-layer", group_index))
+            .h(TIMELINE_LAYER_HEIGHT)
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(if selected {
+                cx.theme().colors().element_selected
+            } else {
+                cx.theme().colors().element_hover.opacity(0.32)
+            })
+            .child(label)
+            .child(scrollable_lane);
+        #[cfg(test)]
+        let row = row.debug_selector(move || format!("fanta-motion-layer-{group_index}"));
+        row.into_any_element()
+    }
+
+    fn render_track(
+        &self,
+        track: &TimelineTrackViewModel,
+        property: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let scale = self.timeline_scale();
+        let label = h_flex()
+            .h_full()
+            .w(TRACK_LABEL_WIDTH)
+            .flex_none()
+            .pl_4()
+            .pr_2()
+            .gap_1p5()
+            .border_r_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                div()
+                    .relative()
+                    .w(px(14.))
+                    .h_full()
+                    .flex_none()
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top_0()
+                            .h(relative(0.5))
+                            .w_px()
+                            .bg(cx.theme().colors().border),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top(relative(0.5))
+                            .w(px(9.))
+                            .h_px()
+                            .bg(cx.theme().colors().border),
+                    ),
+            )
+            .child(
+                div()
+                    .size(px(7.))
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(cx.theme().colors().text_muted),
+            )
+            .child(
+                Label::new(property.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .single_line(),
+            );
+
+        let mut lane = div()
+            .relative()
+            .h_full()
+            .min_w_full()
+            .w(relative(self.zoom))
+            .children(self.render_grid_lines(scale));
+        if let Some((start, end)) = track_keyframe_extent(track) {
+            lane = lane.child(
+                div()
+                    .absolute()
+                    .left(relative(progress(start, self.model.duration_us)))
+                    .right(relative(1.0 - progress(end, self.model.duration_us)))
+                    .top(px(9.))
+                    .h(px(10.))
+                    .min_w(px(3.))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().text_accent.opacity(0.75))
+                    .bg(cx.theme().colors().text_accent.opacity(0.12)),
+            );
+        }
+        lane = lane.child(self.render_playhead_line());
         for keyframe in &track.keyframes {
             let selection = TimelineKeyframeSelection {
                 track_id: track.id.clone(),
@@ -1005,22 +1305,15 @@ impl TimelineShell {
             let selected = self.selected_keyframe.as_ref() == Some(&selection);
             let selection_for_drag = selection.clone();
             lane = lane.child(
-                div()
+                h_flex()
                     .id(keyframe.id.clone())
                     .absolute()
                     .left(relative(progress(keyframe.time_us, self.model.duration_us)))
-                    .ml(px(-4.))
-                    .top(px(8.))
-                    .size(px(9.))
-                    .rounded(px(2.))
-                    .bg(if selected {
-                        cx.theme().colors().text_accent
-                    } else {
-                        cx.theme().colors().text_muted
-                    })
-                    .when(selected, |marker| {
-                        marker.border_1().border_color(cx.theme().colors().text)
-                    })
+                    .ml(px(-9.))
+                    .top_0()
+                    .h_full()
+                    .w(px(18.))
+                    .justify_center()
                     .when(self.authoring_enabled, |marker| {
                         marker.cursor_col_resize().on_mouse_down(
                             MouseButton::Left,
@@ -1033,23 +1326,51 @@ impl TimelineShell {
                                 );
                             }),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .size(px(9.))
+                            .rounded(px(2.))
+                            .border_1()
+                            .border_color(if selected {
+                                cx.theme().colors().text
+                            } else {
+                                cx.theme().colors().text_accent
+                            })
+                            .bg(if selected {
+                                cx.theme().colors().text_accent
+                            } else {
+                                cx.theme().colors().panel_background
+                            }),
+                    ),
             );
         }
-        h_flex()
+
+        let mut scrollable_lane = div()
+            .id(format!("fanta-motion-track-scroll-{}", track.id))
+            .h_full()
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&self.horizontal_scroll_handle)
+            .child(lane);
+        scrollable_lane.style().restrict_scroll_to_axis = Some(true);
+
+        let row = h_flex()
             .id(track.id.clone())
-            .h(px(26.))
+            .h(TIMELINE_TRACK_HEIGHT)
+            .flex_none()
             .border_b_1()
-            .border_color(cx.theme().colors().border_variant)
-            .child(
-                div().w(TRACK_LABEL_WIDTH).flex_none().px_2().child(
-                    Label::new(track.label.clone())
-                        .size(LabelSize::Small)
-                        .single_line(),
-                ),
-            )
-            .child(lane)
-            .into_any_element()
+            .border_color(cx.theme().colors().border_variant.opacity(0.7))
+            .hover(|row| row.bg(cx.theme().colors().element_hover.opacity(0.45)))
+            .child(label)
+            .child(scrollable_lane);
+        #[cfg(test)]
+        let row = row.debug_selector({
+            let track_id = track.id.clone();
+            move || format!("fanta-motion-track-{track_id}")
+        });
+        row.into_any_element()
     }
 
     fn render_clip_name(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1293,30 +1614,52 @@ impl TimelineShell {
         }
         Some(controls.into_any_element())
     }
-}
 
-impl Render for TimelineShell {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_clip_editors(window, cx);
-        let keyframe_controls = self.render_selected_keyframe_controls(window, cx);
-        let mut tracks = v_flex()
-            .id("fanta-motion-tracks")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll();
-        if self.model.tracks.is_empty() {
-            tracks = tracks.child(
-                h_flex().h(px(40.)).px_3().child(
-                    Label::new("Select a layer and add a keyframe to begin")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                ),
-            );
-        } else {
-            for track in &self.model.tracks {
-                tracks = tracks.child(self.render_track(track, cx));
-            }
-        }
+    fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let has_clip = self.model.clip_name.is_some();
+        let timeline = cx.weak_entity();
+        let play = TimelineToolbarButton::new(
+            "fanta-motion-play",
+            if self.playing {
+                IconName::DebugPause
+            } else {
+                IconName::PlayFilled
+            },
+            if self.playing { "Pause" } else { "Play" },
+            move |_, cx| {
+                timeline
+                    .update(cx, |timeline, cx| timeline.toggle_playback(cx))
+                    .log_err();
+            },
+        )
+        .active(self.playing)
+        .disabled(!has_clip);
+        let timeline = cx.weak_entity();
+        let restart = TimelineToolbarButton::new(
+            "fanta-motion-restart",
+            IconName::RotateCcw,
+            "Return to start",
+            move |_, cx| {
+                timeline
+                    .update(cx, |timeline, cx| timeline.jump_to_start(cx))
+                    .log_err();
+            },
+        )
+        .disabled(!has_clip);
+        let timeline = cx.weak_entity();
+        let looping = TimelineToolbarButton::new(
+            "fanta-motion-loop",
+            IconName::RotateCw,
+            "Loop playback",
+            move |_, cx| {
+                timeline
+                    .update(cx, |timeline, cx| timeline.toggle_loop_playback(cx))
+                    .log_err();
+            },
+        )
+        .active(self.loop_playback)
+        .disabled(!has_clip);
+
         let timeline = cx.weak_entity();
         let keyframe_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
             for (property, label) in [
@@ -1337,9 +1680,173 @@ impl Render for TimelineShell {
             }
             menu
         });
-        v_flex()
+
+        let timeline = cx.weak_entity();
+        let zoom_out = TimelineToolbarButton::new(
+            "fanta-motion-zoom-out",
+            IconName::Dash,
+            "Zoom out timeline",
+            move |_, cx| {
+                timeline
+                    .update(cx, |timeline, cx| timeline.zoom_out(cx))
+                    .log_err();
+            },
+        )
+        .disabled(self.zoom <= TIMELINE_MIN_ZOOM);
+        let timeline = cx.weak_entity();
+        let zoom_in = TimelineToolbarButton::new(
+            "fanta-motion-zoom-in",
+            IconName::Plus,
+            "Zoom in timeline",
+            move |_, cx| {
+                timeline
+                    .update(cx, |timeline, cx| timeline.zoom_in(cx))
+                    .log_err();
+            },
+        )
+        .disabled(self.zoom >= TIMELINE_MAX_ZOOM);
+        let timeline = cx.weak_entity();
+        let zoom_value = Button::new(
+            "fanta-motion-zoom-reset",
+            format!("{:.0}%", self.zoom * 100.0),
+        )
+        .size(ButtonSize::Compact)
+        .tooltip(Tooltip::text("Fit the complete timeline"))
+        .on_click(move |_, _, cx| {
+            timeline
+                .update(cx, |timeline, cx| timeline.reset_zoom(cx))
+                .log_err();
+        });
+        let keyframe_controls = self.render_selected_keyframe_controls(window, cx);
+        h_flex()
+            .h(TIMELINE_TOOLBAR_HEIGHT)
+            .flex_none()
+            .px_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(play)
+            .child(restart)
+            .child(looping)
+            .child(div().h(px(20.)).mx_1().child(Divider::vertical()))
+            .child(TimelineTimecode::new(self.playhead_us))
+            .child(
+                Label::new(format!("/ {}", format_timecode(self.model.duration_us)))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(div().h(px(20.)).mx_1().child(Divider::vertical()))
+            .child(self.render_clip_name(cx))
+            .when(has_clip, |toolbar| {
+                toolbar.child(self.render_clip_duration(cx))
+            })
+            .child(if has_clip {
+                DropdownMenu::new("fanta-motion-add-keyframe", "+ Keyframe", keyframe_menu)
+                    .style(DropdownStyle::Outlined)
+                    .trigger_size(ButtonSize::Compact)
+                    .disabled(!self.authoring_enabled)
+                    .into_any_element()
+            } else {
+                Button::new("fanta-motion-create-clip", "Create animation")
+                    .size(ButtonSize::Compact)
+                    .disabled(!self.authoring_enabled)
+                    .on_click(cx.listener(|timeline, _, _, cx| timeline.emit_create_clip(cx)))
+                    .into_any_element()
+            })
+            .when_some(keyframe_controls, |toolbar, controls| {
+                toolbar.child(div().min_w_0().overflow_hidden().ml_1().child(controls))
+            })
+            .when(self.selected_keyframe.is_some(), |toolbar| {
+                toolbar.child(
+                    IconButton::new("fanta-motion-delete-keyframe", IconName::Trash)
+                        .icon_size(IconSize::Small)
+                        .disabled(!self.authoring_enabled)
+                        .aria_label("Delete keyframe")
+                        .tooltip(Tooltip::text("Delete keyframe"))
+                        .on_click(
+                            cx.listener(|timeline, _, _, cx| timeline.delete_selected_keyframe(cx)),
+                        ),
+                )
+            })
+            .when_some(self.clip_edit_error.clone(), |toolbar, error| {
+                toolbar.child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error)
+                        .single_line(),
+                )
+            })
+            .when_some(self.easing_edit_error.clone(), |toolbar, error| {
+                toolbar.child(
+                    Label::new(error)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error)
+                        .single_line(),
+                )
+            })
+            .child(div().flex_1().min_w_2())
+            .child(zoom_out)
+            .child(zoom_value)
+            .child(zoom_in)
+            .into_any_element()
+    }
+}
+
+impl Render for TimelineShell {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_clip_editors(window, cx);
+        let mut tracks = v_flex()
+            .id("fanta-motion-tracks")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        if self.model.tracks.is_empty() {
+            tracks = tracks.child(
+                h_flex()
+                    .flex_1()
+                    .min_h(px(96.))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(TRACK_LABEL_WIDTH)
+                            .flex_none()
+                            .border_r_1()
+                            .border_color(cx.theme().colors().border_variant),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .child(
+                                Label::new("No animated properties")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default),
+                            )
+                            .child(
+                                Label::new("Select a layer, then add a keyframe from the toolbar")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+            );
+        } else {
+            for (group_index, (_, layer, layer_tracks)) in
+                grouped_tracks(&self.model.tracks).into_iter().enumerate()
+            {
+                tracks =
+                    tracks.child(self.render_layer_row(group_index, &layer, &layer_tracks, cx));
+                for track in layer_tracks {
+                    let (_, property) = split_track_label(&track.label);
+                    tracks = tracks.child(self.render_track(track, &property, cx));
+                }
+            }
+        }
+        let timeline = v_flex()
             .id("fanta-motion-timeline")
             .h(TIMELINE_HEIGHT)
+            .w_full()
             .flex_none()
             .border_t_1()
             .border_color(cx.theme().colors().border)
@@ -1347,86 +1854,12 @@ impl Render for TimelineShell {
             .on_mouse_move(cx.listener(Self::update_keyframe_drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_keyframe_drag))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_keyframe_drag))
-            .child(
-                h_flex()
-                    .h(px(34.))
-                    .px_2()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(
-                        IconButton::new(
-                            "fanta-motion-play",
-                            if self.playing {
-                                IconName::DebugPause
-                            } else {
-                                IconName::PlayFilled
-                            },
-                        )
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text(if self.playing { "Pause" } else { "Play" }))
-                        .on_click(cx.listener(|timeline, _, _, cx| timeline.toggle_playback(cx))),
-                    )
-                    .child(self.render_clip_name(cx))
-                    .when(self.model.clip_name.is_some(), |header| {
-                        header.child(self.render_clip_duration(cx))
-                    })
-                    .child(if self.model.clip_name.is_some() {
-                        DropdownMenu::new(
-                            "fanta-motion-add-keyframe",
-                            "Add keyframe",
-                            keyframe_menu,
-                        )
-                        .style(DropdownStyle::Outlined)
-                        .trigger_size(ButtonSize::Compact)
-                        .disabled(!self.authoring_enabled)
-                        .into_any_element()
-                    } else {
-                        Button::new("fanta-motion-create-clip", "Create animation")
-                            .size(ButtonSize::Compact)
-                            .disabled(!self.authoring_enabled)
-                            .on_click(
-                                cx.listener(|timeline, _, _, cx| timeline.emit_create_clip(cx)),
-                            )
-                            .into_any_element()
-                    })
-                    .when_some(keyframe_controls, |header, controls| header.child(controls))
-                    .when(self.selected_keyframe.is_some(), |header| {
-                        header.child(
-                            IconButton::new("fanta-motion-delete-keyframe", IconName::Trash)
-                                .icon_size(IconSize::Small)
-                                .disabled(!self.authoring_enabled)
-                                .tooltip(Tooltip::text("Delete keyframe"))
-                                .on_click(cx.listener(|timeline, _, _, cx| {
-                                    timeline.delete_selected_keyframe(cx)
-                                })),
-                        )
-                    })
-                    .when_some(self.clip_edit_error.clone(), |header, error| {
-                        header.child(
-                            Label::new(error)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error)
-                                .single_line(),
-                        )
-                    })
-                    .when_some(self.easing_edit_error.clone(), |header, error| {
-                        header.child(
-                            Label::new(error)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error)
-                                .single_line(),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        Label::new(format_time(self.playhead_us))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            )
+            .child(self.render_toolbar(window, cx))
             .child(self.render_ruler(cx))
-            .child(tracks)
+            .child(tracks);
+        #[cfg(test)]
+        let timeline = timeline.debug_selector(|| "fanta-motion-timeline-shell".to_owned());
+        timeline
     }
 }
 
@@ -1436,6 +1869,59 @@ impl Default for TimelineShell {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn split_track_label(label: &SharedString) -> (SharedString, SharedString) {
+    label
+        .rsplit_once(" · ")
+        .map(|(layer, property)| (layer.to_owned().into(), property.to_owned().into()))
+        .unwrap_or_else(|| ("Layer".into(), label.clone()))
+}
+
+fn grouped_tracks(
+    tracks: &[TimelineTrackViewModel],
+) -> Vec<(NodeId, SharedString, Vec<&TimelineTrackViewModel>)> {
+    let mut groups: Vec<(NodeId, SharedString, Vec<&TimelineTrackViewModel>)> = Vec::new();
+    for track in tracks {
+        let (layer, _) = split_track_label(&track.label);
+        if let Some((_, _, layer_tracks)) = groups
+            .iter_mut()
+            .find(|(node_id, _, _)| *node_id == track.node_id)
+        {
+            layer_tracks.push(track);
+        } else {
+            groups.push((track.node_id, layer, vec![track]));
+        }
+    }
+    groups
+}
+
+fn track_keyframe_extent(track: &TimelineTrackViewModel) -> Option<(i64, i64)> {
+    let start = track
+        .keyframes
+        .iter()
+        .map(|keyframe| keyframe.time_us)
+        .min()?;
+    let end = track
+        .keyframes
+        .iter()
+        .map(|keyframe| keyframe.time_us)
+        .max()?;
+    Some((start, end))
+}
+
+fn track_extent(tracks: &[&TimelineTrackViewModel], duration_us: i64) -> Option<(i64, i64)> {
+    let start = tracks
+        .iter()
+        .flat_map(|track| track.keyframes.iter())
+        .map(|keyframe| keyframe.time_us)
+        .min()?;
+    let end = tracks
+        .iter()
+        .flat_map(|track| track.keyframes.iter())
+        .map(|keyframe| keyframe.time_us)
+        .max()?;
+    Some((start.clamp(0, duration_us), end.clamp(0, duration_us)))
 }
 
 fn progress(time_us: i64, duration_us: i64) -> f32 {
@@ -1702,7 +2188,9 @@ mod tests {
             1_000_000,
             vec![TimelineTrackViewModel {
                 id: selection.track_id.clone(),
+                node_id: NodeId::from_u128(1),
                 label: "Layer · Position X".into(),
+                selected: false,
                 keyframes: vec![TimelineKeyframeViewModel {
                     id: selection.keyframe_id.clone(),
                     time_us: 250_000,
@@ -1727,6 +2215,49 @@ mod tests {
         assert_eq!(model.duration_us, 1);
         assert_eq!(progress(10, model.duration_us), 1.0);
         assert_eq!(format_time(1_250_000), "1.25s");
+        assert_eq!(format_timecode(1_250_000), "00:01.250");
+        assert_eq!(format_timecode(61_005_000), "01:01.005");
+    }
+
+    #[test]
+    fn tracks_group_by_node_identity_when_names_duplicate_and_order_is_interleaved() {
+        let first_card = NodeId::from_u128(1);
+        let second_card = NodeId::from_u128(2);
+        let track =
+            |id: &'static str, node_id, label: &'static str, time_us| TimelineTrackViewModel {
+                id: id.into(),
+                node_id,
+                label: label.into(),
+                selected: false,
+                keyframes: vec![TimelineKeyframeViewModel {
+                    id: format!("key-{id}").into(),
+                    time_us,
+                    interpolation: Interpolation::Linear,
+                    easing: Easing::Linear,
+                }],
+            };
+        let tracks = vec![
+            track("x", first_card, "Card · Position X", 100_000),
+            track("opacity", second_card, "Card · Opacity", 200_000),
+            track("y", first_card, "Card · Position Y", 900_000),
+        ];
+
+        let groups = grouped_tracks(&tracks);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, first_card);
+        assert_eq!(groups[0].1.as_ref(), "Card");
+        assert_eq!(groups[0].2.len(), 2);
+        assert_eq!(groups[1].0, second_card);
+        assert_eq!(groups[1].1.as_ref(), "Card");
+        assert_eq!(groups[1].2.len(), 1);
+        assert_eq!(
+            split_track_label(&groups[0].2[1].label).1.as_ref(),
+            "Position Y"
+        );
+        assert_eq!(
+            track_extent(&groups[0].2, 1_000_000),
+            Some((100_000, 900_000))
+        );
     }
 
     #[test]
@@ -1740,7 +2271,9 @@ mod tests {
             1_000_000,
             vec![TimelineTrackViewModel {
                 id: selection.track_id.clone(),
+                node_id: NodeId::from_u128(1),
                 label: "Layer · Position X".into(),
+                selected: false,
                 keyframes: vec![TimelineKeyframeViewModel {
                     id: selection.keyframe_id.clone(),
                     time_us: 250_000,
@@ -1800,7 +2333,9 @@ mod tests {
                     1_000_000,
                     vec![TimelineTrackViewModel {
                         id: selection.track_id.clone(),
+                        node_id: NodeId::from_u128(1),
                         label: "Layer · Position X".into(),
+                        selected: false,
                         keyframes: vec![TimelineKeyframeViewModel {
                             id: selection.keyframe_id.clone(),
                             time_us: 250_000,
@@ -1862,6 +2397,150 @@ mod tests {
             assert!(timeline.editing_clip_field.is_none());
             assert!(timeline.clip_edit_error.is_none());
         });
+    }
+
+    #[gpui::test]
+    fn zoom_controls_clamp_and_loop_is_explicit_state(cx: &mut TestAppContext) {
+        let timeline = cx.new(|_| TimelineShell::new());
+        timeline.update(cx, |timeline, cx| {
+            for _ in 0..20 {
+                timeline.zoom_in(cx);
+            }
+            assert_eq!(timeline.zoom, TIMELINE_MAX_ZOOM);
+            for _ in 0..20 {
+                timeline.zoom_out(cx);
+            }
+            assert_eq!(timeline.zoom, TIMELINE_MIN_ZOOM);
+            timeline.toggle_loop_playback(cx);
+            assert!(timeline.loop_playback);
+            timeline.reset_zoom(cx);
+            assert_eq!(timeline.zoom, TIMELINE_MIN_ZOOM);
+        });
+    }
+
+    #[gpui::test]
+    fn timeline_visual_hierarchy_keeps_the_layer_rail_pinned(cx: &mut TestAppContext) {
+        init_editor_test(cx);
+        let window = cx.add_window(|_, _| TimelineShell::new());
+        let timeline = window.entity(cx).expect("timeline entity");
+        window
+            .update(cx, |timeline, _, cx| {
+                timeline.set_model(
+                    TimelineViewModel::for_clip(
+                        "Entrance",
+                        2_000_000,
+                        vec![
+                            TimelineTrackViewModel {
+                                id: "position-x".into(),
+                                node_id: NodeId::from_u128(1),
+                                label: "Card · Position X".into(),
+                                selected: true,
+                                keyframes: vec![
+                                    TimelineKeyframeViewModel {
+                                        id: "position-start".into(),
+                                        time_us: 0,
+                                        interpolation: Interpolation::Linear,
+                                        easing: Easing::EaseOut,
+                                    },
+                                    TimelineKeyframeViewModel {
+                                        id: "position-end".into(),
+                                        time_us: 500_000,
+                                        interpolation: Interpolation::Linear,
+                                        easing: Easing::EaseOut,
+                                    },
+                                ],
+                            },
+                            TimelineTrackViewModel {
+                                id: "opacity".into(),
+                                node_id: NodeId::from_u128(1),
+                                label: "Card · Opacity".into(),
+                                selected: true,
+                                keyframes: vec![TimelineKeyframeViewModel {
+                                    id: "opacity-end".into(),
+                                    time_us: 500_000,
+                                    interpolation: Interpolation::Linear,
+                                    easing: Easing::EaseOut,
+                                }],
+                            },
+                        ],
+                    ),
+                    cx,
+                );
+            })
+            .expect("update timeline window");
+
+        let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual_context.simulate_resize(gpui::size(px(1_200.), TIMELINE_HEIGHT));
+        visual_context.update(|window, cx| window.draw(cx).clear());
+
+        let shell = visual_context
+            .debug_bounds("fanta-motion-timeline-shell")
+            .expect("timeline shell");
+        let rail = visual_context
+            .debug_bounds("fanta-motion-label-rail")
+            .expect("layer rail");
+        let ruler = visual_context
+            .debug_bounds("fanta-motion-ruler-lane")
+            .expect("ruler lane");
+        let layer = visual_context
+            .debug_bounds("fanta-motion-layer-0")
+            .expect("layer group row");
+        let property = visual_context
+            .debug_bounds("fanta-motion-track-position-x")
+            .expect("property track row");
+
+        assert!(shell.size.width >= px(1_190.));
+        assert_eq!(rail.size.width, TRACK_LABEL_WIDTH);
+        assert!(ruler.left() >= rail.right());
+        assert_eq!(layer.size.width, shell.size.width);
+        assert_eq!(property.size.width, shell.size.width);
+
+        let zoom_in = visual_context
+            .debug_bounds("ICON-Plus")
+            .expect("timeline zoom in button");
+        visual_context.simulate_click(zoom_in.center(), gpui::Modifiers::default());
+        visual_context.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(
+            timeline.read_with(&visual_context, |timeline, _| timeline.zoom),
+            1.5
+        );
+
+        let ruler = visual_context
+            .debug_bounds("fanta-motion-ruler-lane")
+            .expect("ruler after zoom");
+        let scrub_start = gpui::point(
+            ruler.left() + ruler.size.width / 4.,
+            ruler.bottom() - px(2.),
+        );
+        let scrub_release = gpui::point(ruler.left() - px(20.), scrub_start.y);
+        visual_context.simulate_mouse_down(
+            scrub_start,
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert!(timeline.read_with(&visual_context, |timeline, _| timeline.scrubbing));
+        visual_context.simulate_mouse_move(
+            scrub_release,
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        visual_context.simulate_mouse_up(
+            scrub_release,
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        assert!(!timeline.read_with(&visual_context, |timeline, _| timeline.scrubbing));
+        let released_playhead =
+            timeline.read_with(&visual_context, |timeline, _| timeline.playhead_us);
+        visual_context.simulate_mouse_move(
+            gpui::point(ruler.right() - px(2.), scrub_start.y),
+            None,
+            gpui::Modifiers::default(),
+        );
+        assert_eq!(
+            timeline.read_with(&visual_context, |timeline, _| timeline.playhead_us),
+            released_playhead
+        );
     }
 
     #[gpui::test]
@@ -2012,6 +2691,74 @@ mod tests {
                 TimelineEditPhase::Commit,
             ]
         );
+    }
+
+    #[gpui::test]
+    fn finishing_custom_easing_commits_valid_text_and_restores_invalid_text(
+        cx: &mut TestAppContext,
+    ) {
+        init_editor_test(cx);
+        let selection = TimelineKeyframeSelection {
+            track_id: "track-1".into(),
+            keyframe_id: "keyframe-1".into(),
+        };
+        let original = Easing::CubicBezier {
+            x1: 0.42,
+            y1: 0.0,
+            x2: 0.58,
+            y2: 1.0,
+        };
+        let committed = Easing::CubicBezier {
+            x1: 0.1,
+            y1: -2.0,
+            x2: 0.9,
+            y2: 3.0,
+        };
+        let timeline = cx.add_window(|_, _| TimelineShell::new());
+
+        timeline
+            .update(cx, |timeline, window, cx| {
+                timeline.set_model(easing_model(&selection, original), cx);
+                timeline.begin_easing_edit(selection.clone(), original, window, cx);
+                let editor = timeline.easing_editor.clone().expect("easing editor");
+                editor.update(cx, |editor, cx| {
+                    editor.set_text("0.1, -2, 0.9, 3", window, cx)
+                });
+
+                assert!(matches!(
+                    timeline.finish_easing_edit(cx),
+                    Some(TimelineEvent::EditKeyframeEasing {
+                        ref keyframe,
+                        easing,
+                        phase: TimelineEditPhase::Commit,
+                    }) if keyframe == &selection && easing == committed
+                ));
+                assert_eq!(
+                    model_keyframe_easing(&timeline.model, &selection),
+                    Some(committed)
+                );
+
+                timeline.begin_easing_edit(selection.clone(), committed, window, cx);
+                editor.update(cx, |editor, cx| editor.set_text("not a curve", window, cx));
+                timeline.preview_easing_edit(cx);
+                assert!(timeline.easing_edit_error.is_some());
+
+                assert!(matches!(
+                    timeline.finish_easing_edit(cx),
+                    Some(TimelineEvent::EditKeyframeEasing {
+                        ref keyframe,
+                        easing,
+                        phase: TimelineEditPhase::Cancel,
+                    }) if keyframe == &selection && easing == committed
+                ));
+                assert_eq!(
+                    model_keyframe_easing(&timeline.model, &selection),
+                    Some(committed)
+                );
+                assert!(timeline.easing_edit.is_none());
+                assert!(timeline.easing_edit_error.is_none());
+            })
+            .expect("update timeline window");
     }
 
     #[gpui::test]

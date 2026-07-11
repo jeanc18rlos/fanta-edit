@@ -1,8 +1,8 @@
 use editor::{Editor, EditorEvent, actions::SelectAll};
 use fanta_doc::{
-    Action, Color as FantaColor, ComponentId, Direction, Doc, Easing, NodeData, NodeId, Operation,
-    OverlayPosition, OverlaySettings, Reaction, ReactionId, Transition, TransitionStyle, Trigger,
-    VarValue, VariableId, VariableType,
+    Action, AnimationClipId, Color as FantaColor, ComponentId, Direction, Doc, Easing, NodeData,
+    NodeId, Operation, OverlayPosition, OverlaySettings, PrototypeAnimation, Reaction, ReactionId,
+    Transition, TransitionStyle, Trigger, VarValue, VariableId, VariableType,
 };
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
@@ -39,6 +39,12 @@ struct PrototypeComponent {
     name: SharedString,
 }
 
+#[derive(Clone)]
+struct PrototypeClip {
+    id: AnimationClipId,
+    name: SharedString,
+}
+
 enum PrototypeSnapshot {
     Message(SharedString),
     Selection {
@@ -53,6 +59,7 @@ enum PrototypeSnapshot {
         scroll_targets: Vec<PrototypeTarget>,
         variables: Vec<PrototypeVariable>,
         components: Vec<PrototypeComponent>,
+        clips: Vec<PrototypeClip>,
     },
 }
 
@@ -187,6 +194,7 @@ impl OverlayPositionChoice {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParameterKind {
     Delay,
+    AnimationDelay,
     Keys,
     VariableValue,
     Variant,
@@ -712,6 +720,7 @@ impl FantaPrototypePanel {
         let scroll_targets = prototype_scroll_targets(doc, node_id);
         let variables = prototype_variables(doc);
         let components = prototype_components(doc);
+        let clips = prototype_clips(doc);
         PrototypeSnapshot::Selection {
             editable: item.is_editable(),
             node: node_id,
@@ -724,6 +733,7 @@ impl FantaPrototypePanel {
             scroll_targets,
             variables,
             components,
+            clips,
         }
     }
 
@@ -1029,6 +1039,23 @@ impl FantaPrototypePanel {
         );
     }
 
+    fn set_animation_clip(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        clip: Option<AnimationClipId>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    bind_reaction_animation(reaction, clip);
+                })
+            },
+            cx,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_choice_dropdown<T: Copy + PartialEq + 'static>(
         &self,
@@ -1121,6 +1148,81 @@ impl FantaPrototypePanel {
             .aria_label("Prototype target")
             .into_any_element(),
         )
+    }
+
+    fn render_clip_dropdown(
+        &self,
+        node: NodeId,
+        reaction: &Reaction,
+        clips: &[PrototypeClip],
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = reaction.animation.as_ref().map(|animation| animation.clip);
+        let label = current
+            .and_then(|current| {
+                clips
+                    .iter()
+                    .find(|clip| clip.id == current)
+                    .map(|clip| clip.name.clone())
+            })
+            .unwrap_or_else(|| {
+                if current.is_some() {
+                    "Missing clip".into()
+                } else if clips.is_empty() {
+                    "No motion clips".into()
+                } else {
+                    "None".into()
+                }
+            });
+        let panel = cx.weak_entity();
+        let reaction_id = reaction.id;
+        let choices = clips.to_vec();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let clear_panel = panel.clone();
+            menu.push_item(
+                ContextMenuEntry::new("None")
+                    .toggleable(IconPosition::End, current.is_none())
+                    .handler(move |_, cx| {
+                        clear_panel
+                            .update(cx, |panel, cx| {
+                                panel.set_animation_clip(node, reaction_id, None, cx)
+                            })
+                            .log_err();
+                    }),
+            );
+            if !choices.is_empty() {
+                menu = menu.separator();
+            }
+            for clip in &choices {
+                let panel = panel.clone();
+                let clip_id = clip.id;
+                menu.push_item(
+                    ContextMenuEntry::new(clip.name.clone())
+                        .toggleable(IconPosition::End, current == Some(clip_id))
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.set_animation_clip(node, reaction_id, Some(clip_id), cx)
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(
+            reaction_element_id("fanta-prototype-motion-clip", reaction.id),
+            label,
+            menu,
+        )
+        .style(DropdownStyle::Outlined)
+        .trigger_size(ButtonSize::Compact)
+        .full_width(true)
+        .disabled(!editable || (clips.is_empty() && current.is_none()))
+        .aria_label("Prototype property animation")
+        .into_any_element()
     }
 
     fn render_variable_dropdown(
@@ -1314,6 +1416,7 @@ impl FantaPrototypePanel {
         scroll_targets: &[PrototypeTarget],
         variables: &[PrototypeVariable],
         components: &[PrototypeComponent],
+        clips: &[PrototypeClip],
         editable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1561,7 +1664,7 @@ impl FantaPrototypePanel {
                 ));
         }
         card = card.child(self.render_labeled_row(
-            "Animation",
+            "Transition",
             self.render_choice_dropdown(
                 "fanta-prototype-transition",
                 index,
@@ -1640,6 +1743,25 @@ impl FantaPrototypePanel {
                 ));
             }
         }
+        card = card.child(self.render_labeled_row(
+            "Motion clip",
+            self.render_clip_dropdown(node, reaction, clips, editable, window, cx),
+        ));
+        if let Some(animation) = &reaction.animation {
+            card = card.child(self.render_labeled_row(
+                "Clip delay",
+                self.render_inline_parameter(
+                    index,
+                    node,
+                    reaction.id,
+                    ParameterKind::AnimationDelay,
+                    animation.delay_ms.to_string(),
+                    "0",
+                    editable,
+                    cx,
+                ),
+            ));
+        }
         card.into_any_element()
     }
 
@@ -1682,6 +1804,7 @@ impl Render for FantaPrototypePanel {
                 scroll_targets,
                 variables,
                 components,
+                clips,
             } => {
                 let header = v_flex()
                     .px_4()
@@ -1794,6 +1917,7 @@ impl Render for FantaPrototypePanel {
                             &scroll_targets,
                             &variables,
                             &components,
+                            &clips,
                             editable,
                             window,
                             cx,
@@ -2030,6 +2154,16 @@ fn parameter_reaction_from_text(
             };
             *current = delay_ms;
         }
+        ParameterKind::AnimationDelay => {
+            let delay_ms = text
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "Enter a whole-number animation delay in milliseconds".to_owned())?;
+            let Some(animation) = &mut reaction.animation else {
+                return Err("Bind a motion clip before editing its delay".to_owned());
+            };
+            animation.delay_ms = delay_ms;
+        }
         ParameterKind::Keys => {
             let keys: Vec<String> = text
                 .split(|character| character == '+' || character == ',')
@@ -2154,6 +2288,7 @@ fn reaction_element_id(key: &'static str, reaction: ReactionId) -> ElementId {
 fn parameter_key(kind: ParameterKind) -> &'static str {
     match kind {
         ParameterKind::Delay => "fanta-prototype-delay",
+        ParameterKind::AnimationDelay => "fanta-prototype-animation-delay",
         ParameterKind::Keys => "fanta-prototype-keys",
         ParameterKind::VariableValue => "fanta-prototype-variable-value",
         ParameterKind::Variant => "fanta-prototype-variant",
@@ -2169,6 +2304,29 @@ fn format_number(value: f64) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn prototype_clips(doc: &Doc) -> Vec<PrototypeClip> {
+    let mut clips: Vec<_> = doc
+        .motion
+        .clips
+        .values()
+        .map(|clip| PrototypeClip {
+            id: clip.id,
+            name: if clip.name.trim().is_empty() {
+                "Untitled animation".into()
+            } else {
+                clip.name.clone().into()
+            },
+        })
+        .collect();
+    clips.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    clips
 }
 
 fn prototype_frame_targets(doc: &Doc, selected: NodeId) -> Vec<PrototypeTarget> {
@@ -2255,6 +2413,7 @@ fn add_reaction_operation(doc: &Doc, node: NodeId) -> Option<Operation> {
             trigger: Trigger::Click,
             action,
             transition: None,
+            animation: None,
         },
     })
 }
@@ -2292,6 +2451,14 @@ fn set_reaction_operation(
         old,
         new,
     })
+}
+
+fn bind_reaction_animation(reaction: &mut Reaction, clip: Option<AnimationClipId>) {
+    let delay_ms = reaction
+        .animation
+        .as_ref()
+        .map_or(0, |animation| animation.delay_ms);
+    reaction.animation = clip.map(|clip| PrototypeAnimation { clip, delay_ms });
 }
 
 fn flow_start_operation(doc: &Doc, new: Option<NodeId>) -> Option<Operation> {
@@ -2385,8 +2552,8 @@ mod tests {
     use super::*;
     use crate::document::ready_item_for_test;
     use fanta_doc::{
-        CanvasNode, ComponentSet, GroupNode, Mode, ModeId, Variable, VariableCollection,
-        VariableCollectionId, VariantAxis,
+        AnimationClip, CanvasNode, ComponentSet, GroupNode, Mode, ModeId, Variable,
+        VariableCollection, VariableCollectionId, VariantAxis,
     };
     use gpui::TestAppContext;
     use project::{FakeFs, Project};
@@ -2565,6 +2732,72 @@ mod tests {
     }
 
     #[test]
+    fn motion_clip_choices_are_readable_and_deterministic() {
+        let mut doc = Doc::new();
+        let zoom = AnimationClip::new(AnimationClipId::new(), "Zoom", 500);
+        let untitled = AnimationClip::new(AnimationClipId::new(), "  ", 500);
+        let alpha = AnimationClip::new(AnimationClipId::new(), "alpha", 500);
+        doc.motion.clips.insert(zoom.id, zoom);
+        doc.motion.clips.insert(untitled.id, untitled);
+        doc.motion.clips.insert(alpha.id, alpha);
+
+        assert_eq!(
+            prototype_clips(&doc)
+                .iter()
+                .map(|clip| clip.name.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "Untitled animation", "Zoom"]
+        );
+    }
+
+    #[test]
+    fn property_animation_binding_preserves_delay_and_reaction_identity() {
+        let (doc, _, _) = document_with_two_frames();
+        let first_clip = AnimationClipId::new();
+        let second_clip = AnimationClipId::new();
+        let reaction_id = ReactionId::new();
+        let mut reaction = Reaction {
+            id: reaction_id,
+            trigger: Trigger::Click,
+            action: Action::Back,
+            transition: None,
+            animation: Some(PrototypeAnimation {
+                clip: first_clip,
+                delay_ms: 125,
+            }),
+        };
+
+        bind_reaction_animation(&mut reaction, Some(second_clip));
+        assert_eq!(reaction.id, reaction_id);
+        assert_eq!(
+            reaction.animation,
+            Some(PrototypeAnimation {
+                clip: second_clip,
+                delay_ms: 125,
+            })
+        );
+
+        let edited =
+            parameter_reaction_from_text(&doc, &reaction, ParameterKind::AnimationDelay, "275")
+                .expect("valid property-animation delay");
+        assert_eq!(edited.id, reaction_id);
+        assert_eq!(
+            edited
+                .animation
+                .as_ref()
+                .map(|animation| animation.delay_ms),
+            Some(275)
+        );
+
+        bind_reaction_animation(&mut reaction, None);
+        assert!(reaction.animation.is_none());
+        assert!(
+            parameter_reaction_from_text(&doc, &reaction, ParameterKind::AnimationDelay, "300",)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn reaction_edits_resolve_by_stable_id_not_stale_index() {
         let (mut doc, first, _) = document_with_two_frames();
         let reaction_id = ReactionId::new();
@@ -2575,6 +2808,7 @@ mod tests {
                 trigger: Trigger::Click,
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .unwrap();
@@ -2628,6 +2862,7 @@ mod tests {
                 value: VarValue::Float { value: 1.0 },
             },
             transition: None,
+            animation: None,
         };
         doc.apply(Operation::AddReaction {
             node: first,
@@ -2677,6 +2912,7 @@ mod tests {
             trigger: Trigger::Click,
             action: Action::Back,
             transition: None,
+            animation: None,
         };
         doc.apply(Operation::AddReaction {
             node: first,
@@ -2721,6 +2957,7 @@ mod tests {
             },
             action: Action::OpenLink { url: String::new() },
             transition: None,
+            animation: None,
         };
         let keyed = parameter_reaction_from_text(&doc, &key, ParameterKind::Keys, "Shift + K")
             .expect("valid key chord");
@@ -2752,6 +2989,7 @@ mod tests {
                 },
             },
             transition: None,
+            animation: None,
         };
         let offset =
             parameter_reaction_from_text(&doc, &overlay, ParameterKind::OverlayOffsetX, "18.25")
@@ -2793,6 +3031,7 @@ mod tests {
                     duration_ms: 500,
                     easing: Easing::EaseOut,
                 }),
+                animation: None,
             },
         })
         .expect("add reaction");
@@ -2822,6 +3061,84 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn property_animation_binding_is_one_undoable_panel_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut doc, first, _) = document_with_two_frames();
+        let clip = AnimationClip::new(AnimationClipId::new(), "Entrance", 500);
+        let clip_id = clip.id;
+        doc.motion.clips.insert(clip_id, clip);
+        let reaction_id = ReactionId::new();
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: Reaction {
+                id: reaction_id,
+                trigger: Trigger::Click,
+                action: Action::Back,
+                transition: None,
+                animation: None,
+            },
+        })
+        .expect("add reaction");
+        doc.selection.select_only(first);
+        doc.history = Default::default();
+
+        let file_system = FakeFs::new(cx.executor());
+        let roots: [&std::path::Path; 0] = [];
+        let project = Project::test(file_system, roots, cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeMotionBinding.fanta"),
+            doc,
+            cx,
+        );
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        cx.update_window(panel.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .expect("draw prototype panel");
+
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_animation_clip(first, reaction_id, Some(clip_id), cx)
+            })
+            .expect("bind property animation");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let reaction = reaction_by_id(
+                &item.document().expect("ready document").doc,
+                first,
+                reaction_id,
+            )
+            .expect("reaction remains");
+            assert_eq!(
+                reaction.animation,
+                Some(PrototypeAnimation {
+                    clip: clip_id,
+                    delay_ms: 0,
+                })
+            );
+        });
+
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo binding")
+        );
+        item.read_with(cx, |item, _| {
+            assert!(
+                reaction_by_id(
+                    &item.document().expect("ready document").doc,
+                    first,
+                    reaction_id,
+                )
+                .expect("reaction remains after undo")
+                .animation
+                .is_none()
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn inline_parameter_previews_live_and_commits_as_one_stable_id_operation(
         cx: &mut TestAppContext,
     ) {
@@ -2835,6 +3152,7 @@ mod tests {
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .expect("add reaction");
@@ -2920,6 +3238,7 @@ mod tests {
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .expect("add reaction");
@@ -3073,6 +3392,7 @@ mod tests {
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
                 transition: None,
+                animation: None,
             },
         })
         .expect("add reaction");
