@@ -238,7 +238,11 @@ fn text_color_override(def_path: &OverridePath, color: Color) -> Override {
 /// Upsert `new_override` into `overrides` (replace the matching path/prop entry,
 /// else append). Used to build the previewed override set.
 fn upsert(overrides: &mut Vec<Override>, new_override: Override) {
-    match override_index(overrides, &new_override.target_path, &new_override.target_prop) {
+    match override_index(
+        overrides,
+        &new_override.target_path,
+        &new_override.target_prop,
+    ) {
         Some(i) => overrides[i] = new_override,
         None => overrides.push(new_override),
     }
@@ -281,7 +285,11 @@ pub(crate) fn commit_ops(
         upsert(working, ov);
     };
     if let Some(content) = content {
-        push_upsert(&mut ops, &mut working, text_content_override(def_path, content));
+        push_upsert(
+            &mut ops,
+            &mut working,
+            text_content_override(def_path, content),
+        );
     }
     if let Some(color) = color {
         push_upsert(&mut ops, &mut working, text_color_override(def_path, color));
@@ -378,7 +386,8 @@ mod tests {
         }));
         let instance_id = instance.id;
         instance.transform = Transform2D::translation(500.0, 300.0);
-        doc.apply(Operation::create_node(instance)).expect("instance");
+        doc.apply(Operation::create_node(instance))
+            .expect("instance");
         doc.add_page(instance_id);
 
         let def_path: OverridePath = smallvec![text_id];
@@ -404,7 +413,10 @@ mod tests {
         // (500,300) + (10,20) = (510, 320) — the master root's own (1000,1000)
         // transform is suppressed.
         let origin = target.world.transform_point(DVec2::ZERO);
-        assert!((origin - DVec2::new(510.0, 320.0)).length() < 1e-6, "{origin:?}");
+        assert!(
+            (origin - DVec2::new(510.0, 320.0)).length() < 1e-6,
+            "{origin:?}"
+        );
     }
 
     #[test]
@@ -442,7 +454,10 @@ mod tests {
         // First edit appends (index 0, old None).
         let ops = commit_ops(&doc, instance_id, &def_path, Some("Edited"), None);
         assert_eq!(ops.len(), 1);
-        let Operation::SetInstanceOverride { index, old, new, .. } = &ops[0] else {
+        let Operation::SetInstanceOverride {
+            index, old, new, ..
+        } = &ops[0]
+        else {
             panic!("expected SetInstanceOverride");
         };
         assert_eq!(*index, 0);
@@ -491,7 +506,11 @@ mod tests {
         let NodeData::Instance(instance) = &doc.scene.get(instance_id).unwrap().data else {
             panic!("instance");
         };
-        assert_eq!(instance.overrides.len(), 2, "content + color are distinct overrides");
+        assert_eq!(
+            instance.overrides.len(),
+            2,
+            "content + color are distinct overrides"
+        );
 
         let target = text_target_at(&doc, instance_id, DVec2::new(520.0, 330.0)).expect("target");
         assert_eq!(target.text.content, "Hi");
@@ -514,7 +533,8 @@ mod tests {
         let inner_id = inner.id;
         inner.parent = Some(root_id);
         inner.transform = Transform2D::translation(30.0, 40.0);
-        doc.apply(Operation::create_node(inner)).expect("inner group");
+        doc.apply(Operation::create_node(inner))
+            .expect("inner group");
 
         let mut text = CanvasNode::new(NodeData::Text(TextNode::new("Nested", 120.0, 30.0)));
         let text_id = text.id;
@@ -536,7 +556,8 @@ mod tests {
         }));
         let instance_id = instance.id;
         instance.transform = Transform2D::translation(500.0, 300.0);
-        doc.apply(Operation::create_node(instance)).expect("instance");
+        doc.apply(Operation::create_node(instance))
+            .expect("instance");
         doc.add_page(instance_id);
 
         let def_path: OverridePath = smallvec![inner_id, text_id];
