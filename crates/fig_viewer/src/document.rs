@@ -141,6 +141,11 @@ pub struct FigDocument {
     /// asset byte on the foreground. Assets in a format GPUI has no decoder for
     /// are absent (their row falls back to a generic glyph).
     pub gpui_images: HashMap<AssetId, Arc<Image>>,
+    /// Decoded images the agent ingested after load, layered over the
+    /// load-time resolver so placing one image never re-decodes the whole
+    /// asset set. Created lazily on the first ingestion; reset by reload
+    /// (which rebuilds the resolver from disk anyway).
+    agent_asset_overlay: Option<Arc<OverlayAssetResolver>>,
     /// Whether any node in the scene uses auto layout. Computed once at load;
     /// documents without it skip the whole-page layout re-solve after every
     /// edit, which includes text measurement and is far too slow to run per
@@ -211,6 +216,7 @@ impl FigDocument {
             asset_resolver,
             raw_assets: Arc::new(raw_assets),
             gpui_images,
+            agent_asset_overlay: None,
             uses_auto_layout,
             render_generation: 0,
         }
@@ -329,6 +335,140 @@ impl FigDocument {
         {
             self.refresh_page_bounds(index);
         }
+    }
+
+    /// Split the document into the scene [`Doc`] and mutable views of the
+    /// asset stores, so an edit batch can create nodes and ingest their image
+    /// assets in the same pass without a double borrow.
+    pub(crate) fn doc_and_assets(&mut self) -> (&mut Doc, AssetStores<'_>) {
+        (
+            &mut self.doc,
+            AssetStores {
+                raw_assets: &mut self.raw_assets,
+                asset_resolver: &mut self.asset_resolver,
+                overlay: &mut self.agent_asset_overlay,
+                gpui_images: &mut self.gpui_images,
+            },
+        )
+    }
+}
+
+/// Layers agent-ingested images over the resolver built at load, so placing
+/// one image is O(1) instead of a re-decode of every embedded asset. Interior
+/// mutability because the resolver is shared as an `Arc<dyn AssetResolver>`
+/// with background renders; reads take the lock only on the overlay map.
+pub(crate) struct OverlayAssetResolver {
+    base: Option<Arc<dyn AssetResolver>>,
+    added: std::sync::RwLock<HashMap<AssetId, DecodedImage>>,
+}
+
+impl AssetResolver for OverlayAssetResolver {
+    fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
+        if let Some(image) = self.added.read().unwrap().get(&id) {
+            return Some(image.clone());
+        }
+        self.base.as_ref()?.resolve(id)
+    }
+
+    fn resolve_bytes(&self, id: AssetId) -> Option<Arc<Vec<u8>>> {
+        self.base.as_ref()?.resolve_bytes(id)
+    }
+}
+
+/// Mutable views of every store an ingested image must reach: the raw bytes
+/// (persisted on save), the render resolver, and the GPUI thumbnail cache.
+pub(crate) struct AssetStores<'a> {
+    raw_assets: &'a mut Arc<BTreeMap<AssetId, Vec<u8>>>,
+    asset_resolver: &'a mut Option<Arc<dyn AssetResolver>>,
+    overlay: &'a mut Option<Arc<OverlayAssetResolver>>,
+    gpui_images: &'a mut HashMap<AssetId, Arc<Image>>,
+}
+
+/// Owned backing for [`AssetStores`] — for tests that exercise batch
+/// application without a full [`FigDocument`].
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestAssetStores {
+    raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>,
+    asset_resolver: Option<Arc<dyn AssetResolver>>,
+    overlay: Option<Arc<OverlayAssetResolver>>,
+    gpui_images: HashMap<AssetId, Arc<Image>>,
+}
+
+#[cfg(test)]
+impl TestAssetStores {
+    pub(crate) fn stores(&mut self) -> AssetStores<'_> {
+        AssetStores {
+            raw_assets: &mut self.raw_assets,
+            asset_resolver: &mut self.asset_resolver,
+            overlay: &mut self.overlay,
+            gpui_images: &mut self.gpui_images,
+        }
+    }
+
+    pub(crate) fn raw_assets(&self) -> &BTreeMap<AssetId, Vec<u8>> {
+        &self.raw_assets
+    }
+
+    pub(crate) fn resolver(&self) -> Option<&Arc<dyn AssetResolver>> {
+        self.asset_resolver.as_ref()
+    }
+}
+
+impl AssetStores<'_> {
+    /// Ingest encoded image bytes as a fresh project asset. Decodes eagerly
+    /// (so a corrupt payload fails the op instead of rendering a placeholder)
+    /// and returns the new id plus the natural pixel size.
+    pub(crate) fn add_image(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2])> {
+        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
+        let id = AssetId::new();
+
+        // `raw_assets` is shared behind an `Arc` (the Assets panel keys its
+        // cache on pointer identity), so ingesting clones the byte map. Fine
+        // for occasional agent placements; batch imports should get a
+        // shared-bytes representation first.
+        let mut raw = (**self.raw_assets).clone();
+        raw.insert(id, bytes.clone());
+        *self.raw_assets = Arc::new(raw);
+
+        if self.overlay.is_none() {
+            *self.overlay = Some(Arc::new(OverlayAssetResolver {
+                base: self.asset_resolver.clone(),
+                added: std::sync::RwLock::new(HashMap::default()),
+            }));
+        }
+        let overlay = self.overlay.as_ref().expect("just ensured above");
+        overlay.added.write().unwrap().insert(
+            id,
+            DecodedImage::new(Arc::new(rgba.into_raw()), width, height),
+        );
+        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+
+        if let Some(format) = image::guess_format(&bytes)
+            .ok()
+            .and_then(gpui_image_format)
+        {
+            self.gpui_images
+                .insert(id, Arc::new(Image::from_bytes(format, bytes)));
+        }
+        Ok((id, [width, height]))
+    }
+
+    /// Drop an asset ingested by [`add_image`](Self::add_image) again — the
+    /// rollback path when a batch fails after ingesting.
+    pub(crate) fn remove(&mut self, id: AssetId) {
+        if self.raw_assets.contains_key(&id) {
+            let mut raw = (**self.raw_assets).clone();
+            raw.remove(&id);
+            *self.raw_assets = Arc::new(raw);
+        }
+        if let Some(overlay) = self.overlay.as_ref() {
+            overlay.added.write().unwrap().remove(&id);
+        }
+        self.gpui_images.remove(&id);
     }
 }
 

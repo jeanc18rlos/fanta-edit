@@ -9,17 +9,19 @@ use std::path::Path;
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
 use design_surface::{DesignNodeType, DesignOp, DesignSurface, NodeQuery, ScreenshotTarget};
 use fanta_doc::{
-    CanvasNode, Color, Doc, Fill, GroupNode, IndexKey, NodeData, NodeFlags, NodeId, Operation,
-    PathData, TextNode, Transform2D, UnitInterval, VectorNode, Viewport,
+    AssetId, BitmapNode, CanvasNode, Color, Doc, Fill, GroupNode, ImageFitMode, IndexKey,
+    NodeData, NodeFlags, NodeId, Operation, PathData, TextNode, Transform2D, UnitInterval,
+    VectorNode, Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::document::{DocChange, FigDocument, FigItem, page_bounds};
+use crate::document::{AssetStores, DocChange, FigDocument, FigItem, page_bounds};
 use crate::export::render_inputs;
 use crate::properties_ops::{
     DEFAULT_FILL_COLOR, parse_color, replace_data_operation, resize_operations, set_corner_radius,
@@ -159,7 +161,8 @@ impl DesignSurface for FigDesignSurface {
                 bail!("the design document is still loading");
             }
             item.with_document(cx, |document| {
-                let outcome = apply_batch(&mut document.doc, &ops, &label);
+                let (doc, mut assets) = document.doc_and_assets();
+                let outcome = apply_batch(doc, &mut assets, &ops, &label);
                 (Ok(outcome.value), outcome.change)
             })
             .unwrap_or_else(|| Err(anyhow!("the document is no longer available")))
@@ -414,17 +417,24 @@ enum Applied {
 
 /// Apply the batch inside one history transaction: all content ops commit as
 /// a single undo step, and any failure rolls the content back (selection and
-/// viewport changes are not transactional).
-fn apply_batch(doc: &mut Doc, ops: &[DesignOp], label: &str) -> BatchOutcome {
+/// viewport changes are not transactional). Image assets ingested by
+/// `create_image` ops are removed again when the batch rolls back.
+fn apply_batch(
+    doc: &mut Doc,
+    assets: &mut AssetStores<'_>,
+    ops: &[DesignOp],
+    label: &str,
+) -> BatchOutcome {
     let mut created: Vec<String> = Vec::new();
     let mut statuses: Vec<Value> = Vec::new();
+    let mut ingested_assets: Vec<AssetId> = Vec::new();
     let mut content_changed = false;
     let mut selection_changed = false;
     let mut failure: Option<(usize, String)> = None;
 
     doc.history.begin(label, &mut doc.scene);
     for (index, op) in ops.iter().enumerate() {
-        match apply_one(doc, op) {
+        match apply_one(doc, assets, &mut ingested_assets, op) {
             Ok(Applied::Content { created: id }) => {
                 content_changed = true;
                 let mut status = json!({ "index": index, "status": "ok" });
@@ -466,6 +476,9 @@ fn apply_batch(doc: &mut Doc, ops: &[DesignOp], label: &str) -> BatchOutcome {
             if let Err(abort_error) = doc.history.abort(&mut doc.scene) {
                 message = format!("{message}; rolling back also failed: {abort_error}");
             }
+            for asset in ingested_assets {
+                assets.remove(asset);
+            }
             statuses.push(json!({ "index": index, "status": "failed", "error": message }));
             for skipped in index + 1..ops.len() {
                 statuses.push(json!({ "index": skipped, "status": "skipped" }));
@@ -486,8 +499,76 @@ fn apply_batch(doc: &mut Doc, ops: &[DesignOp], label: &str) -> BatchOutcome {
     }
 }
 
-fn apply_one(doc: &mut Doc, op: &DesignOp) -> Result<Applied> {
+fn apply_one(
+    doc: &mut Doc,
+    assets: &mut AssetStores<'_>,
+    ingested_assets: &mut Vec<AssetId>,
+    op: &DesignOp,
+) -> Result<Applied> {
     match op {
+        DesignOp::CreateImage {
+            source,
+            parent,
+            name,
+            x,
+            y,
+            width,
+            height,
+            meta,
+        } => {
+            let parent = resolve_container(doc, parent.as_deref())?;
+            let bytes = decode_image_source(source)?;
+            let (asset, natural_size) = assets.add_image(bytes)?;
+            // Track before any fallible step so a later failure in this batch
+            // rolls the asset back out of the stores too.
+            ingested_assets.push(asset);
+
+            let natural_width = f64::from(natural_size[0].max(1));
+            let natural_height = f64::from(natural_size[1].max(1));
+            let (width, height) = match (width, height) {
+                (Some(width), Some(height)) => (*width, *height),
+                (Some(width), None) => (*width, width * natural_height / natural_width),
+                (None, Some(height)) => (height * natural_width / natural_height, *height),
+                (None, None) => (natural_width, natural_height),
+            };
+            if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+                bail!("width and height must be positive");
+            }
+
+            let mut node = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+                asset,
+                natural_size,
+                local_size: [width, height],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }));
+            if let Some(name) = name {
+                node.name = name.clone();
+            }
+            let parent_world = parent
+                .and_then(|parent| doc.scene.world_transform(parent))
+                .unwrap_or(Transform2D::IDENTITY);
+            node.parent = parent;
+            node.index = doc.scene.next_child_index(parent);
+            node.transform = Transform2D::translation(*x, *y).then(&parent_world.inverse());
+            let id = node.id;
+            doc.apply(Operation::create_node(node))
+                .context("creating the image node")?;
+            if let Some(meta) = meta
+                && !meta.is_null()
+            {
+                doc.apply(Operation::SetMeta {
+                    id,
+                    old: Value::Null,
+                    new: meta.clone(),
+                })
+                .context("recording the image node's metadata")?;
+            }
+            Ok(Applied::Content {
+                created: Some(id.to_string()),
+            })
+        }
         DesignOp::CreateNode {
             node_type,
             parent,
@@ -906,6 +987,49 @@ fn sibling_index(
     Ok(IndexKey::between(left, right))
 }
 
+/// Cap on a `create_image` payload after base64 decoding. Generous for any
+/// generated PNG while keeping a bad tool call from ballooning the document.
+const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Decode a `create_image` source: a `data:` URI or raw base64. URLs are
+/// deliberately not fetched here — the surface is synchronous and network
+/// access belongs to the tool layer (`place_generation`), which downloads and
+/// re-issues the op with base64.
+fn decode_image_source(source: &str) -> Result<Vec<u8>> {
+    let source = source.trim();
+    if source.starts_with("http://") || source.starts_with("https://") {
+        bail!(
+            "create_image does not fetch URLs; use the place_generation tool, or fetch the \
+             bytes yourself and pass them as base64"
+        );
+    }
+    let payload = match source.strip_prefix("data:") {
+        Some(rest) => {
+            let (header, payload) = rest
+                .split_once(',')
+                .context("the data: URI has no `,` separating the payload")?;
+            if !header.ends_with(";base64") {
+                bail!("only base64 data: URIs are supported");
+            }
+            payload
+        }
+        None => source,
+    };
+    // Models occasionally hard-wrap long base64 payloads; strip whitespace
+    // before decoding so that doesn't fail the op.
+    let compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact.as_bytes())
+        .context("the image source is not valid base64")?;
+    if bytes.len() > MAX_IMAGE_SOURCE_BYTES {
+        bail!(
+            "the image is {} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES}",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
 fn parse_fill_color(raw: &str) -> Result<Color> {
     parse_color(raw)
         .with_context(|| format!("`{raw}` is not a valid hex color (use #RRGGBB or #RRGGBBAA)"))
@@ -962,10 +1086,113 @@ mod tests {
             .expect("created id parses")
     }
 
+    /// Run a batch against throwaway asset stores (for tests that don't
+    /// place images).
+    fn run_batch(doc: &mut Doc, ops: &[DesignOp], label: &str) -> BatchOutcome {
+        let mut stores = crate::document::TestAssetStores::default();
+        apply_batch(doc, &mut stores.stores(), ops, label)
+    }
+
+    /// A tiny valid PNG (2x1, opaque) as base64.
+    fn tiny_png_base64() -> String {
+        let mut png = Vec::new();
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 0, 0, 255]));
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encoding the fixture PNG");
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    }
+
+    #[test]
+    fn create_image_ingests_the_asset_and_places_a_bitmap_node() {
+        let (mut doc, page_id) = doc_with_page();
+        let mut stores = crate::document::TestAssetStores::default();
+        let outcome = apply_batch(
+            &mut doc,
+            &mut stores.stores(),
+            &ops(json!([
+                {"op": "create_image", "source": tiny_png_base64(), "name": "Hero",
+                 "x": 5.0, "y": 7.0, "width": 200.0,
+                 "meta": {"generation": {"prompt": "a hero", "model": "m1", "generation_id": "g1"}}},
+            ])),
+            "Place image",
+        );
+        assert_eq!(outcome.value["applied"], json!(true));
+        let id = created_id(&outcome, 0);
+        let node = doc.scene.get(id).unwrap();
+        assert_eq!(node.parent, Some(page_id));
+        assert_eq!(node.name, "Hero");
+        let NodeData::Bitmap(bitmap) = &node.data else {
+            panic!("expected a bitmap node");
+        };
+        assert_eq!(bitmap.natural_size, [2, 1]);
+        // One dimension given: the other follows the 2:1 natural aspect.
+        assert_eq!(bitmap.local_size, [200.0, 100.0]);
+        assert_eq!(
+            node.meta["generation"]["prompt"],
+            json!("a hero"),
+            "provenance lands in node meta"
+        );
+
+        // The asset is in the raw store (for save) and resolvable (for render).
+        assert_eq!(stores.raw_assets().len(), 1);
+        assert!(stores.raw_assets().contains_key(&bitmap.asset));
+        let resolved = stores
+            .resolver()
+            .expect("resolver present after ingest")
+            .resolve(bitmap.asset)
+            .expect("the new asset resolves");
+        assert_eq!((resolved.width, resolved.height), (2, 1));
+    }
+
+    #[test]
+    fn failing_batch_rolls_back_ingested_assets() {
+        let (mut doc, _) = doc_with_page();
+        let mut stores = crate::document::TestAssetStores::default();
+        let outcome = apply_batch(
+            &mut doc,
+            &mut stores.stores(),
+            &ops(json!([
+                {"op": "create_image", "source": tiny_png_base64(),
+                 "x": 0.0, "y": 0.0},
+                {"op": "delete", "id": "not-a-node"},
+            ])),
+            "Broken image batch",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        assert_eq!(stores.raw_assets().len(), 0, "the ingested asset was rolled back");
+    }
+
+    #[test]
+    fn create_image_refuses_urls_and_junk() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_image", "source": "https://example.com/cat.png",
+                 "x": 0.0, "y": 0.0},
+            ])),
+            "URL image",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        let error = outcome.value["ops"][0]["error"].as_str().unwrap();
+        assert!(error.contains("place_generation"), "error steers to the tool: {error}");
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_image", "source": "bm90IGFuIGltYWdl", // "not an image"
+                 "x": 0.0, "y": 0.0},
+            ])),
+            "Junk image",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+    }
+
     #[test]
     fn create_batch_places_nodes_on_the_active_page_as_one_undo_step() {
         let (mut doc, page_id) = doc_with_page();
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "create_node", "node_type": "frame", "name": "Card",
@@ -1003,7 +1230,7 @@ mod tests {
     #[test]
     fn set_props_addresses_world_bounds_and_restyles_in_place() {
         let (mut doc, _) = doc_with_page();
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "create_node", "node_type": "rectangle",
@@ -1013,7 +1240,7 @@ mod tests {
         );
         let id = created_id(&outcome, 0);
 
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "set_props", "id": id.to_string(), "x": 50.0, "y": 60.0,
@@ -1039,7 +1266,7 @@ mod tests {
     #[test]
     fn reparent_preserves_world_position() {
         let (mut doc, page_id) = doc_with_page();
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "create_node", "node_type": "frame",
@@ -1053,7 +1280,7 @@ mod tests {
         let rect = created_id(&outcome, 1);
         assert_eq!(doc.scene.get(rect).unwrap().parent, Some(page_id));
 
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "reparent", "id": rect.to_string(), "parent": frame.to_string()},
@@ -1070,7 +1297,7 @@ mod tests {
     fn failing_op_rolls_back_the_whole_batch() {
         let (mut doc, _) = doc_with_page();
         let nodes_before = doc.scene.len();
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "create_node", "node_type": "rectangle",
@@ -1090,7 +1317,7 @@ mod tests {
     #[test]
     fn delete_removes_the_subtree_and_prunes_selection() {
         let (mut doc, _) = doc_with_page();
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "create_node", "node_type": "frame",
@@ -1099,7 +1326,7 @@ mod tests {
             "Create",
         );
         let frame = created_id(&outcome, 0);
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([
                 {"op": "create_node", "node_type": "ellipse", "parent": frame.to_string(),
@@ -1110,7 +1337,7 @@ mod tests {
         let ellipse = created_id(&outcome, 0);
         doc.selection.select_only(ellipse);
 
-        let outcome = apply_batch(
+        let outcome = run_batch(
             &mut doc,
             &ops(json!([{"op": "delete", "id": frame.to_string()}])),
             "Delete",

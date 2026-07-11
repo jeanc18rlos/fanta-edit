@@ -6758,6 +6758,7 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "assets",
+ "base64 0.22.1",
  "buffer_diff",
  "core-foundation 0.10.0",
  "core-video",

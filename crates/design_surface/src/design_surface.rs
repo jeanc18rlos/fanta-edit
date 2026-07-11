@@ -54,6 +54,34 @@ pub enum DesignOp {
         #[serde(default)]
         font_size: Option<f32>,
     },
+    /// Place an image on the canvas as a bitmap layer. The image bytes are
+    /// ingested as a project asset (written to `assets/images/` on save) and
+    /// the node references it by asset id.
+    CreateImage {
+        /// The image content: a `data:image/...;base64,...` URI or raw base64
+        /// of the encoded bytes (PNG/JPEG/WebP/GIF). `http(s)` URLs are NOT
+        /// fetched here — the `place_generation` tool downloads a URL and
+        /// places it in one step.
+        source: String,
+        /// Id of the parent frame/group. Omit to place on the active page.
+        #[serde(default)]
+        parent: Option<String>,
+        /// Layer name. Omit for the default ("Image").
+        #[serde(default)]
+        name: Option<String>,
+        x: f64,
+        y: f64,
+        /// Placed width in canvas units. Omit both to use the image's natural
+        /// pixel size; give one and the other scales to preserve aspect.
+        #[serde(default)]
+        width: Option<f64>,
+        #[serde(default)]
+        height: Option<f64>,
+        /// JSON stored in the node's metadata (e.g. AI generation provenance
+        /// `{prompt, model, generation_id}`).
+        #[serde(default)]
+        meta: Option<serde_json::Value>,
+    },
     /// Update properties of an existing node. Only the provided fields change.
     SetProps {
         id: String,
