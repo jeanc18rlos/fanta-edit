@@ -204,7 +204,7 @@ impl AgentTool for PlaceGenerationTool {
                 };
                 event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
                     acp::ToolCallContent::Content(acp::Content::new(acp::ContentBlock::Image(
-                        acp::ImageContent::new(image.source.clone(), mime),
+                        acp::ImageContent::new(image.source, mime),
                     ))),
                 ]));
             }

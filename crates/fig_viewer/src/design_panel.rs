@@ -2503,7 +2503,7 @@ impl FantaDesignPanel {
                             .id(("fanta-component-name", index))
                             .flex_1()
                             .min_w_0()
-                            .tooltip(Tooltip::text(component_name.clone()))
+                            .tooltip(Tooltip::text(component_name))
                             .child(
                                 Label::new(name)
                                     .single_line()
