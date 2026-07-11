@@ -52,6 +52,7 @@ members = [
     "crates/debugger_tools",
     "crates/debugger_ui",
     "crates/deepseek",
+    "crates/design_surface",
     "crates/dev_container",
     "crates/diagnostics",
     "crates/docs_preprocessor",
@@ -322,6 +323,7 @@ debugger_tools = { path = "crates/debugger_tools" }
 debugger_ui = { path = "crates/debugger_ui" }
 deepseek = { path = "crates/deepseek" }
 derive_refineable = { path = "crates/refineable/derive_refineable" }
+design_surface = { path = "crates/design_surface" }
 dev_container = { path = "crates/dev_container" }
 diagnostics = { path = "crates/diagnostics" }
 dialoguer = { version = "0.12", default-features = false }
