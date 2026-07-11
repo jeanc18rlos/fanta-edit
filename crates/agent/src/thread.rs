@@ -3,7 +3,8 @@ use crate::{
     CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DesignEditTool,
     DesignScreenshotTool, DesignStateTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
     FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
-    ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool,
+    ListDirectoryTool, MovePathTool, PlaceGenerationTool, ProjectSnapshot, ReadFileTool,
+    RenameTool,
     SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
     ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
@@ -2143,6 +2144,9 @@ impl Thread {
         self.add_tool(DesignStateTool);
         self.add_tool(DesignEditTool);
         self.add_tool(DesignScreenshotTool);
+        self.add_tool(PlaceGenerationTool::new(
+            self.project.read(cx).client().http_client(),
+        ));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 

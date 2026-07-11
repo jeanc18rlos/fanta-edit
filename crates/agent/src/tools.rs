@@ -21,6 +21,7 @@ mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
 mod move_path_tool;
+mod place_generation_tool;
 mod read_file_tool;
 mod rename_tool;
 mod skill_tool;
@@ -85,6 +86,7 @@ pub use grep_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
 pub use move_path_tool::*;
+pub use place_generation_tool::*;
 pub use read_file_tool::*;
 pub use rename_tool::*;
 pub use skill_tool::*;
@@ -211,6 +213,7 @@ tools! {
     ListAgentsAndModelsTool,
     ListDirectoryTool,
     MovePathTool,
+    PlaceGenerationTool,
     ReadFileTool,
     RenameTool,
     SkillTool,
@@ -249,10 +252,13 @@ mod tests {
     fn fetch_and_terminal_are_forbidden_in_restricted_mode() {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(PlaceGenerationTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
-            let expected = *name != FetchTool::NAME && *name != TerminalTool::NAME;
+            let expected = *name != FetchTool::NAME
+                && *name != TerminalTool::NAME
+                && *name != PlaceGenerationTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

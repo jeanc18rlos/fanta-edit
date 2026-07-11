@@ -1418,6 +1418,10 @@ mod tests {
             "list_agents_and_models",
             "list_directory",
             "open",
+            // place_generation's download is gated by the shared per-host
+            // network grants (like fetch's host lane), and the placement is an
+            // in-memory, undoable canvas edit — no tool_permissions rules.
+            "place_generation",
             "read_file",
             "rename_symbol",
             "thinking",

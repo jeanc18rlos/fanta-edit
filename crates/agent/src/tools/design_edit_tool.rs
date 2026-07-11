@@ -14,14 +14,16 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 }
 
 /// Edit the open design canvas by applying a batch of ops in order:
-/// `create_node` (frame, rectangle, ellipse, text), `set_props`, `reparent`,
-/// `delete`, `select`, and `set_viewport`.
+/// `create_node` (frame, rectangle, ellipse, text), `create_image` (base64 or
+/// data: URI source; becomes a project asset + bitmap layer), `set_props`,
+/// `reparent`, `delete`, `select`, and `set_viewport`.
 ///
 /// The batch is one undoable transaction: if any op fails, everything rolls
 /// back and the result reports the failing op so it can be corrected. `x`/`y`
 /// are world (canvas) coordinates of a node's top-left corner. Created node
 /// ids are returned in creation order. Verify the result with
-/// `design_screenshot` after substantive edits.
+/// `design_screenshot` after substantive edits. To place an image from a URL
+/// (e.g. a finished AI generation), use `place_generation` instead.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignEditToolInput {
     /// The ops to apply, in order.
