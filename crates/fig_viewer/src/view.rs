@@ -361,6 +361,13 @@ impl FigView {
                 this.handle_timeline_event(event.clone(), cx);
             });
         let focus_handle = cx.focus_handle();
+        // The agent's design tools target the most recently opened or focused
+        // canvas; keep the registry pointed at this item.
+        crate::agent_surface::set_active_item(item.downgrade(), cx);
+        cx.on_focus(&focus_handle, window, |this: &mut Self, _, cx| {
+            crate::agent_surface::set_active_item(this.item.downgrade(), cx);
+        })
+        .detach();
         // A space held across a focus change (panel click, window switch, a
         // text session opening) delivers its key-up elsewhere; without this
         // reset `space_pan` stays true and the Select tool pans with a hand

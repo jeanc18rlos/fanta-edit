@@ -407,7 +407,7 @@ fn render_pdf(batch: &ExportBatch, document: &Doc, target: &ExportTarget) -> Res
     Ok(pdf)
 }
 
-fn render_inputs(document: &Doc) -> RenderInputs<'_> {
+pub(crate) fn render_inputs(document: &Doc) -> RenderInputs<'_> {
     RenderInputs {
         components: &document.components,
         variables: &document.variables,
