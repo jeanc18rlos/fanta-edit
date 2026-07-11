@@ -934,3 +934,190 @@ fn set_solid_fill(data: &mut NodeData, color: Color) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ops(value: Value) -> Vec<DesignOp> {
+        serde_json::from_value(value).expect("ops JSON matches the DesignOp schema")
+    }
+
+    fn doc_with_page() -> (Doc, NodeId) {
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).unwrap();
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        doc.history = Default::default();
+        (doc, page_id)
+    }
+
+    fn created_id(outcome: &BatchOutcome, index: usize) -> NodeId {
+        outcome.value["created"][index]
+            .as_str()
+            .expect("created id present")
+            .parse()
+            .expect("created id parses")
+    }
+
+    #[test]
+    fn create_batch_places_nodes_on_the_active_page_as_one_undo_step() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Card",
+                 "x": 10.0, "y": 20.0, "width": 200.0, "height": 100.0, "fill": "#FFFFFF"},
+                {"op": "create_node", "node_type": "text", "text": "Hello",
+                 "x": 26.0, "y": 36.0, "width": 120.0, "height": 24.0, "font_size": 14.0},
+            ])),
+            "Create card",
+        );
+        assert_eq!(outcome.value["applied"], json!(true));
+        assert_eq!(outcome.change, DocChange::Content);
+
+        let frame = created_id(&outcome, 0);
+        let text = created_id(&outcome, 1);
+        assert_eq!(doc.scene.get(frame).unwrap().parent, Some(page_id));
+        assert_eq!(doc.scene.get(frame).unwrap().name, "Card");
+        let bounds = doc.scene.world_bounds(frame).unwrap();
+        assert_eq!(
+            (bounds.min_x, bounds.min_y, bounds.width(), bounds.height()),
+            (10.0, 20.0, 200.0, 100.0)
+        );
+        let NodeData::Text(text_node) = &doc.scene.get(text).unwrap().data else {
+            panic!("expected a text node");
+        };
+        assert_eq!(text_node.content, "Hello");
+        assert_eq!(text_node.style.size_px, 14.0);
+
+        // The whole batch is one undo step.
+        assert_eq!(doc.history.undo_depth(), 1);
+        assert!(doc.undo().unwrap());
+        assert!(!doc.scene.contains(frame));
+        assert!(!doc.scene.contains(text));
+    }
+
+    #[test]
+    fn set_props_addresses_world_bounds_and_restyles_in_place() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "rectangle",
+                 "x": 0.0, "y": 0.0, "width": 40.0, "height": 40.0},
+            ])),
+            "Create",
+        );
+        let id = created_id(&outcome, 0);
+
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_props", "id": id.to_string(), "x": 50.0, "y": 60.0,
+                 "fill": "#FF0000", "corner_radius": 8.0, "opacity": 0.5},
+            ])),
+            "Restyle",
+        );
+        assert_eq!(outcome.value["applied"], json!(true));
+        let bounds = doc.scene.world_bounds(id).unwrap();
+        assert_eq!((bounds.min_x, bounds.min_y), (50.0, 60.0));
+        let node = doc.scene.get(id).unwrap();
+        assert_eq!(node.opacity, UnitInterval::new(0.5));
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("expected a vector node");
+        };
+        assert_eq!(vector.corner_radius, Some(8.0));
+        assert_eq!(
+            vector.fills.first().and_then(Fill::solid_color),
+            parse_color("#FF0000")
+        );
+    }
+
+    #[test]
+    fn reparent_preserves_world_position() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 100.0, "y": 100.0, "width": 300.0, "height": 200.0},
+                {"op": "create_node", "node_type": "rectangle",
+                 "x": 120.0, "y": 130.0, "width": 40.0, "height": 40.0},
+            ])),
+            "Create",
+        );
+        let frame = created_id(&outcome, 0);
+        let rect = created_id(&outcome, 1);
+        assert_eq!(doc.scene.get(rect).unwrap().parent, Some(page_id));
+
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "reparent", "id": rect.to_string(), "parent": frame.to_string()},
+            ])),
+            "Nest",
+        );
+        assert_eq!(outcome.value["applied"], json!(true));
+        assert_eq!(doc.scene.get(rect).unwrap().parent, Some(frame));
+        let bounds = doc.scene.world_bounds(rect).unwrap();
+        assert_eq!((bounds.min_x, bounds.min_y), (120.0, 130.0));
+    }
+
+    #[test]
+    fn failing_op_rolls_back_the_whole_batch() {
+        let (mut doc, _) = doc_with_page();
+        let nodes_before = doc.scene.len();
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "rectangle",
+                 "x": 0.0, "y": 0.0, "width": 40.0, "height": 40.0},
+                {"op": "delete", "id": "not-a-node"},
+            ])),
+            "Broken batch",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        assert_eq!(outcome.change, DocChange::None);
+        assert_eq!(outcome.value["ops"][1]["status"], json!("failed"));
+        assert_eq!(outcome.value["ops"][0]["status"], json!("ok"));
+        assert_eq!(doc.scene.len(), nodes_before, "the created node was rolled back");
+        assert_eq!(doc.history.undo_depth(), 0, "no undo step for a failed batch");
+    }
+
+    #[test]
+    fn delete_removes_the_subtree_and_prunes_selection() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0},
+            ])),
+            "Create",
+        );
+        let frame = created_id(&outcome, 0);
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "ellipse", "parent": frame.to_string(),
+                 "x": 10.0, "y": 10.0, "width": 20.0, "height": 20.0},
+            ])),
+            "Fill in",
+        );
+        let ellipse = created_id(&outcome, 0);
+        doc.selection.select_only(ellipse);
+
+        let outcome = apply_batch(
+            &mut doc,
+            &ops(json!([{"op": "delete", "id": frame.to_string()}])),
+            "Delete",
+        );
+        assert_eq!(outcome.value["applied"], json!(true));
+        assert!(!doc.scene.contains(frame));
+        assert!(!doc.scene.contains(ellipse));
+        assert!(doc.selection.iter().next().is_none());
+    }
+}
