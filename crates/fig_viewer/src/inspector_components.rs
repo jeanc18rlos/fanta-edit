@@ -6,8 +6,8 @@ use gpui::{
 };
 use ui::prelude::*;
 
-const SECTION_HEADER_HEIGHT: f32 = 28.0;
-const PROPERTY_LABEL_WIDTH: f32 = 76.0;
+const SECTION_HEADER_HEIGHT: f32 = 32.0;
+const PROPERTY_LABEL_WIDTH: f32 = 72.0;
 
 type TabHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -220,7 +220,9 @@ impl InspectorSectionHeader {
 
 impl RenderOnce for InspectorSectionHeader {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        h_flex()
+        #[cfg(test)]
+        let debug_title = self.title.clone();
+        let header = h_flex()
             .px_4()
             .h(px(SECTION_HEADER_HEIGHT))
             .items_center()
@@ -231,9 +233,14 @@ impl RenderOnce for InspectorSectionHeader {
             .child(
                 Label::new(self.title)
                     .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::BOLD),
+                    .weight(gpui::FontWeight::SEMIBOLD)
+                    .line_height_style(LineHeightStyle::UiLabel),
             )
-            .children(self.action)
+            .children(self.action);
+        #[cfg(test)]
+        let header =
+            header.debug_selector(move || format!("fanta-inspector-section-header-{debug_title}"));
+        header
     }
 }
 
@@ -268,7 +275,10 @@ impl InspectorPropertyRow {
 
 impl RenderOnce for InspectorPropertyRow {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        h_flex()
+        #[cfg(test)]
+        let debug_label = self.label.clone();
+        let row = h_flex()
+            .min_h(px(28.))
             .gap_2()
             .items_center()
             .when(self.inset, |row| row.px_4())
@@ -280,7 +290,10 @@ impl RenderOnce for InspectorPropertyRow {
                         .single_line(),
                 ),
             )
-            .child(div().flex_1().min_w_0().child(self.content))
+            .child(div().flex_1().min_w_0().child(self.content));
+        #[cfg(test)]
+        let row = row.debug_selector(move || format!("fanta-inspector-property-row-{debug_label}"));
+        row
     }
 }
 
@@ -310,7 +323,23 @@ impl RenderOnce for InspectorMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::InspectorSectionHeader;
+    use gpui::{Context, Render, TestAppContext, size};
+
+    use super::{InspectorPropertyRow, InspectorSectionHeader, *};
+
+    struct InspectorHarness;
+
+    impl Render for InspectorHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .w(px(320.))
+                .child(InspectorSectionHeader::new("Typography").without_top_border())
+                .child(InspectorPropertyRow::new(
+                    "Family",
+                    div().h(px(28.)).w_full(),
+                ))
+        }
+    }
 
     #[test]
     fn section_owner_can_disable_the_headers_builtin_separator() {
@@ -320,5 +349,29 @@ mod tests {
                 .without_top_border()
                 .top_border
         );
+    }
+
+    #[gpui::test]
+    fn inspector_atoms_keep_the_release_density(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        let window = cx.add_window(|_, _| InspectorHarness);
+        let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual_context.simulate_resize(size(px(320.), px(120.)));
+        visual_context.update(|window, cx| window.draw(cx).clear());
+
+        let header = visual_context
+            .debug_bounds("fanta-inspector-section-header-Typography")
+            .expect("typography section header");
+        let row = visual_context
+            .debug_bounds("fanta-inspector-property-row-Family")
+            .expect("family property row");
+        assert_eq!(header.size.height, px(SECTION_HEADER_HEIGHT));
+        assert_eq!(row.size.height, px(28.));
     }
 }

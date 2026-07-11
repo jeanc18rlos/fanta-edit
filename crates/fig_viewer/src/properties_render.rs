@@ -19,6 +19,8 @@ use ui::{
     Tooltip,
 };
 
+use fanta_ui::font_family_picker::FontFamilyPicker;
+
 use crate::color_picker::gradient_preview_strip;
 use crate::component_properties::CreateComponentPropertyKind;
 use crate::export::{EXPORT_FORMATS, EXPORT_SCALES};
@@ -1787,6 +1789,29 @@ impl FantaPropertiesPanel {
             editable,
             cx,
         );
+        let mut font_families = theme::FontFamilyCache::global(cx)
+            .try_list_font_families()
+            .unwrap_or_default();
+        font_families.retain(|family| !family.starts_with('.'));
+        font_families.extend(fanta_text::bundled_family_names().map(SharedString::from));
+        let apply_panel = cx.weak_entity();
+        let open_panel = cx.weak_entity();
+        let font_picker = FontFamilyPicker::new(
+            "fanta-font-family",
+            typography.font_family.clone(),
+            font_families,
+            move |family, _, cx| {
+                apply_panel
+                    .update(cx, |panel, cx| panel.set_font_family(id, family, cx))
+                    .log_err();
+            },
+        )
+        .disabled(!editable)
+        .on_open(move |_, cx| {
+            open_panel
+                .update(cx, |panel, cx| panel.prepare_font_family_picker(id, cx))
+                .log_err();
+        });
         v_flex()
             .py_1()
             .gap_2()
@@ -1794,15 +1819,7 @@ impl FantaPropertiesPanel {
                 "Typography",
                 text_style_binding,
             ))
-            .child(h_flex().px_4().child(self.render_text_cell(
-                "fanta-font-family",
-                0,
-                Some("Aa".into()),
-                InspectorField::FontFamily(id),
-                typography.font_family.clone().into(),
-                editable.then(|| typography.font_family.clone()),
-                cx,
-            )))
+            .child(h_flex().px_4().child(font_picker))
             .child(
                 h_flex()
                     .px_4()
@@ -1810,7 +1827,7 @@ impl FantaPropertiesPanel {
                     .child(self.render_labeled_dropdown(
                         "fanta-font-weight",
                         "Font weight",
-                        font_weight_label(typography.weight).into(),
+                        font_weight_label(typography.weight),
                         id,
                         typography.weight,
                         &FONT_WEIGHTS,
@@ -1825,7 +1842,7 @@ impl FantaPropertiesPanel {
                         Some("S".into()),
                         InspectorField::FontSize(id),
                         Some(typography.size_px),
-                        None,
+                        Some("px"),
                         editable,
                         cx,
                     ))),
@@ -1840,7 +1857,7 @@ impl FantaPropertiesPanel {
                         Some("LH".into()),
                         InspectorField::LineHeight(id),
                         Some(typography.line_height),
-                        None,
+                        Some("×"),
                         editable,
                         cx,
                     ))
@@ -1850,7 +1867,7 @@ impl FantaPropertiesPanel {
                         Some("LS".into()),
                         InspectorField::LetterSpacing(id),
                         Some(typography.letter_spacing),
-                        None,
+                        Some("px"),
                         editable,
                         cx,
                     )),
@@ -1954,7 +1971,6 @@ impl FantaPropertiesPanel {
             .items_center()
             .child(Self::pill_label("Style"))
             .child(strip)
-            .child(div().flex_1())
             .into_any_element()
     }
 

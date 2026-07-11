@@ -397,15 +397,18 @@ pub(crate) const BLEND_MODES: [(BlendMode, &str); 16] = [
 ];
 
 /// The OpenType weights the typography dropdown offers. The model stores the
-/// numeric weight (100–900), so an off-list value round-trips untouched and is
-/// labeled "Custom" instead of snapping onto the nearest stop.
-pub(crate) const FONT_WEIGHTS: [(u16, &str); 6] = [
+/// numeric weight (100–900), so an intermediate value round-trips untouched and
+/// is labeled with its exact number instead of snapping onto the nearest stop.
+pub(crate) const FONT_WEIGHTS: [(u16, &str); 9] = [
+    (100, "Thin"),
+    (200, "Extra Light"),
     (300, "Light"),
     (400, "Regular"),
     (500, "Medium"),
-    (600, "SemiBold"),
+    (600, "Semi Bold"),
     (700, "Bold"),
-    (800, "ExtraBold"),
+    (800, "Extra Bold"),
+    (900, "Black"),
 ];
 
 /// The paint types the fill/stroke type selector offers, in cycle order.

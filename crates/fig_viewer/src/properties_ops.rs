@@ -278,6 +278,7 @@ pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) ->
                 replace_data_operation(doc, *id, |data| {
                     if let NodeData::Text(node_text) = data {
                         node_text.style.line_height = line_height;
+                        node_text.style.line_height_auto_percent = None;
                     }
                 })
             })
@@ -1498,15 +1499,14 @@ pub(crate) fn parse_color(text: &str) -> Option<FantaColor> {
     FantaColor::from_hex(&format!("#{trimmed}"))
 }
 
-/// The dropdown label for a numeric OpenType weight. Weights off the standard
-/// ladder (an imported 350 or 900) read "Custom" and are never rewritten —
-/// only an explicit pick from the menu changes the stored value.
-pub(crate) fn font_weight_label(weight: u16) -> &'static str {
+/// The dropdown label for a numeric OpenType weight. Values between the standard
+/// 100-step stops retain their exact number and are never snapped onto a stop.
+pub(crate) fn font_weight_label(weight: u16) -> gpui::SharedString {
     FONT_WEIGHTS
         .iter()
         .find(|(value, _)| *value == weight)
-        .map(|(_, label)| *label)
-        .unwrap_or("Custom")
+        .map(|(_, label)| gpui::SharedString::from(*label))
+        .unwrap_or_else(|| format!("Custom · {weight}").into())
 }
 
 pub(crate) fn fanta_color_rgba(color: FantaColor) -> Rgba {
@@ -1533,19 +1533,42 @@ mod tests {
 
     #[test]
     fn font_weight_dropdown_labels_the_ladder_and_keeps_custom_weights() {
+        assert_eq!(font_weight_label(100), "Thin");
+        assert_eq!(font_weight_label(200), "Extra Light");
         assert_eq!(font_weight_label(300), "Light");
         assert_eq!(font_weight_label(400), "Regular");
         assert_eq!(font_weight_label(500), "Medium");
-        assert_eq!(font_weight_label(600), "SemiBold");
+        assert_eq!(font_weight_label(600), "Semi Bold");
         assert_eq!(font_weight_label(700), "Bold");
-        assert_eq!(font_weight_label(800), "ExtraBold");
-        // Off-ladder weights read "Custom"; nothing snaps them onto a stop.
-        assert_eq!(font_weight_label(350), "Custom");
-        assert_eq!(font_weight_label(900), "Custom");
+        assert_eq!(font_weight_label(800), "Extra Bold");
+        assert_eq!(font_weight_label(900), "Black");
+        // Off-ladder weights retain their exact numeric value in the trigger.
+        assert_eq!(font_weight_label(350), "Custom · 350");
         // Every option the dropdown offers must round-trip through the label.
         for (weight, label) in FONT_WEIGHTS {
             assert_eq!(font_weight_label(weight), label);
         }
+    }
+
+    #[test]
+    fn explicit_line_height_edit_clears_imported_metric_relative_override() {
+        let mut text = text_node();
+        text.style.line_height = 1.1;
+        text.style.line_height_auto_percent = Some(100.0);
+        let node = CanvasNode::new(NodeData::Text(text));
+        let id = node.id;
+        let mut doc = Doc::new();
+        doc.scene.insert(node).expect("insert text node");
+
+        for operation in field_operations(&doc, &InspectorField::LineHeight(id), "1.75") {
+            doc.apply(operation).expect("apply line-height edit");
+        }
+
+        let NodeData::Text(text) = &doc.scene.get(id).expect("text node remains").data else {
+            panic!("expected text node");
+        };
+        assert_eq!(text.style.line_height, 1.75);
+        assert_eq!(text.style.line_height_auto_percent, None);
     }
 
     fn fill_at(data: &NodeData, index: usize) -> Option<&Fill> {

@@ -19,7 +19,7 @@ use fs::Fs;
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, Image, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ObjectFit, Pixels, ScrollStrategy, SharedString, Subscription,
+    MouseUpEvent, ObjectFit, Pixels, Role, ScrollStrategy, SharedString, Subscription,
     UniformListScrollHandle, WeakEntity, Window, actions, deferred, img, px, uniform_list,
 };
 use settings::{Settings as _, update_settings_file};
@@ -52,13 +52,14 @@ enum Section {
     Assets,
 }
 
-/// Estimated height of one list row, matching the `uniform_list` containers
-/// which have always sized themselves as `row_count * 24`.
-const SECTION_ROW_HEIGHT: f32 = 24.;
-const MIN_SECTION_HEIGHT: Pixels = px(48.);
+/// The design sidebar uses the same compact 28 px rhythm as Zed's outline and
+/// project panels. Pinning the height also keeps `uniform_list` measurements in
+/// sync with the rows it virtualizes.
+const SECTION_ROW_HEIGHT: f32 = 28.;
+const MIN_SECTION_HEIGHT: Pixels = px(56.);
 const DEFAULT_PAGES_HEIGHT: Pixels = px(168.);
-const DEFAULT_COMPONENTS_HEIGHT: Pixels = px(160.);
-const DEFAULT_ASSETS_HEIGHT: Pixels = px(192.);
+const DEFAULT_COMPONENTS_HEIGHT: Pixels = px(168.);
+const DEFAULT_ASSETS_HEIGHT: Pixels = px(200.);
 const DIVIDER_HITBOX_SIZE: Pixels = px(6.);
 /// Ceiling on any single section so the other section headers and a usable
 /// slice of the Layers list always stay visible while dragging.
@@ -70,11 +71,19 @@ const SECTION_INDENT_STEP: Pixels = px(12.);
 /// Asset rows are taller than the rest: they carry a thumbnail beside a
 /// two-line label. `uniform_list` sizes every row from the first one, so the
 /// row pins itself to this height and the list container is measured with it.
-const ASSET_ROW_HEIGHT: f32 = 32.;
+const ASSET_ROW_HEIGHT: f32 = 40.;
 const ASSET_THUMBNAIL_SIZE: Pixels = px(28.);
 
 fn section_list_height(row_count: usize, row_height: f32, stored: Pixels) -> Pixels {
     px((row_count as f32 * row_height).min(stored.as_f32()))
+}
+
+fn section_count_label(visible: usize, total: usize, filtered: bool) -> SharedString {
+    if filtered && visible != total {
+        SharedString::from(format!("{visible} / {total}"))
+    } else {
+        SharedString::from(visible.to_string())
+    }
 }
 
 /// Keep the pages whose name contains `query` (already lowercased), preserving
@@ -110,11 +119,38 @@ impl Render for DraggedSectionDivider {
 }
 
 #[derive(Clone)]
-struct DraggedLayer(NodeId);
+struct DraggedLayer {
+    id: NodeId,
+    name: SharedString,
+    icon: IconName,
+}
 
 impl Render for DraggedLayer {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Empty
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex().pl_3().pt_3().child(
+            h_flex()
+                .max_w(px(240.))
+                .min_w_0()
+                .h(px(SECTION_ROW_HEIGHT))
+                .gap_1()
+                .px_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().background)
+                .shadow_md()
+                .child(
+                    Icon::new(self.icon)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Label::new(self.name.clone()).single_line().truncate()),
+                ),
+        )
     }
 }
 
@@ -432,6 +468,7 @@ pub struct FantaDesignPanel {
     layer_rows: Vec<LayerRow>,
     pages_cache: Vec<PageEntry>,
     components_cache: Vec<(SharedString, NodeId)>,
+    components_total_count: usize,
     assets_cache: Vec<AssetEntry>,
     /// The `raw_assets` map `assets_cache`'s thumbnails were built from.
     /// `Image::from_bytes` content-hashes every asset byte, so the thumbnails
@@ -592,6 +629,7 @@ impl FantaDesignPanel {
             layer_rows: Vec::new(),
             pages_cache: Vec::new(),
             components_cache: Vec::new(),
+            components_total_count: 0,
             assets_cache: Vec::new(),
             assets_source: None,
             assets_names_revision: None,
@@ -681,10 +719,16 @@ impl FantaDesignPanel {
         !self.collapsed_sections.contains(&section)
     }
 
-    fn toggle_section(&mut self, section: Section, cx: &mut Context<Self>) {
-        if !self.collapsed_sections.remove(&section) {
-            self.collapsed_sections.insert(section);
+    fn toggle_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        if self.collapsed_sections.remove(&section) {
+            cx.notify();
+            return;
         }
+
+        if self.filter_target == Some(section) {
+            self.close_filter(window, cx);
+        }
+        self.collapsed_sections.insert(section);
         cx.notify();
     }
 
@@ -720,6 +764,9 @@ impl FantaDesignPanel {
             self.close_filter(window, cx);
             return;
         }
+        // A header remains actionable while collapsed. Reveal the editor before
+        // focusing it so keyboard input can never be captured by invisible UI.
+        self.collapsed_sections.remove(&section);
         self.filter_target = Some(section);
         self.filter_editor.update(cx, |editor, cx| {
             editor.set_text("", window, cx);
@@ -1145,6 +1192,7 @@ impl FantaDesignPanel {
         self.layer_rows.clear();
         self.pages_cache.clear();
         self.components_cache.clear();
+        self.components_total_count = 0;
         self.current_page_index = None;
         self.document_editable = false;
         self.document_ready = false;
@@ -1297,6 +1345,7 @@ impl FantaDesignPanel {
         self.components_cache = components;
         self.components_cache
             .sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        self.components_total_count = self.components_cache.len();
         if let Some(query) = self.filter_query(Section::Components, cx) {
             self.components_cache
                 .retain(|(name, _)| name.to_lowercase().contains(&query));
@@ -1511,7 +1560,9 @@ impl FantaDesignPanel {
         let pages = self.pages_cache.clone();
         let current_page_index = self.current_page_index;
         let component_count = self.components_cache.len();
+        let component_total_count = self.components_total_count;
         let asset_count = self.visible_assets.len();
+        let asset_total_count = self.assets_cache.len();
 
         let pages_open = self.section_open(Section::Pages);
         let layers_open = self.section_open(Section::Layers);
@@ -1543,11 +1594,9 @@ impl FantaDesignPanel {
                         ListHeader::new("Pages")
                             .inset(true)
                             .toggle(Some(pages_open))
-                            .on_toggle(
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_section(Section::Pages, cx)
-                                }),
-                            )
+                            .on_toggle(cx.listener(|this, _, window, cx| {
+                                this.toggle_section(Section::Pages, window, cx)
+                            }))
                             .end_slot(
                                 h_flex()
                                     .gap_1()
@@ -1558,6 +1607,7 @@ impl FantaDesignPanel {
                                         )
                                         .icon_size(IconSize::Small)
                                         .toggle_state(pages_filter_open)
+                                        .aria_label("Filter pages")
                                         .tooltip(Tooltip::text("Filter Pages"))
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
@@ -1569,6 +1619,7 @@ impl FantaDesignPanel {
                                         slot.child(
                                             IconButton::new("fanta-page-add", IconName::Plus)
                                                 .icon_size(IconSize::Small)
+                                                .aria_label("Add page")
                                                 .tooltip(Tooltip::text("Add Page"))
                                                 .on_click(
                                                     cx.listener(|this, _, _, cx| this.add_page(cx)),
@@ -1613,8 +1664,8 @@ impl FantaDesignPanel {
                         ListHeader::new("Layers")
                             .inset(true)
                             .toggle(Some(layers_open))
-                            .on_toggle(cx.listener(|this, _, _, cx| {
-                                this.toggle_section(Section::Layers, cx)
+                            .on_toggle(cx.listener(|this, _, window, cx| {
+                                this.toggle_section(Section::Layers, window, cx)
                             }))
                             .end_slot(
                                 h_flex()
@@ -1626,6 +1677,7 @@ impl FantaDesignPanel {
                                                 IconName::ListCollapse,
                                             )
                                             .icon_size(IconSize::Small)
+                                            .aria_label("Collapse all layers")
                                             .tooltip(Tooltip::text("Collapse All Layers"))
                                             .on_click(
                                                 cx.listener(|this, _, _, cx| {
@@ -1643,6 +1695,7 @@ impl FantaDesignPanel {
                                         )
                                         .icon_size(IconSize::Small)
                                         .toggle_state(layers_filter_open)
+                                        .aria_label("Filter layers")
                                         .tooltip(Tooltip::text("Filter Layers"))
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
@@ -1695,8 +1748,8 @@ impl FantaDesignPanel {
                         ListHeader::new("Components")
                             .inset(true)
                             .toggle(Some(components_open))
-                            .on_toggle(cx.listener(|this, _, _, cx| {
-                                this.toggle_section(Section::Components, cx)
+                            .on_toggle(cx.listener(|this, _, window, cx| {
+                                this.toggle_section(Section::Components, window, cx)
                             }))
                             .end_slot(
                                 h_flex()
@@ -1708,6 +1761,7 @@ impl FantaDesignPanel {
                                         )
                                         .icon_size(IconSize::Small)
                                         .toggle_state(components_this_page)
+                                        .aria_label("Only show components on this page")
                                         .tooltip(Tooltip::text("Only Components on This Page"))
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
@@ -1722,6 +1776,7 @@ impl FantaDesignPanel {
                                         )
                                         .icon_size(IconSize::Small)
                                         .toggle_state(components_filter_open)
+                                        .aria_label("Filter components")
                                         .tooltip(Tooltip::text("Filter Components"))
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
@@ -1730,9 +1785,13 @@ impl FantaDesignPanel {
                                         ),
                                     )
                                     .child(
-                                        Label::new(component_count.to_string())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
+                                        Label::new(section_count_label(
+                                            component_count,
+                                            component_total_count,
+                                            components_filtering,
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
                                     ),
                             ),
                     )
@@ -1792,8 +1851,8 @@ impl FantaDesignPanel {
                         ListHeader::new("Assets")
                             .inset(true)
                             .toggle(Some(assets_open))
-                            .on_toggle(cx.listener(|this, _, _, cx| {
-                                this.toggle_section(Section::Assets, cx)
+                            .on_toggle(cx.listener(|this, _, window, cx| {
+                                this.toggle_section(Section::Assets, window, cx)
                             }))
                             .end_slot(
                                 h_flex()
@@ -1805,6 +1864,7 @@ impl FantaDesignPanel {
                                         )
                                         .icon_size(IconSize::Small)
                                         .toggle_state(assets_filter_open)
+                                        .aria_label("Filter assets")
                                         .tooltip(Tooltip::text("Filter Assets"))
                                         .on_click(
                                             cx.listener(|this, _, window, cx| {
@@ -1813,9 +1873,13 @@ impl FantaDesignPanel {
                                         ),
                                     )
                                     .child(
-                                        Label::new(asset_count.to_string())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
+                                        Label::new(section_count_label(
+                                            asset_count,
+                                            asset_total_count,
+                                            assets_filtering,
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
                                     ),
                             ),
                     )
@@ -1869,8 +1933,8 @@ impl FantaDesignPanel {
     fn render_filter_row(&self, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
             .w_full()
+            .h(px(SECTION_ROW_HEIGHT))
             .px_2()
-            .py_0p5()
             .gap_1p5()
             .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_filter(window, cx)))
             .child(
@@ -1879,6 +1943,14 @@ impl FantaDesignPanel {
                     .color(Color::Muted),
             )
             .child(div().flex_1().min_w_0().child(self.filter_editor.clone()))
+            .child(
+                IconButton::new("fanta-filter-close", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .aria_label("Close filter")
+                    .tooltip(Tooltip::text("Close Filter"))
+                    .on_click(cx.listener(|this, _, window, cx| this.close_filter(window, cx))),
+            )
             .into_any_element()
     }
 
@@ -1972,20 +2044,28 @@ impl FantaDesignPanel {
         if renaming {
             return ListItem::new(("fanta-page", index))
                 .spacing(ListItemSpacing::ExtraDense)
+                .height(px(SECTION_ROW_HEIGHT))
                 .indent_level(1)
                 .indent_step_size(SECTION_INDENT_STEP)
                 .toggle_state(is_current)
+                .aria_role(Role::ListItem)
+                .aria_label(entry.name.clone())
                 .child(self.render_rename_editor(cx))
                 .into_any_element();
         }
 
         let root = entry.root;
+        let page_name = entry.name.clone();
         ListItem::new(("fanta-page", index))
             .spacing(ListItemSpacing::ExtraDense)
+            .height(px(SECTION_ROW_HEIGHT))
             .indent_level(1)
             .indent_step_size(SECTION_INDENT_STEP)
             .toggle_state(is_current)
+            .aria_role(Role::ListItem)
+            .aria_label(page_name.clone())
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.focus_handle.focus(window, cx);
                 // Double-click a real page to rename it in place; a single click
                 // just switches to it.
                 if event.click_count() >= 2 {
@@ -1996,12 +2076,20 @@ impl FantaDesignPanel {
                     this.select_page(index, cx);
                 }
             }))
-            .child(Label::new(entry.name.clone()).single_line())
+            .child(
+                div()
+                    .id(("fanta-page-name", index))
+                    .flex_1()
+                    .min_w_0()
+                    .tooltip(Tooltip::text(page_name.clone()))
+                    .child(Label::new(page_name).single_line().truncate()),
+            )
             .when(deletable, |item| {
                 item.end_slot(
                     IconButton::new(("fanta-page-delete", index), IconName::Close)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
+                        .aria_label("Delete page")
                         .tooltip(Tooltip::text("Delete Page"))
                         .visible_on_hover("list_item")
                         .on_click(cx.listener(move |this, _, _, cx| this.delete_page(index, cx))),
@@ -2115,33 +2203,56 @@ impl FantaDesignPanel {
                 .indent_level(row.depth + 1)
                 .indent_step_size(SECTION_INDENT_STEP)
                 .spacing(ListItemSpacing::ExtraDense)
+                .height(px(SECTION_ROW_HEIGHT))
                 .toggle_state(row.selected)
+                .aria_role(Role::TreeItem)
+                .aria_label(row.name.clone())
                 .child(self.render_rename_editor(cx))
                 .into_any_element();
         }
-        let name_color = if row.accent {
-            Color::Accent
-        } else if row.hidden {
+        let name_color = if row.hidden {
             Color::Muted
+        } else if row.accent {
+            Color::Accent
         } else {
             Color::Default
         };
-        let icon_color = if row.accent {
+        let icon_color = if row.hidden {
+            Color::Muted
+        } else if row.accent {
             Color::Accent
         } else {
             Color::Muted
         };
+        let layer_name = row.name.clone();
 
         let mut item = ListItem::new(format!("fanta-layer-{id}"))
             .indent_level(row.depth + 1)
             .indent_step_size(SECTION_INDENT_STEP)
             .spacing(ListItemSpacing::ExtraDense)
+            .height(px(SECTION_ROW_HEIGHT))
             .toggle_state(row.selected)
+            .aria_role(Role::TreeItem)
+            .aria_label(layer_name.clone())
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .gap_1()
                     .child(Icon::new(row.icon).size(IconSize::Small).color(icon_color))
-                    .child(Label::new(row.name.clone()).single_line().color(name_color)),
+                    .child(
+                        div()
+                            .id(format!("fanta-layer-name-{id}"))
+                            .flex_1()
+                            .min_w_0()
+                            .tooltip(Tooltip::text(layer_name.clone()))
+                            .child(
+                                Label::new(layer_name)
+                                    .single_line()
+                                    .truncate()
+                                    .color(name_color),
+                            ),
+                    ),
             );
 
         if row.has_children {
@@ -2162,9 +2273,14 @@ impl FantaDesignPanel {
             )
             .icon_size(IconSize::XSmall)
             .icon_color(if row.hidden {
-                Color::Warning
+                Color::Default
             } else {
                 Color::Muted
+            })
+            .aria_label(if row.hidden {
+                "Show layer"
+            } else {
+                "Hide layer"
             })
             .tooltip(Tooltip::text(if row.hidden {
                 "Show Layer"
@@ -2186,9 +2302,14 @@ impl FantaDesignPanel {
             )
             .icon_size(IconSize::XSmall)
             .icon_color(if row.locked {
-                Color::Conflict
+                Color::Default
             } else {
                 Color::Muted
+            })
+            .aria_label(if row.locked {
+                "Unlock layer"
+            } else {
+                "Lock layer"
             })
             .tooltip(Tooltip::text(if row.locked {
                 "Unlock Layer"
@@ -2218,6 +2339,11 @@ impl FantaDesignPanel {
         let inside_item = active_item.clone();
         let above_item = active_item.clone();
         let below_item = active_item;
+        let dragged_layer = DraggedLayer {
+            id,
+            name: row.name.clone(),
+            icon: row.icon,
+        };
         div()
             .id(format!("fanta-layer-drop-{id}"))
             .relative()
@@ -2236,7 +2362,7 @@ impl FantaDesignPanel {
                 }
                 cx.stop_propagation();
             }))
-            .on_drag(DraggedLayer(id), |dragged, _, _, cx| {
+            .on_drag(dragged_layer, |dragged, _, _, cx| {
                 cx.new(|_| dragged.clone())
             })
             .can_drop(move |value, _, cx| {
@@ -2251,7 +2377,7 @@ impl FantaDesignPanel {
                     && item.document().is_some_and(|document| {
                         layer_move_operations(
                             &document.doc,
-                            dragged.0,
+                            dragged.id,
                             id,
                             LayerDropPlacement::Inside,
                         )
@@ -2262,7 +2388,7 @@ impl FantaDesignPanel {
                 style.bg(cx.theme().colors().drop_target_background)
             })
             .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                this.drop_layer(dragged.0, id, LayerDropPlacement::Inside, cx);
+                this.drop_layer(dragged.id, id, LayerDropPlacement::Inside, cx);
                 cx.stop_propagation();
             }))
             .child(item)
@@ -2286,7 +2412,7 @@ impl FantaDesignPanel {
                             && item.document().is_some_and(|document| {
                                 layer_move_operations(
                                     &document.doc,
-                                    dragged.0,
+                                    dragged.id,
                                     id,
                                     LayerDropPlacement::Above,
                                 )
@@ -2299,7 +2425,7 @@ impl FantaDesignPanel {
                             .border_color(cx.theme().colors().drop_target_border)
                     })
                     .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                        this.drop_layer(dragged.0, id, LayerDropPlacement::Above, cx);
+                        this.drop_layer(dragged.id, id, LayerDropPlacement::Above, cx);
                         cx.stop_propagation();
                     })),
             )
@@ -2323,7 +2449,7 @@ impl FantaDesignPanel {
                             && item.document().is_some_and(|document| {
                                 layer_move_operations(
                                     &document.doc,
-                                    dragged.0,
+                                    dragged.id,
                                     id,
                                     LayerDropPlacement::Below,
                                 )
@@ -2336,7 +2462,7 @@ impl FantaDesignPanel {
                             .border_color(cx.theme().colors().drop_target_border)
                     })
                     .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                        this.drop_layer(dragged.0, id, LayerDropPlacement::Below, cx);
+                        this.drop_layer(dragged.id, id, LayerDropPlacement::Below, cx);
                         cx.stop_propagation();
                     })),
             )
@@ -2350,20 +2476,41 @@ impl FantaDesignPanel {
         root: NodeId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let component_name = name.clone();
         ListItem::new(("fanta-component", index))
             .spacing(ListItemSpacing::ExtraDense)
+            .height(px(SECTION_ROW_HEIGHT))
             .indent_level(1)
             .indent_step_size(SECTION_INDENT_STEP)
-            .on_click(cx.listener(move |this, _, _, cx| this.focus_component(root, cx)))
+            .aria_role(Role::ListItem)
+            .aria_label(component_name.clone())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.focus_handle.focus(window, cx);
+                this.focus_component(root, cx);
+            }))
             .child(
                 h_flex()
+                    .w_full()
+                    .min_w_0()
                     .gap_1()
                     .child(
                         Icon::new(IconName::Blocks)
                             .size(IconSize::Small)
                             .color(Color::Accent),
                     )
-                    .child(Label::new(name).single_line().color(Color::Accent)),
+                    .child(
+                        div()
+                            .id(("fanta-component-name", index))
+                            .flex_1()
+                            .min_w_0()
+                            .tooltip(Tooltip::text(component_name.clone()))
+                            .child(
+                                Label::new(name)
+                                    .single_line()
+                                    .truncate()
+                                    .color(Color::Accent),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -2374,9 +2521,10 @@ impl FantaDesignPanel {
             .indent_level(1)
             .indent_step_size(SECTION_INDENT_STEP)
             .height(px(ASSET_ROW_HEIGHT))
-            // The asset id is the only stable handle a user can copy into a
-            // `.fant` file by hand, so the row keeps it one hover away.
-            .tooltip(Tooltip::text(SharedString::from(entry.id.to_string())))
+            .selectable(false)
+            .aria_role(Role::ListItem)
+            .aria_label(entry.name.clone())
+            .tooltip(Tooltip::text(asset_tooltip_text(entry)))
             .child(
                 h_flex()
                     .w_full()
@@ -2428,7 +2576,7 @@ fn render_asset_thumbnail(entry: &AssetEntry, cx: &App) -> AnyElement {
         Some(image) => tile.child(
             img(image.clone())
                 .size(ASSET_THUMBNAIL_SIZE)
-                .object_fit(ObjectFit::Cover)
+                .object_fit(ObjectFit::Contain)
                 .rounded_sm(),
         ),
         None => tile.items_center().justify_center().child(
@@ -2453,6 +2601,18 @@ fn asset_detail(entry: &AssetEntry) -> Option<SharedString> {
         (None, Some(format)) => Some(SharedString::from(format.to_owned())),
         (None, None) => None,
     }
+}
+
+fn asset_tooltip_text(entry: &AssetEntry) -> SharedString {
+    let file_size = format_file_size(entry.byte_count as u64, true);
+    let metadata = match asset_detail(entry) {
+        Some(detail) => format!("{detail} · {file_size}"),
+        None => file_size,
+    };
+    SharedString::from(format!(
+        "{}\n{}\nAsset ID: {}",
+        entry.name, metadata, entry.id
+    ))
 }
 
 /// Precompute one [`AssetEntry`] per embedded asset. `name` is left empty for
@@ -2598,6 +2758,7 @@ fn layer_icon(node: &CanvasNode) -> IconName {
 fn empty_section_label(id: &'static str, text: &'static str) -> AnyElement {
     ListItem::new(id)
         .spacing(ListItemSpacing::ExtraDense)
+        .height(px(SECTION_ROW_HEIGHT))
         .indent_level(1)
         .indent_step_size(SECTION_INDENT_STEP)
         .selectable(false)
@@ -2742,6 +2903,20 @@ mod tests {
         BitmapNode, BlendMode, ComponentDef, ImageAdjust, ImageFitMode, InstanceNode, Transform2D,
         VectorNode,
     };
+    use gpui::TestAppContext;
+    use project::FakeFs;
+
+    fn init_panel_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+    }
 
     fn insert_node(doc: &mut Doc, mut node: CanvasNode) -> NodeId {
         node.index = doc.scene.next_child_index(node.parent);
@@ -3178,6 +3353,58 @@ mod tests {
         );
         assert_eq!(asset_detail(&entry(None, "PNG")).as_deref(), Some("PNG"));
         assert_eq!(asset_detail(&entry(None, "")), None);
+    }
+
+    #[test]
+    fn asset_tooltip_exposes_human_context_and_stable_id() {
+        let id = AssetId::new();
+        let entry = AssetEntry {
+            id,
+            name: SharedString::from("Product mark"),
+            image: None,
+            dimensions: Some((512, 384)),
+            format_label: SharedString::from("PNG"),
+            byte_count: 4096,
+        };
+
+        let tooltip = asset_tooltip_text(&entry);
+        assert!(tooltip.contains("Product mark"));
+        assert!(tooltip.contains("512×384 · PNG"));
+        assert!(tooltip.contains(&id.to_string()));
+    }
+
+    #[test]
+    fn filtered_counts_retain_the_total_context() {
+        assert_eq!(section_count_label(3, 12, true).as_ref(), "3 / 12");
+        assert_eq!(section_count_label(12, 12, true).as_ref(), "12");
+        assert_eq!(section_count_label(3, 12, false).as_ref(), "3");
+    }
+
+    #[gpui::test]
+    fn filtering_expands_its_section_and_collapsing_closes_the_editor(cx: &mut TestAppContext) {
+        init_panel_test(cx);
+        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
+        let panel = cx.add_window(move |window, cx| {
+            FantaDesignPanel::build(fs, None, window, cx, Vec::new())
+        });
+
+        panel
+            .update(cx, |panel, window, cx| {
+                panel.collapsed_sections.insert(Section::Layers);
+                panel.toggle_filter(Section::Layers, window, cx);
+                assert!(panel.section_open(Section::Layers));
+                assert_eq!(panel.filter_target, Some(Section::Layers));
+
+                panel.filter_editor.update(cx, |editor, cx| {
+                    editor.set_text("button", window, cx);
+                });
+                panel.toggle_section(Section::Layers, window, cx);
+
+                assert!(!panel.section_open(Section::Layers));
+                assert_eq!(panel.filter_target, None);
+                assert!(panel.filter_editor.read(cx).text(cx).is_empty());
+            })
+            .expect("design panel window remains available");
     }
 
     fn page(name: &str, index: usize) -> PageEntry {

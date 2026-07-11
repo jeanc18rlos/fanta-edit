@@ -49,13 +49,14 @@ impl InspectorSection {
 impl RenderOnce for InspectorSection {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let header = h_flex()
-            .h_10()
-            .px_3()
+            .h_8()
+            .px_4()
             .justify_between()
             .child(
                 Label::new(self.title)
                     .size(LabelSize::Small)
-                    .weight(FontWeight::SEMIBOLD),
+                    .weight(FontWeight::SEMIBOLD)
+                    .line_height_style(LineHeightStyle::UiLabel),
             )
             .children(self.action);
         div()
@@ -89,15 +90,16 @@ impl InspectorFieldRow {
 impl RenderOnce for InspectorFieldRow {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         h_flex()
-            .min_h_9()
-            .px_3()
-            .gap_3()
+            .min_h_8()
+            .px_4()
+            .gap_2()
             .items_center()
             .child(
-                div().w(px(82.)).flex_none().child(
+                div().w(px(72.)).flex_none().child(
                     Label::new(self.label)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line(),
                 ),
             )
             .child(div().flex_1().min_w_0().child(self.control))

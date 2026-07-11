@@ -4,6 +4,7 @@
 //! density, drag-to-scrub numeric fields, opacity slider, and anchored color
 //! picker.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -191,6 +192,7 @@ pub struct FantaPropertiesPanel {
     export_feedback: Option<ExportFeedback>,
     pub(crate) export_task: Option<Task<()>>,
     export_generation: u64,
+    _font_cache_task: Task<()>,
     pub(crate) _subscriptions: Vec<Subscription>,
     pub(crate) _active_view_subscription: Option<Subscription>,
 }
@@ -257,6 +259,19 @@ impl FantaPropertiesPanel {
         cx: &mut Context<Self>,
         mut subscriptions: Vec<Subscription>,
     ) -> Self {
+        let preview_fonts = fanta_text::bundled_family_names()
+            .filter_map(fanta_text::bundled_preview_bytes)
+            .map(Cow::Borrowed)
+            .collect();
+        if let Err(error) = cx.text_system().add_fonts(preview_fonts) {
+            log::debug!("failed to register Fanta font-picker previews: {error:#}");
+        }
+        theme::FontFamilyCache::init_global(cx);
+        let font_family_cache = theme::FontFamilyCache::global(cx);
+        let font_cache_task = cx.spawn(async move |this, cx| {
+            font_family_cache.prefetch(cx).await;
+            this.update(cx, |_, cx| cx.notify()).log_err();
+        });
         let field_editor = cx.new(|cx| Editor::single_line(window, cx));
         subscriptions.push(cx.subscribe_in(
             &field_editor,
@@ -295,6 +310,7 @@ impl FantaPropertiesPanel {
             export_feedback: None,
             export_task: None,
             export_generation: 0,
+            _font_cache_task: font_cache_task,
             _subscriptions: subscriptions,
             _active_view_subscription: None,
         };
@@ -739,6 +755,13 @@ impl FantaPropertiesPanel {
                 v.update(cx, |view, cx| {
                     view.with_text_selection_style(cx, |s| {
                         s.weight = weight;
+                        if let Some(axis) = s
+                            .font_variations
+                            .iter_mut()
+                            .find(|axis| axis.axis.trim().eq_ignore_ascii_case("wght"))
+                        {
+                            axis.value = f32::from(weight);
+                        }
                     })
                 })
             })
@@ -750,6 +773,45 @@ impl FantaPropertiesPanel {
             move |data| {
                 if let NodeData::Text(text) = data {
                     text.style.weight = weight;
+                    if let Some(axis) = text
+                        .style
+                        .font_variations
+                        .iter_mut()
+                        .find(|axis| axis.axis.trim().eq_ignore_ascii_case("wght"))
+                    {
+                        axis.value = f32::from(weight);
+                    }
+                }
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn prepare_font_family_picker(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.finish_continuous_edits(cx);
+        self.retain_text_selection_on_next_focus_out(&InspectorField::FontFamily(id), cx);
+    }
+
+    pub(crate) fn set_font_family(
+        &mut self,
+        id: NodeId,
+        family: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let family = family.trim();
+        if family.is_empty() {
+            return;
+        }
+        self.finish_continuous_edits(cx);
+        if self.try_apply_text_selection_field(&InspectorField::FontFamily(id), family, cx) {
+            return;
+        }
+        let family = family.to_owned();
+        self.update_node_data(
+            id,
+            move |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.font_family.clone_from(&family);
                 }
             },
             cx,
@@ -799,6 +861,7 @@ impl FantaPropertiesPanel {
                         parse_number(&text).filter(|line_height| *line_height > 0.0)
                     {
                         style.line_height = line_height;
+                        style.line_height_auto_percent = None;
                     }
                 }
                 InspectorField::LetterSpacing(_) => {
@@ -2923,6 +2986,7 @@ mod panel_integration_tests {
         // laid out by the draw tests too.
         let mut text = fanta_doc::TextNode::new("Hello", 100.0, 24.0);
         text.style.weight = 350; // an off-ladder weight must survive a render
+        text.style.font_variations = vec![fanta_doc::FontVariation::new("wght", 350.0)];
         text.align = TextAlign::Justify;
         let mut text_node = CanvasNode::new(NodeData::Text(text));
         text_node.parent = Some(page_id);
@@ -3450,6 +3514,123 @@ mod panel_integration_tests {
         assert!(committed_styles.iter().all(|style| style.size_px == 30.0));
         assert!(committed_styles.iter().any(|style| style.color == red));
         assert!(committed_styles.iter().any(|style| style.color == blue));
+    }
+
+    #[gpui::test]
+    async fn inline_line_height_edit_clears_percent_override_on_the_live_selection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                    assert!(view.with_text_selection_style(cx, |style| {
+                        style.line_height = 1.1;
+                        style.line_height_auto_percent = Some(100.0);
+                    }));
+                });
+            })
+            .expect("open text edit");
+
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.start_editing(
+                    InspectorField::LineHeight(text_id),
+                    "1.1".to_string(),
+                    window,
+                    cx,
+                );
+            })
+            .expect("start line-height edit");
+        let mut visual = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.run_until_parked();
+        visual.simulate_input("1.75");
+
+        let preview_styles = view.read_with(&visual.cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("font controls retain text editing")
+                .session
+                .text_buffer()
+                .runs()
+                .iter()
+                .map(|run| run.style.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(preview_styles.iter().all(|style| {
+            style.line_height == 1.75 && style.line_height_auto_percent.is_none()
+        }));
+    }
+
+    #[gpui::test]
+    async fn confirmed_font_family_preserves_the_active_rich_text_selection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                    {
+                        let session = &mut view.text_edit.as_mut().expect("text edit").session;
+                        session.move_to(0, false);
+                        session.move_to(2, true);
+                    }
+                    assert!(view.with_text_selection_style(cx, |style| {
+                        style.color = FantaColor::rgb(220, 20, 30)
+                    }));
+                    view.text_edit
+                        .as_mut()
+                        .expect("text edit")
+                        .session
+                        .select_all();
+                });
+            })
+            .expect("open text edit");
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.prepare_font_family_picker(text_id, cx);
+                panel.set_font_family(text_id, "Source Serif 4".into(), cx);
+            })
+            .expect("confirm font family");
+
+        let styles = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("font picker keeps the text session active")
+                .session
+                .text_buffer()
+                .runs()
+                .iter()
+                .map(|run| run.style.clone())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            styles
+                .iter()
+                .all(|style| style.font_family == "Source Serif 4")
+        );
+        assert!(
+            styles
+                .iter()
+                .any(|style| style.color == FantaColor::rgb(220, 20, 30)),
+            "changing family must not flatten the selected runs"
+        );
     }
 
     #[gpui::test]
@@ -4320,20 +4501,27 @@ mod panel_integration_tests {
         cx.run_until_parked();
         draw(harness.panel, cx);
 
-        let (weight, underline, align, auto_resize) = harness._view.read_with(cx, |view, cx| {
-            let item = view.item().read(cx);
-            let doc = &item.document().unwrap().doc;
-            let NodeData::Text(text) = &doc.scene.get(text_id).unwrap().data else {
-                panic!("expected a text node");
-            };
-            (
-                text.style.weight,
-                text.style.underline,
-                text.align,
-                text.auto_resize,
-            )
-        });
+        let (weight, weight_axis, underline, align, auto_resize) =
+            harness._view.read_with(cx, |view, cx| {
+                let item = view.item().read(cx);
+                let doc = &item.document().unwrap().doc;
+                let NodeData::Text(text) = &doc.scene.get(text_id).unwrap().data else {
+                    panic!("expected a text node");
+                };
+                (
+                    text.style.weight,
+                    text.style
+                        .font_variations
+                        .iter()
+                        .find(|axis| axis.axis == "wght")
+                        .map(|axis| axis.value),
+                    text.style.underline,
+                    text.align,
+                    text.auto_resize,
+                )
+            });
         assert_eq!(weight, 800);
+        assert_eq!(weight_axis, Some(800.0));
         assert!(underline);
         assert_eq!(align, TextAlign::Justify);
         assert_eq!(auto_resize, TextAutoResize::Height);

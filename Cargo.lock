@@ -6637,6 +6637,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "picker",
  "settings",
  "theme",
  "theme_settings",

@@ -16,6 +16,7 @@ mod fanta_ui_visual_tests {
     use assets::Assets;
     use fanta_ui::{
         animation_panel::{AnimationDetailHeader, AnimationProperty, AnimationPropertyRow},
+        font_family_picker::FontFamilyPicker,
         inspector::{InspectorEmptyState, InspectorFieldRow, InspectorSection},
         timeline::{
             TimelineGridLine, TimelinePlayhead, TimelineRulerHeader, TimelineRulerTick,
@@ -56,6 +57,11 @@ mod fanta_ui_visual_tests {
                 size: size(px(1240.), px(330.)),
                 kind: GalleryKind::Timeline,
             },
+            VisualCase {
+                name: "inspector",
+                size: size(px(420.), px(500.)),
+                kind: GalleryKind::Inspector,
+            },
         ];
         let update_baseline = std::env::var_os("UPDATE_BASELINE").is_some()
             || std::env::var_os("UPDATE_BASELINES").is_some();
@@ -70,6 +76,7 @@ mod fanta_ui_visual_tests {
     enum GalleryKind {
         AnimationPanel,
         Timeline,
+        Inspector,
     }
 
     struct VisualCase {
@@ -242,6 +249,7 @@ mod fanta_ui_visual_tests {
             let content = match self.kind {
                 GalleryKind::AnimationPanel => animation_panel_gallery(cx),
                 GalleryKind::Timeline => timeline_gallery(cx),
+                GalleryKind::Inspector => inspector_gallery(cx),
             };
             div()
                 .size_full()
@@ -344,6 +352,89 @@ mod fanta_ui_visual_tests {
                     .child(InspectorEmptyState::new(
                         "Preview ready",
                         "Changes preview live and commit as one undoable edit.",
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn inspector_gallery(cx: &mut Context<Gallery>) -> AnyElement {
+        h_flex()
+            .size_full()
+            .p_5()
+            .items_start()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(320.))
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .bg(cx.theme().colors().panel_background)
+                    .child(
+                        InspectorSection::new("visual-typography", "Typography")
+                            .separated(false)
+                            .child(InspectorFieldRow::new(
+                                "Family",
+                                FontFamilyPicker::new(
+                                    "visual-font-family",
+                                    "Source Sans 3",
+                                    ["Inter", "Source Sans 3", "Source Serif 4", "Zed Sans"],
+                                    |_, _, _| {},
+                                ),
+                            ))
+                            .child(InspectorFieldRow::new(
+                                "Weight",
+                                Button::new("visual-font-weight", "Regular")
+                                    .size(ButtonSize::Medium)
+                                    .style(ButtonStyle::Outlined)
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .full_width(),
+                            ))
+                            .child(InspectorFieldRow::new(
+                                "Size",
+                                Button::new("visual-font-size", "16 px")
+                                    .size(ButtonSize::Medium)
+                                    .style(ButtonStyle::Outlined)
+                                    .full_width(),
+                            ))
+                            .child(InspectorFieldRow::new(
+                                "Line height",
+                                Button::new("visual-line-height", "1.2×")
+                                    .size(ButtonSize::Medium)
+                                    .style(ButtonStyle::Outlined)
+                                    .full_width(),
+                            )),
+                    )
+                    .child(
+                        InspectorSection::new("visual-appearance", "Appearance")
+                            .child(InspectorFieldRow::new(
+                                "Opacity",
+                                Button::new("visual-opacity", "100%")
+                                    .size(ButtonSize::Medium)
+                                    .style(ButtonStyle::Outlined)
+                                    .full_width(),
+                            ))
+                            .child(InspectorFieldRow::new(
+                                "Blend",
+                                Button::new("visual-blend", "Normal")
+                                    .size(ButtonSize::Medium)
+                                    .style(ButtonStyle::Outlined)
+                                    .end_icon(
+                                        Icon::new(IconName::ChevronDown)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .full_width(),
+                            )),
+                    )
+                    .child(InspectorEmptyState::new(
+                        "Live inspector",
+                        "Controls share one compact rhythm and preserve canvas selection while menus are open.",
                     )),
             )
             .into_any_element()

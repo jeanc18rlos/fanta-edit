@@ -15,6 +15,7 @@ doctest = false
 [features]
 test-support = [
     "gpui/test-support",
+    "dep:assets",
     "dep:settings",
     "dep:theme",
     "dep:theme_settings",
@@ -40,6 +41,7 @@ env_logger = { workspace = true, optional = true }
 gpui.workspace = true
 gpui_platform = { workspace = true, optional = true, features = ["font-kit", "test-support", "screen-capture"] }
 image = { workspace = true, optional = true }
+picker.workspace = true
 settings = { workspace = true, optional = true, features = ["test-support"] }
 theme = { workspace = true, optional = true, features = ["test-support"] }
 theme_settings = { workspace = true, optional = true }
