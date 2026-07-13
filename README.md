@@ -26,7 +26,7 @@ cargo run --release
 ## Upstream
 
 - **Upstream:** https://github.com/zed-industries/zed
-- **This fork:** https://github.com/jeanc18rlos/fanta-edit
+- **This fork:** https://github.com/YOUR_USERNAME/fanta-edit
 
 See [FORK.md](./FORK.md) for syncing with upstream and the full rebranding checklist.
 

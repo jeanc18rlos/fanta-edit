@@ -2,7 +2,7 @@
 
 The program that makes fanta-edit's design surface (fig_viewer) drivable by
 agents — external ones over MCP and the built-in agent panel natively — plus
-media generation (image/video via api.fantaisa.net) and collaboration.
+media generation (image/video via the configured backend) and collaboration.
 
 ## What we learned (research pass, 2026-07-11)
 
@@ -34,7 +34,7 @@ ships `get_editor_state` / `batch_get` / `batch_design` (JSON op list) /
 `get_screenshot` / `get_guidelines` / `snapshot_layout`. The old live_mcp
 already had `batch_get`/`batch_ops` — v2 promotes them to the primary verbs.
 
-**The backend** (api.fantaisa.net): `/mcp` already serves 14 metered tools —
+**The backend** (api.fanta.dev): `/mcp` already serves 14 metered tools —
 generate_image, edit_image, upscale_image, vectorize, animate_image,
 transcribe, plan_compose, get_generation, list/search_assets, upload_asset,
 remember/recall, list_models, get_credits. Auth = `Bearer fnt_live_…`.
@@ -85,7 +85,7 @@ preview → place → refine by talking).
 
 A `fanta-design` skill (port of the old shared SKILL.md, updated for v2
 verbs) + `fanta-media` skill teaching generate→poll→place via the backend
-MCP (context_servers entry `fanta` at https://api.fantaisa.net/mcp, staged
+MCP (context_servers entry `fanta` at https://api.fanta.dev/mcp, staged
 on the integration branch). Video: `animate_image` → wan-2.2-i2v — requires
 the `videogen` Modal family deployed (imagegen is live; videogen is next in
 the runbook order).

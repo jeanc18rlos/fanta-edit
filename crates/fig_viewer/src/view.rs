@@ -5339,4 +5339,70 @@ mod tests {
             assert_eq!(text.content, fanta_tools::text::PLACEHOLDER);
         });
     }
+
+    #[gpui::test]
+    async fn canvas_create_rectangle_and_undo_restores_state(cx: &mut TestAppContext) {
+        // Covers core BDD scenarios: create shapes, undo across visual ops.
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut initial_doc = doc_with_one_page();
+        let page_id = initial_doc.active_page().expect("page").id;
+
+        // Seed one page with nothing extra
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/CanvasUndo.fig"),
+            initial_doc,
+            cx,
+        );
+
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create view");
+
+        // Simulate a simple create via document (as higher level tools would)
+        let created = cx.update(|cx| {
+            let mut doc = item.read(cx).document().expect("doc").doc.clone();
+            let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                10.0,
+                20.0,
+                100.0,
+                50.0,
+                Color::from_srgb_u8(100, 150, 200),
+            )));
+            rect.parent = Some(page_id);
+            let id = rect.id;
+            doc.apply(Operation::create_node(rect))
+                .expect("apply create");
+            item.update(cx, |it, cx| {
+                // In real flow this goes through EditorSession + transaction
+                it.document().expect("doc").apply_external_change(doc, cx);
+            });
+            id
+        });
+
+        // Verify node exists
+        item.read_with(cx, |it, _| {
+            let doc = &it.document().expect("doc").doc;
+            assert!(
+                doc.scene.contains(created),
+                "node should exist after create"
+            );
+        });
+
+        // Undo
+        let did_undo = cx.update(|cx| item.update(cx, |it, cx| it.undo(cx).expect("undo")));
+        assert!(did_undo, "undo should succeed");
+
+        item.read_with(cx, |it, _| {
+            let doc = &it.document().expect("doc").doc;
+            assert!(
+                !doc.scene.contains(created),
+                "node should be gone after undo"
+            );
+        });
+    }
 }

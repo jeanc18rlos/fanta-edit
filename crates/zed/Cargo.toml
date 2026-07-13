@@ -299,7 +299,7 @@ osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
 
-[package.metadata.bundle-stable]
+[package.metadata.bundle]
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
 identifier = "dev.fanta.Fanta"
 name = "Fanta"

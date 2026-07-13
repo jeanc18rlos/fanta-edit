@@ -21,16 +21,16 @@ release process, and user-facing disclosure.
 
 ## Code Touchpoints Changed
 
-- [assets/settings/default.json](/Users/jeanrojas/fanta-edit/assets/settings/default.json)
+- [assets/settings/default.json](assets/settings/default.json)
   - Default agent model provider changed from `zed.dev` to `anthropic`.
   - Default telemetry diagnostics and metrics changed to `false`.
   - Default auto-update changed to `false`.
   - Default `server_url` changed from `https://zed.dev` to `https://fanta.dev`.
   - Default `zed.dev` language model provider entry was removed.
-- [crates/auto_update/src/auto_update.rs](/Users/jeanrojas/fanta-edit/crates/auto_update/src/auto_update.rs)
+- [crates/auto_update/src/auto_update.rs](crates/auto_update/src/auto_update.rs)
   - Auto-update default documentation now describes Fanta's disabled baseline.
   - The default-setting test now expects auto-update to be disabled.
-- [FANTA.md](/Users/jeanrojas/fanta-edit/FANTA.md)
+- [FANTA.md](FANTA.md)
   - Records the fork contract, service-safety baseline, release resources, and first feature substrate.
 
 ## Self-Hosting Binnacle

@@ -2391,6 +2391,7 @@
       },
     },
     "FNX": {
+      "format_on_save": "on",
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
       "prettier": {
         "allowed": true,
@@ -2660,7 +2661,7 @@
   },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
-  "server_url": "https://api.fantaisa.net",
+  "server_url": "https://api.fanta.dev",
   // Settings overrides to use when using Zed Preview.
   // Mostly useful for developers who are managing multiple instances of Zed.
   "preview": {

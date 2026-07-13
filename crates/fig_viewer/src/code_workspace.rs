@@ -12,7 +12,10 @@ use gpui::{
     Subscription, Task, Window, div, px,
 };
 use language::{Buffer, BufferEvent};
-use project::Project;
+use project::{
+    Project,
+    lsp_store::{FormatTrigger, LspFormatTarget},
+};
 use ui::prelude::*;
 
 use crate::document::{FigItem, FigItemEvent};
@@ -386,18 +389,40 @@ impl FantaCodeWorkspace {
             ))));
         }
 
-        let (source, version) = {
-            let buffer = buffer.read(cx);
-            (buffer.text(), buffer.version())
-        };
         self.validation_task = None;
         self.error_message = None;
         self.validation_message = Some("Saving FNX…".into());
         self.source_save_in_progress = true;
         let item = self.item.clone();
         let project = self.project.clone();
+        let format_source = (!cfg!(test)).then(|| {
+            project.update(cx, |project, cx| {
+                project.format(
+                    std::iter::once(buffer.clone()).collect(),
+                    LspFormatTarget::Buffers,
+                    false,
+                    FormatTrigger::Manual,
+                    cx,
+                )
+            })
+        });
 
         Some(cx.spawn(async move |this, cx| {
+            if let Some(format_source) = format_source
+                && let Err(error) = format_source.await
+            {
+                item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                this.update(cx, |this, cx| {
+                    this.source_save_in_progress = false;
+                    this.validation_message = None;
+                    this.error_message =
+                        Some(format!("Could not format FNX before saving: {error:#}").into());
+                    cx.notify();
+                })?;
+                return Err(error).context("formatting the FNX source edit");
+            }
+            let (source, version) =
+                buffer.read_with(cx, |buffer, _| (buffer.text(), buffer.version()));
             let apply_path = source_path.clone();
             let source_edit = cx
                 .background_spawn(async move {
@@ -576,8 +601,36 @@ impl FantaCodeWorkspace {
         let open_task = self
             .project
             .update(cx, |project, cx| project.open_local_buffer(&path, cx));
+        let project = self.project.clone();
         self.fnx_load_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = open_task.await;
+            let result = match open_task.await {
+                Ok(buffer) if cfg!(test) => Ok(buffer),
+                Ok(buffer) => {
+                    let format = project.update(cx, |project, cx| {
+                        project.format(
+                            std::iter::once(buffer.clone()).collect(),
+                            LspFormatTarget::Buffers,
+                            false,
+                            FormatTrigger::Manual,
+                            cx,
+                        )
+                    });
+                    match format.await {
+                        Ok(_) if buffer.read_with(cx, |buffer, _| buffer.is_dirty()) => {
+                            match project
+                                .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+                                .await
+                            {
+                                Ok(_) => Ok(buffer),
+                                Err(error) => Err(error.context("saving formatted FNX source")),
+                            }
+                        }
+                        Ok(_) => Ok(buffer),
+                        Err(error) => Err(error.context("formatting FNX source")),
+                    }
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = this.update_in(cx, |this, window, cx| {
                 if this.fnx_path.as_ref() != Some(&path) {
                     return;
