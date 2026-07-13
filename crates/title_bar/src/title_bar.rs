@@ -1306,7 +1306,9 @@ impl TitleBar {
                                     .w_full()
                                     .gap_1()
                                     .justify_between()
-                                    .child(Label::new("Restart to update Fanta").color(Color::Accent))
+                                    .child(
+                                        Label::new("Restart to update Fanta").color(Color::Accent),
+                                    )
                                     .child(
                                         Icon::new(IconName::Download)
                                             .size(IconSize::Small)

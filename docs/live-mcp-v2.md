@@ -2,7 +2,7 @@
 
 The program that makes fanta-edit's design surface (fig_viewer) drivable by
 agents — external ones over MCP and the built-in agent panel natively — plus
-media generation (image/video via api.fantaisa.net) and collaboration.
+media generation (image/video via the configured backend) and collaboration.
 
 ## What we learned (research pass, 2026-07-11)
 

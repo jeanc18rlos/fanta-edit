@@ -7,9 +7,7 @@
 use std::{collections::HashMap, env, path::PathBuf};
 
 use anyhow::{Result, anyhow};
-use fanta_doc::{
-    Doc, ExpandedNode, NodeData, NodeId, Transform2D, expand_instance,
-};
+use fanta_doc::{Doc, ExpandedNode, NodeData, NodeId, Transform2D, expand_instance};
 use glam::DVec2;
 
 fn clone_world(
@@ -49,14 +47,24 @@ fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("usage: probe_instance_text <project_dir> [wx] [wy]"))?;
-    let px: f64 = env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(163.0);
-    let py: f64 = env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(113.0);
+    let px: f64 = env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(163.0);
+    let py: f64 = env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(113.0);
     let point = DVec2::new(px, py);
 
     let (doc, _assets) = fanta_format::read_project_tree(&dir)?;
     let doc: Doc = doc;
 
-    println!("pages={:?} active={:?}", doc.pages().len(), doc.active_page());
+    println!(
+        "pages={:?} active={:?}",
+        doc.pages().len(),
+        doc.active_page()
+    );
     println!("components: {}", doc.components.defs.len());
     for (id, def) in &doc.components.defs {
         println!(
@@ -69,16 +77,24 @@ fn main() -> Result<()> {
 
     let instances: Vec<NodeId> = doc
         .scene
-        .descendants_of(doc.active_page().unwrap_or_else(|| {
-            doc.scene.roots().first().copied().expect("a root")
-        }))
-        .filter(|id| matches!(doc.scene.get(*id).map(|n| &n.data), Some(NodeData::Instance(_))))
+        .descendants_of(
+            doc.active_page()
+                .unwrap_or_else(|| doc.scene.roots().first().copied().expect("a root")),
+        )
+        .filter(|id| {
+            matches!(
+                doc.scene.get(*id).map(|n| &n.data),
+                Some(NodeData::Instance(_))
+            )
+        })
         .collect();
     println!("instances under active page: {}", instances.len());
 
     for inst_id in instances {
         let node = doc.scene.get(inst_id).expect("node");
-        let NodeData::Instance(inst) = &node.data else { continue };
+        let NodeData::Instance(inst) = &node.data else {
+            continue;
+        };
         let w_inst = doc.scene.world_transform(inst_id).expect("world");
         println!(
             "\n=== instance {inst_id:?} derived={} overrides={} w_inst_origin={:?}",

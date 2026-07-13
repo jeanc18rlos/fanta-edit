@@ -12,9 +12,9 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use design_surface::{DesignNodeType, DesignOp, DesignSurface, NodeQuery, ScreenshotTarget};
 use fanta_doc::{
-    AssetId, BitmapNode, CanvasNode, Color, Doc, Fill, GroupNode, ImageFitMode, IndexKey,
-    NodeData, NodeFlags, NodeId, Operation, PathData, TextNode, Transform2D, UnitInterval,
-    VectorNode, Viewport,
+    AssetId, BitmapNode, CanvasNode, Color, Doc, Fill, GroupNode, ImageFitMode, IndexKey, NodeData,
+    NodeFlags, NodeId, Operation, PathData, TextNode, Transform2D, UnitInterval, VectorNode,
+    Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
@@ -1160,7 +1160,11 @@ mod tests {
             "Broken image batch",
         );
         assert_eq!(outcome.value["applied"], json!(false));
-        assert_eq!(stores.raw_assets().len(), 0, "the ingested asset was rolled back");
+        assert_eq!(
+            stores.raw_assets().len(),
+            0,
+            "the ingested asset was rolled back"
+        );
     }
 
     #[test]
@@ -1176,7 +1180,10 @@ mod tests {
         );
         assert_eq!(outcome.value["applied"], json!(false));
         let error = outcome.value["ops"][0]["error"].as_str().unwrap();
-        assert!(error.contains("place_generation"), "error steers to the tool: {error}");
+        assert!(
+            error.contains("place_generation"),
+            "error steers to the tool: {error}"
+        );
 
         let outcome = run_batch(
             &mut doc,
@@ -1310,8 +1317,16 @@ mod tests {
         assert_eq!(outcome.change, DocChange::None);
         assert_eq!(outcome.value["ops"][1]["status"], json!("failed"));
         assert_eq!(outcome.value["ops"][0]["status"], json!("ok"));
-        assert_eq!(doc.scene.len(), nodes_before, "the created node was rolled back");
-        assert_eq!(doc.history.undo_depth(), 0, "no undo step for a failed batch");
+        assert_eq!(
+            doc.scene.len(),
+            nodes_before,
+            "the created node was rolled back"
+        );
+        assert_eq!(
+            doc.history.undo_depth(),
+            0,
+            "no undo step for a failed batch"
+        );
     }
 
     #[test]

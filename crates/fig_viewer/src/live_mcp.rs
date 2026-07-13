@@ -128,7 +128,9 @@ struct OrDefault<T>(T);
 
 impl<'de, T: Deserialize<'de> + Default> Deserialize<'de> for OrDefault<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Ok(Self(Option::<T>::deserialize(deserializer)?.unwrap_or_default()))
+        Ok(Self(
+            Option::<T>::deserialize(deserializer)?.unwrap_or_default(),
+        ))
     }
 }
 
@@ -157,8 +159,9 @@ fn with_surface<R: 'static>(
     f: impl FnOnce(std::rc::Rc<dyn design_surface::DesignSurface>, &mut App) -> Result<R> + 'static,
 ) -> Result<R> {
     cx.update(|cx| {
-        let surface = design_surface::active(cx)
-            .context("no design canvas is open; open a .fig file or Fanta project in Fanta first")?;
+        let surface = design_surface::active(cx).context(
+            "no design canvas is open; open a .fig file or Fanta project in Fanta first",
+        )?;
         f(surface, cx)
     })
 }

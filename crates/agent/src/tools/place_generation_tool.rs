@@ -282,7 +282,10 @@ mod tests {
 
     #[test]
     fn sniffs_the_supported_image_formats() {
-        assert_eq!(sniff_image_mime(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));
+        assert_eq!(
+            sniff_image_mime(b"\x89PNG\r\n\x1a\n...."),
+            Some("image/png")
+        );
         assert_eq!(
             sniff_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]),
             Some("image/jpeg")

@@ -43,12 +43,7 @@ impl EditorWorkspace {
 }
 
 impl EditorMode {
-    pub const ALL: [Self; 4] = [
-        Self::Design,
-        Self::Prototype,
-        Self::Motion,
-        Self::Comments,
-    ];
+    pub const ALL: [Self; 4] = [Self::Design, Self::Prototype, Self::Motion, Self::Comments];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -154,16 +149,14 @@ impl RenderOnce for EditorModeTabs {
         let mut tabs = CollapsibleIconTabBar::new("fanta-editor-mode-tabs");
         for (index, mode) in EditorMode::ALL.into_iter().enumerate() {
             let on_select = self.on_select.clone();
-            tabs = tabs.tab(
-                CollapsibleIconTab::new(
-                    "fanta-editor-mode",
-                    index,
-                    mode.icon(),
-                    mode.label(),
-                    mode == self.selected,
-                    move |window, cx| on_select(mode, window, cx),
-                ),
-            );
+            tabs = tabs.tab(CollapsibleIconTab::new(
+                "fanta-editor-mode",
+                index,
+                mode.icon(),
+                mode.label(),
+                mode == self.selected,
+                move |window, cx| on_select(mode, window, cx),
+            ));
         }
         tabs
     }
@@ -192,16 +185,14 @@ impl RenderOnce for EditorWorkspaceTabs {
         let mut tabs = CollapsibleIconTabBar::new("fanta-editor-workspace-tabs");
         for (index, workspace) in EditorWorkspace::ALL.into_iter().enumerate() {
             let on_select = self.on_select.clone();
-            tabs = tabs.tab(
-                CollapsibleIconTab::new(
-                    "fanta-editor-workspace",
-                    index,
-                    workspace.icon(),
-                    workspace.label(),
-                    workspace == self.selected,
-                    move |window, cx| on_select(workspace, window, cx),
-                ),
-            );
+            tabs = tabs.tab(CollapsibleIconTab::new(
+                "fanta-editor-workspace",
+                index,
+                workspace.icon(),
+                workspace.label(),
+                workspace == self.selected,
+                move |window, cx| on_select(workspace, window, cx),
+            ));
         }
         tabs
     }

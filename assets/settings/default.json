@@ -2397,6 +2397,7 @@
       },
     },
     "FNX": {
+      "format_on_save": "on",
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
       "prettier": {
         "allowed": true,

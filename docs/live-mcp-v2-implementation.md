@@ -1,6 +1,6 @@
 # Live MCP v2 — phase 1 implementation spec
 
-Target worktree: `/Users/jeanrojas/fanta-edit-live-mcp` (branch `feat/live-mcp-v2`).
+Target worktree: `/path/to/fanta-edit` (branch `feat/live-mcp-v2`).
 Engine crates resolve via `../fanta-engine-migration`. Everything below was
 verified against the codebase (anchors included). Follow repo idiom; keep
 comments to non-obvious constraints only.
@@ -119,7 +119,7 @@ Registration gates (ALL required — tools.rs:173-188 comment):
 Follow `builtin/create-skill/` layout (SKILL.md with name/description
 frontmatter; registered in `builtin_skills()` agent_skills.rs:701).
 - `builtin/fanta-design/SKILL.md` — adapt the OLD skill (READ it at
-  /Users/jeanrojas/fanta/plugins/fanta-design/skills/fanta-design/SKILL.md):
+  path/to/fanta/plugins/fanta-design/skills/fanta-design/SKILL.md):
   the loop (state → screenshot → edit → screenshot), build mechanics, depth &
   material, typography, icons; rewrite tool names to design_state/
   design_edit/design_screenshot and fnx-source editing via edit_file.

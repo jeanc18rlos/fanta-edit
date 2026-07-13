@@ -447,10 +447,7 @@ impl AssetStores<'_> {
         );
         *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
 
-        if let Some(format) = image::guess_format(&bytes)
-            .ok()
-            .and_then(gpui_image_format)
-        {
+        if let Some(format) = image::guess_format(&bytes).ok().and_then(gpui_image_format) {
             self.gpui_images
                 .insert(id, Arc::new(Image::from_bytes(format, bytes)));
         }

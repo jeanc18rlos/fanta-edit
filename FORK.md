@@ -5,10 +5,10 @@
 After accepting the Xcode license (`sudo xcodebuild -license accept`), initialize git and connect remotes:
 
 ```sh
-cd /Users/jeanrojas/fanta-edit
+cd /path/to/fanta-edit
 
 git init
-git remote add origin https://github.com/jeanc18rlos/fanta-edit.git
+git remote add origin https://github.com/YOUR_USERNAME/fanta-edit.git
 git remote add upstream https://github.com/zed-industries/zed.git
 
 git fetch upstream
