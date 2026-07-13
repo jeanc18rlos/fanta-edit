@@ -1750,11 +1750,9 @@
   //      "load_direnv": "disabled"
   "load_direnv": "direct",
   "edit_predictions": {
-    // Which edit prediction provider to use. Fanta serves self-hosted
-    // Zeta 2.1 (open weights) over an OpenAI-completions lane, metered.
-    // Reverts to "zed" (dead in this fork) or "copilot" if you prefer.
-    // The Fanta endpoint is configured in "open_ai_compatible_api" below.
-    "provider": "open_ai_compatible_api",
+    // Which edit prediction provider to use. Fanta's OpenAI-compatible endpoint
+    // is configured below, but remains disabled until its Zeta service is deployed.
+    "provider": "none",
     // A list of globs representing files that edit predictions should be disabled for.
     // There's a sensible default list of globs already included.
     // Any addition to this list will be merged with the default list.
@@ -1803,11 +1801,11 @@
       "prompt_format": "infer",
       "max_output_tokens": 64,
     },
-    // Fanta self-hosted Zeta 2.1 edit predictions (metered). Set the key via
-    // ZED_OPEN_AI_COMPATIBLE_EDIT_PREDICTION_API_KEY or the keychain. Point
-    // api_url elsewhere (or set provider above to "zed"/"copilot") to change.
+    // Fanta self-hosted Zeta 2.1 edit predictions (metered). Once its service is
+    // deployed, set provider above to "open_ai_compatible_api". Fanta account
+    // credentials are reused only for this exact endpoint.
     "open_ai_compatible_api": {
-      "api_url": "https://api.fantaisa.net",
+      "api_url": "https://api.fantaisa.net/v1/completions",
       "model": "fanta-zeta-1",
       "prompt_format": "zeta2_1",
       "max_output_tokens": 2048,

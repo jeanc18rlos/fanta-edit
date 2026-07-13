@@ -4,11 +4,13 @@ use crate::{
     prediction::EditPredictionResult,
 };
 use anyhow::{Context as _, Result, anyhow};
+use client::{Client, ClientSettings};
 use gpui::{App, AppContext as _, Entity, Task};
 use language::{
     Anchor, Buffer, BufferSnapshot, EditPredictionPromptFormat, ToOffset, ToPoint as _,
     language_settings::all_language_settings,
 };
+use settings::Settings as _;
 use std::{path::Path, sync::Arc, time::Instant};
 use zeta_prompt::{Zeta2PromptInput, compute_editable_and_context_ranges};
 
@@ -33,6 +35,7 @@ pub fn request_prediction(
         ..
     }: EditPredictionModelInput,
     prompt_format: EditPredictionPromptFormat,
+    client: Arc<Client>,
     cx: &mut App,
 ) -> Task<Result<Option<EditPredictionResult>>> {
     let settings = &all_language_settings(None, cx).edit_predictions;
@@ -58,7 +61,12 @@ pub fn request_prediction(
         return Task::ready(Err(anyhow!("Unsupported edit prediction provider for FIM")));
     };
 
-    let api_key = load_open_ai_compatible_api_key_if_needed(provider, cx);
+    let api_key = load_open_ai_compatible_api_key_if_needed(provider, cx).or_else(|| {
+        let server_url = &ClientSettings::get_global(cx).server_url;
+        uses_account_credentials(settings.api_url.as_ref(), server_url)
+            .then(|| client.account_access_token())
+            .flatten()
+    });
 
     let result = cx.background_spawn(async move {
         let cursor_offset = cursor_point.to_offset(&snapshot);
@@ -165,6 +173,10 @@ pub fn request_prediction(
     })
 }
 
+fn uses_account_credentials(api_url: &str, server_url: &str) -> bool {
+    api_url == format!("{}/v1/completions", server_url.trim_end_matches('/'))
+}
+
 fn format_fim_prompt(
     prompt_format: EditPredictionPromptFormat,
     prefix: &str,
@@ -241,4 +253,25 @@ fn clean_fim_completion(response: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uses_account_credentials;
+
+    #[test]
+    fn account_credentials_are_only_used_for_the_fanta_completion_endpoint() {
+        assert!(uses_account_credentials(
+            "https://api.fantaisa.net/v1/completions",
+            "https://api.fantaisa.net",
+        ));
+        assert!(uses_account_credentials(
+            "https://api.fantaisa.net/v1/completions",
+            "https://api.fantaisa.net/",
+        ));
+        assert!(!uses_account_credentials(
+            "https://example.com/v1/completions",
+            "https://api.fantaisa.net",
+        ));
+    }
 }

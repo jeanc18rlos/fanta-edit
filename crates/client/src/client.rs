@@ -877,6 +877,14 @@ impl Client {
             .is_some()
     }
 
+    pub fn account_access_token(&self) -> Option<Arc<str>> {
+        self.state
+            .read()
+            .credentials
+            .as_ref()
+            .map(|credentials| Arc::from(credentials.access_token.as_str()))
+    }
+
     pub async fn sign_in(
         self: &Arc<Self>,
         try_provider: bool,

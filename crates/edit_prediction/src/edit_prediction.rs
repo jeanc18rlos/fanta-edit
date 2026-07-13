@@ -2876,7 +2876,9 @@ impl EditPredictionStore {
                     cx,
                 )
             }
-            EditPredictionModel::Fim { format } => fim::request_prediction(inputs, format, cx),
+            EditPredictionModel::Fim { format } => {
+                fim::request_prediction(inputs, format, self.client.clone(), cx)
+            }
             EditPredictionModel::Mercury => {
                 self.mercury
                     .request_prediction(inputs, self.credentials_provider.clone(), cx)
