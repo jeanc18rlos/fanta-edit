@@ -228,6 +228,9 @@ pub struct SettingsContent {
     /// The URL of the Zed server to connect to.
     pub server_url: Option<String>,
 
+    /// Whether to maintain a WebSocket connection for cloud account updates.
+    pub cloud_updates_enabled: Option<bool>,
+
     /// The URL used as the key for credential storage.
     ///
     /// When set, credentials are stored under this URL instead of `server_url`.

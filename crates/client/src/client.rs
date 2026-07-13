@@ -103,6 +103,7 @@ actions!(
 #[derive(Deserialize, RegisterSetting)]
 pub struct ClientSettings {
     pub server_url: String,
+    pub cloud_updates_enabled: bool,
     /// Overrides the key used to store credentials in the system keychain.
     /// Defaults to `server_url` when unset.
     ///
@@ -119,11 +120,13 @@ impl Settings for ClientSettings {
         if let Some(server_url) = &*ZED_SERVER_URL {
             return Self {
                 server_url: server_url.clone(),
+                cloud_updates_enabled: content.cloud_updates_enabled.unwrap_or(true),
                 credentials_url: content.credentials_url.clone(),
             };
         }
         Self {
             server_url: content.server_url.clone().unwrap(),
+            cloud_updates_enabled: content.cloud_updates_enabled.unwrap_or(true),
             credentials_url: content.credentials_url.clone(),
         }
     }
@@ -1070,7 +1073,11 @@ impl Client {
 
         let credentials = self.sign_in(try_provider, cx).await?;
 
-        self.connect_to_cloud(cx);
+        let cloud_updates_enabled =
+            cx.update(|cx| ClientSettings::get_global(cx).cloud_updates_enabled);
+        if cloud_updates_enabled {
+            self.connect_to_cloud(cx);
+        }
 
         cx.update(move |cx| {
             cx.spawn({
