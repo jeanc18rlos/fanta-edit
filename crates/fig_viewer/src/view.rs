@@ -5789,6 +5789,7 @@ mod tests {
 impl FigView {
     /// The zoom the toolbar should display: live viewport zoom, or the fit
     /// zoom the canvas will initialize with before first interaction.
+    #[cfg(feature = "fanta-gpui-ui")]
     fn current_zoom_percent(&self, cx: &App) -> u16 {
         let zoom = self
             .viewport
