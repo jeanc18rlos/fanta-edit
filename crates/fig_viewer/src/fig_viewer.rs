@@ -16,6 +16,8 @@ mod document;
 mod editor_session;
 mod export;
 mod fnx_editor;
+#[cfg(feature = "fanta-gpui-ui")]
+mod gpui_adapters;
 mod inspector_components;
 mod inspector_widgets;
 mod instance_text;
