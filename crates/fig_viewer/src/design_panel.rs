@@ -469,6 +469,8 @@ pub struct FantaDesignPanel {
     pages_cache: Vec<PageEntry>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_pages: Option<crate::gpui_adapters::pages::PagesAdapter>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    gpui_layers: Option<crate::gpui_adapters::layers::LayersAdapter>,
     components_cache: Vec<(SharedString, NodeId)>,
     components_total_count: usize,
     assets_cache: Vec<AssetEntry>,
@@ -632,6 +634,8 @@ impl FantaDesignPanel {
             pages_cache: Vec::new(),
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_pages: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_layers: None,
             components_cache: Vec::new(),
             components_total_count: 0,
             assets_cache: Vec::new(),
@@ -697,6 +701,8 @@ impl FantaDesignPanel {
                                 this.rebuild_layer_rows(cx);
                                 #[cfg(feature = "fanta-gpui-ui")]
                                 this.refresh_gpui_pages(cx);
+                                #[cfg(feature = "fanta-gpui-ui")]
+                                this.refresh_gpui_layers(cx);
                                 cx.notify();
                             }
                         },
@@ -1601,6 +1607,10 @@ impl FantaDesignPanel {
         let gpui_pages_section: Option<AnyElement> = self.gpui_pages_section_element(cx);
         #[cfg(not(feature = "fanta-gpui-ui"))]
         let gpui_pages_section: Option<AnyElement> = None;
+        #[cfg(feature = "fanta-gpui-ui")]
+        let gpui_layers_section: Option<AnyElement> = self.gpui_layers_section_element(cx);
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        let gpui_layers_section: Option<AnyElement> = None;
         let element = v_flex()
             .size_full()
             .overflow_hidden()
@@ -1677,8 +1687,8 @@ impl FantaDesignPanel {
                 }
             })
             .child(self.render_section_divider(SectionDivider::PagesLayers, cx))
-            .child(
-                v_flex()
+            .child({
+                let native = v_flex()
                     .when(layers_open, |section| section.flex_1())
                     .overflow_hidden()
                     .child(
@@ -1759,8 +1769,12 @@ impl FantaDesignPanel {
                                 .track_scroll(&self.layers_scroll_handle),
                             )
                         }
-                    }),
-            )
+                    });
+                match gpui_layers_section {
+                    Some(section) => section,
+                    None => native.into_any_element(),
+                }
+            })
             .child(self.render_section_divider(SectionDivider::LayersComponents, cx))
             .child(
                 v_flex()
@@ -2800,6 +2814,8 @@ impl Render for FantaDesignPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(feature = "fanta-gpui-ui")]
         self.ensure_gpui_pages(_window, cx);
+        #[cfg(feature = "fanta-gpui-ui")]
+        self.ensure_gpui_layers(_window, cx);
         let body = match self.active_view(cx) {
             None => centered_message("Open a Figma document to browse its layers"),
             Some(view) => {
@@ -3874,6 +3890,242 @@ impl FantaDesignPanel {
             v_flex()
                 .flex_none()
                 .max_h(self.pages_height + px(96.))
+                .overflow_hidden()
+                .child(adapter.panel.clone())
+                .into_any_element(),
+        )
+    }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+impl FantaDesignPanel {
+    fn ensure_gpui_layers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.gpui_layers.is_some()
+            || !crate::gpui_adapters::runtime_enabled(cx)
+            || !crate::gpui_adapters::layers::layers_enabled()
+        {
+            return;
+        }
+        let panel = cx.new(|cx| {
+            fanta_gpui::layers::LayersPanel::new("fanta-gpui-layers", Vec::new(), window, cx)
+        });
+        let subscription = cx.subscribe_in(&panel, window, Self::handle_layers_action);
+        self.gpui_layers = Some(crate::gpui_adapters::layers::LayersAdapter {
+            panel,
+            _subscription: subscription,
+        });
+        self.refresh_gpui_layers(cx);
+    }
+
+    /// The active page's root, when it is a real page node.
+    fn gpui_layers_page_root(&self, cx: &App) -> Option<NodeId> {
+        let view = self.active_view(cx)?;
+        let item = view.read(cx).item().clone();
+        let fig_item = item.read(cx);
+        let document = fig_item.document()?;
+        self.current_page_index
+            .and_then(|index| document.pages.get(index))
+            .and_then(|page| page.root)
+    }
+
+    /// True when the current page fits the non-virtualized panel's budget.
+    fn gpui_layers_within_budget(&self, cx: &App) -> bool {
+        let Some(root) = self.gpui_layers_page_root(cx) else {
+            return false;
+        };
+        let Some(view) = self.active_view(cx) else {
+            return false;
+        };
+        let item = view.read(cx).item().clone();
+        let fig_item = item.read(cx);
+        let Some(document) = fig_item.document() else {
+            return false;
+        };
+        crate::gpui_adapters::layers::subtree_len(&document.doc, root)
+            <= crate::gpui_adapters::layers::node_budget()
+    }
+
+    /// Echo the layer tree, selection, and expansion into the panel. Skipped
+    /// (cheaply) while over budget — the native section renders then.
+    fn refresh_gpui_layers(&mut self, cx: &mut App) {
+        if self.gpui_layers.is_none() || !self.gpui_layers_within_budget(cx) {
+            return;
+        }
+        let Some(root) = self.gpui_layers_page_root(cx) else {
+            return;
+        };
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let fig_item = item.read(cx);
+        let Some(document) = fig_item.document() else {
+            return;
+        };
+        let tree = crate::gpui_adapters::layers::layers_tree(&document.doc, root);
+        let selected: Vec<SharedString> = document
+            .doc
+            .selection
+            .iter()
+            .map(|id| SharedString::from(id.to_string()))
+            .collect();
+        let expanded: Vec<SharedString> = self
+            .expanded_nodes
+            .iter()
+            .map(|id| SharedString::from(id.to_string()))
+            .collect();
+        if let Some(adapter) = self.gpui_layers.as_ref() {
+            adapter.panel.update(cx, |panel, cx| {
+                panel.set_nodes(tree, cx);
+                panel.set_selected_node_ids(selected, cx);
+                panel.set_expanded_node_ids(expanded, cx);
+            });
+        }
+    }
+
+    fn handle_layers_action(
+        &mut self,
+        _panel: &Entity<fanta_gpui::layers::LayersPanel>,
+        action: &fanta_gpui::layers::LayersPanelAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::gpui_adapters::layers::node_id;
+        use fanta_gpui::layers::{
+            LayersPanelAction, LayersPanelContextAction, LayersPanelSelectionMode,
+        };
+        match action {
+            LayersPanelAction::SelectRequested { node_id: id, mode } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                match mode {
+                    LayersPanelSelectionMode::Replace => self.select_node(id, false, cx),
+                    LayersPanelSelectionMode::Toggle => self.select_node(id, true, cx),
+                    LayersPanelSelectionMode::Range => self.select_node_range_to(id, cx),
+                }
+            }
+            LayersPanelAction::ExpansionChanged {
+                node_id: id,
+                expanded,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                if *expanded {
+                    self.expanded_nodes.insert(id);
+                } else {
+                    self.expanded_nodes.remove(&id);
+                }
+                cx.notify();
+            }
+            LayersPanelAction::CollapseAllRequested => {
+                self.expanded_nodes.clear();
+                self.refresh_gpui_layers(cx);
+                cx.notify();
+            }
+            LayersPanelAction::RenameRequested { node_id: id, title } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.rename_node_to(id, title.to_string(), cx);
+            }
+            LayersPanelAction::VisibilityChanged { node_id: id, .. } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.toggle_node_flag(id, NodeFlags::HIDDEN, cx);
+            }
+            LayersPanelAction::LockChanged { node_id: id, .. } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.toggle_node_flag(id, NodeFlags::LOCKED, cx);
+            }
+            LayersPanelAction::MoveRequested {
+                node_id: dragged,
+                target_node_id: target,
+                position,
+            } => {
+                use fanta_gpui::layers::LayersPanelDropPosition;
+                let (Some(dragged), Some(target)) = (node_id(dragged), node_id(target)) else {
+                    return;
+                };
+                let placement = match position {
+                    LayersPanelDropPosition::Before => LayerDropPlacement::Above,
+                    LayersPanelDropPosition::Inside => LayerDropPlacement::Inside,
+                    LayersPanelDropPosition::After => LayerDropPlacement::Below,
+                };
+                self.drop_layer(dragged, target, placement, cx);
+            }
+            LayersPanelAction::ContextActionRequested {
+                node_id: id,
+                action,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                match action {
+                    LayersPanelContextAction::ShowHide => {
+                        self.toggle_node_flag(id, NodeFlags::HIDDEN, cx)
+                    }
+                    LayersPanelContextAction::LockUnlock => {
+                        self.toggle_node_flag(id, NodeFlags::LOCKED, cx)
+                    }
+                    // The panel opens its own inline rename for Rename.
+                    LayersPanelContextAction::Rename => {}
+                    other => {
+                        log::info!("fanta-gpui layers: context action {other:?} not wired yet");
+                    }
+                }
+            }
+            LayersPanelAction::PanelExpansionChanged { .. } => {}
+        }
+    }
+
+    /// Shift-click range selection over the flattened visible row order the
+    /// native section maintains (`layer_rows` is rebuilt on every document
+    /// event even while the gpui panel renders).
+    fn select_node_range_to(&mut self, target: NodeId, cx: &mut Context<Self>) {
+        let anchor = self
+            .layer_rows
+            .iter()
+            .position(|row| row.selected)
+            .unwrap_or(0);
+        let Some(end) = self.layer_rows.iter().position(|row| row.id == target) else {
+            self.select_node(target, false, cx);
+            return;
+        };
+        let (from, to) = (anchor.min(end), anchor.max(end));
+        let ids: Vec<NodeId> = self.layer_rows[from..=to]
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
+        let item = view.read(cx).item().clone();
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with(ids.iter().copied());
+                ((), DocChange::Selection)
+            });
+        });
+    }
+
+    /// The mounted LayersPanel when the adapter is live AND the page is
+    /// within the node budget; None falls back to the native section.
+    fn gpui_layers_section_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let adapter = self.gpui_layers.as_ref()?;
+        if !self.gpui_layers_within_budget(cx) {
+            return None;
+        }
+        Some(
+            v_flex()
+                .flex_1()
                 .overflow_hidden()
                 .child(adapter.panel.clone())
                 .into_any_element(),
