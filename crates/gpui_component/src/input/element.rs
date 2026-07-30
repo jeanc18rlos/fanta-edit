@@ -10,7 +10,7 @@ use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
-    ActiveTheme as _, Colorize, PixelsExt, Root,
+    ActiveTheme as _, Colorize, Root,
     input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, text_wrapper::LineLayout},
 };
 
@@ -1394,7 +1394,14 @@ impl Element for TextElement {
                     window.paint_quad(fill(ghost_bounds, cx.theme().editor_background()));
 
                     // Paint ghost line text
-                    _ = ghost_line.paint(ghost_p, line_height, gpui::TextAlign::default(), None, window, cx);
+                    _ = ghost_line.paint(
+                        ghost_p,
+                        line_height,
+                        gpui::TextAlign::default(),
+                        None,
+                        window,
+                        cx,
+                    );
                     offset_y += line_height;
                 }
             }
@@ -1482,7 +1489,14 @@ impl Element for TextElement {
                     window.paint_quad(fill(bg_bounds, cx.theme().editor_background()));
 
                     // Paint first line completion text
-                    _ = first_line.paint(p, line_height, gpui::TextAlign::default(), None, window, cx);
+                    _ = first_line.paint(
+                        p,
+                        line_height,
+                        gpui::TextAlign::default(),
+                        None,
+                        window,
+                        cx,
+                    );
                 }
             }
         }

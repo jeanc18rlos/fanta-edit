@@ -1,5 +1,5 @@
 use gpui::{
-    App, AppContext, Bounds, ClickEvent, Context, Anchor, Div, ElementId, Entity, EventEmitter,
+    Anchor, App, AppContext, Bounds, ClickEvent, Context, Div, ElementId, Entity, EventEmitter,
     FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement, KeyBinding, MouseButton,
     ParentElement, Pixels, Point, Render, RenderOnce, SharedString, Stateful,
     StatefulInteractiveElement as _, StyleRefinement, Styled, Subscription, Window, anchored,

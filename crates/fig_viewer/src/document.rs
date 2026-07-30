@@ -978,7 +978,11 @@ impl FigItem {
     /// tree. Idempotent per project entity; called for every window that
     /// opens this shared item, so external-edit detection outlives any single
     /// window's `Project`.
-    pub(crate) fn subscribe_to_project(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+    pub(crate) fn subscribe_to_project(
+        &mut self,
+        project: &Entity<Project>,
+        cx: &mut Context<Self>,
+    ) {
         self.project_subscriptions
             .retain(|(project, _)| project.upgrade().is_some());
         if self
@@ -1156,12 +1160,7 @@ impl FigItem {
     /// of the merge is not on disk yet) and the merge base advances to the
     /// disk state so the next external change merges against the right
     /// ancestor.
-    fn adopt_merged_document(
-        &mut self,
-        merged: Doc,
-        disk: FigDocument,
-        cx: &mut Context<Self>,
-    ) {
+    fn adopt_merged_document(&mut self, merged: Doc, disk: FigDocument, cx: &mut Context<Self>) {
         let mut raw_assets: BTreeMap<AssetId, Vec<u8>> = (*disk.raw_assets).clone();
         if let Some(current) = self.document.ready() {
             for (id, bytes) in current.raw_assets.iter() {
@@ -1196,7 +1195,9 @@ impl FigItem {
             .collect();
         document.doc.selection.replace_with(surviving);
         document.continue_generation_after(
-            self.document.ready().map(|current| current.render_generation()),
+            self.document
+                .ready()
+                .map(|current| current.render_generation()),
         );
         self.document = FigDocumentState::Ready(document);
         self.merge_base = Some(disk.doc);
@@ -1285,7 +1286,9 @@ impl FigItem {
             document.restore_active_root(root);
         }
         document.continue_generation_after(
-            self.document.ready().map(|current| current.render_generation()),
+            self.document
+                .ready()
+                .map(|current| current.render_generation()),
         );
         self.merge_base = Some(document.doc.clone());
         self.document = FigDocumentState::Ready(document);
@@ -1327,7 +1330,9 @@ impl FigItem {
         document.doc.selection.replace_with(preserved_selection);
         document.doc.viewport = previous_viewport;
         document.continue_generation_after(
-            self.document.ready().map(|current| current.render_generation()),
+            self.document
+                .ready()
+                .map(|current| current.render_generation()),
         );
         self.document = FigDocumentState::Ready(document);
         self.dirty = false;
@@ -1846,7 +1851,8 @@ fn scoped_project_source(path: &Path) -> Option<(PathBuf, FigScope)> {
     let doc_directory = path.parent()?;
     if path.file_name()? == "variables.json" && doc_directory.file_name()? == "doc" {
         let root = doc_directory.parent()?;
-        return fanta_format::is_project_dir(root).then(|| (root.to_path_buf(), FigScope::Variables));
+        return fanta_format::is_project_dir(root)
+            .then(|| (root.to_path_buf(), FigScope::Variables));
     }
     None
 }
@@ -2140,7 +2146,8 @@ mod tests {
         let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
         page.name = "Page 1".to_owned();
         let page_root = page.id;
-        doc.apply(Operation::create_node(page)).expect("create page");
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
         doc.add_page(page_root);
         let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
         master.name = "Button".to_owned();
@@ -2169,10 +2176,7 @@ mod tests {
         fanta_format::scaffold_project_tree(root).expect("scaffold");
 
         let page = NodeId::new();
-        let page_path = root
-            .join("pages")
-            .join(page.to_string())
-            .join("page.fnx");
+        let page_path = root.join("pages").join(page.to_string()).join("page.fnx");
         assert_eq!(
             scoped_project_source(&page_path),
             Some((root.to_path_buf(), FigScope::Page(page)))
@@ -2195,7 +2199,10 @@ mod tests {
 
         // Wrong file names, malformed ids, and look-alike paths outside a
         // tagged project all decline (falling through to the text editor).
-        assert_eq!(scoped_project_source(&root.join("doc").join("motion.json")), None);
+        assert_eq!(
+            scoped_project_source(&root.join("doc").join("motion.json")),
+            None
+        );
         assert_eq!(
             scoped_project_source(&root.join("pages").join("not-an-id").join("page.fnx")),
             None
@@ -2204,7 +2211,10 @@ mod tests {
         std::fs::create_dir_all(outside.join("pages").join(page.to_string())).expect("mkdir");
         assert_eq!(
             scoped_project_source(
-                &outside.join("pages").join(page.to_string()).join("page.fnx")
+                &outside
+                    .join("pages")
+                    .join(page.to_string())
+                    .join("page.fnx")
             ),
             None
         );
@@ -2792,9 +2802,7 @@ mod tests {
     /// (reload/merge/conflict) dies with the first window's project, and the
     /// next save clobbers newer disk state.
     #[gpui::test]
-    async fn a_second_windows_open_watches_its_project_for_external_edits(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_second_windows_open_watches_its_project_for_external_edits(cx: &mut TestAppContext) {
         use project::ProjectItem as _;
 
         async fn open_via_new_project(

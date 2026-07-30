@@ -1,4 +1,4 @@
-use crate::{ActiveTheme, PixelsExt as _};
+use crate::ActiveTheme as _;
 use gpui::{
     App, BoxShadow, Corners, DefiniteLength, Div, Edges, FocusHandle, Hsla, ParentElement, Pixels,
     Refineable, StyleRefinement, Styled, Window, div, point, px,

@@ -21,6 +21,14 @@ pub(crate) fn env_enabled() -> bool {
     )
 }
 
+/// A fanta-gpui surface may mount only when the env switch allows it AND
+/// `gpui_component::init` has run (its Theme global exists). Hosts that
+/// skipped init — including unit tests building a bare FigView — fall back
+/// to the native surface instead of panicking on the missing global.
+pub(crate) fn runtime_enabled(cx: &gpui::App) -> bool {
+    env_enabled() && cx.try_global::<gpui_component::theme::Theme>().is_some()
+}
+
 #[cfg(test)]
 mod spike_tests {
     use fanta_gpui::prelude::*;

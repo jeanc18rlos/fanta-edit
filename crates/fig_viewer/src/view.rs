@@ -264,6 +264,8 @@ pub struct FigView {
     /// The last-used tool per toolbar group, so each group's button keeps
     /// showing the member you last picked (Figma behavior). Indexed by group.
     group_faces: Vec<ToolKind>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    gpui_toolbar: Option<crate::gpui_adapters::toolbar::ToolbarAdapter>,
     /// Set once the document's fonts have been queued for background download,
     /// so the one-shot prewarm doesn't re-fire every frame.
     fonts_prewarmed: bool,
@@ -486,6 +488,9 @@ impl FigView {
             tools: ToolShell::new(),
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
+                .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
             fonts_prewarmed: false,
             hovered_node: None,
             text_edit: None,
@@ -3658,6 +3663,14 @@ impl Render for FigView {
         let is_loading = snapshot.loading_message.is_some();
         let editor_mode = self.editor_mode(cx);
         let editor_workspace = self.editor_workspace(cx);
+        #[cfg(feature = "fanta-gpui-ui")]
+        {
+            let tool = self.tools.kind();
+            let zoom_percent = self.current_zoom_percent(cx);
+            if let Some(adapter) = self.gpui_toolbar.as_mut() {
+                adapter.refresh(editor_mode, tool, zoom_percent, cx);
+            }
+        }
         let cursor_style = match &self.text_edit {
             // The I-beam over the edited text, an arrow elsewhere — clicking
             // away commits.
@@ -3940,7 +3953,7 @@ impl Render for FigView {
                                         .then(|| self.timeline_shell.clone()),
                                 ),
                         )
-                        .child(self.render_tool_pill(cx))
+                        .child(self.render_toolbar_slot(cx))
                         .children(
                             self.item
                                 .read(cx)
@@ -4381,6 +4394,9 @@ impl Item for FigView {
                 tools: ToolShell::new(),
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
+                #[cfg(feature = "fanta-gpui-ui")]
+                gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
+                    .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
                 fonts_prewarmed: false,
                 hovered_node: None,
                 text_edit: None,
@@ -5708,5 +5724,178 @@ mod tests {
                 "node should be gone after undo"
             );
         });
+    }
+}
+
+impl FigView {
+    /// The zoom the toolbar should display: live viewport zoom, or the fit
+    /// zoom the canvas will initialize with before first interaction.
+    fn current_zoom_percent(&self, cx: &App) -> u16 {
+        let zoom = self
+            .viewport
+            .map(|viewport| viewport.zoom)
+            .or_else(|| {
+                let bounds = self.container_bounds?;
+                let item = self.item.read(cx);
+                let document = item.document()?;
+                let page = document.page(self.selected_page_index)?;
+                Some(
+                    crate::document::fit_bounds(
+                        page.bounds,
+                        bounds_size(bounds),
+                        RENDER_PADDING,
+                        MIN_ZOOM,
+                        MAX_ZOOM,
+                    )
+                    .zoom,
+                )
+            })
+            .unwrap_or(1.0);
+        (zoom * 100.0).round().clamp(1.0, u16::MAX as f64) as u16
+    }
+
+    fn render_toolbar_slot(&self, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if self.gpui_toolbar.is_some() {
+            return self.render_gpui_toolbar(cx);
+        }
+        self.render_tool_pill(cx)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn render_gpui_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(adapter) = self.gpui_toolbar.as_ref() else {
+            return self.render_tool_pill(cx);
+        };
+        h_flex()
+            .absolute()
+            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
+                TIMELINE_HEIGHT + px(16.)
+            } else {
+                px(16.)
+            })
+            .left_0()
+            .right_0()
+            .justify_center()
+            .gap_2()
+            .child(adapter.panel.clone())
+            .child(self.render_toolbar_trailing_cluster(cx))
+            .into_any_element()
+    }
+
+    /// Fit-to-view plus the sidebar toggles: host chrome the component
+    /// doesn't model yet, rendered natively beside it so nothing regresses.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn render_toolbar_trailing_cluster(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .px_1()
+            .rounded_lg()
+            .elevation_2(cx)
+            .child(
+                IconButton::new("fig-gpui-fit", IconName::Maximize)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::for_action_title("Fit to View", &FitToView))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.fit_to_view(&FitToView, window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new(
+                    "fig-gpui-toggle-layers",
+                    if self.layers_sidebar_visible {
+                        IconName::ThreadsSidebarLeftOpen
+                    } else {
+                        IconName::ThreadsSidebarLeftClosed
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .toggle_state(self.layers_sidebar_visible)
+                .tooltip(Tooltip::text(if self.layers_sidebar_visible {
+                    "Hide Layers"
+                } else {
+                    "Show Layers"
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx);
+                })),
+            )
+            .child(
+                IconButton::new(
+                    "fig-gpui-toggle-inspector",
+                    if self.inspector_sidebar_visible {
+                        IconName::ThreadsSidebarRightOpen
+                    } else {
+                        IconName::ThreadsSidebarRightClosed
+                    },
+                )
+                .icon_size(IconSize::Small)
+                .toggle_state(self.inspector_sidebar_visible)
+                .tooltip(Tooltip::text(if self.inspector_sidebar_visible {
+                    "Hide Inspector"
+                } else {
+                    "Show Inspector"
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
+                })),
+            )
+            .into_any_element()
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    pub(crate) fn handle_toolbar_action(
+        &mut self,
+        _toolbar: &Entity<fanta_gpui::toolbar::EditorToolbar>,
+        action: &fanta_gpui::toolbar::ToolbarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fanta_gpui::toolbar::{ToolbarAction, ToolbarCommand, ToolbarMode};
+        match action {
+            ToolbarAction::ToolChangeRequested { tool, .. } => {
+                match crate::gpui_adapters::toolbar::tool_kind(*tool) {
+                    Some(kind) => self.activate_tool(kind, cx),
+                    None => log::info!("fanta-gpui toolbar: tool {tool:?} not wired yet"),
+                }
+            }
+            ToolbarAction::ModeChangeRequested { mode } => match mode {
+                ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
+                ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
+                ToolbarMode::Draw | ToolbarMode::Dev => {
+                    log::info!("fanta-gpui toolbar: mode {mode:?} not available yet");
+                }
+            },
+            ToolbarAction::ZoomChangeRequested { percent } => {
+                let current = f64::from(self.current_zoom_percent(cx)).max(1.0);
+                let target = f64::from(*percent).max(1.0);
+                self.zoom_by(target / current, None, cx);
+            }
+            ToolbarAction::CommandInvoked { command } => match command {
+                ToolbarCommand::Undo => self.undo(&Undo, window, cx),
+                ToolbarCommand::Redo => self.redo(&Redo, window, cx),
+                ToolbarCommand::Cut => self.cut_selection(&CutSelection, window, cx),
+                ToolbarCommand::Copy => self.copy_selection(&CopySelection, window, cx),
+                ToolbarCommand::Paste => self.paste_selection(&PasteSelection, window, cx),
+                ToolbarCommand::Duplicate => {
+                    self.duplicate_selection(&DuplicateSelection, window, cx)
+                }
+                ToolbarCommand::Delete => self.delete_selection(&DeleteSelection, window, cx),
+                ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
+                ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
+                ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
+                ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
+                other => log::info!("fanta-gpui toolbar: command {other:?} not wired yet"),
+            },
+            // Palette/agent text plumbing and secondary controls are
+            // component-internal or post-release surfaces.
+            ToolbarAction::CommandQueryChanged { .. }
+            | ToolbarAction::AiPromptSubmitted { .. }
+            | ToolbarAction::AgentVisibilityChanged { .. }
+            | ToolbarAction::AgentAttachmentRequested
+            | ToolbarAction::AgentVoiceInputRequested
+            | ToolbarAction::SecondaryControlInvoked { .. }
+            | ToolbarAction::ControlChangeRequested { .. } => {}
+        }
     }
 }

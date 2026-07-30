@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    Context, Anchor, DismissEvent, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
+    Anchor, Context, DismissEvent, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
     RenderOnce, SharedString, StyleRefinement, Styled, Window,
 };
 
-use crate::{button::Button, menu::PopupMenu, popover::Popover, Selectable};
+use crate::{Selectable, button::Button, menu::PopupMenu, popover::Popover};
 
 /// A dropdown menu trait for buttons and other interactive elements
 pub trait DropdownMenu: Styled + Selectable + InteractiveElement + IntoElement + 'static {

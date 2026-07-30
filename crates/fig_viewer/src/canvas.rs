@@ -2469,7 +2469,11 @@ mod tests {
             FrameDecision::Reproject
         );
         // Past the reproject scale cap the frame is too sparse to be useful.
-        let far_out = surface_key([0.0, 0.0], 1.0 / (MacGpuRenderer::MAX_REPROJECT_SCALE * 1.01), 7);
+        let far_out = surface_key(
+            [0.0, 0.0],
+            1.0 / (MacGpuRenderer::MAX_REPROJECT_SCALE * 1.01),
+            7,
+        );
         assert_eq!(
             frame_decision(&cached, &far_out, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::RenderFresh
