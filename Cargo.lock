@@ -6713,6 +6713,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-gpui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+]
+
+[[package]]
 name = "fanta-present"
 version = "0.1.0"
 dependencies = [
@@ -6917,6 +6925,7 @@ dependencies = [
  "fanta-fig-interop",
  "fanta-fnx",
  "fanta-format",
+ "fanta-gpui",
  "fanta-present",
  "fanta-render",
  "fanta-text",
@@ -6927,6 +6936,7 @@ dependencies = [
  "fs",
  "glam 0.32.1",
  "gpui",
+ "gpui-component",
  "image",
  "language",
  "log",
