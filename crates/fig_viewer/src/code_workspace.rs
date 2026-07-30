@@ -380,7 +380,10 @@ impl FantaCodeWorkspace {
     /// auto-persist path for edits that validated cleanly (an agent rewriting
     /// the file, or live typing). Skipping the reformat keeps the author's
     /// cursor and text untouched; the manual save still formats.
-    fn persist_validated_source_edit(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
+    fn persist_validated_source_edit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
         self.save_source_edit_impl(false, cx)
     }
 
@@ -571,11 +574,7 @@ impl FantaCodeWorkspace {
                         .map(|(id, _)| *id)
                 })
             });
-            (
-                item.project_root().map(Path::to_path_buf),
-                page,
-                component,
-            )
+            (item.project_root().map(Path::to_path_buf), page, component)
         };
         let Some(project_root) = project_root else {
             self.clear_editors();
@@ -608,7 +607,8 @@ impl FantaCodeWorkspace {
                 let Some(fnx_path) = fanta_format::locate_page_source(&project_root, page) else {
                     self.clear_editors();
                     self.error_message = Some(
-                        "This page has no source on disk yet; save the document to materialize it.".into(),
+                        "This page has no source on disk yet; save the document to materialize it."
+                            .into(),
                     );
                     cx.notify();
                     return;
@@ -1304,7 +1304,6 @@ impl Render for FantaCodeWorkspace {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1418,8 +1417,8 @@ mod tests {
                 .read(cx)
                 .id()
         });
-        let fnx_abs = fanta_format::locate_page_source(temporary.path(), page)
-            .expect("page source on disk");
+        let fnx_abs =
+            fanta_format::locate_page_source(temporary.path(), page).expect("page source on disk");
         let fnx_rel = fnx_abs
             .strip_prefix(temporary.path())
             .expect("page source inside project")
@@ -1480,8 +1479,8 @@ mod tests {
                 .read(cx)
                 .id()
         });
-        let fnx_abs = fanta_format::locate_page_source(temporary.path(), page)
-            .expect("page source on disk");
+        let fnx_abs =
+            fanta_format::locate_page_source(temporary.path(), page).expect("page source on disk");
         let fnx_rel = fnx_abs
             .strip_prefix(temporary.path())
             .expect("page source inside project")
@@ -2150,9 +2149,7 @@ mod tests {
 /// One status-line summary of the engine's authoring warnings (unknown
 /// attributes with did-you-mean suggestions). `None` when there are none, so
 /// callers can skip the update entirely.
-fn summarize_source_diagnostics(
-    diagnostics: &[fanta_format::SourceDiagnostic],
-) -> Option<String> {
+fn summarize_source_diagnostics(diagnostics: &[fanta_format::SourceDiagnostic]) -> Option<String> {
     if diagnostics.is_empty() {
         return None;
     }
