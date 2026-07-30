@@ -10,6 +10,7 @@
 //! Theme rule: files hosting fanta-gpui panels import
 //! `gpui_component::ActiveTheme` OR Zed's `theme::ActiveTheme`, never both.
 
+pub(crate) mod pages;
 pub(crate) mod toolbar;
 
 /// Process-wide kill switch: `FANTA_GPUI_UI=0` forces every fanta-gpui

@@ -467,6 +467,8 @@ pub struct FantaDesignPanel {
     // `render_sections`).
     layer_rows: Vec<LayerRow>,
     pages_cache: Vec<PageEntry>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    gpui_pages: Option<crate::gpui_adapters::pages::PagesAdapter>,
     components_cache: Vec<(SharedString, NodeId)>,
     components_total_count: usize,
     assets_cache: Vec<AssetEntry>,
@@ -628,6 +630,8 @@ impl FantaDesignPanel {
             collapsed_sections: HashSet::new(),
             layer_rows: Vec::new(),
             pages_cache: Vec::new(),
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_pages: None,
             components_cache: Vec::new(),
             components_total_count: 0,
             assets_cache: Vec::new(),
@@ -691,6 +695,8 @@ impl FantaDesignPanel {
                                     | crate::document::FigItemEvent::TextSelectionChanged
                             ) {
                                 this.rebuild_layer_rows(cx);
+                                #[cfg(feature = "fanta-gpui-ui")]
+                                this.refresh_gpui_pages(cx);
                                 cx.notify();
                             }
                         },
@@ -1591,11 +1597,15 @@ impl FantaDesignPanel {
         let components_filtering = self.filter_query(Section::Components, cx).is_some();
         let assets_filtering = self.filter_query(Section::Assets, cx).is_some();
 
+        #[cfg(feature = "fanta-gpui-ui")]
+        let gpui_pages_section: Option<AnyElement> = self.gpui_pages_section_element(cx);
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        let gpui_pages_section: Option<AnyElement> = None;
         let element = v_flex()
             .size_full()
             .overflow_hidden()
-            .child(
-                v_flex()
+            .child({
+                let native = v_flex()
                     .flex_none()
                     .child(
                         ListHeader::new("Pages")
@@ -1660,8 +1670,12 @@ impl FantaDesignPanel {
                                     }))),
                             )
                         }
-                    }),
-            )
+                    });
+                match gpui_pages_section {
+                    Some(section) => section,
+                    None => native.into_any_element(),
+                }
+            })
             .child(self.render_section_divider(SectionDivider::PagesLayers, cx))
             .child(
                 v_flex()
@@ -2784,6 +2798,8 @@ fn centered_message(text: impl Into<SharedString>) -> AnyElement {
 
 impl Render for FantaDesignPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(feature = "fanta-gpui-ui")]
+        self.ensure_gpui_pages(_window, cx);
         let body = match self.active_view(cx) {
             None => centered_message("Open a Figma document to browse its layers"),
             Some(view) => {
@@ -3443,5 +3459,424 @@ mod tests {
 
         // A non-matching query yields the empty-state list.
         assert!(filter_pages(pages, Some("zzz")).is_empty());
+    }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+impl FantaDesignPanel {
+    /// Build the PagesPanel adapter once a window is available and
+    /// gpui_component has been initialized; no-op otherwise.
+    fn ensure_gpui_pages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.gpui_pages.is_some() || !crate::gpui_adapters::runtime_enabled(cx) {
+            return;
+        }
+        let panel = cx.new(|cx| {
+            fanta_gpui::pages::PagesPanel::new("fanta-gpui-pages", Vec::new(), window, cx)
+        });
+        let subscription = cx.subscribe_in(&panel, window, Self::handle_pages_action);
+        self.gpui_pages = Some(crate::gpui_adapters::pages::PagesAdapter {
+            panel,
+            id_map: std::collections::HashMap::new(),
+            result_map: std::collections::HashMap::new(),
+            result_order: Vec::new(),
+            last_search: None,
+            _subscription: subscription,
+        });
+        self.refresh_gpui_pages(cx);
+    }
+
+    /// Echo document state into the panel: page rows, selection, and the
+    /// open search (re-run against the fresh document).
+    fn refresh_gpui_pages(&mut self, cx: &mut App) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let Some(adapter) = self.gpui_pages.as_mut() else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let fig_item = item.read(cx);
+        let Some(document) = fig_item.document() else {
+            return;
+        };
+        let (items, id_map) = crate::gpui_adapters::pages::pages_view_data(document);
+        let selected = self
+            .current_page_index
+            .and_then(|index| document.pages.get(index).map(|page| (index, page.root)))
+            .map(|(index, root)| crate::gpui_adapters::pages::page_id(root, index));
+        let search = adapter.last_search.clone();
+        let search_update = search.as_ref().map(|request| {
+            crate::gpui_adapters::pages::search_pages(document, self.current_page_index, request)
+        });
+        adapter.id_map = id_map;
+        adapter.panel.update(cx, |panel, cx| {
+            panel.set_pages(items, cx);
+            panel.set_selected_page(selected, cx);
+            if let Some((results, hit_map, order)) = search_update {
+                panel.set_search_results(results, cx);
+                let adapter_maps = (hit_map, order);
+                // written back below; panel update borrow ends first
+                cx.notify();
+                let _ = adapter_maps;
+            }
+        });
+        if let Some(request) = search {
+            let fig_item = item.read(cx);
+            if let Some(document) = fig_item.document() {
+                let (_, hit_map, order) = crate::gpui_adapters::pages::search_pages(
+                    document,
+                    self.current_page_index,
+                    &request,
+                );
+                if let Some(adapter) = self.gpui_pages.as_mut() {
+                    adapter.result_map = hit_map;
+                    adapter.result_order = order;
+                }
+            }
+        }
+    }
+
+    fn select_search_hit(
+        &mut self,
+        hit: crate::gpui_adapters::pages::SearchHit,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let switch_page = self.current_page_index != Some(hit.page_index);
+        view.update(cx, |view, cx| {
+            if switch_page {
+                view.select_page(hit.page_index, cx);
+            }
+        });
+        self.select_node(hit.node, false, cx);
+    }
+
+    fn handle_pages_action(
+        &mut self,
+        _panel: &Entity<fanta_gpui::pages::PagesPanel>,
+        action: &fanta_gpui::pages::PagesPanelAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fanta_gpui::pages::PagesPanelAction;
+        match action {
+            PagesPanelAction::SelectRequested { page_id } => {
+                let index = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.id_map.get(page_id))
+                    .map(|page| page.index);
+                if let Some(index) = index {
+                    self.select_page(index, cx);
+                }
+            }
+            PagesPanelAction::CreateRequested { title } => {
+                self.add_page(cx);
+                // `add_page` names the page "Page N" and selects it; apply
+                // the requested title on top when one was typed.
+                let title = title.trim();
+                if !title.is_empty() {
+                    let root = self.active_view(cx).and_then(|view| {
+                        let item = view.read(cx).item().clone();
+                        let fig_item = item.read(cx);
+                        fig_item
+                            .document()
+                            .and_then(|document| document.pages.last())
+                            .and_then(|page| page.root)
+                    });
+                    if let Some(root) = root {
+                        self.rename_node_to(root, title.to_string(), cx);
+                    }
+                }
+            }
+            PagesPanelAction::RenameRequested { page_id, title } => {
+                let root = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.id_map.get(page_id))
+                    .and_then(|page| page.root);
+                if let Some(root) = root {
+                    self.rename_node_to(root, title.to_string(), cx);
+                }
+            }
+            PagesPanelAction::DeleteRequested { page_id } => {
+                let index = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.id_map.get(page_id))
+                    .map(|page| page.index);
+                if let Some(index) = index {
+                    self.delete_page(index, cx);
+                }
+            }
+            PagesPanelAction::DuplicateRequested { page_id } => {
+                log::info!("fanta-gpui pages: duplicate {page_id} not wired yet");
+            }
+            PagesPanelAction::CopyLinkRequested { page_id } => {
+                let link = format!("fanta://page/{page_id}");
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+            }
+            PagesPanelAction::SearchRequested(request) => {
+                self.run_gpui_pages_search(request.clone(), cx);
+            }
+            PagesPanelAction::SearchClosed => {
+                if let Some(adapter) = self.gpui_pages.as_mut() {
+                    adapter.last_search = None;
+                    adapter.result_map.clear();
+                    adapter.result_order.clear();
+                }
+            }
+            PagesPanelAction::SearchResultSelected { result_id } => {
+                let hit = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.result_map.get(result_id))
+                    .copied();
+                if let Some(hit) = hit {
+                    self.select_search_hit(hit, cx);
+                }
+            }
+            PagesPanelAction::NavigateResults {
+                direction,
+                result_id,
+            } => {
+                use fanta_gpui::pages::PagesPanelResultDirection;
+                let hit = self.gpui_pages.as_ref().and_then(|adapter| {
+                    if adapter.result_order.is_empty() {
+                        return None;
+                    }
+                    let current = result_id
+                        .as_ref()
+                        .and_then(|id| adapter.result_order.iter().position(|other| other == id));
+                    let target = match (direction, current) {
+                        (PagesPanelResultDirection::Next, Some(index)) => {
+                            (index + 1) % adapter.result_order.len()
+                        }
+                        (PagesPanelResultDirection::Previous, Some(index)) => {
+                            (index + adapter.result_order.len() - 1) % adapter.result_order.len()
+                        }
+                        (PagesPanelResultDirection::Next, None) => 0,
+                        (PagesPanelResultDirection::Previous, None) => {
+                            adapter.result_order.len() - 1
+                        }
+                    };
+                    let id = adapter.result_order[target].clone();
+                    adapter.result_map.get(&id).copied()
+                });
+                if let Some(hit) = hit {
+                    self.select_search_hit(hit, cx);
+                }
+            }
+            PagesPanelAction::ReplaceRequested {
+                request,
+                result_id,
+                replacement,
+            } => {
+                let hits: Vec<crate::gpui_adapters::pages::SearchHit> = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| {
+                        result_id
+                            .as_ref()
+                            .and_then(|id| adapter.result_map.get(id).copied())
+                    })
+                    .into_iter()
+                    .collect();
+                self.apply_gpui_pages_replace(request, &hits, replacement, "Replace", cx);
+            }
+            PagesPanelAction::ReplaceAllRequested {
+                request,
+                replacement,
+            } => {
+                let hits: Vec<crate::gpui_adapters::pages::SearchHit> = self
+                    .gpui_pages
+                    .as_ref()
+                    .map(|adapter| {
+                        adapter
+                            .result_order
+                            .iter()
+                            .filter_map(|id| adapter.result_map.get(id).copied())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.apply_gpui_pages_replace(request, &hits, replacement, "Replace all", cx);
+            }
+            PagesPanelAction::ExpansionChanged { .. } => {}
+        }
+    }
+
+    fn run_gpui_pages_search(
+        &mut self,
+        request: fanta_gpui::pages::PagesPanelSearchRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let fig_item = item.read(cx);
+        let Some(document) = fig_item.document() else {
+            return;
+        };
+        let (results, hit_map, order) =
+            crate::gpui_adapters::pages::search_pages(document, self.current_page_index, &request);
+        if let Some(adapter) = self.gpui_pages.as_mut() {
+            adapter.last_search = Some(request);
+            adapter.result_map = hit_map;
+            adapter.result_order = order;
+            adapter
+                .panel
+                .update(cx, |panel, cx| panel.set_search_results(results, cx));
+        }
+    }
+
+    /// One undo step per replace gesture: name hits via `SetName`, text hits
+    /// via `ReplaceData` on the text node, inside a history transaction.
+    fn apply_gpui_pages_replace(
+        &mut self,
+        request: &fanta_gpui::pages::PagesPanelSearchRequest,
+        hits: &[crate::gpui_adapters::pages::SearchHit],
+        replacement: &str,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::gpui_adapters::pages::{HitField, replace_matches};
+        if hits.is_empty() {
+            return;
+        }
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        if !item.read(cx).is_editable() {
+            return;
+        }
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
+        let query = request.query.to_string();
+        let match_case = request.match_case;
+        let hits = hits.to_vec();
+        let replacement = replacement.to_string();
+        let result: Option<anyhow::Result<()>> = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let doc = &mut document.doc;
+                let mut operations = Vec::new();
+                for hit in &hits {
+                    let Some(node) = doc.scene.get(hit.node) else {
+                        continue;
+                    };
+                    match hit.field {
+                        HitField::Name => {
+                            let old = node.name.clone();
+                            let new = replace_matches(&old, &query, &replacement, match_case);
+                            if new != old {
+                                operations.push(Operation::SetName {
+                                    id: hit.node,
+                                    old,
+                                    new,
+                                });
+                            }
+                        }
+                        HitField::TextContent => {
+                            if let NodeData::Text(text) = &node.data {
+                                let mut updated = text.clone();
+                                updated.content = replace_matches(
+                                    &text.content,
+                                    &query,
+                                    &replacement,
+                                    match_case,
+                                );
+                                if updated.content != text.content {
+                                    operations.push(Operation::ReplaceData {
+                                        id: hit.node,
+                                        old: Box::new(node.data.clone()),
+                                        new: Box::new(NodeData::Text(updated)),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if operations.is_empty() {
+                    return (Ok(()), DocChange::None);
+                }
+                doc.history.begin(label, &mut doc.scene);
+                for operation in operations {
+                    if let Err(error) = doc.apply(operation) {
+                        let rollback = doc.history.abort(&mut doc.scene);
+                        let error = match rollback {
+                            Ok(()) => anyhow::anyhow!("{label}: {error}"),
+                            Err(rollback_error) => {
+                                anyhow::anyhow!("{label}: {error}; rolling back: {rollback_error}")
+                            }
+                        };
+                        return (Err(error), DocChange::None);
+                    }
+                }
+                doc.history.commit(&mut doc.scene);
+                (Ok(()), DocChange::Content)
+            })
+        });
+        if let Some(Err(error)) = result {
+            log::error!("fanta-gpui pages: {label} failed: {error:#}");
+        }
+        // The Edited echo refreshes rows; re-run the search so result rows
+        // reflect the replacement immediately.
+        if let Some(request) = self
+            .gpui_pages
+            .as_ref()
+            .and_then(|adapter| adapter.last_search.clone())
+        {
+            self.run_gpui_pages_search(request, cx);
+        }
+    }
+
+    /// Renames a node with the SetName pattern the native rename editor uses.
+    fn rename_node_to(&mut self, node: NodeId, new_name: String, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let old_name = item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(node))
+            .map(|node| node.name.clone());
+        let Some(old_name) = old_name else {
+            return;
+        };
+        if old_name == new_name {
+            return;
+        }
+        let applied = item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: node,
+                    old: old_name,
+                    new: new_name,
+                },
+                cx,
+            )
+        });
+        if let Err(error) = applied {
+            log::error!("fanta-gpui pages: rename failed: {error:#}");
+        }
+    }
+
+    /// The mounted PagesPanel wrapped to respect the section height, or None
+    /// when the adapter is off (native section renders instead).
+    fn gpui_pages_section_element(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        let adapter = self.gpui_pages.as_ref()?;
+        Some(
+            v_flex()
+                .flex_none()
+                .max_h(self.pages_height + px(96.))
+                .overflow_hidden()
+                .child(adapter.panel.clone())
+                .into_any_element(),
+        )
     }
 }
