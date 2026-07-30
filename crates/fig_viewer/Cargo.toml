@@ -15,6 +15,10 @@ doctest = false
 [features]
 fanta-gpui-ui = ["dep:fanta-gpui", "dep:gpui-component"]
 
+[[example]]
+name = "fanta_gpui_smoke"
+required-features = ["fanta-gpui-ui"]
+
 [dependencies]
 fanta-gpui = { workspace = true, optional = true }
 gpui-component = { workspace = true, optional = true }
@@ -59,6 +63,7 @@ workspace.workspace = true
 worktree.workspace = true
 
 [dev-dependencies]
+gpui_platform = { workspace = true, default-features = true }
 assets.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
