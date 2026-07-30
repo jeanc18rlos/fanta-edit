@@ -3403,6 +3403,21 @@ impl FigView {
         let next_view = cx.weak_entity();
         let restart_view = cx.weak_entity();
         let exit_view = cx.weak_entity();
+        let flow_view = cx.weak_entity();
+        // Named flows from the imported document, for the flow picker; a
+        // single unnamed flow gets no picker.
+        let flows: Vec<(usize, SharedString)> = self
+            .prototype_player
+            .as_ref()
+            .map(|player| {
+                player
+                    .flows()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, flow)| (index, SharedString::from(flow.name.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
         let link_notice = self.prototype_link_notice.clone();
         let nav_label = position
             .map(|(index, count)| format!("{index} / {count}"))
@@ -3458,6 +3473,50 @@ impl FigView {
                             .px_1()
                             .child(Icon::new(IconName::PlayFilled).size(IconSize::Small))
                             .child(Label::new(title).single_line())
+                            .when(flows.len() > 1, |row| {
+                                let flows = flows.clone();
+                                row.child(
+                                    PopoverMenu::new("fanta-prototype-flow-picker")
+                                        .anchor(Anchor::TopLeft)
+                                        .trigger(
+                                            IconButton::new(
+                                                "fanta-prototype-flow-caret",
+                                                IconName::ChevronDown,
+                                            )
+                                            .icon_size(IconSize::XSmall)
+                                            .icon_color(Color::Muted)
+                                            .tooltip(Tooltip::text("Switch Flow")),
+                                        )
+                                        .menu(move |window, cx| {
+                                            let flows = flows.clone();
+                                            let flow_view = flow_view.clone();
+                                            Some(ContextMenu::build(
+                                                window,
+                                                cx,
+                                                move |mut menu, _window, _cx| {
+                                                    for (index, name) in flows.iter() {
+                                                        let flow_view = flow_view.clone();
+                                                        let index = *index;
+                                                        menu = menu.entry(
+                                                            name.clone(),
+                                                            None,
+                                                            move |_, cx| {
+                                                                flow_view
+                                                                    .update(cx, |view, cx| {
+                                                                        view.start_prototype_flow(
+                                                                            index, cx,
+                                                                        );
+                                                                    })
+                                                                    .ok();
+                                                            },
+                                                        );
+                                                    }
+                                                    menu
+                                                },
+                                            ))
+                                        }),
+                                )
+                            })
                             .into_any_element(),
                     ))
                     .child(chrome(
@@ -5896,6 +5955,19 @@ impl FigView {
             | ToolbarAction::AgentVoiceInputRequested
             | ToolbarAction::SecondaryControlInvoked { .. }
             | ToolbarAction::ControlChangeRequested { .. } => {}
+        }
+    }
+}
+
+impl FigView {
+    /// Restart the presentation at a named flow's entry frame (the flow
+    /// picker in the presentation chrome).
+    pub(crate) fn start_prototype_flow(&mut self, flow: usize, cx: &mut Context<Self>) {
+        if let Some(player) = self.prototype_player.as_mut()
+            && player.start_flow(flow)
+        {
+            self.invalidate_canvas_cache();
+            cx.notify();
         }
     }
 }

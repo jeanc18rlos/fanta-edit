@@ -106,13 +106,11 @@ impl PrototypePlayerState {
 
     /// The document's named prototype flows, for a flow picker. Empty for
     /// single-flow files.
-    #[allow(dead_code)]
     pub(crate) fn flows(&self) -> &[fanta_doc::Flow] {
         self.session.flows()
     }
 
     /// Restart the presentation at a named flow's entry frame.
-    #[allow(dead_code)]
     pub(crate) fn start_flow(&mut self, flow: usize) -> bool {
         self.session.start_flow(flow)
     }
