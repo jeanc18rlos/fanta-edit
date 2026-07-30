@@ -31,6 +31,8 @@ mod properties_snapshot;
 mod prototype_panel;
 mod prototype_player;
 mod text_edit;
+#[cfg(feature = "fanta-gpui-ui")]
+mod theme_bridge;
 mod timeline;
 mod tools;
 mod variable_binding;
@@ -62,6 +64,12 @@ pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{FigView, FigViewEvent};
 
 pub fn init(cx: &mut App) {
+    #[cfg(feature = "fanta-gpui-ui")]
+    {
+        gpui_component::init(cx);
+        fanta_gpui::init(cx);
+        theme_bridge::init(cx);
+    }
     fnx_editor::init(cx);
     agent_surface::init(cx);
     live_mcp::init(cx);
