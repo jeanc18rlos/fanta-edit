@@ -401,7 +401,9 @@ impl RenderOnce for Dialog {
                     })
                     .when(self.overlay, |this| {
                         // Only the last dialog owns the `mouse down - close dialog` event.
-                        if (self.layer_ix + 1) != Root::read(window, cx).active_dialogs.len() {
+                        if Root::try_read(window, cx)
+                            .is_some_and(|root| (self.layer_ix + 1) != root.active_dialogs.len())
+                        {
                             return this;
                         }
 

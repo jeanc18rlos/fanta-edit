@@ -85,7 +85,7 @@ impl WindowExt for Window {
     where
         F: Fn(Sheet, &mut Window, &mut App) -> Sheet + 'static,
     {
-        Root::update(self, cx, move |root, window, cx| {
+        _ = Root::update(self, cx, move |root, window, cx| {
             if root.active_sheet.is_none() {
                 root.previous_focus_handle = window.focused(cx);
             }
@@ -103,11 +103,11 @@ impl WindowExt for Window {
     }
 
     fn has_active_sheet(&mut self, cx: &mut App) -> bool {
-        Root::read(self, cx).active_sheet.is_some()
+        Root::try_read(self, cx).is_some_and(|root| root.active_sheet.is_some())
     }
 
     fn close_sheet(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        _ = Root::update(self, cx, |root, window, cx| {
             root.focused_input = None;
             root.active_sheet = None;
             root.focus_back(window, cx);
@@ -119,7 +119,7 @@ impl WindowExt for Window {
     where
         F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
     {
-        Root::update(self, cx, move |root, window, cx| {
+        _ = Root::update(self, cx, move |root, window, cx| {
             // Only save focus handle if there are no active dialogs.
             // This is used to restore focus when all dialogs are closed.
             if root.active_dialogs.len() == 0 {
@@ -138,11 +138,11 @@ impl WindowExt for Window {
     }
 
     fn has_active_dialog(&mut self, cx: &mut App) -> bool {
-        Root::read(self, cx).active_dialogs.len() > 0
+        Root::try_read(self, cx).is_some_and(|root| !root.active_dialogs.is_empty())
     }
 
     fn close_dialog(&mut self, cx: &mut App) {
-        Root::update(self, cx, move |root, window, cx| {
+        _ = Root::update(self, cx, move |root, window, cx| {
             root.focused_input = None;
             root.active_dialogs.pop();
 
@@ -158,7 +158,7 @@ impl WindowExt for Window {
     }
 
     fn close_all_dialogs(&mut self, cx: &mut App) {
-        Root::update(self, cx, |root, window, cx| {
+        _ = Root::update(self, cx, |root, window, cx| {
             root.focused_input = None;
             root.active_dialogs.clear();
             root.focus_back(window, cx);
@@ -168,7 +168,7 @@ impl WindowExt for Window {
 
     fn push_notification(&mut self, note: impl Into<Notification>, cx: &mut App) {
         let note = note.into();
-        Root::update(self, cx, move |root, window, cx| {
+        _ = Root::update(self, cx, move |root, window, cx| {
             root.notification
                 .update(cx, |view, cx| view.push(note, window, cx));
             cx.notify();
@@ -176,7 +176,7 @@ impl WindowExt for Window {
     }
 
     fn remove_notification<T: Sized + 'static>(&mut self, cx: &mut App) {
-        Root::update(self, cx, move |root, window, cx| {
+        _ = Root::update(self, cx, move |root, window, cx| {
             root.notification.update(cx, |view, cx| {
                 let id = TypeId::of::<T>();
                 view.close(id, window, cx);
@@ -186,7 +186,7 @@ impl WindowExt for Window {
     }
 
     fn clear_notifications(&mut self, cx: &mut App) {
-        Root::update(self, cx, move |root, window, cx| {
+        _ = Root::update(self, cx, move |root, window, cx| {
             root.notification
                 .update(cx, |view, cx| view.clear(window, cx));
             cx.notify();
@@ -194,16 +194,18 @@ impl WindowExt for Window {
     }
 
     fn notifications(&mut self, cx: &mut App) -> Rc<Vec<Entity<Notification>>> {
-        let entity = Root::read(self, cx).notification.clone();
+        let Some(entity) = Root::try_read(self, cx).map(|root| root.notification.clone()) else {
+            return Rc::new(Vec::new());
+        };
         Rc::new(entity.read(cx).notifications())
     }
 
     fn has_focused_input(&mut self, cx: &mut App) -> bool {
-        Root::read(self, cx).focused_input.is_some()
+        Root::try_read(self, cx).is_some_and(|root| root.focused_input.is_some())
     }
 
     fn focused_input(&mut self, cx: &mut App) -> Option<Entity<InputState>> {
-        Root::read(self, cx).focused_input.clone()
+        Root::try_read(self, cx).and_then(|root| root.focused_input.clone())
     }
 }
 
@@ -249,24 +251,24 @@ impl Root {
         }
     }
 
-    pub fn update<F, R>(window: &mut Window, cx: &mut App, f: F) -> R
+    /// Updates the window's Root, or no-ops (returning `None`) when the
+    /// window is hosted by an application whose root view is not a
+    /// `gpui_component::Root` — components must stay paintable there.
+    pub fn update<F, R>(window: &mut Window, cx: &mut App, f: F) -> Option<R>
     where
         F: FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> R,
     {
-        let root = window
-            .root::<Root>()
-            .flatten()
-            .expect("BUG: window first layer should be a gpui_component::Root.");
-
-        root.update(cx, |root, cx| f(root, window, cx))
+        let root = window.root::<Root>().flatten()?;
+        Some(root.update(cx, |root, cx| f(root, window, cx)))
     }
 
     pub fn read<'a>(window: &'a Window, cx: &'a App) -> &'a Self {
-        &window
-            .root::<Root>()
-            .expect("The window root view should be of type `ui::Root`.")
-            .unwrap()
-            .read(cx)
+        Self::try_read(window, cx).expect("The window root view should be of type `ui::Root`.")
+    }
+
+    /// `read` for windows that may not be rooted at a `Root`.
+    pub fn try_read<'a>(window: &'a Window, cx: &'a App) -> Option<&'a Self> {
+        Some(window.root::<Root>()??.read(cx))
     }
 
     fn focus_back(&mut self, window: &mut Window, cx: &mut App) {

@@ -1265,7 +1265,9 @@ impl Element for TextElement {
         // Set Root focused_input when self is focused
         if focused {
             let state = self.state.clone();
-            if Root::read(window, cx).focused_input.as_ref() != Some(&state) {
+            if Root::try_read(window, cx)
+                .is_some_and(|root| root.focused_input.as_ref() != Some(&state))
+            {
                 Root::update(window, cx, |root, _, cx| {
                     root.focused_input = Some(state);
                     cx.notify();
@@ -1277,7 +1279,10 @@ impl Element for TextElement {
         window.on_next_frame({
             let state = self.state.clone();
             move |window, cx| {
-                if !focused && Root::read(window, cx).focused_input.as_ref() == Some(&state) {
+                if !focused
+                    && Root::try_read(window, cx)
+                        .is_some_and(|root| root.focused_input.as_ref() == Some(&state))
+                {
                     Root::update(window, cx, |root, _, cx| {
                         root.focused_input = None;
                         cx.notify();
