@@ -20,8 +20,9 @@ use gpui::{
     ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, Window, actions, div, px,
 };
 use language::Capability;
-use project::Project;
+use project::{Project, ProjectEntryId};
 use settings::{Settings as _, update_settings_file};
+use smallvec::SmallVec;
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use workspace::{
@@ -40,7 +41,7 @@ use crate::clipboard::{
 use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
-use crate::document::{DocChange, FigDocument, FigItem, FigItemEvent};
+use crate::document::{DocChange, FigDocument, FigItem, FigItemEvent, FigScope, ScopeRequester};
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
@@ -234,6 +235,20 @@ pub struct FigView {
     /// Root node of the explicitly selected page, used to re-resolve
     /// `selected_page_index` when a disk reload reorders or removes pages.
     selected_page_root: Option<NodeId>,
+    /// The worktree entry this view was opened from (the clicked `page.fnx`,
+    /// `master.fnx`, `doc/variables.json`, manifest, or `.fig`). Reported to
+    /// the pane so each opened path keeps its OWN tab even though every tab
+    /// shares the project's one [`FigItem`].
+    opened_entry_id: Option<ProjectEntryId>,
+    /// What this tab is scoped to. Re-asserted on focus so the shared
+    /// document's single render root follows the focused tab, and updated by
+    /// in-tab navigation ([`Self::select_page`]).
+    scope: Option<FigScope>,
+    is_focused: bool,
+    /// The document root this view last acted on: a `ScopeApplied` that
+    /// merely restores our own root (switching back to this tab) must not
+    /// clobber the saved viewport.
+    last_seen_root: Option<NodeId>,
     pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
@@ -346,7 +361,31 @@ impl FigView {
                 clamp_sidebar_width(settings.default_width, SidebarKind::Inspector),
             )
         };
+        // The descriptor carries what `FigItem::try_open` learned about THIS
+        // open (the clicked entry and the scope its path implies); the shared
+        // item cannot, since one item backs every tab of the project.
+        let descriptor = crate::document::take_pending_view_descriptor(cx);
+        let opened_entry_id = descriptor.and_then(|descriptor| descriptor.entry_id);
+        let scope = descriptor.and_then(|descriptor| descriptor.scope);
         let editor_session = cx.new(|_| EditorSession::new());
+        // A variables-scoped tab starts in the variables space — the
+        // `doc/variables.json` file IS the variables registry, so that's what
+        // clicking it shows. A plain open without a descriptor (e.g. a second
+        // window) follows the shared item's most recent scope. Later scope
+        // changes arrive via `FigItemEvent::ScopeApplied`.
+        let starts_in_variables = match scope {
+            Some(FigScope::Variables) => true,
+            Some(_) => false,
+            None => {
+                item.read(cx).last_scope() == Some(FigScope::Variables)
+                    || item.read(cx).pending_variables_scope()
+            }
+        };
+        if starts_in_variables {
+            editor_session.update(cx, |session, cx| {
+                session.set_workspace(EditorWorkspace::Variables, cx);
+            });
+        }
         let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
         let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
@@ -378,7 +417,17 @@ impl FigView {
         // canvas; keep the registry pointed at this item.
         crate::agent_surface::set_active_item(item.downgrade(), cx);
         cx.on_focus(&focus_handle, window, |this: &mut Self, _, cx| {
+            this.is_focused = true;
             crate::agent_surface::set_active_item(this.item.downgrade(), cx);
+            // The shared document has ONE render root; re-assert this tab's
+            // scope so focusing the tab brings its page/component back.
+            // `request_scope` is a cheap no-op when the root is already ours.
+            if let Some(scope) = this.scope {
+                let view = cx.entity_id();
+                this.item.update(cx, |item, cx| {
+                    item.request_scope(scope, ScopeRequester::View(view), cx)
+                });
+            }
         })
         .detach();
         // A space held across a focus change (panel click, window switch, a
@@ -386,6 +435,7 @@ impl FigView {
         // reset `space_pan` stays true and the Select tool pans with a hand
         // cursor until space is pressed again.
         cx.on_focus_out(&focus_handle, window, |this: &mut Self, _, _, cx| {
+            this.is_focused = false;
             if this.space_pan || this.pan_last_position.is_some() {
                 this.space_pan = false;
                 this.pan_last_position = None;
@@ -393,6 +443,14 @@ impl FigView {
             }
         })
         .detach();
+        // The root the document currently shows. For a scoped open of an
+        // already-ready shared item the scope was applied in `try_open`, so
+        // this starts as our own root and the echoing `ScopeApplied` (or a
+        // later tab switch back to us) does not reset the viewport.
+        let last_seen_root = item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.active_page());
         Self {
             item,
             project,
@@ -413,6 +471,10 @@ impl FigView {
             inspector_sidebar_width,
             selected_page_index: None,
             selected_page_root: None,
+            opened_entry_id,
+            scope,
+            is_focused: false,
+            last_seen_root,
             viewport: None,
             pan_last_position: None,
             primary_pressed: false,
@@ -527,6 +589,63 @@ impl FigView {
                         .log_err();
                     });
                     cx.emit(FigViewEvent::Edited);
+                }
+                FigItemEvent::ScopeApplied(scope, requester) => {
+                    // A scoped open, a tab re-asserting its scope on focus, or
+                    // the load-time apply re-targeted the shared document. The
+                    // refit decision keys on WHO asked — not on `is_focused`,
+                    // which is stale between the emit and the next draw (GPUI
+                    // fires focus listeners only when a frame is drawn), so
+                    // the previous tab could still believe it is focused and
+                    // have its saved viewport and page mirrors clobbered by a
+                    // sibling's navigation. Only the requesting view follows,
+                    // and only onto a root it is not already showing (a tab
+                    // switch merely restoring our root must keep the saved
+                    // viewport); a scoped open targets a tab that does not
+                    // exist yet, so no live view follows; the load-time apply
+                    // has no requesting view, so the focused view follows.
+                    // Known limitation: the shared document has ONE render
+                    // root, so two SPLITS visible at once both render the
+                    // focused tab's root.
+                    let follows = match requester {
+                        ScopeRequester::View(view) => *view == cx.entity_id(),
+                        ScopeRequester::Open => false,
+                        ScopeRequester::Load => this.is_focused,
+                    };
+                    let root = this
+                        .item
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.active_page());
+                    if follows && this.last_seen_root != root {
+                        this.last_seen_root = root;
+                        match scope {
+                            FigScope::Variables => {
+                                this.set_editor_workspace(EditorWorkspace::Variables, cx);
+                            }
+                            FigScope::Page(_) | FigScope::Component(_) => {
+                                if this.editor_workspace(cx) == EditorWorkspace::Variables {
+                                    this.set_editor_workspace(EditorWorkspace::Canvas, cx);
+                                }
+                                let document = this.item.read(cx).document();
+                                let selected_page_index = root.and_then(|root| {
+                                    document.and_then(|document| {
+                                        document
+                                            .pages
+                                            .iter()
+                                            .position(|page| page.root == Some(root))
+                                    })
+                                });
+                                this.selected_page_root = root;
+                                this.selected_page_index = selected_page_index;
+                                this.viewport = None;
+                                this.hovered_node = None;
+                                this.invalidate_canvas_cache();
+                            }
+                        }
+                        cx.emit(FigViewEvent::TitleChanged);
+                        cx.notify();
+                    }
                 }
             }
             cx.notify();
@@ -2074,6 +2193,30 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Presentation mode: the wheel scrolls the prototype's scrollable
+        // container under the cursor (authored Figma overflow — clamped,
+        // fixed/sticky children honored), never the editor viewport.
+        if self.prototype_player.is_some() {
+            let delta = match event.delta {
+                ScrollDelta::Pixels(pixels) => pixels,
+                ScrollDelta::Lines(lines) => lines.map(|line| px(line * SCROLL_LINE_MULTIPLIER)),
+            };
+            let Some(bounds) = self.container_bounds else {
+                return;
+            };
+            let screen = screen_position_in_bounds(event.position, bounds);
+            let scroll_delta = [
+                -f64::from(f32::from(delta.x)),
+                -f64::from(f32::from(delta.y)),
+            ];
+            if let Some(player) = self.prototype_player.as_mut()
+                && player.scroll_by_screen(screen, scroll_delta).is_some()
+            {
+                self.invalidate_canvas_cache();
+                cx.notify();
+            }
+            return;
+        }
         if event.modifiers.control || event.modifiers.platform {
             let delta: f32 = match event.delta {
                 ScrollDelta::Pixels(pixels) => pixels.y.into(),
@@ -2712,6 +2855,10 @@ impl FigView {
             .flatten();
         self.selected_page_index = Some(index);
         self.selected_page_root = root;
+        // Focus re-assertion must follow in-tab navigation: this tab now
+        // means this page, and the root it shows is already current.
+        self.scope = root.map(FigScope::Page);
+        self.last_seen_root = root;
         self.viewport = None;
         self.hovered_node = None;
         cx.notify();
@@ -3965,6 +4112,19 @@ impl Item for FigView {
         f(self.item.entity_id(), self.item.read(cx));
     }
 
+    fn project_entry_ids(&self, cx: &App) -> SmallVec<[ProjectEntryId; 3]> {
+        // The pane dedupes opens by entry. One shared FigItem backs every tab
+        // of a project, so the default (the item's own entry — its FIRST-open
+        // path) would collapse every scoped open onto that first tab; report
+        // the entry this view was actually opened from instead.
+        match self.opened_entry_id {
+            Some(entry_id) => [entry_id].into_iter().collect(),
+            None => project::ProjectItem::entry_id(self.item.read(cx), cx)
+                .into_iter()
+                .collect(),
+        }
+    }
+
     fn tab_content_text(&self, _: usize, cx: &App) -> SharedString {
         self.item.read(cx).title()
     }
@@ -4137,6 +4297,9 @@ impl Item for FigView {
         let viewport = self.viewport;
         let selected_page_index = self.selected_page_index;
         let selected_page_root = self.selected_page_root;
+        let opened_entry_id = self.opened_entry_id;
+        let scope = self.scope;
+        let last_seen_root = self.last_seen_root;
         let layers_sidebar_visible = self.layers_sidebar_visible;
         let inspector_sidebar_visible = self.inspector_sidebar_visible;
         let layers_sidebar_width = self.layers_sidebar_width;
@@ -4203,6 +4366,10 @@ impl Item for FigView {
                 inspector_sidebar_width,
                 selected_page_index,
                 selected_page_root,
+                opened_entry_id,
+                scope,
+                is_focused: false,
+                last_seen_root,
                 viewport,
                 pan_last_position: None,
                 primary_pressed: false,
@@ -4657,6 +4824,146 @@ mod tests {
                 y2: 1.5,
             }
         );
+    }
+
+    fn doc_with_two_pages() -> (fanta_doc::Doc, NodeId, NodeId) {
+        let mut doc = doc_with_one_page();
+        let page_one = doc.active_page().expect("page one");
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.name = "Page 2".to_owned();
+        let page_two = second.id;
+        doc.apply(Operation::create_node(second))
+            .expect("create page two");
+        doc.add_page(page_two);
+        (doc, page_one, page_two)
+    }
+
+    /// The headline new-tab walk: tab A shows page 1 zoomed and still reports
+    /// `is_focused` when the scoped open of `pages/<p2>/page.fnx` re-targets
+    /// the shared document (focus listeners only run at the next draw, so the
+    /// flag is stale at event delivery). Tab A must keep its viewport and
+    /// page mirrors — both at the scoped open and when focus later returns
+    /// and re-asserts its own scope.
+    #[gpui::test]
+    async fn a_scoped_open_for_a_new_tab_never_clobbers_the_previous_tabs_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, page_one, page_two) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let tab_a = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("tab A");
+        let zoomed = Viewport {
+            center: [120.0, -40.0],
+            zoom: 3.0,
+        };
+        tab_a.update(cx, |view, _| {
+            view.is_focused = true;
+            view.scope = Some(FigScope::Page(page_one));
+            view.selected_page_index = Some(0);
+            view.selected_page_root = Some(page_one);
+            view.viewport = Some(zoomed);
+        });
+
+        // The scoped open's `try_open` runs before any draw delivers tab A's
+        // focus-out, so A still reports `is_focused` when this event lands.
+        item.update(cx, |item, cx| {
+            item.request_scope(FigScope::Page(page_two), ScopeRequester::Open, cx);
+        });
+        cx.run_until_parked();
+        tab_a.read_with(cx, |view, _| {
+            assert_eq!(
+                view.viewport,
+                Some(zoomed),
+                "a sibling's scoped open must not clobber tab A's viewport"
+            );
+            assert_eq!(view.last_seen_root, Some(page_one));
+            assert_eq!(view.selected_page_index, Some(0));
+            assert_eq!(view.selected_page_root, Some(page_one));
+        });
+
+        // Focus returns to tab A: its on-focus re-assert re-roots the shared
+        // document back to page 1. Restoring our OWN root must keep the
+        // saved viewport.
+        tab_a.update(cx, |view, cx| {
+            let requester = ScopeRequester::View(cx.entity_id());
+            view.item.update(cx, |item, cx| {
+                item.request_scope(FigScope::Page(page_one), requester, cx)
+            });
+        });
+        cx.run_until_parked();
+        tab_a.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.viewport,
+                Some(zoomed),
+                "switching back to tab A must keep its zoom"
+            );
+            assert_eq!(
+                view.item.read(cx).doc().and_then(|doc| doc.active_page()),
+                Some(page_one),
+                "the re-assert re-roots the shared document to tab A's page"
+            );
+        });
+    }
+
+    /// The load-time apply carries no requesting view (the scoped tab was
+    /// created while the document was still loading), so the focused view
+    /// must still follow it.
+    #[gpui::test]
+    async fn the_load_time_scope_apply_still_refits_the_focused_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _page_one, page_two) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("view");
+        view.update(cx, |view, _| {
+            view.is_focused = true;
+            view.viewport = Some(Viewport {
+                center: [10.0, 20.0],
+                zoom: 2.0,
+            });
+        });
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.set_active_page(Some(page_two));
+                ((), DocChange::Selection)
+            });
+            cx.emit(FigItemEvent::ScopeApplied(
+                FigScope::Page(page_two),
+                ScopeRequester::Load,
+            ));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.viewport, None,
+                "the focused view refits to the load-applied scope"
+            );
+            assert_eq!(view.last_seen_root, Some(page_two));
+            assert_eq!(view.selected_page_root, Some(page_two));
+            assert_eq!(view.selected_page_index, Some(1));
+        });
     }
 
     #[gpui::test]
@@ -5345,8 +5652,8 @@ mod tests {
         // Covers core BDD scenarios: create shapes, undo across visual ops.
         init_visual_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
-        let mut initial_doc = doc_with_one_page();
-        let page_id = initial_doc.active_page().expect("page").id;
+        let initial_doc = doc_with_one_page();
+        let page_id = initial_doc.active_page().expect("page");
 
         // Seed one page with nothing extra
         let item = crate::document::ready_item_for_test(
@@ -5357,7 +5664,7 @@ mod tests {
         );
 
         let scratch = cx.add_window(|_, _| gpui::Empty);
-        let view = scratch
+        let _view = scratch
             .update(cx, |_, window, cx| {
                 cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
             })
@@ -5365,21 +5672,18 @@ mod tests {
 
         // Simulate a simple create via document (as higher level tools would)
         let created = cx.update(|cx| {
-            let mut doc = item.read(cx).document().expect("doc").doc.clone();
             let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
                 10.0,
                 20.0,
                 100.0,
                 50.0,
-                Color::from_srgb_u8(100, 150, 200),
+                Color::rgb(100, 150, 200),
             )));
             rect.parent = Some(page_id);
             let id = rect.id;
-            doc.apply(Operation::create_node(rect))
-                .expect("apply create");
             item.update(cx, |it, cx| {
-                // In real flow this goes through EditorSession + transaction
-                it.document().expect("doc").apply_external_change(doc, cx);
+                it.apply(Operation::create_node(rect), cx)
+                    .expect("apply create");
             });
             id
         });

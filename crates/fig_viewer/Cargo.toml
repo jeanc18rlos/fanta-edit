@@ -43,6 +43,7 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+skia-safe.workspace = true
 smallvec.workspace = true
 tempfile.workspace = true
 theme.workspace = true
@@ -72,4 +73,4 @@ core-foundation.workspace = true
 core-video.workspace = true
 foreign-types = "0.5"
 metal.workspace = true
-skia-safe.workspace = true
+skia-safe = { workspace = true, features = ["metal"] }

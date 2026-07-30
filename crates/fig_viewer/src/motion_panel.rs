@@ -1256,6 +1256,7 @@ fn easing_label(easing: Easing) -> &'static str {
         Easing::EaseOut => "Ease out",
         Easing::EaseInOut => "Ease in and out",
         Easing::CubicBezier { .. } => "Custom curve",
+        Easing::Spring { .. } => "Spring",
     }
 }
 

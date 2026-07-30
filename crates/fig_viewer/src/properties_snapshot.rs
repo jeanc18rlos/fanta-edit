@@ -1313,6 +1313,9 @@ pub(crate) fn reaction_summary(reaction: &Reaction) -> SharedString {
         Trigger::AfterDelay { delay_ms } => format!("After {delay_ms} ms"),
         Trigger::Key { keys } => format!("On key {}", keys.join(", ")),
         Trigger::WhilePressing => "While pressing".to_string(),
+        Trigger::MouseEnter => "On mouse enter".to_string(),
+        Trigger::MouseLeave => "On mouse leave".to_string(),
+        Trigger::WhileHovering => "While hovering".to_string(),
     };
     let action = match &reaction.action {
         Action::Navigate { .. } => "navigate",

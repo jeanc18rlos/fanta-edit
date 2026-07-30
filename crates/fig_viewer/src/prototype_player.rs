@@ -96,6 +96,34 @@ impl PrototypePlayerState {
         self.session.handle_pointer(point, event)
     }
 
+    /// Prototype scrolling: route a wheel/trackpad delta at a screen point to
+    /// the topmost scrollable container under it (authored Figma overflow —
+    /// clamped, honoring Fixed/Sticky children). Returns the container
+    /// scrolled, or `None` when nothing under the point scrolls.
+    pub(crate) fn scroll_by_screen(&mut self, point: DVec2, delta: [f64; 2]) -> Option<NodeId> {
+        self.session.scroll_by_screen(point, delta)
+    }
+
+    /// The document's named prototype flows, for a flow picker. Empty for
+    /// single-flow files.
+    #[allow(dead_code)]
+    pub(crate) fn flows(&self) -> &[fanta_doc::Flow] {
+        self.session.flows()
+    }
+
+    /// Restart the presentation at a named flow's entry frame.
+    #[allow(dead_code)]
+    pub(crate) fn start_flow(&mut self, flow: usize) -> bool {
+        self.session.start_flow(flow)
+    }
+
+    /// The authored presentation device (size / preset / surround color), when
+    /// the file carries one — for letterboxing and chrome.
+    #[allow(dead_code)]
+    pub(crate) fn presentation(&self) -> Option<&fanta_doc::PresentationConfig> {
+        self.session.presentation()
+    }
+
     pub(crate) fn handle_key(&mut self, key: &str) -> PresentResponse {
         self.session.handle_key(key, KeyEvent::Down)
     }

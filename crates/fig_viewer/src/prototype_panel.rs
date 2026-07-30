@@ -89,6 +89,10 @@ impl TriggerChoice {
             Trigger::Drag => Self::Drag,
             Trigger::Hover => Self::Hover,
             Trigger::WhilePressing => Self::WhilePressing,
+            // The hover-family triggers imported from Figma present as the
+            // closest editable choice; re-selecting in the panel normalizes.
+            Trigger::MouseEnter | Trigger::WhileHovering => Self::Hover,
+            Trigger::MouseLeave => Self::Hover,
             Trigger::AfterDelay { .. } => Self::AfterDelay,
             Trigger::Key { .. } => Self::Key,
         }
@@ -276,6 +280,11 @@ impl TransitionChoice {
             Some(TransitionStyle::SlideIn { .. }) => Self::SlideIn,
             Some(TransitionStyle::Push { .. }) => Self::Push,
             Some(TransitionStyle::MoveIn { .. }) => Self::MoveIn,
+            // Out-transitions and animated scroll present as their nearest
+            // editable choice; re-selecting in the panel normalizes.
+            Some(TransitionStyle::SlideOut { .. }) => Self::SlideIn,
+            Some(TransitionStyle::MoveOut { .. }) => Self::MoveIn,
+            Some(TransitionStyle::ScrollAnimate) => Self::SmartAnimate,
         }
     }
 }
@@ -287,7 +296,7 @@ impl EasingChoice {
             Easing::EaseIn => Some(Self::EaseIn),
             Easing::EaseOut => Some(Self::EaseOut),
             Easing::EaseInOut => Some(Self::EaseInOut),
-            Easing::CubicBezier { .. } => None,
+            Easing::CubicBezier { .. } | Easing::Spring { .. } => None,
         }
     }
 
@@ -1472,6 +1481,8 @@ impl FantaPrototypePanel {
                 ),
             ));
         match &reaction.trigger {
+            // Hover-family triggers carry no editable parameter row.
+            Trigger::MouseEnter | Trigger::MouseLeave | Trigger::WhileHovering => {}
             Trigger::AfterDelay { delay_ms } => {
                 card = card.child(self.render_labeled_row(
                     "Delay",
@@ -2412,6 +2423,7 @@ fn add_reaction_operation(doc: &Doc, node: NodeId) -> Option<Operation> {
             id: ReactionId::new(),
             trigger: Trigger::Click,
             action,
+            extra_actions: Vec::new(),
             transition: None,
             animation: None,
         },
@@ -2496,9 +2508,13 @@ fn direction_choice(style: TransitionStyle) -> Option<DirectionChoice> {
         TransitionStyle::SlideIn { direction }
         | TransitionStyle::Push { direction }
         | TransitionStyle::MoveIn { direction } => Some(DirectionChoice::from_direction(direction)),
-        TransitionStyle::Instant | TransitionStyle::Dissolve | TransitionStyle::SmartAnimate => {
-            None
+        TransitionStyle::SlideOut { direction } | TransitionStyle::MoveOut { direction } => {
+            Some(DirectionChoice::from_direction(direction))
         }
+        TransitionStyle::Instant
+        | TransitionStyle::Dissolve
+        | TransitionStyle::SmartAnimate
+        | TransitionStyle::ScrollAnimate => None,
     }
 }
 
@@ -2520,6 +2536,9 @@ fn trigger_label(trigger: &Trigger) -> String {
         Trigger::Key { keys } if keys.is_empty() => "On key press".to_string(),
         Trigger::Key { keys } => format!("On {}", keys.join(" + ")),
         Trigger::WhilePressing => "While pressing".to_string(),
+        Trigger::MouseEnter => "On mouse enter".to_string(),
+        Trigger::MouseLeave => "On mouse leave".to_string(),
+        Trigger::WhileHovering => "While hovering".to_string(),
     }
 }
 
@@ -2760,6 +2779,7 @@ mod tests {
             id: reaction_id,
             trigger: Trigger::Click,
             action: Action::Back,
+            extra_actions: Vec::new(),
             transition: None,
             animation: Some(PrototypeAnimation {
                 clip: first_clip,
@@ -2807,6 +2827,7 @@ mod tests {
                 id: reaction_id,
                 trigger: Trigger::Click,
                 action: Action::Back,
+                extra_actions: Vec::new(),
                 transition: None,
                 animation: None,
             },
@@ -2861,6 +2882,7 @@ mod tests {
                 variable,
                 value: VarValue::Float { value: 1.0 },
             },
+            extra_actions: Vec::new(),
             transition: None,
             animation: None,
         };
@@ -2911,6 +2933,7 @@ mod tests {
             id: reaction_id,
             trigger: Trigger::Click,
             action: Action::Back,
+            extra_actions: Vec::new(),
             transition: None,
             animation: None,
         };
@@ -2956,6 +2979,7 @@ mod tests {
                 keys: vec!["Enter".into()],
             },
             action: Action::OpenLink { url: String::new() },
+            extra_actions: Vec::new(),
             transition: None,
             animation: None,
         };
@@ -2988,6 +3012,7 @@ mod tests {
                     close_on_click_outside: true,
                 },
             },
+            extra_actions: Vec::new(),
             transition: None,
             animation: None,
         };
@@ -3024,6 +3049,7 @@ mod tests {
                 id: reaction_id,
                 trigger: Trigger::Click,
                 action: Action::Back,
+                extra_actions: Vec::new(),
                 transition: Some(Transition {
                     style: TransitionStyle::SlideIn {
                         direction: Direction::Left,
@@ -3074,6 +3100,7 @@ mod tests {
                 id: reaction_id,
                 trigger: Trigger::Click,
                 action: Action::Back,
+                extra_actions: Vec::new(),
                 transition: None,
                 animation: None,
             },
@@ -3151,6 +3178,7 @@ mod tests {
                 id: reaction_id,
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
+                extra_actions: Vec::new(),
                 transition: None,
                 animation: None,
             },
@@ -3237,6 +3265,7 @@ mod tests {
                 id: reaction_id,
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
+                extra_actions: Vec::new(),
                 transition: None,
                 animation: None,
             },
@@ -3391,6 +3420,7 @@ mod tests {
                 id: reaction_id,
                 trigger: Trigger::AfterDelay { delay_ms: 300 },
                 action: Action::Back,
+                extra_actions: Vec::new(),
                 transition: None,
                 animation: None,
             },

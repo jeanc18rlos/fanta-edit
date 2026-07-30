@@ -2076,6 +2076,7 @@ fn easing_label(easing: Easing) -> &'static str {
         Easing::EaseOut => "Ease out",
         Easing::EaseInOut => "Ease in/out",
         Easing::CubicBezier { .. } => "Custom",
+        Easing::Spring { .. } => "Spring",
     }
 }
 
@@ -2085,7 +2086,9 @@ fn easing_preset(easing: Easing) -> TimelineEasingPreset {
         Easing::EaseIn => TimelineEasingPreset::EaseIn,
         Easing::EaseOut => TimelineEasingPreset::EaseOut,
         Easing::EaseInOut => TimelineEasingPreset::EaseInOut,
-        Easing::CubicBezier { .. } => TimelineEasingPreset::Custom,
+        // Springs surface as Custom in the timeline preset picker; picking a
+        // named preset replaces the spring with that curve.
+        Easing::CubicBezier { .. } | Easing::Spring { .. } => TimelineEasingPreset::Custom,
     }
 }
 
@@ -2096,7 +2099,7 @@ fn easing_for_preset(preset: TimelineEasingPreset, current: Easing) -> Easing {
         TimelineEasingPreset::EaseOut => Easing::EaseOut,
         TimelineEasingPreset::EaseInOut => Easing::EaseInOut,
         TimelineEasingPreset::Custom => match current {
-            Easing::CubicBezier { .. } => current,
+            Easing::CubicBezier { .. } | Easing::Spring { .. } => current,
             Easing::Linear => Easing::CubicBezier {
                 x1: 0.0,
                 y1: 0.0,

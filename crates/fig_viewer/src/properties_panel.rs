@@ -46,12 +46,12 @@ use crate::inspector_widgets::{PanelDrag, TextDecorationGlyph, scrub_value, trac
 use crate::mode_overrides::mode_override_operation;
 use crate::panel_settings::FantaPropertiesPanelSettings;
 use crate::properties_ops::{
-    add_fill, apply_preview_operation, blurs_operations, combine_as_variants_operations,
-    convert_paint_kind, default_blur, default_shadow, detach_instance_operations,
-    effects_operations, field_operations, finite_transform_operations, format_number,
-    paint_slot_mut, parse_number, read_field_text, remove_fill, replace_data_operation,
-    restore_snapshot, set_clip_content_meta_operation, set_paint_gradient, stroke_list_mut,
-    variant_select_operations,
+    DEFAULT_PAGE_BACKGROUND, add_fill, apply_preview_operation, blurs_operations,
+    combine_as_variants_operations, convert_paint_kind, create_component_operations, default_blur,
+    default_shadow, detach_instance_operations, effects_operations, field_operations,
+    finite_transform_operations, format_number, paint_slot_mut, parse_number, read_field_text,
+    remove_fill, replace_data_operation, restore_snapshot, set_clip_content_meta_operation,
+    set_paint_gradient, stroke_list_mut, variant_select_operations,
 };
 use crate::properties_snapshot::{
     AlignCommand, HiddenPaintAlpha, InspectorBody, InspectorField, InspectorSnapshot, NodeKind,
@@ -636,6 +636,34 @@ impl FantaPropertiesPanel {
                     add_fill(data);
                 }
             },
+            cx,
+        );
+    }
+
+    /// Seed a page that has no background with the default color (one undoable
+    /// operation, like adding a paint), then open the picker on it so the
+    /// swatch click lands the user directly in color selection.
+    pub(crate) fn add_page_background(
+        &mut self,
+        id: NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_node_data(
+            id,
+            |data| {
+                if let NodeData::Group(group) = data
+                    && group.background.is_none()
+                {
+                    group.background = Some(Fill::solid(DEFAULT_PAGE_BACKGROUND));
+                }
+            },
+            cx,
+        );
+        self.toggle_color_picker(
+            InspectorField::PageBackground(id),
+            DEFAULT_PAGE_BACKGROUND,
+            window,
             cx,
         );
     }
@@ -1467,6 +1495,12 @@ impl FantaPropertiesPanel {
     /// data swap alone would drop.
     pub(crate) fn detach_instance(&mut self, id: NodeId, cx: &mut Context<Self>) {
         self.apply_document_ops(cx, move |doc| detach_instance_operations(doc, id));
+    }
+
+    /// Promote the selected frame or group into a component master, in place,
+    /// so it can be instanced elsewhere in the document.
+    pub(crate) fn create_component(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.apply_document_ops(cx, move |doc| create_component_operations(doc, id));
     }
 
     /// Merge the selected component masters into one variant set, so their
@@ -2671,6 +2705,7 @@ impl Render for FantaPropertiesPanel {
                         //  Align               Y     Y     Y     Y    Y     Y    Y    Y
                         //  Position (X/Y/W/H)  Y     Y     Y     Y    Y     Y    Y    Y
                         //  Component master    -     -     -     -    -     -    Y    -
+                        //  Create component    Y     Y     -     -    -     -    -    -
                         //  Instance info       -     -     -     -    -     Y    -    -
                         //  Typography          -     -     -     Y    -     -    -    -
                         //  Image (fit only)    -     -     -     -    Y     -    -    -
@@ -2700,6 +2735,11 @@ impl Render for FantaPropertiesPanel {
                         // Component master identity + variant set + schema.
                         if let Some(master) = &node.master {
                             sections.push(self.render_master_section(master, editable, cx));
+                        }
+                        // A plain frame/group offers promotion into a master
+                        // in the same slot the master section occupies after.
+                        if editable && matches!(kind, Frame | Group) {
+                            sections.push(self.render_create_component_section(id, cx));
                         }
                         if let Some(binding) = &node.component_binding {
                             sections.push(self.render_component_binding_section(

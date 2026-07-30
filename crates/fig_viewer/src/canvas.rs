@@ -204,7 +204,14 @@ fn frame_decision(
         let offset_x = (cached.viewport_center[0] - requested.viewport_center[0]).abs();
         let offset_y = (cached.viewport_center[1] - requested.viewport_center[1]).abs();
         let covers_view = offset_x <= slack_x && offset_y <= slack_y;
-        if covers_view
+        // Zooming OUT quickly leaves the cached frame's coverage (its margin
+        // is thin), which used to force a FULL scene render on every input
+        // event — the exact "zooming degrades" cliff. A shrinking reprojected
+        // frame with briefly exposed background at the edges is the same
+        // blurry-then-sharp trade zoom-in already makes, so accept it while
+        // the throttle is closed instead of stalling the gesture.
+        let zooming_out = scale < 1.0;
+        if (covers_view || zooming_out)
             && (1.0 / MacGpuRenderer::MAX_REPROJECT_SCALE..=MacGpuRenderer::MAX_REPROJECT_SCALE)
                 .contains(&scale)
         {
@@ -650,9 +657,18 @@ impl Element for CanvasElement {
             let Some(page) = document.page(view.selected_page_index()) else {
                 return None;
             };
+            // A component-scoped view renders a master root that is not a
+            // listed page; the initial fit must frame the master's own bounds,
+            // not the fallback page the paint path never shows.
+            let fit = document
+                .doc
+                .active_page()
+                .filter(|root| document.doc.is_component_root(*root))
+                .map(|root| crate::document::page_bounds(&document.doc, Some(root)))
+                .unwrap_or(page.bounds);
             let viewport = view.viewport().unwrap_or_else(|| {
                 crate::document::fit_bounds(
-                    page.bounds,
+                    fit,
                     logical_size,
                     crate::view::RENDER_PADDING,
                     crate::view::MIN_ZOOM,
@@ -2435,6 +2451,32 @@ mod tests {
         );
         assert_eq!(
             frame_decision(&cached, &beyond_cap, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn zooming_out_reprojects_within_the_throttle_despite_thin_coverage() {
+        // Zooming out grows the needed world coverage past the cached frame's
+        // margin almost immediately. That must NOT fall off the throttle onto
+        // a full render per input event (the old degradation cliff): while the
+        // interval is closed the shrinking frame reprojects with briefly
+        // exposed edges, and the sharp frame lands when the throttle opens.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let zoomed_out = surface_key([0.0, 0.0], 0.5, 7);
+        assert_eq!(
+            frame_decision(&cached, &zoomed_out, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::Reproject
+        );
+        // Past the reproject scale cap the frame is too sparse to be useful.
+        let far_out = surface_key([0.0, 0.0], 1.0 / (MacGpuRenderer::MAX_REPROJECT_SCALE * 1.01), 7);
+        assert_eq!(
+            frame_decision(&cached, &far_out, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+        // And with the throttle open, the sharp frame renders.
+        assert_eq!(
+            frame_decision(&cached, &zoomed_out, FRAME_LOGICAL, VISIBLE_LOGICAL, false),
             FrameDecision::RenderFresh
         );
     }

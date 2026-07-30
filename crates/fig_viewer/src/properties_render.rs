@@ -719,6 +719,35 @@ impl FantaPropertiesPanel {
         swatch.into_any_element()
     }
 
+    /// The Page background swatch when the page has no background yet: the
+    /// standard "add" affordance. Clicking seeds the default background (one
+    /// undoable operation, like adding a paint) and opens the color picker on
+    /// it.
+    fn render_page_background_add_swatch(&self, id: NodeId, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        h_flex()
+            .id("fanta-page-background-add")
+            .size(px(18.))
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.element_background)
+            .cursor_pointer()
+            .hover(|style| style.bg(colors.element_hover))
+            .child(
+                Icon::new(IconName::Plus)
+                    .size(IconSize::XSmall)
+                    .color(Color::Accent),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.add_page_background(id, window, cx);
+            }))
+            .into_any_element()
+    }
+
     /// A swatch previewing a gradient paint. Clicking it opens the gradient
     /// editor popover, anchored just below the swatch like the color picker.
     fn render_gradient_swatch(
@@ -3608,19 +3637,27 @@ impl FantaPropertiesPanel {
                 ),
                 PageBackgroundValue::Other(label) => (None, label.clone(), None),
             };
+            // A page without a background still needs a live affordance: the
+            // plain swatch is inert when it has no color, so swap in one that
+            // seeds the default background and opens the picker.
+            let swatch = if editable && matches!(background, PageBackgroundValue::None) {
+                self.render_page_background_add_swatch(id, cx)
+            } else {
+                self.render_color_swatch(
+                    "fanta-page-background-swatch",
+                    0,
+                    color,
+                    Some(InspectorField::PageBackground(id)),
+                    editable,
+                    cx,
+                )
+            };
             section = section.child(
                 h_flex()
                     .px_4()
                     .gap_1p5()
                     .items_center()
-                    .child(self.render_color_swatch(
-                        "fanta-page-background-swatch",
-                        0,
-                        color,
-                        Some(InspectorField::PageBackground(id)),
-                        editable,
-                        cx,
-                    ))
+                    .child(swatch)
                     .child(div().flex_1().min_w_0().child(self.render_text_cell(
                         "fanta-page-background",
                         0,
@@ -3945,6 +3982,30 @@ impl FantaPropertiesPanel {
             );
         }
         section.into_any_element()
+    }
+
+    /// "Create component": promote the selected frame or group into a
+    /// component master, in place, so it can be instanced elsewhere.
+    pub(crate) fn render_create_component_section(
+        &self,
+        id: NodeId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .py_1()
+            .gap_2()
+            .child(Self::render_section_header("Component", None))
+            .child(
+                h_flex().px_4().child(
+                    Button::new("fanta-create-component", "Create component")
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::Small)
+                        .full_width()
+                        .tooltip(Tooltip::text("Turn this frame into a reusable component"))
+                        .on_click(cx.listener(move |this, _, _, cx| this.create_component(id, cx))),
+                ),
+            )
+            .into_any_element()
     }
 
     /// "Combine N as variants": merge the selected component masters into one

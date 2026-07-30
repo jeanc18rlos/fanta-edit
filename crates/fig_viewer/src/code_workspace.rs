@@ -252,23 +252,37 @@ impl FantaCodeWorkspace {
             .values()
             .map(|component| component.root)
             .collect();
+        // Mirror the project writer's bucketing: a node belongs to the design
+        // of its NEAREST component-root ancestor-or-self, or to its page when
+        // it has none. A page encoding therefore excludes every master
+        // subtree, and a component-scope encoding (root is a master) keeps
+        // exactly its own subtree minus any nested other master.
+        let nearest_component_root = |node: NodeId| -> Option<NodeId> {
+            if component_roots.contains(&node) {
+                return Some(node);
+            }
+            document
+                .scene
+                .ancestors_of(node)
+                .map(|ancestor| ancestor.id)
+                .find(|id| component_roots.contains(id))
+        };
+        let scope_component_root = component_roots.contains(&root).then_some(root);
         let nodes = document
             .scene
             .descendants_of(root)
-            .filter(|node| {
-                !component_roots.contains(node)
-                    && !document
-                        .scene
-                        .ancestors_of(*node)
-                        .any(|ancestor| component_roots.contains(&ancestor.id))
-            })
+            .filter(|node| nearest_component_root(*node) == scope_component_root)
             .filter_map(|node| document.scene.get(node))
             .map(serde_json::to_value)
             .collect::<serde_json::Result<Vec<_>>>()
             .context("serializing the canvas page")?;
         let function_name = root_node.name.trim();
         let function_name = if function_name.is_empty() {
-            "Page"
+            if scope_component_root.is_some() {
+                "Component"
+            } else {
+                "Page"
+            }
         } else {
             function_name
         };
@@ -359,6 +373,22 @@ impl FantaCodeWorkspace {
     /// the exact saved buffer version so Zed's dirty state and the canvas lock
     /// converge with disk.
     pub(crate) fn save_source_edit(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
+        self.save_source_edit_impl(true, cx)
+    }
+
+    /// Persist the dirty FNX buffer without the pre-save format pass — the
+    /// auto-persist path for edits that validated cleanly (an agent rewriting
+    /// the file, or live typing). Skipping the reformat keeps the author's
+    /// cursor and text untouched; the manual save still formats.
+    fn persist_validated_source_edit(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
+        self.save_source_edit_impl(false, cx)
+    }
+
+    fn save_source_edit_impl(
+        &mut self,
+        format: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
         if !self.source_is_dirty(cx) {
             return None;
         }
@@ -395,7 +425,7 @@ impl FantaCodeWorkspace {
         self.source_save_in_progress = true;
         let item = self.item.clone();
         let project = self.project.clone();
-        let format_source = (!cfg!(test)).then(|| {
+        let format_source = (format && !cfg!(test)).then(|| {
             project.update(cx, |project, cx| {
                 project.format(
                     std::iter::once(buffer.clone()).collect(),
@@ -426,10 +456,14 @@ impl FantaCodeWorkspace {
             let apply_path = source_path.clone();
             let source_edit = cx
                 .background_spawn(async move {
-                    fanta_format::apply_project_source_edit(&project_root, &apply_path, &source)
+                    fanta_format::apply_project_source_edit_with_diagnostics(
+                        &project_root,
+                        &apply_path,
+                        &source,
+                    )
                 })
                 .await;
-            let source_edit = match source_edit {
+            let (source_edit, source_diagnostics) = match source_edit {
                 Ok(source_edit) => source_edit,
                 Err(error) => {
                     item.update(cx, |item, _| item.finish_source_edit_pipeline());
@@ -442,6 +476,15 @@ impl FantaCodeWorkspace {
                     return Err(error).context("applying the FNX source edit");
                 }
             };
+            // Authoring warnings (typo'd/unknown attributes with a
+            // did-you-mean) never block the save — surface them where the
+            // author is looking instead of letting a typo pass silently.
+            if let Some(summary) = summarize_source_diagnostics(&source_diagnostics) {
+                this.update(cx, |this, cx| {
+                    this.validation_message = Some(summary.into());
+                    cx.notify();
+                })?;
+            }
 
             let buffer_unchanged = buffer.read_with(cx, |buffer, _| buffer.version() == version);
             if !buffer_unchanged {
@@ -511,12 +554,27 @@ impl FantaCodeWorkspace {
     }
 
     fn refresh_from_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (project_root, page) = {
+        let (project_root, page, component) = {
             let item = self.item.read(cx);
+            let page = self
+                .requested_page
+                .or_else(|| item.doc().and_then(|doc| doc.active_page()));
+            // The active root may be a component master (a component-scoped
+            // view) rather than a listed page; its source is
+            // `components/<id>/master.fnx`, with `def.json` as the JSON pane.
+            let component = page.and_then(|root| {
+                item.doc().and_then(|doc| {
+                    doc.components
+                        .defs
+                        .iter()
+                        .find(|(_, def)| def.root == root)
+                        .map(|(id, _)| *id)
+                })
+            });
             (
                 item.project_root().map(Path::to_path_buf),
-                self.requested_page
-                    .or_else(|| item.doc().and_then(|doc| doc.active_page())),
+                page,
+                component,
             )
         };
         let Some(project_root) = project_root else {
@@ -527,10 +585,37 @@ impl FantaCodeWorkspace {
             return;
         };
 
+        // Design directories are named by human-readable slugs (layout v3)
+        // with identity in the JSON headers, so source paths are resolved by
+        // scanning the tree — never derived from ids.
         match page {
+            Some(_) if component.is_some() => {
+                let component = component.expect("checked by the match guard");
+                let Some(fnx_path) = fanta_format::locate_master_source(&project_root, component)
+                else {
+                    self.clear_editors();
+                    self.error_message = Some(
+                        "This component has no source on disk yet; save the document to materialize it.".into(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                let def_path = fnx_path.with_file_name("def.json");
+                self.open_fnx(fnx_path, window, cx);
+                self.open_json(def_path, window, cx);
+            }
             Some(page) => {
-                self.open_fnx(page_source_path(&project_root, page), window, cx);
-                self.open_json(page_json_path(&project_root, page), window, cx);
+                let Some(fnx_path) = fanta_format::locate_page_source(&project_root, page) else {
+                    self.clear_editors();
+                    self.error_message = Some(
+                        "This page has no source on disk yet; save the document to materialize it.".into(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                let json_path = fnx_path.with_file_name("page.json");
+                self.open_fnx(fnx_path, window, cx);
+                self.open_json(json_path, window, cx);
             }
             None => {
                 self.fnx_path = None;
@@ -794,11 +879,15 @@ impl FantaCodeWorkspace {
             let apply_path = source_path.clone();
             let reconciliation = cx
                 .background_spawn(async move {
-                    fanta_format::apply_project_source_edit(&project_root, &apply_path, &source)
+                    fanta_format::apply_project_source_edit_with_diagnostics(
+                        &project_root,
+                        &apply_path,
+                        &source,
+                    )
                 })
                 .await;
 
-            let source_edit = match reconciliation {
+            let (source_edit, source_diagnostics) = match reconciliation {
                 Ok(source_edit) => source_edit,
                 Err(error) => {
                     item.update(cx, |item, _| item.finish_source_edit_pipeline());
@@ -819,6 +908,18 @@ impl FantaCodeWorkspace {
                     return;
                 }
             };
+            // Non-blocking authoring warnings (unknown attributes with a
+            // did-you-mean) — surfaced, never a reason to reject the save.
+            if let Some(summary) = summarize_source_diagnostics(&source_diagnostics)
+                && let Err(update_error) = this.update(cx, |this, cx| {
+                    this.validation_message = Some(summary.into());
+                    cx.notify();
+                })
+            {
+                log::debug!(
+                    "dropping saved FNX diagnostics for closed workspace: {update_error:#}"
+                );
+            }
 
             let source_is_current = match this.read_with(cx, |this, cx| {
                 this.fnx_path.as_ref() == Some(&source_path)
@@ -1006,6 +1107,7 @@ impl FantaCodeWorkspace {
                         }
                         this.error_message = None;
                         let item = this.item.clone();
+                        let workspace = cx.weak_entity();
                         let expected_version = version.clone();
                         cx.defer(move |cx| {
                             if buffer.read(cx).version() != expected_version {
@@ -1016,6 +1118,25 @@ impl FantaCodeWorkspace {
                                 item.adopt_source_edit(source_edit, cx);
                                 item.set_source_edit_locked(source_is_dirty, cx);
                             });
+                            // A cleanly validated source edit persists right
+                            // away: leaving the buffer dirty kept the canvas
+                            // LOCKED after an agent rewrote the file — the
+                            // user couldn't edit, and the save flow fought
+                            // them. Persisting closes the code→canvas loop
+                            // (canvas unlocks via the buffer save) and the
+                            // lock now only survives for INVALID source.
+                            if source_is_dirty
+                                && let Err(error) = workspace.update(cx, |workspace, cx| {
+                                    if let Some(save) = workspace.persist_validated_source_edit(cx)
+                                    {
+                                        save.detach_and_log_err(cx);
+                                    }
+                                })
+                            {
+                                log::debug!(
+                                    "dropping FNX auto-persist for closed workspace: {error:#}"
+                                );
+                            }
                         });
                     }
                     Err(error) => {
@@ -1152,7 +1273,7 @@ impl Render for FantaCodeWorkspace {
                 let conflict_message = if has_local_canvas_source_conflict {
                     "Canvas and FNX source changed independently. Compare them before choosing Overwrite or Discard."
                 } else {
-                    "Project files changed on disk while this document had unsaved edits. Choose Overwrite to keep the current edits or Discard to reload the project."
+                    "External file edits conflict with unsaved canvas edits on the same values and could not be auto-merged. Choose Overwrite to keep the canvas edits or Discard to reload the project."
                 };
                 this.child(
                     h_flex()
@@ -1183,19 +1304,6 @@ impl Render for FantaCodeWorkspace {
     }
 }
 
-fn page_source_path(project_root: &Path, page: NodeId) -> PathBuf {
-    project_root
-        .join("pages")
-        .join(page.to_string())
-        .join("page.fnx")
-}
-
-fn page_json_path(project_root: &Path, page: NodeId) -> PathBuf {
-    project_root
-        .join("pages")
-        .join(page.to_string())
-        .join("page.json")
-}
 
 #[cfg(test)]
 mod tests {
@@ -1282,6 +1390,218 @@ mod tests {
         (project, item, workspace)
     }
 
+    /// Opening a project source file (`page.fnx`) while the project is open
+    /// must reuse the SAME shared item — no reload, one document — and apply
+    /// the scope so the click navigates the existing editor to that page.
+    #[gpui::test]
+    async fn a_scoped_open_reuses_the_shared_project_item_and_applies_the_scope(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let (project, item, _workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        // Navigate away from the page so the scoped open has something to do.
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.set_active_page(None);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+
+        let worktree_id = project.update(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("project worktree")
+                .read(cx)
+                .id()
+        });
+        let fnx_abs = fanta_format::locate_page_source(temporary.path(), page)
+            .expect("page source on disk");
+        let fnx_rel = fnx_abs
+            .strip_prefix(temporary.path())
+            .expect("page source inside project")
+            .to_str()
+            .expect("utf8 path");
+        let scoped_path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path(fnx_rel).into(),
+        };
+        let scoped_item = cx
+            .update(|cx| FigItem::try_open(&project, &scoped_path, cx))
+            .expect("page.fnx routes to the fig viewer")
+            .await
+            .expect("open scoped FigItem");
+        cx.run_until_parked();
+
+        assert_eq!(
+            scoped_item.entity_id(),
+            item.entity_id(),
+            "scoped opens must share the project's one item"
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().and_then(|doc| doc.active_page()),
+                Some(page),
+                "the scoped open navigates the shared document to its page"
+            );
+        });
+    }
+
+    /// Every open leaves a descriptor recording WHICH entry the user clicked
+    /// (the pane's tab-dedupe key, via the view's `project_entry_ids`
+    /// override) plus that path's scope. A scoped open must be keyed by the
+    /// clicked file's entry — not the shared item's first-open entry — so it
+    /// gets its own tab, while REOPENING the same path repeats the same key
+    /// and lands on the existing tab. The item itself stays shared.
+    #[gpui::test]
+    async fn scoped_opens_carry_their_own_entry_and_scope_for_the_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let (project, item, _workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        let manifest_descriptor = cx
+            .update(crate::document::take_pending_view_descriptor)
+            .expect("the manifest open leaves a view descriptor");
+        assert_eq!(manifest_descriptor.scope, None);
+        assert!(
+            manifest_descriptor.entry_id.is_some(),
+            "the manifest exists in the worktree"
+        );
+
+        let worktree_id = project.update(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("project worktree")
+                .read(cx)
+                .id()
+        });
+        let fnx_abs = fanta_format::locate_page_source(temporary.path(), page)
+            .expect("page source on disk");
+        let fnx_rel = fnx_abs
+            .strip_prefix(temporary.path())
+            .expect("page source inside project")
+            .to_str()
+            .expect("utf8 path");
+        let scoped_path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path(fnx_rel).into(),
+        };
+        let scoped_entry = project.update(cx, |project, cx| {
+            project
+                .entry_for_path(&scoped_path, cx)
+                .map(|entry| entry.id)
+        });
+        assert!(
+            scoped_entry.is_some(),
+            "the page source exists in the worktree"
+        );
+
+        let scoped_item = cx
+            .update(|cx| FigItem::try_open(&project, &scoped_path, cx))
+            .expect("page.fnx routes to the fig viewer")
+            .await
+            .expect("open scoped FigItem");
+        cx.run_until_parked();
+        assert_eq!(
+            scoped_item.entity_id(),
+            item.entity_id(),
+            "scoped opens must share the project's one item"
+        );
+        let first_open = cx
+            .update(crate::document::take_pending_view_descriptor)
+            .expect("the scoped open leaves a view descriptor");
+        assert_eq!(first_open.entry_id, scoped_entry);
+        assert_eq!(
+            first_open.scope,
+            Some(crate::document::FigScope::Page(page))
+        );
+        assert_ne!(
+            first_open.entry_id, manifest_descriptor.entry_id,
+            "a scoped open must not dedupe onto the manifest's tab"
+        );
+
+        let reopened_item = cx
+            .update(|cx| FigItem::try_open(&project, &scoped_path, cx))
+            .expect("page.fnx routes to the fig viewer")
+            .await
+            .expect("reopen scoped FigItem");
+        cx.run_until_parked();
+        let second_open = cx
+            .update(crate::document::take_pending_view_descriptor)
+            .expect("the reopen leaves a view descriptor");
+        assert_eq!(
+            reopened_item.entity_id(),
+            item.entity_id(),
+            "reopening still shares the project's one item"
+        );
+        assert_eq!(
+            second_open, first_open,
+            "reopening the same path repeats the same tab key"
+        );
+    }
+
+    /// A focused tab re-asserts its scope on every focus change; when the
+    /// document already shows that root the request must be a cheap no-op —
+    /// no `ScopeApplied` — or every tab switch would reset sibling viewports.
+    #[gpui::test]
+    async fn re_asserting_the_current_scope_emits_no_scope_applied(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let (_project, item, _workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        let scope_applied = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+        let _subscription = cx.update({
+            let scope_applied = scope_applied.clone();
+            |cx| {
+                cx.subscribe(&item, move |_, event, _| {
+                    if matches!(event, crate::document::FigItemEvent::ScopeApplied(..)) {
+                        scope_applied.set(scope_applied.get() + 1);
+                    }
+                })
+            }
+        });
+
+        item.update(cx, |item, cx| {
+            item.request_scope(
+                crate::document::FigScope::Page(page),
+                crate::document::ScopeRequester::Open,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            scope_applied.get(),
+            0,
+            "re-asserting the already-active root must not emit ScopeApplied"
+        );
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.set_active_page(None);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        item.update(cx, |item, cx| {
+            item.request_scope(
+                crate::document::FigScope::Page(page),
+                crate::document::ScopeRequester::Open,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            scope_applied.get(),
+            1,
+            "an actual re-target still emits ScopeApplied"
+        );
+    }
+
     fn replace_workspace_source(
         workspace: gpui::WindowHandle<FantaCodeWorkspace>,
         source: String,
@@ -1299,6 +1619,21 @@ mod tests {
         cx.executor()
             .advance_clock(SOURCE_VALIDATION_DEBOUNCE + Duration::from_millis(1));
         cx.run_until_parked();
+    }
+
+    /// Drive the executor until the auto-persist that follows a valid FNX
+    /// validation has landed (its save path crosses real-fs operations that
+    /// a single `run_until_parked` can outpace).
+    fn wait_for_source_persist(item: &Entity<FigItem>, cx: &mut TestAppContext) {
+        for _ in 0..200 {
+            let unlocked = item.read_with(cx, |item, _| !item.source_edit_locked());
+            if unlocked {
+                return;
+            }
+            cx.executor().advance_clock(Duration::from_millis(50));
+            cx.run_until_parked();
+        }
+        panic!("FNX auto-persist did not complete");
     }
 
     fn page_name(item: &Entity<FigItem>, page: NodeId, cx: &TestAppContext) -> String {
@@ -1327,16 +1662,33 @@ mod tests {
 
     #[test]
     fn source_paths_follow_the_project_layout() {
-        let root = Path::new("/tmp/design");
-        let page = NodeId::from_u128(7);
-        assert_eq!(
-            page_source_path(root, page),
-            root.join("pages").join(page.to_string()).join("page.fnx")
+        // Design dirs are slug-named (layout v3); paths resolve by scanning,
+        // not by id. The resolved page source sits under pages/<slug>/page.fnx.
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let fnx = page_source_path(temporary.path(), page);
+        assert!(fnx.ends_with(Path::new("page.fnx")), "{}", fnx.display());
+        assert!(
+            fnx.parent()
+                .and_then(|dir| dir.parent())
+                .is_some_and(|pages| pages.ends_with("pages")),
+            "{}",
+            fnx.display()
         );
         assert_eq!(
-            page_json_path(root, page),
-            root.join("pages").join(page.to_string()).join("page.json")
+            page_json_path(temporary.path(), page),
+            fnx.with_file_name("page.json")
         );
+    }
+
+    /// Resolve a page's source path in a REAL on-disk project — the slug
+    /// layout means paths can't be derived from ids.
+    fn page_source_path(project_root: &Path, page: NodeId) -> PathBuf {
+        fanta_format::locate_page_source(project_root, page).expect("page source on disk")
+    }
+
+    fn page_json_path(project_root: &Path, page: NodeId) -> PathBuf {
+        page_source_path(project_root, page).with_file_name("page.json")
     }
 
     #[test]
@@ -1452,12 +1804,9 @@ mod tests {
         let original_source =
             std::fs::read_to_string(&source_path).expect("read generated FNX source");
         let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
-        replace_workspace_source(
-            workspace,
-            original_source.replace("name=\"Original\"", "name=\"Discard me\""),
-            cx,
-        );
-        assert_eq!(page_name(&item, page, cx), "Discard me");
+        // A VALID edit would auto-persist and leave nothing to discard, so
+        // the discard path is exercised by what still locks: invalid source.
+        replace_workspace_source(workspace, "<Frame".to_owned(), cx);
         item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
 
         let discard = workspace
@@ -1705,24 +2054,20 @@ mod tests {
 
         let changed_source = original_source.replace("name=\"Original\"", "name=\"Changed\"");
         assert_ne!(changed_source, original_source);
-        replace_workspace_source(workspace, changed_source, cx);
+        replace_workspace_source(workspace, changed_source.clone(), cx);
         assert_eq!(page_name(&item, page, cx), "Changed");
+        // A valid edit auto-persists: the canvas must NOT stay locked (an
+        // agent rewriting the file used to freeze the editor), and disk holds
+        // the edit without a manual save.
+        wait_for_source_persist(&item, cx);
         item.read_with(cx, |item, _| {
-            assert!(item.source_edit_locked());
-            assert!(!item.is_editable());
+            assert!(!item.source_edit_locked());
+            assert!(item.is_editable());
         });
-        let blocked_mutation = item.update(cx, |item, cx| {
-            item.apply(
-                Operation::SetName {
-                    id: page,
-                    old: "Changed".to_owned(),
-                    new: "Canvas overwrite".to_owned(),
-                },
-                cx,
-            )
-        });
-        assert!(blocked_mutation.is_err());
-        assert_eq!(page_name(&item, page, cx), "Changed");
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("auto-persisted source"),
+            changed_source
+        );
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 document.doc.selection.select_only(page);
@@ -1732,10 +2077,6 @@ mod tests {
         item.read_with(cx, |item, _| {
             assert_eq!(item.doc().expect("document").selection.as_slice(), &[page]);
         });
-        assert_eq!(
-            std::fs::read_to_string(&source_path).expect("source remains unsaved"),
-            original_source
-        );
         workspace
             .read_with(cx, |workspace, _| {
                 assert!(workspace.validation_error().is_none());
@@ -1771,16 +2112,14 @@ mod tests {
         let changed_source = original_source.replace("name=\"Original\"", "name=\"Saved\"");
         replace_workspace_source(workspace, changed_source.clone(), cx);
         assert_eq!(page_name(&item, page, cx), "Saved");
-        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
-
-        let save_task = workspace
+        wait_for_source_persist(&item, cx);
+        // Validation already persisted the edit; a manual save has nothing
+        // left to do.
+        workspace
             .update(cx, |workspace, _window, cx| {
-                workspace
-                    .save_source_edit(cx)
-                    .expect("dirty source save task")
+                assert!(workspace.save_source_edit(cx).is_none());
             })
             .expect("update code workspace");
-        save_task.await.expect("save valid FNX source edit");
         cx.run_until_parked();
 
         assert_eq!(
@@ -1806,4 +2145,31 @@ mod tests {
             })
             .expect("read code workspace");
     }
+}
+
+/// One status-line summary of the engine's authoring warnings (unknown
+/// attributes with did-you-mean suggestions). `None` when there are none, so
+/// callers can skip the update entirely.
+fn summarize_source_diagnostics(
+    diagnostics: &[fanta_format::SourceDiagnostic],
+) -> Option<String> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = diagnostics
+        .iter()
+        .take(2)
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    let extra = diagnostics.len().saturating_sub(shown.len());
+    let mut summary = format!(
+        "Saved with {} warning{}: {}",
+        diagnostics.len(),
+        if diagnostics.len() == 1 { "" } else { "s" },
+        shown.join(" · ")
+    );
+    if extra > 0 {
+        summary.push_str(&format!(" (+{extra} more)"));
+    }
+    Some(summary)
 }

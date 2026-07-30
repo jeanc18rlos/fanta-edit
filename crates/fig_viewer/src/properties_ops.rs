@@ -11,10 +11,10 @@ use fanta_canvas::{
     resize_transform_keep_rotation, rotate_about, transform_angle,
 };
 use fanta_doc::{
-    BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor, ComponentId,
-    ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill, Gradient, GroupNode,
-    LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, TextAutoResize,
-    Transform2D, UnitInterval, VarValue, VariantAxis, expand_instance,
+    BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor,
+    ComponentDef, ComponentId, ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill,
+    Gradient, GroupNode, LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke,
+    TextAutoResize, Transform2D, UnitInterval, VarValue, VariantAxis, expand_instance,
 };
 use glam::DVec2;
 use gpui::Rgba;
@@ -27,6 +27,10 @@ use crate::properties_snapshot::{
 };
 
 pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217);
+
+/// Figma's default page background, seeded when a page without one gets its
+/// first color from the inspector.
+pub(crate) const DEFAULT_PAGE_BACKGROUND: FantaColor = FantaColor::rgb(245, 245, 245);
 
 fn inspector_local_bounds(doc: &Doc, id: NodeId) -> Option<FantaBounds> {
     let node = doc.scene.get(id)?;
@@ -794,6 +798,28 @@ pub(crate) fn detach_instance_operations(doc: &Doc, id: NodeId) -> Vec<Operation
         });
     }
     operations
+}
+
+/// Promote the frame or group rooted at `id` into a new component master —
+/// one undoable [`Operation::DefineComponent`], named after the node. The
+/// master stays where it is on the canvas (Figma behavior). Non-groups,
+/// instances, and nodes that already are masters are refused.
+pub(crate) fn create_component_operations(doc: &Doc, id: NodeId) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    if !matches!(node.data, NodeData::Group(_)) {
+        return Vec::new();
+    }
+    if doc.components.defs.values().any(|def| def.root == id) {
+        return Vec::new();
+    }
+    let name = node.name.trim();
+    let name = if name.is_empty() { "Component" } else { name };
+    let component = ComponentId::new();
+    vec![Operation::DefineComponent {
+        def: Box::new(ComponentDef::new(component, id, name)),
+    }]
 }
 
 /// Merge the selected component masters into one variant set along a single
@@ -2499,6 +2525,46 @@ mod tests {
         // Detaching something that is not an instance is a no-op.
         assert!(detach_instance_operations(&doc, master_root_id).is_empty());
         assert!(detach_instance_operations(&doc, NodeId::new()).is_empty());
+    }
+
+    #[test]
+    fn create_component_promotes_a_frame_in_place_and_is_idempotent() {
+        let (mut doc, id) = doc_with_node(NodeData::Group(frame_group()));
+        doc.scene.get_mut(id).expect("the frame").name = "Card".to_owned();
+
+        let operations = create_component_operations(&doc, id);
+        assert_eq!(operations.len(), 1);
+        let Some(Operation::DefineComponent { def }) = operations.first() else {
+            panic!("expected a DefineComponent operation");
+        };
+        assert_eq!(def.root, id);
+        assert_eq!(def.name, "Card");
+
+        for operation in operations {
+            doc.apply(operation).expect("promoting the frame");
+        }
+        assert!(
+            doc.components.defs.values().any(|def| def.root == id),
+            "the frame is now a master root"
+        );
+
+        // Promoting a node that already is a master is a no-op.
+        assert!(create_component_operations(&doc, id).is_empty());
+    }
+
+    #[test]
+    fn create_component_refuses_non_groups_and_names_unnamed_frames() {
+        let (doc, id) = doc_with_node(NodeData::Text(text_node()));
+        assert!(create_component_operations(&doc, id).is_empty());
+        assert!(create_component_operations(&doc, NodeId::new()).is_empty());
+
+        let (mut doc, id) = doc_with_node(NodeData::Group(frame_group()));
+        doc.scene.get_mut(id).expect("the frame").name = "  ".to_owned();
+        let operations = create_component_operations(&doc, id);
+        let Some(Operation::DefineComponent { def }) = operations.first() else {
+            panic!("expected a DefineComponent operation");
+        };
+        assert_eq!(def.name, "Component");
     }
 
     #[test]

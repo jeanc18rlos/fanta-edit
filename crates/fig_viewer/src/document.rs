@@ -14,8 +14,8 @@ use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
 use fanta_render::{AssetResolver, DecodedImage, InMemoryAssetResolver, solve_scene_layout};
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, Image, ImageFormat, SharedString,
-    Subscription, Task,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
+    SharedString, Subscription, Task, WeakEntity,
 };
 use project::{Project, ProjectPath};
 use worktree::{PathChange, ProjectEntryId, UpdatedEntriesSet, WorktreeId};
@@ -53,9 +53,85 @@ pub struct FigItem {
     /// Ignore worktree events until this instant; set around our own project
     /// writes so saving from the canvas does not trigger a self-reload.
     suppress_watcher_until: Option<Instant>,
+    /// The last document state both the canvas and the disk agreed on (as of
+    /// the last load, reload, or save). The common ancestor for the
+    /// three-way merge that reconciles concurrent canvas edits with external
+    /// (agent/hand) file edits instead of forcing Overwrite/Discard.
+    merge_base: Option<Doc>,
+    /// A scope requested while the document was still loading (from the open
+    /// path — `page.fnx` / `master.fnx` / `doc/variables.json` — or a scoped
+    /// re-open of the shared item). Applied and cleared when the load lands.
+    pending_scope: Option<FigScope>,
+    /// The most recently applied scope, so a view created after the fact
+    /// (e.g. in a second window) can land in the right workspace.
+    last_scope: Option<FigScope>,
+    /// Bumped every time the authoritative document/disk state changes (save,
+    /// source-edit adoption, reload, merge adoption). In-flight merge/reload
+    /// tasks capture it when scheduled and abort if it moved — otherwise a
+    /// task that loaded a disk snapshot BEFORE a save completed would adopt
+    /// that stale snapshot afterwards, silently reverting (and on the next
+    /// save destroying) freshly saved content.
+    sync_epoch: u64,
     reload_task: Option<Task<()>>,
     _load_task: Option<Task<()>>,
-    _project_subscription: Subscription,
+    /// Worktree-event subscriptions, one per [`Project`] that opened this
+    /// item. The item is shared across windows and each window brings its OWN
+    /// `Project` entity, so watching only the first opener's project would
+    /// silently end external-edit detection (reload/merge/conflict) when that
+    /// window closes — and the next save would clobber newer disk state.
+    /// Deduped by project entity id; dead entries are pruned opportunistically.
+    project_subscriptions: Vec<(WeakEntity<Project>, Subscription)>,
+}
+
+/// One live [`FigItem`] per materialized project directory, so every open —
+/// `fanta.json`, a `page.fnx`, a `master.fnx`, `doc/variables.json` — shares
+/// the SAME document entity. Sharing is what makes scoped opens instant (no
+/// re-read of the project tree), makes an edit in any tab land in every other
+/// view immediately, and removes the self-inflicted disk conflicts two
+/// parallel items produced. Weak handles: a closed project drops its item.
+#[derive(Default)]
+struct SharedProjectItems(HashMap<PathBuf, gpui::WeakEntity<FigItem>>);
+
+impl gpui::Global for SharedProjectItems {}
+
+fn shared_project_item(root: &Path, cx: &mut App) -> Option<Entity<FigItem>> {
+    cx.default_global::<SharedProjectItems>()
+        .0
+        .get(root)
+        .and_then(|item| item.upgrade())
+}
+
+fn register_shared_project_item(root: PathBuf, item: &Entity<FigItem>, cx: &mut App) {
+    let registry = &mut cx.default_global::<SharedProjectItems>().0;
+    registry.retain(|_, item| item.upgrade().is_some());
+    registry.insert(root, item.downgrade());
+}
+
+/// Hand-off from [`FigItem::try_open`] to the [`FigView`](crate::FigView) the
+/// workspace builds next: the worktree entry the user actually clicked and the
+/// scope that path implies. The shared item cannot carry this per-open state
+/// (it is ONE entity behind many openable paths), and the workspace's
+/// item-building plumbing has no side channel — so a crate global bridges the
+/// two, exactly like `agent_surface::set_active_item`. Sound because the
+/// foreground is serial between `try_open` resolving and the view being
+/// constructed, and every `try_open` overwrites the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FigViewDescriptor {
+    pub(crate) entry_id: Option<ProjectEntryId>,
+    pub(crate) scope: Option<FigScope>,
+}
+
+#[derive(Default)]
+struct PendingViewDescriptor(Option<FigViewDescriptor>);
+
+impl gpui::Global for PendingViewDescriptor {}
+
+pub(crate) fn set_pending_view_descriptor(descriptor: FigViewDescriptor, cx: &mut App) {
+    cx.default_global::<PendingViewDescriptor>().0 = Some(descriptor);
+}
+
+pub(crate) fn take_pending_view_descriptor(cx: &mut App) -> Option<FigViewDescriptor> {
+    cx.default_global::<PendingViewDescriptor>().0.take()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +155,31 @@ pub enum FigItemEvent {
     ConflictChanged,
     /// An FNX buffer became dirty or returned to its persisted version.
     SourceEditLockChanged,
+    /// A scoped open (`page.fnx` / `master.fnx` / `doc/variables.json`)
+    /// re-targeted this shared document: the requesting view should refit its
+    /// viewport to the new root and switch workspaces (Variables ↔ Canvas)
+    /// accordingly.
+    ScopeApplied(FigScope, ScopeRequester),
+}
+
+/// Who initiated a scope change, carried on [`FigItemEvent::ScopeApplied`] so
+/// views can tell whether the re-target is theirs to follow. Keying the refit
+/// on the requester (instead of each view's cached focus flag) matters
+/// because GPUI focus listeners only run at the next draw: at event delivery
+/// the PREVIOUS tab can still believe it is focused, and following the event
+/// would clobber its saved viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeRequester {
+    /// A view re-asserted or navigated to this scope; only the view with this
+    /// entity id follows.
+    View(EntityId),
+    /// A scoped open re-targeted the document for a tab that does not exist
+    /// yet; no live view follows (the new view initializes from the already
+    /// re-rooted document).
+    Open,
+    /// The pending scope was applied when the initial load landed; there is
+    /// no requesting view, so the focused view follows.
+    Load,
 }
 
 impl EventEmitter<FigItemEvent> for FigItem {}
@@ -226,6 +327,17 @@ impl FigDocument {
         self.render_generation
     }
 
+    /// Continue the generation sequence of a document this one replaces.
+    /// A fresh `from_doc` restarts at 0; without reseeding, an in-flight
+    /// merge that captured generation G on the OLD document could collide
+    /// with the NEW document reaching G and adopt a merge built from the
+    /// pre-swap snapshot, dropping edits.
+    pub(crate) fn continue_generation_after(&mut self, previous: Option<u64>) {
+        if let Some(previous) = previous {
+            self.render_generation = self.render_generation.max(previous.wrapping_add(1));
+        }
+    }
+
     fn advance_render_generation(&mut self) {
         self.render_generation = self.render_generation.wrapping_add(1);
     }
@@ -303,6 +415,36 @@ impl FigDocument {
             solve_scene_layout(&mut self.doc.scene, page_root);
             self.refresh_page_bounds(page_index);
         }
+    }
+
+    /// Lazily solve layout for an arbitrary subtree root — a component master
+    /// scoped into its own view, which is not listed in [`Self::pages`] and so
+    /// can't go through [`Self::ensure_page_solved`]. Shares the same
+    /// solved-once tracking, keyed by root id.
+    pub fn ensure_root_solved(&mut self, root: NodeId) {
+        if self.doc.scene.get(root).is_some() && self.solved_pages.insert(root) {
+            solve_scene_layout(&mut self.doc.scene, root);
+        }
+    }
+
+    /// Re-activate `root` in a freshly swapped-in document (disk reload,
+    /// source adoption, merge): a listed page restores its index, a component
+    /// master root restores the component scope. Returns whether the root was
+    /// restored — `false` means it no longer exists and the caller should let
+    /// the document fall back to its default page.
+    pub(crate) fn restore_active_root(&mut self, root: NodeId) -> bool {
+        if let Some(index) = self.pages.iter().position(|page| page.root == Some(root)) {
+            self.ensure_page_solved(index);
+            self.doc.set_active_page(Some(root));
+            self.default_page_index = index;
+            return true;
+        }
+        if self.doc.is_component_root(root) && self.doc.scene.get(root).is_some() {
+            self.ensure_root_solved(root);
+            self.doc.set_active_page(Some(root));
+            return true;
+        }
+        false
     }
 
     fn refresh_page_bounds(&mut self, page_index: usize) {
@@ -479,7 +621,14 @@ impl project::ProjectItem for FigItem {
         let is_fig = is_fig_file(path) || abs_path.as_deref().is_some_and(path_has_fig_extension);
         let is_manifest = is_fanta_manifest(path.path.as_std_path())
             || abs_path.as_deref().is_some_and(is_fanta_manifest);
-        if !is_fig && !is_manifest {
+        // A project source file opens the editor SCOPED to what it describes:
+        // `pages/<id>/page.fnx` → that page, `components/<id>/master.fnx` →
+        // that component master alone (atomic component editing),
+        // `doc/variables.json` → the variables space. The check includes an
+        // `is_project_dir` probe (one tiny fanta.json read) so a loose
+        // look-alike path still falls through to the text editor.
+        let scoped = abs_path.as_deref().and_then(scoped_project_source);
+        if !is_fig && !is_manifest && scoped.is_none() {
             return None;
         }
 
@@ -493,7 +642,10 @@ impl project::ProjectItem for FigItem {
         Some(cx.spawn(async move |cx| {
             let abs_path =
                 abs_path.context("Figma viewer only supports local .fig files and projects")?;
-            let project_root = if is_manifest {
+            let initial_scope = scoped.as_ref().map(|(_, scope)| *scope);
+            let project_root = if let Some((root, _)) = scoped {
+                Some(root)
+            } else if is_manifest {
                 abs_path.parent().map(Path::to_path_buf)
             } else {
                 // A `.fig` that was already materialized into a sibling Fanta
@@ -506,47 +658,182 @@ impl project::ProjectItem for FigItem {
                 let candidate = available_project_dir(&abs_path);
                 fanta_format::is_project_dir(&candidate).then_some(candidate)
             };
+
+            // One live item per project directory: a scoped open (page.fnx,
+            // master.fnx, variables.json) of an already-open project reuses
+            // the SHARED document — instant (no re-read of the tree), and the
+            // pane's entry-id dedupe then activates the existing editor tab,
+            // making the click pure navigation. Applying the scope re-targets
+            // that shared document.
+            let registry_key = project_root
+                .as_deref()
+                .map(|root| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
+            if let Some(key) = &registry_key
+                && let Some(item) = cx.update(|cx| shared_project_item(key, cx))
+            {
+                item.update(cx, |item, cx| {
+                    // A second window reaches this branch with its OWN
+                    // `Project` entity; the shared item must watch that
+                    // project's worktree events too, or external-edit
+                    // detection dies with the original window.
+                    item.subscribe_to_project(&project, cx);
+                    if let Some(scope) = initial_scope {
+                        item.request_scope(scope, ScopeRequester::Open, cx);
+                    }
+                });
+                cx.update(|cx| {
+                    set_pending_view_descriptor(
+                        FigViewDescriptor {
+                            entry_id,
+                            scope: initial_scope,
+                        },
+                        cx,
+                    )
+                });
+                return Ok(item);
+            }
             let item = cx.new(|cx| {
                 let load_path = abs_path.clone();
                 let load_project_root = project_root.clone();
-                let load_task = cx.spawn(async move |this, cx| {
-                    let set_loading = |message: &'static str| {
-                        let message = SharedString::from(message);
-                        move |this: &mut FigItem, cx: &mut Context<FigItem>| {
-                            this.document = FigDocumentState::Loading { message };
-                            cx.notify();
-                        }
-                    };
-                    if let Err(error) = this.update(cx, set_loading("Reading document...")) {
-                        log::debug!("dropping load update for closed .fig item: {error:#}");
-                        return;
-                    }
-
-                    let document = cx
-                        .background_spawn(async move {
-                            match load_project_root {
-                                Some(root) => load_project_document(&root),
-                                None => load_fig_document(&load_path),
+                let load_task = cx.spawn({
+                    let project = project.downgrade();
+                    async move |this, cx| {
+                        let set_loading = |message: &'static str| {
+                            let message = SharedString::from(message);
+                            move |this: &mut FigItem, cx: &mut Context<FigItem>| {
+                                this.document = FigDocumentState::Loading { message };
+                                cx.notify();
                             }
-                        })
-                        .await;
+                        };
+                        if let Err(error) = this.update(cx, set_loading("Reading document...")) {
+                            log::debug!("dropping load update for closed .fig item: {error:#}");
+                            return;
+                        }
 
-                    if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
-                        this.document = FigDocumentState::from_result(document);
-                        cx.emit(FigItemEvent::StateChanged);
-                        cx.notify();
-                    }) {
-                        log::debug!("dropping loaded update for closed .fig item: {error:#}");
+                        let load_result = cx
+                            .background_spawn(async move {
+                                match load_project_root {
+                                    Some(root) => {
+                                        load_project_document(&root).map(|document| (document, None))
+                                    }
+                                    // First open of a bare `.fig`: parse it AND
+                                    // materialize the project directory right
+                                    // away, so the editor is project-backed and
+                                    // editable from the first frame instead of
+                                    // leaving a folder to appear only on the
+                                    // first save. A failed materialization
+                                    // degrades to the old in-memory mode — the
+                                    // parse is still shown and the first save
+                                    // retries the write.
+                                    None => load_fig_document(&load_path).map(|document| {
+                                        let target = available_project_dir(&load_path);
+                                        if fanta_format::is_project_dir(&target) {
+                                            // Appeared since the redirect check
+                                            // in `try_open`; never overwrite it.
+                                            return (document, None);
+                                        }
+                                        let created_here = !target.exists();
+                                        match write_project(
+                                            &target,
+                                            &document.doc,
+                                            &document.raw_assets,
+                                        ) {
+                                            Ok(()) => (document, Some(target)),
+                                            Err(error) => {
+                                                log::error!(
+                                                    "materializing Fanta project at {} on open failed: {error:#}",
+                                                    target.display()
+                                                );
+                                                // A half-written dir is already
+                                                // tagged as a project (the
+                                                // manifest is scaffolded first),
+                                                // so leaving it would hijack
+                                                // every reopen AND block the
+                                                // save that could repair it.
+                                                // Remove what we created; the
+                                                // first save re-materializes.
+                                                if created_here
+                                                    && let Err(error) =
+                                                        std::fs::remove_dir_all(&target)
+                                                {
+                                                    log::error!(
+                                                        "cleaning up partial Fanta project at {} failed: {error:#}",
+                                                        target.display()
+                                                    );
+                                                }
+                                                (document, None)
+                                            }
+                                        }
+                                    }),
+                                }
+                            })
+                            .await;
+
+                        let adopted_root = load_result
+                            .as_ref()
+                            .ok()
+                            .and_then(|(_, root)| root.clone());
+                        let document = load_result.map(|(document, _)| document);
+                        if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
+                            if this.sync_epoch != 0 {
+                                // An external change already reloaded a newer
+                                // document while this initial load ran (the
+                                // project root was known from open, so the
+                                // watcher was live); installing this older
+                                // snapshot would regress it and poison
+                                // merge_base for the next save.
+                                return;
+                            }
+                            if let Some(root) = adopted_root.clone() {
+                                // The write above echoes back through the
+                                // worktree watcher once the folder is adopted;
+                                // suppress it exactly like a save's self-write.
+                                this.suppress_watcher_until =
+                                    Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+                                this.project_root = Some(root.clone());
+                                // The project directory now exists; share this
+                                // item so later scoped opens reuse it.
+                                let key = root.canonicalize().unwrap_or(root);
+                                register_shared_project_item(key, &cx.entity(), cx);
+                            }
+                            this.document = FigDocumentState::from_result(document);
+                            if let Some(scope) = this.pending_scope.take()
+                                && let FigDocumentState::Ready(document) = &mut this.document
+                            {
+                                apply_scope(document, scope);
+                                this.last_scope = Some(scope);
+                                cx.emit(FigItemEvent::ScopeApplied(scope, ScopeRequester::Load));
+                            }
+                            this.merge_base =
+                                this.document.ready().map(|document| document.doc.clone());
+                            cx.emit(FigItemEvent::StateChanged);
+                            cx.notify();
+                        }) {
+                            log::debug!("dropping loaded update for closed .fig item: {error:#}");
+                            return;
+                        }
+
+                        // Surface the freshly materialized project as a visible
+                        // worktree so its `fanta.json` / `.fnx` / asset files
+                        // show in the project panel — the editor is now
+                        // launched "from the folder". Never fails the open.
+                        if let Some(root) = adopted_root
+                            && let Some(project) = project.upgrade()
+                        {
+                            let worktree = project.update(cx, |project, cx| {
+                                project.find_or_create_worktree(root.clone(), true, cx)
+                            });
+                            if let Err(error) = worktree.await {
+                                log::error!(
+                                    "adding materialized Fanta project {} to the workspace failed: {error:#}",
+                                    root.display()
+                                );
+                            }
+                        }
                     }
                 });
 
-                let project_subscription =
-                    cx.subscribe(&project, |this: &mut Self, project, event, cx| {
-                        if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event
-                        {
-                            this.worktree_entries_updated(&project, *worktree_id, changes, cx);
-                        }
-                    });
+                let project_subscription = Self::project_subscription(&project, cx);
 
                 Self {
                     path,
@@ -562,10 +849,26 @@ impl project::ProjectItem for FigItem {
                     source_edit_locked: false,
                     source_edit_pipeline_in_progress: false,
                     suppress_watcher_until: None,
+                    merge_base: None,
+                    pending_scope: initial_scope,
+                    last_scope: None,
+                    sync_epoch: 0,
                     reload_task: None,
                     _load_task: Some(load_task),
-                    _project_subscription: project_subscription,
+                    project_subscriptions: vec![(project.downgrade(), project_subscription)],
                 }
+            });
+            if let Some(key) = registry_key {
+                cx.update(|cx| register_shared_project_item(key, &item, cx));
+            }
+            cx.update(|cx| {
+                set_pending_view_descriptor(
+                    FigViewDescriptor {
+                        entry_id,
+                        scope: initial_scope,
+                    },
+                    cx,
+                )
             });
             Ok(item)
         }))
@@ -663,6 +966,33 @@ impl FigItem {
         }
     }
 
+    fn project_subscription(project: &Entity<Project>, cx: &mut Context<Self>) -> Subscription {
+        cx.subscribe(project, |this: &mut Self, project, event, cx| {
+            if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event {
+                this.worktree_entries_updated(&project, *worktree_id, changes, cx);
+            }
+        })
+    }
+
+    /// Watch `project`'s worktree events for external edits to the project
+    /// tree. Idempotent per project entity; called for every window that
+    /// opens this shared item, so external-edit detection outlives any single
+    /// window's `Project`.
+    pub(crate) fn subscribe_to_project(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        self.project_subscriptions
+            .retain(|(project, _)| project.upgrade().is_some());
+        if self
+            .project_subscriptions
+            .iter()
+            .any(|(existing, _)| existing.entity_id() == project.entity_id())
+        {
+            return;
+        }
+        let subscription = Self::project_subscription(project, cx);
+        self.project_subscriptions
+            .push((project.downgrade(), subscription));
+    }
+
     /// React to worktree file events, refreshing the canvas when something
     /// else (typically the AI agent editing `.fnx` sources as text) changes
     /// the project on disk. Only works while the project directory lives
@@ -697,11 +1027,194 @@ impl FigItem {
         if !relevant {
             return;
         }
-        if self.dirty || self.source_edit_locked {
-            // Unsaved canvas edits win over disk; surface the divergence as
-            // a conflict instead of clobbering them. A dirty FNX buffer owns
-            // its live preview just as strongly as an operation-authored edit.
+        if self.source_edit_locked {
+            // A dirty FNX buffer owns its live preview; merging under it
+            // would race the text the user is still editing.
             self.set_conflict(true, cx);
+        } else if self.dirty {
+            // Unsaved canvas edits + external file edits: try a three-way
+            // merge against the last agreed state instead of forcing the
+            // binary Overwrite/Discard choice.
+            self.schedule_merge(cx);
+        } else {
+            self.schedule_reload(cx);
+        }
+    }
+
+    /// Debounce an external disk change that landed while the canvas has
+    /// unsaved edits, then three-way merge disk against the canvas. A clean
+    /// merge is adopted silently (the canvas stays dirty — its half is not
+    /// on disk yet); any real conflict falls back to the conflict banner.
+    fn schedule_merge(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root.clone() else {
+            self.set_conflict(true, cx);
+            return;
+        };
+        let Some(base) = self.merge_base.clone() else {
+            self.set_conflict(true, cx);
+            return;
+        };
+        let epoch = self.sync_epoch;
+        self.reload_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RELOAD_DEBOUNCE).await;
+            let loaded = cx
+                .background_spawn({
+                    let root = root.clone();
+                    async move { load_project_document(&root) }
+                })
+                .await;
+            let theirs = match loaded {
+                Ok(theirs) => theirs,
+                Err(error) => {
+                    log::error!(
+                        "loading external changes for merge from {} failed: {error:#}",
+                        root.display()
+                    );
+                    // Possibly a half-written batch; the next watcher event
+                    // retries. Keep the canvas and flag the divergence.
+                    if let Err(error) = this.update(cx, |this, cx| {
+                        if this.sync_epoch == epoch {
+                            this.set_conflict(true, cx);
+                        }
+                    }) {
+                        log::debug!("dropping merge for closed Fanta project item: {error:#}");
+                    }
+                    return;
+                }
+            };
+            let ours = this.read_with(cx, |this, _| {
+                this.document
+                    .ready()
+                    .map(|document| (document.doc.clone(), document.render_generation()))
+            });
+            let Ok(Some((ours, ours_generation))) = ours else {
+                return;
+            };
+            let merge = cx
+                .background_spawn({
+                    let theirs_doc = theirs.doc.clone();
+                    async move { fanta_format::merge_docs(&base, &ours, &theirs_doc) }
+                })
+                .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.sync_epoch != epoch {
+                    // A save/adoption/reload advanced the authoritative state
+                    // while this task held a pre-advance disk snapshot;
+                    // adopting it now would revert that newer state. The
+                    // watcher event that scheduled this task is spent, so
+                    // re-check disk under the new epoch instead of silently
+                    // diverging.
+                    this.schedule_resync(cx);
+                    return;
+                }
+                if this.source_edit_locked {
+                    this.set_conflict(true, cx);
+                    return;
+                }
+                if !this.dirty {
+                    // The canvas edits were saved or discarded mid-merge;
+                    // plain reload semantics apply.
+                    this.apply_reloaded_document(theirs, cx);
+                    return;
+                }
+                if this
+                    .document
+                    .ready()
+                    .is_none_or(|document| document.render_generation() != ours_generation)
+                {
+                    // The user kept editing while the merge computed; the
+                    // `ours` snapshot is stale and adopting its merge would
+                    // silently drop those newer edits. Merge again from the
+                    // current state.
+                    this.schedule_merge(cx);
+                    return;
+                }
+                match merge {
+                    Ok(merge) if merge.is_clean() => {
+                        this.adopt_merged_document(merge.doc, theirs, cx);
+                    }
+                    Ok(merge) => {
+                        log::info!(
+                            "external changes conflict with unsaved canvas edits at: {}",
+                            merge.conflicts.join(", ")
+                        );
+                        this.set_conflict(true, cx);
+                    }
+                    Err(error) => {
+                        log::warn!("merging external changes failed: {error:#}");
+                        this.set_conflict(true, cx);
+                    }
+                }
+            }) {
+                log::debug!("dropping merge for closed Fanta project item: {error:#}");
+            }
+        }));
+    }
+
+    /// Swap in a cleanly merged document: the union of the canvas's unsaved
+    /// edits and the external file edits. The canvas stays dirty (its half
+    /// of the merge is not on disk yet) and the merge base advances to the
+    /// disk state so the next external change merges against the right
+    /// ancestor.
+    fn adopt_merged_document(
+        &mut self,
+        merged: Doc,
+        disk: FigDocument,
+        cx: &mut Context<Self>,
+    ) {
+        let mut raw_assets: BTreeMap<AssetId, Vec<u8>> = (*disk.raw_assets).clone();
+        if let Some(current) = self.document.ready() {
+            for (id, bytes) in current.raw_assets.iter() {
+                raw_assets.entry(*id).or_insert_with(|| bytes.clone());
+            }
+        }
+        let active_page = merged.active_page();
+        let mut document = FigDocument::from_doc(merged, raw_assets);
+        if let Some(root) = active_page
+            && !document.restore_active_root(root)
+        {
+            // The external edit deleted the page/master the user was viewing;
+            // a dangling active root would swallow new shapes (tools parent
+            // into it) and blank the scoped render. Fall back like a page
+            // deletion does.
+            let fallback = document
+                .pages
+                .get(document.default_page_index)
+                .and_then(|page| page.root);
+            document.doc.set_active_page(fallback);
+        }
+        // The merge keeps the local selection verbatim; drop entries whose
+        // nodes the external edit deleted so inspectors and alignment ops
+        // never operate on dead ids.
+        let surviving: Vec<_> = document
+            .doc
+            .selection
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|node| document.doc.scene.get(*node).is_some())
+            .collect();
+        document.doc.selection.replace_with(surviving);
+        document.continue_generation_after(
+            self.document.ready().map(|current| current.render_generation()),
+        );
+        self.document = FigDocumentState::Ready(document);
+        self.merge_base = Some(disk.doc);
+        self.sync_epoch += 1;
+        self.set_conflict(false, cx);
+        cx.emit(FigItemEvent::StateChanged);
+        cx.notify();
+    }
+
+    /// Re-dispatch after a stale task aborted on the epoch guard: the watcher
+    /// event that scheduled it is spent, so disk must be re-checked under the
+    /// new epoch or an external edit that raced a save would silently
+    /// diverge from the canvas (and be overwritten by the next save).
+    fn schedule_resync(&mut self, cx: &mut Context<Self>) {
+        if self.source_edit_locked {
+            self.set_conflict(true, cx);
+        } else if self.dirty {
+            self.schedule_merge(cx);
         } else {
             self.schedule_reload(cx);
         }
@@ -715,12 +1228,22 @@ impl FigItem {
         let Some(root) = self.project_root.clone() else {
             return;
         };
+        let epoch = self.sync_epoch;
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DEBOUNCE).await;
             let loaded = cx
                 .background_spawn(async move { load_project_document(&root) })
                 .await;
             if let Err(error) = this.update(cx, |this, cx| {
+                if this.sync_epoch != epoch {
+                    // A save/adoption advanced the authoritative state while
+                    // this reload held an older disk snapshot; applying it
+                    // would revert the newer state. Re-check disk under the
+                    // new epoch — the watcher event this task consumed will
+                    // not fire again.
+                    this.schedule_resync(cx);
+                    return;
+                }
                 if this.dirty || this.source_edit_locked {
                     // Canvas or FNX edits landed while the reload was in
                     // flight; keep them and flag the divergence.
@@ -758,19 +1281,17 @@ impl FigItem {
             .document
             .ready()
             .and_then(|current| current.doc.active_page());
-        if let Some(root) = previous_page_root
-            && let Some(index) = document
-                .pages
-                .iter()
-                .position(|page| page.root == Some(root))
-        {
-            document.ensure_page_solved(index);
-            document.doc.set_active_page(Some(root));
-            document.default_page_index = index;
+        if let Some(root) = previous_page_root {
+            document.restore_active_root(root);
         }
+        document.continue_generation_after(
+            self.document.ready().map(|current| current.render_generation()),
+        );
+        self.merge_base = Some(document.doc.clone());
         self.document = FigDocumentState::Ready(document);
         self.dirty = false;
         self.preview_dirty_before = None;
+        self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
         cx.notify();
@@ -796,15 +1317,8 @@ impl FigItem {
             .map(|current| current.doc.viewport)
             .unwrap_or_default();
         let mut document = FigDocument::from_doc(source_edit.document, source_edit.assets);
-        if let Some(root) = previous_page_root
-            && let Some(index) = document
-                .pages
-                .iter()
-                .position(|page| page.root == Some(root))
-        {
-            document.ensure_page_solved(index);
-            document.doc.set_active_page(Some(root));
-            document.default_page_index = index;
+        if let Some(root) = previous_page_root {
+            document.restore_active_root(root);
         }
         let preserved_selection: Vec<_> = previous_selection
             .into_iter()
@@ -812,6 +1326,9 @@ impl FigItem {
             .collect();
         document.doc.selection.replace_with(preserved_selection);
         document.doc.viewport = previous_viewport;
+        document.continue_generation_after(
+            self.document.ready().map(|current| current.render_generation()),
+        );
         self.document = FigDocumentState::Ready(document);
         self.dirty = false;
         self.preview_dirty_before = None;
@@ -826,7 +1343,18 @@ impl FigItem {
         cx: &mut Context<Self>,
     ) {
         self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+        // A pending merge/reload holds a disk snapshot from before this save;
+        // cancel it — the adoption below is the newer authoritative state.
+        self.reload_task = None;
         self.adopt_source_edit(source_edit, cx);
+        // The persisted source edit is now the on-disk state; advance the
+        // merge ancestor with it — from the ADOPTED (normalized) document,
+        // not the reader-raw one, so a later merge doesn't see phantom
+        // base-vs-ours differences on solver-derived geometry. (The
+        // unsaved-preview adopt path must NOT advance the ancestor — the
+        // disk still holds the older tree there.)
+        self.merge_base = self.document.ready().map(|document| document.doc.clone());
+        self.sync_epoch += 1;
     }
 
     /// Reload the project from disk immediately, discarding unsaved canvas
@@ -853,26 +1381,83 @@ impl FigItem {
             return Task::ready(Ok(()));
         };
         self.reload_task = None;
+        let epoch = self.sync_epoch;
         cx.spawn(async move |this, cx| {
             let document = cx
                 .background_spawn(async move { load_project_document(&root) })
                 .await?;
-            this.update(cx, |this, cx| this.apply_reloaded_document(document, cx))?;
+            this.update(cx, |this, cx| {
+                // A save/adoption superseded this discard while its snapshot
+                // loaded; applying the older snapshot would revert (and on
+                // the next save destroy) the newer state.
+                if this.sync_epoch == epoch {
+                    this.apply_reloaded_document(document, cx);
+                }
+            })?;
             Ok(())
         })
     }
 
     /// The display name of the document: the project directory name once a
-    /// Fanta project exists, the `.fig` file name before that.
+    /// Fanta project exists, the `.fig` file name before that. One shared
+    /// item backs every open of the project, so the tab names the project —
+    /// scoped opens navigate this same editor rather than adding tabs.
     pub fn title(&self) -> SharedString {
-        let name = self
+        let project = self
             .project_root
             .as_deref()
             .and_then(Path::file_name)
             .or_else(|| self.abs_path.file_name())
             .and_then(|name| name.to_str())
             .unwrap_or("Figma");
-        name.to_string().into()
+        project.to_string().into()
+    }
+
+    /// Re-target the shared document onto `scope` — the effect of clicking a
+    /// `page.fnx` / `master.fnx` / `doc/variables.json` while the project is
+    /// already open, or of a tab re-asserting its scope on focus. Applies
+    /// immediately on a ready document (the `requester` follows via
+    /// [`FigItemEvent::ScopeApplied`]); queues until the load lands otherwise
+    /// (the load-time apply emits [`ScopeRequester::Load`]).
+    pub(crate) fn request_scope(
+        &mut self,
+        scope: FigScope,
+        requester: ScopeRequester,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.document {
+            FigDocumentState::Ready(document) => {
+                // Focused tabs re-assert their scope on every tab switch; when
+                // the document already shows this scope's root there is
+                // nothing to re-target, and emitting `ScopeApplied` anyway
+                // would make the requesting view reset its viewport for no
+                // actual change.
+                if scope_target_root(document, scope)
+                    .is_none_or(|root| document.doc.active_page() == Some(root))
+                {
+                    self.last_scope = Some(scope);
+                    return;
+                }
+                apply_scope(document, scope);
+                self.last_scope = Some(scope);
+                cx.emit(FigItemEvent::ScopeApplied(scope, requester));
+                // The active-page change is presence state; this nudges the
+                // code workspace and panels to re-bind their sources.
+                cx.emit(FigItemEvent::SelectionChanged);
+                cx.notify();
+            }
+            _ => self.pending_scope = Some(scope),
+        }
+    }
+
+    /// The most recently applied open scope, if any.
+    pub(crate) fn last_scope(&self) -> Option<FigScope> {
+        self.last_scope
+    }
+
+    /// Whether a variables-space scope is queued behind the initial load.
+    pub(crate) fn pending_variables_scope(&self) -> bool {
+        self.pending_scope == Some(FigScope::Variables)
     }
 
     /// Apply an undoable operation to the document, re-solve the affected
@@ -1078,7 +1663,13 @@ impl FigItem {
         // adopted as a worktree, so its initial scan does not bounce back as a
         // reload.
         self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+        // A pending merge/reload holds a disk snapshot from before this save;
+        // cancel it so it can't adopt that stale snapshot after the write
+        // lands (silently reverting — and on the next save destroying — the
+        // content saved here).
+        self.reload_task = None;
         cx.spawn(async move |this, cx| {
+            let saved_doc = doc.clone();
             let result = cx
                 .background_spawn({
                     let target = target.clone();
@@ -1091,8 +1682,12 @@ impl FigItem {
                     if materializing {
                         this.project_root = Some(target.clone());
                     }
+                    // Disk and canvas agree again — this is the new merge
+                    // ancestor for reconciling future concurrent edits.
+                    this.merge_base = Some(saved_doc);
                     this.dirty = false;
                     this.preview_dirty_before = None;
+                    this.sync_epoch += 1;
                     this.set_conflict(false, cx);
                     cx.emit(FigItemEvent::StateChanged);
                     cx.notify();
@@ -1112,31 +1707,31 @@ pub(crate) fn ready_item_for_test(
 ) -> Entity<FigItem> {
     use util::rel_path::RelPath;
 
-    cx.new(|cx| {
-        let subscription = cx.subscribe(
-            project,
-            |_: &mut FigItem, _: Entity<Project>, _: &project::Event, _| {},
-        );
-        FigItem {
-            path: ProjectPath {
-                worktree_id: WorktreeId::from_usize(0),
-                path: RelPath::empty_arc(),
-            },
-            abs_path,
-            entry_id: None,
-            document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
-            project_root: None,
-            dirty: false,
-            preview_dirty_before: None,
-            conflict: false,
-            source_edit_locked: false,
-            source_edit_pipeline_in_progress: false,
-            suppress_watcher_until: None,
-            reload_task: None,
-            _load_task: None,
-            _project_subscription: subscription,
-        }
-    })
+    let item = cx.new(|_| FigItem {
+        path: ProjectPath {
+            worktree_id: WorktreeId::from_usize(0),
+            path: RelPath::empty_arc(),
+        },
+        abs_path,
+        entry_id: None,
+        document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
+        project_root: None,
+        dirty: false,
+        preview_dirty_before: None,
+        conflict: false,
+        source_edit_locked: false,
+        source_edit_pipeline_in_progress: false,
+        suppress_watcher_until: None,
+        merge_base: None,
+        pending_scope: None,
+        last_scope: None,
+        sync_epoch: 0,
+        reload_task: None,
+        _load_task: None,
+        project_subscriptions: Vec::new(),
+    });
+    item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
+    item
 }
 
 /// How a scoped document mutation affects persistence.
@@ -1214,6 +1809,102 @@ fn path_has_fig_extension(path: &Path) -> bool {
 fn is_fanta_manifest(path: &Path) -> bool {
     path.file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("fanta.json"))
+}
+
+/// What a scoped open focuses the editor on. Carried from [`FigItem::try_open`]
+/// (when the opened path is a project source file) into the loaded document
+/// and the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FigScope {
+    /// `pages/<id>/page.fnx` — the canvas scoped to that page.
+    Page(NodeId),
+    /// `components/<id>/master.fnx` — the canvas scoped to that component's
+    /// master subtree alone: atomic component editing, every instance follows.
+    Component(fanta_doc::ComponentId),
+    /// `doc/variables.json` — the variables space.
+    Variables,
+}
+
+/// Parse a scoped-open path inside a materialized Fanta project:
+/// `<root>/pages/<slug>/page.fnx`, `<root>/components/<slug>/master.fnx`
+/// (identity resolved from the design's JSON header — dir names are v3 slugs,
+/// with the v2 id-named fallback handled by `fanta_format`), or
+/// `<root>/doc/variables.json`. Returns the project root and the scope, or
+/// `None` (including when the candidate root is not a tagged project dir, so
+/// look-alike paths outside a project keep opening as plain text).
+fn scoped_project_source(path: &Path) -> Option<(PathBuf, FigScope)> {
+    if let Some((root, design)) = fanta_format::page_scope_of_source(path) {
+        if !fanta_format::is_project_dir(&root) {
+            return None;
+        }
+        let scope = match design {
+            fanta_format::ScopedDesign::Page(page) => FigScope::Page(page),
+            fanta_format::ScopedDesign::Component(component) => FigScope::Component(component),
+        };
+        return Some((root, scope));
+    }
+    let doc_directory = path.parent()?;
+    if path.file_name()? == "variables.json" && doc_directory.file_name()? == "doc" {
+        let root = doc_directory.parent()?;
+        return fanta_format::is_project_dir(root).then(|| (root.to_path_buf(), FigScope::Variables));
+    }
+    None
+}
+
+/// The root node [`apply_scope`] would activate for `scope`, when that target
+/// still exists in the document. `None` for the variables space (it never
+/// re-roots the canvas) and for targets that are gone.
+fn scope_target_root(document: &FigDocument, scope: FigScope) -> Option<NodeId> {
+    match scope {
+        FigScope::Page(root) => document
+            .pages
+            .iter()
+            .find_map(|page| (page.root == Some(root)).then_some(root)),
+        FigScope::Component(component) => document
+            .doc
+            .components
+            .defs
+            .get(&component)
+            .map(|def| def.root)
+            .filter(|root| document.doc.scene.get(*root).is_some()),
+        FigScope::Variables => None,
+    }
+}
+
+/// Focus a freshly loaded document on its open scope: activate the page, or
+/// activate the component master's root (the canvas renders, hit-tests, and
+/// parents into that subtree alone). A scope whose target no longer exists is
+/// ignored — the document opens on its default page instead of failing.
+fn apply_scope(document: &mut FigDocument, scope: FigScope) {
+    match scope {
+        FigScope::Page(root) => {
+            if let Some(index) = document
+                .pages
+                .iter()
+                .position(|page| page.root == Some(root))
+            {
+                document.ensure_page_solved(index);
+                document.doc.set_active_page(Some(root));
+                document.default_page_index = index;
+            }
+        }
+        FigScope::Component(component) => {
+            if let Some(root) = document
+                .doc
+                .components
+                .defs
+                .get(&component)
+                .map(|def| def.root)
+                .filter(|root| document.doc.scene.get(*root).is_some())
+            {
+                document.ensure_root_solved(root);
+                document.doc.set_active_page(Some(root));
+            }
+        }
+        // The variables space is a view concern (the Variables workspace);
+        // the document itself opens unscoped.
+        FigScope::Variables => {}
+    }
 }
 
 fn load_fig_document(path: &Path) -> Result<FigDocument> {
@@ -1440,6 +2131,117 @@ pub(crate) fn fit_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A doc with one page and one component master (an ordinary group
+    /// promoted via DefineComponent), for scope tests.
+    fn doc_with_page_and_component() -> (Doc, NodeId, fanta_doc::ComponentId, NodeId) {
+        use fanta_doc::{CanvasNode, ComponentDef, ComponentId, GroupNode, NodeData};
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let page_root = page.id;
+        doc.apply(Operation::create_node(page)).expect("create page");
+        doc.add_page(page_root);
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.name = "Button".to_owned();
+        let master_root = master.id;
+        doc.apply(Operation::create_node(master))
+            .expect("create master");
+        let component = ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(ComponentDef {
+                id: component,
+                root: master_root,
+                name: "Button".into(),
+                variant_of: None,
+                props: Vec::new(),
+                rev: 0,
+            }),
+        })
+        .expect("define component");
+        (doc, page_root, component, master_root)
+    }
+
+    #[test]
+    fn scoped_project_source_parses_only_project_backed_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        fanta_format::scaffold_project_tree(root).expect("scaffold");
+
+        let page = NodeId::new();
+        let page_path = root
+            .join("pages")
+            .join(page.to_string())
+            .join("page.fnx");
+        assert_eq!(
+            scoped_project_source(&page_path),
+            Some((root.to_path_buf(), FigScope::Page(page)))
+        );
+
+        let component = fanta_doc::ComponentId::new();
+        let master_path = root
+            .join("components")
+            .join(component.to_string())
+            .join("master.fnx");
+        assert_eq!(
+            scoped_project_source(&master_path),
+            Some((root.to_path_buf(), FigScope::Component(component)))
+        );
+
+        assert_eq!(
+            scoped_project_source(&root.join("doc").join("variables.json")),
+            Some((root.to_path_buf(), FigScope::Variables))
+        );
+
+        // Wrong file names, malformed ids, and look-alike paths outside a
+        // tagged project all decline (falling through to the text editor).
+        assert_eq!(scoped_project_source(&root.join("doc").join("motion.json")), None);
+        assert_eq!(
+            scoped_project_source(&root.join("pages").join("not-an-id").join("page.fnx")),
+            None
+        );
+        let outside = dir.path().join("not-a-project");
+        std::fs::create_dir_all(outside.join("pages").join(page.to_string())).expect("mkdir");
+        assert_eq!(
+            scoped_project_source(
+                &outside.join("pages").join(page.to_string()).join("page.fnx")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn component_scope_activates_the_master_root() {
+        let (doc, page_root, component, master_root) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        // The default open lands on the page.
+        assert_eq!(document.doc.active_page(), Some(page_root));
+
+        apply_scope(&mut document, FigScope::Component(component));
+        assert_eq!(document.doc.active_page(), Some(master_root));
+
+        // Restoring after a reload/merge swap keeps the component scope.
+        let (doc2, _, _, _) = {
+            let (d, p, c, m) = doc_with_page_and_component();
+            (d, p, c, m)
+        };
+        drop(doc2);
+        assert!(document.restore_active_root(master_root));
+        assert_eq!(document.doc.active_page(), Some(master_root));
+    }
+
+    #[test]
+    fn page_scope_activates_that_page() {
+        let (doc, page_root, _, _) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        document.doc.set_active_page(None);
+        apply_scope(&mut document, FigScope::Page(page_root));
+        assert_eq!(document.doc.active_page(), Some(page_root));
+
+        // A vanished page is ignored — the document keeps its default view.
+        apply_scope(&mut document, FigScope::Page(NodeId::new()));
+        assert_eq!(document.doc.active_page(), Some(page_root));
+    }
 
     #[test]
     fn fit_bounds_centers_and_fits_the_larger_axis() {
@@ -1668,31 +2470,31 @@ mod tests {
         doc: Doc,
         cx: &mut TestAppContext,
     ) -> Entity<FigItem> {
-        cx.new(|cx| {
-            let subscription = cx.subscribe(
-                project,
-                |_: &mut FigItem, _: Entity<Project>, _: &project::Event, _| {},
-            );
-            FigItem {
-                path: ProjectPath {
-                    worktree_id: WorktreeId::from_usize(0),
-                    path: RelPath::empty_arc(),
-                },
-                abs_path,
-                entry_id: None,
-                document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
-                project_root,
-                dirty: false,
-                preview_dirty_before: None,
-                conflict: false,
-                source_edit_locked: false,
-                source_edit_pipeline_in_progress: false,
-                suppress_watcher_until: None,
-                reload_task: None,
-                _load_task: None,
-                _project_subscription: subscription,
-            }
-        })
+        let item = cx.new(|_| FigItem {
+            path: ProjectPath {
+                worktree_id: WorktreeId::from_usize(0),
+                path: RelPath::empty_arc(),
+            },
+            abs_path,
+            entry_id: None,
+            document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
+            project_root,
+            dirty: false,
+            preview_dirty_before: None,
+            conflict: false,
+            source_edit_locked: false,
+            source_edit_pipeline_in_progress: false,
+            suppress_watcher_until: None,
+            merge_base: None,
+            pending_scope: None,
+            last_scope: None,
+            sync_epoch: 0,
+            reload_task: None,
+            _load_task: None,
+            project_subscriptions: Vec::new(),
+        });
+        item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
+        item
     }
 
     #[gpui::test]
@@ -1981,6 +2783,121 @@ mod tests {
             item.with_document(cx, |_| ((), DocChange::ContentPreview));
             item.finish_content_preview(false, cx);
             assert!(item.dirty);
+        });
+    }
+
+    /// A second window opens the same project directory through its OWN
+    /// `Project` entity and reuses the shared item. The item must watch that
+    /// project's worktree events too — otherwise external-edit detection
+    /// (reload/merge/conflict) dies with the first window's project, and the
+    /// next save clobbers newer disk state.
+    #[gpui::test]
+    async fn a_second_windows_open_watches_its_project_for_external_edits(
+        cx: &mut TestAppContext,
+    ) {
+        use project::ProjectItem as _;
+
+        async fn open_via_new_project(
+            root: &Path,
+            cx: &mut TestAppContext,
+        ) -> (Entity<Project>, Entity<FigItem>) {
+            let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
+            let project = Project::test(file_system, [root], cx).await;
+            let worktree_id = project.update(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("project worktree")
+                    .read(cx)
+                    .id()
+            });
+            let path = ProjectPath {
+                worktree_id,
+                path: util::rel_path::rel_path("fanta.json").into(),
+            };
+            let item = cx
+                .update(|cx| FigItem::try_open(&project, &path, cx))
+                .expect("fanta.json opens as a FigItem")
+                .await
+                .expect("open FigItem");
+            cx.run_until_parked();
+            (project, item)
+        }
+
+        init_test(cx);
+        cx.executor().allow_parking();
+        let temporary = tempfile::tempdir().expect("temporary project");
+        write_project(temporary.path(), &doc_with_one_page(), &BTreeMap::new())
+            .expect("write project tree");
+
+        let (first_project, first_item) = open_via_new_project(temporary.path(), cx).await;
+        let (second_project, second_item) = open_via_new_project(temporary.path(), cx).await;
+        assert_eq!(
+            second_item.entity_id(),
+            first_item.entity_id(),
+            "the second window shares the project's one item"
+        );
+        second_item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.project_subscriptions.len(),
+                2,
+                "the shared item watches both windows' projects"
+            );
+        });
+
+        // Reopening through an already-watched project adds no duplicate.
+        let worktree_id = second_project.update(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("project worktree")
+                .read(cx)
+                .id()
+        });
+        let reopened = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &second_project,
+                    &ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .expect("fanta.json opens as a FigItem")
+            .await
+            .expect("reopen FigItem");
+        cx.run_until_parked();
+        assert_eq!(reopened.entity_id(), first_item.entity_id());
+        second_item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.project_subscriptions.len(),
+                2,
+                "reopening dedupes per project entity"
+            );
+        });
+
+        // The first window closes (its project drops); an external edit
+        // reported by the SECOND project must still reach the item —
+        // observable as the conflict flag while an FNX buffer is locked.
+        drop(first_project);
+        second_item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        let changes: UpdatedEntriesSet = vec![(
+            util::rel_path::rel_path("pages/some-page/page.fnx").into(),
+            ProjectEntryId::from_proto(1),
+            PathChange::Updated,
+        )]
+        .into();
+        second_project.update(cx, |_, cx| {
+            cx.emit(project::Event::WorktreeUpdatedEntries(worktree_id, changes));
+        });
+        cx.run_until_parked();
+        second_item.read_with(cx, |item, _| {
+            assert!(
+                item.has_conflict(),
+                "the second project's worktree events must reach the shared item"
+            );
         });
     }
 }

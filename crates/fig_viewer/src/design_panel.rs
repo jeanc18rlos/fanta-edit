@@ -1232,9 +1232,16 @@ impl FantaDesignPanel {
         };
         self.document_ready = true;
         let doc = &document.doc;
-        let page_root = document
-            .page(view.selected_page_index())
-            .and_then(|page| page.root);
+        // Follow the same root the canvas renders and hit-tests: the ACTIVE
+        // page first (which may be a component master root in a
+        // component-scoped view), selected-page fallback. Deriving these
+        // differently made the panel list a page the scoped canvas never
+        // paints, so clicking a layer selected/edited an invisible node.
+        let page_root = doc.active_page().or_else(|| {
+            document
+                .page(view.selected_page_index())
+                .and_then(|page| page.root)
+        });
 
         self.current_page_index = document.page_index(view.selected_page_index());
         // Read each real page's name live from its scene node so an inline
@@ -2827,7 +2834,7 @@ impl Render for FantaDesignPanel {
             }))
             .size_full()
             .overflow_hidden()
-            .bg(cx.theme().colors().panel_background)
+            .bg(cx.theme().colors().editor_background)
             .on_drag_move(cx.listener(Self::handle_divider_drag))
             .child(body)
     }

@@ -43,7 +43,7 @@ use workspace::{Panel, Workspace};
 
 pub use code_workspace::{CodeWorkspaceFile, FantaCodeWorkspace};
 pub use design_panel::FantaDesignPanel;
-pub use document::{DocChange, FigDocument, FigItem, FigItemEvent, FigPage};
+pub use document::{DocChange, FigDocument, FigItem, FigItemEvent, FigPage, ScopeRequester};
 pub use editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorSessionEvent, EditorWorkspace,
     EditorWorkspaceTabs,
