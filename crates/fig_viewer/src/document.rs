@@ -27,8 +27,11 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 /// How long after our own project writes to keep ignoring watcher events:
 /// long enough to cover the file-system watcher's delivery latency, short
 /// enough that a genuinely external edit right after a save is only briefly
-/// missed (the next edit's events will still arrive).
-const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
+/// missed (the next edit's events will still arrive). Multi-megabyte project
+/// trees (a 43MB page.fnx is real) take whole seconds to write and FSEvents
+/// coalesces their notifications well past the old 1s window, which made the
+/// app's own saves look like foreign edits.
+const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(3);
 
 pub struct FigItem {
     pub(crate) path: ProjectPath,

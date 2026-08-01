@@ -688,34 +688,17 @@ impl FantaCodeWorkspace {
             .update(cx, |project, cx| project.open_local_buffer(&path, cx));
         let project = self.project.clone();
         self.fnx_load_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = match open_task.await {
-                Ok(buffer) if cfg!(test) => Ok(buffer),
-                Ok(buffer) => {
-                    let format = project.update(cx, |project, cx| {
-                        project.format(
-                            std::iter::once(buffer.clone()).collect(),
-                            LspFormatTarget::Buffers,
-                            false,
-                            FormatTrigger::Manual,
-                            cx,
-                        )
-                    });
-                    match format.await {
-                        Ok(_) if buffer.read_with(cx, |buffer, _| buffer.is_dirty()) => {
-                            match project
-                                .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
-                                .await
-                            {
-                                Ok(_) => Ok(buffer),
-                                Err(error) => Err(error.context("saving formatted FNX source")),
-                            }
-                        }
-                        Ok(_) => Ok(buffer),
-                        Err(error) => Err(error.context("formatting FNX source")),
-                    }
-                }
-                Err(error) => Err(error),
-            };
+            // The engine printer is the canonical .fnx formatter: its bytes are
+            // what the sidecar reconciler and the surgical source patcher
+            // operate on. The previous format-on-open pass (prettier via the
+            // TSX grammar) rewrote every generated file into a second
+            // canonical form, so each open and each canvas save re-rewrote
+            // the whole source and the two writers never converged — on large
+            // files that write ping-pong latched the source-edit lock before
+            // the user touched anything. Projects now also seed a
+            // .prettierignore for *.fnx.
+            let _ = project;
+            let result = open_task.await;
             if let Err(error) = this.update_in(cx, |this, window, cx| {
                 if this.fnx_path.as_ref() != Some(&path) {
                     return;
@@ -833,8 +816,14 @@ impl FantaCodeWorkspace {
     fn reconcile_saved_source(&mut self, cx: &mut Context<Self>) {
         self.validation_task = None;
         if self.item.read(cx).is_dirty() {
-            self.item
-                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            let source_dirty = self
+                .fnx_buffer
+                .as_ref()
+                .is_some_and(|buffer| buffer.read(cx).is_dirty());
+            self.item.update(cx, |item, cx| {
+                item.set_source_edit_locked(source_dirty, cx);
+                item.finish_source_edit_pipeline();
+            });
             self.validation_message = None;
             self.error_message = Some(
                 "FNX was saved outside the canvas while canvas changes were unsaved. Reload or save the canvas before reconciling the source."
@@ -844,24 +833,30 @@ impl FantaCodeWorkspace {
             return;
         }
         let Some(project_root) = self.item.read(cx).project_root().map(Path::to_path_buf) else {
-            self.item
-                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.item.update(cx, |item, cx| {
+                item.set_source_edit_locked(false, cx);
+                item.finish_source_edit_pipeline();
+            });
             self.validation_message = None;
             self.error_message = Some("The FNX project root is unavailable.".into());
             cx.notify();
             return;
         };
         let Some(source_path) = self.fnx_path.clone() else {
-            self.item
-                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.item.update(cx, |item, cx| {
+                item.set_source_edit_locked(false, cx);
+                item.finish_source_edit_pipeline();
+            });
             self.validation_message = None;
             self.error_message = Some("The saved FNX source path is unavailable.".into());
             cx.notify();
             return;
         };
         let Some(buffer) = self.fnx_buffer.clone() else {
-            self.item
-                .update(cx, |item, _| item.finish_source_edit_pipeline());
+            self.item.update(cx, |item, cx| {
+                item.set_source_edit_locked(false, cx);
+                item.finish_source_edit_pipeline();
+            });
             self.validation_message = None;
             self.error_message = Some("The saved FNX buffer is unavailable.".into());
             cx.notify();
@@ -890,6 +885,11 @@ impl FantaCodeWorkspace {
             let (source_edit, source_diagnostics) = match reconciliation {
                 Ok(source_edit) => source_edit,
                 Err(error) => {
+                    // Deliberately KEEP the lock here: the on-disk source is
+                    // invalid, so canvas edits would overwrite it with
+                    // regenerated source and silently discard the user's
+                    // text. Fixing or discarding the source in the code pane
+                    // releases it (the success arm and discard both unlock).
                     item.update(cx, |item, _| item.finish_source_edit_pipeline());
                     if let Err(update_error) = this.update(cx, |this, cx| {
                         this.validation_message = None;
@@ -928,7 +928,10 @@ impl FantaCodeWorkspace {
             }) {
                 Ok(source_is_current) => source_is_current,
                 Err(error) => {
-                    item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                    item.update(cx, |item, cx| {
+                        item.set_source_edit_locked(false, cx);
+                        item.finish_source_edit_pipeline();
+                    });
                     log::debug!(
                         "dropping saved FNX reconciliation for closed workspace: {error:#}"
                     );
@@ -936,7 +939,13 @@ impl FantaCodeWorkspace {
                 }
             };
             if !source_is_current {
-                item.update(cx, |item, _| item.finish_source_edit_pipeline());
+                let source_dirty = this
+                    .read_with(cx, |_, cx| buffer.read(cx).is_dirty())
+                    .unwrap_or(false);
+                item.update(cx, |item, cx| {
+                    item.set_source_edit_locked(source_dirty, cx);
+                    item.finish_source_edit_pipeline();
+                });
                 if let Err(error) = this.update(cx, |this, cx| {
                     if this.validation_message.as_deref() == Some("Reconciling saved FNX…") {
                         this.validation_message = None;
