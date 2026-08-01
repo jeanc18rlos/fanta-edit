@@ -471,6 +471,15 @@ pub struct FantaDesignPanel {
     gpui_pages: Option<crate::gpui_adapters::pages::PagesAdapter>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_layers: Option<crate::gpui_adapters::layers::LayersAdapter>,
+    /// Memoized node-budget verdict for the gpui layers panel, keyed on the
+    /// page root and the document render generation it was counted at (the
+    /// generation is monotonic across reloads, unlike the scene revision).
+    /// The count is a whole-subtree walk, and the check runs on every
+    /// document event (including every selection change) AND from render, so
+    /// an uncached count made each canvas click and each panel frame O(page)
+    /// on large pages. A `Cell` because render only holds `&self`.
+    #[cfg(feature = "fanta-gpui-ui")]
+    gpui_layers_budget: std::cell::Cell<Option<(NodeId, u64, bool)>>,
     components_cache: Vec<(SharedString, NodeId)>,
     components_total_count: usize,
     assets_cache: Vec<AssetEntry>,
@@ -636,6 +645,8 @@ impl FantaDesignPanel {
             gpui_pages: None,
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_layers: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_layers_budget: std::cell::Cell::new(None),
             components_cache: Vec::new(),
             components_total_count: 0,
             assets_cache: Vec::new(),
@@ -1201,6 +1212,7 @@ impl FantaDesignPanel {
     // === Layer tree flattening =============================================
 
     fn rebuild_layer_rows(&mut self, cx: &mut App) {
+        let rebuild_started = std::time::Instant::now();
         self.layer_rows.clear();
         self.pages_cache.clear();
         self.components_cache.clear();
@@ -1230,6 +1242,7 @@ impl FantaDesignPanel {
         // thumbnails needs `&mut App` and cannot run while `document` borrows it.
         self.rebuild_tree(&view, cx);
         self.rebuild_assets(&view, cx);
+        crate::report_slow("design panel layer rows", rebuild_started);
     }
 
     /// Flatten the active document's Pages, Components, and Layers into their
@@ -3929,6 +3942,10 @@ impl FantaDesignPanel {
     }
 
     /// True when the current page fits the non-virtualized panel's budget.
+    /// Memoized per (page root, render generation) — node count only changes
+    /// on content edits, which advance the generation — and the cold count
+    /// stops walking at budget + 1, so an over-budget page never pays a full
+    /// walk.
     fn gpui_layers_within_budget(&self, cx: &App) -> bool {
         let Some(root) = self.gpui_layers_page_root(cx) else {
             return false;
@@ -3941,14 +3958,29 @@ impl FantaDesignPanel {
         let Some(document) = fig_item.document() else {
             return false;
         };
-        crate::gpui_adapters::layers::subtree_len(&document.doc, root)
-            <= crate::gpui_adapters::layers::node_budget()
+        let generation = document.render_generation();
+        if let Some((cached_root, cached_generation, within)) = self.gpui_layers_budget.get()
+            && cached_root == root
+            && cached_generation == generation
+        {
+            return within;
+        }
+        let within = crate::gpui_adapters::layers::subtree_within_budget(
+            &document.doc,
+            root,
+            crate::gpui_adapters::layers::node_budget(),
+        );
+        self.gpui_layers_budget
+            .set(Some((root, generation, within)));
+        within
     }
 
     /// Echo the layer tree, selection, and expansion into the panel. Skipped
     /// (cheaply) while over budget — the native section renders then.
     fn refresh_gpui_layers(&mut self, cx: &mut App) {
+        let refresh_started = std::time::Instant::now();
         if self.gpui_layers.is_none() || !self.gpui_layers_within_budget(cx) {
+            crate::report_slow("gpui layers budget check", refresh_started);
             return;
         }
         let Some(root) = self.gpui_layers_page_root(cx) else {
@@ -3981,6 +4013,7 @@ impl FantaDesignPanel {
                 panel.set_expanded_node_ids(expanded, cx);
             });
         }
+        crate::report_slow("gpui layers refresh", refresh_started);
     }
 
     fn handle_layers_action(

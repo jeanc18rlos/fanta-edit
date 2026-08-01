@@ -69,8 +69,8 @@ fn print_selected_fields(value: &KiwiValue, depth: usize) {
     let KiwiValue::Object { fields, .. } = value else {
         return;
     };
-    let mut keys = fields.keys().collect::<Vec<_>>();
-    keys.sort();
+    let mut keys = fields.iter().map(|(key, _)| key).collect::<Vec<_>>();
+    keys.sort_unstable();
     for key in keys {
         if should_print_key(key) {
             println!(
@@ -110,7 +110,7 @@ fn format_value(value: Option<&KiwiValue>) -> String {
         KiwiValue::String(value) => format!("{value:?}"),
         KiwiValue::Int64(value) => value.to_string(),
         KiwiValue::Uint64(value) => value.to_string(),
-        KiwiValue::Enum(value) => value.clone(),
+        KiwiValue::Enum(value) => value.to_string(),
         KiwiValue::Array(values) => {
             let items = values
                 .iter()
@@ -122,17 +122,17 @@ fn format_value(value: Option<&KiwiValue>) -> String {
             format!("[{}{}] len={}", items, suffix, values.len())
         }
         KiwiValue::Object { type_name, fields } => {
-            if type_name == "GUID" {
+            if type_name.as_ref() == "GUID" {
                 return format_guid_object(value).unwrap_or_else(|| "GUID{?}".to_owned());
             }
-            if type_name == "StyleId" {
+            if type_name.as_ref() == "StyleId" {
                 return value
                     .get("guid")
                     .and_then(|guid| format_guid_object(guid))
                     .map(|guid| format!("StyleId({guid})"))
                     .unwrap_or_else(|| "StyleId{?}".to_owned());
             }
-            if type_name == "GUIDPath" {
+            if type_name.as_ref() == "GUIDPath" {
                 let guids = value
                     .get("guids")
                     .and_then(KiwiValue::as_array)
@@ -146,17 +146,17 @@ fn format_value(value: Option<&KiwiValue>) -> String {
                     .unwrap_or_default();
                 return format!("GUIDPath({guids})");
             }
-            if type_name == "Paint" {
+            if type_name.as_ref() == "Paint" {
                 return format_paint(value).unwrap_or_else(|| "Paint{?}".to_owned());
             }
-            if type_name == "TextData" {
+            if type_name.as_ref() == "TextData" {
                 let characters = value
                     .get("characters")
                     .and_then(KiwiValue::as_str)
                     .unwrap_or("");
                 return format!("TextData(characters={characters:?})");
             }
-            if type_name == "Vector" {
+            if type_name.as_ref() == "Vector" {
                 let x = value
                     .get("x")
                     .and_then(KiwiValue::as_f64)
@@ -167,7 +167,7 @@ fn format_value(value: Option<&KiwiValue>) -> String {
                     .unwrap_or_default();
                 return format!("Vector({x:.3},{y:.3})");
             }
-            if type_name == "Matrix" {
+            if type_name.as_ref() == "Matrix" {
                 let get = |field: &str, default| {
                     value
                         .get(field)
@@ -184,8 +184,8 @@ fn format_value(value: Option<&KiwiValue>) -> String {
                     get("m12", 0.0),
                 );
             }
-            let mut keys = fields.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
+            let mut keys = fields.iter().map(|(key, _)| key).collect::<Vec<_>>();
+            keys.sort_unstable();
             let keys = keys.into_iter().take(8).collect::<Vec<_>>().join(",");
             format!("{type_name}{{{keys}}}")
         }

@@ -257,6 +257,14 @@ pub struct FigView {
     space_pan: bool,
     pub(crate) container_bounds: Option<Bounds<Pixels>>,
     pub(crate) rendered_canvas: Option<RenderedCanvas>,
+    /// Memoized selection-chrome geometry (frame labels, per-node selection
+    /// bounds, text baselines), reused across paint frames while the scene
+    /// revision, page root, selection, and text-edit target are unchanged —
+    /// pans and zooms repaint every frame without touching any of them.
+    /// Interior-mutable because the canvas element collects overlays during
+    /// paint with only `&App`. Cleared with the rendered-canvas cache: a
+    /// reload restarts the scene revision counter, which could collide.
+    pub(crate) chrome_cache: std::cell::RefCell<Option<crate::canvas::ChromeCache>>,
     #[cfg(target_os = "macos")]
     gpu_renderer: Option<MacGpuRenderer>,
     pub(crate) tools: ToolShell,
@@ -483,6 +491,7 @@ impl FigView {
             space_pan: false,
             container_bounds: None,
             rendered_canvas: None,
+            chrome_cache: std::cell::RefCell::new(None),
             #[cfg(target_os = "macos")]
             gpu_renderer: None,
             tools: ToolShell::new(),
@@ -1483,6 +1492,7 @@ impl FigView {
     pub(crate) fn invalidate_canvas_cache(&mut self) {
         self.rendered_canvas = None;
         self.prototype_render_cache = None;
+        self.chrome_cache.replace(None);
         #[cfg(target_os = "macos")]
         if let Some(renderer) = self.gpu_renderer.as_mut() {
             renderer.invalidate();
@@ -4448,6 +4458,7 @@ impl Item for FigView {
                 space_pan: false,
                 container_bounds: None,
                 rendered_canvas: None,
+                chrome_cache: std::cell::RefCell::new(None),
                 #[cfg(target_os = "macos")]
                 gpu_renderer: None,
                 tools: ToolShell::new(),

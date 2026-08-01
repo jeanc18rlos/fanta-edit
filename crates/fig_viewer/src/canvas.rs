@@ -2,6 +2,7 @@
 //! macOS, with a CPU fallback), then the interaction overlays — hover and
 //! selection outlines, resize handles, and the active tool's render hints.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -901,15 +902,21 @@ pub(crate) fn evaluated_world_transform(
     id: NodeId,
     motion: Option<&MotionEvaluation>,
 ) -> Option<fanta_doc::Transform2D> {
+    // Motion-free (the Design-mode norm): identical composition through the
+    // scene's memoized cache — O(1) warm instead of an ancestor `Vec`
+    // allocation and walk per call. The chrome scan calls this per selected
+    // node per frame, so with a select-all on a large page the uncached walk
+    // was O(selection × depth) every paint.
+    let Some(motion) = motion else {
+        return scene.world_transform(id);
+    };
     let node = scene.get(id)?;
     let mut ancestors: Vec<_> = scene.ancestors_of(id).collect();
     ancestors.reverse();
 
     let mut world = fanta_doc::Transform2D::IDENTITY;
     for ancestor in ancestors.into_iter().chain(std::iter::once(node)) {
-        let local = motion
-            .map(|motion| motion.apply_to_node(ancestor).transform)
-            .unwrap_or(ancestor.transform);
+        let local = motion.apply_to_node(ancestor).transform;
         world = local.then(&world);
     }
     Some(world)
@@ -921,10 +928,41 @@ pub(crate) fn evaluated_world_bounds(
     motion: Option<&MotionEvaluation>,
 ) -> Option<fanta_doc::Bounds> {
     let node = scene.get(id)?;
-    let evaluated = motion.map(|motion| motion.apply_to_node(node));
-    let node = evaluated.as_ref().unwrap_or(node);
-    if let Some(local) = node.data.local_bounds() {
-        return local.try_transformed(&evaluated_world_transform(scene, id, motion)?);
+    if let Some(motion) = motion {
+        let evaluated = motion.apply_to_node(node);
+        if let Some(local) = evaluated.data.local_bounds() {
+            return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
+        }
+    } else {
+        // Motion-free fast paths: the same math as the motion branch, but
+        // through the scene's memoized caches. Without these, every call
+        // re-ran a vector's `rough_bounds` (a full path-segment walk) and an
+        // ancestor-chain transform fold — per selected node, per frame.
+        match &node.data {
+            // A group's data-level box (clip/local size) can diverge from the
+            // scene's local bounds when the `clip_content` meta is off, so
+            // keep reading the data box (an O(1) field read); only the
+            // transform goes through the cache.
+            fanta_doc::NodeData::Group(_) => {
+                if let Some(local) = node.data.local_bounds() {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+                // Sizeless group: union children below, like the motion path.
+            }
+            // A boolean's scene-level local bounds union its operands in
+            // LOCAL space, which differs from the world-space union below
+            // under rotation. Keep the world-space union for parity.
+            fanta_doc::NodeData::Boolean(_) => {}
+            // For every other kind the scene's local bounds ARE
+            // `data.local_bounds()` — memoized, so a vector's path walk runs
+            // once per edit instead of once per call.
+            _ => {
+                if let Some(local) = scene.local_bounds(id) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+                // No intrinsic bounds: union children below.
+            }
+        }
     }
 
     let mut bounds: Option<fanta_doc::Bounds> = None;
@@ -1029,7 +1067,7 @@ fn evaluated_hit_test_subtree(
 }
 
 /// A top-level frame's name label to paint above its top-left corner.
-struct FrameLabel {
+pub(crate) struct FrameLabel {
     /// The frame's world bounds; its projected top-left anchors the label.
     world: fanta_doc::Bounds,
     name: String,
@@ -1037,17 +1075,39 @@ struct FrameLabel {
     selected: bool,
 }
 
+/// Selection-dependent overlay geometry memoized across paint frames. The
+/// scan behind it is O(selection) (with a select-all, O(page)), yet its
+/// inputs only change on document edits or selection changes — a pan or zoom
+/// repaints every frame with both untouched. Owned by [`FigView`] behind a
+/// `RefCell` because overlay collection runs during element paint with only
+/// `&App`; cleared alongside the rendered-canvas cache on reloads, whose
+/// restarted revision counter could otherwise collide with a stale entry.
+///
+/// [`FigView`]: crate::view::FigView
+pub(crate) struct ChromeCache {
+    scene_revision: u64,
+    page_root: Option<NodeId>,
+    selection: Vec<NodeId>,
+    editing_node: Option<NodeId>,
+    frame_labels: Rc<Vec<FrameLabel>>,
+    selected_bounds: Rc<Vec<fanta_doc::Bounds>>,
+    selection_union: Option<fanta_doc::Bounds>,
+    text_baselines: Rc<Vec<(DVec2, DVec2)>>,
+}
+
 /// Owned overlay data gathered while the document is borrowed, so the paint
-/// pass (which needs `&mut App` for text) no longer holds that borrow.
+/// pass (which needs `&mut App` for text) no longer holds that borrow. The
+/// selection-scaled pieces are shared `Rc`s with the [`ChromeCache`] so a
+/// cache hit clones a pointer, not a 29k-element `Vec`.
 struct OverlayData {
-    frame_labels: Vec<FrameLabel>,
+    frame_labels: Rc<Vec<FrameLabel>>,
     hovered_bounds: Option<fanta_doc::Bounds>,
-    selected_bounds: Vec<fanta_doc::Bounds>,
+    selected_bounds: Rc<Vec<fanta_doc::Bounds>>,
     /// A single selection follows its transformed local box instead of drawing
     /// an axis-aligned world AABB. This keeps the box and handles attached to a
     /// rotated node, including beneath transformed parents.
     oriented_selection: Option<OrientedSelection>,
-    text_baselines: Vec<(DVec2, DVec2)>,
+    text_baselines: Rc<Vec<(DVec2, DVec2)>>,
     /// Union of every selected node's world bounds, for the size badge.
     selection_union: Option<fanta_doc::Bounds>,
     /// The selection's world size shown in the badge, once nodes are selected.
@@ -1110,12 +1170,13 @@ impl CanvasElement {
     /// the view/document) is released before the paint pass, which needs a
     /// mutable `cx` to shape and paint text.
     fn collect_overlay_data(&self, cx: &App) -> OverlayData {
+        let collect_started = std::time::Instant::now();
         let mut data = OverlayData {
-            frame_labels: Vec::new(),
+            frame_labels: Rc::new(Vec::new()),
             hovered_bounds: None,
-            selected_bounds: Vec::new(),
+            selected_bounds: Rc::new(Vec::new()),
             oriented_selection: None,
-            text_baselines: Vec::new(),
+            text_baselines: Rc::new(Vec::new()),
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
@@ -1131,52 +1192,106 @@ impl CanvasElement {
         };
         let doc = &document.doc;
         let motion = view.motion_evaluation(document, cx);
-
-        // Frame name labels: only frame-surface groups that are direct children
-        // of the active page (top-level frames/sections, like Figma) — nested
-        // frames would be noise.
-        let page_children: &[NodeId] = doc.scene.children_of(doc.active_page());
-        for &id in page_children {
-            let Some(node) = doc.scene.get(id) else {
-                continue;
-            };
-            let is_frame =
-                matches!(&node.data, fanta_doc::NodeData::Group(group) if group.is_frame_surface());
-            if !is_frame {
-                continue;
-            }
-            let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) else {
-                continue;
-            };
-            let name = node.name.trim();
-            let name = if name.is_empty() { "Frame" } else { name };
-            data.frame_labels.push(FrameLabel {
-                world,
-                name: name.to_string(),
-                selected: doc.selection.contains(id),
-            });
-        }
-
-        // Selection union + size badge.
         let editing_node = view.text_edit.as_ref().map(|edit| edit.session.node_id());
-        for &id in doc.selection.iter() {
-            if let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) {
-                data.selected_bounds.push(world);
-                data.selection_union = Some(match data.selection_union {
-                    Some(existing) => existing.union(&world),
-                    None => world,
+        let page_root = doc.active_page();
+
+        // The selection-scaled scans (frame labels, per-node selection bounds,
+        // text baselines) only depend on scene content, the active page, the
+        // selection, and the text-editing node. Reuse the memoized geometry
+        // when none of those changed — a pan/zoom repaints every frame with
+        // all of them untouched, so this turns an O(selection) walk into an
+        // `Rc` clone. Motion mode samples the timeline per frame and bypasses
+        // the cache entirely.
+        let cached = motion.is_none().then(|| {
+            let cache = view.chrome_cache.borrow();
+            cache
+                .as_ref()
+                .filter(|cache| {
+                    cache.scene_revision == doc.scene.revision()
+                        && cache.page_root == page_root
+                        && cache.editing_node == editing_node
+                        && cache.selection.as_slice() == doc.selection.as_slice()
+                })
+                .map(|cache| {
+                    (
+                        cache.frame_labels.clone(),
+                        cache.selected_bounds.clone(),
+                        cache.selection_union,
+                        cache.text_baselines.clone(),
+                    )
+                })
+        });
+        if let Some(Some((frame_labels, selected_bounds, selection_union, text_baselines))) = cached
+        {
+            data.frame_labels = frame_labels;
+            data.selected_bounds = selected_bounds;
+            data.selection_union = selection_union;
+            data.text_baselines = text_baselines;
+        } else {
+            // Frame name labels: only frame-surface groups that are direct
+            // children of the active page (top-level frames/sections, like
+            // Figma) — nested frames would be noise.
+            let mut frame_labels = Vec::new();
+            let page_children: &[NodeId] = doc.scene.children_of(page_root);
+            for &id in page_children {
+                let Some(node) = doc.scene.get(id) else {
+                    continue;
+                };
+                let is_frame = matches!(&node.data, fanta_doc::NodeData::Group(group) if group.is_frame_surface());
+                if !is_frame {
+                    continue;
+                }
+                let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) else {
+                    continue;
+                };
+                let name = node.name.trim();
+                let name = if name.is_empty() { "Frame" } else { name };
+                frame_labels.push(FrameLabel {
+                    world,
+                    name: name.to_string(),
+                    selected: doc.selection.contains(id),
                 });
             }
-            if editing_node != Some(id)
-                && let Some(node) = doc.scene.get(id)
-                && let fanta_doc::NodeData::Text(text) = &node.data
-                && let Some(transform) = evaluated_world_transform(&doc.scene, id, motion.as_ref())
-            {
-                let baseline = fanta_render::text_first_baseline(text);
-                data.text_baselines.push((
-                    transform.transform_point(DVec2::new(0.0, baseline)),
-                    transform.transform_point(DVec2::new(text.local_size[0].max(1.0), baseline)),
-                ));
+
+            // Selection union + size badge.
+            let mut selected_bounds = Vec::new();
+            let mut text_baselines = Vec::new();
+            for &id in doc.selection.iter() {
+                if let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) {
+                    selected_bounds.push(world);
+                    data.selection_union = Some(match data.selection_union {
+                        Some(existing) => existing.union(&world),
+                        None => world,
+                    });
+                }
+                if editing_node != Some(id)
+                    && let Some(node) = doc.scene.get(id)
+                    && let fanta_doc::NodeData::Text(text) = &node.data
+                    && let Some(transform) =
+                        evaluated_world_transform(&doc.scene, id, motion.as_ref())
+                {
+                    let baseline = fanta_render::text_first_baseline(text);
+                    text_baselines.push((
+                        transform.transform_point(DVec2::new(0.0, baseline)),
+                        transform
+                            .transform_point(DVec2::new(text.local_size[0].max(1.0), baseline)),
+                    ));
+                }
+            }
+            data.frame_labels = Rc::new(frame_labels);
+            data.selected_bounds = Rc::new(selected_bounds);
+            data.text_baselines = Rc::new(text_baselines);
+            if motion.is_none() {
+                *view.chrome_cache.borrow_mut() = Some(ChromeCache {
+                    scene_revision: doc.scene.revision(),
+                    page_root,
+                    selection: doc.selection.as_slice().to_vec(),
+                    editing_node,
+                    frame_labels: data.frame_labels.clone(),
+                    selected_bounds: data.selected_bounds.clone(),
+                    selection_union: data.selection_union,
+                    text_baselines: data.text_baselines.clone(),
+                });
             }
         }
         if let &[id] = doc.selection.as_slice()
@@ -1273,6 +1388,7 @@ impl CanvasElement {
             data.measure_segments = edge_gaps(selected_world, hovered_world);
         }
 
+        crate::report_slow("canvas chrome scan", collect_started);
         data
     }
 
@@ -1328,7 +1444,7 @@ impl CanvasElement {
                     );
                 }
             } else {
-                for world in &overlay_data.selected_bounds {
+                for world in overlay_data.selected_bounds.iter() {
                     window.paint_quad(gpui::outline(
                         project_bounds(*world),
                         accent,
@@ -1336,7 +1452,7 @@ impl CanvasElement {
                     ));
                 }
             }
-            for (start, end) in &overlay_data.text_baselines {
+            for (start, end) in overlay_data.text_baselines.iter() {
                 paint_line(project(*start), project(*end), accent, window);
             }
 
@@ -1584,7 +1700,7 @@ impl CanvasElement {
         // distinct `&mut App` from the `window` it receives) so `ShapedLine`
         // painting works while the mask is on the stack.
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            for label in &data.frame_labels {
+            for label in data.frame_labels.iter() {
                 let top_left = project_bounds(label.world).origin;
                 let color = if label.selected { accent } else { label_muted };
                 let line = shape_label(&label.name, color, &ui_font, window);
@@ -2118,6 +2234,134 @@ mod geometry_tests {
             Some(WorldBounds::from_xywh(105.0, 26.0, 10.0, 10.0))
         );
         Ok(())
+    }
+
+    /// The pre-cache implementation of [`evaluated_world_transform`] with
+    /// `motion: None`: an explicit root→leaf fold over the ancestor chain.
+    /// The fast path must stay bit-identical to it.
+    fn reference_world_transform(scene: &Scene, id: NodeId) -> Option<Transform2D> {
+        let node = scene.get(id)?;
+        let mut ancestors: Vec<_> = scene.ancestors_of(id).collect();
+        ancestors.reverse();
+        let mut world = Transform2D::IDENTITY;
+        for ancestor in ancestors.into_iter().chain(std::iter::once(node)) {
+            world = ancestor.transform.then(&world);
+        }
+        Some(world)
+    }
+
+    /// The pre-cache implementation of [`evaluated_world_bounds`] with
+    /// `motion: None`: data-level local bounds through the uncached transform
+    /// fold, world-space child union otherwise.
+    fn reference_world_bounds(scene: &Scene, id: NodeId) -> Option<WorldBounds> {
+        let node = scene.get(id)?;
+        if let Some(local) = node.data.local_bounds() {
+            return local.try_transformed(&reference_world_transform(scene, id)?);
+        }
+        let mut bounds: Option<WorldBounds> = None;
+        for &child in scene.children_of(Some(id)) {
+            if let Some(child_bounds) = reference_world_bounds(scene, child) {
+                bounds = Some(match bounds {
+                    Some(bounds) => bounds.union(&child_bounds),
+                    None => child_bounds,
+                });
+            }
+        }
+        bounds
+    }
+
+    /// A scene exercising every fast-path branch: a clipped frame, a sizeless
+    /// group (child union), a rotated vector, and a loose root vector.
+    fn fast_path_scene() -> (Scene, Vec<NodeId>) {
+        let mut scene = Scene::new();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([200.0, 100.0]),
+            background: Some(fanta_doc::Fill::solid(Color::WHITE)),
+            ..GroupNode::default()
+        }));
+        frame.transform = Transform2D::translation(10.0, 20.0);
+        let frame_id = frame.id;
+        scene.insert(frame).expect("insert frame");
+
+        let mut sizeless = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        sizeless.parent = Some(frame_id);
+        sizeless.transform = Transform2D::rotation(0.3).then(&Transform2D::translation(5.0, 7.0));
+        let sizeless_id = sizeless.id;
+        scene.insert(sizeless).expect("insert group");
+
+        let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            30.0,
+            40.0,
+            Color::BLACK,
+        )));
+        rect.parent = Some(sizeless_id);
+        rect.transform = Transform2D::rotation(-0.7).then(&Transform2D::translation(3.0, 4.0));
+        let rect_id = rect.id;
+        scene.insert(rect).expect("insert rect");
+
+        let mut loose = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            12.0,
+            8.0,
+            Color::WHITE,
+        )));
+        loose.transform = Transform2D::translation(-40.0, 9.0);
+        let loose_id = loose.id;
+        scene.insert(loose).expect("insert loose rect");
+
+        (scene, vec![frame_id, sizeless_id, rect_id, loose_id])
+    }
+
+    #[test]
+    fn motion_free_world_transform_matches_the_uncached_fold() {
+        let (scene, ids) = fast_path_scene();
+        for &id in &ids {
+            // Twice per node: a cold cache fill, then the memoized answer.
+            for _ in 0..2 {
+                assert_eq!(
+                    evaluated_world_transform(&scene, id, None),
+                    reference_world_transform(&scene, id),
+                    "world transform diverged for {id:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn motion_free_world_bounds_match_the_uncached_walk() {
+        let (scene, ids) = fast_path_scene();
+        for &id in &ids {
+            for _ in 0..2 {
+                assert_eq!(
+                    evaluated_world_bounds(&scene, id, None),
+                    reference_world_bounds(&scene, id),
+                    "world bounds diverged for {id:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn motion_free_world_bounds_track_edits_through_the_cache() {
+        let (mut scene, ids) = fast_path_scene();
+        let rect_id = ids[2];
+        // Warm the caches, then move the node; the memoized fast path must
+        // observe the invalidation and re-agree with the uncached walk.
+        let _ = evaluated_world_bounds(&scene, rect_id, None);
+        scene
+            .set_transform(rect_id, Transform2D::translation(500.0, 600.0))
+            .expect("set transform");
+        assert_eq!(
+            evaluated_world_bounds(&scene, rect_id, None),
+            reference_world_bounds(&scene, rect_id),
+        );
+        assert_eq!(
+            evaluated_world_bounds(&scene, ids[0], None),
+            reference_world_bounds(&scene, ids[0]),
+        );
     }
 
     #[test]

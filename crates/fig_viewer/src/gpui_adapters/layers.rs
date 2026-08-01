@@ -32,10 +32,12 @@ pub(crate) fn layers_enabled() -> bool {
     )
 }
 
-/// Counts the subtree under `root` without building anything, so the budget
-/// check stays cheap on the files that need it most.
-pub(crate) fn subtree_len(doc: &Doc, root: NodeId) -> usize {
-    doc.scene.descendants_of(root).count()
+/// Whether the subtree under `root` fits `budget` nodes, without building
+/// anything. The walk stops at `budget + 1` visited nodes, so the check stays
+/// cheap on exactly the over-budget pages that need it most — a 29k-node page
+/// costs a budget-sized walk, not a full traversal.
+pub(crate) fn subtree_within_budget(doc: &Doc, root: NodeId, budget: usize) -> bool {
+    doc.scene.descendants_of(root).take(budget + 1).count() <= budget
 }
 
 /// The 22-way fold from engine node data (12 variants) to the panel's
@@ -115,4 +117,46 @@ fn build_children(
 /// ULIDs (the adapter minted them), so a parse failure means a stale row.
 pub(crate) fn node_id(id: &SharedString) -> Option<NodeId> {
     id.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fanta_doc::{CanvasNode, Color, GroupNode, VectorNode};
+
+    fn doc_with_page_of(children: usize) -> (Doc, NodeId) {
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        for _ in 0..children {
+            let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                Color::BLACK,
+            )));
+            node.parent = Some(page_id);
+            doc.scene.insert(node).expect("insert child");
+        }
+        (doc, page_id)
+    }
+
+    #[test]
+    fn budget_verdict_flips_exactly_at_the_budget() {
+        // `descendants_of` counts the root itself: 5 children = 6 nodes.
+        let (doc, page) = doc_with_page_of(5);
+        assert!(subtree_within_budget(&doc, page, 7));
+        assert!(subtree_within_budget(&doc, page, 6));
+        assert!(!subtree_within_budget(&doc, page, 5));
+        assert!(!subtree_within_budget(&doc, page, 0));
+    }
+
+    #[test]
+    fn childless_root_is_one_node() {
+        let (doc, page) = doc_with_page_of(0);
+        assert!(subtree_within_budget(&doc, page, 1));
+        assert!(!subtree_within_budget(&doc, page, 0));
+    }
 }

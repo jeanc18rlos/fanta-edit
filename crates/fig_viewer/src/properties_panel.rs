@@ -367,6 +367,23 @@ impl FantaPropertiesPanel {
                                 crate::document::FigItemEvent::SelectionChanged => {
                                     this.reset_for_new_subject(true, cx);
                                 }
+                                crate::document::FigItemEvent::EditedTransient => {
+                                    // Transient drag frames re-render the panel
+                                    // for live X/Y. Above the multi-select
+                                    // detail limit the snapshot shows no live
+                                    // values anyway (every field reads mixed),
+                                    // so skip the per-pointer-move rebuild; the
+                                    // committing Edited refreshes once at drop.
+                                    let selection_len = item
+                                        .read(cx)
+                                        .document()
+                                        .map_or(0, |document| document.doc.selection.len());
+                                    if selection_len
+                                        > crate::properties_snapshot::MULTI_SELECTION_DETAIL_LIMIT
+                                    {
+                                        return;
+                                    }
+                                }
                                 crate::document::FigItemEvent::TextSelectionChanged => {}
                                 crate::document::FigItemEvent::StateChanged => {
                                     // The document may have been replaced from

@@ -26,6 +26,14 @@ use crate::properties_ops::{format_number, inspector_world_size};
 
 pub(crate) const MIXED_VALUE: &str = "–";
 
+/// Above this many selected nodes the multi-select snapshot degrades to a
+/// count summary (Figma-style): the per-node geometry reads and the
+/// selection-colors scan are skipped, every field reads as mixed, and the
+/// properties panel stops re-rendering on transient drag frames. Without the
+/// cap, a select-all on a large page re-derived O(selection) geometry on
+/// every event and every render.
+pub(crate) const MULTI_SELECTION_DETAIL_LIMIT: usize = 1_000;
+
 /// One editable value in the inspector; identifies which node property the
 /// shared inline editor (or an in-flight scrub / color-picker session) is
 /// currently bound to.
@@ -1360,60 +1368,116 @@ pub(crate) fn bound_prop_label(prop: &BoundProp) -> String {
     }
 }
 
+/// Incremental "is this value shared across the selection" state: the
+/// per-property equivalent of collecting every value and comparing against the
+/// first. `merge(None)` (a node without the property) marks the property
+/// mixed, matching the old `values.len() == ids.len()` gate, and once a
+/// property is mixed the caller can stop paying for its per-node read.
+#[derive(Clone, Copy)]
+enum SharedValue {
+    Unset,
+    Value(f64),
+    Mixed,
+}
+
+impl SharedValue {
+    fn merge(&mut self, value: Option<f64>) {
+        match (*self, value) {
+            (Self::Mixed, _) | (_, None) => *self = Self::Mixed,
+            (Self::Unset, Some(value)) => *self = Self::Value(value),
+            (Self::Value(first), Some(value)) => {
+                if (value - first).abs() >= 0.01 {
+                    *self = Self::Mixed;
+                }
+            }
+        }
+    }
+
+    fn is_mixed(self) -> bool {
+        matches!(self, Self::Mixed)
+    }
+
+    fn get(self) -> Option<f64> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Unset | Self::Mixed => None,
+        }
+    }
+}
+
 pub(crate) fn multi_section(
     doc: &Doc,
     ids: &[NodeId],
     masters: &HashMap<NodeId, ComponentId>,
 ) -> MultiSection {
-    let mut xs = Vec::with_capacity(ids.len());
-    let mut ys = Vec::with_capacity(ids.len());
-    let mut widths = Vec::with_capacity(ids.len());
-    let mut heights = Vec::with_capacity(ids.len());
-    let mut rotations = Vec::with_capacity(ids.len());
+    // Only masters NOT already in a variant set can be combined; the op
+    // (`combine_as_variants_operations`) filters the same way, so gating the
+    // "Combine N as variants" button on the raw master count would offer it
+    // for a selection that then does nothing.
+    let master_count = ids
+        .iter()
+        .filter_map(|id| masters.get(id))
+        .filter(|component| {
+            doc.components
+                .def(**component)
+                .is_some_and(|def| def.variant_of.is_none())
+        })
+        .count();
+    let first_id = ids.first().copied().unwrap_or_else(NodeId::new);
+    // Huge selections degrade to a count summary (see the limit's docs).
+    if ids.len() > MULTI_SELECTION_DETAIL_LIMIT {
+        return MultiSection {
+            count: ids.len(),
+            first_id,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            rotation_degrees: None,
+            colors: Vec::new(),
+            master_count,
+        };
+    }
+    let mut x = SharedValue::Unset;
+    let mut y = SharedValue::Unset;
+    let mut width = SharedValue::Unset;
+    let mut height = SharedValue::Unset;
+    let mut rotation = SharedValue::Unset;
     let mut colors = Vec::new();
     for &id in ids {
-        if let Some(bounds) = doc.scene.world_bounds(id) {
-            xs.push(bounds.min_x);
-            ys.push(bounds.min_y);
+        // Each geometry read is skipped once every property it feeds is
+        // already mixed — with many nodes the usual case after a handful.
+        if !(x.is_mixed() && y.is_mixed()) {
+            let bounds = doc.scene.world_bounds(id);
+            x.merge(bounds.map(|bounds| bounds.min_x));
+            y.merge(bounds.map(|bounds| bounds.min_y));
         }
-        if let Some((width, height)) = inspector_world_size(doc, id) {
-            widths.push(width);
-            heights.push(height);
+        if !(width.is_mixed() && height.is_mixed()) {
+            let size = inspector_world_size(doc, id);
+            width.merge(size.map(|size| size.0));
+            height.merge(size.map(|size| size.1));
+        }
+        if !rotation.is_mixed() {
+            rotation.merge(
+                doc.scene
+                    .world_transform(id)
+                    .map(|transform| transform_angle(&transform).to_degrees()),
+            );
         }
         if let Some(node) = doc.scene.get(id) {
-            if let Some(world_transform) = doc.scene.world_transform(id) {
-                rotations.push(transform_angle(&world_transform).to_degrees());
-            }
             node_solid_colors(node, &mut colors);
         }
     }
-    let common = |values: &[f64]| -> Option<f64> {
-        let first = *values.first()?;
-        (values.len() == ids.len() && values.iter().all(|value| (value - first).abs() < 0.01))
-            .then_some(first)
-    };
     MultiSection {
         count: ids.len(),
-        first_id: ids.first().copied().unwrap_or_else(NodeId::new),
-        x: common(&xs),
-        y: common(&ys),
-        width: common(&widths),
-        height: common(&heights),
-        rotation_degrees: common(&rotations),
+        first_id,
+        x: x.get(),
+        y: y.get(),
+        width: width.get(),
+        height: height.get(),
+        rotation_degrees: rotation.get(),
         colors: group_selection_colors(colors),
-        // Only masters NOT already in a variant set can be combined; the op
-        // (`combine_as_variants_operations`) filters the same way, so gating the
-        // "Combine N as variants" button on the raw master count would offer it
-        // for a selection that then does nothing.
-        master_count: ids
-            .iter()
-            .filter_map(|id| masters.get(id))
-            .filter(|component| {
-                doc.components
-                    .def(**component)
-                    .is_some_and(|def| def.variant_of.is_none())
-            })
-            .count(),
+        master_count,
     }
 }
 
@@ -1451,13 +1515,21 @@ pub(crate) fn node_solid_colors(node: &CanvasNode, out: &mut Vec<FantaColor>) {
 }
 
 /// Collapse the selection's solid colors into distinct rows with usage counts,
-/// preserving first-seen order so the list is stable across rebuilds.
+/// preserving first-seen order so the list is stable across rebuilds. Indexed
+/// by a hash map: the old per-color `Vec` scan was O(distinct × total), which
+/// on a many-colored selection turned one snapshot into millions of compares.
 pub(crate) fn group_selection_colors(colors: Vec<FantaColor>) -> Vec<SelectionColorSnapshot> {
     let mut grouped: Vec<SelectionColorSnapshot> = Vec::new();
+    let mut index: HashMap<FantaColor, usize> = HashMap::new();
     for color in colors {
-        match grouped.iter_mut().find(|entry| entry.color == color) {
-            Some(entry) => entry.uses += 1,
-            None => grouped.push(SelectionColorSnapshot { color, uses: 1 }),
+        match index.entry(color) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                grouped[*entry.get()].uses += 1;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(grouped.len());
+                grouped.push(SelectionColorSnapshot { color, uses: 1 });
+            }
         }
     }
     grouped
@@ -1896,6 +1968,98 @@ pub(crate) mod tests {
 
         let text = node_with_data(NodeData::Text(text_node()));
         assert_eq!(corner_smoothing_value(&text), None);
+    }
+
+    fn doc_with_rects(count: usize, offset_each: bool) -> (Doc, Vec<NodeId>) {
+        let mut doc = Doc::new();
+        let mut ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                FantaColor::BLACK,
+            )));
+            if offset_each {
+                node.transform = Transform2D::translation(index as f64 * 20.0, 0.0);
+            }
+            ids.push(node.id);
+            doc.scene.insert(node).expect("insert rect");
+        }
+        (doc, ids)
+    }
+
+    #[test]
+    fn multi_section_reads_shared_and_mixed_values() {
+        let masters = HashMap::new();
+        // Identical rects at the same spot: everything reads as one value.
+        let (doc, ids) = doc_with_rects(3, false);
+        let section = multi_section(&doc, &ids, &masters);
+        assert_eq!(section.count, 3);
+        assert_eq!(section.x, Some(0.0));
+        assert_eq!(section.y, Some(0.0));
+        assert_eq!(section.width, Some(10.0));
+        assert_eq!(section.height, Some(10.0));
+        assert_eq!(section.rotation_degrees, Some(0.0));
+        assert_eq!(section.colors.len(), 1);
+        assert_eq!(section.colors[0].uses, 3);
+
+        // Offset rects: X is mixed, size/rotation still shared.
+        let (doc, ids) = doc_with_rects(3, true);
+        let section = multi_section(&doc, &ids, &masters);
+        assert_eq!(section.x, None);
+        assert_eq!(section.y, Some(0.0));
+        assert_eq!(section.width, Some(10.0));
+        assert_eq!(section.rotation_degrees, Some(0.0));
+    }
+
+    #[test]
+    fn huge_selections_degrade_to_a_count_summary() {
+        let masters = HashMap::new();
+        let (doc, ids) = doc_with_rects(MULTI_SELECTION_DETAIL_LIMIT + 1, false);
+        let section = multi_section(&doc, &ids, &masters);
+        assert_eq!(section.count, MULTI_SELECTION_DETAIL_LIMIT + 1);
+        assert_eq!(section.first_id, ids[0]);
+        // Geometry and colors are skipped wholesale — every field reads mixed
+        // and the colors section is empty — but the variants gate still counts.
+        assert_eq!(section.x, None);
+        assert_eq!(section.y, None);
+        assert_eq!(section.width, None);
+        assert_eq!(section.height, None);
+        assert_eq!(section.rotation_degrees, None);
+        assert!(section.colors.is_empty());
+        assert_eq!(section.master_count, 0);
+
+        // One under the limit still reads full detail.
+        let (doc, ids) = doc_with_rects(2, false);
+        let section = multi_section(&doc, &ids, &masters);
+        assert_eq!(section.x, Some(0.0));
+        assert_eq!(section.colors.len(), 1);
+    }
+
+    #[test]
+    fn shared_value_merge_matches_collect_then_compare() {
+        let mut shared = SharedValue::Unset;
+        assert_eq!(shared.get(), None);
+        shared.merge(Some(5.0));
+        assert_eq!(shared.get(), Some(5.0));
+        // Within the 0.01 tolerance of the FIRST value: still shared.
+        shared.merge(Some(5.005));
+        assert_eq!(shared.get(), Some(5.0));
+        shared.merge(Some(5.02));
+        assert!(shared.is_mixed());
+        // Mixed is terminal.
+        shared.merge(Some(5.0));
+        assert!(shared.is_mixed());
+
+        // A node without the property (None) means mixed, matching the old
+        // `values.len() == ids.len()` gate.
+        let mut with_gap = SharedValue::Unset;
+        with_gap.merge(None);
+        with_gap.merge(Some(1.0));
+        assert!(with_gap.is_mixed());
+        assert_eq!(with_gap.get(), None);
     }
 
     #[test]
