@@ -35,7 +35,7 @@ pub(crate) fn runtime_enabled(cx: &gpui::App) -> bool {
 mod spike_tests {
     use fanta_gpui::prelude::*;
     use fanta_gpui::toolbar::{EditorToolbar, ToolbarMode, ToolbarTool};
-    use gpui::{AppContext as _, Entity, TestAppContext, VisualContext as _};
+    use gpui::{AppContext as _, Entity, TestAppContext};
     use gpui_component::Root;
 
     fn init_test(cx: &mut TestAppContext) {

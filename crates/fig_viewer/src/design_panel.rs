@@ -1268,7 +1268,23 @@ impl FantaDesignPanel {
                 .and_then(|page| page.root)
         });
 
-        self.current_page_index = document.page_index(view.selected_page_index());
+        // The page highlight and This-page search must follow the page the
+        // canvas actually renders — `page_root` above — not the view's last
+        // clicked index: canvas-side navigation (scoped opens, prototype
+        // jumps, component focus) moves the ACTIVE page without touching
+        // `selected_page_index`, and the default-index fallback can disagree
+        // with the active page outright (fresh open of a document whose
+        // active page is not the largest). Deriving the index from any other
+        // root made the Pages panel highlight the wrong row and scope its
+        // search to a page the user was not looking at.
+        self.current_page_index = page_root
+            .and_then(|root| {
+                document
+                    .pages
+                    .iter()
+                    .position(|page| page.root == Some(root))
+            })
+            .or_else(|| document.page_index(view.selected_page_index()));
         // Read each real page's name live from its scene node so an inline
         // rename (and its undo) reflects without maintaining the `FigPage`
         // cache; the synthetic page (root `None`) falls back to its stored name.
@@ -3488,6 +3504,210 @@ mod tests {
 
         // A non-matching query yields the empty-state list.
         assert!(filter_pages(pages, Some("zzz")).is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "fanta-gpui-ui"))]
+mod gpui_pages_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use fanta_doc::VectorNode;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+    }
+
+    fn named_page(doc: &mut Doc, page_name: &str, child_name: &str) -> NodeId {
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = page_name.to_owned();
+        let root = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page root");
+        doc.add_page(root);
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::default()));
+        child.name = child_name.to_owned();
+        child.parent = Some(root);
+        doc.apply(Operation::create_node(child))
+            .expect("create page child");
+        root
+    }
+
+    /// Two visible pages, each holding one named vector node.
+    fn doc_with_two_named_pages() -> (Doc, NodeId, NodeId) {
+        let mut doc = Doc::new();
+        let page_one = named_page(&mut doc, "Page 1", "Star Button");
+        let page_two = named_page(&mut doc, "Page 2", "Star Chart");
+        doc.set_active_page(Some(page_one));
+        (doc, page_one, page_two)
+    }
+
+    async fn setup_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FantaDesignPanel>,
+        Entity<FigView>,
+        Entity<fanta_gpui::pages::PagesPanel>,
+        NodeId,
+        NodeId,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (doc, page_one, page_two) = doc_with_two_named_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let view_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured_view = view_slot.clone();
+        let (panel, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            *captured_view.borrow_mut() = Some(view.clone());
+            FantaDesignPanel::build(fs, Some(view), window, cx, Vec::new())
+        });
+        let view = view_slot
+            .borrow_mut()
+            .take()
+            .expect("the fig view should be captured during window setup");
+        cx.run_until_parked();
+        let pages_panel = panel.read_with(cx, |panel, _| {
+            panel
+                .gpui_pages
+                .as_ref()
+                .expect("the fanta-gpui pages adapter should mount in a themed window")
+                .panel
+                .clone()
+        });
+        let cx = cx.clone();
+        (panel, view, pages_panel, page_one, page_two, cx)
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &str) {
+        // `debug_bounds` wants a `&'static str`; tests can afford the leak.
+        let selector: &'static str = Box::leak(selector.to_owned().into_boxed_str());
+        let center = |cx: &mut VisualTestContext| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing rendered selector: {selector}"))
+                .center()
+        };
+        // The move draws a fresh frame, letting reveal animations (advanced
+        // via the test clock) settle before the click's hit test runs.
+        let position = center(cx);
+        cx.simulate_mouse_move(position, None, gpui::Modifiers::none());
+        let position = center(cx);
+        cx.simulate_click(position, gpui::Modifiers::none());
+    }
+
+    #[gpui::test]
+    async fn typing_in_pages_search_returns_matches_from_the_document(cx: &mut TestAppContext) {
+        let (panel, _view, pages_panel, _page_one, _page_two, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+
+        click(cx, "pages-search-trigger");
+        cx.run_until_parked();
+        cx.simulate_input("Star");
+        cx.run_until_parked();
+
+        let results = pages_panel.read_with(cx, |panel, _| panel.search_results().clone());
+        assert_eq!(
+            results
+                .items
+                .iter()
+                .map(|item| item.title.to_string())
+                .collect::<Vec<_>>(),
+            vec!["Star Button".to_owned()],
+            "the default This-page scope should surface the current page's match"
+        );
+        assert_eq!(results.total, 1);
+        assert!(
+            cx.debug_bounds("pages-result-0").is_some(),
+            "the match should be rendered as a result row"
+        );
+
+        // Widening the scope reaches the second page too.
+        click(cx, "pages-scope-trigger");
+        click(cx, "pages-scope-all-pages");
+        cx.run_until_parked();
+        let results = pages_panel.read_with(cx, |panel, _| panel.search_results().clone());
+        assert_eq!(
+            results
+                .items
+                .iter()
+                .map(|item| item.title.to_string())
+                .collect::<Vec<_>>(),
+            vec!["Star Button".to_owned(), "Star Chart".to_owned()],
+            "the All-pages scope should surface matches on every visible page"
+        );
+
+        // Host bookkeeping matches what the panel shows.
+        panel.read_with(cx, |panel, _| {
+            let adapter = panel.gpui_pages.as_ref().expect("adapter");
+            assert_eq!(adapter.result_order.len(), 2);
+            assert_eq!(adapter.result_map.len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn switching_pages_keeps_the_panel_highlight_in_sync(cx: &mut TestAppContext) {
+        let (_panel, view, pages_panel, page_one, page_two, mut cx) = setup_panel(cx).await;
+        let cx = &mut cx;
+
+        let page_one_id = SharedString::from(page_one.to_string());
+        let page_two_id = SharedString::from(page_two.to_string());
+
+        // The freshly mounted panel highlights the page the canvas shows.
+        assert_eq!(
+            pages_panel.read_with(cx, |panel, _| panel.selected_page().cloned()),
+            Some(page_one_id.clone()),
+            "the initial echo should select the active page"
+        );
+
+        // A panel row activation round-trips: intent -> host page switch ->
+        // echo. The row-click -> SelectRequested half lives in the
+        // component's own tests; the pages reveal animation never settles
+        // under the test scheduler, so the intent is emitted directly here.
+        pages_panel.update_in(cx, |_, _, cx| {
+            cx.emit(fanta_gpui::pages::PagesPanelAction::SelectRequested {
+                page_id: page_two_id.clone(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.selected_page_index()),
+            Some(1),
+            "the panel intent should switch the canvas page"
+        );
+        assert_eq!(
+            pages_panel.read_with(cx, |panel, _| panel.selected_page().cloned()),
+            Some(page_two_id),
+            "the panel highlight should follow the page switch"
+        );
+
+        // A canvas-side page switch (no panel involvement) echoes too.
+        view.update_in(cx, |view, _window, cx| view.select_page(0, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            pages_panel.read_with(cx, |panel, _| panel.selected_page().cloned()),
+            Some(page_one_id),
+            "a canvas-driven page switch should re-highlight the panel row"
+        );
     }
 }
 

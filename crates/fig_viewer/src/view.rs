@@ -350,7 +350,7 @@ pub(crate) enum TextEditSeed {
 }
 
 impl FigView {
-    fn new(
+    pub(crate) fn new(
         item: Entity<FigItem>,
         project: Entity<Project>,
         window: &mut Window,
