@@ -16,7 +16,6 @@ use gpui::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use smol::Timer;
 
 /// The width of the scrollbar (THUMB_ACTIVE_INSET * 2 + THUMB_ACTIVE_WIDTH)
 const WIDTH: Pixels = px(4. * 2. + 8.);
@@ -652,9 +651,15 @@ impl Element for Scrollbar {
                                 state.set(state.get().with_idle_timer_scheduled(true));
                                 let current_view = window.current_view();
                                 let next_delay = Duration::from_secs_f32(FADE_OUT_DELAY - elapsed);
+                                // GPUI's executor timer (not a raw smol
+                                // `Timer`): the raw timer wakes from the
+                                // async-io reactor thread, which escapes the
+                                // deterministic test scheduler and aborts any
+                                // test that paints a scrolled scrollbar.
+                                let timer = cx.background_executor().timer(next_delay);
                                 window
                                     .spawn(cx, async move |cx| {
-                                        Timer::after(next_delay).await;
+                                        timer.await;
                                         state.set(state.get().with_idle_timer_scheduled(false));
                                         cx.update(|_, cx| cx.notify(current_view)).ok();
                                     })
