@@ -277,7 +277,7 @@ fn bind_property_operation(
     }))
 }
 
-fn unbind_property_operation(
+pub(crate) fn unbind_property_operation(
     doc: &Doc,
     node_id: NodeId,
     prop: BoundProp,

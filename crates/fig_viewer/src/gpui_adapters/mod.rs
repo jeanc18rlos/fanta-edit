@@ -10,6 +10,7 @@
 //! Theme rule: files hosting fanta-gpui panels import
 //! `gpui_component::ActiveTheme` OR Zed's `theme::ActiveTheme`, never both.
 
+pub(crate) mod design;
 pub(crate) mod layers;
 pub(crate) mod pages;
 pub(crate) mod toolbar;

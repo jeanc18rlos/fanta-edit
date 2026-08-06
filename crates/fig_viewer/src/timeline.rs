@@ -727,6 +727,38 @@ impl TimelineShell {
         }
     }
 
+    pub(crate) fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub(crate) fn loop_playback_enabled(&self) -> bool {
+        self.loop_playback
+    }
+
+    /// Accepted-value transport entry points for the editor toolbar: the
+    /// toolbar's Play/Loop chips carry the value the user accepted, so these
+    /// set rather than toggle. Starting playback keeps `toggle_playback`'s
+    /// guards — with no clip (or a zero duration) the state stays paused and
+    /// the toolbar echo never claims otherwise.
+    pub(crate) fn set_playing(&mut self, playing: bool, cx: &mut Context<Self>) {
+        if playing == self.playing {
+            return;
+        }
+        if playing {
+            self.toggle_playback(cx);
+        } else {
+            self.pause(cx);
+        }
+    }
+
+    pub(crate) fn set_loop_playback(&mut self, loop_playback: bool, cx: &mut Context<Self>) {
+        if self.loop_playback == loop_playback {
+            return;
+        }
+        self.loop_playback = loop_playback;
+        cx.notify();
+    }
+
     fn set_playhead(&mut self, playhead_us: i64, cx: &mut Context<Self>) {
         let playhead_us = playhead_us.clamp(0, self.model.duration_us);
         if playhead_us == self.playhead_us {

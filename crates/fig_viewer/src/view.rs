@@ -274,6 +274,12 @@ pub struct FigView {
     group_faces: Vec<ToolKind>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_toolbar: Option<crate::gpui_adapters::toolbar::ToolbarAdapter>,
+    /// The DesignPanel inspector adapter, mounted for Design mode when the
+    /// fanta-gpui runtime and the `FANTA_GPUI_DESIGN` gate allow it; the
+    /// legacy `FantaPropertiesPanel` stays the fallback. `pub(crate)` because
+    /// the adapter's host methods live in `gpui_adapters::design`.
+    #[cfg(feature = "fanta-gpui-ui")]
+    pub(crate) gpui_design: Option<crate::gpui_adapters::design::DesignAdapter>,
     /// Set once the document's fonts have been queued for background download,
     /// so the one-shot prewarm doesn't re-fire every frame.
     fonts_prewarmed: bool,
@@ -500,6 +506,10 @@ impl FigView {
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                 .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_design: (crate::gpui_adapters::runtime_enabled(cx)
+                && crate::gpui_adapters::design::design_enabled())
+            .then(|| crate::gpui_adapters::design::DesignAdapter::new(window, cx)),
             fonts_prewarmed: false,
             hovered_node: None,
             text_edit: None,
@@ -522,6 +532,14 @@ impl FigView {
 
     fn subscribe_to_item(item: &Entity<FigItem>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(item, |this, _, event: &FigItemEvent, cx| {
+            // Echo document state into the DesignPanel inspector. Preview
+            // frames are skipped (the panel re-echoes on the committing
+            // event); selection and text-selection changes must refresh even
+            // though the native panels ignore them.
+            #[cfg(feature = "fanta-gpui-ui")]
+            if !matches!(event, FigItemEvent::EditedTransient) {
+                this.refresh_gpui_design(cx);
+            }
             match event {
                 FigItemEvent::Edited => {
                     this.invalidate_canvas_cache();
@@ -746,6 +764,8 @@ impl FigView {
             .update(cx, |workspace, cx| workspace.finish_value_edit(cx));
         self.prototype_sidebar
             .update(cx, |panel, cx| panel.finish_parameter_edit(cx));
+        #[cfg(feature = "fanta-gpui-ui")]
+        self.finish_gpui_design_edits(cx);
     }
 
     fn finish_document_edits(&mut self, cx: &mut Context<Self>) {
@@ -2986,7 +3006,19 @@ impl FigView {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => self.render_comments_sidebar(cx),
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
-            EditorMode::Design => self.inspector_sidebar.clone().into_any_element(),
+            EditorMode::Design => {
+                // The fanta-gpui DesignPanel replaces the legacy inspector
+                // when its adapter mounted; `FANTA_GPUI_DESIGN=0` (or the
+                // process-wide `FANTA_GPUI_UI=0`) keeps the legacy panel.
+                #[cfg(feature = "fanta-gpui-ui")]
+                let body = match self.gpui_design.as_ref() {
+                    Some(adapter) => adapter.panel.clone().into_any_element(),
+                    None => self.inspector_sidebar.clone().into_any_element(),
+                };
+                #[cfg(not(feature = "fanta-gpui-ui"))]
+                let body = self.inspector_sidebar.clone().into_any_element();
+                body
+            }
         };
         let sidebar = div()
             .id("fanta-inspector-sidebar")
@@ -3736,9 +3768,13 @@ impl Render for FigView {
         {
             let tool = self.tools.kind();
             let zoom_percent = self.current_zoom_percent(cx);
+            let options = self.toolbar_option_inputs(cx);
             if let Some(adapter) = self.gpui_toolbar.as_mut() {
-                adapter.refresh(editor_mode, tool, zoom_percent, cx);
+                adapter.refresh(editor_mode, tool, zoom_percent, options, cx);
             }
+            // Covers state that was already ready before the first item
+            // event (a preloaded document); memoized, so later frames skip.
+            self.refresh_gpui_design(cx);
         }
         let cursor_style = match &self.text_edit {
             // The I-beam over the edited text, an arrow elsewhere — clicking
@@ -4467,6 +4503,10 @@ impl Item for FigView {
                 #[cfg(feature = "fanta-gpui-ui")]
                 gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                     .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
+                #[cfg(feature = "fanta-gpui-ui")]
+                gpui_design: (crate::gpui_adapters::runtime_enabled(cx)
+                    && crate::gpui_adapters::design::design_enabled())
+                .then(|| crate::gpui_adapters::design::DesignAdapter::new(window, cx)),
                 fonts_prewarmed: false,
                 hovered_node: None,
                 text_edit: None,
@@ -5825,6 +5865,113 @@ impl FigView {
         (zoom * 100.0).round().clamp(1.0, u16::MAX as f64) as u16
     }
 
+    /// Host state behind the toolbar's Motion/Dev/Agent option read models,
+    /// snapshotted per render for the adapter's diff-guarded push.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn toolbar_option_inputs(
+        &self,
+        cx: &App,
+    ) -> crate::gpui_adapters::toolbar::ToolbarOptionInputs {
+        let timeline = self.timeline_shell.read(cx);
+        let current_time_ms = timeline
+            .playhead_us()
+            .max(0)
+            .div_euclid(1_000)
+            .min(i64::from(u32::MAX)) as u32;
+        let duration_ms = self.item.read(cx).document().and_then(|document| {
+            let clip = self.active_motion_clip?;
+            document.doc.motion.clip(clip).map(|clip| clip.duration_ms)
+        });
+        crate::gpui_adapters::toolbar::ToolbarOptionInputs {
+            playing: timeline.is_playing(),
+            looping: timeline.loop_playback_enabled(),
+            current_time_ms,
+            duration_ms,
+            agent_context_label: self.toolbar_agent_context_label(cx),
+        }
+    }
+
+    /// What the Agent composer's context chip names: the selected layer, a
+    /// selection count, or the current page when nothing is selected.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn toolbar_agent_context_label(&self, cx: &App) -> SharedString {
+        let Some(document) = self.item.read(cx).document() else {
+            return "Canvas".into();
+        };
+        match document.doc.selection.as_slice() {
+            [] => document
+                .page(self.selected_page_index)
+                .map(|page| page.name.clone())
+                .unwrap_or_else(|| "Canvas".into()),
+            [node] => document
+                .doc
+                .scene
+                .get(*node)
+                .filter(|node| !node.name.is_empty())
+                .map(|node| SharedString::from(node.name.clone()))
+                .unwrap_or_else(|| "1 layer".into()),
+            selection => format!("{} layers", selection.len()).into(),
+        }
+    }
+
+    /// Apply an absolute zoom percentage through the same viewport path the
+    /// scroll and keyboard zooms use, anchored at the canvas center. The
+    /// factor comes from the live viewport zoom — not the rounded display
+    /// percent — so ladder steps and the 100% entry land exactly.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn zoom_to_percent(&mut self, percent: u16, cx: &mut Context<Self>) {
+        let Some(viewport) = self.viewport else {
+            return;
+        };
+        if viewport.zoom <= 0.0 {
+            return;
+        }
+        let target = f64::from(percent.clamp(1, 3_200)) / 100.0;
+        self.zoom_by(target / viewport.zoom, None, cx);
+    }
+
+    /// Fit the viewport around the current selection: `fit_page_to_view`'s
+    /// framing applied to the union of the selected nodes' world bounds.
+    /// No-op when nothing is selected or no selected node has finite bounds.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn zoom_to_selection(&mut self, cx: &mut Context<Self>) {
+        let viewport = self
+            .container_bounds
+            .zip(self.item.read(cx).document())
+            .and_then(|(bounds, document)| {
+                let mut selection_bounds: Option<fanta_doc::Bounds> = None;
+                for node in document.doc.selection.iter() {
+                    if let Some(node_bounds) = document.doc.scene.world_bounds(*node)
+                        && node_bounds.is_finite()
+                    {
+                        selection_bounds = Some(match selection_bounds {
+                            Some(current) => current.union(&node_bounds),
+                            None => node_bounds,
+                        });
+                    }
+                }
+                Some(crate::document::fit_bounds(
+                    selection_bounds?,
+                    bounds_size(bounds),
+                    RENDER_PADDING,
+                    MIN_ZOOM,
+                    MAX_ZOOM,
+                ))
+            });
+        if let Some(viewport) = viewport {
+            self.set_viewport(viewport, cx);
+        }
+    }
+
+    /// Test-only view of the mounted toolbar adapter, for the echo tests in
+    /// `gpui_adapters::toolbar`.
+    #[cfg(all(test, feature = "fanta-gpui-ui"))]
+    pub(crate) fn gpui_toolbar_adapter(
+        &self,
+    ) -> Option<&crate::gpui_adapters::toolbar::ToolbarAdapter> {
+        self.gpui_toolbar.as_ref()
+    }
+
     fn render_toolbar_slot(&self, cx: &mut Context<Self>) -> AnyElement {
         #[cfg(feature = "fanta-gpui-ui")]
         if self.gpui_toolbar.is_some() {
@@ -5922,8 +6069,15 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use fanta_gpui::toolbar::{ToolbarAction, ToolbarCommand, ToolbarMode};
+        use fanta_gpui::toolbar::{ToolbarAction, ToolbarCommand, ToolbarMode, ToolbarTool};
         match action {
+            // Resources is host chrome, not a canvas tool: Figma's ⇧I panel
+            // corresponds to the left pages/layers sidebar here, the same
+            // surface the toolbar's trailing cluster toggles.
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::Resources,
+                ..
+            } => self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
                     Some(kind) => self.activate_tool(kind, cx),
@@ -5937,10 +6091,11 @@ impl FigView {
                     log::info!("fanta-gpui toolbar: mode {mode:?} not available yet");
                 }
             },
+            // The +/- steppers, the zoom menu's percent entries, typed
+            // percentages, and the ZoomCanvasTo100 command action all arrive
+            // here, so they share one absolute canvas zoom path.
             ToolbarAction::ZoomChangeRequested { percent } => {
-                let current = f64::from(self.current_zoom_percent(cx)).max(1.0);
-                let target = f64::from(*percent).max(1.0);
-                self.zoom_by(target / current, None, cx);
+                self.zoom_to_percent(*percent, cx);
             }
             ToolbarAction::CommandInvoked { command } => match command {
                 ToolbarCommand::Undo => self.undo(&Undo, window, cx),
@@ -5953,20 +6108,130 @@ impl FigView {
                 }
                 ToolbarCommand::Delete => self.delete_selection(&DeleteSelection, window, cx),
                 ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
+                ToolbarCommand::ZoomToSelection => self.zoom_to_selection(cx),
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
                 ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
                 other => log::info!("fanta-gpui toolbar: command {other:?} not wired yet"),
             },
-            // Palette/agent text plumbing and secondary controls are
-            // component-internal or post-release surfaces.
+            ToolbarAction::ControlChangeRequested { control, value, .. } => {
+                self.handle_toolbar_control_change(*control, value, cx);
+            }
+            ToolbarAction::SecondaryControlInvoked { control, .. } => {
+                self.handle_toolbar_secondary_control(*control);
+            }
+            // Palette/agent text plumbing is component-internal or
+            // post-release surface area.
             ToolbarAction::CommandQueryChanged { .. }
             | ToolbarAction::AiPromptSubmitted { .. }
             | ToolbarAction::AgentVisibilityChanged { .. }
             | ToolbarAction::AgentAttachmentRequested
-            | ToolbarAction::AgentVoiceInputRequested
-            | ToolbarAction::SecondaryControlInvoked { .. }
-            | ToolbarAction::ControlChangeRequested { .. } => {}
+            | ToolbarAction::AgentVoiceInputRequested => {}
+        }
+    }
+
+    /// §12 contract: an accepted control value is applied to host state and
+    /// echoed back through the options setters. The echo flows through the
+    /// render-time `ToolbarAdapter::refresh`, the same diff-guarded choke
+    /// point every other host mutation uses.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn handle_toolbar_control_change(
+        &mut self,
+        control: fanta_gpui::toolbar::ToolbarSecondaryControl,
+        value: &fanta_gpui::toolbar::ToolbarControlValue,
+        cx: &mut Context<Self>,
+    ) {
+        use fanta_gpui::toolbar::{ToolbarControlValue, ToolbarSecondaryControl};
+        match (control, value) {
+            (ToolbarSecondaryControl::MotionPlayPause, ToolbarControlValue::Toggle(playing)) => {
+                self.timeline_shell
+                    .update(cx, |timeline, cx| timeline.set_playing(*playing, cx));
+                cx.notify();
+            }
+            (ToolbarSecondaryControl::MotionLoop, ToolbarControlValue::Toggle(looping)) => {
+                self.timeline_shell
+                    .update(cx, |timeline, cx| timeline.set_loop_playback(*looping, cx));
+                cx.notify();
+            }
+            (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
+                if let Some(adapter) = self.gpui_toolbar.as_mut()
+                    && adapter.accept_animation_style(style)
+                {
+                    cx.notify();
+                }
+            }
+            (ToolbarSecondaryControl::MotionAutoKeyframe, _) => {
+                // Echoing "recording" without a recorder would lie; leave the
+                // chip off until a keyframe-recording mode exists.
+                log::info!("fanta-gpui toolbar: auto-keyframe has no host recording model yet");
+            }
+            (ToolbarSecondaryControl::DevReadyForDevelopment, _) => {
+                log::info!(
+                    "fanta-gpui toolbar: ready-for-development has no host model yet \
+                     (Dev mode is unreachable)"
+                );
+            }
+            (
+                ToolbarSecondaryControl::DrawStrokeColor
+                | ToolbarSecondaryControl::DrawBrushStyle
+                | ToolbarSecondaryControl::DrawStrokeWeight
+                | ToolbarSecondaryControl::DrawSmoothing
+                | ToolbarSecondaryControl::DrawPressure,
+                _,
+            ) => {
+                log::info!(
+                    "fanta-gpui toolbar: Draw controls have no host surface (no Draw mode)"
+                );
+            }
+            (control, value) => {
+                log::info!(
+                    "fanta-gpui toolbar: control change {control:?} = {value:?} not wired yet"
+                );
+            }
+        }
+    }
+
+    /// Routes press-style secondary controls to matching host actions. The
+    /// transport and option chips arrive as `ControlChangeRequested`; the
+    /// press-only chips below are the whole `SecondaryControlInvoked`
+    /// surface, and each unwired one is logged individually.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn handle_toolbar_secondary_control(
+        &mut self,
+        control: fanta_gpui::toolbar::ToolbarSecondaryControl,
+    ) {
+        use fanta_gpui::toolbar::ToolbarSecondaryControl;
+        match control {
+            ToolbarSecondaryControl::MotionAddKeyframe => {
+                // `add_motion_keyframe` needs a `TimelineProperty`; the chip
+                // carries none, and inventing one would author a keyframe the
+                // user did not ask for. The timeline's per-track controls own
+                // that flow.
+                log::info!(
+                    "fanta-gpui toolbar: Add keyframe needs a track property; \
+                     use the timeline's per-track controls"
+                );
+            }
+            ToolbarSecondaryControl::MotionTimeline => {
+                log::info!(
+                    "fanta-gpui toolbar: the Motion timeline is always visible in Motion mode; \
+                     there is no toggle"
+                );
+            }
+            ToolbarSecondaryControl::MotionTimeComment => {
+                log::info!("fanta-gpui toolbar: time-anchored comments are not modeled yet");
+            }
+            ToolbarSecondaryControl::DevInspect
+            | ToolbarSecondaryControl::DevAnnotate
+            | ToolbarSecondaryControl::DevMeasure => {
+                log::info!(
+                    "fanta-gpui toolbar: Dev handoff control {control:?} has no host tool \
+                     (Dev mode is unreachable)"
+                );
+            }
+            other => {
+                log::info!("fanta-gpui toolbar: secondary control {other:?} not wired yet");
+            }
         }
     }
 }
