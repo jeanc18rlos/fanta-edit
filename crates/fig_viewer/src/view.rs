@@ -68,7 +68,7 @@ use crate::tools::{
 use crate::variables_workspace::FantaVariablesWorkspace;
 
 #[cfg(target_os = "macos")]
-use crate::canvas::MacGpuRenderer;
+use crate::canvas::GpuCanvas;
 
 actions!(
     fig_viewer,
@@ -265,8 +265,10 @@ pub struct FigView {
     /// paint with only `&App`. Cleared with the rendered-canvas cache: a
     /// reload restarts the scene revision counter, which could collide.
     pub(crate) chrome_cache: std::cell::RefCell<Option<crate::canvas::ChromeCache>>,
+    /// The Metal render thread and its newest frame; created on first paint.
+    /// `pub(crate)` because the canvas element drives it during paint.
     #[cfg(target_os = "macos")]
-    gpu_renderer: Option<MacGpuRenderer>,
+    pub(crate) gpu_canvas: Option<GpuCanvas>,
     pub(crate) tools: ToolShell,
     pub(crate) comment_state: crate::comments_ui::CommentState,
     /// The last-used tool per toolbar group, so each group's button keeps
@@ -499,7 +501,7 @@ impl FigView {
             rendered_canvas: None,
             chrome_cache: std::cell::RefCell::new(None),
             #[cfg(target_os = "macos")]
-            gpu_renderer: None,
+            gpu_canvas: None,
             tools: ToolShell::new(),
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
@@ -1514,19 +1516,9 @@ impl FigView {
         self.prototype_render_cache = None;
         self.chrome_cache.replace(None);
         #[cfg(target_os = "macos")]
-        if let Some(renderer) = self.gpu_renderer.as_mut() {
-            renderer.invalidate();
+        if let Some(gpu) = self.gpu_canvas.as_mut() {
+            gpu.invalidate();
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn take_gpu_renderer(&mut self) -> Option<MacGpuRenderer> {
-        self.gpu_renderer.take()
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn store_gpu_renderer(&mut self, renderer: MacGpuRenderer) {
-        self.gpu_renderer = Some(renderer);
     }
 
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
@@ -4496,7 +4488,7 @@ impl Item for FigView {
                 rendered_canvas: None,
                 chrome_cache: std::cell::RefCell::new(None),
                 #[cfg(target_os = "macos")]
-                gpu_renderer: None,
+                gpu_canvas: None,
                 tools: ToolShell::new(),
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),

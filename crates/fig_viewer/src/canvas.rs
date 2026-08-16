@@ -1,9 +1,23 @@
 //! The canvas element: paints the rendered scene (through Skia Metal on
 //! macOS, with a CPU fallback), then the interaction overlays — hover and
 //! selection outlines, resize handles, and the active tool's render hints.
+//!
+//! On macOS the scene raster runs on a dedicated render thread (see
+//! [`GpuCanvas`]): paint always presents the newest completed frame —
+//! reprojected against the live viewport when they differ — and only ever
+//! blocks on a render when the last frame was cheap AND the request shows
+//! nothing that frame did not already cover (an edit, a pan inside the render
+//! margin), so blocking is invisible. A pan into new content therefore never
+//! waits for a raster, however heavy the page.
 
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Mutex, mpsc},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context as _, Result, anyhow};
 #[cfg(target_os = "macos")]
@@ -21,6 +35,10 @@ use core_video::{
 };
 use fanta_canvas::ResizeHandle;
 use fanta_doc::{Action, AnimationClipId, MotionEvaluation, NodeId, Viewport};
+#[cfg(target_os = "macos")]
+use fanta_doc::{ComponentLibrary, ModeId, Scene, VariableCollectionId, VariableRegistry};
+#[cfg(target_os = "macos")]
+use fanta_render::AssetResolver;
 use fanta_render::{RasterRenderer, RenderInputs};
 use fanta_tools::{SnapGuideAxis, ToolOverlay};
 #[cfg(target_os = "macos")]
@@ -32,6 +50,8 @@ use gpui::{
     Pixels, Point, RenderImage, ShapedLine, TextAlign, TextRun, Window, font, point, px, relative,
     size,
 };
+#[cfg(target_os = "macos")]
+use gpui::{Context, Task};
 use image::{Frame, RgbaImage};
 #[cfg(target_os = "macos")]
 use skia_safe::{
@@ -104,19 +124,23 @@ impl From<&MotionEvaluation> for MotionFrameKey {
 enum PaintCanvas {
     #[cfg(target_os = "macos")]
     Surface {
-        frame: GpuFrame,
+        /// `None` when no completed frame can stand in for the request yet
+        /// (first frame still rendering, or the page changed): the canvas
+        /// background shows until the render thread delivers.
+        frame: Option<GpuFrame>,
         viewport: Viewport,
     },
     Image(Arc<RenderImage>),
 }
 
-/// Where a frame rendered at `cached` must be painted so its world content
-/// lines up under the `current` viewport: the cached image covers the element
-/// rect at its own zoom, so scale it by the zoom ratio and shift it by the
-/// screen-space distance between the two centers.
+/// Where a frame rendered at `cached` (covering `cached_logical` logical
+/// pixels) must be painted so its world content lines up under the `current`
+/// viewport over the `bounds` frame rect: scale it by the zoom ratio and shift
+/// it by the screen-space distance between the two centers.
 #[cfg(target_os = "macos")]
 fn reprojected_bounds(
     bounds: Bounds<Pixels>,
+    cached_logical: (f64, f64),
     cached: Viewport,
     current: Viewport,
 ) -> Bounds<Pixels> {
@@ -124,8 +148,8 @@ fn reprojected_bounds(
     let scale = current.zoom / cached.zoom.max(f64::EPSILON);
     let center_x = (cached.center[0] - current.center[0]) * current.zoom + width * 0.5;
     let center_y = (cached.center[1] - current.center[1]) * current.zoom + height * 0.5;
-    let projected_width = width * scale;
-    let projected_height = height * scale;
+    let projected_width = cached_logical.0 * scale;
+    let projected_height = cached_logical.1 * scale;
     Bounds {
         origin: point(
             bounds.origin.x + px((center_x - projected_width * 0.5) as f32),
@@ -138,23 +162,47 @@ fn reprojected_bounds(
 /// Key identifying one rendered frame. While it matches, repaints reuse the
 /// previous surface without touching the GPU.
 #[cfg(target_os = "macos")]
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 struct SurfaceKey {
     size: (u32, u32),
     viewport_center: [f64; 2],
     viewport_zoom: f64,
     page_root: Option<NodeId>,
+    /// `FigDocument::render_generation()`: doc-level edits through the item.
     revision: u64,
+    /// The scene instance and its content revision. Catches in-place scene
+    /// writes that bypass the item's generation counter, and a reload that
+    /// restarts both counters under surviving node ids.
+    scene: (u64, u64),
+    /// Canvas-side invalidations ([`FigView::invalidate_canvas_cache`]).
+    epoch: u64,
     motion_frame: Option<MotionFrameKey>,
 }
 
 #[cfg(target_os = "macos")]
-struct CachedSurface {
-    buffer: CVPixelBuffer,
-    key: SurfaceKey,
+impl SurfaceKey {
+    /// Whether two keys describe the same scene content — everything except
+    /// the viewport and target size, i.e. what a reprojected frame may differ
+    /// in without showing stale pixels.
+    fn same_content(&self, other: &SurfaceKey) -> bool {
+        self.page_root == other.page_root
+            && self.revision == other.revision
+            && self.scene == other.scene
+            && self.epoch == other.epoch
+            && self.motion_frame == other.motion_frame
+    }
+
+    /// Whether two keys show the same page of the same scene instance — the
+    /// granularity at which a measured render cost carries over. Edits and
+    /// motion ticks keep the class (their cost tracks the page's); a page
+    /// switch or a document reload starts unmeasured.
+    fn same_content_class(&self, other: &SurfaceKey) -> bool {
+        self.page_root == other.page_root && self.scene.0 == other.scene.0
+    }
 }
 
-/// What to do with the cached frame for a newly requested one.
+/// What to do with the cached frame for a newly requested one, on a scene
+/// cheap enough to render synchronously.
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
 enum FrameDecision {
@@ -188,23 +236,9 @@ fn frame_decision(
     if *cached == *requested {
         return FrameDecision::ReuseCached;
     }
-    if cached.size == requested.size
-        && cached.page_root == requested.page_root
-        && cached.revision == requested.revision
-        && cached.motion_frame == requested.motion_frame
-        && within_render_interval
-    {
-        let cached_zoom = cached.viewport_zoom.max(f64::EPSILON);
-        let scale = requested.viewport_zoom / cached_zoom;
-        let covered_width = frame_logical.0 / cached_zoom;
-        let covered_height = frame_logical.1 / cached_zoom;
-        let needed_width = visible_logical.0 / requested.viewport_zoom.max(f64::EPSILON);
-        let needed_height = visible_logical.1 / requested.viewport_zoom.max(f64::EPSILON);
-        let slack_x = (covered_width - needed_width) * 0.5;
-        let slack_y = (covered_height - needed_height) * 0.5;
-        let offset_x = (cached.viewport_center[0] - requested.viewport_center[0]).abs();
-        let offset_y = (cached.viewport_center[1] - requested.viewport_center[1]).abs();
-        let covers_view = offset_x <= slack_x && offset_y <= slack_y;
+    if cached.size == requested.size && cached.same_content(requested) && within_render_interval {
+        let scale = requested.viewport_zoom / cached.viewport_zoom.max(f64::EPSILON);
+        let covers_view = frame_covers_request(cached, requested, frame_logical, visible_logical);
         // Zooming OUT quickly leaves the cached frame's coverage (its margin
         // is thin), which used to force a FULL scene render on every input
         // event — the exact "zooming degrades" cliff. A shrinking reprojected
@@ -213,7 +247,7 @@ fn frame_decision(
         // the throttle is closed instead of stalling the gesture.
         let zooming_out = scale < 1.0;
         if (covers_view || zooming_out)
-            && (1.0 / MacGpuRenderer::MAX_REPROJECT_SCALE..=MacGpuRenderer::MAX_REPROJECT_SCALE)
+            && (1.0 / GpuCanvas::MAX_REPROJECT_SCALE..=GpuCanvas::MAX_REPROJECT_SCALE)
                 .contains(&scale)
         {
             return FrameDecision::Reproject;
@@ -222,32 +256,179 @@ fn frame_decision(
     FrameDecision::RenderFresh
 }
 
+/// Whether the world region a frame at `cached` covers (it spans
+/// `frame_logical` logical pixels — the element plus its render margin —
+/// at the cached zoom) contains everything the element must show for
+/// `requested` (`visible_logical` logical pixels at the requested zoom).
+/// Only meaningful for frames of the same pixel size.
+///
+/// Beyond deciding whether a reprojected frame would expose background at its
+/// edges, this is the app's proxy for *cold content*: whatever the request
+/// shows was walked by the newest render, so its text is shaped, its images
+/// decoded and uploaded, and its paths built — the next render costs about
+/// what the last one did. An uncovered request reveals nodes the renderer may
+/// never have seen, whose first frame can cost seconds (per-node font
+/// resolution, image uploads) however cheap the last frame was.
 #[cfg(target_os = "macos")]
-pub(crate) struct MacGpuRenderer {
-    raster_renderer: RasterRenderer,
-    direct_context: skia_safe::gpu::DirectContext,
-    texture_cache: CVMetalTextureCache,
-    _device: metal::Device,
-    _command_queue: metal::CommandQueue,
-    size: (u32, u32),
-    /// Recycled pixel buffers matching `size`. Reusing them avoids a
-    /// multi-megabyte IOSurface allocation per frame.
-    buffer_pool: Vec<CVPixelBuffer>,
-    /// Buffers handed to the compositor recently. They only graduate to the
-    /// pool after `IN_FLIGHT_FRAMES` newer frames were presented, because the
-    /// window server may still be scanning them out — rendering into one too
-    /// early tears or corrupts the displayed frame.
-    retired: std::collections::VecDeque<CVPixelBuffer>,
-    cached: Option<CachedSurface>,
-    last_render_at: Option<std::time::Instant>,
-    /// Wall time of the most recent fresh scene render (walk + GPU flush +
-    /// sync). Drives the adaptive reproject window — see [`render_interval`].
-    last_render_duration: std::time::Duration,
+fn frame_covers_request(
+    cached: &SurfaceKey,
+    requested: &SurfaceKey,
+    frame_logical: (f64, f64),
+    visible_logical: (f64, f64),
+) -> bool {
+    let cached_zoom = cached.viewport_zoom.max(f64::EPSILON);
+    let requested_zoom = requested.viewport_zoom.max(f64::EPSILON);
+    let covered_width = frame_logical.0 / cached_zoom;
+    let covered_height = frame_logical.1 / cached_zoom;
+    let needed_width = visible_logical.0 / requested_zoom;
+    let needed_height = visible_logical.1 / requested_zoom;
+    let slack_x = (covered_width - needed_width) * 0.5;
+    let slack_y = (covered_height - needed_height) * 0.5;
+    let offset_x = (cached.viewport_center[0] - requested.viewport_center[0]).abs();
+    let offset_y = (cached.viewport_center[1] - requested.viewport_center[1]).abs();
+    offset_x <= slack_x && offset_y <= slack_y
+}
+
+/// How expensive the last measured scene render was, which decides whether
+/// paint may block on the next one.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderCost {
+    /// Nothing measured yet (first frame): render off-thread — the cold frame
+    /// (font shaping + shader compile) can take seconds and must not freeze
+    /// the window.
+    Unknown,
+    /// Renders finish inside a display frame; paint blocks on them — for
+    /// edits and viewport changes the newest frame already covers — so edits
+    /// show without a snapshot round trip. Anything revealing new content
+    /// still renders off-thread (see [`plan_paint`]).
+    Cheap,
+    /// Renders cost real time; they run on the render thread from a scene
+    /// snapshot while paint keeps presenting the newest frame.
+    Expensive,
+}
+
+#[cfg(target_os = "macos")]
+impl RenderCost {
+    /// The class after a render that took `duration`. Hysteresis keeps a
+    /// scene hovering around the budget from flipping modes every frame.
+    fn after(self, duration: Duration) -> RenderCost {
+        match self {
+            RenderCost::Cheap if duration > GpuCanvas::SYNC_RENDER_BUDGET => RenderCost::Expensive,
+            RenderCost::Cheap => RenderCost::Cheap,
+            RenderCost::Unknown if duration <= GpuCanvas::SYNC_RENDER_BUDGET => RenderCost::Cheap,
+            RenderCost::Unknown => RenderCost::Expensive,
+            RenderCost::Expensive if duration < GpuCanvas::ASYNC_EXIT_BUDGET => RenderCost::Cheap,
+            RenderCost::Expensive => RenderCost::Expensive,
+        }
+    }
+}
+
+/// The cost class after a frame for `installed` (which took `duration`)
+/// replaces the `previous` newest frame. A frame of another page or scene
+/// instance starts its own cost history — the previous class says nothing
+/// about this content — so it classifies from `Unknown`, like a first frame.
+#[cfg(target_os = "macos")]
+fn cost_after_install(
+    previous: Option<&SurfaceKey>,
+    installed: &SurfaceKey,
+    cost: RenderCost,
+    duration: Duration,
+) -> RenderCost {
+    let carried = match previous {
+        Some(previous) if previous.same_content_class(installed) => cost,
+        Some(_) => RenderCost::Unknown,
+        None => cost,
+    };
+    carried.after(duration)
+}
+
+/// What one paint pass does with the render thread and the newest frame.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum PaintPlan {
+    /// The newest frame matches the request; present it as-is.
+    Present,
+    /// Cheap scene inside the reproject window: present the newest frame
+    /// reprojected and repaint soon (the sharp frame lands when the window
+    /// opens).
+    Reproject,
+    /// Cheap scene, render thread idle, and the request shows nothing beyond
+    /// the newest frame's coverage (an edit, a covered pan, a zoom-in): block
+    /// paint on a render straight from the live document, then present it
+    /// fresh.
+    RenderBlocking,
+    /// Expensive or unmeasured scene, or a request revealing content the
+    /// newest frame never covered, render thread idle: present the newest
+    /// frame reprojected and hand the render thread a fresh request.
+    PresentAndRender,
+    /// A render is in flight: present the newest frame reprojected; the
+    /// completion repaints. Never block, never queue a second request.
+    PresentAndWait,
+}
+
+/// The pure presentation policy behind [`GpuCanvas`]: given the newest
+/// completed frame, the request, and the render thread's state, decide what
+/// paint does. Unit-testable without a Metal device.
+///
+/// The invariant that matters for interaction smoothness: while the render
+/// thread is busy, or whenever the scene is expensive, paint NEVER blocks — a
+/// pan tick presents the newest frame shifted under the live viewport and, at
+/// most, enqueues one coalesced (latest-wins) fresh render.
+///
+/// `cost` describes the newest frame's content, and only holds for requests
+/// that frame already covers (see [`frame_covers_request`]): a pan past the
+/// render margin, a zoom-out, another page, or a reloaded document (a new
+/// scene instance) all reveal content the renderer may never have walked,
+/// whose first frame pays cold text shaping and image uploads — seconds, on
+/// a large page — so those never run inline however cheap the last frame
+/// was. What blocks on a cheap scene is exactly the case that is safe AND
+/// pays for itself: an edit or a covered viewport change, rendered from the
+/// live document without a scene snapshot.
+#[cfg(target_os = "macos")]
+fn plan_paint(
+    newest: Option<&SurfaceKey>,
+    requested: &SurfaceKey,
+    render_in_flight: bool,
+    cost: RenderCost,
+    frame_logical: (f64, f64),
+    visible_logical: (f64, f64),
+    within_render_interval: bool,
+) -> PaintPlan {
+    if newest.is_some_and(|newest| *newest == *requested) {
+        return PaintPlan::Present;
+    }
+    if render_in_flight {
+        return PaintPlan::PresentAndWait;
+    }
+    let measured = newest.filter(|newest| newest.same_content_class(requested));
+    match (cost, measured) {
+        (RenderCost::Cheap, Some(newest)) => match frame_decision(
+            newest,
+            requested,
+            frame_logical,
+            visible_logical,
+            within_render_interval,
+        ) {
+            FrameDecision::ReuseCached => PaintPlan::Present,
+            FrameDecision::Reproject => PaintPlan::Reproject,
+            FrameDecision::RenderFresh
+                if newest.size == requested.size
+                    && frame_covers_request(newest, requested, frame_logical, visible_logical) =>
+            {
+                PaintPlan::RenderBlocking
+            }
+            FrameDecision::RenderFresh => PaintPlan::PresentAndRender,
+        },
+        (RenderCost::Cheap, None) | (RenderCost::Unknown | RenderCost::Expensive, _) => {
+            PaintPlan::PresentAndRender
+        }
+    }
 }
 
 /// The reproject window that follows a fresh render costing
-/// `last_render_duration`: while it is open, mid-interaction paints reuse the
-/// cached frame reprojected instead of rendering the scene again.
+/// `last_render_duration`: while it is open, mid-interaction paints on a cheap
+/// scene reuse the newest frame reprojected instead of rendering again.
 ///
 /// A fixed 33 ms window assumed a render is cheaper than a display frame. On a
 /// heavy page zoomed out (thousands of visible nodes) a render can take tens of
@@ -259,14 +440,16 @@ pub(crate) struct MacGpuRenderer {
 /// renders (≤ 11 ms) keep the display-rate 33 ms floor, expensive ones space
 /// themselves out and the reprojected frame (pixel-exact for a pure pan) covers
 /// the ticks in between. The ceiling keeps a pathological render from starving
-/// the sharp frame for longer than a quarter second.
+/// the sharp frame for longer than a quarter second. (Renders past
+/// [`GpuCanvas::SYNC_RENDER_BUDGET`] no longer block at all — they move to the
+/// render thread — so in practice the window only throttles cheap scenes.)
 #[cfg(target_os = "macos")]
-fn render_interval(last_render_duration: std::time::Duration) -> std::time::Duration {
+fn render_interval(last_render_duration: Duration) -> Duration {
     last_render_duration
-        .saturating_mul(MacGpuRenderer::REPROJECT_COST_FACTOR)
+        .saturating_mul(GpuCanvas::REPROJECT_COST_FACTOR)
         .clamp(
-            MacGpuRenderer::MIN_RENDER_INTERVAL,
-            MacGpuRenderer::MAX_RENDER_INTERVAL,
+            GpuCanvas::MIN_RENDER_INTERVAL,
+            GpuCanvas::MAX_RENDER_INTERVAL,
         )
 }
 
@@ -275,36 +458,363 @@ fn render_interval(last_render_duration: std::time::Duration) -> std::time::Dura
 pub(crate) enum GpuFrame {
     /// Rendered at the requested viewport; paint it 1:1 over the element.
     Fresh(CVPixelBuffer),
-    /// The cached frame from an earlier `viewport`, reused because a fresh
-    /// render is throttled mid-interaction. The caller scales/offsets it to
-    /// approximate the requested viewport and repaints soon after.
+    /// The newest completed frame, rendered at `viewport` over `logical`
+    /// logical pixels, standing in for a request it does not match exactly.
+    /// The caller scales/offsets it to approximate the requested viewport; a
+    /// fresh render is either in flight or was just requested.
     Reprojected {
         buffer: CVPixelBuffer,
         viewport: Viewport,
+        logical: (f64, f64),
     },
+}
+
+// ============================================================================
+// Render thread plumbing
+// ============================================================================
+
+/// Identity of the document state a [`SceneSnapshot`] was copied from. The
+/// render thread's copy is reused across every pan/zoom/motion frame while
+/// this is unchanged; only an actual content change re-copies the scene.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotStamp {
+    scene_instance: u64,
+    scene_revision: u64,
+    generation: u64,
+    /// Identity of the installed asset resolver (it can be swapped for an
+    /// overlay without any counter moving; images that finish decoding into
+    /// the same resolver are shared with the snapshot through the `Arc`).
+    asset_resolver: Option<usize>,
+    // Deliberately NOT part of the stamp: [`GpuCanvas::invalidate`]'s epoch.
+    // Every scene write moves `scene.revision()` (`get_mut` bumps it) or the
+    // render generation (`DocChange::Content*`), so the epoch only ever
+    // signals view-side state — a timeline playhead tick, a mode switch, a
+    // comment pin — that the render request already carries or the overlays
+    // draw; re-copying the scene for it would cost a snapshot per playback
+    // frame on an expensive page.
+}
+
+#[cfg(target_os = "macos")]
+impl SnapshotStamp {
+    fn of(document: &FigDocument) -> Self {
+        Self {
+            scene_instance: document.doc.scene.instance_id(),
+            scene_revision: document.doc.scene.revision(),
+            generation: document.render_generation(),
+            asset_resolver: document
+                .asset_resolver
+                .as_ref()
+                .map(|resolver| Arc::as_ptr(resolver) as *const () as usize),
+        }
+    }
+}
+
+/// Everything a scene render reads from the document, copied out so the
+/// render thread can draw while the UI thread keeps editing. `Scene` keeps
+/// `RefCell` memo caches (it is `!Sync`), so the copy is owned outright by the
+/// render thread and never shared; a snapshot is only taken when the content
+/// stamp moved — never for a pan, zoom, resize, or motion tick — and the
+/// previous copy is dropped on the render thread.
+#[cfg(target_os = "macos")]
+struct SceneSnapshot {
+    stamp: SnapshotStamp,
+    scene: Scene,
+    components: ComponentLibrary,
+    variables: VariableRegistry,
+    active_modes: BTreeMap<VariableCollectionId, ModeId>,
+    asset_resolver: Option<Arc<dyn AssetResolver>>,
+}
+
+#[cfg(target_os = "macos")]
+impl SceneSnapshot {
+    fn capture(document: &FigDocument, stamp: SnapshotStamp) -> Self {
+        Self {
+            stamp,
+            scene: document.doc.scene.clone(),
+            components: document.doc.components.clone(),
+            variables: document.doc.variables.clone(),
+            active_modes: document.doc.active_modes.clone(),
+            asset_resolver: document.asset_resolver.clone(),
+        }
+    }
+
+    fn inputs(&self) -> FrameInputs<'_> {
+        FrameInputs {
+            scene: &self.scene,
+            components: &self.components,
+            variables: &self.variables,
+            active_modes: &self.active_modes,
+            asset_resolver: self.asset_resolver.as_ref(),
+        }
+    }
+}
+
+/// Borrowed render inputs — from a snapshot on the render thread, or from the
+/// live document during a blocking render.
+#[cfg(target_os = "macos")]
+struct FrameInputs<'a> {
+    scene: &'a Scene,
+    components: &'a ComponentLibrary,
+    variables: &'a VariableRegistry,
+    active_modes: &'a BTreeMap<VariableCollectionId, ModeId>,
+    asset_resolver: Option<&'a Arc<dyn AssetResolver>>,
+}
+
+/// Raw pointers into the live document for a *blocking* render: the UI thread
+/// sends these and then waits on the reply channel before touching the
+/// document again, so for the whole render the pointees are borrowed
+/// exclusively by the render thread — the same discipline as a scoped thread,
+/// with the join replaced by the reply.
+#[cfg(target_os = "macos")]
+struct LiveInputs {
+    scene: *const Scene,
+    components: *const ComponentLibrary,
+    variables: *const VariableRegistry,
+    active_modes: *const BTreeMap<VariableCollectionId, ModeId>,
+    asset_resolver: Option<Arc<dyn AssetResolver>>,
+}
+
+// SAFETY: the pointers are only dereferenced inside the render job that
+// carries them, while the sending thread is blocked in `GpuCanvas::
+// render_blocking` and therefore cannot mutate, move, or drop the pointees;
+// `Scene`'s `RefCell` caches are then touched by exactly one thread. The
+// resolver is `Send + Sync` by trait bound.
+#[cfg(target_os = "macos")]
+unsafe impl Send for LiveInputs {}
+
+#[cfg(target_os = "macos")]
+impl LiveInputs {
+    fn of(document: &FigDocument) -> Self {
+        Self {
+            scene: &document.doc.scene,
+            components: &document.doc.components,
+            variables: &document.doc.variables,
+            active_modes: &document.doc.active_modes,
+            asset_resolver: document.asset_resolver.clone(),
+        }
+    }
+
+    /// # Safety
+    /// Only inside the render job for which the sender is still blocked.
+    unsafe fn inputs(&self) -> FrameInputs<'_> {
+        // SAFETY: see the `Send` impl — the sender is blocked until this job's
+        // reply lands, so every pointee is alive and unaliased for `'_`.
+        unsafe {
+            FrameInputs {
+                scene: &*self.scene,
+                components: &*self.components,
+                variables: &*self.variables,
+                active_modes: &*self.active_modes,
+                asset_resolver: self.asset_resolver.as_ref(),
+            }
+        }
+    }
+}
+
+/// A CoreVideo pixel buffer crossing threads. CF objects are thread-safe to
+/// retain/release, and the buffer's pixels are only ever written by the render
+/// thread and read by the window server, so moving the handle is sound.
+#[cfg(target_os = "macos")]
+struct SendBuffer(CVPixelBuffer);
+
+// SAFETY: see the type docs — a retained CFTypeRef with no thread affinity.
+#[cfg(target_os = "macos")]
+unsafe impl Send for SendBuffer {}
+
+/// What to render one frame from.
+#[cfg(target_os = "macos")]
+enum RenderSource {
+    /// The render thread's own snapshot; `Some` installs a fresh copy first.
+    Snapshot(Option<Box<SceneSnapshot>>),
+    /// The live document, with the UI thread blocked until the reply.
+    Live(LiveInputs),
+}
+
+/// One request for the render thread.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct RenderRequest {
+    key: SurfaceKey,
+    scale_factor: f32,
+    motion: Option<MotionEvaluation>,
+}
+
+#[cfg(target_os = "macos")]
+struct RenderJob {
+    source: RenderSource,
+    request: RenderRequest,
+    /// Buffers the compositor is done with, going back to the pool.
+    recycled: Vec<SendBuffer>,
+}
+
+#[cfg(target_os = "macos")]
+enum RenderReply {
+    Frame {
+        key: SurfaceKey,
+        scale_factor: f32,
+        result: Result<(SendBuffer, Duration)>,
+    },
+    /// The render thread could not bring up Metal/Skia; the canvas falls back
+    /// to the CPU raster path.
+    InitFailed(anyhow::Error),
+}
+
+/// A manual-reset event the render thread raises after every reply so the
+/// UI-side task wakes and repaints. Plain `std` so it works with any waker —
+/// gpui's foreground tasks are woken through the platform main-queue dispatch,
+/// which is safe to call from any thread.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct WakeSignal {
+    state: Mutex<(bool, Option<std::task::Waker>)>,
+}
+
+#[cfg(target_os = "macos")]
+impl WakeSignal {
+    fn wake(&self) {
+        let waker = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.0 = true;
+            state.1.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn wait(&self) -> WakeWait<'_> {
+        WakeWait(self)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct WakeWait<'a>(&'a WakeSignal);
+
+#[cfg(target_os = "macos")]
+impl std::future::Future for WakeWait<'_> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.0 {
+            state.0 = false;
+            std::task::Poll::Ready(())
+        } else {
+            state.1 = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// The render thread body: owns the Metal queue, Skia context, raster caches,
+/// buffer pool, and the scene snapshot for the view's whole lifetime, and
+/// serves one job at a time. Every job runs inside its own autorelease pool
+/// (and the whole body inside an outer one for bring-up and tear-down) since
+/// this thread has no run loop of its own.
+#[cfg(target_os = "macos")]
+fn render_thread_main(
+    size: (u32, u32),
+    jobs: mpsc::Receiver<RenderJob>,
+    replies: mpsc::Sender<RenderReply>,
+    signal: Arc<WakeSignal>,
+) {
+    metal::objc::rc::autoreleasepool(|| render_thread_loop(size, jobs, replies, signal));
+}
+
+#[cfg(target_os = "macos")]
+fn render_thread_loop(
+    size: (u32, u32),
+    jobs: mpsc::Receiver<RenderJob>,
+    replies: mpsc::Sender<RenderReply>,
+    signal: Arc<WakeSignal>,
+) {
+    let mut renderer = match MacGpuRenderer::new(size) {
+        Ok(renderer) => renderer,
+        Err(error) => {
+            let _ = replies.send(RenderReply::InitFailed(error));
+            signal.wake();
+            return;
+        }
+    };
+    let mut snapshot: Option<Box<SceneSnapshot>> = None;
+    while let Ok(job) = jobs.recv() {
+        let RenderJob {
+            source,
+            request,
+            recycled,
+        } = job;
+        let reply = metal::objc::rc::autoreleasepool(|| {
+            for buffer in recycled {
+                renderer.recycle(buffer.0);
+            }
+            let result = match source {
+                RenderSource::Snapshot(fresh) => {
+                    if let Some(fresh) = fresh {
+                        // The stale copy (if any) drops here, off the UI thread.
+                        snapshot = Some(fresh);
+                    }
+                    match snapshot.as_deref() {
+                        Some(snapshot) => renderer.render_frame(snapshot.inputs(), &request),
+                        None => Err(anyhow!("render thread has no scene snapshot")),
+                    }
+                }
+                RenderSource::Live(live) => {
+                    // SAFETY: the UI thread is blocked in `render_blocking`
+                    // until this job's reply is received.
+                    let inputs = unsafe { live.inputs() };
+                    renderer.render_frame(inputs, &request)
+                }
+            };
+            RenderReply::Frame {
+                key: request.key,
+                scale_factor: request.scale_factor,
+                result: result.map(|(buffer, duration)| (SendBuffer(buffer), duration)),
+            }
+        });
+        if replies.send(reply).is_err() {
+            break;
+        }
+        signal.wake();
+    }
+}
+
+/// The Skia-Metal raster engine, owned by the render thread: renders one
+/// frame at a time into IOSurface-backed pixel buffers from its pool.
+#[cfg(target_os = "macos")]
+struct MacGpuRenderer {
+    raster_renderer: RasterRenderer,
+    direct_context: skia_safe::gpu::DirectContext,
+    texture_cache: CVMetalTextureCache,
+    _device: metal::Device,
+    _command_queue: metal::CommandQueue,
+    size: (u32, u32),
+    /// Recycled pixel buffers matching `size`. Reusing them avoids a
+    /// multi-megabyte IOSurface allocation per frame.
+    buffer_pool: Vec<CVPixelBuffer>,
 }
 
 #[cfg(target_os = "macos")]
 impl MacGpuRenderer {
-    const BUFFER_POOL_LIMIT: usize = 3;
-    const IN_FLIGHT_FRAMES: usize = 2;
-    /// Floor on how often the scene is re-rendered while the viewport is
-    /// animating. Frames in between reuse the previous render reprojected,
-    /// which keeps pans and zooms at display rate no matter the scene cost —
-    /// the same blurry-then-sharp trade design tools like Figma make. The
-    /// live window grows with the measured render cost (see
-    /// [`render_interval`]) up to [`Self::MAX_RENDER_INTERVAL`].
-    const MIN_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
-    /// Ceiling on the adaptive reproject window.
-    const MAX_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-    /// Reproject for this many multiples of the last render's duration before
-    /// paying for the next fresh frame mid-interaction.
-    const REPROJECT_COST_FACTOR: u32 = 3;
-    /// Beyond this zoom ratio a reprojected frame is too blurry or too sparse
-    /// to be useful; render fresh even mid-interaction.
-    const MAX_REPROJECT_SCALE: f64 = 3.0;
+    /// Enough to keep the steady-state cycle (one frame rendering, the newest
+    /// presented, two retired) allocation-free without hoarding IOSurfaces.
+    const BUFFER_POOL_LIMIT: usize = 2;
+    /// Ganesh resource-cache budget shared by image textures and the engine's
+    /// effect-layer cache. Sized so a dense page's mipped image set (~450 MB
+    /// on the sample Design page) plus ~100 MB of cached layers stay resident.
+    const GPU_RESOURCE_CACHE_BYTES: usize = 1024 << 20;
 
-    pub(crate) fn new(size: (u32, u32)) -> Result<Self> {
+    fn new(size: (u32, u32)) -> Result<Self> {
         let device = metal::Device::system_default()
             .ok_or_else(|| anyhow!("Metal system default device is unavailable"))?;
         let command_queue = device.new_command_queue();
@@ -316,12 +826,21 @@ impl MacGpuRenderer {
                 command_queue.as_ptr() as mtl::Handle,
             )
         };
-        let direct_context = direct_contexts::make_metal(&backend, None)
+        let mut direct_context = direct_contexts::make_metal(&backend, None)
             .ok_or_else(|| anyhow!("creating Skia Metal context failed"))?;
+        // Ganesh's 256 MB default evicts a dense page's image textures every
+        // frame (22 assets on the sample Design page mip to ~450 MB), forcing
+        // a re-upload per render; the layer cache shares the same budget.
+        direct_context.set_resource_cache_limit(Self::GPU_RESOURCE_CACHE_BYTES);
         let texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
             .map_err(|status| anyhow!("creating CoreVideo Metal texture cache failed: {status}"))?;
-        let raster_renderer =
+        let mut raster_renderer =
             RasterRenderer::new(size.0, size.1).context("creating Skia renderer state")?;
+        // Trackpad pans are fractional logical pixels; snapping the viewport's
+        // device translation to whole pixels (<= 0.5 px) lets the engine's
+        // effect-layer cache hit across pans instead of re-rendering every
+        // blurred/shadowed subtree per frame.
+        raster_renderer.set_pixel_snap_pan(true);
 
         Ok(Self {
             raster_renderer,
@@ -331,32 +850,15 @@ impl MacGpuRenderer {
             _command_queue: command_queue,
             size,
             buffer_pool: Vec::new(),
-            retired: std::collections::VecDeque::new(),
-            cached: None,
-            last_render_at: None,
-            last_render_duration: std::time::Duration::ZERO,
         })
     }
 
-    pub(crate) fn invalidate(&mut self) {
-        if let Some(cached) = self.cached.take() {
-            self.retire(cached.buffer);
-        }
-    }
-
-    /// Queue a previously presented buffer for reuse once enough newer frames
-    /// have shipped that the compositor cannot still be reading it.
-    fn retire(&mut self, buffer: CVPixelBuffer) {
-        self.retired.push_back(buffer);
-        while self.retired.len() > Self::IN_FLIGHT_FRAMES {
-            if let Some(buffer) = self.retired.pop_front() {
-                self.recycle(buffer);
-            }
-        }
-    }
-
+    /// Return a buffer the compositor has finished with to the pool. Buffers
+    /// of a stale size (the element was resized meanwhile) are dropped.
     fn recycle(&mut self, buffer: CVPixelBuffer) {
-        if self.buffer_pool.len() < Self::BUFFER_POOL_LIMIT {
+        let matches_size = buffer.get_width() == self.size.0 as usize
+            && buffer.get_height() == self.size.1 as usize;
+        if matches_size && self.buffer_pool.len() < Self::BUFFER_POOL_LIMIT {
             self.buffer_pool.push(buffer);
         }
     }
@@ -373,8 +875,6 @@ impl MacGpuRenderer {
             .context("resizing Skia renderer state")?;
         self.size = size;
         self.buffer_pool.clear();
-        self.retired.clear();
-        self.cached = None;
         Ok(())
     }
 
@@ -385,55 +885,19 @@ impl MacGpuRenderer {
         create_bgra_pixel_buffer(size.0, size.1)
     }
 
-    fn render(
+    /// Render one frame for `request` from `inputs` into a pooled buffer.
+    /// Returns the buffer with its GPU work complete (the compositor samples
+    /// the IOSurface as soon as it is presented) and the wall time it took.
+    fn render_frame(
         &mut self,
-        document: &FigDocument,
-        page_root: Option<NodeId>,
-        size: (u32, u32),
-        frame_logical: (f64, f64),
-        visible_logical: (f64, f64),
-        viewport: Viewport,
-        scale_factor: f32,
-        motion: Option<&MotionEvaluation>,
-    ) -> Result<GpuFrame> {
-        let key = SurfaceKey {
-            size,
-            viewport_center: viewport.center,
-            viewport_zoom: viewport.zoom,
-            page_root,
-            revision: document.render_generation(),
-            motion_frame: motion.map(MotionFrameKey::from),
-        };
-        if let Some(cached) = &self.cached {
-            let within_render_interval = self
-                .last_render_at
-                .is_some_and(|at| at.elapsed() < render_interval(self.last_render_duration));
-            match frame_decision(
-                &cached.key,
-                &key,
-                frame_logical,
-                visible_logical,
-                within_render_interval,
-            ) {
-                FrameDecision::ReuseCached => {
-                    return Ok(GpuFrame::Fresh(cached.buffer.clone()));
-                }
-                FrameDecision::Reproject => {
-                    return Ok(GpuFrame::Reprojected {
-                        buffer: cached.buffer.clone(),
-                        viewport: Viewport {
-                            center: cached.key.viewport_center,
-                            zoom: cached.key.viewport_zoom,
-                        },
-                    });
-                }
-                FrameDecision::RenderFresh => {}
-            }
-        }
-
+        inputs: FrameInputs<'_>,
+        request: &RenderRequest,
+    ) -> Result<(CVPixelBuffer, Duration)> {
+        let size = request.key.size;
         self.resize(size)?;
-        if let Some(asset_resolver) = document.asset_resolver.clone() {
-            self.raster_renderer.set_asset_resolver(asset_resolver);
+        if let Some(asset_resolver) = inputs.asset_resolver {
+            self.raster_renderer
+                .set_asset_resolver(asset_resolver.clone());
         }
 
         let pixel_buffer = self.take_buffer(size)?;
@@ -468,45 +932,440 @@ impl MacGpuRenderer {
         .ok_or_else(|| anyhow!("wrapping Metal texture as Skia surface failed"))?;
 
         let render_viewport = Viewport {
-            center: viewport.center,
-            zoom: viewport.zoom * f64::from(scale_factor),
+            center: request.key.viewport_center,
+            zoom: request.key.viewport_zoom * f64::from(request.scale_factor),
         };
-        let inputs = RenderInputs {
-            components: &document.doc.components,
-            variables: &document.doc.variables,
-            active_modes: &document.doc.active_modes,
-            mode_generation: document.render_generation(),
-            motion,
+        let render_inputs = RenderInputs {
+            components: inputs.components,
+            variables: inputs.variables,
+            active_modes: inputs.active_modes,
+            mode_generation: request.key.revision,
+            motion: request.motion.as_ref(),
             playback: None,
             dark_ui: false,
         };
-        let render_started = std::time::Instant::now();
+        let render_started = Instant::now();
         self.raster_renderer.render_to_canvas(
             surface.canvas(),
             size.0,
             size.1,
-            &document.doc.scene,
+            inputs.scene,
             &render_viewport,
-            page_root,
-            &inputs,
+            request.key.page_root,
+            &render_inputs,
         );
         // The compositor samples the IOSurface as soon as we hand it to
         // `paint_surface`, so the GPU work must be complete by then.
         self.direct_context.flush_submit_and_sync_cpu();
         drop(surface);
-        // Walk + flush + GPU sync: the whole blocking cost the next reproject
-        // window is sized against.
-        self.last_render_duration = render_started.elapsed();
+        // Walk + flush + GPU sync: the whole cost of a fresh frame, measured
+        // on the render thread.
+        let duration = render_started.elapsed();
+        crate::report_slow("canvas scene render", render_started);
+        Ok((pixel_buffer, duration))
+    }
+}
 
-        if let Some(previous) = self.cached.take() {
+/// A completed frame held on the UI side.
+#[cfg(target_os = "macos")]
+struct CompletedFrame {
+    buffer: CVPixelBuffer,
+    key: SurfaceKey,
+    /// The frame's logical extent, for reprojection after an element resize.
+    logical: (f64, f64),
+}
+
+/// The UI-thread side of the canvas: the newest completed frame, the render
+/// thread's channels, the presented-buffer retirement queue, and the
+/// cheap-vs-expensive policy state. Owned by [`FigView`].
+///
+/// [`FigView`]: crate::view::FigView
+#[cfg(target_os = "macos")]
+pub(crate) struct GpuCanvas {
+    jobs: mpsc::Sender<RenderJob>,
+    replies: mpsc::Receiver<RenderReply>,
+    /// UI-side task that repaints the view when the render thread replies
+    /// (woken through the thread's [`WakeSignal`]).
+    _reply_task: Task<()>,
+    /// Set once the render thread is unusable; the canvas then paints through
+    /// the CPU fallback.
+    failed: Option<String>,
+    consecutive_failures: u32,
+    /// The request the render thread is working on, if any. At most one.
+    in_flight: Option<SurfaceKey>,
+    newest: Option<CompletedFrame>,
+    /// Buffers handed to the compositor recently. They only graduate to the
+    /// render thread's pool after `IN_FLIGHT_FRAMES` newer frames were
+    /// presented, because the window server may still be scanning them out —
+    /// rendering into one too early tears or corrupts the displayed frame.
+    retired: VecDeque<CVPixelBuffer>,
+    /// Graduated buffers waiting to ride along with the next job.
+    to_recycle: Vec<SendBuffer>,
+    /// The snapshot the render thread currently holds.
+    worker_snapshot: Option<SnapshotStamp>,
+    cost: RenderCost,
+    last_render_at: Option<Instant>,
+    /// Wall time of the most recent scene render. Drives the adaptive
+    /// reproject window on cheap scenes — see [`render_interval`].
+    last_render_duration: Duration,
+    epoch: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl GpuCanvas {
+    const IN_FLIGHT_FRAMES: usize = 2;
+    /// Floor on how often a cheap scene is re-rendered while the viewport is
+    /// animating. Frames in between reuse the previous render reprojected. The
+    /// live window grows with the measured render cost (see
+    /// [`render_interval`]) up to [`Self::MAX_RENDER_INTERVAL`].
+    const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(33);
+    /// Ceiling on the adaptive reproject window.
+    const MAX_RENDER_INTERVAL: Duration = Duration::from_millis(250);
+    /// Reproject for this many multiples of the last render's duration before
+    /// paying for the next fresh frame mid-interaction.
+    const REPROJECT_COST_FACTOR: u32 = 3;
+    /// Beyond this zoom ratio a reprojected frame is too blurry or too sparse
+    /// to stand in for a cheap scene's fresh render.
+    const MAX_REPROJECT_SCALE: f64 = 3.0;
+    /// A render at or under this cost may block paint (it fits a display
+    /// frame); anything slower moves to the render thread.
+    const SYNC_RENDER_BUDGET: Duration = Duration::from_millis(16);
+    /// An expensive scene returns to blocking renders once a render measures
+    /// under this — below the entry budget so a scene hovering around it does
+    /// not flap between modes every frame.
+    const ASYNC_EXIT_BUDGET: Duration = Duration::from_millis(12);
+    /// Consecutive failed renders before the GPU path is abandoned for the
+    /// CPU fallback, so a persistently failing device does not spin.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+    pub(crate) fn new(size: (u32, u32), cx: &mut Context<FigView>) -> Self {
+        let (jobs, job_rx) = mpsc::channel();
+        let (reply_tx, replies) = mpsc::channel();
+        let signal = Arc::new(WakeSignal::default());
+        let thread_signal = signal.clone();
+        let spawned = std::thread::Builder::new()
+            .name("fanta-canvas-render".into())
+            .spawn(move || render_thread_main(size, job_rx, reply_tx, thread_signal));
+        let failed = spawned
+            .err()
+            .map(|error| format!("spawning the canvas render thread failed: {error}"));
+
+        let reply_task = cx.spawn(async move |this, cx| {
+            loop {
+                signal.wait().await;
+                if this
+                    .update(cx, |view, cx| view.on_gpu_canvas_reply(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        Self {
+            jobs,
+            replies,
+            _reply_task: reply_task,
+            failed,
+            consecutive_failures: 0,
+            in_flight: None,
+            newest: None,
+            retired: VecDeque::new(),
+            to_recycle: Vec::new(),
+            worker_snapshot: None,
+            cost: RenderCost::Unknown,
+            last_render_at: None,
+            last_render_duration: Duration::ZERO,
+            epoch: 0,
+        }
+    }
+
+    /// The GPU path is usable (the render thread came up and keeps working).
+    pub(crate) fn is_available(&self) -> bool {
+        self.failed.is_none()
+    }
+
+    /// Force the next paint to render anew even if nothing else changed.
+    pub(crate) fn invalidate(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Drain every reply the render thread has produced. Returns whether any
+    /// arrived (the caller repaints in that case: either a new frame landed
+    /// or the thread went idle and paint should re-plan).
+    fn pump_replies(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(reply) = self.replies.try_recv() {
+            self.handle_reply(reply);
+            any = true;
+        }
+        any
+    }
+
+    fn handle_reply(&mut self, reply: RenderReply) {
+        match reply {
+            RenderReply::Frame {
+                key,
+                scale_factor,
+                result,
+            } => {
+                self.in_flight = None;
+                match result {
+                    Ok((buffer, duration)) => {
+                        self.consecutive_failures = 0;
+                        self.install_frame(key, scale_factor, buffer.0, duration);
+                    }
+                    Err(error) => {
+                        self.consecutive_failures += 1;
+                        log::warn!("failed to render .fig canvas with Skia Metal: {error:#}");
+                        if self.consecutive_failures >= Self::MAX_CONSECUTIVE_FAILURES {
+                            self.failed = Some(format!(
+                                "{} consecutive Skia Metal render failures; using the CPU raster path",
+                                self.consecutive_failures
+                            ));
+                        }
+                    }
+                }
+            }
+            RenderReply::InitFailed(error) => {
+                self.in_flight = None;
+                self.failed = Some(format!("Skia Metal is unavailable: {error:#}"));
+            }
+        }
+    }
+
+    fn install_frame(
+        &mut self,
+        key: SurfaceKey,
+        scale_factor: f32,
+        buffer: CVPixelBuffer,
+        duration: Duration,
+    ) {
+        let scale = f64::from(scale_factor.max(f32::EPSILON));
+        let logical = (f64::from(key.size.0) / scale, f64::from(key.size.1) / scale);
+        let previous = self.newest.take();
+        self.cost = cost_after_install(
+            previous.as_ref().map(|frame| &frame.key),
+            &key,
+            self.cost,
+            duration,
+        );
+        if let Some(previous) = previous {
             self.retire(previous.buffer);
         }
-        self.cached = Some(CachedSurface {
-            buffer: pixel_buffer.clone(),
+        self.newest = Some(CompletedFrame {
+            buffer,
             key,
+            logical,
         });
-        self.last_render_at = Some(std::time::Instant::now());
-        Ok(GpuFrame::Fresh(pixel_buffer))
+        self.last_render_duration = duration;
+        self.last_render_at = Some(Instant::now());
+    }
+
+    /// Queue a previously presented buffer for reuse once enough newer frames
+    /// have shipped that the compositor cannot still be reading it.
+    fn retire(&mut self, buffer: CVPixelBuffer) {
+        self.retired.push_back(buffer);
+        while self.retired.len() > Self::IN_FLIGHT_FRAMES {
+            if let Some(buffer) = self.retired.pop_front() {
+                self.to_recycle.push(SendBuffer(buffer));
+            }
+        }
+    }
+
+    /// Hand the render thread one job. Coalesced by construction: paint only
+    /// dispatches while nothing is in flight, and always for the latest
+    /// viewport, so a burst of pan ticks costs one render, not a queue.
+    fn dispatch(&mut self, source: RenderSource, request: RenderRequest) -> Result<()> {
+        if let Some(reason) = &self.failed {
+            return Err(anyhow!("{reason}"));
+        }
+        if let RenderSource::Snapshot(Some(snapshot)) = &source {
+            self.worker_snapshot = Some(snapshot.stamp);
+        }
+        let key = request.key;
+        let job = RenderJob {
+            source,
+            request,
+            recycled: std::mem::take(&mut self.to_recycle),
+        };
+        if self.jobs.send(job).is_err() {
+            self.failed = Some("the canvas render thread exited".into());
+            return Err(anyhow!("the canvas render thread exited"));
+        }
+        self.in_flight = Some(key);
+        Ok(())
+    }
+
+    /// Render from the live document and wait for it — only for cheap scenes,
+    /// where blocking is invisible and skipping the snapshot copy matters.
+    fn render_blocking(&mut self, live: LiveInputs, request: RenderRequest) -> Result<()> {
+        let key = request.key;
+        self.dispatch(RenderSource::Live(live), request)?;
+        loop {
+            match self.replies.recv() {
+                Ok(reply) => {
+                    let (is_ours, failure) = match &reply {
+                        RenderReply::Frame {
+                            key: reply_key,
+                            result,
+                            ..
+                        } if *reply_key == key => (
+                            true,
+                            result.as_ref().err().map(|error| format!("{error:#}")),
+                        ),
+                        RenderReply::InitFailed(error) => (true, Some(format!("{error:#}"))),
+                        _ => (false, None),
+                    };
+                    self.handle_reply(reply);
+                    if is_ours {
+                        return match failure {
+                            Some(message) => Err(anyhow!("{message}")),
+                            None => Ok(()),
+                        };
+                    }
+                }
+                Err(_) => {
+                    // The render thread is gone: whatever it was reading is
+                    // no longer touched, so the live borrow ends safely.
+                    self.in_flight = None;
+                    self.failed = Some("the canvas render thread exited".into());
+                    return Err(anyhow!("the canvas render thread exited mid-render"));
+                }
+            }
+        }
+    }
+
+    /// The frame to paint for `requested`: the newest completed frame, fresh
+    /// when it matches and reprojected otherwise. Nothing when the newest
+    /// frame shows a different page — its pixels would be wrong content, not
+    /// merely stale.
+    fn present(&self, requested: &SurfaceKey) -> Option<GpuFrame> {
+        let newest = self.newest.as_ref()?;
+        if newest.key.page_root != requested.page_root {
+            return None;
+        }
+        if newest.key == *requested {
+            return Some(GpuFrame::Fresh(newest.buffer.clone()));
+        }
+        Some(GpuFrame::Reprojected {
+            buffer: newest.buffer.clone(),
+            viewport: Viewport {
+                center: newest.key.viewport_center,
+                zoom: newest.key.viewport_zoom,
+            },
+            logical: newest.logical,
+        })
+    }
+
+    /// One paint pass: pick up replies, plan against the newest frame, do the
+    /// planned work (dispatch or block), and return what to present plus
+    /// whether an immediate repaint should follow.
+    fn paint_frame(
+        &mut self,
+        document: &FigDocument,
+        page_root: Option<NodeId>,
+        size: (u32, u32),
+        frame_logical: (f64, f64),
+        visible_logical: (f64, f64),
+        viewport: Viewport,
+        scale_factor: f32,
+        motion: Option<MotionEvaluation>,
+    ) -> Result<(Option<GpuFrame>, bool)> {
+        self.pump_replies();
+        if let Some(reason) = &self.failed {
+            return Err(anyhow!("{reason}"));
+        }
+        let key = SurfaceKey {
+            size,
+            viewport_center: viewport.center,
+            viewport_zoom: viewport.zoom,
+            page_root,
+            revision: document.render_generation(),
+            scene: (
+                document.doc.scene.instance_id(),
+                document.doc.scene.revision(),
+            ),
+            epoch: self.epoch,
+            motion_frame: motion.as_ref().map(MotionFrameKey::from),
+        };
+        let within_render_interval = self
+            .last_render_at
+            .is_some_and(|at| at.elapsed() < render_interval(self.last_render_duration));
+        let plan = plan_paint(
+            self.newest.as_ref().map(|frame| &frame.key),
+            &key,
+            self.in_flight.is_some(),
+            self.cost,
+            frame_logical,
+            visible_logical,
+            within_render_interval,
+        );
+        let request = RenderRequest {
+            key,
+            scale_factor,
+            motion,
+        };
+        let mut repaint = false;
+        match plan {
+            PaintPlan::Present | PaintPlan::PresentAndWait => {}
+            PaintPlan::Reproject => repaint = true,
+            PaintPlan::RenderBlocking => {
+                self.render_blocking(LiveInputs::of(document), request)?;
+            }
+            PaintPlan::PresentAndRender => {
+                let stamp = SnapshotStamp::of(document);
+                let snapshot = (self.worker_snapshot != Some(stamp)).then(|| {
+                    let started = Instant::now();
+                    let snapshot = Box::new(SceneSnapshot::capture(document, stamp));
+                    crate::report_slow("canvas scene snapshot", started);
+                    snapshot
+                });
+                self.dispatch(RenderSource::Snapshot(snapshot), request)?;
+            }
+        }
+        Ok((self.present(&key), repaint))
+    }
+}
+
+// Dropping a `GpuCanvas` closes the job channel, which ends the render thread
+// after its current job; the thread owns the Metal context and the snapshot and
+// drops them itself. The reply task is cancelled with its handle. A blocking
+// (live-document) job can never be in progress at that point, because the UI
+// thread — the only one that can drop the canvas — waits for its reply.
+
+#[cfg(target_os = "macos")]
+impl FigView {
+    /// Make sure the render thread exists for a `size` canvas. Returns whether
+    /// the GPU path can serve this paint.
+    pub(crate) fn ensure_gpu_canvas(&mut self, size: (u32, u32), cx: &mut Context<Self>) -> bool {
+        // gpui's deterministic test scheduler forbids task activity from
+        // threads it does not drive, and the render thread wakes the UI-side
+        // reply task from outside it; unit tests paint through the CPU raster
+        // path instead (the same scene, synchronously).
+        if cfg!(test) {
+            return false;
+        }
+        if self.gpu_canvas.is_none() {
+            self.gpu_canvas = Some(GpuCanvas::new(size, cx));
+        }
+        self.gpu_canvas
+            .as_ref()
+            .is_some_and(GpuCanvas::is_available)
+    }
+
+    /// The render thread signalled: pick up its replies and repaint so paint
+    /// presents the new frame (or, if it went idle, requests the next one).
+    pub(crate) fn on_gpu_canvas_reply(&mut self, cx: &mut Context<Self>) {
+        let Some(gpu) = self.gpu_canvas.as_mut() else {
+            return;
+        };
+        if gpu.pump_replies() {
+            if let Some(reason) = gpu.failed.as_deref() {
+                log::warn!("falling back to the CPU canvas: {reason}");
+            }
+            cx.notify();
+        }
     }
 }
 
@@ -832,6 +1691,10 @@ impl Element for CanvasElement {
             let viewport = this
                 .viewport()
                 .ok_or_else(|| anyhow!("Figma canvas viewport was not initialized"))?;
+            // Bring the render thread up before borrowing the document: its
+            // construction needs the entity context, which the borrow pins.
+            #[cfg(target_os = "macos")]
+            let gpu_available = this.ensure_gpu_canvas(render_size, cx);
             let item = this.item().clone();
             let item = item.read(cx);
             let document = item
@@ -854,12 +1717,10 @@ impl Element for CanvasElement {
             let motion = this.motion_evaluation(document, cx);
 
             #[cfg(target_os = "macos")]
+            if gpu_available
+                && let Some(gpu) = this.gpu_canvas.as_mut()
             {
-                let mut gpu_renderer = match this.take_gpu_renderer() {
-                    Some(renderer) => renderer,
-                    None => MacGpuRenderer::new(render_size)?,
-                };
-                let gpu_result = gpu_renderer.render(
+                match gpu.paint_frame(
                     document,
                     page_root,
                     render_size,
@@ -867,19 +1728,11 @@ impl Element for CanvasElement {
                     bounds_size(bounds),
                     viewport,
                     scale_factor,
-                    motion.as_ref(),
-                );
-                this.store_gpu_renderer(gpu_renderer);
-                match gpu_result {
-                    Ok(frame) => {
+                    motion.clone(),
+                ) {
+                    Ok((frame, repaint)) => {
                         this.clear_rendered_canvas();
-                        if matches!(frame, GpuFrame::Reprojected { .. }) {
-                            // Repaint immediately so a fresh render lands as
-                            // soon as the throttle window opens; the chain
-                            // stops once the cache matches the viewport.
-                            cx.notify();
-                        }
-                        return Ok(PaintCanvas::Surface { frame, viewport });
+                        return Ok((PaintCanvas::Surface { frame, viewport }, repaint));
                     }
                     Err(error) => {
                         log::warn!(
@@ -897,29 +1750,46 @@ impl Element for CanvasElement {
                 scale_factor,
                 motion.as_ref(),
             )
-                .map(PaintCanvas::Image)
+            .map(|image| (PaintCanvas::Image(image), false))
         });
-        crate::report_slow("canvas scene render", paint_started);
+        // UI-thread cost of this paint: presenting the newest frame, plus a
+        // blocking render only on a cheap scene. The scene raster itself logs
+        // "canvas scene render" from the render thread.
+        crate::report_slow("canvas present", paint_started);
 
         match paint_canvas {
             #[cfg(target_os = "macos")]
-            Ok(PaintCanvas::Surface { frame, viewport }) => match frame {
-                GpuFrame::Fresh(surface) => {
-                    window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                        window.paint_surface(frame_bounds, surface);
-                    });
+            Ok((PaintCanvas::Surface { frame, viewport }, repaint)) => {
+                match frame {
+                    Some(GpuFrame::Fresh(surface)) => {
+                        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                            window.paint_surface(frame_bounds, surface);
+                        });
+                    }
+                    Some(GpuFrame::Reprojected {
+                        buffer,
+                        viewport: cached_viewport,
+                        logical,
+                    }) => {
+                        let projected =
+                            reprojected_bounds(frame_bounds, logical, cached_viewport, viewport);
+                        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                            window.paint_surface(projected, buffer);
+                        });
+                    }
+                    // Nothing rendered yet for this page: the canvas background
+                    // shows until the render thread delivers the first frame.
+                    None => {}
                 }
-                GpuFrame::Reprojected {
-                    buffer,
-                    viewport: cached_viewport,
-                } => {
-                    let projected = reprojected_bounds(frame_bounds, cached_viewport, viewport);
-                    window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-                        window.paint_surface(projected, buffer);
-                    });
+                if repaint {
+                    // Cheap scene inside the reproject window: repaint
+                    // immediately so the sharp frame lands as soon as the
+                    // window opens; the chain stops once the newest frame
+                    // matches the viewport.
+                    self.view.update(cx, |_, cx| cx.notify());
                 }
-            },
-            Ok(PaintCanvas::Image(image)) => {
+            }
+            Ok((PaintCanvas::Image(image), _)) => {
                 if let Err(error) = window
                     .with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                         window.paint_image(frame_bounds, Default::default(), image, 0, false)
@@ -2603,7 +3473,7 @@ mod tests {
         };
         let cached = viewport([0.0, 0.0], 1.0);
         let current = viewport([10.0, 0.0], 1.0);
-        let projected = reprojected_bounds(bounds, cached, current);
+        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, current);
         // Panning the viewport 10 world units right moves the old frame's
         // content 10 px left at zoom 1.
         assert!((f32::from(projected.origin.x) - -10.0).abs() < 1e-4);
@@ -2619,7 +3489,7 @@ mod tests {
         };
         let cached = viewport([0.0, 0.0], 1.0);
         let current = viewport([0.0, 0.0], 2.0);
-        let projected = reprojected_bounds(bounds, cached, current);
+        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, current);
         // Doubling the zoom doubles the old frame around the element center.
         assert!((f32::from(projected.size.width) - 200.0).abs() < 1e-4);
         assert!((f32::from(projected.origin.x) - -50.0).abs() < 1e-4);
@@ -2632,6 +3502,8 @@ mod tests {
             viewport_zoom: zoom,
             page_root: None,
             revision,
+            scene: (1, 0),
+            epoch: 0,
             motion_frame: None,
         }
     }
@@ -2727,8 +3599,8 @@ mod tests {
         // still covers the view — only the 3× scale cap forces the fresh
         // render here.
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        let at_cap = surface_key([0.0, 0.0], MacGpuRenderer::MAX_REPROJECT_SCALE, 7);
-        let beyond_cap = surface_key([0.0, 0.0], MacGpuRenderer::MAX_REPROJECT_SCALE * 1.01, 7);
+        let at_cap = surface_key([0.0, 0.0], GpuCanvas::MAX_REPROJECT_SCALE, 7);
+        let beyond_cap = surface_key([0.0, 0.0], GpuCanvas::MAX_REPROJECT_SCALE * 1.01, 7);
         assert_eq!(
             frame_decision(&cached, &at_cap, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::Reproject
@@ -2753,11 +3625,7 @@ mod tests {
             FrameDecision::Reproject
         );
         // Past the reproject scale cap the frame is too sparse to be useful.
-        let far_out = surface_key(
-            [0.0, 0.0],
-            1.0 / (MacGpuRenderer::MAX_REPROJECT_SCALE * 1.01),
-            7,
-        );
+        let far_out = surface_key([0.0, 0.0], 1.0 / (GpuCanvas::MAX_REPROJECT_SCALE * 1.01), 7);
         assert_eq!(
             frame_decision(&cached, &far_out, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::RenderFresh
@@ -2797,11 +3665,11 @@ mod tests {
         // Cheap renders keep the display-rate floor.
         assert_eq!(
             render_interval(Duration::from_millis(3)),
-            MacGpuRenderer::MIN_RENDER_INTERVAL
+            GpuCanvas::MIN_RENDER_INTERVAL
         );
         assert_eq!(
             render_interval(Duration::ZERO),
-            MacGpuRenderer::MIN_RENDER_INTERVAL
+            GpuCanvas::MIN_RENDER_INTERVAL
         );
         // A 32 ms render earns three renders' worth of reprojected frames.
         assert_eq!(
@@ -2811,7 +3679,7 @@ mod tests {
         // Pathological renders are capped so the sharp frame still lands.
         assert_eq!(
             render_interval(Duration::from_millis(145)),
-            MacGpuRenderer::MAX_RENDER_INTERVAL
+            GpuCanvas::MAX_RENDER_INTERVAL
         );
     }
 
@@ -2852,8 +3720,406 @@ mod tests {
         // from the third tick on.
         let fixed_window_reprojects = decisions
             .iter()
-            .filter(|(elapsed, _)| *elapsed < MacGpuRenderer::MIN_RENDER_INTERVAL)
+            .filter(|(elapsed, _)| *elapsed < GpuCanvas::MIN_RENDER_INTERVAL)
             .count();
         assert!(fixed_window_reprojects <= 2);
+    }
+
+    #[test]
+    fn a_reprojected_frame_of_another_size_keeps_its_own_extent() {
+        // After the element grew from 100×100 to 200×200 the old frame still
+        // covers 100 logical px, centered on the shared world center.
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(200.), px(200.)),
+        };
+        let cached = viewport([0.0, 0.0], 1.0);
+        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, cached);
+        assert!((f32::from(projected.size.width) - 100.0).abs() < 1e-4);
+        assert!((f32::from(projected.origin.x) - 50.0).abs() < 1e-4);
+        assert!((f32::from(projected.origin.y) - 50.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_scene_write_that_bypasses_the_generation_counter_renders_fresh() {
+        // Same generation, but the scene's own revision moved (an in-place
+        // `get_mut` edit): the cached pixels are stale.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let mut requested = cached;
+        requested.scene = (1, 1);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+        // And so does a canvas-side invalidation.
+        let mut invalidated = cached;
+        invalidated.epoch = 1;
+        assert_eq!(
+            frame_decision(&cached, &invalidated, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+    }
+
+    // ---- paint plan: the render thread policy ---------------------------
+
+    fn plan(
+        newest: Option<&SurfaceKey>,
+        requested: &SurfaceKey,
+        in_flight: bool,
+        cost: RenderCost,
+        within: bool,
+    ) -> PaintPlan {
+        plan_paint(
+            newest,
+            requested,
+            in_flight,
+            cost,
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL,
+            within,
+        )
+    }
+
+    #[test]
+    fn a_matching_newest_frame_is_presented_as_is() {
+        let key = surface_key([0.0, 0.0], 1.0, 7);
+        for cost in [
+            RenderCost::Unknown,
+            RenderCost::Cheap,
+            RenderCost::Expensive,
+        ] {
+            for in_flight in [false, true] {
+                assert_eq!(
+                    plan(Some(&key), &key, in_flight, cost, false),
+                    PaintPlan::Present
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pan_never_blocks_paint_on_an_expensive_scene() {
+        // Whatever the coverage or the reproject window: on an expensive
+        // scene the newest frame is presented (shifted) and one fresh render
+        // is requested — never rendered inline.
+        let cached = surface_key([0.0, 0.0], 0.1, 7);
+        for tick in 1..=40u32 {
+            let requested = surface_key([500.0 * f64::from(tick), 0.0], 0.1, 7);
+            for within in [false, true] {
+                assert_eq!(
+                    plan(
+                        Some(&cached),
+                        &requested,
+                        false,
+                        RenderCost::Expensive,
+                        within
+                    ),
+                    PaintPlan::PresentAndRender,
+                    "tick {tick} within {within}"
+                );
+                assert_eq!(
+                    plan(
+                        Some(&cached),
+                        &requested,
+                        true,
+                        RenderCost::Expensive,
+                        within
+                    ),
+                    PaintPlan::PresentAndWait,
+                    "tick {tick} within {within} (in flight)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pan_never_blocks_paint_while_a_render_is_in_flight() {
+        // Even a cheap scene must not queue a second render or block behind
+        // the one running: present the newest frame and let the reply repaint.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let requested = surface_key([500.0, 0.0], 1.0, 7);
+        assert_eq!(
+            plan(Some(&cached), &requested, true, RenderCost::Cheap, false),
+            PaintPlan::PresentAndWait
+        );
+        assert_eq!(
+            plan(None, &requested, true, RenderCost::Cheap, false),
+            PaintPlan::PresentAndWait
+        );
+    }
+
+    #[test]
+    fn the_first_frame_renders_off_thread() {
+        // No cost measured yet: the cold render (fonts, shaders) can take
+        // seconds, so it never runs inline.
+        let requested = surface_key([0.0, 0.0], 1.0, 7);
+        assert_eq!(
+            plan(None, &requested, false, RenderCost::Unknown, false),
+            PaintPlan::PresentAndRender
+        );
+    }
+
+    #[test]
+    fn a_cheap_scene_reprojects_inside_the_window_and_blocks_outside_it() {
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let covered = surface_key([100.0, 0.0], 1.0, 7);
+        assert_eq!(
+            plan(Some(&cached), &covered, false, RenderCost::Cheap, true),
+            PaintPlan::Reproject
+        );
+        assert_eq!(
+            plan(Some(&cached), &covered, false, RenderCost::Cheap, false),
+            PaintPlan::RenderBlocking
+        );
+        // An edit renders inline on a cheap scene: no snapshot round trip.
+        let edited = surface_key([0.0, 0.0], 1.0, 8);
+        assert_eq!(
+            plan(Some(&cached), &edited, false, RenderCost::Cheap, true),
+            PaintPlan::RenderBlocking
+        );
+        // So does a zoom-in past the reproject cap: it reveals nothing the
+        // newest frame did not already walk.
+        let zoomed_in = surface_key([0.0, 0.0], GpuCanvas::MAX_REPROJECT_SCALE * 1.5, 7);
+        assert_eq!(
+            plan(Some(&cached), &zoomed_in, false, RenderCost::Cheap, true),
+            PaintPlan::RenderBlocking
+        );
+    }
+
+    #[test]
+    fn revealing_content_beyond_the_newest_frame_never_blocks_paint() {
+        // A cheap class only says the LAST frame's content was cheap. A pan
+        // past the render margin or a zoom-out reveals nodes the renderer may
+        // never have walked — cold text shaping and image uploads cost seconds
+        // on a large page (a 4 s inline render was measured on a pan from the
+        // fit view into unvisited content) — so those go to the render thread,
+        // presenting the newest frame reprojected meanwhile.
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let uncovered_pan = surface_key([200.0, 0.0], 1.0, 7);
+        for within in [false, true] {
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &uncovered_pan,
+                    false,
+                    RenderCost::Cheap,
+                    within
+                ),
+                PaintPlan::PresentAndRender,
+                "uncovered pan, within {within}"
+            );
+        }
+        // Zoom-out: reprojected while the throttle is closed, then off-thread.
+        let zoomed_out = surface_key([0.0, 0.0], 0.5, 7);
+        assert_eq!(
+            plan(Some(&cached), &zoomed_out, false, RenderCost::Cheap, true),
+            PaintPlan::Reproject
+        );
+        assert_eq!(
+            plan(Some(&cached), &zoomed_out, false, RenderCost::Cheap, false),
+            PaintPlan::PresentAndRender
+        );
+        // A fit-to-page jump from a cheap close-up: never inline.
+        let fit = surface_key([3000.0, 3000.0], 0.1, 7);
+        assert_eq!(
+            plan(Some(&cached), &fit, false, RenderCost::Cheap, false),
+            PaintPlan::PresentAndRender
+        );
+        // A resize is a new coverage too.
+        let mut resized = cached;
+        resized.size = (1200, 1000);
+        assert_eq!(
+            plan(Some(&cached), &resized, false, RenderCost::Cheap, false),
+            PaintPlan::PresentAndRender
+        );
+    }
+
+    #[test]
+    fn frame_coverage_scales_with_zoom_and_margin() {
+        // At zoom 1 the 1320-px frame leaves 160 world units of slack per
+        // side around the 1000-px view; at zoom 2 it is 80.
+        let at_1 = surface_key([0.0, 0.0], 1.0, 7);
+        assert!(frame_covers_request(
+            &at_1,
+            &surface_key([160.0, -160.0], 1.0, 7),
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL
+        ));
+        assert!(!frame_covers_request(
+            &at_1,
+            &surface_key([161.0, 0.0], 1.0, 7),
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL
+        ));
+        let at_2 = surface_key([0.0, 0.0], 2.0, 7);
+        assert!(frame_covers_request(
+            &at_2,
+            &surface_key([0.0, 80.0], 2.0, 7),
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL
+        ));
+        assert!(!frame_covers_request(
+            &at_2,
+            &surface_key([0.0, 81.0], 2.0, 7),
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL
+        ));
+        // Zooming in needs less world; zooming out past the margin needs more.
+        assert!(frame_covers_request(
+            &at_1,
+            &surface_key([0.0, 0.0], 4.0, 7),
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL
+        ));
+        assert!(!frame_covers_request(
+            &at_1,
+            &surface_key([0.0, 0.0], 0.5, 7),
+            FRAME_LOGICAL,
+            VISIBLE_LOGICAL
+        ));
+    }
+
+    #[test]
+    fn an_edit_on_an_expensive_scene_presents_the_stale_frame_and_requests() {
+        let cached = surface_key([0.0, 0.0], 0.1, 7);
+        let edited = surface_key([0.0, 0.0], 0.1, 8);
+        assert_eq!(
+            plan(Some(&cached), &edited, false, RenderCost::Expensive, false),
+            PaintPlan::PresentAndRender
+        );
+    }
+
+    #[test]
+    fn render_cost_classes_with_hysteresis() {
+        use std::time::Duration;
+        let budget = GpuCanvas::SYNC_RENDER_BUDGET;
+        let exit = GpuCanvas::ASYNC_EXIT_BUDGET;
+        // First measurement decides the class outright.
+        assert_eq!(RenderCost::Unknown.after(budget), RenderCost::Cheap);
+        assert_eq!(
+            RenderCost::Unknown.after(budget + Duration::from_millis(1)),
+            RenderCost::Expensive
+        );
+        // Cheap stays cheap up to the budget, then flips.
+        assert_eq!(RenderCost::Cheap.after(budget), RenderCost::Cheap);
+        assert_eq!(
+            RenderCost::Cheap.after(budget + Duration::from_millis(1)),
+            RenderCost::Expensive
+        );
+        // Expensive needs a render well under the budget to flip back, so a
+        // scene hovering around the budget does not flap.
+        assert_eq!(RenderCost::Expensive.after(exit), RenderCost::Expensive);
+        assert_eq!(
+            RenderCost::Expensive.after(budget - Duration::from_millis(1)),
+            RenderCost::Expensive
+        );
+        assert_eq!(
+            RenderCost::Expensive.after(exit - Duration::from_millis(1)),
+            RenderCost::Cheap
+        );
+        // A pathological cold frame classifies as expensive.
+        assert_eq!(
+            RenderCost::Unknown.after(Duration::from_secs(5)),
+            RenderCost::Expensive
+        );
+    }
+
+    #[test]
+    fn a_page_switch_never_blocks_paint_even_after_a_cheap_page() {
+        // The cost class describes the newest frame's page; another page's
+        // first render (cold text shaping, images) can take seconds and must
+        // go to the render thread whatever the previous page cost — and the
+        // stale frame is NOT reprojected over the new page (see `present`).
+        let mut cached = surface_key([0.0, 0.0], 1.0, 7);
+        cached.page_root = Some(NodeId::from_u128(1));
+        let mut other_page = cached;
+        other_page.page_root = Some(NodeId::from_u128(2));
+        for within in [false, true] {
+            assert_eq!(
+                plan(Some(&cached), &other_page, false, RenderCost::Cheap, within),
+                PaintPlan::PresentAndRender
+            );
+        }
+        // Same for a reloaded document: a new scene instance under the same
+        // page root is unmeasured content.
+        let mut reloaded = cached;
+        reloaded.scene = (2, 0);
+        assert_eq!(
+            plan(Some(&cached), &reloaded, false, RenderCost::Cheap, false),
+            PaintPlan::PresentAndRender
+        );
+        // Whereas an edit on the same page keeps the cheap class and renders
+        // inline.
+        let mut edited = cached;
+        edited.revision = 8;
+        assert_eq!(
+            plan(Some(&cached), &edited, false, RenderCost::Cheap, false),
+            PaintPlan::RenderBlocking
+        );
+    }
+
+    #[test]
+    fn render_cost_history_restarts_on_a_page_switch() {
+        use std::time::Duration;
+        let cheap = Duration::from_millis(4);
+        let mut page_a = surface_key([0.0, 0.0], 1.0, 7);
+        page_a.page_root = Some(NodeId::from_u128(1));
+        let mut page_b = page_a;
+        page_b.page_root = Some(NodeId::from_u128(2));
+        // Expensive page A, then a 4 ms first frame of page B: without the
+        // restart the exit hysteresis would still call it expensive; with it,
+        // page B classifies outright as cheap.
+        assert_eq!(
+            cost_after_install(Some(&page_a), &page_b, RenderCost::Expensive, cheap),
+            RenderCost::Cheap
+        );
+        // Within a page the hysteresis stays in force.
+        assert_eq!(
+            cost_after_install(
+                Some(&page_a),
+                &page_a,
+                RenderCost::Expensive,
+                GpuCanvas::ASYNC_EXIT_BUDGET
+            ),
+            RenderCost::Expensive
+        );
+        // The very first frame classifies from the initial class.
+        assert_eq!(
+            cost_after_install(None, &page_a, RenderCost::Unknown, cheap),
+            RenderCost::Cheap
+        );
+    }
+
+    #[test]
+    fn a_wake_signal_wakes_a_pending_waiter_once() {
+        use std::future::Future as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CountingWake(AtomicUsize);
+        impl Wake for CountingWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let signal = WakeSignal::default();
+        let counter = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        let mut wait = std::pin::pin!(signal.wait());
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        signal.wake();
+        assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
+        // Consumed: a fresh wait pends again until the next wake.
+        let mut wait = std::pin::pin!(signal.wait());
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        // A wake with no waiter registered is remembered for the next poll.
+        drop(wait);
+        signal.wake();
+        let mut wait = std::pin::pin!(signal.wait());
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
     }
 }
