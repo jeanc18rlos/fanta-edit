@@ -13,6 +13,9 @@ path = "src/fig_viewer.rs"
 doctest = false
 
 [features]
+# The fanta-gpui LayersPanel is the only layers UI, so the runtime is on by
+# default; `--no-default-features` builds a diagnostic host without it.
+default = ["fanta-gpui-ui"]
 fanta-gpui-ui = ["dep:fanta-gpui", "dep:gpui-component"]
 
 [[example]]

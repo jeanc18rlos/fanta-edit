@@ -240,6 +240,34 @@ pub(crate) struct MacGpuRenderer {
     retired: std::collections::VecDeque<CVPixelBuffer>,
     cached: Option<CachedSurface>,
     last_render_at: Option<std::time::Instant>,
+    /// Wall time of the most recent fresh scene render (walk + GPU flush +
+    /// sync). Drives the adaptive reproject window — see [`render_interval`].
+    last_render_duration: std::time::Duration,
+}
+
+/// The reproject window that follows a fresh render costing
+/// `last_render_duration`: while it is open, mid-interaction paints reuse the
+/// cached frame reprojected instead of rendering the scene again.
+///
+/// A fixed 33 ms window assumed a render is cheaper than a display frame. On a
+/// heavy page zoomed out (thousands of visible nodes) a render can take tens of
+/// milliseconds; with a fixed window nearly every pan tick then blocks on a
+/// full render (145 ms renders left the window open only ~18% of the time),
+/// so the gesture froze between sparse fresh frames. Scaling the window with
+/// the measured cost bounds the share of wall time spent inside blocking
+/// renders to roughly `1 / (1 + REPROJECT_COST_FACTOR)`, i.e. ~25%: cheap
+/// renders (≤ 11 ms) keep the display-rate 33 ms floor, expensive ones space
+/// themselves out and the reprojected frame (pixel-exact for a pure pan) covers
+/// the ticks in between. The ceiling keeps a pathological render from starving
+/// the sharp frame for longer than a quarter second.
+#[cfg(target_os = "macos")]
+fn render_interval(last_render_duration: std::time::Duration) -> std::time::Duration {
+    last_render_duration
+        .saturating_mul(MacGpuRenderer::REPROJECT_COST_FACTOR)
+        .clamp(
+            MacGpuRenderer::MIN_RENDER_INTERVAL,
+            MacGpuRenderer::MAX_RENDER_INTERVAL,
+        )
 }
 
 /// One frame's worth of pixels for the canvas.
@@ -260,11 +288,18 @@ pub(crate) enum GpuFrame {
 impl MacGpuRenderer {
     const BUFFER_POOL_LIMIT: usize = 3;
     const IN_FLIGHT_FRAMES: usize = 2;
-    /// Cap on how often the scene is re-rendered while the viewport is
+    /// Floor on how often the scene is re-rendered while the viewport is
     /// animating. Frames in between reuse the previous render reprojected,
     /// which keeps pans and zooms at display rate no matter the scene cost —
-    /// the same blurry-then-sharp trade design tools like Figma make.
+    /// the same blurry-then-sharp trade design tools like Figma make. The
+    /// live window grows with the measured render cost (see
+    /// [`render_interval`]) up to [`Self::MAX_RENDER_INTERVAL`].
     const MIN_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+    /// Ceiling on the adaptive reproject window.
+    const MAX_RENDER_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+    /// Reproject for this many multiples of the last render's duration before
+    /// paying for the next fresh frame mid-interaction.
+    const REPROJECT_COST_FACTOR: u32 = 3;
     /// Beyond this zoom ratio a reprojected frame is too blurry or too sparse
     /// to be useful; render fresh even mid-interaction.
     const MAX_REPROJECT_SCALE: f64 = 3.0;
@@ -299,6 +334,7 @@ impl MacGpuRenderer {
             retired: std::collections::VecDeque::new(),
             cached: None,
             last_render_at: None,
+            last_render_duration: std::time::Duration::ZERO,
         })
     }
 
@@ -371,7 +407,7 @@ impl MacGpuRenderer {
         if let Some(cached) = &self.cached {
             let within_render_interval = self
                 .last_render_at
-                .is_some_and(|at| at.elapsed() < Self::MIN_RENDER_INTERVAL);
+                .is_some_and(|at| at.elapsed() < render_interval(self.last_render_duration));
             match frame_decision(
                 &cached.key,
                 &key,
@@ -444,6 +480,7 @@ impl MacGpuRenderer {
             playback: None,
             dark_ui: false,
         };
+        let render_started = std::time::Instant::now();
         self.raster_renderer.render_to_canvas(
             surface.canvas(),
             size.0,
@@ -457,6 +494,9 @@ impl MacGpuRenderer {
         // `paint_surface`, so the GPU work must be complete by then.
         self.direct_context.flush_submit_and_sync_cpu();
         drop(surface);
+        // Walk + flush + GPU sync: the whole blocking cost the next reproject
+        // window is sized against.
+        self.last_render_duration = render_started.elapsed();
 
         if let Some(previous) = self.cached.take() {
             self.retire(previous.buffer);
@@ -2749,5 +2789,71 @@ mod tests {
             frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::RenderFresh
         );
+    }
+
+    #[test]
+    fn reproject_window_scales_with_render_cost_between_floor_and_ceiling() {
+        use std::time::Duration;
+        // Cheap renders keep the display-rate floor.
+        assert_eq!(
+            render_interval(Duration::from_millis(3)),
+            MacGpuRenderer::MIN_RENDER_INTERVAL
+        );
+        assert_eq!(
+            render_interval(Duration::ZERO),
+            MacGpuRenderer::MIN_RENDER_INTERVAL
+        );
+        // A 32 ms render earns three renders' worth of reprojected frames.
+        assert_eq!(
+            render_interval(Duration::from_millis(32)),
+            Duration::from_millis(96)
+        );
+        // Pathological renders are capped so the sharp frame still lands.
+        assert_eq!(
+            render_interval(Duration::from_millis(145)),
+            MacGpuRenderer::MAX_RENDER_INTERVAL
+        );
+    }
+
+    #[test]
+    fn a_low_zoom_pan_keeps_reprojecting_across_a_slow_render_window() {
+        // Zoomed out to 10% after a 145 ms render: the old fixed 33 ms window
+        // let only ~2 pan ticks reproject before the next blocking render.
+        // With the cost-scaled window a trackpad pan (16 ms ticks, 10 logical
+        // px per tick = 100 world px at zoom 0.1) reprojects for the whole
+        // 250 ms ceiling — every tick stays inside the 1,600-world-px slack —
+        // and only the first tick past the window renders fresh.
+        use std::time::Duration;
+        let interval = render_interval(Duration::from_millis(145));
+        let cached = surface_key([0.0, 0.0], 0.1, 7);
+        let mut decisions = Vec::new();
+        for tick in 1..=20u32 {
+            let elapsed = Duration::from_millis(16 * u64::from(tick));
+            let within = elapsed < interval;
+            let requested = surface_key([100.0 * f64::from(tick), 0.0], 0.1, 7);
+            decisions.push((
+                elapsed,
+                frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, within),
+            ));
+        }
+        let (reprojected, fresh): (Vec<_>, Vec<_>) = decisions
+            .iter()
+            .partition(|(_, decision)| *decision == FrameDecision::Reproject);
+        assert!(
+            reprojected.len() >= 15,
+            "expected the pan to reproject through the window, got {decisions:?}"
+        );
+        assert!(
+            reprojected.iter().all(|(elapsed, _)| *elapsed < interval)
+                && fresh.iter().all(|(elapsed, _)| *elapsed >= interval),
+            "reprojection must end exactly when the window closes: {decisions:?}"
+        );
+        // Under the old fixed window the same pan would have rendered fresh
+        // from the third tick on.
+        let fixed_window_reprojects = decisions
+            .iter()
+            .filter(|(elapsed, _)| *elapsed < MacGpuRenderer::MIN_RENDER_INTERVAL)
+            .count();
+        assert!(fixed_window_reprojects <= 2);
     }
 }

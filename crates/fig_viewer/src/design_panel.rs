@@ -1,9 +1,15 @@
-//! The Fanta design panel: Pages, Layers, Components, and Assets sections for
-//! the active Figma canvas, mirroring the original Fanta left sidebar.
+//! The Fanta design panel: the Pages and Layers sections for the active
+//! Figma canvas, mirroring the original Fanta left sidebar. Layers is the
+//! fanta-gpui `LayersPanel` (virtualized, so a 30k-node page costs the same
+//! per frame as a 30-node one); this file owns the host side of its
+//! contract — the read model, the intent → operation mapping, and the echo.
+//!
+//! Without the `fanta-gpui-ui` feature (a diagnostic build; the feature is
+//! on by default) there is no layers UI, so the layer-move machinery and the
+//! selection/drop paths have no caller.
+#![cfg_attr(not(feature = "fanta-gpui-ui"), allow(dead_code))]
 
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Range;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,19 +18,16 @@ use editor::{
     actions::{Cancel, SelectAll},
 };
 use fanta_doc::{
-    AssetId, CanvasNode, ComponentId, Doc, Fill, GroupNode, IndexKey, NodeData, NodeFlags, NodeId,
-    Operation, Scene,
+    CanvasNode, Doc, GroupNode, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene,
 };
 use fs::Fs;
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, Image, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, ObjectFit, Pixels, Role, ScrollStrategy, SharedString, Subscription,
-    UniformListScrollHandle, WeakEntity, Window, actions, deferred, img, px, uniform_list,
+    EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
+    Pixels, Role, SharedString, Subscription, WeakEntity, Window, actions, deferred, px,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::{ListHeader, ListItem, ListItemSpacing, Tooltip, prelude::*};
-use util::size::format_file_size;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -44,22 +47,19 @@ actions!(
     ]
 );
 
+/// The native (fallback) sections with a collapsible header and a filter
+/// field. Layers has no native section any more — the fanta-gpui panel owns
+/// its own header, collapse state, and (virtualized) tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Section {
     Pages,
-    Layers,
-    Components,
-    Assets,
 }
 
 /// The design sidebar uses the same compact 28 px rhythm as Zed's outline and
-/// project panels. Pinning the height also keeps `uniform_list` measurements in
-/// sync with the rows it virtualizes.
+/// project panels.
 const SECTION_ROW_HEIGHT: f32 = 28.;
 const MIN_SECTION_HEIGHT: Pixels = px(56.);
 const DEFAULT_PAGES_HEIGHT: Pixels = px(168.);
-const DEFAULT_COMPONENTS_HEIGHT: Pixels = px(168.);
-const DEFAULT_ASSETS_HEIGHT: Pixels = px(200.);
 const DIVIDER_HITBOX_SIZE: Pixels = px(6.);
 /// Ceiling on any single section so the other section headers and a usable
 /// slice of the Layers list always stay visible while dragging.
@@ -68,22 +68,9 @@ const SECTION_RESIZE_RESERVE: Pixels = px(160.);
 /// header instead of sitting flush against the panel edge. The indent lives
 /// inside the row (`ListItem::indent_level`), keeping hover targets full width.
 const SECTION_INDENT_STEP: Pixels = px(12.);
-/// Asset rows are taller than the rest: they carry a thumbnail beside a
-/// two-line label. `uniform_list` sizes every row from the first one, so the
-/// row pins itself to this height and the list container is measured with it.
-const ASSET_ROW_HEIGHT: f32 = 40.;
-const ASSET_THUMBNAIL_SIZE: Pixels = px(28.);
 
 fn section_list_height(row_count: usize, row_height: f32, stored: Pixels) -> Pixels {
     px((row_count as f32 * row_height).min(stored.as_f32()))
-}
-
-fn section_count_label(visible: usize, total: usize, filtered: bool) -> SharedString {
-    if filtered && visible != total {
-        SharedString::from(format!("{visible} / {total}"))
-    } else {
-        SharedString::from(visible.to_string())
-    }
 }
 
 /// Keep the pages whose name contains `query` (already lowercased), preserving
@@ -99,14 +86,12 @@ fn filter_pages(pages: Vec<PageEntry>, query: Option<&str>) -> Vec<PageEntry> {
     }
 }
 
-/// The draggable boundaries between sidebar sections. Each divider resizes the
-/// fixed-height section adjacent to it while Layers (`flex_1`) absorbs the
+/// The draggable boundary between sidebar sections. It resizes the
+/// fixed-height Pages section above it while Layers (`flex_1`) absorbs the
 /// remaining space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SectionDivider {
     PagesLayers,
-    LayersComponents,
-    ComponentsAssets,
 }
 
 #[derive(Clone)]
@@ -115,42 +100,6 @@ struct DraggedSectionDivider(SectionDivider);
 impl Render for DraggedSectionDivider {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
-    }
-}
-
-#[derive(Clone)]
-struct DraggedLayer {
-    id: NodeId,
-    name: SharedString,
-    icon: IconName,
-}
-
-impl Render for DraggedLayer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex().pl_3().pt_3().child(
-            h_flex()
-                .max_w(px(240.))
-                .min_w_0()
-                .h(px(SECTION_ROW_HEIGHT))
-                .gap_1()
-                .px_2()
-                .rounded_lg()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .shadow_md()
-                .child(
-                    Icon::new(self.icon)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(Label::new(self.name.clone()).single_line().truncate()),
-                ),
-        )
     }
 }
 
@@ -171,7 +120,7 @@ enum LayerDropError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayerDropPlacement {
+pub(crate) enum LayerDropPlacement {
     /// Above the target row, which is later (higher) in paint order because
     /// layer rows display the scene's bottom-first child order in reverse.
     Above,
@@ -411,104 +360,42 @@ struct DividerDragState {
     start_height: Pixels,
 }
 
-/// One row of the Assets section. Everything here is precomputed in
-/// [`FantaDesignPanel::rebuild_assets`] — decoding, hashing, or scanning the
-/// scene from the row builder would run once per visible row per frame.
-struct AssetEntry {
-    id: AssetId,
-    /// The name of the layer that references this asset, or a synthetic
-    /// `"Image {n}"` when nothing in the scene uses it.
-    name: SharedString,
-    /// The encoded bytes wrapped for GPUI, which decodes and caches the
-    /// texture behind the content hash. `None` when GPUI has no decoder for
-    /// the format, in which case the row falls back to a generic glyph.
-    image: Option<Arc<Image>>,
-    /// Natural pixel size, from the decoded asset. `None` if it failed to
-    /// decode at load.
-    dimensions: Option<(u32, u32)>,
-    /// `"PNG"`, `"JPG"`, … Empty when the encoding could not be identified.
-    format_label: SharedString,
-    byte_count: usize,
-}
-
-/// A name recovered for an asset from the scene node that references it.
-struct AssetName {
-    name: SharedString,
-    /// A `Bitmap` layer names its asset directly; a shape painted with an image
-    /// *fill* only lends its own name. Tracked so the former can upgrade the
-    /// latter regardless of which is met first in scene order.
-    from_bitmap: bool,
-}
-
-/// One visible row of the flattened layer tree, rebuilt every render.
-struct LayerRow {
-    id: NodeId,
-    depth: usize,
-    has_children: bool,
-    expanded: bool,
-    icon: IconName,
-    name: SharedString,
-    /// Instances and component masters get the accent tint, mirroring the
-    /// original panel's violet/purple layer names.
-    accent: bool,
-    hidden: bool,
-    locked: bool,
-    selected: bool,
-}
-
 pub struct FantaDesignPanel {
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,
     active_view: Option<WeakEntity<FigView>>,
     width: Option<Pixels>,
+    /// Host-controlled expansion of the layer tree, echoed into the gpui
+    /// panel on every refresh (the panel's own expansion interactions come
+    /// back as `ExpansionChanged` and land here).
     expanded_nodes: HashSet<NodeId>,
     collapsed_sections: HashSet<Section>,
     // Cached section state, rebuilt on document events (never in render — see
     // `render_sections`).
-    layer_rows: Vec<LayerRow>,
     pages_cache: Vec<PageEntry>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_pages: Option<crate::gpui_adapters::pages::PagesAdapter>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_layers: Option<crate::gpui_adapters::layers::LayersAdapter>,
-    /// Memoized node-budget verdict for the gpui layers panel, keyed on the
-    /// page root and the document render generation it was counted at (the
-    /// generation is monotonic across reloads, unlike the scene revision).
-    /// The count is a whole-subtree walk, and the check runs on every
-    /// document event (including every selection change) AND from render, so
-    /// an uncached count made each canvas click and each panel frame O(page)
-    /// on large pages. A `Cell` because render only holds `&self`.
-    #[cfg(feature = "fanta-gpui-ui")]
-    gpui_layers_budget: std::cell::Cell<Option<(NodeId, u64, bool)>>,
-    components_cache: Vec<(SharedString, NodeId)>,
-    components_total_count: usize,
-    assets_cache: Vec<AssetEntry>,
-    /// The `raw_assets` map `assets_cache`'s thumbnails were built from.
-    /// `Image::from_bytes` content-hashes every asset byte, so the thumbnails
-    /// are rebuilt only when the document swaps its (immutable) asset map on
-    /// load — not on every selection change, which also rebuilds this panel.
-    assets_source: Option<Arc<BTreeMap<AssetId, Vec<u8>>>>,
-    /// The scene revision `assets_cache`'s recovered names were resolved at.
-    /// Recovering names is a whole-scene walk, so it reruns only when the scene
-    /// actually changed — not on the selection changes that also rebuild here.
-    assets_names_revision: Option<u64>,
-    /// Indices into `assets_cache` surviving the Assets filter. The cache
-    /// itself stays whole so filtering never invalidates the thumbnails.
-    visible_assets: Vec<usize>,
+    /// The gpui Layers panel's own header collapsed it: the section then
+    /// takes only its header height instead of flexing over the sidebar.
+    layers_collapsed: bool,
     current_page_index: Option<usize>,
     document_editable: bool,
     document_ready: bool,
-    layers_scroll_handle: UniformListScrollHandle,
+    /// The selection anchor the layer tree last revealed. When the anchor
+    /// changes (typically from a canvas click) its ancestors are expanded
+    /// and the row is scrolled into view; a repeat of the same anchor is
+    /// left alone so browsing the list never yanks it around.
     last_reveal_anchor: Option<NodeId>,
+    /// A node to scroll into view on the next layers echo — set by
+    /// `rebuild_tree` when the reveal anchor changes, consumed by
+    /// `refresh_gpui_layers` after the tree and expansion are echoed.
+    pending_reveal: Option<NodeId>,
     pages_height: Pixels,
-    components_height: Pixels,
-    assets_height: Pixels,
     divider_drag: Option<DividerDragState>,
     filter_editor: Entity<Editor>,
     filter_target: Option<Section>,
-    /// Scope the Components list to masters actually used (instanced) on the
-    /// page being viewed, rather than every master in the document.
-    components_this_page: bool,
     /// The page or layer being renamed inline, if any; the shared
     /// `rename_editor` carries the edited text.
     renaming: Option<RenameTarget>,
@@ -528,13 +415,13 @@ struct PageEntry {
     index: usize,
 }
 
-/// An inline rename in progress. Both a page and a layer rename a scene node by
-/// id (via `SetName`); a page also tracks its row index so the editor renders in
-/// the right Pages row.
+/// An inline rename in progress in the native Pages section: a page renames
+/// its root scene node (via `SetName`) and tracks its row index so the editor
+/// renders in the right Pages row. (Layer renames are the gpui panel's own
+/// inline editor, landing here as `RenameRequested`.)
 #[derive(Clone, Copy)]
 enum RenameTarget {
     Page { index: usize, root: NodeId },
-    Layer { node: NodeId },
 }
 
 impl RenameTarget {
@@ -542,7 +429,6 @@ impl RenameTarget {
     fn node(&self) -> NodeId {
         match *self {
             RenameTarget::Page { root, .. } => root,
-            RenameTarget::Layer { node } => node,
         }
     }
 }
@@ -614,7 +500,7 @@ impl FantaDesignPanel {
             &filter_editor,
             |this: &mut Self, _, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::BufferEdited) {
-                    this.rebuild_layer_rows(cx);
+                    this.rebuild_caches(cx);
                     cx.notify();
                 }
             },
@@ -639,32 +525,21 @@ impl FantaDesignPanel {
             width: None,
             expanded_nodes: HashSet::new(),
             collapsed_sections: HashSet::new(),
-            layer_rows: Vec::new(),
             pages_cache: Vec::new(),
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_pages: None,
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_layers: None,
-            #[cfg(feature = "fanta-gpui-ui")]
-            gpui_layers_budget: std::cell::Cell::new(None),
-            components_cache: Vec::new(),
-            components_total_count: 0,
-            assets_cache: Vec::new(),
-            assets_source: None,
-            assets_names_revision: None,
-            visible_assets: Vec::new(),
+            layers_collapsed: false,
             current_page_index: None,
             document_ready: false,
             document_editable: false,
-            layers_scroll_handle: UniformListScrollHandle::new(),
             last_reveal_anchor: None,
+            pending_reveal: None,
             pages_height: DEFAULT_PAGES_HEIGHT,
-            components_height: DEFAULT_COMPONENTS_HEIGHT,
-            assets_height: DEFAULT_ASSETS_HEIGHT,
             divider_drag: None,
             filter_editor,
             filter_target: None,
-            components_this_page: false,
             renaming: None,
             rename_editor,
             _subscriptions: subscriptions,
@@ -697,7 +572,7 @@ impl FantaDesignPanel {
                 if !is_same {
                     // Subscribe to the item's event stream rather than
                     // observing the view: the view notifies on every pan and
-                    // pointer-move frame. The layer rows are rebuilt HERE, on
+                    // pointer-move frame. The caches are rebuilt HERE, on
                     // document events, never in render — preview frames can't
                     // change tree structure, so they're skipped too.
                     let item = view.read(cx).item().clone();
@@ -709,7 +584,7 @@ impl FantaDesignPanel {
                                 crate::document::FigItemEvent::EditedTransient
                                     | crate::document::FigItemEvent::TextSelectionChanged
                             ) {
-                                this.rebuild_layer_rows(cx);
+                                this.rebuild_caches(cx);
                                 #[cfg(feature = "fanta-gpui-ui")]
                                 this.refresh_gpui_pages(cx);
                                 #[cfg(feature = "fanta-gpui-ui")]
@@ -721,7 +596,19 @@ impl FantaDesignPanel {
                     self.active_view = Some(view.downgrade());
                     self.expanded_nodes.clear();
                     self.last_reveal_anchor = None;
-                    self.rebuild_layer_rows(cx);
+                    self.pending_reveal = None;
+                    // Another document may reuse a (root, generation) key —
+                    // the same .fig open in two tabs — so the memoized layer
+                    // tree must not survive a view switch.
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    if let Some(adapter) = self.gpui_layers.as_mut() {
+                        adapter.tree_key = None;
+                    }
+                    self.rebuild_caches(cx);
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    self.refresh_gpui_pages(cx);
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    self.refresh_gpui_layers(cx);
                 }
             }
             None => {
@@ -755,14 +642,6 @@ impl FantaDesignPanel {
         cx.notify();
     }
 
-    fn toggle_node_expanded(&mut self, id: NodeId, cx: &mut Context<Self>) {
-        if !self.expanded_nodes.remove(&id) {
-            self.expanded_nodes.insert(id);
-        }
-        self.rebuild_layer_rows(cx);
-        cx.notify();
-    }
-
     // === Search / filter ====================================================
 
     /// The active, non-empty filter query for `section`, lowercased for
@@ -774,12 +653,6 @@ impl FantaDesignPanel {
         let text = self.filter_editor.read(cx).text(cx);
         let query = text.trim().to_lowercase();
         (!query.is_empty()).then_some(query)
-    }
-
-    fn toggle_components_this_page(&mut self, cx: &mut Context<Self>) {
-        self.components_this_page = !self.components_this_page;
-        self.rebuild_layer_rows(cx);
-        cx.notify();
     }
 
     fn toggle_filter(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
@@ -796,14 +669,11 @@ impl FantaDesignPanel {
             // Exhaustive so a new section can't silently inherit the wrong hint.
             let placeholder = match section {
                 Section::Pages => "Filter pages…",
-                Section::Layers => "Filter layers…",
-                Section::Components => "Filter components…",
-                Section::Assets => "Filter assets…",
             };
             editor.set_placeholder_text(placeholder, window, cx);
         });
         self.filter_editor.focus_handle(cx).focus(window, cx);
-        self.rebuild_layer_rows(cx);
+        self.rebuild_caches(cx);
         cx.notify();
     }
 
@@ -820,10 +690,7 @@ impl FantaDesignPanel {
         {
             self.focus_handle.focus(window, cx);
         }
-        // A node selected from the flat results may sit in a collapsed branch;
-        // clearing the reveal anchor makes the rebuild expand and scroll to it.
-        self.last_reveal_anchor = None;
-        self.rebuild_layer_rows(cx);
+        self.rebuild_caches(cx);
         cx.notify();
     }
 
@@ -834,8 +701,6 @@ impl FantaDesignPanel {
         // section is collapsed there is nothing to resize.
         match divider {
             SectionDivider::PagesLayers => self.section_open(Section::Pages),
-            SectionDivider::LayersComponents => self.section_open(Section::Components),
-            SectionDivider::ComponentsAssets => self.section_open(Section::Assets),
         }
     }
 
@@ -849,32 +714,18 @@ impl FantaDesignPanel {
                 SECTION_ROW_HEIGHT,
                 self.pages_height,
             ),
-            SectionDivider::LayersComponents => section_list_height(
-                self.components_cache.len(),
-                SECTION_ROW_HEIGHT,
-                self.components_height,
-            ),
-            SectionDivider::ComponentsAssets => section_list_height(
-                self.visible_assets.len(),
-                ASSET_ROW_HEIGHT,
-                self.assets_height,
-            ),
         }
     }
 
     fn set_section_height(&mut self, divider: SectionDivider, height: Pixels) {
         match divider {
             SectionDivider::PagesLayers => self.pages_height = height,
-            SectionDivider::LayersComponents => self.components_height = height,
-            SectionDivider::ComponentsAssets => self.assets_height = height,
         }
     }
 
     fn reset_section_height(&mut self, divider: SectionDivider, cx: &mut Context<Self>) {
         let default_height = match divider {
             SectionDivider::PagesLayers => DEFAULT_PAGES_HEIGHT,
-            SectionDivider::LayersComponents => DEFAULT_COMPONENTS_HEIGHT,
-            SectionDivider::ComponentsAssets => DEFAULT_ASSETS_HEIGHT,
         };
         self.set_section_height(divider, default_height);
         cx.notify();
@@ -893,14 +744,11 @@ impl FantaDesignPanel {
         if drag_state.divider != dragged_divider {
             return;
         }
-        // Dragging the boundary down grows the section above it (Pages) or
-        // shrinks the section below it (Components, Assets); Layers flexes.
+        // Dragging the boundary down grows the section above it (Pages);
+        // Layers flexes.
         let delta = event.event.position.y - drag_state.start_mouse_y;
         let proposed = match dragged_divider {
             SectionDivider::PagesLayers => drag_state.start_height + delta,
-            SectionDivider::LayersComponents | SectionDivider::ComponentsAssets => {
-                drag_state.start_height - delta
-            }
         };
         let max_height =
             (event.bounds.size.height - SECTION_RESIZE_RESERVE).max(MIN_SECTION_HEIGHT);
@@ -971,7 +819,16 @@ impl FantaDesignPanel {
                 let operations =
                     match layer_move_operations(&document.doc, dragged, target, placement) {
                         Ok(operations) => operations,
-                        Err(_) => return (Ok(false), DocChange::None),
+                        Err(reason) => {
+                            // The panel's drop highlight consults the same
+                            // rules (`layer_drop_allowed`), so a refusal here
+                            // is a race with a concurrent edit, not a UI lie.
+                            log::debug!(
+                                "fanta design panel: layer move {dragged} -> {target} \
+                                 ({placement:?}) refused: {reason:?}"
+                            );
+                            return (Ok(false), DocChange::None);
+                        }
                     };
                 let doc = &mut document.doc;
                 doc.history.begin("Move layer", &mut doc.scene);
@@ -997,11 +854,102 @@ impl FantaDesignPanel {
                 if placement == LayerDropPlacement::Inside {
                     self.expanded_nodes.insert(target);
                 }
-                self.rebuild_layer_rows(cx);
+                self.rebuild_caches(cx);
                 cx.notify();
             }
             Ok(false) => {}
             Err(error) => log::error!("fanta design panel: failed to move layer: {error:#}"),
+        }
+    }
+
+    /// Whether `layer_move_operations` would accept this drop right now — the
+    /// truth the gpui panel's drop highlight is wired to, so a target the
+    /// document refuses (a page root, a component master leaving its library,
+    /// a recursive instance, a non-container `Inside`, …) never lights up.
+    fn layer_drop_allowed(
+        &self,
+        dragged: NodeId,
+        target: NodeId,
+        placement: LayerDropPlacement,
+        cx: &App,
+    ) -> bool {
+        let Some(view) = self.active_view(cx) else {
+            return false;
+        };
+        let item = view.read(cx).item().read(cx);
+        item.is_editable()
+            && item.document().is_some_and(|document| {
+                layer_move_operations(&document.doc, dragged, target, placement).is_ok()
+            })
+    }
+
+    /// Reorder `id` to the top (`front`) or bottom of its siblings — Figma's
+    /// Bring to front / Send to back — through the same move path a drag uses,
+    /// so undo, transform preservation, and the document rules are shared.
+    fn move_layer_to_extreme(&mut self, id: NodeId, front: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let target = {
+            let item = view.read(cx).item().read(cx);
+            let Some(document) = item.document() else {
+                return;
+            };
+            let scene = &document.doc.scene;
+            let Some(node) = scene.get(id) else {
+                return;
+            };
+            // Siblings are bottom-first in paint order: the last child is
+            // the topmost row.
+            let siblings = scene.children_of(node.parent);
+            let extreme = if front {
+                siblings.last()
+            } else {
+                siblings.first()
+            };
+            match extreme.copied() {
+                Some(target) if target != id => target,
+                _ => return,
+            }
+        };
+        let placement = if front {
+            LayerDropPlacement::Above
+        } else {
+            LayerDropPlacement::Below
+        };
+        self.drop_layer(id, target, placement, cx);
+    }
+
+    /// Apply the operations `build` derives from the document as one undo
+    /// step. Empty operation lists are a no-op; failures roll back and log.
+    fn apply_document_ops(
+        &mut self,
+        label: &'static str,
+        build: impl FnOnce(&Doc) -> Vec<Operation>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
+        let item = view.read(cx).item().clone();
+        let result: Option<Result<bool>> = item.update(cx, |item, cx| {
+            if !item.is_editable() {
+                return None;
+            }
+            item.with_document(cx, |document| {
+                let operations = build(&document.doc);
+                match crate::clipboard::apply_transaction(&mut document.doc, label, operations) {
+                    Ok(true) => (Ok(true), DocChange::Content),
+                    Ok(false) => (Ok(false), DocChange::None),
+                    Err(error) => (Err(error), DocChange::None),
+                }
+            })
+        });
+        if let Some(Err(error)) = result {
+            log::error!("fanta design panel: {label} failed: {error:#}");
         }
     }
 
@@ -1209,64 +1157,53 @@ impl FantaDesignPanel {
         }
     }
 
-    // === Layer tree flattening =============================================
+    // === Document caches ===================================================
 
-    fn rebuild_layer_rows(&mut self, cx: &mut App) {
+    /// Refresh the cached page rows, the current page index, and the reveal
+    /// bookkeeping from the active view's document. Runs on document events,
+    /// never in render.
+    fn rebuild_caches(&mut self, cx: &mut App) {
         let rebuild_started = std::time::Instant::now();
-        self.layer_rows.clear();
         self.pages_cache.clear();
-        self.components_cache.clear();
-        self.components_total_count = 0;
         self.current_page_index = None;
         self.document_editable = false;
         self.document_ready = false;
         let Some(view) = self.active_view(cx) else {
             self.last_reveal_anchor = None;
-            self.clear_assets(cx);
+            self.pending_reveal = None;
             return;
         };
-        // Capture document readiness in a scoped read so `cx` stays free (as
-        // `&mut App`) to evict the previous document's cached thumbnails when
-        // the active view has no ready document.
-        let document_ready = {
-            let fig_item = view.read(cx).item().read(cx);
-            self.document_editable = fig_item.is_editable();
-            fig_item.document().is_some()
-        };
-        if !document_ready {
-            self.clear_assets(cx);
-            return;
-        }
-        // The Pages/Components/Layers caches are pure reads of the document; the
-        // Assets cache is rebuilt after, since evicting the outgoing document's
-        // thumbnails needs `&mut App` and cannot run while `document` borrows it.
         self.rebuild_tree(&view, cx);
-        self.rebuild_assets(&view, cx);
-        crate::report_slow("design panel layer rows", rebuild_started);
+        crate::report_slow("design panel caches", rebuild_started);
     }
 
-    /// Flatten the active document's Pages, Components, and Layers into their
-    /// caches. A pure read of the document — Assets are rebuilt separately (see
-    /// [`FantaDesignPanel::rebuild_assets`]), as they need `&mut App` to evict
-    /// thumbnails.
+    /// The root the layer tree lists: the ACTIVE page first (which may be a
+    /// component master root in a component-scoped view), selected-page
+    /// fallback — the same root the canvas renders and hit-tests. `None` is a
+    /// document without page roots, whose scene roots are the layers.
+    fn layers_page_root(view: &FigView, document: &FigDocument) -> Option<NodeId> {
+        document.doc.active_page().or_else(|| {
+            document
+                .page(view.selected_page_index())
+                .and_then(|page| page.root)
+        })
+    }
+
+    /// Refresh the Pages cache and the layer-tree reveal state. A pure read
+    /// of the document.
     fn rebuild_tree(&mut self, view: &Entity<FigView>, cx: &App) {
         let view = view.read(cx);
         let fig_item = view.item().read(cx);
+        self.document_editable = fig_item.is_editable();
         let Some(document) = fig_item.document() else {
             return;
         };
         self.document_ready = true;
         let doc = &document.doc;
-        // Follow the same root the canvas renders and hit-tests: the ACTIVE
-        // page first (which may be a component master root in a
-        // component-scoped view), selected-page fallback. Deriving these
+        // Follow the same root the canvas renders and hit-tests. Deriving it
         // differently made the panel list a page the scoped canvas never
         // paints, so clicking a layer selected/edited an invisible node.
-        let page_root = doc.active_page().or_else(|| {
-            document
-                .page(view.selected_page_index())
-                .and_then(|page| page.root)
-        });
+        let page_root = Self::layers_page_root(view, document);
 
         // The page highlight and This-page search must follow the page the
         // canvas actually renders — `page_root` above — not the view's last
@@ -1315,289 +1252,26 @@ impl FantaDesignPanel {
         {
             self.renaming = None;
         }
-        // When scoping to the current page, collect the master/set ids present
-        // on it — both instances placed there AND masters *defined* there. A
-        // design system's Icons/Typography page holds the component masters
-        // themselves (the importer only relocates orphaned library masters to
-        // the hidden Components page), so counting instances alone would show
-        // nothing there. A variant (instance or master) counts toward its set.
-        let used_on_page: Option<HashSet<ComponentId>> = (self.components_this_page).then(|| {
-            let root_to_component: HashMap<NodeId, ComponentId> = doc
-                .components
-                .defs
-                .values()
-                .map(|def| (def.root, def.id))
-                .collect();
-            let master_of = |component: ComponentId| {
-                doc.components
-                    .defs
-                    .get(&component)
-                    .and_then(|def| def.variant_of.as_ref().map(|m| m.set))
-                    .unwrap_or(component)
-            };
-            let mut used = HashSet::new();
-            if let Some(root) = page_root {
-                for node_id in doc.scene.descendants_of(root) {
-                    // A component master defined on this page.
-                    if let Some(&component) = root_to_component.get(&node_id) {
-                        used.insert(master_of(component));
-                    }
-                    // An instance placed on this page.
-                    if let Some(node) = doc.scene.get(node_id)
-                        && let NodeData::Instance(instance) = &node.data
-                    {
-                        used.insert(master_of(instance.component));
-                    }
-                }
-            }
-            used
-        });
-        let is_used = |id: ComponentId| used_on_page.as_ref().is_none_or(|ids| ids.contains(&id));
-
-        // Show only component MASTERS: standalone components, plus one row per
-        // variant SET (its variants collapse into it). Individual variants and
-        // instances are never listed — a set like Button has thousands of
-        // variants but is one master to the user.
-        let mut components: Vec<(SharedString, NodeId)> = Vec::new();
-        for def in doc.components.defs.values() {
-            if def.variant_of.is_none() && is_used(def.id) {
-                components.push((SharedString::from(def.name.clone()), def.root));
-            }
-        }
-        for set in doc.components.sets.values() {
-            if !is_used(set.id) {
-                continue;
-            }
-            // Navigate to the set's frame — a member variant's parent — so all
-            // its variants come into view, not just one.
-            let member_root = doc
-                .components
-                .defs
-                .get(&set.default_variant)
-                .or_else(|| {
-                    set.members
-                        .first()
-                        .and_then(|id| doc.components.defs.get(id))
-                })
-                .map(|def| def.root);
-            let Some(member_root) = member_root else {
-                continue;
-            };
-            let target = doc
-                .scene
-                .get(member_root)
-                .and_then(|node| node.parent)
-                .unwrap_or(member_root);
-            components.push((SharedString::from(set.name.clone()), target));
-        }
-        self.components_cache = components;
-        self.components_cache
-            .sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
-        self.components_total_count = self.components_cache.len();
-        if let Some(query) = self.filter_query(Section::Components, cx) {
-            self.components_cache
-                .retain(|(name, _)| name.to_lowercase().contains(&query));
-        }
-        let layers_query = self.filter_query(Section::Layers, cx);
 
         // Reveal the selection: when the anchor changes (typically from a
         // canvas click), expand its ancestor chain so its row exists, then
-        // scroll it into view once the rows are rebuilt. While filtering, the
-        // list is flat, so expansion is skipped and only the scroll applies.
+        // scroll it into view once the tree is echoed into the layers panel.
         let anchor = doc.selection.anchor();
-        let mut reveal_target = None;
         if anchor != self.last_reveal_anchor {
             self.last_reveal_anchor = anchor;
             if let Some(anchor) = anchor {
-                if layers_query.is_none() {
-                    for ancestor in doc.scene.ancestors_of(anchor) {
-                        self.expanded_nodes.insert(ancestor.id);
-                    }
+                for ancestor in doc.scene.ancestors_of(anchor) {
+                    self.expanded_nodes.insert(ancestor.id);
                 }
-                reveal_target = Some(anchor);
+                self.pending_reveal = Some(anchor);
             }
         }
-
-        let component_roots: HashSet<NodeId> =
-            doc.components.defs.values().map(|def| def.root).collect();
-
-        // Children are stored bottom-first in z-order; popping the stack from
-        // the end lists the topmost sibling first, like the original panel.
-        let mut stack: Vec<(NodeId, usize)> = match page_root {
-            Some(root) => doc
-                .scene
-                .children_of(Some(root))
-                .iter()
-                .map(|id| (*id, 0))
-                .collect(),
-            None => doc.scene.roots().iter().map(|id| (*id, 0)).collect(),
-        };
-        if let Some(query) = &layers_query {
-            // Filtered rows are flat, like the outline panel's search results:
-            // every matching node on the page appears at depth zero.
-            while let Some((id, _)) = stack.pop() {
-                let Some(node) = doc.scene.get(id) else {
-                    continue;
-                };
-                stack.extend(
-                    doc.scene
-                        .children_of(Some(id))
-                        .iter()
-                        .map(|child| (*child, 0)),
-                );
-                if !node.name.to_lowercase().contains(query) {
-                    continue;
-                }
-                self.layer_rows.push(LayerRow {
-                    id,
-                    depth: 0,
-                    has_children: false,
-                    expanded: false,
-                    icon: layer_icon(node),
-                    name: SharedString::from(node.name.clone()),
-                    accent: matches!(node.data, NodeData::Instance(_))
-                        || component_roots.contains(&id),
-                    hidden: node.flags.contains(NodeFlags::HIDDEN),
-                    locked: node.flags.contains(NodeFlags::LOCKED),
-                    selected: doc.selection.contains(id),
-                });
-            }
-        } else {
-            while let Some((id, depth)) = stack.pop() {
-                let Some(node) = doc.scene.get(id) else {
-                    continue;
-                };
-                let children = doc.scene.children_of(Some(id));
-                let has_children = !children.is_empty();
-                let expanded = has_children && self.expanded_nodes.contains(&id);
-                self.layer_rows.push(LayerRow {
-                    id,
-                    depth,
-                    has_children,
-                    expanded,
-                    icon: layer_icon(node),
-                    name: SharedString::from(node.name.clone()),
-                    accent: matches!(node.data, NodeData::Instance(_))
-                        || component_roots.contains(&id),
-                    hidden: node.flags.contains(NodeFlags::HIDDEN),
-                    locked: node.flags.contains(NodeFlags::LOCKED),
-                    selected: doc.selection.contains(id),
-                });
-                if expanded {
-                    stack.extend(children.iter().map(|child| (*child, depth + 1)));
-                }
-            }
-        }
-
-        if let Some(reveal_target) = reveal_target
-            && let Some(index) = self
-                .layer_rows
-                .iter()
-                .position(|row| row.id == reveal_target)
-        {
-            self.layers_scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
-        }
-    }
-
-    // === Assets =============================================================
-
-    /// Evict the current thumbnails from GPUI's global asset cache, then clear
-    /// the Assets rows. GPUI keys a decoded texture by its `Image`'s content
-    /// hash and does NOT free it when the `Arc<Image>` drops, so a swap to
-    /// another document (or losing the active document) must remove them.
-    fn clear_assets(&mut self, cx: &mut App) {
-        self.evict_asset_thumbnails(cx);
-        self.assets_source = None;
-        self.assets_names_revision = None;
-        self.visible_assets.clear();
-    }
-
-    /// Drop the cached-thumbnail entries, removing each decoded texture from
-    /// GPUI's global asset cache. `remove_asset` is a no-op for a thumbnail that
-    /// was never scrolled into view (and so was never decoded).
-    fn evict_asset_thumbnails(&mut self, cx: &mut App) {
-        for entry in self.assets_cache.drain(..) {
-            if let Some(image) = entry.image {
-                image.remove_asset(cx);
-            }
-        }
-    }
-
-    /// Refresh the Assets rows for the active view's document. Thumbnails,
-    /// dimensions, and formats are derived from the (immutable) asset bytes, so
-    /// they are rebuilt only when the document swaps its asset map on load —
-    /// evicting the previous map's cached textures as it does. Only the
-    /// recovered names (which track layer renames and their undo) and the filter
-    /// are recomputed on every rebuild.
-    fn rebuild_assets(&mut self, view: &Entity<FigView>, cx: &mut App) {
-        // Everything that reads the document happens first, under a scoped
-        // shared borrow. The swap path defers installing the freshly built
-        // entries until that borrow is released, so the outgoing document's
-        // thumbnails can be evicted with `&mut App`.
-        let rebuilt = {
-            let fig_item = view.read(cx).item().read(cx);
-            let Some(document) = fig_item.document() else {
-                return;
-            };
-            let same_assets = self
-                .assets_source
-                .as_ref()
-                .is_some_and(|source| Arc::ptr_eq(source, &document.raw_assets));
-            if same_assets {
-                // The same immutable asset map: no thumbnails to rebuild or
-                // evict. Only the scene-gated names and the filter can change.
-                self.refresh_asset_names(document);
-                self.filter_assets(cx);
-                return;
-            }
-            let mut entries = build_asset_entries(document);
-            let names_revision = document.doc.scene.revision();
-            apply_asset_names(&mut entries, &document.doc.scene);
-            (entries, document.raw_assets.clone(), names_revision)
-        };
-
-        let (entries, source, names_revision) = rebuilt;
-        self.evict_asset_thumbnails(cx);
-        self.assets_cache = entries;
-        self.assets_source = Some(source);
-        self.assets_names_revision = Some(names_revision);
-        self.filter_assets(cx);
-    }
-
-    /// Recover asset names from the scene, gated on the scene revision: this
-    /// rebuild also runs on every `SelectionChanged` (i.e. every canvas click),
-    /// but names can only change when the scene itself does, and the selection
-    /// lives outside the scene.
-    fn refresh_asset_names(&mut self, document: &FigDocument) {
-        let revision = document.doc.scene.revision();
-        if self.assets_names_revision != Some(revision) {
-            self.assets_names_revision = Some(revision);
-            apply_asset_names(&mut self.assets_cache, &document.doc.scene);
-        }
-    }
-
-    /// Narrow the visible rows to those whose name matches the Assets filter.
-    /// The cache itself stays whole so filtering never invalidates thumbnails.
-    fn filter_assets(&mut self, cx: &App) {
-        let query = self.filter_query(Section::Assets, cx);
-        self.visible_assets = self
-            .assets_cache
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                query
-                    .as_ref()
-                    .is_none_or(|query| entry.name.to_lowercase().contains(query))
-            })
-            .map(|(index, _)| index)
-            .collect();
     }
 
     // === Rendering =========================================================
 
     // GPUI re-renders every visible view on each window redraw, so render
-    // must consume the cached rows: flattening the layer tree here would run
+    // must consume the cached rows: rebuilding them here would run
     // O(document) work on every canvas frame while the panel is open.
     fn render_sections(&mut self, _view: &Entity<FigView>, cx: &mut Context<Self>) -> AnyElement {
         let render_started = std::time::Instant::now();
@@ -1607,30 +1281,15 @@ impl FantaDesignPanel {
         }
         let pages = self.pages_cache.clone();
         let current_page_index = self.current_page_index;
-        let component_count = self.components_cache.len();
-        let component_total_count = self.components_total_count;
-        let asset_count = self.visible_assets.len();
-        let asset_total_count = self.assets_cache.len();
 
         let pages_open = self.section_open(Section::Pages);
-        let layers_open = self.section_open(Section::Layers);
-        let components_open = self.section_open(Section::Components);
-        let assets_open = self.section_open(Section::Assets);
 
         let can_add_page = editable && pages.iter().all(|entry| entry.root.is_some());
         let can_delete_page = editable && pages.len() > 1;
-        let layer_row_count = self.layer_rows.len();
 
         let pages_filter_open = self.filter_target == Some(Section::Pages);
         let pages_query = self.filter_query(Section::Pages, cx);
         let pages = filter_pages(pages, pages_query.as_deref());
-        let layers_filter_open = self.filter_target == Some(Section::Layers);
-        let components_filter_open = self.filter_target == Some(Section::Components);
-        let assets_filter_open = self.filter_target == Some(Section::Assets);
-        let components_this_page = self.components_this_page;
-        let layers_filtering = self.filter_query(Section::Layers, cx).is_some();
-        let components_filtering = self.filter_query(Section::Components, cx).is_some();
-        let assets_filtering = self.filter_query(Section::Assets, cx).is_some();
 
         #[cfg(feature = "fanta-gpui-ui")]
         let gpui_pages_section: Option<AnyElement> = self.gpui_pages_section_element(cx);
@@ -1716,279 +1375,23 @@ impl FantaDesignPanel {
                 }
             })
             .child(self.render_section_divider(SectionDivider::PagesLayers, cx))
-            .child({
-                let native = v_flex()
-                    .when(layers_open, |section| section.flex_1())
+            .child(match gpui_layers_section {
+                Some(section) => section,
+                // The fanta-gpui LayersPanel is the only layers UI. It is
+                // absent only when the runtime is switched off (build without
+                // `fanta-gpui-ui`, `FANTA_GPUI_UI=0`, or a host that skipped
+                // `gpui_component::init`), which is a diagnostic state, not a
+                // mode: say so instead of rendering nothing.
+                None => v_flex()
+                    .flex_1()
                     .overflow_hidden()
-                    .child(
-                        ListHeader::new("Layers")
-                            .inset(true)
-                            .toggle(Some(layers_open))
-                            .on_toggle(cx.listener(|this, _, window, cx| {
-                                this.toggle_section(Section::Layers, window, cx)
-                            }))
-                            .end_slot(
-                                h_flex()
-                                    .gap_1()
-                                    .when(!self.expanded_nodes.is_empty(), |slot| {
-                                        slot.child(
-                                            IconButton::new(
-                                                "fanta-layers-collapse",
-                                                IconName::ListCollapse,
-                                            )
-                                            .icon_size(IconSize::Small)
-                                            .aria_label("Collapse all layers")
-                                            .tooltip(Tooltip::text("Collapse All Layers"))
-                                            .on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.expanded_nodes.clear();
-                                                    this.rebuild_layer_rows(cx);
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                        )
-                                    })
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-layers-filter",
-                                            IconName::MagnifyingGlass,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .toggle_state(layers_filter_open)
-                                        .aria_label("Filter layers")
-                                        .tooltip(Tooltip::text("Filter Layers"))
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_filter(Section::Layers, window, cx)
-                                            }),
-                                        ),
-                                    ),
-                            ),
-                    )
-                    .when(layers_open && layers_filter_open, |section| {
-                        section.child(self.render_filter_row(cx))
-                    })
-                    .when(layers_open, |section| {
-                        if layer_row_count == 0 {
-                            section.child(empty_section_label(
-                                "fanta-layers-empty",
-                                if layers_filtering {
-                                    "No layers match the filter"
-                                } else {
-                                    "No layers on this page"
-                                },
-                            ))
-                        } else {
-                            section.child(
-                                uniform_list(
-                                    "fanta-layers",
-                                    layer_row_count,
-                                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                                        let mut rows = Vec::with_capacity(range.len());
-                                        for index in range {
-                                            if let Some(row) = this.layer_rows.get(index) {
-                                                rows.push(this.render_layer_row(index, row, cx));
-                                            }
-                                        }
-                                        rows
-                                    }),
-                                )
-                                .size_full()
-                                .flex_shrink_1()
-                                .track_scroll(&self.layers_scroll_handle),
-                            )
-                        }
-                    });
-                match gpui_layers_section {
-                    Some(section) => section,
-                    None => native.into_any_element(),
-                }
+                    .child(ListHeader::new("Layers").inset(true))
+                    .child(empty_section_label(
+                        "fanta-layers-unavailable",
+                        "Layers need the fanta-gpui UI runtime",
+                    ))
+                    .into_any_element(),
             })
-            .child(self.render_section_divider(SectionDivider::LayersComponents, cx))
-            .child(
-                v_flex()
-                    .flex_none()
-                    .child(
-                        ListHeader::new("Components")
-                            .inset(true)
-                            .toggle(Some(components_open))
-                            .on_toggle(cx.listener(|this, _, window, cx| {
-                                this.toggle_section(Section::Components, window, cx)
-                            }))
-                            .end_slot(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-components-this-page",
-                                            IconName::ListFilter,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .toggle_state(components_this_page)
-                                        .aria_label("Only show components on this page")
-                                        .tooltip(Tooltip::text("Only Components on This Page"))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.toggle_components_this_page(cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-components-filter",
-                                            IconName::MagnifyingGlass,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .toggle_state(components_filter_open)
-                                        .aria_label("Filter components")
-                                        .tooltip(Tooltip::text("Filter Components"))
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_filter(Section::Components, window, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        Label::new(section_count_label(
-                                            component_count,
-                                            component_total_count,
-                                            components_filtering,
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    ),
-                            ),
-                    )
-                    .when(components_open && components_filter_open, |section| {
-                        section.child(self.render_filter_row(cx))
-                    })
-                    .when(components_open, |section| {
-                        if component_count == 0 {
-                            section.child(empty_section_label(
-                                "fanta-components-empty",
-                                if components_filtering {
-                                    "No components match the filter"
-                                } else {
-                                    "No components"
-                                },
-                            ))
-                        } else {
-                            // Virtualized: component libraries can hold
-                            // thousands of entries, and this runs on every
-                            // window redraw.
-                            section.child(
-                                uniform_list(
-                                    "fanta-components",
-                                    component_count,
-                                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                                        let mut rows = Vec::with_capacity(range.len());
-                                        for index in range {
-                                            if let Some((name, root)) =
-                                                this.components_cache.get(index)
-                                            {
-                                                rows.push(this.render_component_row(
-                                                    index,
-                                                    name.clone(),
-                                                    *root,
-                                                    cx,
-                                                ));
-                                            }
-                                        }
-                                        rows
-                                    }),
-                                )
-                                .w_full()
-                                .h(section_list_height(
-                                    component_count,
-                                    SECTION_ROW_HEIGHT,
-                                    self.components_height,
-                                )),
-                            )
-                        }
-                    }),
-            )
-            .child(self.render_section_divider(SectionDivider::ComponentsAssets, cx))
-            .child(
-                v_flex()
-                    .flex_none()
-                    .child(
-                        ListHeader::new("Assets")
-                            .inset(true)
-                            .toggle(Some(assets_open))
-                            .on_toggle(cx.listener(|this, _, window, cx| {
-                                this.toggle_section(Section::Assets, window, cx)
-                            }))
-                            .end_slot(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-assets-filter",
-                                            IconName::MagnifyingGlass,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .toggle_state(assets_filter_open)
-                                        .aria_label("Filter assets")
-                                        .tooltip(Tooltip::text("Filter Assets"))
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_filter(Section::Assets, window, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .child(
-                                        Label::new(section_count_label(
-                                            asset_count,
-                                            asset_total_count,
-                                            assets_filtering,
-                                        ))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                    ),
-                            ),
-                    )
-                    .when(assets_open && assets_filter_open, |section| {
-                        section.child(self.render_filter_row(cx))
-                    })
-                    .when(assets_open, |section| {
-                        if asset_count == 0 {
-                            section.child(empty_section_label(
-                                "fanta-assets-empty",
-                                if assets_filtering {
-                                    "No assets match the filter"
-                                } else {
-                                    "No assets"
-                                },
-                            ))
-                        } else {
-                            section.child(
-                                uniform_list(
-                                    "fanta-assets",
-                                    asset_count,
-                                    cx.processor(|this, range: Range<usize>, _window, cx| {
-                                        let mut rows = Vec::with_capacity(range.len());
-                                        for index in range {
-                                            if let Some(entry) = this
-                                                .visible_assets
-                                                .get(index)
-                                                .and_then(|asset| this.assets_cache.get(*asset))
-                                            {
-                                                rows.push(this.render_asset_row(index, entry, cx));
-                                            }
-                                        }
-                                        rows
-                                    }),
-                                )
-                                .w_full()
-                                .h(section_list_height(
-                                    asset_count,
-                                    ASSET_ROW_HEIGHT,
-                                    self.assets_height,
-                                )),
-                            )
-                        }
-                    }),
-            )
             .into_any_element();
         crate::report_slow("design panel render", render_started);
         element
@@ -2073,8 +1476,8 @@ impl FantaDesignPanel {
             .into_any_element()
     }
 
-    /// The inline rename field shared by a page or layer row: Enter/Escape
-    /// commit or cancel; clicking away commits via the blur subscription.
+    /// The inline rename field of a page row: Enter/Escape commit or cancel;
+    /// clicking away commits via the blur subscription.
     fn render_rename_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .w_full()
@@ -2172,12 +1575,8 @@ impl FantaDesignPanel {
         self.begin_rename(RenameTarget::Page { index, root }, window, cx);
     }
 
-    fn begin_layer_rename(&mut self, node: NodeId, window: &mut Window, cx: &mut Context<Self>) {
-        self.begin_rename(RenameTarget::Layer { node }, window, cx);
-    }
-
-    /// Enter inline-rename mode for a page or layer: seed the shared editor with
-    /// the node's current name, select it all, and focus it.
+    /// Enter inline-rename mode for a page: seed the shared editor with the
+    /// node's current name, select it all, and focus it.
     fn begin_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active_view(cx) else {
             return;
@@ -2253,568 +1652,6 @@ impl FantaDesignPanel {
         if let Err(error) = applied {
             log::error!("fanta design panel: failed to rename: {error:#}");
         }
-    }
-
-    fn render_layer_row(
-        &self,
-        _index: usize,
-        row: &LayerRow,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = row.id;
-        if matches!(self.renaming, Some(RenameTarget::Layer { node }) if node == id) {
-            return ListItem::new(format!("fanta-layer-{id}"))
-                .indent_level(row.depth + 1)
-                .indent_step_size(SECTION_INDENT_STEP)
-                .spacing(ListItemSpacing::ExtraDense)
-                .height(px(SECTION_ROW_HEIGHT))
-                .toggle_state(row.selected)
-                .aria_role(Role::TreeItem)
-                .aria_label(row.name.clone())
-                .child(self.render_rename_editor(cx))
-                .into_any_element();
-        }
-        let name_color = if row.hidden {
-            Color::Muted
-        } else if row.accent {
-            Color::Accent
-        } else {
-            Color::Default
-        };
-        let icon_color = if row.hidden {
-            Color::Muted
-        } else if row.accent {
-            Color::Accent
-        } else {
-            Color::Muted
-        };
-        let layer_name = row.name.clone();
-
-        let mut item = ListItem::new(format!("fanta-layer-{id}"))
-            .indent_level(row.depth + 1)
-            .indent_step_size(SECTION_INDENT_STEP)
-            .spacing(ListItemSpacing::ExtraDense)
-            .height(px(SECTION_ROW_HEIGHT))
-            .toggle_state(row.selected)
-            .aria_role(Role::TreeItem)
-            .aria_label(layer_name.clone())
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .child(Icon::new(row.icon).size(IconSize::Small).color(icon_color))
-                    .child(
-                        div()
-                            .id(format!("fanta-layer-name-{id}"))
-                            .flex_1()
-                            .min_w_0()
-                            .tooltip(Tooltip::text(layer_name.clone()))
-                            .child(
-                                Label::new(layer_name)
-                                    .single_line()
-                                    .truncate()
-                                    .color(name_color),
-                            ),
-                    ),
-            );
-
-        if row.has_children {
-            item = item
-                .toggle(Some(row.expanded))
-                .always_show_disclosure_icon(true)
-                .on_toggle(cx.listener(move |this, _, _, cx| this.toggle_node_expanded(id, cx)));
-        }
-
-        if self.document_editable {
-            let eye_button = IconButton::new(
-                format!("fanta-layer-eye-{id}"),
-                if row.hidden {
-                    IconName::EyeOff
-                } else {
-                    IconName::Eye
-                },
-            )
-            .icon_size(IconSize::XSmall)
-            .icon_color(if row.hidden {
-                Color::Default
-            } else {
-                Color::Muted
-            })
-            .aria_label(if row.hidden {
-                "Show layer"
-            } else {
-                "Hide layer"
-            })
-            .tooltip(Tooltip::text(if row.hidden {
-                "Show Layer"
-            } else {
-                "Hide Layer"
-            }))
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.toggle_node_flag(id, NodeFlags::HIDDEN, cx)),
-            )
-            .when(!row.hidden, |button| button.visible_on_hover("list_item"));
-
-            let lock_button = IconButton::new(
-                format!("fanta-layer-lock-{id}"),
-                if row.locked {
-                    IconName::Lock
-                } else {
-                    IconName::LockOff
-                },
-            )
-            .icon_size(IconSize::XSmall)
-            .icon_color(if row.locked {
-                Color::Default
-            } else {
-                Color::Muted
-            })
-            .aria_label(if row.locked {
-                "Unlock layer"
-            } else {
-                "Lock layer"
-            })
-            .tooltip(Tooltip::text(if row.locked {
-                "Unlock Layer"
-            } else {
-                "Lock Layer"
-            }))
-            .on_click(
-                cx.listener(move |this, _, _, cx| this.toggle_node_flag(id, NodeFlags::LOCKED, cx)),
-            )
-            .when(!row.locked, |button| button.visible_on_hover("list_item"));
-
-            item = item.end_slot(
-                h_flex()
-                    .gap_1()
-                    .flex_none()
-                    .child(eye_button)
-                    .child(lock_button),
-            );
-        }
-
-        if !self.document_editable {
-            return item.into_any_element();
-        }
-        let active_item = self
-            .active_view(cx)
-            .map(|view| view.read(cx).item().clone());
-        let inside_item = active_item.clone();
-        let above_item = active_item.clone();
-        let below_item = active_item;
-        let dragged_layer = DraggedLayer {
-            id,
-            name: row.name.clone(),
-            icon: row.icon,
-        };
-        div()
-            .id(format!("fanta-layer-drop-{id}"))
-            .relative()
-            .w_full()
-            .cursor_move()
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                // Keep the whole row as the drag source. A click that lands on
-                // one of the thin before/after drop hitboxes still bubbles here
-                // and selects exactly like a click on the row's content.
-                this.focus_handle.focus(window, cx);
-                if event.click_count() >= 2 {
-                    this.begin_layer_rename(id, window, cx);
-                } else {
-                    let modifiers = event.modifiers();
-                    this.select_node(id, modifiers.secondary() || modifiers.shift, cx);
-                }
-                cx.stop_propagation();
-            }))
-            .on_drag(dragged_layer, |dragged, _, _, cx| {
-                cx.new(|_| dragged.clone())
-            })
-            .can_drop(move |value, _, cx| {
-                let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
-                    return false;
-                };
-                let Some(item) = inside_item.as_ref() else {
-                    return false;
-                };
-                let item = item.read(cx);
-                item.is_editable()
-                    && item.document().is_some_and(|document| {
-                        layer_move_operations(
-                            &document.doc,
-                            dragged.id,
-                            id,
-                            LayerDropPlacement::Inside,
-                        )
-                        .is_ok()
-                    })
-            })
-            .drag_over::<DraggedLayer>(|style, _, _, cx| {
-                style.bg(cx.theme().colors().drop_target_background)
-            })
-            .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                this.drop_layer(dragged.id, id, LayerDropPlacement::Inside, cx);
-                cx.stop_propagation();
-            }))
-            .child(item)
-            .child(
-                div()
-                    .id(format!("fanta-layer-drop-above-{id}"))
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(6.))
-                    .can_drop(move |value, _, cx| {
-                        let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
-                            return false;
-                        };
-                        let Some(item) = above_item.as_ref() else {
-                            return false;
-                        };
-                        let item = item.read(cx);
-                        item.is_editable()
-                            && item.document().is_some_and(|document| {
-                                layer_move_operations(
-                                    &document.doc,
-                                    dragged.id,
-                                    id,
-                                    LayerDropPlacement::Above,
-                                )
-                                .is_ok()
-                            })
-                    })
-                    .drag_over::<DraggedLayer>(|style, _, _, cx| {
-                        style
-                            .border_t_2()
-                            .border_color(cx.theme().colors().drop_target_border)
-                    })
-                    .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                        this.drop_layer(dragged.id, id, LayerDropPlacement::Above, cx);
-                        cx.stop_propagation();
-                    })),
-            )
-            .child(
-                div()
-                    .id(format!("fanta-layer-drop-below-{id}"))
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(6.))
-                    .can_drop(move |value, _, cx| {
-                        let Some(dragged) = value.downcast_ref::<DraggedLayer>() else {
-                            return false;
-                        };
-                        let Some(item) = below_item.as_ref() else {
-                            return false;
-                        };
-                        let item = item.read(cx);
-                        item.is_editable()
-                            && item.document().is_some_and(|document| {
-                                layer_move_operations(
-                                    &document.doc,
-                                    dragged.id,
-                                    id,
-                                    LayerDropPlacement::Below,
-                                )
-                                .is_ok()
-                            })
-                    })
-                    .drag_over::<DraggedLayer>(|style, _, _, cx| {
-                        style
-                            .border_b_2()
-                            .border_color(cx.theme().colors().drop_target_border)
-                    })
-                    .on_drop(cx.listener(move |this, dragged: &DraggedLayer, _, cx| {
-                        this.drop_layer(dragged.id, id, LayerDropPlacement::Below, cx);
-                        cx.stop_propagation();
-                    })),
-            )
-            .into_any_element()
-    }
-
-    fn render_component_row(
-        &self,
-        index: usize,
-        name: SharedString,
-        root: NodeId,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let component_name = name.clone();
-        ListItem::new(("fanta-component", index))
-            .spacing(ListItemSpacing::ExtraDense)
-            .height(px(SECTION_ROW_HEIGHT))
-            .indent_level(1)
-            .indent_step_size(SECTION_INDENT_STEP)
-            .aria_role(Role::ListItem)
-            .aria_label(component_name.clone())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.focus_handle.focus(window, cx);
-                this.focus_component(root, cx);
-            }))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::Blocks)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                    )
-                    .child(
-                        div()
-                            .id(("fanta-component-name", index))
-                            .flex_1()
-                            .min_w_0()
-                            .tooltip(Tooltip::text(component_name))
-                            .child(
-                                Label::new(name)
-                                    .single_line()
-                                    .truncate()
-                                    .color(Color::Accent),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    fn render_asset_row(&self, index: usize, entry: &AssetEntry, cx: &App) -> AnyElement {
-        ListItem::new(("fanta-asset", index))
-            .spacing(ListItemSpacing::ExtraDense)
-            .indent_level(1)
-            .indent_step_size(SECTION_INDENT_STEP)
-            .height(px(ASSET_ROW_HEIGHT))
-            .selectable(false)
-            .aria_role(Role::ListItem)
-            .aria_label(entry.name.clone())
-            .tooltip(Tooltip::text(asset_tooltip_text(entry)))
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_2()
-                    .child(render_asset_thumbnail(entry, cx))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                Label::new(entry.name.clone())
-                                    .single_line()
-                                    .truncate()
-                                    .line_height_style(LineHeightStyle::UiLabel),
-                            )
-                            .when_some(asset_detail(entry), |column, detail| {
-                                column.child(
-                                    Label::new(detail)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .single_line()
-                                        .truncate()
-                                        .line_height_style(LineHeightStyle::UiLabel),
-                                )
-                            }),
-                    ),
-            )
-            .end_slot(
-                Label::new(format_file_size(entry.byte_count as u64, true))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .into_any_element()
-    }
-}
-
-/// The asset's thumbnail over an opaque tile, so a transparent PNG reads as an
-/// image rather than a hole in the panel. Assets GPUI cannot decode keep the
-/// generic glyph.
-fn render_asset_thumbnail(entry: &AssetEntry, cx: &App) -> AnyElement {
-    let tile = div()
-        .flex_none()
-        .size(ASSET_THUMBNAIL_SIZE)
-        .rounded_sm()
-        .overflow_hidden()
-        .bg(cx.theme().colors().element_background);
-    match &entry.image {
-        Some(image) => tile.child(
-            img(image.clone())
-                .size(ASSET_THUMBNAIL_SIZE)
-                .object_fit(ObjectFit::Contain)
-                .rounded_sm(),
-        ),
-        None => tile.items_center().justify_center().child(
-            Icon::new(IconName::Image)
-                .size(IconSize::Small)
-                .color(Color::Muted),
-        ),
-    }
-    .into_any_element()
-}
-
-/// The muted secondary line: `"512×512 · PNG"`, dropping whichever half could
-/// not be recovered.
-fn asset_detail(entry: &AssetEntry) -> Option<SharedString> {
-    let dimensions = entry
-        .dimensions
-        .map(|(width, height)| format!("{width}×{height}"));
-    let format = (!entry.format_label.is_empty()).then(|| entry.format_label.as_ref());
-    match (dimensions, format) {
-        (Some(dimensions), Some(format)) => Some(format!("{dimensions} · {format}").into()),
-        (Some(dimensions), None) => Some(dimensions.into()),
-        (None, Some(format)) => Some(SharedString::from(format.to_owned())),
-        (None, None) => None,
-    }
-}
-
-fn asset_tooltip_text(entry: &AssetEntry) -> SharedString {
-    let file_size = format_file_size(entry.byte_count as u64, true);
-    let metadata = match asset_detail(entry) {
-        Some(detail) => format!("{detail} · {file_size}"),
-        None => file_size,
-    };
-    SharedString::from(format!(
-        "{}\n{}\nAsset ID: {}",
-        entry.name, metadata, entry.id
-    ))
-}
-
-/// Precompute one [`AssetEntry`] per embedded asset. `name` is left empty for
-/// [`apply_asset_names`] to fill from the scene. The GPUI thumbnail is cloned
-/// from the document's precomputed set (built on the background load thread), so
-/// no asset bytes are hashed here on the foreground.
-fn build_asset_entries(document: &FigDocument) -> Vec<AssetEntry> {
-    document
-        .raw_assets
-        .iter()
-        .map(|(asset_id, bytes)| {
-            let image = document.gpui_images.get(asset_id).cloned();
-            let dimensions = document
-                .asset_resolver
-                .as_ref()
-                .and_then(|resolver| resolver.resolve(*asset_id))
-                .map(|decoded| (decoded.width, decoded.height));
-            AssetEntry {
-                id: *asset_id,
-                name: SharedString::default(),
-                image,
-                dimensions,
-                // Guessing the format reads only the header, not the whole
-                // asset, so identifying the label stays cheap on the foreground.
-                format_label: image::guess_format(bytes)
-                    .ok()
-                    .map(format_label)
-                    .unwrap_or_default(),
-                byte_count: bytes.len(),
-            }
-        })
-        .collect()
-}
-
-/// A short, uppercase label for an encoded format, from its canonical extension
-/// (`Jpeg` → `"JPG"`).
-fn format_label(format: image::ImageFormat) -> SharedString {
-    match format.extensions_str().first() {
-        Some(extension) => SharedString::from(extension.to_uppercase()),
-        None => SharedString::default(),
-    }
-}
-
-/// Fill each entry's `name` from the scene node that references it, numbering
-/// the assets nothing references (`"Image 1"`, `"Image 2"`, …).
-fn apply_asset_names(entries: &mut [AssetEntry], scene: &Scene) {
-    let names = collect_asset_names(scene);
-    let mut unnamed = 0usize;
-    for entry in entries {
-        entry.name = match names.get(&entry.id) {
-            Some(recovered) => recovered.name.clone(),
-            None => {
-                unnamed += 1;
-                SharedString::from(format!("Image {unnamed}"))
-            }
-        };
-    }
-}
-
-/// The best name for every asset the scene references. An asset with no
-/// reference is absent, and gets a synthetic name from the caller.
-fn collect_asset_names(scene: &Scene) -> HashMap<AssetId, AssetName> {
-    let mut names = HashMap::new();
-    for root in scene.roots() {
-        for node_id in scene.descendants_of(*root) {
-            if let Some(node) = scene.get(node_id) {
-                record_asset_names(node, &mut names);
-            }
-        }
-    }
-    names
-}
-
-/// Record the names `node` lends to the assets it references: its own name, for
-/// its bitmap or any image fill it paints with.
-fn record_asset_names(node: &CanvasNode, names: &mut HashMap<AssetId, AssetName>) {
-    // The name is cloned only where it is kept: a page of image-filled shapes
-    // walks this for every one of them.
-    let mut record = |asset: AssetId, from_bitmap: bool| {
-        let name = || AssetName {
-            name: SharedString::from(node.name.clone()),
-            from_bitmap,
-        };
-        match names.entry(asset) {
-            Entry::Vacant(slot) => {
-                slot.insert(name());
-            }
-            // A bitmap layer is named after the asset itself, so it replaces a
-            // name merely borrowed from a shape that paints with it. Between
-            // two references of the same strength, the first in scene order
-            // wins, keeping the list stable.
-            Entry::Occupied(mut slot) if from_bitmap && !slot.get().from_bitmap => {
-                slot.insert(name());
-            }
-            Entry::Occupied(_) => {}
-        }
-    };
-
-    match &node.data {
-        NodeData::Bitmap(bitmap) => record(bitmap.asset, true),
-        NodeData::Vector(vector) => {
-            for fill in &vector.fills {
-                if let Fill::Image { asset, .. } = fill {
-                    record(*asset, false);
-                }
-            }
-        }
-        NodeData::Group(group) => {
-            for fill in group.background.iter().chain(group.background_fills.iter()) {
-                if let Fill::Image { asset, .. } = fill {
-                    record(*asset, false);
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn layer_icon(node: &CanvasNode) -> IconName {
-    match &node.data {
-        NodeData::Group(group) => {
-            if group.is_frame_surface() {
-                IconName::ToolFrame
-            } else {
-                IconName::Blocks
-            }
-        }
-        NodeData::Vector(_) => IconName::ToolRect,
-        NodeData::Text(_) => IconName::Font,
-        NodeData::Bitmap(_) => IconName::Image,
-        NodeData::Video(_) => IconName::PlayOutlined,
-        NodeData::Audio(_) => IconName::AudioOn,
-        NodeData::Instance(_) => IconName::Sparkle,
-        NodeData::Boolean(_) => IconName::Blocks,
-        NodeData::NodeGraph(_)
-        | NodeData::Model3d(_)
-        | NodeData::AiArtifact(_)
-        | NodeData::Embed(_) => IconName::SquareDot,
     }
 }
 
@@ -2966,11 +1803,10 @@ impl Panel for FantaDesignPanel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use fanta_doc::{
-        BitmapNode, BlendMode, ComponentDef, ImageAdjust, ImageFitMode, InstanceNode, Transform2D,
-        VectorNode,
-    };
+    use fanta_doc::{ComponentDef, ComponentId, InstanceNode, Transform2D, VectorNode};
     use gpui::TestAppContext;
     use project::FakeFs;
 
@@ -3325,129 +2161,6 @@ mod tests {
         );
     }
 
-    fn image_fill(asset: AssetId) -> Fill {
-        Fill::Image {
-            asset,
-            mode: ImageFitMode::Fill,
-            opacity: 1.0,
-            crop: None,
-            scale: None,
-            rotation: None,
-            blend: BlendMode::Normal,
-            adjust: ImageAdjust::default(),
-        }
-    }
-
-    fn bitmap_layer(asset: AssetId, name: &str) -> CanvasNode {
-        let mut node = CanvasNode::new(NodeData::Bitmap(BitmapNode {
-            asset,
-            natural_size: [64, 64],
-            local_size: [64., 64.],
-            crop: None,
-            fit: ImageFitMode::Fill,
-            tint: None,
-        }));
-        node.name = name.to_owned();
-        node
-    }
-
-    fn frame_filled_with(asset: AssetId, name: &str) -> CanvasNode {
-        let mut node = CanvasNode::new(NodeData::Group(GroupNode {
-            background: Some(image_fill(asset)),
-            ..GroupNode::default()
-        }));
-        node.name = name.to_owned();
-        node
-    }
-
-    #[test]
-    fn asset_names_prefer_a_bitmap_layer_over_a_shape_that_paints_with_the_asset() {
-        let asset = AssetId::new();
-        let mut names = HashMap::new();
-
-        // A shape painted with an image fill only lends its own name.
-        record_asset_names(&frame_filled_with(asset, "Hero card"), &mut names);
-        assert_eq!(
-            names.get(&asset).map(|name| name.name.as_ref()),
-            Some("Hero card")
-        );
-
-        // A bitmap layer names the asset itself, so it upgrades that name even
-        // though it was met second.
-        record_asset_names(&bitmap_layer(asset, "avatar.png"), &mut names);
-        assert_eq!(
-            names.get(&asset).map(|name| name.name.as_ref()),
-            Some("avatar.png")
-        );
-
-        // Between two references of equal strength the first one wins, so the
-        // list does not shuffle as the scene is walked.
-        record_asset_names(&bitmap_layer(asset, "avatar copy.png"), &mut names);
-        record_asset_names(&frame_filled_with(asset, "Other card"), &mut names);
-        assert_eq!(
-            names.get(&asset).map(|name| name.name.as_ref()),
-            Some("avatar.png")
-        );
-
-        // An asset no node references stays unnamed; the panel numbers it.
-        assert!(!names.contains_key(&AssetId::new()));
-    }
-
-    #[test]
-    fn encoded_formats_map_to_short_labels() {
-        assert_eq!(format_label(image::ImageFormat::Png).as_ref(), "PNG");
-        assert_eq!(format_label(image::ImageFormat::Jpeg).as_ref(), "JPG");
-        assert_eq!(format_label(image::ImageFormat::WebP).as_ref(), "WEBP");
-    }
-
-    #[test]
-    fn the_asset_detail_line_drops_whichever_half_is_unknown() {
-        let entry = |dimensions, format_label: &str| AssetEntry {
-            id: AssetId::new(),
-            name: SharedString::default(),
-            image: None,
-            dimensions,
-            format_label: SharedString::from(format_label.to_owned()),
-            byte_count: 0,
-        };
-
-        assert_eq!(
-            asset_detail(&entry(Some((512, 384)), "PNG")).as_deref(),
-            Some("512×384 · PNG")
-        );
-        assert_eq!(
-            asset_detail(&entry(Some((512, 384)), "")).as_deref(),
-            Some("512×384")
-        );
-        assert_eq!(asset_detail(&entry(None, "PNG")).as_deref(), Some("PNG"));
-        assert_eq!(asset_detail(&entry(None, "")), None);
-    }
-
-    #[test]
-    fn asset_tooltip_exposes_human_context_and_stable_id() {
-        let id = AssetId::new();
-        let entry = AssetEntry {
-            id,
-            name: SharedString::from("Product mark"),
-            image: None,
-            dimensions: Some((512, 384)),
-            format_label: SharedString::from("PNG"),
-            byte_count: 4096,
-        };
-
-        let tooltip = asset_tooltip_text(&entry);
-        assert!(tooltip.contains("Product mark"));
-        assert!(tooltip.contains("512×384 · PNG"));
-        assert!(tooltip.contains(&id.to_string()));
-    }
-
-    #[test]
-    fn filtered_counts_retain_the_total_context() {
-        assert_eq!(section_count_label(3, 12, true).as_ref(), "3 / 12");
-        assert_eq!(section_count_label(12, 12, true).as_ref(), "12");
-        assert_eq!(section_count_label(3, 12, false).as_ref(), "3");
-    }
-
     #[gpui::test]
     fn filtering_expands_its_section_and_collapsing_closes_the_editor(cx: &mut TestAppContext) {
         init_panel_test(cx);
@@ -3458,17 +2171,17 @@ mod tests {
 
         panel
             .update(cx, |panel, window, cx| {
-                panel.collapsed_sections.insert(Section::Layers);
-                panel.toggle_filter(Section::Layers, window, cx);
-                assert!(panel.section_open(Section::Layers));
-                assert_eq!(panel.filter_target, Some(Section::Layers));
+                panel.collapsed_sections.insert(Section::Pages);
+                panel.toggle_filter(Section::Pages, window, cx);
+                assert!(panel.section_open(Section::Pages));
+                assert_eq!(panel.filter_target, Some(Section::Pages));
 
                 panel.filter_editor.update(cx, |editor, cx| {
-                    editor.set_text("button", window, cx);
+                    editor.set_text("cover", window, cx);
                 });
-                panel.toggle_section(Section::Layers, window, cx);
+                panel.toggle_section(Section::Pages, window, cx);
 
-                assert!(!panel.section_open(Section::Layers));
+                assert!(!panel.section_open(Section::Pages));
                 assert_eq!(panel.filter_target, None);
                 assert!(panel.filter_editor.read(cx).text(cx).is_empty());
             })
@@ -3707,6 +2420,541 @@ mod gpui_pages_tests {
             pages_panel.read_with(cx, |panel, _| panel.selected_page().cloned()),
             Some(page_one_id),
             "a canvas-driven page switch should re-highlight the panel row"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "fanta-gpui-ui"))]
+mod gpui_layers_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use fanta_doc::{Color, ComponentDef, ComponentId, InstanceNode, VectorNode};
+    use fanta_gpui::layers::{
+        LayersPanel, LayersPanelAction, LayersPanelContextAction, LayersPanelDropPosition,
+        LayersPanelSelectionMode,
+    };
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+    }
+
+    fn insert(doc: &mut Doc, mut node: CanvasNode, parent: Option<NodeId>, name: &str) -> NodeId {
+        node.parent = parent;
+        node.name = name.to_owned();
+        // Bottom-first insertion order, like the importer produces.
+        node.index = doc.scene.next_child_index(parent);
+        let id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create test node");
+        id
+    }
+
+    fn rect(x: f64, y: f64) -> CanvasNode {
+        CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            x,
+            y,
+            40.0,
+            40.0,
+            Color::BLACK,
+        )))
+    }
+
+    fn group() -> CanvasNode {
+        CanvasNode::new(NodeData::Group(GroupNode::default()))
+    }
+
+    /// The fixture page:
+    ///
+    /// ```text
+    /// Page
+    ///   Frame            (group; the panel lists its children topmost first)
+    ///     Leaf 0..leaf_count   (rects; Leaf N is the topmost)
+    ///   Master           (group; a component master)
+    ///   Instance         (instance of Master)
+    /// ```
+    struct Fixture {
+        doc: Doc,
+        page: NodeId,
+        frame: NodeId,
+        leaves: Vec<NodeId>,
+        master: NodeId,
+        instance: NodeId,
+    }
+
+    fn fixture(leaf_count: usize) -> Fixture {
+        let mut doc = Doc::new();
+        let page = insert(&mut doc, group(), None, "Page 1");
+        doc.add_page(page);
+        doc.set_active_page(Some(page));
+        let frame = insert(&mut doc, group(), Some(page), "Frame");
+        let leaves = (0..leaf_count)
+            .map(|index| {
+                insert(
+                    &mut doc,
+                    rect(index as f64 * 50.0, 0.0),
+                    Some(frame),
+                    &format!("Leaf {index}"),
+                )
+            })
+            .collect();
+        let master = insert(&mut doc, group(), Some(page), "Master");
+        let component = ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, master, "Master"));
+        let instance = insert(
+            &mut doc,
+            CanvasNode::new(NodeData::Instance(InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [100.0, 100.0],
+            })),
+            Some(page),
+            "Instance",
+        );
+        Fixture {
+            doc,
+            page,
+            frame,
+            leaves,
+            master,
+            instance,
+        }
+    }
+
+    struct Harness {
+        panel: Entity<FantaDesignPanel>,
+        view: Entity<FigView>,
+        layers: Entity<LayersPanel>,
+        fixture: Fixture,
+        cx: VisualTestContext,
+    }
+
+    async fn setup(cx: &mut TestAppContext, leaf_count: usize) -> Harness {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let mut fixture = fixture(leaf_count);
+        let doc = std::mem::replace(&mut fixture.doc, Doc::new());
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Layers.fig"),
+            doc,
+            cx,
+        );
+        let view_slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured_view = view_slot.clone();
+        let (panel, cx) = cx.add_window_view(move |window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            *captured_view.borrow_mut() = Some(view.clone());
+            FantaDesignPanel::build(fs, Some(view), window, cx, Vec::new())
+        });
+        let view = view_slot
+            .borrow_mut()
+            .take()
+            .expect("the fig view should be captured during window setup");
+        cx.run_until_parked();
+        let layers = panel.read_with(cx, |panel, _| {
+            panel
+                .gpui_layers
+                .as_ref()
+                .expect("the fanta-gpui layers adapter should mount in a themed window")
+                .panel
+                .clone()
+        });
+        let cx = cx.clone();
+        Harness {
+            panel,
+            view,
+            layers,
+            fixture,
+            cx,
+        }
+    }
+
+    fn row_id(id: NodeId) -> SharedString {
+        SharedString::from(id.to_string())
+    }
+
+    fn selection(harness: &Harness) -> Vec<NodeId> {
+        harness.view.read_with(&harness.cx, |view, cx| {
+            view.item()
+                .read(cx)
+                .document()
+                .map(|document| document.doc.selection.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
+    fn select_on_canvas(harness: &mut Harness, id: NodeId) {
+        let item = harness
+            .view
+            .read_with(&harness.cx, |view, _| view.item().clone());
+        harness.cx.update(|_, cx| {
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(id);
+                    ((), DocChange::Selection)
+                });
+            });
+        });
+        harness.cx.run_until_parked();
+    }
+
+    fn with_doc<R>(harness: &Harness, read: impl FnOnce(&Doc) -> R) -> R {
+        harness.view.read_with(&harness.cx, |view, cx| {
+            let item = view.item().read(cx);
+            read(&item.document().expect("document is ready").doc)
+        })
+    }
+
+    fn emit(harness: &mut Harness, action: LayersPanelAction) {
+        let layers = harness.layers.clone();
+        harness.cx.update(|_, cx| {
+            layers.update(cx, |_, cx| cx.emit(action));
+        });
+        harness.cx.run_until_parked();
+    }
+
+    fn context_action(harness: &mut Harness, id: NodeId, action: LayersPanelContextAction) {
+        emit(
+            harness,
+            LayersPanelAction::ContextActionRequested {
+                node_id: row_id(id),
+                action,
+            },
+        );
+    }
+
+    fn row_bounds(harness: &mut Harness, id: NodeId) -> Option<gpui::Bounds<Pixels>> {
+        let selector: &'static str = Box::leak(format!("layers-row-{id}").into_boxed_str());
+        harness.cx.debug_bounds(selector)
+    }
+
+    #[gpui::test]
+    async fn canvas_selection_echoes_into_the_panel_expanding_ancestors_and_revealing_the_row(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 300).await;
+        let frame = harness.fixture.frame;
+        let leaves = harness.fixture.leaves.clone();
+        // Nothing is expanded on mount: the frame's leaves are not shown.
+        let leaf = leaves[3];
+        assert!(row_bounds(&mut harness, leaf).is_none());
+        assert!(row_bounds(&mut harness, frame).is_some());
+
+        // A canvas click on a leaf near the BOTTOM of the frame (Leaf 3 is
+        // the 297th of 300 rows under the frame) must expand the frame and
+        // scroll the row into the viewport.
+        select_on_canvas(&mut harness, leaf);
+        assert!(harness.panel.read_with(&harness.cx, |panel, _| {
+            panel.expanded_nodes.contains(&frame)
+        }));
+        let selected = harness
+            .layers
+            .read_with(&harness.cx, |layers, _| layers.visible_row_ids());
+        assert!(selected.contains(&row_id(leaf)), "the leaf row is shown");
+        let row = row_bounds(&mut harness, leaf).expect("the revealed row is rendered");
+        let viewport = harness
+            .cx
+            .debug_bounds("layers-tree-viewport")
+            .expect("the tree renders");
+        assert!(
+            row.top() >= viewport.top() && row.bottom() <= viewport.bottom(),
+            "the revealed row must sit inside the viewport: {row:?} in {viewport:?}"
+        );
+        assert!(row_bounds(&mut harness, leaves[299]).is_none());
+    }
+
+    #[gpui::test]
+    async fn selection_changes_do_not_rebuild_the_layer_tree(cx: &mut TestAppContext) {
+        let mut harness = setup(cx, 20).await;
+        let leaves = harness.fixture.leaves.clone();
+        let key_before = harness.panel.read_with(&harness.cx, |panel, _| {
+            panel.gpui_layers.as_ref().unwrap().tree_key
+        });
+        assert!(key_before.is_some());
+        select_on_canvas(&mut harness, leaves[0]);
+        select_on_canvas(&mut harness, leaves[1]);
+        let key_after = harness.panel.read_with(&harness.cx, |panel, _| {
+            panel.gpui_layers.as_ref().unwrap().tree_key
+        });
+        assert_eq!(
+            key_before, key_after,
+            "selection is echoed without a rebuild"
+        );
+
+        // A content edit advances the generation and rebuilds.
+        let leaf = harness.fixture.leaves[0];
+        harness.panel.update_in(&mut harness.cx, |panel, _, cx| {
+            panel.rename_node_to(leaf, "Renamed".into(), cx);
+        });
+        harness.cx.run_until_parked();
+        let key_edited = harness.panel.read_with(&harness.cx, |panel, _| {
+            panel.gpui_layers.as_ref().unwrap().tree_key
+        });
+        assert_ne!(key_before, key_edited);
+    }
+
+    #[gpui::test]
+    async fn row_intents_select_toggle_and_range_select_over_the_shown_rows(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 6).await;
+        let leaves = harness.fixture.leaves.clone();
+        let frame = harness.fixture.frame;
+
+        emit(
+            &mut harness,
+            LayersPanelAction::SelectRequested {
+                node_id: row_id(frame),
+                mode: LayersPanelSelectionMode::Replace,
+            },
+        );
+        assert_eq!(selection(&harness), vec![frame]);
+
+        // Expand the frame (as the panel would after a disclosure click),
+        // then range-select from Leaf 4 (anchor) down to Leaf 1. Rows show
+        // topmost first: Leaf 5, 4, 3, 2, 1, 0.
+        emit(
+            &mut harness,
+            LayersPanelAction::ExpansionChanged {
+                node_id: row_id(frame),
+                expanded: true,
+            },
+        );
+        select_on_canvas(&mut harness, leaves[4]);
+        emit(
+            &mut harness,
+            LayersPanelAction::SelectRequested {
+                node_id: row_id(leaves[1]),
+                mode: LayersPanelSelectionMode::Range,
+            },
+        );
+        let mut selected = selection(&harness);
+        selected.sort();
+        let mut expected = vec![leaves[4], leaves[3], leaves[2], leaves[1]];
+        expected.sort();
+        assert_eq!(selected, expected);
+        // The anchor survives the range, so a second range extends from it.
+        assert_eq!(
+            with_doc(&harness, |doc| doc.selection.anchor()),
+            Some(leaves[4])
+        );
+        emit(
+            &mut harness,
+            LayersPanelAction::SelectRequested {
+                node_id: row_id(leaves[5]),
+                mode: LayersPanelSelectionMode::Range,
+            },
+        );
+        let mut selected = selection(&harness);
+        selected.sort();
+        let mut expected = vec![leaves[5], leaves[4]];
+        expected.sort();
+        assert_eq!(selected, expected);
+
+        emit(
+            &mut harness,
+            LayersPanelAction::SelectRequested {
+                node_id: row_id(leaves[0]),
+                mode: LayersPanelSelectionMode::Toggle,
+            },
+        );
+        assert!(selection(&harness).contains(&leaves[0]));
+        assert_eq!(selection(&harness).len(), 3);
+    }
+
+    #[gpui::test]
+    async fn move_intents_reparent_and_the_highlight_validator_matches_the_document(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 3).await;
+        let leaf = harness.fixture.leaves[0];
+        let master = harness.fixture.master;
+        let page = harness.fixture.page;
+        let instance = harness.fixture.instance;
+
+        // The validator the panel's drop highlight consults agrees with the
+        // document rules: a leaf can move into the master, the master itself
+        // may not leave its library, a page root never moves, and an instance
+        // accepts no children.
+        harness.panel.read_with(&harness.cx, |panel, cx| {
+            assert!(panel.layer_drop_allowed(leaf, master, LayerDropPlacement::Inside, cx));
+            assert!(!panel.layer_drop_allowed(master, leaf, LayerDropPlacement::Above, cx));
+            assert!(!panel.layer_drop_allowed(page, master, LayerDropPlacement::Above, cx));
+            assert!(!panel.layer_drop_allowed(leaf, instance, LayerDropPlacement::Inside, cx));
+        });
+
+        emit(
+            &mut harness,
+            LayersPanelAction::MoveRequested {
+                node_id: row_id(leaf),
+                target_node_id: row_id(master),
+                position: LayersPanelDropPosition::Inside,
+            },
+        );
+        assert_eq!(
+            with_doc(&harness, |doc| doc.scene.get(leaf).unwrap().parent),
+            Some(master)
+        );
+        assert!(harness.panel.read_with(&harness.cx, |panel, _| {
+            panel.expanded_nodes.contains(&master)
+        }));
+    }
+
+    #[gpui::test]
+    async fn context_menu_z_order_component_and_copy_actions_hit_real_operations(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 3).await;
+        let leaves = harness.fixture.leaves.clone();
+        let frame = harness.fixture.frame;
+        let master = harness.fixture.master;
+        let instance = harness.fixture.instance;
+
+        // Bring to front / send to back reorder among siblings (bottom-first
+        // scene order: the last child is the topmost row).
+        context_action(
+            &mut harness,
+            leaves[0],
+            LayersPanelContextAction::BringToFront,
+        );
+        assert_eq!(
+            with_doc(&harness, |doc| doc.scene.children_of(Some(frame)).to_vec()),
+            vec![leaves[1], leaves[2], leaves[0]]
+        );
+        context_action(
+            &mut harness,
+            leaves[2],
+            LayersPanelContextAction::SendToBack,
+        );
+        assert_eq!(
+            with_doc(&harness, |doc| doc.scene.children_of(Some(frame)).to_vec()),
+            vec![leaves[2], leaves[1], leaves[0]]
+        );
+
+        // Create component promotes the frame into a master; detach turns the
+        // instance into a plain group.
+        context_action(
+            &mut harness,
+            frame,
+            LayersPanelContextAction::CreateComponent,
+        );
+        assert!(with_doc(&harness, |doc| doc
+            .components
+            .defs
+            .values()
+            .any(|def| def.root == frame)));
+        context_action(
+            &mut harness,
+            instance,
+            LayersPanelContextAction::DetachInstance,
+        );
+        assert!(with_doc(&harness, |doc| matches!(
+            doc.scene.get(instance).unwrap().data,
+            NodeData::Group(_)
+        )));
+
+        select_on_canvas(&mut harness, master);
+        assert_eq!(selection(&harness), vec![master]);
+
+        // Copy puts the selection on the clipboard.
+        select_on_canvas(&mut harness, leaves[1]);
+        context_action(&mut harness, leaves[1], LayersPanelContextAction::Copy);
+        let clipboard = harness.cx.update(|_, cx| cx.read_from_clipboard());
+        assert!(
+            clipboard.is_some_and(|item| !item.text().unwrap_or_default().is_empty()),
+            "copy must place the selected layer on the clipboard"
+        );
+    }
+
+    #[gpui::test]
+    async fn main_component_action_navigates_from_an_instance_to_its_master(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 1).await;
+        let master = harness.fixture.master;
+        let instance = harness.fixture.instance;
+        select_on_canvas(&mut harness, instance);
+        context_action(
+            &mut harness,
+            instance,
+            LayersPanelContextAction::GoToMainComponent,
+        );
+        assert_eq!(selection(&harness), vec![master]);
+        let row = row_bounds(&mut harness, master).expect("the master row is shown");
+        assert!(row.size.height > px(0.));
+    }
+
+    #[gpui::test]
+    async fn collapsing_the_panel_header_frees_the_sidebar_and_a_large_page_renders(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 3_000).await;
+        let frame = harness.fixture.frame;
+        let leaves = harness.fixture.leaves.clone();
+        // The whole page is echoed once (3,003 items) and only the viewport's
+        // rows are built.
+        emit(
+            &mut harness,
+            LayersPanelAction::ExpansionChanged {
+                node_id: row_id(frame),
+                expanded: true,
+            },
+        );
+        select_on_canvas(&mut harness, leaves[2_999]);
+        let shown = harness
+            .layers
+            .read_with(&harness.cx, |layers, _| layers.visible_row_ids().len());
+        assert_eq!(shown, 3_003);
+        assert!(row_bounds(&mut harness, leaves[2_999]).is_some());
+        assert!(row_bounds(&mut harness, leaves[0]).is_none());
+
+        let expanded_height = harness
+            .cx
+            .debug_bounds("layers-panel")
+            .expect("panel renders")
+            .size
+            .height;
+        emit(
+            &mut harness,
+            LayersPanelAction::PanelExpansionChanged { expanded: false },
+        );
+        assert!(
+            harness
+                .panel
+                .read_with(&harness.cx, |panel, _| panel.layers_collapsed)
+        );
+        harness.layers.update_in(&mut harness.cx, |layers, _, cx| {
+            layers.set_expanded(false, cx);
+        });
+        harness.cx.run_until_parked();
+        let collapsed_height = harness
+            .cx
+            .debug_bounds("layers-panel")
+            .expect("panel renders")
+            .size
+            .height;
+        assert!(
+            collapsed_height < expanded_height,
+            "the collapsed panel must give the sidebar back: {collapsed_height:?} < {expanded_height:?}"
         );
     }
 }
@@ -4089,6 +3337,12 @@ impl FantaDesignPanel {
             return;
         };
         let item = view.read(cx).item().clone();
+        if !item.read(cx).is_editable() {
+            return;
+        }
+        view.update(cx, |view, cx| {
+            view.finish_document_edits_for_external_change(cx);
+        });
         let old_name = item
             .read(cx)
             .document()
@@ -4133,90 +3387,65 @@ impl FantaDesignPanel {
 #[cfg(feature = "fanta-gpui-ui")]
 impl FantaDesignPanel {
     fn ensure_gpui_layers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.gpui_layers.is_some()
-            || !crate::gpui_adapters::runtime_enabled(cx)
-            || !crate::gpui_adapters::layers::layers_enabled()
-        {
+        if self.gpui_layers.is_some() || !crate::gpui_adapters::runtime_enabled(cx) {
             return;
         }
         let panel = cx.new(|cx| {
             fanta_gpui::layers::LayersPanel::new("fanta-gpui-layers", Vec::new(), window, cx)
         });
+        // The drop highlight consults `layer_move_operations` through this
+        // hook, so it agrees with what `drop_layer` will accept.
+        let host = cx.entity().downgrade();
+        let validator: fanta_gpui::layers::LayersDropValidator =
+            std::rc::Rc::new(move |dragged, target, position, cx| {
+                use crate::gpui_adapters::layers::{drop_placement, node_id};
+                let (Some(dragged), Some(target)) = (node_id(dragged), node_id(target)) else {
+                    return false;
+                };
+                host.upgrade().is_some_and(|host| {
+                    host.read(cx)
+                        .layer_drop_allowed(dragged, target, drop_placement(position), cx)
+                })
+            });
+        panel.update(cx, |panel, cx| {
+            panel.set_drop_validator(Some(validator), cx)
+        });
         let subscription = cx.subscribe_in(&panel, window, Self::handle_layers_action);
         self.gpui_layers = Some(crate::gpui_adapters::layers::LayersAdapter {
             panel,
+            tree_key: None,
             _subscription: subscription,
         });
         self.refresh_gpui_layers(cx);
     }
 
-    /// The active page's root, when it is a real page node.
-    fn gpui_layers_page_root(&self, cx: &App) -> Option<NodeId> {
-        let view = self.active_view(cx)?;
-        let item = view.read(cx).item().clone();
-        let fig_item = item.read(cx);
-        let document = fig_item.document()?;
-        self.current_page_index
-            .and_then(|index| document.pages.get(index))
-            .and_then(|page| page.root)
-    }
-
-    /// True when the current page fits the non-virtualized panel's budget.
-    /// Memoized per (page root, render generation) — node count only changes
-    /// on content edits, which advance the generation — and the cold count
-    /// stops walking at budget + 1, so an over-budget page never pays a full
-    /// walk.
-    fn gpui_layers_within_budget(&self, cx: &App) -> bool {
-        let Some(root) = self.gpui_layers_page_root(cx) else {
-            return false;
-        };
-        let Some(view) = self.active_view(cx) else {
-            return false;
-        };
-        let item = view.read(cx).item().clone();
-        let fig_item = item.read(cx);
-        let Some(document) = fig_item.document() else {
-            return false;
-        };
-        let generation = document.render_generation();
-        if let Some((cached_root, cached_generation, within)) = self.gpui_layers_budget.get()
-            && cached_root == root
-            && cached_generation == generation
-        {
-            return within;
-        }
-        let within = crate::gpui_adapters::layers::subtree_within_budget(
-            &document.doc,
-            root,
-            crate::gpui_adapters::layers::node_budget(),
-        );
-        self.gpui_layers_budget
-            .set(Some((root, generation, within)));
-        within
-    }
-
-    /// Echo the layer tree, selection, and expansion into the panel. Skipped
-    /// (cheaply) while over budget — the native section renders then.
+    /// Echo the layer tree, selection, and expansion into the panel, then
+    /// scroll a pending reveal into view. The tree read model is memoized on
+    /// (page root, render generation): selection changes — every canvas
+    /// click — reach the panel as two id-list setters, never as a rebuild of
+    /// a 30k-item tree.
     fn refresh_gpui_layers(&mut self, cx: &mut App) {
         let refresh_started = std::time::Instant::now();
-        if self.gpui_layers.is_none() || !self.gpui_layers_within_budget(cx) {
-            crate::report_slow("gpui layers budget check", refresh_started);
-            return;
-        }
-        let Some(root) = self.gpui_layers_page_root(cx) else {
-            return;
-        };
         let Some(view) = self.active_view(cx) else {
             return;
         };
-        let item = view.read(cx).item().clone();
-        let fig_item = item.read(cx);
+        if self.gpui_layers.is_none() {
+            return;
+        }
+        let view = view.read(cx);
+        let fig_item = view.item().read(cx);
         let Some(document) = fig_item.document() else {
             return;
         };
-        let tree = crate::gpui_adapters::layers::layers_tree(&document.doc, root);
-        let selected: Vec<SharedString> = document
-            .doc
+        let doc = &document.doc;
+        let page_root = Self::layers_page_root(view, document);
+        let tree_key = (page_root, document.render_generation());
+        let tree = (self
+            .gpui_layers
+            .as_ref()
+            .is_some_and(|adapter| adapter.tree_key != Some(tree_key)))
+        .then(|| crate::gpui_adapters::layers::layers_tree(doc, page_root));
+        let selected: Vec<SharedString> = doc
             .selection
             .iter()
             .map(|id| SharedString::from(id.to_string()))
@@ -4226,11 +3455,21 @@ impl FantaDesignPanel {
             .iter()
             .map(|id| SharedString::from(id.to_string()))
             .collect();
-        if let Some(adapter) = self.gpui_layers.as_ref() {
+        let reveal = self
+            .pending_reveal
+            .take()
+            .map(|id| SharedString::from(id.to_string()));
+        if let Some(adapter) = self.gpui_layers.as_mut() {
+            adapter.tree_key = Some(tree_key);
             adapter.panel.update(cx, |panel, cx| {
-                panel.set_nodes(tree, cx);
+                if let Some(tree) = tree {
+                    panel.set_nodes(tree, cx);
+                }
                 panel.set_selected_node_ids(selected, cx);
                 panel.set_expanded_node_ids(expanded, cx);
+                if let Some(reveal) = reveal {
+                    panel.reveal_node(&reveal, cx);
+                }
             });
         }
         crate::report_slow("gpui layers refresh", refresh_started);
@@ -4243,10 +3482,8 @@ impl FantaDesignPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::gpui_adapters::layers::node_id;
-        use fanta_gpui::layers::{
-            LayersPanelAction, LayersPanelContextAction, LayersPanelSelectionMode,
-        };
+        use crate::gpui_adapters::layers::{drop_placement, node_id};
+        use fanta_gpui::layers::{LayersPanelAction, LayersPanelSelectionMode};
         match action {
             LayersPanelAction::SelectRequested { node_id: id, mode } => {
                 let Some(id) = node_id(id) else {
@@ -4300,16 +3537,10 @@ impl FantaDesignPanel {
                 target_node_id: target,
                 position,
             } => {
-                use fanta_gpui::layers::LayersPanelDropPosition;
                 let (Some(dragged), Some(target)) = (node_id(dragged), node_id(target)) else {
                     return;
                 };
-                let placement = match position {
-                    LayersPanelDropPosition::Before => LayerDropPlacement::Above,
-                    LayersPanelDropPosition::Inside => LayerDropPlacement::Inside,
-                    LayersPanelDropPosition::After => LayerDropPlacement::Below,
-                };
-                self.drop_layer(dragged, target, placement, cx);
+                self.drop_layer(dragged, target, drop_placement(*position), cx);
             }
             LayersPanelAction::ContextActionRequested {
                 node_id: id,
@@ -4318,49 +3549,130 @@ impl FantaDesignPanel {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                match action {
-                    LayersPanelContextAction::ShowHide => {
-                        self.toggle_node_flag(id, NodeFlags::HIDDEN, cx)
-                    }
-                    LayersPanelContextAction::LockUnlock => {
-                        self.toggle_node_flag(id, NodeFlags::LOCKED, cx)
-                    }
-                    // The panel opens its own inline rename for Rename.
-                    LayersPanelContextAction::Rename => {}
-                    other => {
-                        log::info!("fanta-gpui layers: context action {other:?} not wired yet");
-                    }
-                }
+                self.handle_layers_context_action(id, *action, cx);
             }
-            LayersPanelAction::PanelExpansionChanged { .. } => {}
+            LayersPanelAction::PanelExpansionChanged { expanded } => {
+                self.layers_collapsed = !expanded;
+                cx.notify();
+            }
         }
     }
 
-    /// Shift-click range selection over the flattened visible row order the
-    /// native section maintains (`layer_rows` is rebuilt on every document
-    /// event even while the gpui panel renders).
+    /// The context-menu entries the host has an operation for. Everything
+    /// else is Figma-only or has no engine op yet and is logged, not faked.
+    fn handle_layers_context_action(
+        &mut self,
+        id: NodeId,
+        action: fanta_gpui::layers::LayersPanelContextAction,
+        cx: &mut Context<Self>,
+    ) {
+        use fanta_gpui::layers::LayersPanelContextAction;
+        match action {
+            LayersPanelContextAction::ShowHide => self.toggle_node_flag(id, NodeFlags::HIDDEN, cx),
+            LayersPanelContextAction::LockUnlock => {
+                self.toggle_node_flag(id, NodeFlags::LOCKED, cx)
+            }
+            // The panel opens its own inline rename for Rename.
+            LayersPanelContextAction::Rename => {}
+            // Opening the menu selected the row, so the selection is the node.
+            LayersPanelContextAction::Copy => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.copy_selected_nodes(cx));
+                }
+            }
+            LayersPanelContextAction::BringToFront => self.move_layer_to_extreme(id, true, cx),
+            LayersPanelContextAction::SendToBack => self.move_layer_to_extreme(id, false, cx),
+            LayersPanelContextAction::CreateComponent => {
+                self.apply_document_ops(
+                    "Create component",
+                    |doc| crate::properties_ops::create_component_operations(doc, id),
+                    cx,
+                );
+            }
+            LayersPanelContextAction::DetachInstance => {
+                self.apply_document_ops(
+                    "Detach instance",
+                    |doc| crate::properties_ops::detach_instance_operations(doc, id),
+                    cx,
+                );
+            }
+            LayersPanelContextAction::GoToMainComponent => {
+                let master = self.active_view(cx).and_then(|view| {
+                    let item = view.read(cx).item().read(cx);
+                    let document = item.document()?;
+                    let NodeData::Instance(instance) = &document.doc.scene.get(id)?.data else {
+                        return None;
+                    };
+                    document
+                        .doc
+                        .components
+                        .defs
+                        .get(&instance.component)
+                        .map(|def| def.root)
+                });
+                if let Some(master) = master {
+                    self.focus_component(master, cx);
+                }
+            }
+            other => {
+                log::info!("fanta-gpui layers: context action {other:?} not wired yet");
+            }
+        }
+    }
+
+    /// Shift-click range selection over the rows the panel currently shows,
+    /// anchored on the selection anchor (the last plain click). The anchor is
+    /// echoed last so it survives as the anchor of the new selection and a
+    /// second shift-click extends from the same row.
     fn select_node_range_to(&mut self, target: NodeId, cx: &mut Context<Self>) {
-        let anchor = self
-            .layer_rows
-            .iter()
-            .position(|row| row.selected)
-            .unwrap_or(0);
-        let Some(end) = self.layer_rows.iter().position(|row| row.id == target) else {
-            self.select_node(target, false, cx);
-            return;
-        };
-        let (from, to) = (anchor.min(end), anchor.max(end));
-        let ids: Vec<NodeId> = self.layer_rows[from..=to]
-            .iter()
-            .map(|row| row.id)
-            .collect();
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        let rows: Vec<NodeId> = self
+            .gpui_layers
+            .as_ref()
+            .map(|adapter| {
+                adapter
+                    .panel
+                    .read(cx)
+                    .visible_row_ids()
+                    .iter()
+                    .filter_map(crate::gpui_adapters::layers::node_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(end) = rows.iter().position(|id| *id == target) else {
+            self.select_node(target, false, cx);
+            return;
+        };
+        let item = view.read(cx).item().clone();
+        let anchor = {
+            let fig_item = item.read(cx);
+            let Some(document) = fig_item.document() else {
+                return;
+            };
+            document
+                .doc
+                .selection
+                .anchor()
+                .and_then(|anchor| rows.iter().position(|id| *id == anchor))
+                .or_else(|| {
+                    rows.iter()
+                        .position(|id| document.doc.selection.contains(*id))
+                })
+                .unwrap_or(end)
+        };
+        let (from, to) = (anchor.min(end), anchor.max(end));
+        let anchor_id = rows[anchor];
+        let mut ids: Vec<NodeId> = rows[from..=to]
+            .iter()
+            .copied()
+            .filter(|id| *id != anchor_id)
+            .collect();
+        ids.push(anchor_id);
         view.update(cx, |view, cx| {
             view.finish_document_edits_for_external_change(cx);
         });
-        let item = view.read(cx).item().clone();
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 document.doc.selection.replace_with(ids.iter().copied());
@@ -4369,16 +3681,15 @@ impl FantaDesignPanel {
         });
     }
 
-    /// The mounted LayersPanel when the adapter is live AND the page is
-    /// within the node budget; None falls back to the native section.
-    fn gpui_layers_section_element(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The mounted LayersPanel, flexing over the sidebar remainder — or only
+    /// its header tall while the user collapsed it. None when the fanta-gpui
+    /// runtime is off (the section renders its unavailable notice instead).
+    fn gpui_layers_section_element(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
         let adapter = self.gpui_layers.as_ref()?;
-        if !self.gpui_layers_within_budget(cx) {
-            return None;
-        }
         Some(
             v_flex()
-                .flex_1()
+                .when(!self.layers_collapsed, |section| section.flex_1())
+                .when(self.layers_collapsed, |section| section.flex_none())
                 .overflow_hidden()
                 .child(adapter.panel.clone())
                 .into_any_element(),
