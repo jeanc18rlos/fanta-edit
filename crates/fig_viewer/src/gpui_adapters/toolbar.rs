@@ -3,14 +3,21 @@
 //! and echoes FigView state back into the toolbar entity.
 
 use fanta_gpui::toolbar::{
-    AgentToolbarOptions, DevToolbarOptions, EditorToolbar, MotionToolbarOptions, ToolbarCommand,
-    ToolbarMode, ToolbarTool,
+    AgentToolbarOptions, DevToolbarOptions, EditorToolbar, MotionToolbarOptions,
+    ToolbarChromeControl, ToolbarCommand, ToolbarMode, ToolbarTool,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
+use gpui_component::IconName;
 
 use crate::editor_session::EditorMode;
 use crate::tools::ToolKind;
 use crate::view::FigView;
+
+/// Chrome control ids the host pushes through `set_chrome_controls`; the
+/// toolbar echoes them verbatim in `ToolbarAction::ChromeControlInvoked`.
+pub(crate) const CHROME_FIT_TO_VIEW: &str = "fit-to-view";
+pub(crate) const CHROME_TOGGLE_LAYERS_SIDEBAR: &str = "toggle-layers-sidebar";
+pub(crate) const CHROME_TOGGLE_INSPECTOR_SIDEBAR: &str = "toggle-inspector-sidebar";
 
 /// The commands the host actually implements today. Passed through
 /// `EditorToolbar::set_commands` so the palette never advertises an
@@ -53,6 +60,61 @@ pub(crate) struct ToolbarOptionInputs {
     pub duration_ms: Option<u32>,
     /// What the contextual Agent composer would act on right now.
     pub agent_context_label: SharedString,
+    /// Whether the left (pages/layers) sidebar is shown; drives the chrome
+    /// toggle's icon, label, and active state.
+    pub layers_sidebar_visible: bool,
+    /// Whether the right (inspector) sidebar is shown; same role as above.
+    pub inspector_sidebar_visible: bool,
+    /// The live keymap text for `FitToView` (e.g. "⇧1"), or `None` when the
+    /// action is unbound in the current window.
+    pub fit_to_view_shortcut: Option<SharedString>,
+}
+
+/// The dock's trailing chrome capsule: fit-to-view plus the two sidebar
+/// toggles, exactly the host chrome the pre-capsule trailing cluster held.
+/// The Panel icons depict the action (`*Close` while visible, `*Open` while
+/// hidden) and `active` mirrors visibility, so the raised tile reads
+/// "sidebar is showing".
+pub(crate) fn chrome_controls(
+    layers_sidebar_visible: bool,
+    inspector_sidebar_visible: bool,
+    fit_to_view_shortcut: Option<SharedString>,
+) -> Vec<ToolbarChromeControl> {
+    let mut fit = ToolbarChromeControl::new(CHROME_FIT_TO_VIEW, IconName::Maximize, "Fit to View");
+    if let Some(shortcut) = fit_to_view_shortcut {
+        fit = fit.shortcut(shortcut);
+    }
+    vec![
+        fit,
+        ToolbarChromeControl::new(
+            CHROME_TOGGLE_LAYERS_SIDEBAR,
+            if layers_sidebar_visible {
+                IconName::PanelLeftClose
+            } else {
+                IconName::PanelLeftOpen
+            },
+            if layers_sidebar_visible {
+                "Hide Layers"
+            } else {
+                "Show Layers"
+            },
+        )
+        .active(layers_sidebar_visible),
+        ToolbarChromeControl::new(
+            CHROME_TOGGLE_INSPECTOR_SIDEBAR,
+            if inspector_sidebar_visible {
+                IconName::PanelRightClose
+            } else {
+                IconName::PanelRightOpen
+            },
+            if inspector_sidebar_visible {
+                "Hide Inspector"
+            } else {
+                "Show Inspector"
+            },
+        )
+        .active(inspector_sidebar_visible),
+    ]
 }
 
 /// Total: every canvas tool has a toolbar face.
@@ -79,10 +141,11 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
     }
 }
 
-/// Partial: toolbar faces without a canvas tool (Brush, Lasso, Measure, …)
-/// are roadmap items and intentionally return `None`. `Resources` also has no
-/// canvas tool — `FigView::handle_toolbar_action` intercepts it as host
-/// chrome (the left sidebar toggle) before this mapping is consulted.
+/// Partial: toolbar faces without a canvas tool (Arrow, Measure, Dev and
+/// Motion faces, …) are roadmap items and intentionally return `None`.
+/// `Resources` also has no canvas tool — `FigView::handle_toolbar_action`
+/// intercepts it as host chrome (reveal and focus the left sidebar) before
+/// this mapping is consulted.
 pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
     Some(match tool {
         ToolbarTool::Move => ToolKind::Select,
@@ -107,8 +170,8 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
     })
 }
 
-/// The editor has no Draw or Dev mode; Prototype and Comments keep the
-/// Design strip visible.
+/// The editor has no Dev mode; Prototype and Comments keep the Design strip
+/// visible.
 pub(crate) fn toolbar_mode(mode: EditorMode) -> ToolbarMode {
     match mode {
         EditorMode::Motion => ToolbarMode::Motion,
@@ -125,6 +188,7 @@ pub(crate) struct ToolbarAdapter {
     last_pushed_motion: Option<MotionToolbarOptions>,
     last_pushed_dev: Option<DevToolbarOptions>,
     last_pushed_agent: Option<AgentToolbarOptions>,
+    last_pushed_chrome: Option<Vec<ToolbarChromeControl>>,
     /// The accepted Motion animation style. Host-side UI state held on the
     /// adapter because the document model has no per-clip style field yet;
     /// `ControlChangeRequested` updates it and the render-time refresh echoes
@@ -163,6 +227,7 @@ impl ToolbarAdapter {
             last_pushed_motion: None,
             last_pushed_dev: None,
             last_pushed_agent: None,
+            last_pushed_chrome: None,
             animation_style,
             #[cfg(test)]
             option_pushes: std::cell::Cell::new(0),
@@ -261,11 +326,6 @@ impl ToolbarAdapter {
             self.last_pushed_dev = Some(dev);
         }
 
-        // Draw options are intentionally never pushed: `EditorMode` has no
-        // Draw/ink surface, `toolbar_mode` never yields `ToolbarMode::Draw`,
-        // and feeding a fake stroke model would advertise a mode the host
-        // cannot enter.
-
         let agent = agent_options(options.agent_context_label);
         if self.last_pushed_agent.as_ref() != Some(&agent) {
             self.record_option_push();
@@ -273,6 +333,22 @@ impl ToolbarAdapter {
                 toolbar.set_agent_options(agent.clone(), cx);
             });
             self.last_pushed_agent = Some(agent);
+        }
+
+        // Host chrome (§12): the toolbar renders the capsule, the host owns
+        // the state; a sidebar toggle round-trips as intent → host flip →
+        // this echo, which flips the tile's icon and raised state.
+        let chrome = chrome_controls(
+            options.layers_sidebar_visible,
+            options.inspector_sidebar_visible,
+            options.fit_to_view_shortcut,
+        );
+        if self.last_pushed_chrome.as_ref() != Some(&chrome) {
+            self.record_option_push();
+            self.panel.update(cx, |toolbar, cx| {
+                toolbar.set_chrome_controls(chrome.iter().cloned(), cx);
+            });
+            self.last_pushed_chrome = Some(chrome);
         }
     }
 }
@@ -343,11 +419,6 @@ mod tests {
                 ToolbarTool::Measure,
                 ToolbarTool::Resources,
                 ToolbarTool::Actions,
-                ToolbarTool::Brush,
-                ToolbarTool::PaintBucket,
-                ToolbarTool::ShapeBuilder,
-                ToolbarTool::Lasso,
-                ToolbarTool::VariableWidth,
                 ToolbarTool::Inspect,
                 ToolbarTool::ColorPicker,
                 ToolbarTool::Code,
@@ -370,6 +441,89 @@ mod tests {
         assert_eq!(toolbar_mode(EditorMode::Motion), ToolbarMode::Motion);
         assert_eq!(toolbar_mode(EditorMode::Prototype), ToolbarMode::Design);
         assert_eq!(toolbar_mode(EditorMode::Comments), ToolbarMode::Design);
+    }
+
+    /// The chrome capsule carries exactly the three controls the retired
+    /// trailing cluster held, in the same order, with the Panel icons
+    /// depicting the action and `active` mirroring visibility.
+    #[test]
+    fn chrome_controls_mirror_sidebar_visibility() {
+        use fanta_gpui::toolbar::ToolbarChromeControl;
+        use gpui_component::IconNamed as _;
+
+        let shown = chrome_controls(true, true, Some("⇧1".into()));
+        assert_eq!(
+            shown.iter().map(|c| c.id.as_ref()).collect::<Vec<_>>(),
+            [
+                CHROME_FIT_TO_VIEW,
+                CHROME_TOGGLE_LAYERS_SIDEBAR,
+                CHROME_TOGGLE_INSPECTOR_SIDEBAR
+            ]
+        );
+        assert_eq!(
+            shown[0],
+            ToolbarChromeControl::new(CHROME_FIT_TO_VIEW, IconName::Maximize, "Fit to View")
+                .shortcut("⇧1")
+        );
+        assert_eq!(shown[1].icon_path(), IconName::PanelLeftClose.path());
+        assert_eq!(shown[1].label, "Hide Layers");
+        assert!(shown[1].active);
+        assert_eq!(shown[2].icon_path(), IconName::PanelRightClose.path());
+        assert_eq!(shown[2].label, "Hide Inspector");
+        assert!(shown[2].active);
+
+        let hidden = chrome_controls(false, false, None);
+        assert_eq!(hidden[0].shortcut, None);
+        assert_eq!(hidden[1].icon_path(), IconName::PanelLeftOpen.path());
+        assert_eq!(hidden[1].label, "Show Layers");
+        assert!(!hidden[1].active);
+        assert_eq!(hidden[2].icon_path(), IconName::PanelRightOpen.path());
+        assert_eq!(hidden[2].label, "Show Inspector");
+        assert!(!hidden[2].active);
+    }
+
+    /// The app's asset source is Zed's `assets::Assets` (embedded
+    /// `assets/icons/**`), not gpui-component-assets. Every Lucide icon the
+    /// toolbar can name — its own tool/mode faces and the host's chrome
+    /// controls — must resolve there or the tile renders blank in the app.
+    /// The vendored `IconName::path` table is the exhaustive list of what
+    /// `gpui_component::IconName` can name, so scanning it covers the
+    /// toolbar's internal choices without pinning them here.
+    #[test]
+    fn every_gpui_component_icon_resolves_in_the_app_asset_source() {
+        use gpui::AssetSource as _;
+
+        let icon_table = include_str!("../../../gpui_component/src/icon.rs");
+        let paths: Vec<&str> = icon_table
+            .match_indices("\"icons/")
+            .map(|(start, _)| {
+                let rest = &icon_table[start + 1..];
+                let end = rest.find('"').expect("closing quote");
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            paths.len() >= 80,
+            "the IconName table should list the Lucide set, found {}",
+            paths.len()
+        );
+        for control in chrome_controls(true, false, None) {
+            let path = control.icon_path();
+            assert!(
+                paths.contains(&path.as_ref()),
+                "{path} must come from the IconName table"
+            );
+        }
+        for path in paths {
+            let bytes = assets::Assets
+                .load(path)
+                .unwrap_or_else(|error| panic!("{path}: {error:#}"))
+                .unwrap_or_else(|| panic!("{path} is missing from assets/icons"));
+            assert!(
+                std::str::from_utf8(&bytes).is_ok_and(|svg| svg.contains("<svg")),
+                "{path} must be an SVG document"
+            );
+        }
     }
 
     /// Both zoom commands the component's zoom menu emits are advertised, so
@@ -407,7 +561,8 @@ mod echo_tests {
         Transform2D, Viewport,
     };
     use fanta_gpui::toolbar::{ToolbarAction, ToolbarControlValue, ToolbarSecondaryControl};
-    use gpui::{Bounds, TestAppContext, VisualTestContext, point, px, size};
+    use gpui::{Bounds, Modifiers, TestAppContext, VisualTestContext, point, px, size};
+    use gpui_component::IconNamed as _;
     use project::{FakeFs, Project};
 
     use super::*;
@@ -436,7 +591,8 @@ mod echo_tests {
         let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
         page.name = "Page 1".to_owned();
         let page_root = page.id;
-        doc.apply(Operation::create_node(page)).expect("create page");
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
         doc.add_page(page_root);
         doc.set_active_page(Some(page_root));
 
@@ -612,10 +768,7 @@ mod echo_tests {
                 center: [0.0, 0.0],
                 zoom: 1.0,
             });
-            view.set_container_bounds(Bounds::new(
-                point(px(0.), px(0.)),
-                size(px(800.), px(600.)),
-            ));
+            view.set_container_bounds(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
             cx.notify();
         });
         cx.run_until_parked();
@@ -674,5 +827,230 @@ mod echo_tests {
             "zoom-to-fit must center the page contents, got {:?}",
             viewport.center
         );
+    }
+
+    fn selection(view: &Entity<FigView>, cx: &mut VisualTestContext) -> Vec<fanta_doc::NodeId> {
+        view.read_with(cx, |view, cx| {
+            view.item()
+                .read(cx)
+                .document()
+                .map(|document| document.doc.selection.as_slice().to_vec())
+                .unwrap_or_default()
+        })
+    }
+
+    /// End-to-end click-through guard: the dock renders as an absolute
+    /// overlay inside the canvas workspace, so before the toolbar occluded
+    /// its hitbox a tool press also landed on `fig-container`'s
+    /// `on_mouse_down` and the Select tool cleared the selection. Every dock
+    /// press below leaves the canvas selection untouched while the toolbar
+    /// itself reacts; the closing canvas press proves the probe is live.
+    #[gpui::test]
+    async fn dock_presses_reach_the_toolbar_but_never_the_canvas(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_280.), px(800.)));
+        cx.run_until_parked();
+
+        let initial = selection(&view, cx);
+        assert_eq!(initial.len(), 1, "the fixture starts with Target selected");
+        let canvas = cx
+            .debug_bounds("fig-container")
+            .expect("the canvas container should render");
+        let surface = cx
+            .debug_bounds("editor-toolbar-surface")
+            .expect("the dock surface should render");
+        assert!(
+            surface.intersects(&canvas),
+            "the dock must overlay the canvas for the probe to mean anything: {surface:?} vs {canvas:?}"
+        );
+
+        // A tool tile: the toolbar switches the host tool, the canvas sees
+        // nothing (a Select press on empty canvas would have deselected).
+        let text = cx
+            .debug_bounds("toolbar-tool-text")
+            .expect("the Text tool tile should render");
+        cx.simulate_click(text.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Text,
+            "the tool press must reach the toolbar"
+        );
+        assert_eq!(
+            selection(&view, cx),
+            initial,
+            "the tool press must not reach the canvas"
+        );
+        assert!(!view.read_with(cx, |view, _| view.primary_pressed()));
+
+        // Dock padding, with the Text tool live: a canvas press here would
+        // create a text layer and select it.
+        cx.simulate_click(surface.origin + point(px(3.), px(3.)), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            selection(&view, cx),
+            initial,
+            "dock padding must not reach the canvas"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Text
+        );
+
+        // The chrome capsule: fit-to-view reframes the page and toggles the
+        // sidebar, still without touching the selection.
+        view.update_in(cx, |view, _, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [-900.0, 700.0],
+                zoom: 3.0,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let fit = cx
+            .debug_bounds("toolbar-chrome-fit-to-view")
+            .expect("the fit-to-view chrome control should render");
+        cx.simulate_click(fit.center(), Modifiers::default());
+        cx.run_until_parked();
+        let viewport = view.read_with(cx, |view, _| view.viewport().expect("viewport"));
+        assert!(
+            (viewport.center[0] - 260.0).abs() < 1.0 && (viewport.center[1] - 170.0).abs() < 1.0,
+            "fit-to-view must reframe the page contents, got {:?}",
+            viewport.center
+        );
+        assert_eq!(selection(&view, cx), initial);
+
+        // Beside the dock the canvas is live: back on Select, an empty-canvas
+        // press clears the selection.
+        view.update_in(cx, |view, _, cx| view.activate_tool(ToolKind::Select, cx));
+        cx.run_until_parked();
+        let probe = canvas.origin + point(px(24.), px(24.));
+        assert!(
+            !surface.contains(&probe),
+            "the probe must lie outside the dock"
+        );
+        cx.simulate_click(probe, Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            selection(&view, cx).is_empty(),
+            "an empty-canvas press beside the dock must reach the Select tool"
+        );
+        toolbar.read_with(cx, |toolbar, _| {
+            assert_eq!(toolbar.active_tool(), ToolbarTool::Move);
+        });
+    }
+
+    /// The chrome capsule is the §12 round trip for host chrome: the tiles
+    /// mirror the sidebars, a press flips the host state, and the echo flips
+    /// the tile's icon and raised state; `Resources` reveals (never hides)
+    /// the left sidebar.
+    #[gpui::test]
+    async fn chrome_toggles_round_trip_through_the_sidebars(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_280.), px(800.)));
+        cx.run_until_parked();
+
+        // Mount-time echo: both sidebars start visible.
+        toolbar.read_with(cx, |toolbar, _| {
+            let controls = toolbar.chrome_controls();
+            assert_eq!(
+                controls.iter().map(|c| c.id.as_ref()).collect::<Vec<_>>(),
+                [
+                    CHROME_FIT_TO_VIEW,
+                    CHROME_TOGGLE_LAYERS_SIDEBAR,
+                    CHROME_TOGGLE_INSPECTOR_SIDEBAR
+                ]
+            );
+            assert!(controls[1].active && controls[2].active);
+            assert_eq!(controls[1].icon_path(), IconName::PanelLeftClose.path());
+        });
+        assert!(cx.debug_bounds("fanta-layers-sidebar").is_some());
+        assert!(cx.debug_bounds("fanta-inspector-sidebar").is_some());
+        let baseline = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter()
+                .expect("adapter")
+                .option_push_count()
+        });
+
+        // Hide the layers sidebar from the dock.
+        let layers = cx
+            .debug_bounds("toolbar-chrome-toggle-layers-sidebar")
+            .expect("the layers chrome control should render");
+        cx.simulate_click(layers.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("fanta-layers-sidebar").is_none(),
+            "the layers sidebar must hide"
+        );
+        assert!(cx.debug_bounds("fanta-inspector-sidebar").is_some());
+        toolbar.read_with(cx, |toolbar, _| {
+            let controls = toolbar.chrome_controls();
+            assert!(!controls[1].active, "the echo must flip the tile off");
+            assert_eq!(controls[1].icon_path(), IconName::PanelLeftOpen.path());
+            assert_eq!(controls[1].label, "Show Layers");
+            assert!(controls[2].active);
+        });
+        assert!(
+            cx.debug_bounds("toolbar-chrome-toggle-layers-sidebar-inactive")
+                .is_some()
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.gpui_toolbar_adapter()
+                    .expect("adapter")
+                    .option_push_count()
+            }),
+            baseline + 1,
+            "one flip, one chrome push"
+        );
+
+        // Hide the inspector from the dock too.
+        let inspector = cx
+            .debug_bounds("toolbar-chrome-toggle-inspector-sidebar")
+            .expect("the inspector chrome control should render");
+        cx.simulate_click(inspector.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("fanta-inspector-sidebar").is_none());
+        toolbar.read_with(cx, |toolbar, _| {
+            let controls = toolbar.chrome_controls();
+            assert!(!controls[2].active);
+            assert_eq!(controls[2].icon_path(), IconName::PanelRightOpen.path());
+        });
+
+        // Resources reveals the hidden layers sidebar and focuses it …
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::Resources,
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("fanta-layers-sidebar").is_some(),
+            "Resources must reveal the layers sidebar"
+        );
+        toolbar.read_with(cx, |toolbar, _| {
+            assert!(toolbar.chrome_controls()[1].active)
+        });
+        assert!(
+            view.update_in(cx, |view, window, cx| view
+                .layers_sidebar_is_focused(window, cx)),
+            "Resources must move focus into the layers sidebar"
+        );
+
+        // … and never hides it: a second press is a no-op for visibility.
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::Resources,
+            });
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("fanta-layers-sidebar").is_some());
+        toolbar.read_with(cx, |toolbar, _| {
+            assert!(toolbar.chrome_controls()[1].active)
+        });
     }
 }

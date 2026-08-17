@@ -3760,7 +3760,7 @@ impl Render for FigView {
         {
             let tool = self.tools.kind();
             let zoom_percent = self.current_zoom_percent(cx);
-            let options = self.toolbar_option_inputs(cx);
+            let options = self.toolbar_option_inputs(window, cx);
             if let Some(adapter) = self.gpui_toolbar.as_mut() {
                 adapter.refresh(editor_mode, tool, zoom_percent, options, cx);
             }
@@ -3978,6 +3978,12 @@ impl Render for FigView {
                                                 .child(
                                                     div()
                                                         .id("fig-container")
+                                                        // Release no-op; the
+                                                        // toolbar occlusion
+                                                        // test probes it.
+                                                        .debug_selector(|| {
+                                                            "fig-container".to_owned()
+                                                        })
                                                         .flex_1()
                                                         .min_h_0()
                                                         .w_full()
@@ -5857,11 +5863,13 @@ impl FigView {
         (zoom * 100.0).round().clamp(1.0, u16::MAX as f64) as u16
     }
 
-    /// Host state behind the toolbar's Motion/Dev/Agent option read models,
-    /// snapshotted per render for the adapter's diff-guarded push.
+    /// Host state behind the toolbar's Motion/Dev/Agent option read models
+    /// and its chrome capsule, snapshotted per render for the adapter's
+    /// diff-guarded push.
     #[cfg(feature = "fanta-gpui-ui")]
     fn toolbar_option_inputs(
         &self,
+        window: &Window,
         cx: &App,
     ) -> crate::gpui_adapters::toolbar::ToolbarOptionInputs {
         let timeline = self.timeline_shell.read(cx);
@@ -5880,6 +5888,10 @@ impl FigView {
             current_time_ms,
             duration_ms,
             agent_context_label: self.toolbar_agent_context_label(cx),
+            layers_sidebar_visible: self.layers_sidebar_visible,
+            inspector_sidebar_visible: self.inspector_sidebar_visible,
+            // Live keymap text, like the tooltip the old native button had.
+            fit_to_view_shortcut: ui::text_for_action(&FitToView, window, cx).map(Into::into),
         }
     }
 
@@ -5964,6 +5976,15 @@ impl FigView {
         self.gpui_toolbar.as_ref()
     }
 
+    /// Test-only: whether keyboard focus sits inside the left sidebar (the
+    /// Resources tile's reveal-and-focus contract).
+    #[cfg(all(test, feature = "fanta-gpui-ui"))]
+    pub(crate) fn layers_sidebar_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.layers_sidebar
+            .focus_handle(cx)
+            .contains_focused(window, cx)
+    }
+
     fn render_toolbar_slot(&self, cx: &mut Context<Self>) -> AnyElement {
         #[cfg(feature = "fanta-gpui-ui")]
         if self.gpui_toolbar.is_some() {
@@ -5972,6 +5993,10 @@ impl FigView {
         self.render_tool_pill(cx)
     }
 
+    /// The dock is the whole bottom overlay: fit-to-view and the sidebar
+    /// toggles ride inside it as chrome controls (pushed by the adapter's
+    /// refresh), and the dock surface occludes the canvas beneath it, so a
+    /// press on any part of the toolbar never reaches `handle_mouse_down`.
     #[cfg(feature = "fanta-gpui-ui")]
     fn render_gpui_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(adapter) = self.gpui_toolbar.as_ref() else {
@@ -5987,70 +6012,46 @@ impl FigView {
             .left_0()
             .right_0()
             .justify_center()
-            .gap_2()
             .child(adapter.panel.clone())
-            .child(self.render_toolbar_trailing_cluster(cx))
             .into_any_element()
     }
 
-    /// Fit-to-view plus the sidebar toggles: host chrome the component
-    /// doesn't model yet, rendered natively beside it so nothing regresses.
+    /// Resources (Figma's ⇧I panel) reveals the left pages/layers sidebar and
+    /// moves focus into it. It never hides the sidebar: the dock's chrome
+    /// capsule owns show/hide, and a "Resources" tile that closed the panel
+    /// every other press would read as broken.
     #[cfg(feature = "fanta-gpui-ui")]
-    fn render_toolbar_trailing_cluster(&self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
-            .gap_1()
-            .px_1()
-            .rounded_lg()
-            .elevation_2(cx)
-            .child(
-                IconButton::new("fig-gpui-fit", IconName::Maximize)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::for_action_title("Fit to View", &FitToView))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.fit_to_view(&FitToView, window, cx);
-                    })),
-            )
-            .child(
-                IconButton::new(
-                    "fig-gpui-toggle-layers",
-                    if self.layers_sidebar_visible {
-                        IconName::ThreadsSidebarLeftOpen
-                    } else {
-                        IconName::ThreadsSidebarLeftClosed
-                    },
-                )
-                .icon_size(IconSize::Small)
-                .toggle_state(self.layers_sidebar_visible)
-                .tooltip(Tooltip::text(if self.layers_sidebar_visible {
-                    "Hide Layers"
-                } else {
-                    "Show Layers"
-                }))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx);
-                })),
-            )
-            .child(
-                IconButton::new(
-                    "fig-gpui-toggle-inspector",
-                    if self.inspector_sidebar_visible {
-                        IconName::ThreadsSidebarRightOpen
-                    } else {
-                        IconName::ThreadsSidebarRightClosed
-                    },
-                )
-                .icon_size(IconSize::Small)
-                .toggle_state(self.inspector_sidebar_visible)
-                .tooltip(Tooltip::text(if self.inspector_sidebar_visible {
-                    "Hide Inspector"
-                } else {
-                    "Show Inspector"
-                }))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
-                })),
-            )
-            .into_any_element()
+    fn reveal_layers_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.layers_sidebar_visible {
+            self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx);
+        }
+        self.layers_sidebar.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Routes a dock chrome control to the same host action the retired
+    /// trailing cluster invoked; the new sidebar state echoes back through
+    /// the adapter's render-time refresh.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn handle_toolbar_chrome_control(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::gpui_adapters::toolbar::{
+            CHROME_FIT_TO_VIEW, CHROME_TOGGLE_INSPECTOR_SIDEBAR, CHROME_TOGGLE_LAYERS_SIDEBAR,
+        };
+        match id {
+            CHROME_FIT_TO_VIEW => self.fit_to_view(&FitToView, window, cx),
+            CHROME_TOGGLE_LAYERS_SIDEBAR => {
+                self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx)
+            }
+            CHROME_TOGGLE_INSPECTOR_SIDEBAR => {
+                self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx)
+            }
+            other => log::warn!("fanta-gpui toolbar: unknown chrome control {other:?}"),
+        }
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
@@ -6064,22 +6065,24 @@ impl FigView {
         use fanta_gpui::toolbar::{ToolbarAction, ToolbarCommand, ToolbarMode, ToolbarTool};
         match action {
             // Resources is host chrome, not a canvas tool: Figma's ⇧I panel
-            // corresponds to the left pages/layers sidebar here, the same
-            // surface the toolbar's trailing cluster toggles.
+            // corresponds to the left pages/layers sidebar here.
             ToolbarAction::ToolChangeRequested {
                 tool: ToolbarTool::Resources,
                 ..
-            } => self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx),
+            } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
                     Some(kind) => self.activate_tool(kind, cx),
                     None => log::info!("fanta-gpui toolbar: tool {tool:?} not wired yet"),
                 }
             }
+            ToolbarAction::ChromeControlInvoked { id } => {
+                self.handle_toolbar_chrome_control(id, window, cx);
+            }
             ToolbarAction::ModeChangeRequested { mode } => match mode {
                 ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
-                ToolbarMode::Draw | ToolbarMode::Dev => {
+                ToolbarMode::Dev => {
                     log::info!("fanta-gpui toolbar: mode {mode:?} not available yet");
                 }
             },
@@ -6161,18 +6164,6 @@ impl FigView {
                 log::info!(
                     "fanta-gpui toolbar: ready-for-development has no host model yet \
                      (Dev mode is unreachable)"
-                );
-            }
-            (
-                ToolbarSecondaryControl::DrawStrokeColor
-                | ToolbarSecondaryControl::DrawBrushStyle
-                | ToolbarSecondaryControl::DrawStrokeWeight
-                | ToolbarSecondaryControl::DrawSmoothing
-                | ToolbarSecondaryControl::DrawPressure,
-                _,
-            ) => {
-                log::info!(
-                    "fanta-gpui toolbar: Draw controls have no host surface (no Draw mode)"
                 );
             }
             (control, value) => {
