@@ -86,10 +86,7 @@ script/generate-licenses
 rustup target add $target_triple
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
-# Build remote_server in separate invocation to prevent feature unification from other crates
-# from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple
+cargo build ${build_flag} --locked --package zed --package cli --target $target_triple
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -103,7 +100,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --locked --target $target_triple --select-workspace-root | xargs)
 
 restore_bundle_manifest
 trap - EXIT
@@ -323,19 +320,13 @@ function upload_debug_symbols() {
             cat target/dsymutil.log
             exit 1
         fi
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
-            echo "dsymutil failed"
-            cat target/dsymutil.log
-            exit 1
-        fi
         # note: this uploads the unstripped binary which is needed because it contains
         # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
         # Try uploading up to 3 times
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
             if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/fanta.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
+                "target/${target_triple}/${target_dir}/fanta.dwarf"; then
                 break
             else
                 echo "Sentry upload failed on attempt $attempt"
@@ -358,5 +349,3 @@ sign_app_binaries
 
 # Use the same profile dir the build above produced; hardcoding `release`
 # broke `-d` (debug) bundles, which never create the release binary.
-sign_binary "target/$target_triple/$target_dir/remote_server"
-gzip -f --stdout --best target/$target_triple/$target_dir/remote_server > target/zed-remote-server-macos-$arch_suffix.gz

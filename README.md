@@ -1,35 +1,67 @@
-# Fanta Edit
+# Fanta
 
-> **Unofficial fork** of [Zed](https://github.com/zed-industries/zed). Not affiliated with or endorsed by Zed Industries.
+Fanta is a design app where the file and the agent share one model. It opens
+Figma `.fig` files and Fanta projects on a real canvas, and the same document is
+readable and writable as `.fnx` source, so an agent can change a design the same
+way you can, and you can read the diff afterwards.
 
-Fanta Edit is a personal fork of Zed — a high-performance code editor built in Rust — customized for independent development and experimentation.
+This is an **alpha**. It is rough in places, and the Known Issues list below is
+honest rather than short.
 
-## Status
+## Requirements
 
-This fork is based on upstream Zed `main`. Initial rebranding is in place so Fanta Edit uses its own config/data directories and macOS bundle identity (see [FORK.md](./FORK.md)).
+- macOS 14 or later
+- Apple Silicon (Intel is not supported yet)
 
-## Build (macOS)
+## Install
 
-**Prerequisite:** Accept the Xcode license (required for `git` and Rust builds on macOS):
+1. Download the `.dmg` from the [latest release](RELEASES_URL_TODO).
+2. Open it and drag **Fanta** to Applications.
+3. Launch it.
 
-```sh
-sudo xcodebuild -license accept
+If macOS says the app cannot be verified, the build you have is unsigned; either
+grab the signed build or run:
+
+```
+xattr -dr com.apple.quarantine /Applications/Fanta.app
 ```
 
-Then follow [Building Zed for macOS](./docs/src/development/macos.md):
+## Getting started
 
-```sh
-cargo run          # debug build
-cargo run --release
-```
+1. **File > Open...** a `.fig` file, or **File > New Design...** to start empty.
+   Opening a `.fig` writes a Fanta project folder beside it; that folder, not the
+   original `.fig`, is what your edits go to.
+2. Give the agent a model. Either paste an Anthropic API key under the agent
+   panel's settings, or sign in to use the managed Fanta provider.
+3. Ask it for something: *"add a 200x100 blue rectangle called Hero to this
+   page"*. It edits the canvas through the same operations your cursor does, so
+   undo works on its changes too.
+4. Open the **Code** tab to read the `.fnx` source of what you are looking at.
+   It is read-only in the app on purpose: edit it in your own editor and the
+   canvas follows the file.
 
-## Upstream
+## Known issues in this alpha
 
-- **Upstream:** https://github.com/zed-industries/zed
-- **This fork:** https://github.com/YOUR_USERNAME/fanta-edit
+- The canvas toolbar shows some tools and commands that are not wired up yet.
+  They tell you so when clicked rather than failing silently.
+- Grid auto-layout, several blend modes, and most effect kinds beyond shadows
+  and blurs are not supported by the engine yet.
+- Copy and paste works within one document only. Pasting an image or a file from
+  another app onto the canvas does nothing.
+- Export lives in the inspector, not the toolbar, and needs the project to have
+  been saved once.
+- Very large community `.fig` files (100 MB and up) are slow to open.
+- The Code tab is read-only by design.
+- Design tabs are restored on relaunch via the project folder; a `.fig` that
+  never materialised a project is not restored.
 
-See [FORK.md](./FORK.md) for syncing with upstream and the full rebranding checklist.
+## Feedback
 
-## Licensing
+Please file issues at [ISSUES_URL_TODO]. Logs live in `~/Library/Logs/Fanta/`
+and attaching `Fanta.log` makes almost every report easier to act on.
 
-Same as upstream: primarily GPL-3.0-or-later, with Apache-2.0 components where marked. See upstream [README](https://github.com/zed-industries/zed) and `script/licenses/`.
+## License
+
+GPL-3.0-or-later. Fanta is a fork of Zed; see `NOTICE.md` and `LICENSE-GPL`.
+Source for every binary we ship is this repository, including the vendored
+engine crates under `crates/fanta-*`.

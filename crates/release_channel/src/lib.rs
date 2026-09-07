@@ -7,7 +7,7 @@ use std::{env, str::FromStr, sync::LazyLock};
 use gpui::{App, Global};
 use semver::Version;
 
-const ZED_DOCS_URL: &str = "https://zed.dev/docs";
+const ZED_DOCS_URL: &str = "https://fantaisa.net/docs";
 
 /// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
@@ -213,10 +213,10 @@ impl ReleaseChannel {
     /// This also has to match the application identifiers in the Linux bundle.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Dev => "dev.fanta.Fanta-Dev",
+            ReleaseChannel::Nightly => "dev.fanta.Fanta-Nightly",
+            ReleaseChannel::Preview => "dev.fanta.Fanta-Preview",
+            ReleaseChannel::Stable => "dev.fanta.Fanta",
         }
     }
 
