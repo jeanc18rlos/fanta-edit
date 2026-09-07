@@ -12,8 +12,13 @@ perf-compare = ["run", "--profile", "release-fast", "-p", "perf", "--config", "t
 rustflags = [
     "--cfg",
     "windows_slim_errors",        # This cfg will reduce the size of `windows::core::Error` from 16 bytes to 4 bytes
+    # crt-static temporarily removed for the macOS cross-compile: the skia
+    # prebuilt is only published for the dynamic CRT. Restore before building
+    # on a native Windows host (livekit needs it there).
+    # FORCE:MULTIPLE tolerates the duplicate ICU/STL definitions between the
+    # patched /MT webrtc prebuilt and skia's /MD prebuilt; first def wins.
     "-C",
-    "target-feature=+crt-static", # This fixes the linking issue when compiling livekit on Windows
+    "link-arg=/FORCE:MULTIPLE",
 ]
 
 # We need lld to link libwebrtc.a successfully on aarch64-linux

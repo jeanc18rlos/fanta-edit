@@ -82,6 +82,22 @@ fn main() {
         }
     }
 
+    // `cfg!(windows)` in a build script tests the HOST, so the block below is
+    // skipped when cross-compiling to Windows (e.g. cargo-xwin from macOS).
+    // Re-emit the link args that must always reach the Windows binary, plus a
+    // stub object supplying the static-STL data symbols referenced by the
+    // directive-patched /MT webrtc prebuilt (see the cross-build notes).
+    if !cfg!(windows) && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-arg=/stack:{}", 8 * 1024 * 1024);
+        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+        if let Some(profile_dir) = out_dir.ancestors().nth(3) {
+            let stub = profile_dir.join("stl_statics_stub.obj");
+            if stub.exists() {
+                println!("cargo:rustc-link-arg={}", stub.display());
+            }
+        }
+    }
+
     if cfg!(windows) {
         if cfg!(target_env = "msvc") {
             // todo(windows): This is to avoid stack overflow. Remove it when solved.
