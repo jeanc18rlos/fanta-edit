@@ -23,6 +23,10 @@ accepted = [
     # webpki-roots 1.x ships the Mozilla CA bundle under CDLA-Permissive-2.0,
     # a permissive data license (no copyleft, attribution-free use of the data).
     "CDLA-Permissive-2.0",
+    # enum-iterator-derive, reached through gpui-component. 0BSD is the BSD Zero
+    # Clause License: public-domain-equivalent, no attribution requirement, and
+    # more permissive than MIT.
+    "0BSD",
 ]
 
 [procinfo.clarify]
