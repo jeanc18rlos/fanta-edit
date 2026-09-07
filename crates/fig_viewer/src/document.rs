@@ -1316,8 +1316,6 @@ impl FigItem {
         cx.notify();
     }
 
-
-
     /// Reload the project from disk immediately, discarding unsaved canvas
     /// edits. This backs the workspace's "discard and reload" choice in the
     /// conflict prompt.
@@ -2464,8 +2462,6 @@ mod tests {
         item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
         item
     }
-
-
 
     #[gpui::test]
     async fn a_parsed_fig_is_editable_without_a_project_root(cx: &mut TestAppContext) {

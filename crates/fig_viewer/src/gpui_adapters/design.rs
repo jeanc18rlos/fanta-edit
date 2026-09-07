@@ -29,19 +29,19 @@ use fanta_gpui::design::{
     DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop, DesignLayout,
     DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType, DesignPageBackground,
     DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintProperty, DesignPaintValue,
-    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
-    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase,
-    DesignPanelInspectionContext, DesignPanelMultipleSelection, DesignPanelNode,
-    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout,
+    DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
+    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
+    DesignPanelEditPhase, DesignPanelInspectionContext, DesignPanelMultipleSelection,
+    DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout,
     DesignPanelPermissions, DesignPanelProperty, DesignPanelPropertyValueState, DesignPanelSection,
     DesignPanelTarget, DesignPanelValue, DesignSizingMode, DesignStroke, DesignStrokeAlign,
     DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeJoin,
     DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
     DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment, DesignTypography,
-    DesignPanel,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 
+use crate::color_picker::GradientKind;
 use crate::document::{DocChange, FigDocument};
 use crate::properties_ops::{
     apply_preview_operation, blurs_operations, default_blur, default_shadow,
@@ -51,12 +51,11 @@ use crate::properties_ops::{
     set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
     shadow_field_operations, stroke_list_mut,
 };
+use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
     CornerRadiusValue, InspectorField, NodeSection, NodeSnapshot, PaintSnapshot, PropValueSnapshot,
     TypographySnapshot, master_roots, multi_section, node_section, page_section,
 };
-use crate::properties_snapshot::PaintKind as EnginePaintKind;
-use crate::color_picker::GradientKind;
 use crate::view::FigView;
 
 /// Per-surface kill switch: `FANTA_GPUI_DESIGN=0` keeps the legacy
@@ -127,7 +126,9 @@ pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
         DesignBlendMode::Saturation => BlendMode::Saturation,
         DesignBlendMode::Color => BlendMode::Color,
         DesignBlendMode::Luminosity => BlendMode::Luminosity,
-        DesignBlendMode::PassThrough | DesignBlendMode::LinearBurn | DesignBlendMode::LinearDodge => {
+        DesignBlendMode::PassThrough
+        | DesignBlendMode::LinearBurn
+        | DesignBlendMode::LinearDodge => {
             return None;
         }
     })
@@ -181,7 +182,12 @@ pub(crate) fn design_kind(
 /// re-minted on every echo — the engine has no stable paint identity.
 /// Gradients and media paints are displayed losslessly but read-only in
 /// wave 1; only solid paints accept edits.
-fn design_paint(node_id: NodeId, collection: &str, index: usize, snapshot: &PaintSnapshot) -> DesignPaint {
+fn design_paint(
+    node_id: NodeId,
+    collection: &str,
+    index: usize,
+    snapshot: &PaintSnapshot,
+) -> DesignPaint {
     let mut paint = match (&snapshot.kind, &snapshot.gradient) {
         (Some(EnginePaintKind::Solid), _) => {
             design_solid_paint(snapshot.color.unwrap_or(FantaColor::BLACK))
@@ -676,7 +682,11 @@ pub(crate) fn design_node(
             .collect();
     }
 
-    out.capabilities = Some(gate_capabilities(kind, node.is_mask, out.corner_capabilities));
+    out.capabilities = Some(gate_capabilities(
+        kind,
+        node.is_mask,
+        out.corner_capabilities,
+    ));
     Some(out)
 }
 
@@ -829,9 +839,7 @@ fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
             .map(|variable| variable.name.clone())
             .unwrap_or_else(|| "Missing variable".to_string());
         let resolved = match property {
-            DesignPanelProperty::Opacity => {
-                DesignPanelValue::Number(node.opacity.get() * 100.0)
-            }
+            DesignPanelProperty::Opacity => DesignPanelValue::Number(node.opacity.get() * 100.0),
             DesignPanelProperty::Visible => {
                 DesignPanelValue::Bool(!node.flags.contains(NodeFlags::HIDDEN))
             }
@@ -963,18 +971,14 @@ impl FigView {
                 },
                 ids => {
                     let (aggregate, states) = aggregate_selection(document, ids, &masters);
-                    let mut members = ids
-                        .iter()
-                        .skip(1)
-                        .map(|id| member_node(doc, *id, &masters));
+                    let mut members = ids.iter().skip(1).map(|id| member_node(doc, *id, &masters));
                     let second = members
                         .next()
                         .unwrap_or_else(|| member_node(doc, ids[0], &masters));
                     // Every member's parent layout must agree or the context
                     // degrades to Mixed, matching the panel's contract.
                     let mut layouts = ids.iter().map(|id| parent_layout_for(doc, *id));
-                    let first_layout =
-                        layouts.next().unwrap_or(DesignPanelParentLayout::Canvas);
+                    let first_layout = layouts.next().unwrap_or(DesignPanelParentLayout::Canvas);
                     let parent_layout = if layouts.all(|layout| layout == first_layout) {
                         first_layout
                     } else {
@@ -1402,7 +1406,12 @@ impl FigView {
                 });
             }
             DesignPanelAction::PageBackgroundChangeRequested { page_id, color } => {
-                self.handle_design_page_background(page_id, *color, DesignPanelEditPhase::Commit, cx);
+                self.handle_design_page_background(
+                    page_id,
+                    *color,
+                    DesignPanelEditPhase::Commit,
+                    cx,
+                );
             }
             DesignPanelAction::PageBackgroundEditRequested {
                 page_id,
@@ -1498,9 +1507,7 @@ impl FigView {
         self.finish_document_edits_for_external_change(cx);
         let ops = self.design_ops(cx, |doc| {
             ids.iter()
-                .flat_map(|id| {
-                    property_operations(doc, *id, property, &value).unwrap_or_default()
-                })
+                .flat_map(|id| property_operations(doc, *id, property, &value).unwrap_or_default())
                 .collect()
         });
         self.design_apply_ops(ops, cx);
@@ -1542,7 +1549,9 @@ impl FigView {
                     if !item.is_editable() {
                         return;
                     }
-                    let Some(node) = item.document().and_then(|document| document.doc.scene.get(id))
+                    let Some(node) = item
+                        .document()
+                        .and_then(|document| document.doc.scene.get(id))
                     else {
                         return;
                     };
@@ -1758,13 +1767,7 @@ impl FigView {
             return;
         }
         if phase == DesignPanelEditPhase::Begin {
-            self.handle_design_phased_edit(
-                id,
-                property,
-                value,
-                DesignPanelEditPhase::Begin,
-                cx,
-            );
+            self.handle_design_phased_edit(id, property, value, DesignPanelEditPhase::Begin, cx);
             return;
         }
         let session = self
@@ -1824,12 +1827,10 @@ impl FigView {
                     Some(VarValue::Boolean { value: *value })
                 }
                 Some(DesignComponentPropertyValue::Text(text)) => match kind {
-                    Some(EnginePropKind::Number) => {
-                        match text.trim().parse::<f64>() {
-                            Ok(value) if value.is_finite() => Some(VarValue::Float { value }),
-                            _ => return Vec::new(),
-                        }
-                    }
+                    Some(EnginePropKind::Number) => match text.trim().parse::<f64>() {
+                        Ok(value) if value.is_finite() => Some(VarValue::Float { value }),
+                        _ => return Vec::new(),
+                    },
                     Some(EnginePropKind::Text) => Some(VarValue::String {
                         value: text.to_string(),
                     }),
@@ -1958,8 +1959,7 @@ fn effect_edit_operations(
                     let color = fanta_color(*color);
                     shadow_field_operations(doc, id, index, |shadow| shadow.color = color)
                 }
-                DesignPanelProperty::EffectShadowBlur(_)
-                | DesignPanelProperty::EffectBlur(_) => {
+                DesignPanelProperty::EffectShadowBlur(_) | DesignPanelProperty::EffectBlur(_) => {
                     let blur = number(value)?.max(0.0);
                     shadow_field_operations(doc, id, index, |shadow| shadow.blur = blur)
                 }
@@ -1983,9 +1983,7 @@ fn effect_edit_operations(
                         return None;
                     };
                     let show = *show;
-                    shadow_field_operations(doc, id, index, |shadow| {
-                        shadow.show_behind_node = show
-                    })
+                    shadow_field_operations(doc, id, index, |shadow| shadow.show_behind_node = show)
                 }
                 DesignPanelProperty::EffectKind(_) => {
                     let DesignPanelValue::EffectKind(kind) = value else {
@@ -2029,7 +2027,10 @@ fn effect_kind_change_operations(
 ) -> Option<Vec<Operation>> {
     let node = doc.scene.get(id)?;
     match (reference, kind) {
-        (EffectRef::Shadow(index), DesignEffectKind::DropShadow | DesignEffectKind::InnerShadow) => {
+        (
+            EffectRef::Shadow(index),
+            DesignEffectKind::DropShadow | DesignEffectKind::InnerShadow,
+        ) => {
             let target = if kind == DesignEffectKind::DropShadow {
                 ShadowKind::Drop
             } else {
@@ -2039,7 +2040,10 @@ fn effect_kind_change_operations(
                 shadow.kind = target
             }))
         }
-        (EffectRef::Blur(index), DesignEffectKind::LayerBlur | DesignEffectKind::BackgroundBlur) => {
+        (
+            EffectRef::Blur(index),
+            DesignEffectKind::LayerBlur | DesignEffectKind::BackgroundBlur,
+        ) => {
             let target = if kind == DesignEffectKind::LayerBlur {
                 BlurKind::Layer
             } else {
@@ -2051,7 +2055,10 @@ fn effect_kind_change_operations(
                 }
             }))
         }
-        (EffectRef::Shadow(index), DesignEffectKind::LayerBlur | DesignEffectKind::BackgroundBlur) => {
+        (
+            EffectRef::Shadow(index),
+            DesignEffectKind::LayerBlur | DesignEffectKind::BackgroundBlur,
+        ) => {
             let shadow = node.effects.get(index)?.clone();
             let blur_kind = if kind == DesignEffectKind::LayerBlur {
                 BlurKind::Layer
@@ -2170,9 +2177,10 @@ fn property_operations(
                 set_corner_radius_corner(data, corner, radius);
             }))
         }
-        (P::CornerSmoothing, V::Ratio(ratio)) => {
-            field(InspectorField::CornerSmoothing(id), f64::from(*ratio) * 100.0)
-        }
+        (P::CornerSmoothing, V::Ratio(ratio)) => field(
+            InspectorField::CornerSmoothing(id),
+            f64::from(*ratio) * 100.0,
+        ),
         (P::CornerSmoothing, _) => field(InspectorField::CornerSmoothing(id), number(value)?),
         (P::IndependentCorners, V::Bool(independent)) => {
             let independent = *independent;
@@ -2308,24 +2316,45 @@ fn property_operations(
         (P::Gap, _) => {
             let gap = number(value)?;
             let horizontal = primary_axis_is_horizontal(doc, id)?;
-            Some(layout_gap_operations(doc, id, &format_number(gap), horizontal))
+            Some(layout_gap_operations(
+                doc,
+                id,
+                &format_number(gap),
+                horizontal,
+            ))
         }
         (P::CounterAxisGap, V::OptionalNumber(gap)) => {
             let gap = gap.map(f64::from).unwrap_or(0.0);
             let horizontal = !primary_axis_is_horizontal(doc, id)?;
-            Some(layout_gap_operations(doc, id, &format_number(gap), horizontal))
+            Some(layout_gap_operations(
+                doc,
+                id,
+                &format_number(gap),
+                horizontal,
+            ))
         }
         (P::CounterAxisGap, _) => {
             let gap = number(value)?;
             let horizontal = !primary_axis_is_horizontal(doc, id)?;
-            Some(layout_gap_operations(doc, id, &format_number(gap), horizontal))
+            Some(layout_gap_operations(
+                doc,
+                id,
+                &format_number(gap),
+                horizontal,
+            ))
         }
-        (P::PaddingHorizontal, _) => {
-            Some(layout_padding_operations(doc, id, &format_number(number(value)?), true))
-        }
-        (P::PaddingVertical, _) => {
-            Some(layout_padding_operations(doc, id, &format_number(number(value)?), false))
-        }
+        (P::PaddingHorizontal, _) => Some(layout_padding_operations(
+            doc,
+            id,
+            &format_number(number(value)?),
+            true,
+        )),
+        (P::PaddingVertical, _) => Some(layout_padding_operations(
+            doc,
+            id,
+            &format_number(number(value)?),
+            false,
+        )),
         (P::PaddingShorthand, _) => {
             let padding = number(value)?.max(0.0);
             Some(replace_data_operation(doc, id, |data| {
@@ -2336,10 +2365,7 @@ fn property_operations(
                 }
             }))
         }
-        (P::PaddingTop, _)
-        | (P::PaddingRight, _)
-        | (P::PaddingBottom, _)
-        | (P::PaddingLeft, _) => {
+        (P::PaddingTop, _) | (P::PaddingRight, _) | (P::PaddingBottom, _) | (P::PaddingLeft, _) => {
             let side = match property {
                 P::PaddingTop => 0,
                 P::PaddingRight => 1,
@@ -2385,7 +2411,9 @@ fn property_operations(
                 }
             }))
         }
-        (P::MinWidth, value) | (P::MaxWidth, value) | (P::MinHeight, value)
+        (P::MinWidth, value)
+        | (P::MaxWidth, value)
+        | (P::MinHeight, value)
         | (P::MaxHeight, value) => {
             let text = match value {
                 V::OptionalNumber(None) => String::new(),
@@ -2396,9 +2424,11 @@ fn property_operations(
             let minimum = matches!(property, P::MinWidth | P::MinHeight);
             Some(layout_limit_operations(doc, id, &text, horizontal, minimum))
         }
-        (P::FontFamily, V::Text(family)) => {
-            Some(field_operations(doc, &InspectorField::FontFamily(id), family))
-        }
+        (P::FontFamily, V::Text(family)) => Some(field_operations(
+            doc,
+            &InspectorField::FontFamily(id),
+            family,
+        )),
         (P::FontSize, _) => field(InspectorField::FontSize(id), number(value)?),
         (P::FontWeight, _) => {
             let weight = number(value)?.clamp(1.0, 1000.0) as u16;
@@ -2408,10 +2438,9 @@ fn property_operations(
                 }
             }))
         }
-        (P::LineHeight, V::LineHeight(DesignLineHeight::Percent(percent))) => field(
-            InspectorField::LineHeight(id),
-            f64::from(*percent) / 100.0,
-        ),
+        (P::LineHeight, V::LineHeight(DesignLineHeight::Percent(percent))) => {
+            field(InspectorField::LineHeight(id), f64::from(*percent) / 100.0)
+        }
         (P::LineHeight, _) => None,
         (P::LetterSpacing, V::LetterSpacing(DesignLetterSpacing::Pixels(pixels))) => {
             field(InspectorField::LetterSpacing(id), f64::from(*pixels))
@@ -2641,9 +2670,8 @@ mod tests {
             doc,
             cx,
         );
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            FigView::new(item, project.clone(), window, cx)
-        });
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| FigView::new(item, project.clone(), window, cx));
         cx.run_until_parked();
         let panel = view.read_with(cx, |view, _| {
             view.gpui_design
@@ -2781,7 +2809,10 @@ mod tests {
 
         emit(cx, 25.0, DesignPanelEditPhase::Cancel);
         item.read_with(cx, |item, _| {
-            assert!(!item.is_dirty(), "a cancelled gesture leaves the item clean");
+            assert!(
+                !item.is_dirty(),
+                "a cancelled gesture leaves the item clean"
+            );
             let doc = &item.document().expect("document ready").doc;
             let node = doc.scene.get(rect).expect("rect exists");
             assert!(
