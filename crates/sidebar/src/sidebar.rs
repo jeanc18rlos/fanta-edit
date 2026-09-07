@@ -55,9 +55,9 @@ use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars, Tab,
+    ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar, prelude::*,
+    render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -7450,28 +7450,48 @@ impl Sidebar {
     }
 
     fn render_empty_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        ProjectEmptyState::new(
-            "Threads Sidebar",
-            self.focus_handle(cx),
-            KeyBinding::for_action(&workspace::Open::default(), cx),
-        )
-        .on_open_project(|_, window, cx| {
-            let side = match AgentSettings::get_global(cx).sidebar_side() {
-                SidebarSide::Left => "left",
-                SidebarSide::Right => "right",
-            };
-            telemetry::event!("Sidebar Add Project Clicked", side = side);
-            window.dispatch_action(
-                Open {
-                    create_new_window: Some(false),
-                }
-                .boxed_clone(),
-                cx,
-            );
-        })
-        .on_clone_repo(|_, window, cx| {
-            window.dispatch_action(git::Clone.boxed_clone(), cx);
-        })
+        let focus_handle = self.focus_handle(cx);
+        let open_key_binding = KeyBinding::for_action(&workspace::Open::default(), cx);
+
+        v_flex()
+            .id("sidebar-empty-state")
+            .p_4()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .track_focus(&focus_handle)
+            .child(
+                v_flex()
+                    .w_48()
+                    .max_w_full()
+                    .gap_1()
+                    .child(
+                        div().text_center().mb_2().child(
+                            Label::new("Open a .fig file or a Fanta project to start chatting.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        Button::new("open_project", "Open Design")
+                            .full_width()
+                            .key_binding(open_key_binding)
+                            .on_click(|_, window, cx| {
+                                let side = match AgentSettings::get_global(cx).sidebar_side() {
+                                    SidebarSide::Left => "left",
+                                    SidebarSide::Right => "right",
+                                };
+                                telemetry::event!("Sidebar Add Project Clicked", side = side);
+                                window.dispatch_action(
+                                    Open {
+                                        create_new_window: Some(false),
+                                    }
+                                    .boxed_clone(),
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
     }
 
     fn render_sidebar_header(

@@ -450,7 +450,9 @@ fn zed_ai_description(
         Some(Plan::ZedPro) => {
             "You have access to Fanta's hosted models through your Pro subscription."
         }
-        Some(Plan::ZedProTrial) => "You have access to Fanta's hosted models through your Pro trial.",
+        Some(Plan::ZedProTrial) => {
+            "You have access to Fanta's hosted models through your Pro trial."
+        }
         Some(Plan::ZedStudent) => {
             "You have access to Fanta's hosted models through your Student subscription."
         }

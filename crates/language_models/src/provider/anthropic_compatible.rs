@@ -46,11 +46,7 @@ pub struct AnthropicCompatibleLanguageModelProvider {
 /// account server itself (the managed Fanta provider). Signing in is then all
 /// the configuration the provider needs — no separate API key. Providers
 /// pointing anywhere else never see the account token.
-fn account_token_for(
-    client: &Arc<Client>,
-    api_url: &str,
-    cx: &App,
-) -> Option<Arc<str>> {
+fn account_token_for(client: &Arc<Client>, api_url: &str, cx: &App) -> Option<Arc<str>> {
     let server_url = &ClientSettings::get_global(cx).server_url;
     (api_url.trim_end_matches('/') == server_url.trim_end_matches('/'))
         .then(|| client.account_access_token())

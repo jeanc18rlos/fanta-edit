@@ -92,7 +92,7 @@ use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    PopoverMenuHandle, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -4946,6 +4946,8 @@ pub enum AgentPanelEvent {
     ThreadInteracted { thread_id: ThreadId },
 }
 
+const SHOW_TERMINAL_THREAD_MENU_ENTRY: bool = false;
+
 impl EventEmitter<PanelEvent> for AgentPanel {}
 impl EventEmitter<AgentPanelEvent> for AgentPanel {}
 
@@ -5044,6 +5046,10 @@ impl Panel for AgentPanel {
     }
 
     fn is_agent_panel(&self) -> bool {
+        true
+    }
+
+    fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
         true
     }
 
@@ -5760,20 +5766,39 @@ impl AgentPanel {
 
     fn render_no_project_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
+        let open_key_binding =
+            KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx);
 
-        ProjectEmptyState::new(
-            "Agent Panel",
-            focus_handle.clone(),
-            KeyBinding::for_action_in(&workspace::Open::default(), &focus_handle, cx),
-        )
-        .on_open_project(|_, window, cx| {
-            telemetry::event!("Agent Panel Add Project Clicked");
-            window.dispatch_action(workspace::Open::default().boxed_clone(), cx);
-        })
-        .on_clone_repo(|_, window, cx| {
-            telemetry::event!("Agent Panel Clone Repo Clicked");
-            window.dispatch_action(git::Clone.boxed_clone(), cx);
-        })
+        v_flex()
+            .id("agent-panel-empty-state")
+            .p_4()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .track_focus(&focus_handle)
+            .child(
+                v_flex()
+                    .w_48()
+                    .max_w_full()
+                    .gap_1()
+                    .child(
+                        div().text_center().mb_2().child(
+                            Label::new("Open a .fig file or a Fanta project to start chatting.")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                    .child(
+                        Button::new("open_project", "Open Design")
+                            .full_width()
+                            .key_binding(open_key_binding)
+                            .on_click(|_, window, cx| {
+                                telemetry::event!("Agent Panel Add Project Clicked");
+                                window
+                                    .dispatch_action(workspace::Open::default().boxed_clone(), cx);
+                            }),
+                    ),
+            )
     }
 
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5782,7 +5807,10 @@ impl AgentPanel {
         let focus_handle = self.focus_handle(cx);
 
         let can_create_entries = self.has_open_project(cx);
-        let supports_terminal = self.supports_terminal(cx);
+        // The terminal panel is not loaded by the app, so a terminal thread can never be
+        // reached from here. The entry stays behind this gate rather than being deleted so the
+        // action, its handler, and `new_terminal` remain wired for when terminals come back.
+        let supports_terminal = SHOW_TERMINAL_THREAD_MENU_ENTRY && self.supports_terminal(cx);
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
 
         let (selected_agent_custom_icon, selected_agent_label) = if showing_terminal {
