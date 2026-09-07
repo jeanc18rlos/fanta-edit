@@ -1,11 +1,10 @@
 use crate::{
-    NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation, ToggleWorkspaceSidebar,
+    Workspace, WorkspaceSettings,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
-use git::Clone as GitClone;
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     ParentElement, Render, Styled, Task, TaskExt, Window, actions,
@@ -18,9 +17,7 @@ use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
-use zed_actions::{
-    Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
-};
+use zed_actions::{OpenSettings, assistant::ToggleFocus, command_palette};
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -160,26 +157,20 @@ impl SectionEntry {
     }
 }
 
-const CONTENT: (Section<4>, Section<3>) = (
+const CONTENT: (Section<3>, Section<1>) = (
     Section {
         title: "Get Started",
         entries: [
             SectionEntry {
                 icon: IconName::Plus,
-                title: "New File",
-                action: &NewFile,
+                title: "New Design...",
+                action: &zed_actions::fanta::NewDesign,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::FolderOpen,
-                title: "Open Project",
+                title: "Open .fig or Fanta project...",
                 action: &Open::DEFAULT,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::CloudDownload,
-                title: "Clone Repository",
-                action: &GitClone,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
@@ -192,29 +183,12 @@ const CONTENT: (Section<4>, Section<3>) = (
     },
     Section {
         title: "Configure",
-        entries: [
-            SectionEntry {
-                icon: IconName::Settings,
-                title: "Open Settings",
-                action: &OpenSettings,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::Keyboard,
-                title: "Customize Keymaps",
-                action: &OpenKeymap,
-                visibility_guard: SectionVisibility::Always,
-            },
-            SectionEntry {
-                icon: IconName::Blocks,
-                title: "Explore Extensions",
-                action: &Extensions {
-                    category_filter: None,
-                    id: None,
-                },
-                visibility_guard: SectionVisibility::Always,
-            },
-        ],
+        entries: [SectionEntry {
+            icon: IconName::Settings,
+            title: "Open Settings",
+            action: &OpenSettings,
+            visibility_guard: SectionVisibility::Always,
+        }],
     },
 );
 
@@ -330,7 +304,7 @@ impl WelcomePage {
         let focus = self.focus_handle.clone();
         let color = cx.theme().colors();
 
-        let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
+        let description = "Chat with an agent about the design you have open. Ask it to try variations, rename layers, or explain how a component is put together.";
 
         v_flex()
             .w_full()
@@ -351,7 +325,7 @@ impl WelcomePage {
                             .color(Color::Muted)
                             .size(IconSize::Small),
                     )
-                    .child(Label::new("Collaborate with Agents")),
+                    .child(Label::new("Design with an Agent")),
             )
             .child(
                 Label::new(description)
@@ -415,7 +389,7 @@ impl Render for WelcomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (first_section, second_section) = CONTENT;
         let first_section_entries = first_section.entries.len();
-        let mut next_tab_index = first_section_entries + second_section.entries.len();
+        let next_tab_index = first_section_entries + second_section.entries.len();
 
         let ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
@@ -480,7 +454,7 @@ impl Render for WelcomePage {
                             .child(Vector::square(VectorName::FantaLogo, rems_from_px(45.)))
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
+                                    Label::new("Design with an agent that speaks your source.")
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .italic(),
@@ -490,22 +464,7 @@ impl Render for WelcomePage {
                     .child(first_section.render(Default::default(), &self.focus_handle))
                     .child(second_section)
                     .when(ai_enabled && !showing_recent_projects, |this| {
-                        let agent_tab_index = next_tab_index;
-                        next_tab_index += 1;
-                        this.child(self.render_agent_card(agent_tab_index, cx))
-                    })
-                    .when(!self.fallback_to_recent_projects, |this| {
-                        this.child(
-                            v_flex().gap_4().child(Divider::horizontal()).child(
-                                Button::new("welcome-exit", "Return to Onboarding")
-                                    .tab_index(next_tab_index as isize)
-                                    .full_width()
-                                    .label_size(LabelSize::XSmall)
-                                    .on_click(|_, window, cx| {
-                                        window.dispatch_action(OpenOnboarding.boxed_clone(), cx);
-                                    }),
-                            ),
-                        )
+                        this.child(self.render_agent_card(next_tab_index, cx))
                     }),
             )
     }

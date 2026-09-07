@@ -473,7 +473,7 @@
   "allow_rewrap": "in_comments",
   // Controls whether edit predictions are shown immediately (true)
   // or manually by triggering `editor::ShowEditPrediction` (false).
-  "show_edit_predictions": true,
+  "show_edit_predictions": false,
   // Controls whether edit predictions are shown in a given language scope.
   // Example: ["string", "comment"]
   "edit_predictions_disabled_in": [],
@@ -531,7 +531,7 @@
     // Whether to show the project host and name in the titlebar.
     "show_project_items": true,
     // Whether to show onboarding banners in the titlebar.
-    "show_onboarding_banner": true,
+    "show_onboarding_banner": false,
     // Whether to show user picture in the titlebar.
     "show_user_picture": true,
     // Whether to show the user menu in the titlebar.
@@ -1064,7 +1064,7 @@
     // Whether to show the agent panel button in the status bar.
     "button": true,
     // Where to dock the agent panel. Can be 'left', 'right' or 'bottom'.
-    "dock": "left",
+    "dock": "right",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
     // Default: true
@@ -1072,7 +1072,7 @@
     // Where to position the threads sidebar. Can be 'left' or 'right'.
     "sidebar_side": "left",
     // Default width when the agent panel is docked to the left or right.
-    "default_width": 640,
+    "default_width": 480,
     // Default height when the agent panel is docked to the bottom.
     "default_height": 320,
     // Whether to limit the content width in the agent panel. When enabled,
@@ -1082,15 +1082,15 @@
     // Maximum content width in pixels when limit_content_width is enabled.
     // Content will be centered within the panel.
     "max_content_width": 850,
-    // The default model to use when creating new threads. The managed Fanta
-    // provider authenticates with your signed-in account, so signing in is
-    // the only setup needed; while signed out the agent falls back to the
-    // first configured provider.
+    // The default model to use when creating new threads. By default this is
+    // Anthropic, authenticated with your own Anthropic API key. The managed
+    // "Fanta" provider is also available once you sign in with your account,
+    // and needs no API key of your own.
     "default_model": {
       // The provider to use.
-      "provider": "Fanta",
+      "provider": "anthropic",
       // The model to use.
-      "model": "claude-opus-4-8",
+      "model": "claude-opus-5",
       // Whether thinking is enabled.
       "enable_thinking": false,
     },
@@ -1301,9 +1301,9 @@
     "show_merge_conflict_indicator": true,
   },
   // Whether the screen sharing icon is shown in the os status bar.
-  "show_call_status_icon": true,
+  "show_call_status_icon": false,
   // Whether to use language servers to provide code intelligence.
-  "enable_language_server": true,
+  "enable_language_server": false,
   // Whether to perform linked edits of associated ranges, if the language server supports it.
   // For example, when editing opening <html> tag, the contents of the closing </html> tag will be edited as well.
   "linked_edits": true,
@@ -1355,9 +1355,9 @@
     // Whether or not to show the tab bar in the editor
     "show": true,
     // Whether or not to show the navigation history buttons.
-    "show_nav_history_buttons": true,
+    "show_nav_history_buttons": false,
     // Whether or not to show the tab bar buttons.
-    "show_tab_bar_buttons": true,
+    "show_tab_bar_buttons": false,
     // Whether or not to show pinned tabs in a separate row.
     // When enabled, pinned tabs appear in a top row and unpinned tabs in a bottom row.
     // When disabled, all tabs appear in a single row (default behavior).
@@ -1835,7 +1835,7 @@
   // Status bar-related settings.
   "status_bar": {
     // Whether to show the status bar.
-    "experimental.show": true,
+    "experimental.show": false,
     // Whether to show the name of the active file in the status bar.
     "show_active_file": false,
     // Whether to show the active language button in the status bar.
@@ -2145,9 +2145,7 @@
   //
   // If you don't want any of these extensions, add this field to your settings
   // and change the value to `false`.
-  "auto_install_extensions": {
-    "html": true,
-  },
+  "auto_install_extensions": {},
   // The capabilities granted to extensions.
   //
   // This list can be customized to restrict what extensions are able to do.
@@ -2311,7 +2309,7 @@
     },
     "JSON": {
       "prettier": {
-        "allowed": true,
+        "allowed": false,
       },
     },
     "JSONC": {
@@ -2398,10 +2396,10 @@
       },
     },
     "FNX": {
-      "format_on_save": "on",
+      "format_on_save": "off",
       "language_servers": ["!typescript-language-server", "vtsls", "..."],
       "prettier": {
-        "allowed": true,
+        "allowed": false,
         "parser": "typescript",
         "quoteProps": "preserve",
         "trailingComma": "none",
