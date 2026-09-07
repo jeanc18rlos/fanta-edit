@@ -21,7 +21,10 @@ pub(crate) const CHROME_TOGGLE_INSPECTOR_SIDEBAR: &str = "toggle-inspector-sideb
 
 /// The commands the host actually implements today. Passed through
 /// `EditorToolbar::set_commands` so the palette never advertises an
-/// unwired command.
+/// unwired command. Every entry must have its own arm in
+/// `FigView::handle_toolbar_action`; anything that reaches that match's
+/// fallthrough is answered with a "not in the alpha" notice instead of a
+/// silent no-op, so an accidental addition here is visible rather than dead.
 pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Undo,
     ToolbarCommand::Redo,
@@ -32,6 +35,7 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Delete,
     ToolbarCommand::ZoomToFit,
     ToolbarCommand::ZoomToSelection,
+    ToolbarCommand::Export,
     ToolbarCommand::Present,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,

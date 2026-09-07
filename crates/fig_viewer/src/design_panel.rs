@@ -3054,7 +3054,7 @@ impl FantaDesignPanel {
         &mut self,
         _panel: &Entity<fanta_gpui::pages::PagesPanel>,
         action: &fanta_gpui::pages::PagesPanelAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use fanta_gpui::pages::PagesPanelAction;
@@ -3108,12 +3108,18 @@ impl FantaDesignPanel {
                     self.delete_page(index, cx);
                 }
             }
-            PagesPanelAction::DuplicateRequested { page_id } => {
-                log::info!("fanta-gpui pages: duplicate {page_id} not wired yet");
+            // Both of these are hard-coded entries in the vendored Pages
+            // panel's page menu, which offers the host no way to hide them.
+            // Duplicating a page has no document operation yet, and the
+            // `fanta://page/<id>` link the old Copy-link arm put on the
+            // clipboard resolves to nothing — `open_listener` answers every
+            // `fanta://` url by focusing the app. Handing the user a link that
+            // silently goes nowhere is worse than declining to make one.
+            PagesPanelAction::DuplicateRequested { .. } => {
+                crate::view::notify_unavailable("Duplicating a page", window, cx);
             }
-            PagesPanelAction::CopyLinkRequested { page_id } => {
-                let link = format!("fanta://page/{page_id}");
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+            PagesPanelAction::CopyLinkRequested { .. } => {
+                crate::view::notify_unavailable("Links to a page", window, cx);
             }
             PagesPanelAction::SearchRequested(request) => {
                 self.run_gpui_pages_search(request.clone(), cx);
@@ -3479,7 +3485,7 @@ impl FantaDesignPanel {
         &mut self,
         _panel: &Entity<fanta_gpui::layers::LayersPanel>,
         action: &fanta_gpui::layers::LayersPanelAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use crate::gpui_adapters::layers::{drop_placement, node_id};
@@ -3549,7 +3555,7 @@ impl FantaDesignPanel {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                self.handle_layers_context_action(id, *action, cx);
+                self.handle_layers_context_action(id, *action, window, cx);
             }
             LayersPanelAction::PanelExpansionChanged { expanded } => {
                 self.layers_collapsed = !expanded;
@@ -3559,11 +3565,13 @@ impl FantaDesignPanel {
     }
 
     /// The context-menu entries the host has an operation for. Everything
-    /// else is Figma-only or has no engine op yet and is logged, not faked.
+    /// else is Figma-only or has no engine op yet; those are declined out
+    /// loud rather than faked or silently dropped.
     fn handle_layers_context_action(
         &mut self,
         id: NodeId,
         action: fanta_gpui::layers::LayersPanelContextAction,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use fanta_gpui::layers::LayersPanelContextAction;
@@ -3614,9 +3622,7 @@ impl FantaDesignPanel {
                     self.focus_component(master, cx);
                 }
             }
-            other => {
-                log::info!("fanta-gpui layers: context action {other:?} not wired yet");
-            }
+            other => crate::view::notify_unavailable(other.label(), window, cx),
         }
     }
 

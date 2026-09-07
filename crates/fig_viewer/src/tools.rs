@@ -129,8 +129,13 @@ impl ToolKind {
     }
 
     /// Placeholder tools that appear in the toolbar but have no behavior yet
-    /// (Scale, direct path-selection, text-on-path). Rendered with a "soon" hint
-    /// so it's clear they're not wired up.
+    /// (Scale, direct path-selection, text-on-path).
+    ///
+    /// The legacy native tool pill renders these with a "soon" hint. The
+    /// default fanta-gpui toolbar has no host-side API to hide or disable a
+    /// tool face, so `FigView::handle_toolbar_action` refuses to arm them and
+    /// says so in a notice instead — arming a tool that swallows every drag
+    /// reads as a frozen canvas.
     pub fn is_stub(self) -> bool {
         matches!(self, Self::Scale | Self::PathSelect | Self::TextPath)
     }

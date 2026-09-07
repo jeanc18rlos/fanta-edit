@@ -26,8 +26,9 @@ use smallvec::SmallVec;
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use workspace::{
-    ItemSettings, Pane,
+    ItemSettings, MultiWorkspace, Pane, Toast,
     item::{Item, ItemEvent, ProjectItem, SaveOptions, TabContentParams},
+    notifications::NotificationId,
 };
 
 use crate::canvas::{
@@ -6072,8 +6073,14 @@ impl FigView {
             } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
+                    // Scale, path-selection and text-on-path have a canvas
+                    // tool object but no behavior, so activating them would
+                    // arm a face that silently swallows every drag. The
+                    // vendored toolbar has no host-side API to hide a tool
+                    // (see `EditorToolbar`'s setters), so say so instead.
+                    Some(kind) if kind.is_stub() => notify_unavailable(tool.label(), window, cx),
                     Some(kind) => self.activate_tool(kind, cx),
-                    None => log::info!("fanta-gpui toolbar: tool {tool:?} not wired yet"),
+                    None => notify_unavailable(tool.label(), window, cx),
                 }
             }
             ToolbarAction::ChromeControlInvoked { id } => {
@@ -6082,9 +6089,7 @@ impl FigView {
             ToolbarAction::ModeChangeRequested { mode } => match mode {
                 ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
-                ToolbarMode::Dev => {
-                    log::info!("fanta-gpui toolbar: mode {mode:?} not available yet");
-                }
+                ToolbarMode::Dev => notify_unavailable("Dev mode", window, cx),
             },
             // The +/- steppers, the zoom menu's percent entries, typed
             // percentages, and the ZoomCanvasTo100 command action all arrive
@@ -6107,21 +6112,107 @@ impl FigView {
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
                 ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
-                other => log::info!("fanta-gpui toolbar: command {other:?} not wired yet"),
+                ToolbarCommand::Export => self.export_from_toolbar(window, cx),
+                other => notify_unavailable(other.label(), window, cx),
             },
             ToolbarAction::ControlChangeRequested { control, value, .. } => {
-                self.handle_toolbar_control_change(*control, value, cx);
+                self.handle_toolbar_control_change(*control, value, window, cx);
             }
             ToolbarAction::SecondaryControlInvoked { control, .. } => {
-                self.handle_toolbar_secondary_control(*control);
+                self.handle_toolbar_secondary_control(*control, window, cx);
             }
-            // Palette/agent text plumbing is component-internal or
-            // post-release surface area.
+            ToolbarAction::AiPromptSubmitted { prompt } => {
+                self.route_toolbar_agent_prompt(prompt, window, cx);
+            }
+            ToolbarAction::AgentAttachmentRequested => {
+                notify_unavailable("Attaching a file to the Agent from the toolbar", window, cx)
+            }
+            ToolbarAction::AgentVoiceInputRequested => {
+                notify_unavailable("Voice input", window, cx)
+            }
+            // The palette's query text and the composer's own show/hide are
+            // component-internal state; the host has nothing to do for them.
             ToolbarAction::CommandQueryChanged { .. }
-            | ToolbarAction::AiPromptSubmitted { .. }
-            | ToolbarAction::AgentVisibilityChanged { .. }
-            | ToolbarAction::AgentAttachmentRequested
-            | ToolbarAction::AgentVoiceInputRequested => {}
+            | ToolbarAction::AgentVisibilityChanged { .. } => {}
+        }
+    }
+
+    /// The toolbar's Export command runs the inspector's export flow — the
+    /// same presets, the same `exports/` destination, the same in-panel
+    /// feedback — rather than a second, divergent export path. Deferred
+    /// because that flow reads this view, which is leased for the duration of
+    /// the toolbar event.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn export_from_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The flow reports progress, the written paths, and every failure
+        // (unsaved project, unexportable bounds) as inspector feedback, so the
+        // panel has to be on screen or the command looks like it did nothing.
+        if !self.inspector_sidebar_visible {
+            self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
+        }
+        let inspector = self.inspector_sidebar.downgrade();
+        cx.defer(move |cx| {
+            inspector
+                .update(cx, |inspector, cx| inspector.export_selection(cx))
+                .log_err();
+        });
+    }
+
+    /// Send the toolbar's built-in AI box to the Agent Panel as a draft the
+    /// user still has to send — the same review boundary canvas comments go
+    /// through. The active page and selection are prefixed because the agent
+    /// otherwise has no idea what "make this blue" refers to.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn route_toolbar_agent_prompt(
+        &mut self,
+        prompt: &SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return;
+        }
+        let prompt = format!("{}\n\n{prompt}", self.agent_prompt_context(cx));
+        let workspace = window
+            .root::<MultiWorkspace>()
+            .flatten()
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone());
+        let Some(workspace) = workspace else {
+            show_canvas_notice(
+                "This window has no workspace for the Agent Panel.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+        if let Err(error) =
+            agent_ui::open_external_prompt_for_review(workspace, &prompt, window, cx)
+        {
+            log::error!("routing the toolbar Agent prompt failed: {error:#}");
+            show_canvas_notice(
+                format!("The Agent prompt could not be opened: {error:#}"),
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The one-line "what the user is looking at" header prefixed onto a
+    /// toolbar Agent prompt.
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn agent_prompt_context(&self, cx: &App) -> String {
+        let Some(document) = self.item.read(cx).document() else {
+            return "Fanta canvas: no document is open.".to_string();
+        };
+        let page = document
+            .page(self.selected_page_index)
+            .map(|page| page.name.to_string())
+            .unwrap_or_else(|| "Untitled".to_string());
+        match document.doc.selection.len() {
+            0 => format!("Fanta canvas — page \"{page}\", nothing selected."),
+            1 => format!("Fanta canvas — page \"{page}\", 1 layer selected."),
+            count => format!("Fanta canvas — page \"{page}\", {count} layers selected."),
         }
     }
 
@@ -6134,6 +6225,7 @@ impl FigView {
         &mut self,
         control: fanta_gpui::toolbar::ToolbarSecondaryControl,
         value: &fanta_gpui::toolbar::ToolbarControlValue,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use fanta_gpui::toolbar::{ToolbarControlValue, ToolbarSecondaryControl};
@@ -6158,18 +6250,14 @@ impl FigView {
             (ToolbarSecondaryControl::MotionAutoKeyframe, _) => {
                 // Echoing "recording" without a recorder would lie; leave the
                 // chip off until a keyframe-recording mode exists.
-                log::info!("fanta-gpui toolbar: auto-keyframe has no host recording model yet");
+                notify_unavailable("Auto keyframe recording", window, cx);
             }
             (ToolbarSecondaryControl::DevReadyForDevelopment, _) => {
-                log::info!(
-                    "fanta-gpui toolbar: ready-for-development has no host model yet \
-                     (Dev mode is unreachable)"
-                );
+                notify_unavailable("Marking a design ready for dev", window, cx);
             }
             (control, value) => {
-                log::info!(
-                    "fanta-gpui toolbar: control change {control:?} = {value:?} not wired yet"
-                );
+                log::info!("fanta-gpui toolbar: control change {control:?} = {value:?}");
+                notify_unavailable(control.label(), window, cx);
             }
         }
     }
@@ -6182,6 +6270,8 @@ impl FigView {
     fn handle_toolbar_secondary_control(
         &mut self,
         control: fanta_gpui::toolbar::ToolbarSecondaryControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         use fanta_gpui::toolbar::ToolbarSecondaryControl;
         match control {
@@ -6190,31 +6280,29 @@ impl FigView {
                 // carries none, and inventing one would author a keyframe the
                 // user did not ask for. The timeline's per-track controls own
                 // that flow.
-                log::info!(
-                    "fanta-gpui toolbar: Add keyframe needs a track property; \
-                     use the timeline's per-track controls"
+                show_canvas_notice(
+                    "Add keyframe needs a track: use the timeline's per-track controls."
+                        .to_string(),
+                    window,
+                    cx,
                 );
             }
             ToolbarSecondaryControl::MotionTimeline => {
-                log::info!(
-                    "fanta-gpui toolbar: the Motion timeline is always visible in Motion mode; \
-                     there is no toggle"
+                show_canvas_notice(
+                    "The Motion timeline is always visible in Motion mode.".to_string(),
+                    window,
+                    cx,
                 );
             }
             ToolbarSecondaryControl::MotionTimeComment => {
-                log::info!("fanta-gpui toolbar: time-anchored comments are not modeled yet");
+                notify_unavailable("Time-anchored comments", window, cx);
             }
             ToolbarSecondaryControl::DevInspect
             | ToolbarSecondaryControl::DevAnnotate
             | ToolbarSecondaryControl::DevMeasure => {
-                log::info!(
-                    "fanta-gpui toolbar: Dev handoff control {control:?} has no host tool \
-                     (Dev mode is unreachable)"
-                );
+                notify_unavailable(control.label(), window, cx);
             }
-            other => {
-                log::info!("fanta-gpui toolbar: secondary control {other:?} not wired yet");
-            }
+            other => notify_unavailable(other.label(), window, cx),
         }
     }
 }
@@ -6230,4 +6318,48 @@ impl FigView {
             cx.notify();
         }
     }
+}
+
+/// One id shared by every canvas notice, so a second click replaces the
+/// standing message instead of stacking a queue of them.
+const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
+
+/// Show `message` in this window's workspace notification surface.
+///
+/// The vendored fanta-gpui surfaces (the editor toolbar, the pages and layers
+/// panels) emit intents for far more affordances than this build implements.
+/// Every one of those routes through here, because a click that only produces
+/// a log line is indistinguishable from a broken button.
+pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut App) {
+    let Some(workspace) = window
+        .root::<MultiWorkspace>()
+        .flatten()
+        .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+    else {
+        log::warn!("fanta: no workspace is available to show a notice in: {message}");
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace.show_toast(
+            Toast::new(NotificationId::named(CANVAS_NOTICE_ID.into()), message).autohide(),
+            cx,
+        );
+    });
+}
+
+/// Tell the user, by name, that the thing they just clicked is not in this
+/// build. `what` is the affordance's own label so the message points at the
+/// control the user actually pressed.
+///
+/// Gated with its callers: every unwired affordance belongs to a vendored
+/// fanta-gpui surface, so a `--no-default-features` diagnostic build has
+/// nothing to decline.
+#[cfg(feature = "fanta-gpui-ui")]
+pub(crate) fn notify_unavailable(what: &str, window: &mut Window, cx: &mut App) {
+    log::info!("fanta: {what} is not available in the alpha");
+    show_canvas_notice(
+        format!("{what} is not available in the Fanta alpha yet."),
+        window,
+        cx,
+    );
 }

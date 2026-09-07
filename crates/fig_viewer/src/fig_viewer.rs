@@ -24,6 +24,7 @@ mod live_mcp;
 mod mode_overrides;
 mod motion_edit;
 mod motion_panel;
+mod new_design;
 mod panel_settings;
 mod properties_ops;
 mod properties_panel;
@@ -40,6 +41,7 @@ mod variable_binding;
 mod variables_workspace;
 mod view;
 mod view_text;
+mod workspace_hooks;
 
 use gpui::{App, AsyncWindowContext, Entity, WeakEntity};
 use workspace::{Panel, Workspace};
@@ -77,6 +79,7 @@ pub fn init(cx: &mut App) {
     agent_surface::init(cx);
     live_mcp::init(cx);
     workspace::register_project_item::<FigView>(cx);
+    workspace_hooks::init(cx);
 }
 
 pub async fn add_workspace_panels(

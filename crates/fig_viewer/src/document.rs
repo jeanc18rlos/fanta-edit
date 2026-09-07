@@ -49,7 +49,6 @@ pub struct FigItem {
     source_edit_locked: bool,
     /// Serializes source persistence/reconciliation across split views that
     /// share this item and its project buffer.
-    source_edit_pipeline_in_progress: bool,
     /// Ignore worktree events until this instant; set around our own project
     /// writes so saving from the canvas does not trigger a self-reload.
     suppress_watcher_until: Option<Instant>,
@@ -784,7 +783,7 @@ impl project::ProjectItem for FigItem {
                                 // merge_base for the next save.
                                 return;
                             }
-                            if let Some(root) = adopted_root.clone() {
+                            if let Some(root) = adopted_root {
                                 // The write above echoes back through the
                                 // worktree watcher once the folder is adopted;
                                 // suppress it exactly like a save's self-write.
@@ -813,21 +812,51 @@ impl project::ProjectItem for FigItem {
                             return;
                         }
 
-                        // Surface the freshly materialized project as a visible
-                        // worktree so its `fanta.json` / `.fnx` / asset files
-                        // show in the project panel — the editor is now
-                        // launched "from the folder". Never fails the open.
-                        if let Some(root) = adopted_root
+                        // Surface the project as a visible worktree so its
+                        // `fanta.json` / `.fnx` / asset files show in the
+                        // project panel — the editor is now launched "from the
+                        // folder". This runs for EVERY successful load, not
+                        // just the one that materialized a new directory:
+                        // opening a `.fig` that already had a sibling project,
+                        // or a project source file from outside any worktree,
+                        // otherwise leaves the workspace with no open project
+                        // at all — and then the Agent Panel refuses to start a
+                        // thread, and the disk-sync watcher (which only sees
+                        // events for paths inside an open worktree) never
+                        // reports an external edit. Never fails the open.
+                        let project_root = match this
+                            .read_with(cx, |this, _| this.project_root.clone())
+                        {
+                            Ok(project_root) => project_root,
+                            Err(error) => {
+                                log::debug!(
+                                    "skipping the worktree check for a closed .fig item: {error:#}"
+                                );
+                                return;
+                            }
+                        };
+                        if let Some(root) = project_root
                             && let Some(project) = project.upgrade()
                         {
-                            let worktree = project.update(cx, |project, cx| {
-                                project.find_or_create_worktree(root.clone(), true, cx)
+                            // A project nested inside an already-open folder
+                            // is reachable through that worktree; adding a
+                            // second root for it would clutter the project
+                            // panel with a duplicate tree.
+                            let already_visible = project.read_with(cx, |project, cx| {
+                                project
+                                    .visible_worktrees(cx)
+                                    .any(|worktree| root.starts_with(worktree.read(cx).abs_path()))
                             });
-                            if let Err(error) = worktree.await {
-                                log::error!(
-                                    "adding materialized Fanta project {} to the workspace failed: {error:#}",
-                                    root.display()
-                                );
+                            if !already_visible {
+                                let worktree = project.update(cx, |project, cx| {
+                                    project.find_or_create_worktree(root.clone(), true, cx)
+                                });
+                                if let Err(error) = worktree.await {
+                                    log::error!(
+                                        "adding Fanta project {} to the workspace failed: {error:#}",
+                                        root.display()
+                                    );
+                                }
                             }
                         }
                     }
@@ -847,7 +876,6 @@ impl project::ProjectItem for FigItem {
                     preview_dirty_before: None,
                     conflict: false,
                     source_edit_locked: false,
-                    source_edit_pipeline_in_progress: false,
                     suppress_watcher_until: None,
                     merge_base: None,
                     pending_scope: initial_scope,
@@ -916,6 +944,11 @@ impl FigItem {
         self.source_edit_locked
     }
 
+    /// Test-only. Nothing in the app locks the canvas any more: the source view
+    /// is read-only, so there is no unsaved buffer to protect the document from.
+    /// The guards that read the flag are still live code, and these tests are
+    /// what keeps them honest if source editing ever comes back.
+    #[cfg(test)]
     pub(crate) fn set_source_edit_locked(
         &mut self,
         source_edit_locked: bool,
@@ -927,23 +960,6 @@ impl FigItem {
         self.source_edit_locked = source_edit_locked;
         cx.emit(FigItemEvent::SourceEditLockChanged);
         cx.notify();
-    }
-
-    fn begin_source_edit_save(&mut self) {
-        self.source_edit_pipeline_in_progress = true;
-        self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
-    }
-
-    pub(crate) fn try_begin_source_edit_pipeline(&mut self) -> bool {
-        if self.source_edit_pipeline_in_progress {
-            return false;
-        }
-        self.begin_source_edit_save();
-        true
-    }
-
-    pub(crate) fn finish_source_edit_pipeline(&mut self) {
-        self.source_edit_pipeline_in_progress = false;
     }
 
     pub fn project_root(&self) -> Option<&Path> {
@@ -1300,67 +1316,7 @@ impl FigItem {
         cx.notify();
     }
 
-    pub(crate) fn adopt_source_edit(
-        &mut self,
-        source_edit: fanta_format::ProjectSourceEdit,
-        cx: &mut Context<Self>,
-    ) {
-        let previous_page_root = self
-            .document
-            .ready()
-            .and_then(|current| current.doc.active_page());
-        let previous_selection = self
-            .document
-            .ready()
-            .map(|current| current.doc.selection.as_slice().to_vec())
-            .unwrap_or_default();
-        let previous_viewport = self
-            .document
-            .ready()
-            .map(|current| current.doc.viewport)
-            .unwrap_or_default();
-        let mut document = FigDocument::from_doc(source_edit.document, source_edit.assets);
-        if let Some(root) = previous_page_root {
-            document.restore_active_root(root);
-        }
-        let preserved_selection: Vec<_> = previous_selection
-            .into_iter()
-            .filter(|node| document.doc.scene.get(*node).is_some())
-            .collect();
-        document.doc.selection.replace_with(preserved_selection);
-        document.doc.viewport = previous_viewport;
-        document.continue_generation_after(
-            self.document
-                .ready()
-                .map(|current| current.render_generation()),
-        );
-        self.document = FigDocumentState::Ready(document);
-        self.dirty = false;
-        self.preview_dirty_before = None;
-        self.set_conflict(false, cx);
-        cx.emit(FigItemEvent::StateChanged);
-        cx.notify();
-    }
 
-    pub(crate) fn adopt_saved_source_edit(
-        &mut self,
-        source_edit: fanta_format::ProjectSourceEdit,
-        cx: &mut Context<Self>,
-    ) {
-        self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
-        // A pending merge/reload holds a disk snapshot from before this save;
-        // cancel it — the adoption below is the newer authoritative state.
-        self.reload_task = None;
-        self.adopt_source_edit(source_edit, cx);
-        // The persisted source edit is now the on-disk state; advance the
-        // merge ancestor with it — from the ADOPTED (normalized) document,
-        // not the reader-raw one, so a later merge doesn't see phantom
-        // base-vs-ours differences on solver-derived geometry. (The
-        // unsaved-preview adopt path must NOT advance the ancestor — the
-        // disk still holds the older tree there.)
-        self.merge_base = self.document.ready().map(|document| document.doc.clone());
-        self.sync_epoch += 1;
-    }
 
     /// Reload the project from disk immediately, discarding unsaved canvas
     /// edits. This backs the workspace's "discard and reload" choice in the
@@ -1725,7 +1681,6 @@ pub(crate) fn ready_item_for_test(
         preview_dirty_before: None,
         conflict: false,
         source_edit_locked: false,
-        source_edit_pipeline_in_progress: false,
         suppress_watcher_until: None,
         merge_base: None,
         pending_scope: None,
@@ -1754,7 +1709,11 @@ pub enum DocChange {
     ContentPreview,
 }
 
-fn write_project(root: &Path, doc: &Doc, raw_assets: &BTreeMap<AssetId, Vec<u8>>) -> Result<()> {
+pub(crate) fn write_project(
+    root: &Path,
+    doc: &Doc,
+    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
+) -> Result<()> {
     fanta_format::scaffold_project_tree(root)
         .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
     fanta_format::write_project_tree(root, doc, raw_assets)
@@ -2493,7 +2452,6 @@ mod tests {
             preview_dirty_before: None,
             conflict: false,
             source_edit_locked: false,
-            source_edit_pipeline_in_progress: false,
             suppress_watcher_until: None,
             merge_base: None,
             pending_scope: None,
@@ -2507,64 +2465,7 @@ mod tests {
         item
     }
 
-    #[gpui::test]
-    async fn source_pipeline_is_serialized_across_split_views(cx: &mut TestAppContext) {
-        let project = empty_project(cx).await;
-        let item = ready_item(
-            &project,
-            PathBuf::from("/tmp/design/fanta.json"),
-            Some(PathBuf::from("/tmp/design")),
-            doc_with_one_page(),
-            cx,
-        );
 
-        assert!(item.update(cx, |item, _| item.try_begin_source_edit_pipeline()));
-        assert!(!item.update(cx, |item, _| item.try_begin_source_edit_pipeline()));
-        item.update(cx, |item, _| item.finish_source_edit_pipeline());
-        assert!(item.update(cx, |item, _| item.try_begin_source_edit_pipeline()));
-        item.update(cx, |item, _| item.finish_source_edit_pipeline());
-    }
-
-    #[gpui::test]
-    async fn source_edit_adoption_preserves_page_and_selection(cx: &mut TestAppContext) {
-        let project = empty_project(cx).await;
-        let mut document = doc_with_one_page();
-        let page = document.pages()[0];
-        document.selection.select_only(page);
-        document.viewport = Viewport {
-            center: [275.0, -42.0],
-            zoom: 2.5,
-        };
-        let item = ready_item(
-            &project,
-            PathBuf::from("/tmp/design/fanta.json"),
-            Some(PathBuf::from("/tmp/design")),
-            document.clone(),
-            cx,
-        );
-        document.scene.get_mut(page).expect("page node").name = "Edited source".to_owned();
-        let source_edit = fanta_format::ProjectSourceEdit {
-            document,
-            assets: BTreeMap::new(),
-            source_path: PathBuf::from("/tmp/design/pages/page/page.fnx"),
-        };
-
-        item.update(cx, |item, cx| item.adopt_source_edit(source_edit, cx));
-        item.read_with(cx, |item, _| {
-            let document = item.document().expect("adopted source document");
-            assert_eq!(document.doc.active_page(), Some(page));
-            assert_eq!(document.doc.selection.as_slice(), &[page]);
-            assert_eq!(
-                document.doc.viewport,
-                Viewport {
-                    center: [275.0, -42.0],
-                    zoom: 2.5,
-                }
-            );
-            assert_eq!(document.doc.scene.get(page).unwrap().name, "Edited source");
-            assert!(!item.is_dirty());
-        });
-    }
 
     #[gpui::test]
     async fn a_parsed_fig_is_editable_without_a_project_root(cx: &mut TestAppContext) {
