@@ -1,11 +1,11 @@
 [package]
-description = "The fast, collaborative code editor."
+description = "Fanta - an agent-native design app"
 edition.workspace = true
 name = "zed"
-version = "1.11.0"
+version = "0.1.0-alpha.1"
 publish.workspace = true
 license = "GPL-3.0-or-later"
-authors = ["Zed Team <hi@zed.dev>"]
+authors = ["Fanta"]
 default-run = "fanta"
 
 [lints]
@@ -16,52 +16,10 @@ fanta-gpui-ui = ["fig_viewer/fanta-gpui-ui"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
-test-support = [
-    "gpui/test-support",
-    "gpui_platform/screen-capture",
-    "dep:image",
-    "workspace/test-support",
-    "project/test-support",
-    "editor/test-support",
-    "terminal_view/test-support",
-    "image_viewer/test-support",
-    "recent_projects/test-support",
-    "repl/test-support",
-    "title_bar/test-support",
-]
-visual-tests = [
-    "gpui/test-support",
-    "gpui_platform/screen-capture",
-    "gpui_platform/test-support",
-    "dep:image",
-    "dep:tempfile",
-    "dep:action_log",
-    "dep:agent_servers",
-    "workspace/test-support",
-    "project/test-support",
-    "editor/test-support",
-    "terminal_view/test-support",
-    "image_viewer/test-support",
-    "clock/test-support",
-    "acp_thread/test-support",
-    "action_log/test-support",
-    "agent_ui/test-support",
-    "db/test-support",
-    "agent/test-support",
-    "language_model/test-support",
-    "fs/test-support",
-    "recent_projects/test-support",
-    "title_bar/test-support",
-]
 
 [[bin]]
 name = "fanta"
 path = "src/main.rs"
-
-[[bin]]
-name = "zed_visual_test_runner"
-path = "src/visual_test_runner.rs"
-required-features = ["visual-tests"]
 
 [dependencies]
 acp_tools.workspace = true
@@ -89,13 +47,11 @@ collab_ui.workspace = true
 collections.workspace = true
 command_palette.workspace = true
 component.workspace = true
-component_preview.workspace = true
 copilot.workspace = true
 copilot_chat.workspace = true
 copilot_ui.workspace = true
 crashes.workspace = true
 csv_preview.workspace = true
-dap_adapters.workspace = true
 db.workspace = true
 debug_adapter_extension.workspace = true
 debugger_tools.workspace = true
@@ -107,7 +63,6 @@ encoding_selector.workspace = true
 env_logger.workspace = true
 extension.workspace = true
 extension_host.workspace = true
-extensions_ui.workspace = true
 feature_flags.workspace = true
 feedback.workspace = true
 fig_viewer.workspace = true
@@ -120,16 +75,11 @@ git_ui = { workspace = true, features = ["call"] }
 go_to_line.workspace = true
 system_specs.workspace = true
 gpui = { workspace = true, features = ["input-latency-histogram"] }
-gpui_platform = {workspace = true, features=["screen-capture", "font-kit", "wayland", "x11"]}
+gpui_platform = { workspace = true, features = ["font-kit"] }
 hdrhistogram.workspace = true
-image = { workspace = true, optional = true }
 itertools.workspace = true
 semver.workspace = true
-tempfile = { workspace = true, optional = true }
-clock = { workspace = true, optional = true }
 acp_thread.workspace = true
-action_log = { workspace = true, optional = true }
-agent_servers = { workspace = true, optional = true }
 gpui_tokio.workspace = true
 rayon.workspace = true
 
@@ -140,7 +90,6 @@ image_viewer.workspace = true
 input_latency_ui.workspace = true
 inspector_ui.workspace = true
 install_cli.workspace = true
-journal.workspace = true
 json_schema_store.workspace = true
 keymap_editor.workspace = true
 language.workspace = true
@@ -157,7 +106,6 @@ markdown.workspace = true
 markdown_preview.workspace = true
 menu.workspace = true
 migrator.workspace = true
-miniprofiler_ui.workspace = true
 mimalloc = { version = "0.1", optional = true }
 node_runtime.workspace = true
 notifications.workspace = true
@@ -170,7 +118,6 @@ picker.workspace = true
 profiling.workspace = true
 project.workspace = true
 project_panel.workspace = true
-project_symbols.workspace = true
 prompt_store.workspace = true
 proto.workspace = true
 recent_projects.workspace = true
@@ -186,13 +133,11 @@ serde.workspace = true
 serde_json.workspace = true
 session.workspace = true
 settings.workspace = true
-settings_profile_selector.workspace = true
 settings_ui.workspace = true
 shellexpand.workspace = true
 sidebar.workspace = true
 smol.workspace = true
 snippet_provider.workspace = true
-snippets_ui.workspace = true
 svg_preview.workspace = true
 sysinfo.workspace = true
 tab_switcher.workspace = true
@@ -222,7 +167,6 @@ vim_mode_setting.workspace = true
 watch.workspace = true
 web_search.workspace = true
 web_search_providers.workspace = true
-which_key.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zed_env_vars.workspace = true
@@ -255,26 +199,6 @@ image.workspace = true
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
 pkg-config = "0.3.22"
-
-[dev-dependencies]
-call = { workspace = true, features = ["test-support"] }
-editor = { workspace = true, features = ["test-support"] }
-gpui = { workspace = true, features = ["input-latency-histogram", "test-support"] }
-image_viewer = { workspace = true, features = ["test-support"] }
-itertools.workspace = true
-language = { workspace = true, features = ["test-support"] }
-pretty_assertions.workspace = true
-project = { workspace = true, features = ["test-support"] }
-semver.workspace = true
-terminal_view = { workspace = true, features = ["test-support"] }
-title_bar = { workspace = true, features = ["test-support"] }
-workspace = { workspace = true, features = ["test-support"] }
-image.workspace = true
-agent_ui = { workspace = true, features = ["test-support"] }
-search = { workspace = true, features = ["test-support"] }
-repl = { workspace = true, features = ["test-support"] }
-
-
 
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]

@@ -62,7 +62,10 @@ pub use timeline::{
 };
 pub use tools::ToolKind;
 pub use variables_workspace::FantaVariablesWorkspace;
-pub use view::{FigView, FigViewEvent};
+pub use view::{
+    FigView, FigViewEvent, FitToView, ResetZoom, ToggleInspectorSidebar, ToggleLayersSidebar,
+    ZoomIn, ZoomOut,
+};
 
 pub fn init(cx: &mut App) {
     #[cfg(feature = "fanta-gpui-ui")]

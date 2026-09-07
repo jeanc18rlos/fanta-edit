@@ -941,3 +941,15 @@ pub mod notebook {
         ]
     );
 }
+
+pub mod fanta {
+    use gpui::actions;
+
+    actions!(
+        fanta,
+        [
+            /// Creates a new Fanta design.
+            NewDesign
+        ]
+    );
+}
