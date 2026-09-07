@@ -1,0 +1,39 @@
+[package]
+name = "fanta-doc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Polymorphic scene graph, CanvasNode enum, undo/redo, selection. Renderer-agnostic."
+
+[dependencies]
+# Identity. ULID is globally unique, lexicographically sortable by time, and
+# CRDT-friendly — multiple peers can mint IDs without coordination.
+ulid.workspace = true
+
+# Math. f64 in the doc; f32 projection happens at render time (see ARCHITECTURE.md §13).
+glam.workspace = true
+
+# Pure-geometry 2D curve/stroke math (no renderer): bakes a stroke into a filled
+# outline path (`PathData::stroke_to_fill`) so an icon authored as strokes becomes
+# a robust filled vector. Renderer-agnostic, in the spirit of `glam`.
+kurbo.workspace = true
+
+# Serialization. The canonical `.fant.json` projection is what AI reads and writes.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Containers. SmallVec for short inline lists (selection, small children lists);
+# bitflags for flag fields.
+smallvec = { workspace = true, features = ["serde"] }
+bitflags = { workspace = true, features = ["serde"] }
+
+# Workspace shared.
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

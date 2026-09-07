@@ -1,0 +1,245 @@
+//! Auto-layout ("stack") + per-child layout participation + mask flag reads.
+
+use super::{
+    AutoLayout, AxisSizing, CanvasNode, CounterAlign, KiwiValue, LayoutChild, LayoutMode, MaskType,
+    PrimaryAlign, ScrollBehavior, ScrollDirection,
+};
+
+/// Read the auto-layout ("stack") configuration from a `NodeChange`, or `None`
+/// when the change is not an explicit Figma auto-layout frame.
+///
+/// Figma stack spacing, padding, alignment, sizing, wrapping, and reverse-z
+/// fields are mapped into Fanta's model only when `stackMode` is an explicit
+/// HORIZONTAL or VERTICAL flow. Real `.fig` files can carry stale `stack*`
+/// fields on free-positioned frames; inferring auto-layout from those values
+/// reflows baked Figma compositions incorrectly.
+///
+/// Figma fields (verified against the embedded `fig.kiwi`): `stackMode`,
+/// `stackSpacing`, `stackCounterSpacing`, the `stack*Padding*` family,
+/// `stackPrimaryAlignItems`/`stackJustify`,
+/// `stackCounterAlignItems`/`stackCounterAlign`,
+/// `stackPrimarySizing`/`stackCounterSizing`, `stackWrap`, `stackReverseZIndex`.
+pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
+    // Non-finite stack values are Figma sentinels, not usable geometry (an
+    // "Auto" wrap gap is stored as a NaN `stackCounterSpacing`); a NaN that
+    // leaks into the solver poisons every downstream position, so numeric
+    // reads only accept finite values and fall through to their defaults.
+    let f = |name: &str| {
+        change
+            .get(name)
+            .and_then(KiwiValue::as_f64)
+            .filter(|value| value.is_finite())
+    };
+
+    let primary_align = map_primary_align(
+        change
+            .get("stackPrimaryAlignItems")
+            .or_else(|| change.get("stackJustify"))
+            .and_then(KiwiValue::as_str),
+    );
+    let counter_align = map_counter_align(
+        change
+            .get("stackCounterAlignItems")
+            .or_else(|| change.get("stackCounterAlign"))
+            .and_then(KiwiValue::as_str),
+    );
+
+    // Padding fallback chain, mirroring OpenPencil `mapPadding`:
+    //   top    = stackVerticalPadding   ?? stackPadding ?? 0
+    //   bottom = stackPaddingBottom     ?? stackVerticalPadding   ?? stackPadding ?? 0
+    //   left   = stackHorizontalPadding ?? stackPadding ?? 0
+    //   right  = stackPaddingRight      ?? stackHorizontalPadding ?? stackPadding ?? 0
+    let base = f("stackPadding");
+    let vert = f("stackVerticalPadding");
+    let horiz = f("stackHorizontalPadding");
+    let pad_top = vert.or(base).unwrap_or(0.0);
+    let pad_bottom = f("stackPaddingBottom").or(vert).or(base).unwrap_or(0.0);
+    let pad_left = horiz.or(base).unwrap_or(0.0);
+    let pad_right = f("stackPaddingRight").or(horiz).or(base).unwrap_or(0.0);
+    let padding = [pad_top, pad_right, pad_bottom, pad_left];
+
+    let stack_mode = change.get("stackMode").and_then(KiwiValue::as_str);
+    let mode = match stack_mode {
+        Some("HORIZONTAL") => LayoutMode::Horizontal,
+        Some("VERTICAL") => LayoutMode::Vertical,
+        _ => return None,
+    };
+
+    // Figma's "Auto" gap between wrapped rows/columns is encoded as a NaN
+    // `stackCounterSpacing` (the finite filter above already rejected it);
+    // it means "distribute the lines across the counter extent", not a gap
+    // of zero, so it maps to the explicit auto flag.
+    let counter_auto_spacing = change
+        .get("stackCounterSpacing")
+        .and_then(KiwiValue::as_f64)
+        .is_some_and(f64::is_nan);
+
+    Some(AutoLayout {
+        mode,
+        spacing: f("stackSpacing").unwrap_or(0.0),
+        counter_spacing: f("stackCounterSpacing").unwrap_or(0.0),
+        counter_auto_spacing,
+        padding,
+        primary_align,
+        counter_align,
+        primary_sizing: map_axis_sizing(
+            change.get("stackPrimarySizing").and_then(KiwiValue::as_str),
+        ),
+        counter_sizing: map_axis_sizing(
+            change.get("stackCounterSizing").and_then(KiwiValue::as_str),
+        ),
+        wrap: change.get("stackWrap").and_then(KiwiValue::as_str) == Some("WRAP"),
+        flow_reverse: false,
+        child_layout: true,
+        reverse_z: matches!(
+            change.get("stackReverseZIndex"),
+            Some(KiwiValue::Bool(true))
+        ),
+        // Figma frame min/max sizing (clamps a hug axis). Absent ⇒ no bound.
+        min_size: [f("minWidth"), f("minHeight")],
+        max_size: [f("maxWidth"), f("maxHeight")],
+    })
+}
+
+/// Map Figma `StackSize` → [`AxisSizing`]. `RESIZE_TO_FIT*` ⇒ HUG, else FIXED
+/// (op1 `mapStackSizing`; `FILL` only applies to *children*, handled separately).
+pub(crate) fn map_axis_sizing(s: Option<&str>) -> AxisSizing {
+    match s {
+        Some("RESIZE_TO_FIT") | Some("RESIZE_TO_FIT_WITH_IMPLICIT_SIZE") => AxisSizing::Hug,
+        _ => AxisSizing::Fixed,
+    }
+}
+
+/// Map Figma `StackJustify` → [`PrimaryAlign`] (op1 `mapStackJustify`).
+pub(crate) fn map_primary_align(s: Option<&str>) -> PrimaryAlign {
+    match s {
+        Some("CENTER") => PrimaryAlign::Center,
+        Some("MAX") => PrimaryAlign::End,
+        Some("SPACE_BETWEEN") => PrimaryAlign::SpaceBetween,
+        Some("SPACE_EVENLY") => PrimaryAlign::SpaceEvenly,
+        _ => PrimaryAlign::Start,
+    }
+}
+
+/// Map Figma `StackAlign`/`StackCounterAlign` → [`CounterAlign`] for the
+/// *container's* counter alignment (op1 `mapStackCounterAlign`; `MIN`/absent ⇒
+/// Start, `AUTO` ⇒ Start).
+pub(crate) fn map_counter_align(s: Option<&str>) -> CounterAlign {
+    match s {
+        Some("CENTER") => CounterAlign::Center,
+        Some("MAX") => CounterAlign::End,
+        Some("STRETCH") => CounterAlign::Stretch,
+        Some("BASELINE") => CounterAlign::Baseline,
+        _ => CounterAlign::Start,
+    }
+}
+
+/// Read per-child auto-layout participation (`stackChildPrimaryGrow` /
+/// `layoutGrow`, `stackPositioning` / `layoutPositioning`,
+/// `stackChildAlignSelf` / `layoutAlignSelf`) from a child `NodeChange`.
+/// Returns `None` when the child carries no non-default layout data, so plain
+/// children round-trip without an empty struct.
+pub(crate) fn read_layout_child(change: &KiwiValue) -> Option<LayoutChild> {
+    let grow = change
+        .get("stackChildPrimaryGrow")
+        .or_else(|| change.get("layoutGrow"))
+        .and_then(KiwiValue::as_f64)
+        .unwrap_or(0.0) as f32;
+    let absolute = change
+        .get("stackPositioning")
+        .or_else(|| change.get("layoutPositioning"))
+        .and_then(KiwiValue::as_str)
+        == Some("ABSOLUTE");
+    // `stackChildAlignSelf` uses `StackCounterAlign`: MIN/CENTER/MAX/STRETCH/
+    // BASELINE/AUTO. `AUTO` (and absent) ⇒ inherit the parent ⇒ `None`. `MIN`
+    // ⇒ Start (op1 `mapAlignSelf`).
+    let align_self = match change
+        .get("stackChildAlignSelf")
+        .or_else(|| change.get("layoutAlignSelf"))
+        .and_then(KiwiValue::as_str)
+    {
+        Some("MIN") => Some(CounterAlign::Start),
+        Some("CENTER") => Some(CounterAlign::Center),
+        Some("MAX") => Some(CounterAlign::End),
+        Some("STRETCH") => Some(CounterAlign::Stretch),
+        Some("BASELINE") => Some(CounterAlign::Baseline),
+        _ => None,
+    };
+    let lc = LayoutChild {
+        grow,
+        absolute,
+        align_self,
+    };
+    (!lc.is_trivial()).then_some(lc)
+}
+
+/// Read a node's **mask** flag + type from its `NodeChange` onto `node`. A node
+/// flagged `mask` (Kiwi field) — the same property Figma's editor calls "Use as
+/// mask" / the API exposes as `isMask` — masks its FOLLOWING SIBLINGS within the
+/// same parent until the next mask sibling (the renderer's children-painting
+/// path applies this). The `maskType` selects how:
+///
+/// - `ALPHA` (default, and the fallback when absent) → [`MaskType::Alpha`].
+/// - `LUMINANCE` → [`MaskType::Luminance`].
+/// - `VECTOR` / `OUTLINE` → [`MaskType::Alpha`]: a vector/outline mask is the
+///   alpha coverage of the mask shape, which alpha masking already produces.
+///
+/// A change with no/`false` mask flag leaves `node.is_mask == false`, so this is
+/// a no-op on the overwhelming majority of nodes.
+pub(crate) fn read_mask(change: &KiwiValue, node: &mut CanvasNode) {
+    // Figma stores the flag as `mask` in the Kiwi schema; tolerate `isMask` too
+    // (the public-API spelling some exporters carry).
+    let is_mask = matches!(change.get("mask"), Some(KiwiValue::Bool(true)))
+        || matches!(change.get("isMask"), Some(KiwiValue::Bool(true)));
+    if !is_mask {
+        return;
+    }
+    node.is_mask = true;
+    node.mask_type = match change.get("maskType").and_then(KiwiValue::as_str) {
+        Some("LUMINANCE") => MaskType::Luminance,
+        // ALPHA / VECTOR / OUTLINE / absent → alpha coverage of the mask shape.
+        _ => MaskType::Alpha,
+    };
+}
+
+/// Read a frame's prototype overflow axes (`scrollDirection`).
+///
+/// VERIFIED on a real 2026 export: the embedded schema uses the SHORT member
+/// spellings (`Enum("HORIZONTAL")`). The long REST-style spellings
+/// (`HORIZONTAL_SCROLLING`) are kept as tolerated aliases for older schema
+/// revisions. Unrecognized members read as `None` (no scrolling) rather than
+/// guessing an axis.
+pub(crate) fn read_scroll_direction(change: &KiwiValue) -> Option<ScrollDirection> {
+    let raw = change.get("scrollDirection").and_then(KiwiValue::as_str)?;
+    Some(match raw {
+        "HORIZONTAL_SCROLLING" | "HORIZONTAL" => ScrollDirection::Horizontal,
+        "VERTICAL_SCROLLING" | "VERTICAL" => ScrollDirection::Vertical,
+        "HORIZONTAL_AND_VERTICAL_SCROLLING" | "HORIZONTAL_AND_VERTICAL" | "BOTH" => {
+            ScrollDirection::Both
+        }
+        // "NONE" and unknown members: explicitly not scrollable.
+        _ => ScrollDirection::None,
+    })
+}
+
+/// Read a node's per-child scroll behavior (`scrollBehavior`): fixed elements
+/// stay put while an ancestor frame scrolls; sticky ones pin at the edge.
+/// Absent/unknown ⇒ the default (moves with content). Same ASSUMPTION note as
+/// [`read_scroll_direction`] regarding member spellings.
+pub(crate) fn read_scroll_behavior(change: &KiwiValue) -> ScrollBehavior {
+    match change.get("scrollBehavior").and_then(KiwiValue::as_str) {
+        Some("FIXED_WHEN_CHILD_OF_SCROLLING_FRAME" | "FIXED") => ScrollBehavior::Fixed,
+        Some("STICKY_SCROLLS" | "STICKY") => ScrollBehavior::Sticky,
+        _ => ScrollBehavior::Scrolls,
+    }
+}
+
+/// Read a frame's authored initial scroll offset (`scrollOffset`). Zero (the
+/// overwhelmingly common value) reads as `None` so the model field stays
+/// absent and old docs keep round-tripping byte-identical.
+pub(crate) fn read_scroll_offset(change: &KiwiValue) -> Option<[f64; 2]> {
+    let offset = change.get("scrollOffset")?;
+    let x = offset.get("x").and_then(KiwiValue::as_f64).unwrap_or(0.0);
+    let y = offset.get("y").and_then(KiwiValue::as_f64).unwrap_or(0.0);
+    (x != 0.0 || y != 0.0).then_some([x, y])
+}

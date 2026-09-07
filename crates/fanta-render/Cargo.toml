@@ -1,0 +1,41 @@
+[package]
+name = "fanta-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Skia raster backend: scene walk, effects, instance/image caches; renders to an owned CPU surface or an externally owned Skia canvas."
+
+[dependencies]
+fanta-doc.workspace = true
+# Text shaping + layout over Skia. No dependency cycle: `fanta-text` depends on
+# `fanta-doc` + skia, never on `fanta-render`. The renderer converts a
+# `TextNode`'s doc-level style/align into the engine's types and paints the
+# resulting `TextLayout` straight onto the scene canvas.
+fanta-text.workspace = true
+thiserror.workspace = true
+
+# Skia (skia-safe). Prebuilt binaries via skia-binaries (the default) avoid a
+# 10–30 min source build. The `textlayout` feature pulls in HarfBuzz / ICU /
+# Skia's paragraph layout — needed when text rendering lands but harmless now.
+skia-safe.workspace = true
+
+# Used to fold an instance's overrides/prop_values into the instance-expansion
+# memo key: `OverrideValue` carries `f64`/JSON and isn't `Hash`, so we hash its
+# stable serde projection. Already in the build graph (fanta-doc uses it), so
+# this adds no new compile cost.
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"
+# Needed only to construct `VectorNode.fills` (a `SmallVec`) directly in the
+# bitmap integration tests; matches the version `fanta-doc` already uses.
+smallvec = { version = "1", features = ["union"] }
+# Tier-1 golden-render E2E only: decode the committed golden PNG back to RGBA
+# for a per-pixel comparison and encode a diff image on mismatch. `png`-only
+# feature set keeps the decoder surface minimal; matches `fanta-app`'s version.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[lints]
+workspace = true

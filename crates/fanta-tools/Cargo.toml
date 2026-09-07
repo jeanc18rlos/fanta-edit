@@ -1,0 +1,26 @@
+[package]
+name = "fanta-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Tool state machines — select, marquee, pen, rect, ellipse, line, text, hand."
+
+[dependencies]
+fanta-doc.workspace = true
+fanta-canvas.workspace = true
+tracing.workspace = true
+
+# Pure interaction layer. f64 vectors; no rendering deps.
+glam.workspace = true
+bitflags = { workspace = true, features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = { workspace = true, features = ["serde", "union"] }
+
+[dev-dependencies]
+fanta-text.workspace = true
+
+[lints]
+workspace = true

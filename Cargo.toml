@@ -78,6 +78,16 @@ members = [
     "crates/feature_flags",
     "crates/feature_flags_macros",
     "crates/feedback",
+    "crates/fanta-canvas",
+    "crates/fanta-doc",
+    "crates/fanta-fig-interop",
+    "crates/fanta-fnx",
+    "crates/fanta-format",
+    "crates/fanta-gpui",
+    "crates/fanta-present",
+    "crates/fanta-render",
+    "crates/fanta-text",
+    "crates/fanta-tools",
     "crates/fanta_ui",
     "crates/fig_viewer",
     "crates/file_finder",
@@ -265,6 +275,10 @@ default-members = ["crates/zed"]
 [workspace.package]
 publish = false
 edition = "2024"
+# Inherited by the vendored fanta engine and UI crates under crates/fanta-*.
+version = "0.1.0"
+rust-version = "1.95"
+license = "GPL-3.0"
 
 [workspace.dependencies]
 
@@ -344,15 +358,15 @@ fanta_ui = { path = "crates/fanta_ui" }
 fig_viewer = { path = "crates/fig_viewer" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
-fanta-doc = { path = "../fanta-engine-migration/crates/fanta-doc" }
-fanta-fig-interop = { path = "../fanta-engine-migration/crates/fanta-fig-interop" }
-fanta-fnx = { path = "../fanta-engine-migration/crates/fanta-fnx" }
-fanta-format = { path = "../fanta-engine-migration/crates/fanta-format" }
-fanta-canvas = { path = "../fanta-engine-migration/crates/fanta-canvas" }
-fanta-present = { path = "../fanta-engine-migration/crates/fanta-present" }
-fanta-render = { path = "../fanta-engine-migration/crates/fanta-render" }
-fanta-tools = { path = "../fanta-engine-migration/crates/fanta-tools" }
-fanta-text = { path = "../fanta-engine-migration/crates/fanta-text" }
+fanta-doc = { path = "crates/fanta-doc" }
+fanta-fig-interop = { path = "crates/fanta-fig-interop" }
+fanta-fnx = { path = "crates/fanta-fnx" }
+fanta-format = { path = "crates/fanta-format" }
+fanta-canvas = { path = "crates/fanta-canvas" }
+fanta-present = { path = "crates/fanta-present" }
+fanta-render = { path = "crates/fanta-render" }
+fanta-tools = { path = "crates/fanta-tools" }
+fanta-text = { path = "crates/fanta-text" }
 fs = { path = "crates/fs" }
 fuzzy = { path = "crates/fuzzy" }
 fuzzy_nucleo = { path = "crates/fuzzy_nucleo" }
@@ -364,7 +378,7 @@ google_ai = { path = "crates/google_ai" }
 grammars = { path = "crates/grammars" }
 gpui = { path = "crates/gpui", default-features = false }
 gpui-component = { path = "crates/gpui_component" }
-fanta-gpui = { path = "../fanta-gpui/crates/fanta-gpui" }
+fanta-gpui = { path = "crates/fanta-gpui" }
 gpui_shared_string = { path = "crates/gpui_shared_string" }
 gpui_linux = { path = "crates/gpui_linux", default-features = false }
 gpui_macos = { path = "crates/gpui_macos", default-features = false }

@@ -1,0 +1,21 @@
+[package]
+name = "fanta-present"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Prototype-playback runtime: plays imported Figma prototypes (trigger dispatch, actions, transitions) over an immutable Doc via the Skia renderer."
+
+[lib]
+path = "src/fanta_present.rs"
+
+[dependencies]
+fanta-doc.workspace = true
+fanta-render.workspace = true
+fanta-canvas.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
