@@ -202,7 +202,7 @@ fn register_compatible_providers(
                 CompatibleProviderKind::Anthropic => registry.register_provider(
                     Arc::new(AnthropicCompatibleLanguageModelProvider::new(
                         provider_id.clone(),
-                        client.http_client(),
+                        client.clone(),
                         credentials_provider.clone(),
                         cx,
                     )),

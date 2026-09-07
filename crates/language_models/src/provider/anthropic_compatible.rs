@@ -1,6 +1,7 @@
 use anthropic::completion::{AnthropicEventMapper, AnthropicPromptCacheMode, into_anthropic};
 use anthropic::{AnthropicError, AnthropicModelMode};
 use anyhow::Result;
+use client::{Client, ClientSettings};
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{App, AppContext, AsyncApp, Entity, Task};
@@ -37,7 +38,23 @@ pub struct AnthropicCompatibleLanguageModelProvider {
     id: LanguageModelProviderId,
     name: LanguageModelProviderName,
     http_client: Arc<dyn HttpClient>,
+    client: Arc<Client>,
     state: Entity<State>,
+}
+
+/// The signed-in account's access token, iff this provider targets the
+/// account server itself (the managed Fanta provider). Signing in is then all
+/// the configuration the provider needs — no separate API key. Providers
+/// pointing anywhere else never see the account token.
+fn account_token_for(
+    client: &Arc<Client>,
+    api_url: &str,
+    cx: &App,
+) -> Option<Arc<str>> {
+    let server_url = &ClientSettings::get_global(cx).server_url;
+    (api_url.trim_end_matches('/') == server_url.trim_end_matches('/'))
+        .then(|| client.account_access_token())
+        .flatten()
 }
 
 impl ApiCompatibleProviderSettings for AnthropicCompatibleSettings {
@@ -81,7 +98,7 @@ fn available_model_to_anthropic_model(available: &AvailableModel) -> anthropic::
 impl AnthropicCompatibleLanguageModelProvider {
     pub fn new(
         id: Arc<str>,
-        http_client: Arc<dyn HttpClient>,
+        client: Arc<Client>,
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut App,
     ) -> Self {
@@ -96,10 +113,27 @@ impl AnthropicCompatibleLanguageModelProvider {
             cx,
         );
 
+        // Sign-in/out changes whether the account token authenticates the
+        // managed provider; poke the observable state so the registry and the
+        // agent panel re-evaluate authentication without an app restart.
+        let mut status = client.status();
+        cx.spawn({
+            let state = state.downgrade();
+            async move |cx| {
+                while status.next().await.is_some() {
+                    if state.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+
         Self {
             id: id.clone().into(),
             name: id.into(),
-            http_client,
+            http_client: client.http_client(),
+            client,
             state,
         }
     }
@@ -125,6 +159,7 @@ impl AnthropicCompatibleLanguageModelProvider {
             cache_mode,
             state: self.state.clone(),
             http_client: self.http_client.clone(),
+            client: self.client.clone(),
             request_limiter: RateLimiter::new(4),
         })
     }
@@ -175,11 +210,28 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
     }
 
     fn is_authenticated(&self, cx: &App) -> bool {
-        self.state.read(cx).is_authenticated()
+        if self.state.read(cx).is_authenticated() {
+            return true;
+        }
+        let api_url = self.state.read(cx).settings.api_url.clone();
+        account_token_for(&self.client, &api_url, cx).is_some()
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        // Always run the credential load so an explicit key (provider UI or
+        // env var) is available to requests, where it wins over the account
+        // token. For the managed (account-backed) provider a MISSING key is
+        // not a failure — signing in already authenticates it — so the
+        // account token only masks the error, never skips the load.
+        let inner = self.state.update(cx, |state, cx| state.authenticate(cx));
+        let api_url = self.state.read(cx).settings.api_url.clone();
+        if account_token_for(&self.client, &api_url, cx).is_none() {
+            return inner;
+        }
+        cx.spawn(async move |_cx| {
+            inner.await.ok();
+            Ok(())
+        })
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -215,6 +267,7 @@ pub struct AnthropicCompatibleLanguageModel {
     cache_mode: AnthropicPromptCacheMode,
     state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
+    client: Arc<Client>,
     request_limiter: RateLimiter,
 }
 
@@ -233,13 +286,15 @@ impl AnthropicCompatibleLanguageModel {
         let http_client = self.http_client.clone();
         let provider_name = self.provider_name.clone();
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
+        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, cx| {
             let api_url = state.settings.api_url.clone();
-            (
-                state.api_key_state.key(&api_url),
-                api_url,
-                state.settings.custom_headers.clone(),
-            )
+            // An explicit API key wins; the signed-in account token covers the
+            // managed (account-server) provider so sign-in alone grants AI.
+            let api_key = state
+                .api_key_state
+                .key(&api_url)
+                .or_else(|| account_token_for(&self.client, &api_url, cx));
+            (api_key, api_url, state.settings.custom_headers.clone())
         });
 
         let beta_headers = self.model.beta_headers();

@@ -1082,12 +1082,15 @@
     // Maximum content width in pixels when limit_content_width is enabled.
     // Content will be centered within the panel.
     "max_content_width": 850,
-    // The default model to use when creating new threads.
+    // The default model to use when creating new threads. The managed Fanta
+    // provider authenticates with your signed-in account, so signing in is
+    // the only setup needed; while signed out the agent falls back to the
+    // first configured provider.
     "default_model": {
       // The provider to use.
-      "provider": "anthropic",
+      "provider": "Fanta",
       // The model to use.
-      "model": "claude-sonnet-4-20250514",
+      "model": "claude-opus-4-8",
       // Whether thinking is enabled.
       "enable_thinking": false,
     },
@@ -2467,9 +2470,9 @@
       "api_url": "https://api.anthropic.com",
     },
     // Fanta managed provider (Anthropic Messages-compatible). Metered against
-    // your Fanta credits. Set the key via the provider UI or FANTA_API_KEY.
-    // Available but NOT the default (offline-first stays sacred) — switch
-    // agent.default_model.provider to "Fanta" after signing in.
+    // your Fanta credits. Signing in to your Fanta account is all the setup
+    // needed — the account token authenticates this provider automatically.
+    // An explicit key (provider UI or FANTA_API_KEY) still wins if set.
     "anthropic_compatible": {
       "Fanta": {
         "api_url": "https://api.fantaisa.net",
