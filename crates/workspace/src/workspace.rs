@@ -860,8 +860,21 @@ impl ProjectItemRegistry {
                     }) {
                         Ok(project_item) => {
                             let project_item = project_item;
-                            let project_entry_id: Option<ProjectEntryId> =
+                            let item_entry_id: Option<ProjectEntryId> =
                                 project_item.read_with(cx, project::ProjectItem::entry_id);
+                            // Dedupe tabs by the entry the user opened, not by
+                            // the item's own entry: a project item SHARED
+                            // between several openable paths reports its
+                            // first-open path's entry, which would collapse
+                            // every later path onto that first tab. For
+                            // single-path items the two entries are the same.
+                            let opened_path_entry_id = cx.update(|_, cx| {
+                                project
+                                    .read(cx)
+                                    .entry_for_path(&project_path, cx)
+                                    .map(|entry| entry.id)
+                            })?;
+                            let project_entry_id = opened_path_entry_id.or(item_entry_id);
                             let build_workspace_item = Box::new(
                                 |pane: &mut Pane, window: &mut Window, cx: &mut Context<Pane>| {
                                     Box::new(cx.new(|cx| {

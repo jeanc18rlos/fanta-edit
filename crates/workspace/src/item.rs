@@ -237,6 +237,22 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
     ) {
     }
+
+    /// The worktree entries this item stands for when a pane dedupes opens.
+    /// The default reports the underlying project items' entries. Items whose
+    /// project item is SHARED between several openable paths (one document
+    /// behind many files) must override this to report the entry the view was
+    /// opened from — otherwise every one of those paths dedupes onto whichever
+    /// tab opened the shared item first.
+    fn project_entry_ids(&self, cx: &App) -> SmallVec<[ProjectEntryId; 3]> {
+        let mut result = SmallVec::new();
+        self.for_each_project_item(cx, &mut |_, item| {
+            if let Some(id) = item.entry_id(cx) {
+                result.push(id);
+            }
+        });
+        result
+    }
     fn buffer_kind(&self, _cx: &App) -> ItemBufferKind {
         ItemBufferKind::None
     }
@@ -685,13 +701,7 @@ impl<T: Item> ItemHandle for Entity<T> {
     }
 
     fn project_entry_ids(&self, cx: &App) -> SmallVec<[ProjectEntryId; 3]> {
-        let mut result = SmallVec::new();
-        self.read(cx).for_each_project_item(cx, &mut |_, item| {
-            if let Some(id) = item.entry_id(cx) {
-                result.push(id);
-            }
-        });
-        result
+        self.read(cx).project_entry_ids(cx)
     }
 
     fn project_paths(&self, cx: &App) -> SmallVec<[ProjectPath; 3]> {

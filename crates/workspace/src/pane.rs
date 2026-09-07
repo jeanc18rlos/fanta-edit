@@ -1090,6 +1090,21 @@ impl Pane {
                     break;
                 }
             }
+            // Items that don't report a worktree entry can still represent
+            // the opened path; without this fallback an entry-carrying open
+            // of such a path would duplicate its tab.
+            if existing_item.is_none() {
+                for (index, item) in self.items.iter().enumerate() {
+                    if item.buffer_kind(cx) == ItemBufferKind::Singleton
+                        && item.project_entry_ids(cx).is_empty()
+                        && item.project_path(cx).as_ref() == Some(&project_path)
+                    {
+                        let item = item.boxed_clone();
+                        existing_item = Some((index, item));
+                        break;
+                    }
+                }
+            }
         } else {
             for (index, item) in self.items.iter().enumerate() {
                 if item.buffer_kind(cx) == ItemBufferKind::Singleton
