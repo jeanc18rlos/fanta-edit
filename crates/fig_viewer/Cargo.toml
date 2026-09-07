@@ -28,7 +28,6 @@ gpui-component = { workspace = true, optional = true }
 anyhow.workspace = true
 agent_ui.workspace = true
 base64.workspace = true
-buffer_diff.workspace = true
 context_server.workspace = true
 design_surface.workspace = true
 editor.workspace = true
@@ -36,7 +35,6 @@ fanta-canvas.workspace = true
 fanta-doc.workspace = true
 fanta-fig-interop.workspace = true
 fanta-format.workspace = true
-fanta-fnx.workspace = true
 fanta-present.workspace = true
 fanta-render.workspace = true
 fanta-text.workspace = true
