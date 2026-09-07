@@ -62,3 +62,7 @@ crates/docs_preprocessor/actions.json
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 .claude/launch.json
+
+# Release prep scratch (contains PII; never commit)
+RELEASE_PII_CLEANUP.md
+crates/zed/Cargo.toml.bundletest
