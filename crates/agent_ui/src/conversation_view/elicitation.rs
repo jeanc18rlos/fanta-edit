@@ -362,7 +362,7 @@ mod tests {
                     acp::ElicitationId::new("accepted-url"),
                     "https://auth.example.com/device",
                 ),
-                "Authorize Zed in your browser.",
+                "Authorize Fanta in your browser.",
             ),
             status: ElicitationStatus::Accepted,
         };
@@ -681,7 +681,7 @@ fn render_form_preview(
 ) -> AnyElement {
     let request = acp::CreateElicitationRequest::new(
         acp::ElicitationFormMode::new(preview_request_scope(entry_ix), preview_form_schema()),
-        "Choose how Zed should connect to this account.",
+        "Choose how Fanta should connect to this account.",
     );
     let mut form_state = matches!(status, ElicitationStatus::Pending { .. }).then(|| {
         let acp::ElicitationMode::Form(mode) = &request.mode else {
@@ -714,7 +714,7 @@ fn render_url_preview(
             acp::ElicitationId::new(format!("preview-url-{entry_ix}")),
             preview_url(),
         ),
-        "Authorize Zed in your browser to finish signing in.",
+        "Authorize Fanta in your browser to finish signing in.",
     );
 
     render_preview_card(entry_ix, request, status, None, cx)
