@@ -15,7 +15,6 @@ mod design_panel;
 mod document;
 mod editor_session;
 mod export;
-mod fnx_editor;
 #[cfg(feature = "fanta-gpui-ui")]
 mod gpui_adapters;
 mod inspector_components;
@@ -72,7 +71,6 @@ pub fn init(cx: &mut App) {
         fanta_gpui::init(cx);
         theme_bridge::init(cx);
     }
-    fnx_editor::init(cx);
     agent_surface::init(cx);
     live_mcp::init(cx);
     workspace::register_project_item::<FigView>(cx);
