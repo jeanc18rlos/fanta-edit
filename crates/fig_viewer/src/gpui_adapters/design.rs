@@ -2671,7 +2671,7 @@ mod tests {
             cx,
         );
         let (view, cx) =
-            cx.add_window_view(move |window, cx| FigView::new(item, project.clone(), window, cx));
+            cx.add_window_view(move |window, cx| FigView::new(item, project, window, cx));
         cx.run_until_parked();
         let panel = view.read_with(cx, |view, _| {
             view.gpui_design

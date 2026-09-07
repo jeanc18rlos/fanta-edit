@@ -4114,10 +4114,13 @@ mod tests {
         assert_eq!(counter.0.load(Ordering::SeqCst), 1);
         assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
         // Consumed: a fresh wait pends again until the next wake.
-        let mut wait = std::pin::pin!(signal.wait());
-        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        {
+            let mut wait = std::pin::pin!(signal.wait());
+            assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        }
         // A wake with no waiter registered is remembered for the next poll.
-        drop(wait);
+        // The scope above is what actually drops the waiter: `drop` on the
+        // `Pin<&mut _>` that `pin!` yields only drops the borrow.
         signal.wake();
         let mut wait = std::pin::pin!(signal.wait());
         assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
