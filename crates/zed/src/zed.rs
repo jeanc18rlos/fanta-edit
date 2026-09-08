@@ -467,6 +467,75 @@ fn auto_trust_design_projects(cx: &mut App) {
     .detach();
 }
 
+/// Whether a project's git repository is incapable of running code on our behalf.
+///
+/// Trusting a worktree re-enables git hooks, `core.sshCommand`, `diff.external`,
+/// `credential.helper` and `protocol.ext`, any of which executes a command the
+/// repository chose. A clone never carries those (hooks and config are local),
+/// but a design project delivered as a zip or a copied folder can, and "share the
+/// design repo" is exactly what this product asks people to do. So auto-trust is
+/// granted only when there is demonstrably nothing to execute, and every
+/// uncertainty — an unreadable config, a `.git` file pointing elsewhere, an
+/// unexpected hook — falls back to asking the user.
+fn git_repository_cannot_execute_anything(abs_path: &Path) -> bool {
+    let git_dir = abs_path.join(".git");
+    match std::fs::symlink_metadata(&git_dir) {
+        // No repository, so no git-controlled execution.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        // A `.git` file points at a git dir anywhere on disk, including one whose
+        // hooks we would never look at. A symlink is the same problem.
+        Ok(metadata) if !metadata.is_dir() => return false,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+
+    let hooks_dir = git_dir.join("hooks");
+    match std::fs::read_dir(&hooks_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else { return false };
+                // `git init` ships disabled examples; anything else is a real hook.
+                if entry.file_name().to_string_lossy().ends_with(".sample") {
+                    continue;
+                }
+                return false;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+
+    let config_path = git_dir.join("config");
+    match std::fs::read_to_string(&config_path) {
+        Ok(config) => {
+            const EXECUTABLE_CONFIG_KEYS: &[&str] = &[
+                "hookspath",
+                "sshcommand",
+                "credential",
+                "external",
+                "textconv",
+                "fsmonitor",
+                "pager",
+                "smudge",
+                "clean",
+                "[alias]",
+                "protocol.ext",
+            ];
+            let config = config.to_ascii_lowercase();
+            if EXECUTABLE_CONFIG_KEYS
+                .iter()
+                .any(|key| config.contains(key))
+            {
+                return false;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+
+    true
+}
+
 fn trust_worktree_if_design_project(
     worktree_store: &Entity<WorktreeStore>,
     worktree: &Entity<Worktree>,
@@ -494,6 +563,7 @@ fn trust_worktree_if_design_project(
     } else {
         abs_path.join(FANTA_PROJECT_MANIFEST).is_file()
             && !abs_path.join(PROJECT_LOCAL_CONFIG_DIR).exists()
+            && git_repository_cannot_execute_anything(&abs_path)
     };
     if !is_design {
         return;
@@ -2526,4 +2596,73 @@ fn open_settings_file(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::git_repository_cannot_execute_anything;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fanta-trust-{}-{}",
+            std::process::id(),
+            name
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn init_repo(root: &Path) {
+        fs::create_dir_all(root.join(".git/hooks")).expect("hooks dir");
+        fs::write(root.join(".git/config"), "[core]\n\tbare = false\n").expect("config");
+    }
+
+    #[test]
+    fn a_plain_design_project_is_trusted() {
+        let root = scratch("plain");
+        init_repo(&root);
+        fs::write(root.join(".git/hooks/pre-commit.sample"), "#!/bin/sh\n").expect("sample");
+        assert!(git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_directory_with_no_repository_is_trusted() {
+        let root = scratch("norepo");
+        assert!(git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_real_hook_is_refused() {
+        let root = scratch("hook");
+        init_repo(&root);
+        fs::write(root.join(".git/hooks/post-checkout"), "#!/bin/sh\nid\n").expect("hook");
+        assert!(!git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_executable_config_key_is_refused() {
+        let root = scratch("config");
+        init_repo(&root);
+        fs::write(
+            root.join(".git/config"),
+            "[core]\n\thooksPath = ../evil-hooks\n",
+        )
+        .expect("config");
+        assert!(!git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_git_file_pointing_elsewhere_is_refused() {
+        let root = scratch("gitfile");
+        fs::write(root.join(".git"), "gitdir: /tmp/somewhere-else\n").expect("git file");
+        assert!(!git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
 }
