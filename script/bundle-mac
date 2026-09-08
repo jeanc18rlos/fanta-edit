@@ -100,7 +100,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --locked --target $target_triple --select-workspace-root | xargs)
+app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
 
 restore_bundle_manifest
 trap - EXIT
