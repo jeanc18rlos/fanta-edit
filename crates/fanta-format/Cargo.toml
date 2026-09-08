@@ -26,7 +26,10 @@ zip.workspace = true
 # the typed seam for schema migrations so older docs can be transformed in
 # place without needing a versioned Rust type per release.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` for the same reason as fanta-fnx: the projected JSON files
+# (`doc/metadata.json`, `pages/*/page.json`, variables, …) must reload to the
+# exact floats they were written from, or every save rewrites them.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Content-addressing for assets. SHA-256 is overkill for raw dedup but gives us
 # a 128-bit truncation we can fold into `AssetId::from_u128` without collisions

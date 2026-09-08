@@ -387,7 +387,7 @@ fn main() {
         }
     };
     if failed_single_instance_check {
-        println!("zed is already running");
+        println!("Fanta is already running");
         return;
     }
 
@@ -1467,6 +1467,8 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
         "snippets",
         "tab_switcher",
         "task",
+        // `terminal: toggle vi mode` is what a search for "vim" still matches.
+        "terminal",
         "terminal_panel",
         "toolchain",
         "vim",
@@ -1490,10 +1492,22 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             TypeId::of::<zed_actions::OpenOnboarding>(),
             TypeId::of::<install_cli::RegisterZedScheme>(),
             TypeId::of::<workspace::NewFile>(),
+            TypeId::of::<workspace::NewFileSplit>(),
+            TypeId::of::<workspace::NewFileSplitHorizontal>(),
+            TypeId::of::<workspace::NewFileSplitVertical>(),
+            TypeId::of::<workspace::pane::RevealInProjectPanel>(),
             TypeId::of::<workspace::NewTerminal>(),
             TypeId::of::<workspace::NewCenterTerminal>(),
             TypeId::of::<workspace::ToggleLeftDock>(),
             TypeId::of::<workspace::ToggleRightDock>(),
+            // Both of these write a `.zed/settings.json` into the open project,
+            // which permanently disqualifies it from the design-project auto-trust
+            // in `zed::trust_worktree_if_design_project` and leaves the user facing
+            // an unescapable Restricted Mode prompt on every subsequent open.
+            TypeId::of::<zed::OpenProjectSettingsFile>(),
+            TypeId::of::<zed_actions::OpenProjectSettings>(),
+            TypeId::of::<workspace::OpenTerminal>(),
+            TypeId::of::<workspace::OpenInTerminal>(),
         ]);
     });
 }
@@ -1518,14 +1532,14 @@ struct Args {
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
     /// This overrides the default platform-specific data directory location.
-    /// On macOS, the default is `~/Library/Application Support/Zed`.
-    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
-    /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
+    /// On macOS, the default is `~/Library/Application Support/Fanta`.
+    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/fanta`.
+    /// On Windows, the default is `%LOCALAPPDATA%\Fanta`.
     #[arg(long, value_name = "DIR", verbatim_doc_comment)]
     user_data_dir: Option<String>,
 
     /// The username and WSL distribution to use when opening paths. If not specified,
-    /// Zed will attempt to open the paths directly.
+    /// Fanta will attempt to open the paths directly.
     ///
     /// The username is optional, and if not specified, the default user for the distribution
     /// will be used.
@@ -1537,24 +1551,24 @@ struct Args {
     #[arg(long, value_name = "USER@DISTRO")]
     wsl: Option<String>,
 
-    /// Instructs zed to run as a dev server on this machine. (not implemented)
+    /// Instructs Fanta to run as a dev server on this machine. (not implemented)
     #[arg(long)]
     dev_server_token: Option<String>,
 
     /// Prints system specs.
     ///
     /// Useful for submitting issues on GitHub when encountering a bug that
-    /// prevents Zed from starting, so you can't run `zed: copy system specs to
-    /// clipboard`
+    /// prevents Fanta from starting, so you can't copy the system specs from
+    /// inside the app.
     #[arg(long)]
     system_specs: bool,
 
-    /// Used for recording minidumps on crashes by having Zed run a separate
+    /// Used for recording minidumps on crashes by having Fanta run a separate
     /// process communicating over a socket.
     #[arg(long, hide = true)]
     crash_handler: Option<PathBuf>,
 
-    /// Run zed in the foreground, only used on Windows, to match the behavior on macOS.
+    /// Run Fanta in the foreground, only used on Windows, to match the behavior on macOS.
     #[arg(long)]
     #[cfg(target_os = "windows")]
     #[arg(hide = true)]
@@ -1567,16 +1581,21 @@ struct Args {
     dock_action: Option<usize>,
 
     /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
-    /// by having Zed act like netcat communicating over a Unix socket.
+    /// by having Fanta act like netcat communicating over a Unix socket.
     #[arg(long)]
     #[cfg(not(target_os = "windows"))]
     #[arg(hide = true)]
     askpass: Option<String>,
 
-    /// Bridges stdin/stdout to the running app's live MCP socket, so stdio MCP
-    /// clients (Claude Code, Codex) can reach the open design.
+    /// Connect an external agent to the open design.
+    ///
+    /// Bridges stdin/stdout to the MCP server of the running app, so that a stdio MCP client
+    /// (Claude Code, Codex) can read and edit the design Fanta currently has open. Fanta must
+    /// already be running; this does not start it.
+    ///
+    /// Register it with:  claude mcp add -s user fanta -- <path to fanta> --mcp-stdio
     #[cfg(not(target_os = "windows"))]
-    #[arg(long, hide = true)]
+    #[arg(long, verbatim_doc_comment)]
     mcp_stdio: bool,
 
     #[arg(long, hide = true)]
@@ -1591,7 +1610,7 @@ struct Args {
     #[arg(long, hide = true)]
     record_etw_trace: bool,
 
-    /// The PID of the Zed process to trace for heap analysis.
+    /// The PID of the Fanta process to trace for heap analysis.
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true, allow_hyphen_values = true)]
     etw_zed_pid: Option<i64>,
@@ -1601,7 +1620,7 @@ struct Args {
     #[arg(long, hide = true)]
     etw_output: Option<PathBuf>,
 
-    /// Unix socket path for IPC with the parent Zed process.
+    /// Unix socket path for IPC with the parent Fanta process.
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true)]
     etw_socket: Option<String>,

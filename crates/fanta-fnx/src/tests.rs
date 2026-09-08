@@ -1358,11 +1358,13 @@ fn vector_matching_rect_shape_resugars_on_print() {
     assert_same_nodes(&nodes, &round_trip(&nodes));
 }
 
-/// A `.fig`-imported vector carries `local_size` (its viewport clip) — extra
-/// state the sugar spelling cannot express, so it must keep its verbatim
-/// `<Vector path={…}>` spelling even when the path matches the generator.
+/// A `.fig`-imported rectangle — and any rectangle whose viewport the doc
+/// backfilled on load — carries a `local_size` equal to its own extent. That
+/// viewport crops nothing, so it re-sugars and rides along as its own
+/// attribute. Without this, a `<Rect>` degraded to raw path data on the first
+/// reload and every rectangle in the file diffed on the next save.
 #[test]
-fn fig_style_vector_with_local_size_does_not_resugar() {
+fn vector_with_viewport_equal_to_its_extent_resugars() {
     let mut node = json!({
         "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
         "name": "Imported", "local_size": [120.0, 80.0]
@@ -1372,9 +1374,36 @@ fn fig_style_vector_with_local_size_does_not_resugar() {
 
     let tree = tree_from_nodes(&nodes).unwrap();
     let text = print_doc("Imported", &tree.root);
+    assert!(text.contains("<Rect "), "must re-sugar:\n{text}");
+    assert!(!text.contains("path="), "path must not leak:\n{text}");
+    assert!(
+        text.contains("local_size={[120.0, 80.0]}"),
+        "the viewport must ride along verbatim:\n{text}"
+    );
+
+    assert_same_nodes(&nodes, &round_trip(&nodes));
+    let reparsed = parse_doc(&text).expect("reparse");
+    assert_eq!(tree.root, reparsed, "sugar round-trip changed the tree");
+}
+
+/// A viewport that is NOT the shape's own extent genuinely crops it (a stroke
+/// thickened past the authored box is the usual case). No `<Rect>` spelling
+/// can express that, so the vector must stay verbatim rather than silently
+/// lose its clip.
+#[test]
+fn vector_with_cropping_viewport_does_not_resugar() {
+    let mut node = json!({
+        "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
+        "name": "Clipped", "local_size": [60.0, 80.0]
+    });
+    node["path"] = serde_json::to_value(fanta_doc::PathData::rect(0.0, 0.0, 120.0, 80.0)).unwrap();
+    let nodes = vec![node];
+
+    let tree = tree_from_nodes(&nodes).unwrap();
+    let text = print_doc("Clipped", &tree.root);
     assert!(
         text.contains("<Vector") && text.contains("path="),
-        "imported vector must stay canonical:\n{text}"
+        "a cropping viewport must stay canonical:\n{text}"
     );
     assert!(!text.contains("<Rect"), "must not re-sugar:\n{text}");
 
@@ -2023,5 +2052,44 @@ fn source_mirror_patches_keep_reference_spellings() {
     assert!(
         patched.contains("bindings={{\"fill_color\": \"$Theme/border\"}}"),
         "rebinding should print the new $path: {patched}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Float fidelity across the text boundary
+// ---------------------------------------------------------------------------
+
+/// Floats that need all 17 significant digits — every `.fig`-imported
+/// coordinate is one, since an `f32` widened to `f64` rarely has a shorter
+/// exact spelling — must survive print → parse → print byte-identically.
+///
+/// They only do because `serde_json` is built with `float_roundtrip` here: its
+/// default parser is accurate to within 1 ULP, so `21.762165069580078` used to
+/// come back as `21.76216506958008` and the first save after an import
+/// rewrote every line of the page with a value one ULP away from the one it
+/// had just written.
+#[test]
+fn seventeen_digit_floats_survive_the_text_boundary() {
+    let source = "export default function P() {\n  return (\n    \
+                  <Frame name=\"P\" x={21.762165069580078} y={1234.5678901234567} \
+                  clip_size={[935.6572265625001, 0.30000000000000004]} />\n  );\n}\n";
+    let root = parse_doc(source).expect("parse");
+    let printed = print_doc("P", &root);
+    for spelling in [
+        "x={21.762165069580078}",
+        "y={1234.5678901234567}",
+        "clip_size={[935.6572265625001, 0.30000000000000004]}",
+    ] {
+        assert!(
+            printed.contains(spelling),
+            "{spelling} must print back verbatim:\n{printed}"
+        );
+    }
+    let reparsed = parse_doc(&printed).expect("reparse");
+    assert_eq!(root, reparsed, "reparse moved a float");
+    assert_eq!(
+        printed,
+        print_doc("P", &reparsed),
+        "print must be a fixpoint over parse"
     );
 }

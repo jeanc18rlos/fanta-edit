@@ -21,7 +21,7 @@ use assets::Assets;
 
 use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
-use collections::VecDeque;
+use collections::{HashSet, VecDeque};
 use editor::{Editor, MultiBuffer};
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use futures::{StreamExt, channel::mpsc, select_biased};
@@ -45,7 +45,11 @@ use paths::{
     local_debug_file_relative_path, local_settings_file_relative_path,
     local_tasks_file_relative_path,
 };
-use project::{DirectoryLister, DisableAiSettings, ProjectItem};
+use project::{
+    DirectoryLister, DisableAiSettings, Project, ProjectItem, Worktree,
+    trusted_worktrees::{PathTrust, TrustedWorktrees},
+    worktree_store::{WorktreeStore, WorktreeStoreEvent},
+};
 use recent_projects::open_remote_project;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
@@ -427,7 +431,89 @@ pub fn build_window_options(display_uuid: Option<Uuid>, cx: &mut App) -> WindowO
     }
 }
 
+/// The manifest at the root of every Fanta design project.
+const FANTA_PROJECT_MANIFEST: &str = "fanta.json";
+
+/// Project-local configuration directory. A design project has none; a worktree
+/// that does carry one can configure things this build still executes.
+const PROJECT_LOCAL_CONFIG_DIR: &str = ".zed";
+
+/// Trusts design projects as they are opened, so that opening one's own design
+/// never raises the Restricted Mode prompt — a question a designer has no way to
+/// answer, on a project they just created.
+///
+/// Trust is granted here rather than through the blanket `trust_all_worktrees`
+/// setting because a worktree can still hand this build code to run: project-local
+/// `.zed/settings.json` may declare `context_servers` with an arbitrary command
+/// (the MCP client is still linked, through the agent), and trusting a worktree
+/// also lets its git repository run hooks, `diff.external` and a credential
+/// helper, all of which are suppressed while it is restricted. A design project
+/// with no `.zed` directory configures none of that, so it is safe to trust
+/// without asking; every other worktree still goes through the prompt.
+fn auto_trust_design_projects(cx: &mut App) {
+    cx.observe_new(|project: &mut Project, _, cx: &mut Context<Project>| {
+        let worktree_store = project.worktree_store();
+        let existing_worktrees = worktree_store.read(cx).worktrees().collect::<Vec<_>>();
+        for worktree in existing_worktrees {
+            trust_worktree_if_design_project(&worktree_store, &worktree, cx);
+        }
+        cx.subscribe(&worktree_store, |_, worktree_store, event, cx| {
+            if let WorktreeStoreEvent::WorktreeAdded(worktree) = event {
+                trust_worktree_if_design_project(&worktree_store, worktree, cx);
+            }
+        })
+        .detach();
+    })
+    .detach();
+}
+
+fn trust_worktree_if_design_project(
+    worktree_store: &Entity<WorktreeStore>,
+    worktree: &Entity<Worktree>,
+    cx: &mut App,
+) {
+    let (worktree_id, abs_path, is_single_file, is_visible) = {
+        let worktree = worktree.read(cx);
+        (
+            worktree.id(),
+            worktree.abs_path(),
+            worktree.is_single_file(),
+            worktree.is_visible(),
+        )
+    };
+    if !is_visible {
+        return;
+    }
+
+    let is_design = if is_single_file {
+        // A design file on its own is data: opening one configures nothing.
+        matches!(
+            abs_path.extension().and_then(|extension| extension.to_str()),
+            Some("fig" | "fnx")
+        )
+    } else {
+        abs_path.join(FANTA_PROJECT_MANIFEST).is_file()
+            && !abs_path.join(PROJECT_LOCAL_CONFIG_DIR).exists()
+    };
+    if !is_design {
+        return;
+    }
+
+    let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) else {
+        return;
+    };
+    trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+        trusted_worktrees.trust(
+            worktree_store,
+            HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+            cx,
+        );
+    });
+}
+
 pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
+    auto_trust_design_projects(cx);
+
     let mut _on_close_subscription = bind_on_window_closed(cx);
     cx.observe_global::<SettingsStore>(move |cx| {
         // A 1.92 regression causes unused-assignment to trigger on this variable.

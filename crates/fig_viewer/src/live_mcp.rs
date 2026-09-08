@@ -15,7 +15,7 @@
 //! `--mcp-stdio` bridge has to check the recorded pid before trusting the
 //! socket path next to it.
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use context_server::listener::{McpServer, McpServerTool, ToolResponse};
 use context_server::types::{
@@ -264,6 +264,32 @@ fn text_response(value: serde_json::Value) -> ToolResponse<()> {
     }
 }
 
+/// Cap on one serialized JSON tool result. Whatever an MCP client can carry,
+/// a model cannot use megabytes of JSON, and a client that drops the response
+/// leaves the agent with nothing at all — so a query whose answer is this big
+/// is refused with instructions for narrowing it, never silently cut.
+const MAX_JSON_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Like [`text_response`], but refuses a result too large to be carried or
+/// read. `narrowing_hint` must tell the model how to ask a smaller question.
+fn bounded_text_response(
+    value: serde_json::Value,
+    narrowing_hint: &str,
+) -> Result<ToolResponse<()>> {
+    let text = serde_json::to_string(&value).context("serializing the tool result")?;
+    if text.len() > MAX_JSON_RESPONSE_BYTES {
+        bail!(
+            "this result would be {} bytes, over the {MAX_JSON_RESPONSE_BYTES}-byte response \
+             budget, and no part of it was returned. {narrowing_hint}",
+            text.len()
+        );
+    }
+    Ok(ToolResponse {
+        content: vec![context_server::types::ToolResponseContent::Text { text }],
+        structured_content: (),
+    })
+}
+
 /// Resolve the design surface and run `f` against it on the main thread.
 fn with_surface<R: 'static>(
     cx: &mut AsyncApp,
@@ -319,7 +345,9 @@ impl McpServerTool for GetEditorStateTool {
 /// Read nodes from the open design document: pass `ids` for full node detail,
 /// or omit them to list a page's node tree in compact form (`page` defaults to
 /// the active page; `depth` limits recursion; `include_geometry` adds world
-/// bounding boxes).
+/// bounding boxes). A listing is capped at 262144 bytes; if the tree is wider
+/// than that the call is refused rather than truncated, so lower `depth` or
+/// walk down through `ids`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 struct BatchGetArgs {
     /// Fetch these node ids in full detail.
@@ -329,6 +357,9 @@ struct BatchGetArgs {
     #[serde(default)]
     page: Option<usize>,
     /// How many levels of children to include below each listed node.
+    /// Defaults to 2 when listing a page, because an imported `.fig` page can
+    /// hold tens of thousands of nodes. A node cut off by the limit reports
+    /// `child_count` instead of `children`: re-request it by id to go deeper.
     #[serde(default)]
     depth: Option<u32>,
     /// Include world-space bounding boxes.
@@ -351,14 +382,21 @@ impl McpServerTool for BatchGetTool {
 
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
         let args = input.0;
+        let listing = args.ids.is_none();
         let query = NodeQuery {
             ids: args.ids,
             page: args.page,
-            depth: args.depth,
+            // An unbounded page listing walks the whole scene; on a real
+            // imported `.fig` that is tens of thousands of nodes.
+            depth: args.depth.or(if listing { Some(2) } else { None }),
             include_geometry: args.include_geometry,
         };
         let value = with_surface(cx, move |surface, cx| surface.get_nodes(query, cx))?;
-        Ok(text_response(value))
+        bounded_text_response(
+            value,
+            "Narrow it: lower `depth` (try 1), set `include_geometry` to false, or pass the \
+             `ids` of the specific nodes you need.",
+        )
     }
 }
 
@@ -466,11 +504,190 @@ impl McpServerTool for GetScreenshotTool {
 /// tools; while the project is open in Fanta the canvas hot-reloads about
 /// 300ms after a save, and otherwise the edit is picked up the next time it is
 /// opened.
+///
+/// A page imported from a `.fig` runs to tens of megabytes, so a file is
+/// returned in slices: at most 65536 bytes by default, starting at line
+/// `offset`. The result always carries `total_bytes`, `total_lines` and
+/// `truncated`, and a truncated result carries a `notice` naming the exact
+/// arguments for the next slice. Never assume a slice is the whole file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 struct ReadFnxSourceArgs {
     /// Project-relative source path; omit to list the source files.
     #[serde(default)]
     path: Option<String>,
+    /// 1-based line to start at (default 1).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Maximum number of lines to return.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Maximum bytes of file text to return (default 65536, ceiling 1048576).
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+/// Default cap on the file text one `read_fnx_source` call returns. One page
+/// of a 9.6 MB `.fig` is over 43 million characters, which no MCP client will
+/// carry and no model can read; 64 KiB is roughly 16k tokens, small enough to
+/// sit in a tool result next to everything else an agent is holding, and large
+/// enough for 31 lines of that page — a whole frame's worth of `.fnx`.
+const DEFAULT_SOURCE_BYTES: usize = 64 * 1024;
+
+/// Ceiling on `max_bytes`, so a caller cannot ask for a response that breaks
+/// its own transport.
+const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+
+/// One slice of a source file, with everything the model needs to know that it
+/// is holding a slice and how to ask for the rest.
+#[derive(Debug, PartialEq, Eq)]
+struct SourceSlice {
+    text: String,
+    /// 1-based line number of the first returned line; 0 when nothing was
+    /// returned.
+    first_line: usize,
+    /// 1-based, inclusive line number of the last returned line; 0 when
+    /// nothing was returned.
+    last_line: usize,
+    /// Pass as `offset` to continue; `None` when the file ends here.
+    next_offset: Option<usize>,
+    /// The 1-based line the caller asked to start at, echoed so an empty
+    /// slice can say what was asked for.
+    requested_offset: usize,
+    total_bytes: usize,
+    total_lines: usize,
+    /// The line the byte budget was hit inside of, when the budget ran out
+    /// part way through a single line.
+    partial_line: Option<usize>,
+}
+
+/// Take `limit` lines from line `offset` of `text`, within a byte budget.
+fn slice_source(
+    text: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_bytes: Option<usize>,
+) -> SourceSlice {
+    let total_bytes = text.len();
+    // `split_inclusive` keeps the line terminators, so concatenating the
+    // returned lines reproduces the file byte for byte.
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let total_lines = lines.len();
+    let budget = max_bytes
+        .unwrap_or(DEFAULT_SOURCE_BYTES)
+        .clamp(1, MAX_SOURCE_BYTES);
+    let start = offset.unwrap_or(1).max(1) - 1;
+    let limit = limit.unwrap_or(usize::MAX);
+
+    let mut slice = String::new();
+    let mut taken = 0usize;
+    let mut partial_line = None;
+    for (index, line) in lines.iter().enumerate().skip(start).take(limit) {
+        if slice.len() + line.len() <= budget {
+            slice.push_str(line);
+            taken += 1;
+            continue;
+        }
+        if slice.is_empty() {
+            // A single line wider than the budget would otherwise return
+            // nothing at all and stall the caller's paging.
+            let end = floor_char_boundary(line, budget);
+            slice.push_str(&line[..end]);
+            taken = 1;
+            partial_line = Some(index + 1);
+        }
+        break;
+    }
+
+    let (first_line, last_line) = if taken == 0 {
+        (0, 0)
+    } else {
+        (start + 1, start + taken)
+    };
+    let next_offset = (taken > 0 && last_line < total_lines).then_some(last_line + 1);
+    SourceSlice {
+        text: slice,
+        first_line,
+        last_line,
+        next_offset,
+        requested_offset: start + 1,
+        total_bytes,
+        total_lines,
+        partial_line,
+    }
+}
+
+/// The largest `index` at or below the given one that splits `text` between
+/// characters (`str::floor_char_boundary` is still unstable).
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+impl SourceSlice {
+    fn truncated(&self) -> bool {
+        self.next_offset.is_some()
+            || self.partial_line.is_some()
+            || (self.first_line == 0 && self.total_lines > 0)
+    }
+
+    /// The warning a truncated slice carries. Deleting or rewriting a design
+    /// on the belief that an unread tail is empty is the failure this exists
+    /// to prevent, so the notice says outright that the file is not all here.
+    fn notice(&self, path: &str) -> Option<String> {
+        if !self.truncated() {
+            return None;
+        }
+        if self.first_line == 0 {
+            return Some(format!(
+                "NOTHING WAS RETURNED: {path} has {} lines ({} bytes), and the slice requested \
+                 from line {} is empty. Re-request with {{\"path\": \"{path}\", \"offset\": 1}} to \
+                 start from the top.",
+                self.total_lines, self.total_bytes, self.requested_offset
+            ));
+        }
+        let mut notice = format!(
+            "TRUNCATED — THIS IS NOT THE WHOLE FILE. Returned lines {}-{} of {} ({} of {} bytes) \
+             of {path}. To continue, call read_fnx_source again with {{\"path\": \"{path}\", \
+             \"offset\": {}}}; pass \"limit\" (lines) or \"max_bytes\" (up to {MAX_SOURCE_BYTES}) \
+             for a different slice size. Do not edit, replace or delete anything on the \
+             assumption that the lines you have not read are absent.",
+            self.first_line,
+            self.last_line,
+            self.total_lines,
+            self.text.len(),
+            self.total_bytes,
+            self.next_offset.unwrap_or(self.last_line + 1),
+        );
+        if let Some(line) = self.partial_line {
+            notice.push_str(&format!(
+                " Line {line} is longer than the byte budget and was cut mid-line, so the rest of \
+                 line {line} is in NO later slice: re-request that line with a larger \
+                 \"max_bytes\" to read it whole."
+            ));
+        }
+        Some(notice)
+    }
+
+    fn into_response(self, path: &str) -> serde_json::Value {
+        let notice = self.notice(path);
+        serde_json::json!({
+            "path": path,
+            "text": self.text,
+            "first_line": self.first_line,
+            "last_line": self.last_line,
+            "next_offset": self.next_offset,
+            "total_lines": self.total_lines,
+            "total_bytes": self.total_bytes,
+            "truncated": self.truncated(),
+            "notice": notice,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -487,8 +704,138 @@ impl McpServerTool for ReadFnxSourceTool {
     }
 
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
-        let path = input.0.path;
-        let value = with_surface(cx, move |surface, cx| surface.read_source(path, cx))?;
-        Ok(text_response(value))
+        let args = input.0;
+        let requested = args.path.clone();
+        let value = with_surface(cx, move |surface, cx| surface.read_source(requested, cx))?;
+        let Some(path) = args.path else {
+            return bounded_text_response(
+                value,
+                "This project has more source files than fit in one result; read them by name \
+                 from `pages/` and `components/` instead.",
+            );
+        };
+        let text = value
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let slice = slice_source(text, args.offset, args.limit, args.max_bytes);
+        Ok(text_response(slice.into_response(&path)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_returns_a_whole_small_file_untruncated() {
+        let slice = slice_source("a\nb\nc\n", None, None, None);
+        assert_eq!(slice.text, "a\nb\nc\n");
+        assert_eq!((slice.first_line, slice.last_line), (1, 3));
+        assert_eq!(slice.next_offset, None);
+        assert!(!slice.truncated());
+        assert_eq!(slice.notice("pages/page-1/page.fnx"), None);
+    }
+
+    #[test]
+    fn slice_stops_at_the_byte_budget_and_says_how_to_continue() {
+        let source = "0123456789\n".repeat(100);
+        let slice = slice_source(&source, None, None, Some(35));
+        assert_eq!(slice.text, "0123456789\n0123456789\n0123456789\n");
+        assert_eq!((slice.first_line, slice.last_line), (1, 3));
+        assert_eq!(slice.next_offset, Some(4));
+        assert_eq!(slice.total_bytes, 1100);
+        assert_eq!(slice.total_lines, 100);
+        assert!(slice.truncated());
+
+        let notice = slice
+            .notice("pages/page-1/page.fnx")
+            .expect("a truncated slice must carry a notice");
+        assert!(notice.contains("TRUNCATED"));
+        // The true size and the exact next call are the two facts a model
+        // needs to avoid acting on a partial file.
+        assert!(notice.contains("1100 bytes"));
+        assert!(notice.contains("\"offset\": 4"));
+        assert!(notice.contains("pages/page-1/page.fnx"));
+    }
+
+    #[test]
+    fn slice_honors_an_offset_and_a_line_limit() {
+        let source = "a\nb\nc\nd\ne\n";
+        let slice = slice_source(source, Some(2), Some(2), None);
+        assert_eq!(slice.text, "b\nc\n");
+        assert_eq!((slice.first_line, slice.last_line), (2, 3));
+        assert_eq!(slice.next_offset, Some(4));
+        assert!(slice.truncated());
+    }
+
+    #[test]
+    fn slice_cuts_inside_an_oversized_line_and_warns_about_the_remainder() {
+        let source = format!("{}\nsecond\n", "x".repeat(200));
+        let slice = slice_source(&source, None, None, Some(50));
+        assert_eq!(slice.text, "x".repeat(50));
+        assert_eq!(slice.partial_line, Some(1));
+        assert_eq!(slice.next_offset, Some(2));
+        let notice = slice.notice("page.fnx").expect("a cut line must be reported");
+        assert!(notice.contains("cut mid-line"));
+        assert!(notice.contains("max_bytes"));
+    }
+
+    #[test]
+    fn slice_never_splits_a_multibyte_character() {
+        let source = "ééééé";
+        let slice = slice_source(source, None, None, Some(5));
+        assert_eq!(slice.text, "éé");
+        assert_eq!(slice.partial_line, Some(1));
+    }
+
+    #[test]
+    fn slice_past_the_end_returns_nothing_and_says_so() {
+        let slice = slice_source("a\nb\n", Some(9), None, None);
+        assert!(slice.text.is_empty());
+        assert_eq!(slice.next_offset, None);
+        assert!(slice.truncated());
+        let notice = slice.notice("page.fnx").expect("an empty slice must be reported");
+        assert!(notice.contains("NOTHING WAS RETURNED"));
+        assert!(notice.contains("line 9"));
+    }
+
+    #[test]
+    fn an_empty_file_is_not_reported_as_truncated() {
+        let slice = slice_source("", None, None, None);
+        assert!(!slice.truncated());
+        assert_eq!(slice.notice("page.fnx"), None);
+    }
+
+    #[test]
+    fn max_bytes_is_capped_so_a_caller_cannot_ask_for_the_whole_43mb_page() {
+        let source = "x".repeat(4 * MAX_SOURCE_BYTES);
+        let slice = slice_source(&source, None, None, Some(usize::MAX));
+        assert_eq!(slice.text.len(), MAX_SOURCE_BYTES);
+        assert!(slice.truncated());
+    }
+
+    #[test]
+    fn the_response_carries_the_notice_and_the_true_total() {
+        let source = "0123456789\n".repeat(100);
+        let response = slice_source(&source, None, None, Some(35)).into_response("page.fnx");
+        assert_eq!(response["truncated"], serde_json::json!(true));
+        assert_eq!(response["total_bytes"], serde_json::json!(1100));
+        assert_eq!(response["next_offset"], serde_json::json!(4));
+        assert!(
+            response["notice"]
+                .as_str()
+                .is_some_and(|notice| notice.contains("TRUNCATED"))
+        );
+    }
+
+    #[test]
+    fn bounded_response_refuses_an_oversized_result_with_instructions() {
+        let value = serde_json::json!({ "nodes": "n".repeat(MAX_JSON_RESPONSE_BYTES + 1) });
+        let error = bounded_text_response(value, "Lower `depth`.")
+            .expect_err("an oversized result must be refused, not carried");
+        let message = error.to_string();
+        assert!(message.contains("response budget"));
+        assert!(message.contains("Lower `depth`."));
     }
 }

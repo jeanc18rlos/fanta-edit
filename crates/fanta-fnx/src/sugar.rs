@@ -22,7 +22,9 @@
 //!   re-sugars only when strictly lossless: the recognizer REGENERATES the
 //!   path from the implied size and demands `Value` equality, so
 //!   print→parse→print is a fixpoint by construction — no float tolerance
-//!   anywhere (see [`sugar_shapes`]).
+//!   anywhere (see [`sugar_shapes`]). A viewport (`local_size`) equal to the
+//!   generated shape's own extent rides along on the sugared spelling; any
+//!   other viewport crops the shape and blocks the sugar.
 
 use crate::convert::FnxError;
 use crate::model::FnxElement;
@@ -231,13 +233,15 @@ impl ShapeKind {
 }
 
 /// Attributes a `Vector` may not carry if it is to re-print as shape sugar.
-/// `local_size` / `parametric` / `fill_rule` / `subpath_rules` mark imported
-/// or parametric vectors whose extra state the sugar spelling cannot express
-/// (a `.fig`-imported vector always carries `local_size`); `width` / `height`
-/// ride along as unknown attrs on a Vector (size sugar deliberately skips
-/// Vectors) and would be clobbered by the sugar's own `width`/`height`.
+/// `parametric` / `fill_rule` / `subpath_rules` mark imported or parametric
+/// vectors whose extra state the sugar spelling cannot express; `width` /
+/// `height` ride along as unknown attrs on a Vector (size sugar deliberately
+/// skips Vectors) and would be clobbered by the sugar's own `width`/`height`.
+///
+/// `local_size` is NOT here: it is handled by value in [`sugared_form`],
+/// because a `.fig`-imported (or viewport-backfilled) rectangle carries one
+/// and would otherwise degrade to raw path data on every reload.
 const SUGAR_BLOCKING_ATTRS: &[&str] = &[
-    "local_size",
     "parametric",
     "fill_rule",
     "subpath_rules",
@@ -264,6 +268,23 @@ fn sugared_form(el: &FnxElement, kind: ShapeKind) -> Option<FnxElement> {
     let path = el.attrs.get("path")?;
     let (w, h) = kind.implied_size(path)?;
     if kind.path_value(w, h) != *path {
+        return None;
+    }
+    // A Vector's `local_size` is its SVG viewport: rendering is clipped to
+    // `[0, 0, w, h]`, so a box that differs from the generated shape's own
+    // extent CROPS it (a thick stroke is the usual victim) and no `<Rect>`
+    // spelling can express that — those stay canonical. A box that is exactly
+    // the shape's extent crops nothing, and it rides along verbatim as its own
+    // attribute (`desugar_shapes` never touches `local_size`), so the sugared
+    // and canonical spellings still desugar to bit-identical trees. Without
+    // this, every `.fig`-imported rectangle — and every rectangle whose
+    // viewport the doc backfilled on load — degraded to raw path data on the
+    // first reload and produced a spurious diff on the next save.
+    if el
+        .attrs
+        .get("local_size")
+        .is_some_and(|size| *size != json!([w, h]))
+    {
         return None;
     }
     let mut sugared = el.clone();
@@ -319,7 +340,9 @@ pub(crate) fn desugar_shapes(el: &mut FnxElement) -> Result<(), FnxError> {
         el.attrs
             .insert("path".to_owned(), kind.path_value(width, height));
         // NOT setting `local_size`: on a Vector that field is the SVG-viewport
-        // clip, not the geometry box — setting it would crop, not size.
+        // clip, not the geometry box — setting it would crop, not size. An
+        // explicit one the author (or the printer, re-spelling a clipped
+        // rectangle) wrote is left exactly as it is.
         el.tag = "Vector".to_owned();
     }
     for child in &mut el.children {

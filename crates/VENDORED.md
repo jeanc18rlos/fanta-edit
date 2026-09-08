@@ -48,6 +48,47 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   it never enters the shipped binary. Drop it if a resync brings a `clippy.toml`
   that permits the call.
 
+- `fanta-fnx`: `serde_json` is built with the `float_roundtrip` feature
+  (`Cargo.toml`). Upstream took serde_json's default parser, which is accurate
+  only to within 1 ULP, so re-reading a printed `.fnx` moved every float that
+  needs 17 significant digits — `21.762165069580078` came back as
+  `21.76216506958008` — and the first save after a `.fig` import rewrote the
+  whole page (25,311 insertions / 25,310 deletions, measured). A
+  design-as-source format has to survive text → memory → text byte-identically.
+  Keep on a resync; `src/tests.rs::seventeen_digit_floats_survive_the_text_boundary`
+  fails without it.
+
+- `fanta-fnx`: `src/sugar.rs` no longer blocks shape sugar on the mere PRESENCE
+  of `local_size`. The attribute was removed from `SUGAR_BLOCKING_ATTRS` and is
+  now checked by value in `sugared_form`: a viewport exactly equal to the
+  regenerated shape's extent crops nothing, so the node re-sugars and the
+  attribute rides along verbatim on the `<Rect>` / `<Ellipse>` spelling; any
+  other viewport is a real crop and still keeps the node canonical. Upstream's
+  blanket block meant the app's own `backfill_vector_viewports` turned every
+  readable `<Rect width height />` into a `<Vector local_size path={…} />` blob
+  on the first reload, permanently, with a spurious diff on every rectangle.
+  Keep on a resync; guarded by `vector_with_viewport_equal_to_its_extent_resugars`
+  and `vector_with_cropping_viewport_does_not_resugar`.
+
+- `fanta-format`: `serde_json` is built with the `float_roundtrip` feature
+  (`Cargo.toml`), for the same reason as `fanta-fnx` — the projected JSON files
+  must reload to the exact floats they were written from. Guarded by
+  `project::tests::reload_then_rewrite_is_byte_identical_for_f32_widened_floats`.
+
+- `fanta-format`: `ProjectManifest` (`src/project/layout.rs`) dropped its
+  `modified_at` field, so `fanta.json` no longer changes on every save. Nothing
+  reads it — the reader uses only `format`, `version`, `project_id` and
+  `schema_version`, and the authoritative timestamp lives in
+  `doc/metadata.json`, which the 3-way merge tie-breaks on. It existed only to
+  put a fourth file in the git diff of a one-node edit. Older trees still open
+  (serde ignores the extra field); guarded by
+  `project::layout::tests::manifest_from_an_older_build_still_opens`.
+
+- `fanta-format`: `src/project/fnx.d.ts` documents an optional `local_size` on
+  `FnxShapeSugarProps`, because the printer now emits it on a `<Rect>` /
+  `<Ellipse>` whose viewport matches its extent (see the `fanta-fnx` sugar
+  divergence above).
+
 All other source is byte-identical to upstream. Edits belong here now; the
 sibling checkouts are no longer part of the build.
 

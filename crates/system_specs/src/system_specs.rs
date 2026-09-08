@@ -107,20 +107,24 @@ impl SystemSpecs {
 impl Display for SystemSpecs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let os_information = format!("OS: {} {}", self.os_name, self.os_version);
+        // The channel's display name already spells the product ("Fanta" on stable,
+        // "Fanta Nightly" and so on elsewhere), so it doubles as the line's label
+        // rather than being repeated in a parenthetical after it.
         let app_version_information = format!(
-            "Zed: v{} ({}) {}{}",
+            "{}: v{}{}{}{}",
+            self.release_channel,
             self.app_version,
             match &self.commit_sha {
-                Some(commit_sha) => format!("{} {}", self.release_channel, commit_sha),
-                None => self.release_channel.to_string(),
+                Some(commit_sha) => format!(" ({commit_sha})"),
+                None => "".to_string(),
             },
             if let Some(bundle_type) = &self.bundle_type {
-                format!("({bundle_type})")
+                format!(" ({bundle_type})")
             } else {
                 "".to_string()
             },
             if cfg!(debug_assertions) {
-                "(Taylor's Version)"
+                " (debug build)"
             } else {
                 ""
             },

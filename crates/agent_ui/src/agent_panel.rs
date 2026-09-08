@@ -6198,10 +6198,10 @@ impl AgentPanel {
             }
         }
 
-        let plan = self.user_store.read(cx).plan();
-        let has_previous_trial = self.user_store.read(cx).trial_started_at().is_some();
-
-        plan.is_some_and(|plan| plan == Plan::ZedFree) && has_previous_trial
+        // Fanta sells no subscription, and this upsell's button opens Zed's
+        // billing page. The surrounding machinery is left intact for the day
+        // there is a plan to sell; until then it must never reach a user.
+        false
     }
 
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {

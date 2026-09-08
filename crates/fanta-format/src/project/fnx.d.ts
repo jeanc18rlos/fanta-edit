@@ -259,6 +259,13 @@ declare global {
   interface FnxShapeSugarProps extends FnxNodeProps {
     width: number;
     height: number;
+    /**
+     * SVG viewport clip, carried through from the canonical `<Vector>`. The
+     * editor writes it only when it equals `[width, height]` — a viewport that
+     * would actually crop the shape has no sugar spelling and prints as a
+     * `<Vector>` instead.
+     */
+    local_size?: readonly [number, number];
   }
 
   interface FnxTextProps extends FnxNodeProps {

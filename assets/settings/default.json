@@ -2555,6 +2555,12 @@
     // When trusted, project settings are synchronized automatically,
     // language and MCP servers are downloaded and started automatically.
     //
+    // Left off deliberately: a folder's own `.zed/settings.json` can name an
+    // MCP server command, which trusting it would spawn on open. Fanta design
+    // projects carry no such configuration and are trusted without asking (see
+    // `auto_trust_design_projects` in crates/zed/src/zed.rs), so a designer
+    // never meets the Restricted Mode prompt on their own work.
+    //
     // Default: false
     "trust_all_worktrees": false,
   },

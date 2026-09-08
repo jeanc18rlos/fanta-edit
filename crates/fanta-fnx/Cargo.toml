@@ -12,7 +12,13 @@ description = "The .fnx design-as-source language: lossless React/JSX-style text
 # projection), so fanta-fnx stays free of the doc model and is a pure language
 # crate reusable by persistence (fanta-format) and views (fanta-app/export).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`: serde_json's default number parser is only accurate to
+# within 1 ULP, so re-reading a printed `.fnx` moved floats that need all 17
+# significant digits (`21.762165069580078` came back as `21.76216506958008`)
+# and the next save rewrote every line it touched. A design-as-source file has
+# to survive text -> memory -> text byte-identically, which is exactly what
+# this feature buys.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror.workspace = true
 
 [dev-dependencies]

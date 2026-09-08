@@ -415,12 +415,16 @@ pub struct ProjectManifest {
     /// Unix epoch seconds. Sourced from the doc's own metadata (not the wall
     /// clock) so identical input docs project to byte-identical trees.
     pub created_at: i64,
-    /// Unix epoch seconds; same determinism rule as `created_at`.
-    pub modified_at: i64,
+    // Deliberately NO `modified_at`. Nothing reads one here — the doc's own
+    // `doc/metadata.json` carries the authoritative timestamp (and the 3-way
+    // merge tie-breaks on it) — so a copy in this file would only churn the
+    // project's identity file on every save, putting a fourth file in a diff
+    // that a one-node edit should keep to two. Git already records when the
+    // tree changed. Older trees still carry the field; serde ignores it.
 }
 
 impl ProjectManifest {
-    /// Manifest for an existing doc. Timestamps come from `doc.metadata` so
+    /// Manifest for an existing doc. `created_at` comes from `doc.metadata` so
     /// the projection is a pure function of the doc.
     pub fn for_doc(doc: &Doc) -> Self {
         Self {
@@ -430,7 +434,6 @@ impl ProjectManifest {
             schema_version: doc.schema_version,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             created_at: doc.metadata.created_at,
-            modified_at: doc.metadata.modified_at,
         }
     }
 
@@ -438,15 +441,13 @@ impl ProjectManifest {
     /// [`scaffold_project_tree`]). Mints a fresh [`DocId`] and stamps the
     /// current time.
     pub fn new_empty() -> Self {
-        let now = unix_seconds_now();
         Self {
             format: FORMAT_TAG.to_owned(),
             version: PROJECT_VERSION,
             project_id: DocId::new().to_string(),
             schema_version: SCHEMA_VERSION,
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            created_at: now,
-            modified_at: now,
+            created_at: unix_seconds_now(),
         }
     }
 }
@@ -735,6 +736,27 @@ mod tests {
         assert_eq!(manifest.version, PROJECT_VERSION);
         assert_eq!(manifest.schema_version, fanta_doc::SCHEMA_VERSION);
         assert!(manifest.project_id.starts_with("d_"));
+    }
+
+    /// A project written before the manifest dropped its per-save timestamp
+    /// still opens: the field is simply ignored, and the manifest is rewritten
+    /// without it the next time the projection touches it.
+    #[test]
+    fn manifest_from_an_older_build_still_opens() {
+        let dir = tempdir().unwrap();
+        scaffold_project_tree(dir.path()).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(FANTA_JSON)).unwrap())
+                .unwrap();
+        value
+            .as_object_mut()
+            .expect("manifest is a JSON object")
+            .insert("modified_at".to_owned(), serde_json::json!(1_700_000_002));
+        write_json_file(&dir.path().join(FANTA_JSON), &value).unwrap();
+
+        let manifest = read_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.format, FORMAT_TAG);
+        assert_eq!(manifest.version, PROJECT_VERSION);
     }
 
     #[test]

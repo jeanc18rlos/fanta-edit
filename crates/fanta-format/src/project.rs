@@ -533,6 +533,114 @@ mod tests {
         assert!(restored.scene.get(target).is_some());
     }
 
+    /// A reload must not move a single float. Every coordinate imported from a
+    /// `.fig` is an `f32` widened to `f64`, whose shortest exact spelling
+    /// usually needs all 17 significant digits; a JSON parser that is merely
+    /// accurate to within 1 ULP re-reads those one ULP away, and the next save
+    /// then rewrites every line of the page it just wrote. This walks the whole
+    /// projected tree, so it covers `.fnx` sources and the projected JSON
+    /// files alike.
+    #[test]
+    fn reload_then_rewrite_is_byte_identical_for_f32_widened_floats() {
+        let mut f = fixture();
+        let (assets, _) = fixture_assets();
+        // 21.762165_f32 and 0.30000000000000004 widened / accumulated exactly
+        // as an import produces them.
+        let awkward = [
+            f64::from(21.762165_f32),
+            f64::from(935.65722_f32),
+            0.1 + 0.2,
+        ];
+        for (node, value) in [f.frame, f.inner, f.comp_child].iter().zip(awkward) {
+            let node = f.doc.scene.get_mut(*node).expect("fixture node");
+            node.transform = fanta_doc::Transform2D::translation(value, -value);
+        }
+
+        let first = tempdir().unwrap();
+        write_project_tree(first.path(), &f.doc, &assets).unwrap();
+        assert!(
+            fs::read_to_string(first.path().join("pages/page-1/page.fnx"))
+                .unwrap()
+                .contains("21.762165069580078"),
+            "the fixture must actually exercise a 17-digit float"
+        );
+
+        let (reloaded, reloaded_assets) = read_project_tree(first.path()).unwrap();
+        let second = tempdir().unwrap();
+        write_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
+
+        let before = tree_snapshot(first.path());
+        let after = tree_snapshot(second.path());
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        for (relative, bytes) in &before {
+            let rewritten = &after[relative];
+            assert!(
+                bytes == rewritten,
+                "a save after a reload rewrote {relative}\n{}\n{}",
+                String::from_utf8_lossy(bytes),
+                String::from_utf8_lossy(rewritten)
+            );
+        }
+    }
+
+    /// `<Rect>` must survive a reload. The app backfills an SVG viewport onto
+    /// every origin-anchored vector as it loads (`backfill_vector_viewports`),
+    /// which used to block the shape sugar and degrade a readable
+    /// `<Rect width height />` into a `<Vector local_size path={…} />` blob —
+    /// permanently, and with a spurious diff on every rectangle in the file.
+    #[test]
+    fn rect_sugar_survives_a_reload_with_a_backfilled_viewport() {
+        let (assets, _) = fixture_assets();
+        let mut doc = Doc::new();
+        let page = {
+            let node = group(None, "Page 1");
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        doc.add_page(page);
+        let mut rect = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            120.0,
+            80.0,
+            fanta_doc::Color::rgb(255, 59, 48),
+        )));
+        rect.parent = Some(page);
+        rect.name = "Box".into();
+        doc.scene.insert(rect).unwrap();
+
+        let first = tempdir().unwrap();
+        write_project_tree(first.path(), &doc, &assets).unwrap();
+        let source = first.path().join("pages/page-1/page.fnx");
+        assert!(
+            fs::read_to_string(&source).unwrap().contains("<Rect "),
+            "a fresh rectangle is written as shape sugar"
+        );
+
+        // Reload exactly as the app does: read the tree, then backfill the
+        // viewports it infers from geometry.
+        let (mut reloaded, reloaded_assets) = read_project_tree(first.path()).unwrap();
+        fanta_doc::backfill_vector_viewports(&mut reloaded.scene);
+        let second = tempdir().unwrap();
+        write_project_tree(second.path(), &reloaded, &reloaded_assets).unwrap();
+        let after_reload = fs::read_to_string(second.path().join("pages/page-1/page.fnx")).unwrap();
+        assert!(
+            after_reload.contains("<Rect ") && !after_reload.contains("path="),
+            "the rectangle must not degrade into path data:\n{after_reload}"
+        );
+
+        // And it is a fixpoint from there: reloading again changes nothing.
+        let (mut again, again_assets) = read_project_tree(second.path()).unwrap();
+        fanta_doc::backfill_vector_viewports(&mut again.scene);
+        let third = tempdir().unwrap();
+        write_project_tree(third.path(), &again, &again_assets).unwrap();
+        assert_eq!(tree_snapshot(second.path()), tree_snapshot(third.path()));
+    }
+
     #[test]
     fn write_is_deterministic() {
         let f = fixture();
@@ -1297,14 +1405,16 @@ mod tests {
         f.doc.metadata.modified_at = 1_700_000_002;
         let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
 
-        // The sidecar rewrites too: it fingerprints element names.
+        // The sidecar rewrites too: it fingerprints element names. `fanta.json`
+        // does NOT: the manifest carries no per-save timestamp, so the project's
+        // identity file stays out of the diff for an edit that did not change
+        // the project's identity.
         assert_eq!(
             rel_strings(&report.written),
             BTreeSet::from([
                 "components/button/master.fnx".to_owned(),
                 "components/button/master.ids.json".to_owned(),
                 "doc/metadata.json".to_owned(),
-                "fanta.json".to_owned(),
             ])
         );
         assert!(report.removed.is_empty(), "removed: {:?}", report.removed);
