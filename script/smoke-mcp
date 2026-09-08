@@ -1,0 +1,709 @@
+#!/usr/bin/env python3
+"""Prove Fanta's external-agent loop end to end against a running app.
+
+    script/smoke-mcp <fanta-binary> <project-dir> [options]
+
+The loop under test is the product thesis: an outside agent speaks MCP to the
+running app, edits the open canvas, and the edit lands in the project's `.fnx`
+source as a git diff without anyone pressing Cmd-S.
+
+Options:
+    --launch-timeout SECONDS   how long to wait for the app and its canvas
+                               (default 120; a debug build is slow to start)
+    --autosave-timeout SECONDS how long to wait for the debounced autosave
+                               to reach disk (default 30)
+    --quit-app                 terminate the app if this script started it
+    --socket                   skip `--mcp-stdio` and talk to the unix socket
+
+Exit code is 0 only when every assertion passed.
+"""
+
+import argparse
+import json
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+DISCOVERY_PATH = (
+    Path.home() / "Library" / "Application Support" / "Fanta" / "fanta_live_mcp.json"
+)
+REQUIRED_TOOLS = [
+    "get_editor_state",
+    "batch_get",
+    "batch_design",
+    "get_screenshot",
+    "read_fnx_source",
+]
+PROTOCOL_VERSION = "2025-06-18"
+RECTANGLE_NAME = "smoke-mcp rectangle"
+
+
+def excerpt(value, limit=900):
+    """Render a payload for a failure message without flooding the terminal."""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, indent=2, sort_keys=True)
+    else:
+        text = str(value)
+    if len(text) > limit:
+        text = text[:limit] + f"… [{len(text)} chars]"
+    return text
+
+
+class Report:
+    """One line per assertion, and the exit code that follows from them."""
+
+    def __init__(self):
+        self.failed = 0
+        self.passed = 0
+
+    def check(self, name, ok, detail=""):
+        if ok:
+            self.passed += 1
+            print(f"PASS  {name}" + (f" — {detail}" if detail else ""), flush=True)
+        else:
+            self.failed += 1
+            print(f"FAIL  {name}" + (f" — {detail}" if detail else ""), flush=True)
+        return ok
+
+    def note(self, text):
+        print(f"      {text}", flush=True)
+
+    def summary(self):
+        total = self.passed + self.failed
+        verdict = "all assertions passed" if self.failed == 0 else f"{self.failed} FAILED"
+        print(f"\n{self.passed}/{total} assertions passed — {verdict}", flush=True)
+        return 0 if self.failed == 0 else 1
+
+
+class RpcError(Exception):
+    pass
+
+
+class JsonRpcConnection:
+    """Newline-delimited JSON-RPC over a pair of text streams.
+
+    The reader runs on its own thread so a request can time out instead of
+    blocking forever when the app stops answering. Shutting down takes two
+    steps for that reason: `unblock` has to free the reader thread out of its
+    blocking read before `finish` may close the streams, or closing deadlocks
+    against the lock the reading thread holds.
+    """
+
+    def __init__(self, label, reader, writer, unblock, finish):
+        self.label = label
+        self._reader = reader
+        self._writer = writer
+        self._unblock = unblock
+        self._finish = finish
+        self._next_id = 0
+        self._responses = {}
+        self._condition = threading.Condition()
+        self._eof = False
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self):
+        try:
+            for line in self._reader:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict) or "id" not in message:
+                    continue
+                with self._condition:
+                    self._responses[message["id"]] = message
+                    self._condition.notify_all()
+        except (ValueError, OSError):
+            pass
+        finally:
+            with self._condition:
+                self._eof = True
+                self._condition.notify_all()
+
+    def request(self, method, params=None, timeout=60):
+        self._next_id += 1
+        request_id = self._next_id
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        try:
+            self._writer.write(json.dumps(payload) + "\n")
+            self._writer.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise RpcError(f"writing {method} to the {self.label} transport: {error}")
+
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while request_id not in self._responses:
+                if self._eof:
+                    raise RpcError(
+                        f"the {self.label} transport closed before answering {method}"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RpcError(f"{method} did not answer within {timeout}s")
+                self._condition.wait(remaining)
+            message = self._responses.pop(request_id)
+
+        if "error" in message:
+            raise RpcError(f"{method} returned an error: {excerpt(message['error'])}")
+        return message.get("result")
+
+    def notify(self, method, params=None):
+        payload = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        try:
+            self._writer.write(json.dumps(payload) + "\n")
+            self._writer.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def call_tool(self, name, arguments=None, timeout=120):
+        """Run an MCP tool. Tool failures come back as `isError`, not as a
+        JSON-RPC error, so unwrap them here into something that reads."""
+        result = self.request(
+            "tools/call",
+            {"name": name, "arguments": arguments if arguments is not None else {}},
+            timeout=timeout,
+        )
+        content = result.get("content") or []
+        if result.get("isError"):
+            text = content[0].get("text") if content else "(no message)"
+            raise RpcError(f"tool {name} failed: {text}")
+        return content
+
+    def call_tool_json(self, name, arguments=None, timeout=120):
+        content = self.call_tool(name, arguments, timeout=timeout)
+        if not content or content[0].get("type") != "text":
+            raise RpcError(f"tool {name} returned no text content: {excerpt(content)}")
+        try:
+            return json.loads(content[0]["text"])
+        except json.JSONDecodeError as error:
+            raise RpcError(f"tool {name} returned non-JSON text: {error}")
+
+    def close(self):
+        try:
+            self._unblock()
+        except OSError:
+            pass
+        self._thread.join(timeout=3)
+        try:
+            self._finish()
+        except OSError:
+            pass
+
+
+def open_stdio(binary):
+    process = subprocess.Popen(
+        [str(binary), "--mcp-stdio"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    errors = []
+    threading.Thread(
+        target=lambda: errors.extend(process.stderr.read().splitlines()), daemon=True
+    ).start()
+
+    def unblock():
+        # Closing stdin half-closes the bridge's socket, which is how the
+        # server learns the request stream ended; killing it is the fallback
+        # that guarantees the reader thread sees EOF.
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    connection = JsonRpcConnection(
+        "--mcp-stdio", process.stdout, process.stdin, unblock, lambda: None
+    )
+    connection.process = process
+    connection.errors = errors
+    return connection
+
+
+def open_socket(socket_path):
+    stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stream.connect(str(socket_path))
+    reader = stream.makefile("r", encoding="utf-8")
+    writer = stream.makefile("w", encoding="utf-8")
+
+    def unblock():
+        stream.shutdown(socket.SHUT_RDWR)
+
+    def finish():
+        writer.close()
+        reader.close()
+        stream.close()
+
+    return JsonRpcConnection("unix socket", reader, writer, unblock, finish)
+
+
+def read_discovery():
+    """The socket and pid the running app advertises, or None.
+
+    Nothing removes this file when the app quits, so the pid it records is
+    checked before the socket beside it is believed.
+    """
+    try:
+        discovery = json.loads(DISCOVERY_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    socket_path = discovery.get("socket")
+    pid = discovery.get("pid")
+    if not isinstance(socket_path, str) or not isinstance(pid, int):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    except OSError:
+        return None
+    return {"socket": socket_path, "pid": pid}
+
+
+def binary_supports_stdio(binary):
+    """Whether this binary understands `--mcp-stdio`.
+
+    `--help` is not the probe it looks like: the flag is registered with
+    `hide = true`, so a binary that supports it perfectly still never lists it.
+    Running it with a closed stdin is definitive instead — an unknown flag is a
+    clap parse error, while a known one either bridges or reports that the app
+    is not running. The cost is one extra connect (and so one extra "Agent
+    connected" notice) when the app happens to be up.
+    """
+    try:
+        completed = subprocess.run(
+            [str(binary), "--mcp-stdio"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    message = (completed.stdout + completed.stderr).lower()
+    return "unexpected argument" not in message and "unrecognized" not in message
+
+
+def same_path(left, right):
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return False
+
+
+def connect(binary, use_socket):
+    """Open a transport onto the live server, or return None if it is not up."""
+    discovery = read_discovery()
+    if discovery is None:
+        return None, None
+    if use_socket:
+        try:
+            return open_socket(discovery["socket"]), discovery
+        except OSError:
+            return None, discovery
+    try:
+        return open_stdio(binary), discovery
+    except OSError:
+        return None, discovery
+
+
+def initialize(connection):
+    result = connection.request(
+        "initialize",
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "smoke-mcp", "version": "1.0"},
+        },
+        timeout=60,
+    )
+    connection.notify("notifications/initialized")
+    return result
+
+
+def probe_for_project(binary, project, use_socket):
+    """One attempt at reaching a live canvas showing `project`.
+
+    Returns (connection, initialize_result, editor_state) on success, and
+    otherwise (None, None, reason) so the caller can keep waiting.
+    """
+    connection, discovery = connect(binary, use_socket)
+    if connection is None:
+        reason = "no live MCP server" if discovery is None else "could not open the transport"
+        return None, None, reason
+    try:
+        init_result = initialize(connection)
+        state = connection.call_tool_json("get_editor_state", timeout=60)
+    except RpcError as error:
+        connection.close()
+        return None, None, str(error)
+    root = state.get("project_root")
+    if not root or not same_path(root, project):
+        connection.close()
+        return None, None, f"the open canvas is {root!r}, not the requested project"
+    return connection, init_result, state
+
+
+def launch(binary, project, log_path):
+    log = open(log_path, "ab")
+    process = subprocess.Popen(
+        [str(binary), str(project)],
+        stdout=log,
+        stderr=log,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return process
+
+
+def active_page(state):
+    for page in state.get("pages") or []:
+        if page.get("active"):
+            return page
+    return None
+
+
+def git(project, *args):
+    return subprocess.run(
+        ["git", "-C", str(project), *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("binary", help="path to the fanta binary")
+    parser.add_argument("project", help="path to a Fanta project directory")
+    parser.add_argument("--launch-timeout", type=float, default=120.0)
+    parser.add_argument("--autosave-timeout", type=float, default=30.0)
+    parser.add_argument("--quit-app", action="store_true")
+    parser.add_argument("--socket", action="store_true")
+    args = parser.parse_args()
+
+    binary = Path(args.binary).expanduser()
+    project = Path(args.project).expanduser()
+    report = Report()
+    started_process = None
+    connection = None
+
+    print(f"smoke-mcp: {binary}")
+    print(f"           {project}\n")
+
+    # --- preflight ------------------------------------------------------
+    if not report.check(
+        "binary exists and is executable",
+        binary.is_file() and os.access(binary, os.X_OK),
+        str(binary),
+    ):
+        return report.summary()
+
+    if not report.check(
+        "project directory exists", project.is_dir(), str(project)
+    ):
+        return report.summary()
+
+    inside_repo = git(project, "rev-parse", "--show-toplevel")
+    if inside_repo.returncode != 0:
+        report.check(
+            "project is a git repository",
+            False,
+            "`git rev-parse` failed — projects are git-initialised on creation, so this "
+            f"project was made some other way. Not running `git init` to hide it: {inside_repo.stderr.strip()}",
+        )
+        return report.summary()
+    report.check(
+        "project is a git repository", True, f"toplevel {inside_repo.stdout.strip()}"
+    )
+
+    use_socket = args.socket
+    if not use_socket and not binary_supports_stdio(binary):
+        use_socket = True
+        report.note("`--mcp-stdio` is absent from --help; falling back to the unix socket")
+
+    # --- the app, with the project open ---------------------------------
+    connection, init_result, state = probe_for_project(binary, project, use_socket)
+    reused = connection is not None
+    if not reused:
+        report.note(f"not reachable yet ({state}); launching the app on the project")
+        log_path = Path(
+            os.environ.get("TMPDIR", "/tmp")
+        ) / "smoke-mcp-app.log"
+        try:
+            started_process = launch(binary, project, log_path)
+        except OSError as error:
+            report.check("app launches on the project", False, str(error))
+            return report.summary()
+        report.note(f"launched pid {started_process.pid}; app output in {log_path}")
+
+        deadline = time.monotonic() + args.launch_timeout
+        last_reason = "never got a reply"
+        last_note = time.monotonic()
+        while time.monotonic() < deadline:
+            connection, init_result, probed = probe_for_project(binary, project, use_socket)
+            if connection is not None:
+                state = probed
+                break
+            last_reason = probed
+            if time.monotonic() - last_note > 20:
+                last_note = time.monotonic()
+                report.note(f"still waiting for the canvas: {last_reason}")
+            if started_process.poll() is not None:
+                last_reason = (
+                    f"the launched process exited with {started_process.returncode} "
+                    f"(see {log_path}) — {last_reason}"
+                )
+                break
+            time.sleep(2)
+        if connection is None:
+            report.check(
+                "app is running with the project open",
+                False,
+                f"gave up after {args.launch_timeout:.0f}s: {last_reason}",
+            )
+            return report.summary()
+
+    report.check(
+        "app is running with the project open",
+        True,
+        ("reused the running app" if reused else "started the app")
+        + f", transport: {connection.label}",
+    )
+
+    exit_code = 1
+    try:
+        # --- handshake --------------------------------------------------
+        server_info = (init_result or {}).get("serverInfo") or {}
+        report.check(
+            'initialize returns serverInfo.name == "fanta"',
+            server_info.get("name") == "fanta",
+            excerpt(init_result),
+        )
+
+        try:
+            pong = connection.request("ping", {}, timeout=30)
+            report.check(
+                "ping returns an empty object",
+                isinstance(pong, dict) and not pong,
+                excerpt(pong),
+            )
+        except RpcError as error:
+            report.check("ping returns an empty object", False, str(error))
+
+        try:
+            listed = connection.request("tools/list", {}, timeout=30)
+            names = sorted(tool.get("name") for tool in listed.get("tools") or [])
+            missing = [name for name in REQUIRED_TOOLS if name not in names]
+            report.check(
+                "tools/list carries the five canvas tools",
+                not missing,
+                f"missing {missing}; got {names}" if missing else ", ".join(names),
+            )
+        except RpcError as error:
+            report.check("tools/list carries the five canvas tools", False, str(error))
+
+        # --- the open document ------------------------------------------
+        report.check(
+            "get_editor_state reports the project root",
+            same_path(state.get("project_root") or "", project),
+            f"project_root={state.get('project_root')!r}",
+        )
+
+        page = active_page(state)
+        report.check(
+            "get_editor_state marks one page active",
+            page is not None,
+            f"active page {page.get('name')!r} (index {page.get('index')})"
+            if page
+            else f"no page has active=true: {excerpt(state.get('pages'))}",
+        )
+        if page is None:
+            return report.summary()
+
+        source = page.get("source")
+        report.check(
+            "the active page names its source file",
+            isinstance(source, str) and source.endswith(".fnx"),
+            f"source={source!r}"
+            if not isinstance(source, str)
+            else f"{source} (project-relative)",
+        )
+        if not isinstance(source, str):
+            return report.summary()
+
+        page_file = project / source
+        report.check(
+            "the named source file exists on disk",
+            page_file.is_file(),
+            str(page_file),
+        )
+        if not page_file.is_file():
+            return report.summary()
+
+        try:
+            fetched = connection.call_tool_json(
+                "read_fnx_source", {"path": source}, timeout=60
+            )
+            text = fetched.get("text") or ""
+            report.check(
+                "read_fnx_source returns that file's text",
+                bool(text.strip()),
+                f"{len(text)} chars",
+            )
+        except RpcError as error:
+            report.check("read_fnx_source returns that file's text", False, str(error))
+
+        # --- the edit ----------------------------------------------------
+        mtime_before = page_file.stat().st_mtime
+        git_before = git(project, "status", "--short").stdout
+
+        applied = None
+        try:
+            applied = connection.call_tool_json(
+                "batch_design",
+                {
+                    "label": "smoke-mcp",
+                    "ops": [
+                        {
+                            "op": "create_node",
+                            "node_type": "rectangle",
+                            "name": RECTANGLE_NAME,
+                            "x": 0,
+                            "y": 0,
+                            "width": 120,
+                            "height": 80,
+                            "fill": "#FF3B30",
+                        }
+                    ],
+                },
+                timeout=120,
+            )
+        except RpcError as error:
+            report.check("batch_design creates a rectangle", False, str(error))
+            return report.summary()
+
+        created = applied.get("created") or []
+        report.check(
+            "batch_design creates a rectangle",
+            bool(applied.get("applied")) and len(created) == 1,
+            f"created {created}" if applied.get("applied") else excerpt(applied),
+        )
+
+        # Read the dirty flag immediately: the autosave debounce is about a
+        # second, so a slow round trip can legitimately beat this check.
+        dirty_state = connection.call_tool_json("get_editor_state", timeout=60)
+        dirty = bool(dirty_state.get("dirty"))
+        already_written = page_file.stat().st_mtime > mtime_before
+        report.check(
+            "the canvas reports unsaved work from the MCP edit",
+            dirty or already_written,
+            "dirty=true"
+            if dirty
+            else "dirty=false, but the autosave had already flushed the edit to disk"
+            if already_written
+            else f"dirty=false and nothing reached disk: {excerpt(dirty_state)}",
+        )
+
+        # --- the product thesis ------------------------------------------
+        deadline = time.monotonic() + args.autosave_timeout
+        mtime_after = page_file.stat().st_mtime
+        while mtime_after <= mtime_before and time.monotonic() < deadline:
+            time.sleep(0.5)
+            mtime_after = page_file.stat().st_mtime
+        waited = args.autosave_timeout - max(deadline - time.monotonic(), 0)
+        autosaved = report.check(
+            "the edit reaches the .fnx on disk with no Cmd-S",
+            mtime_after > mtime_before,
+            f"{page_file.name} mtime {mtime_before:.0f} -> {mtime_after:.0f} after {waited:.1f}s"
+            if mtime_after > mtime_before
+            else f"{page_file} mtime never moved from {mtime_before:.0f} in "
+            f"{args.autosave_timeout:.0f}s — nobody pressed Cmd-S, and that is the point",
+        )
+
+        git_after = git(project, "status", "--short")
+        report.check(
+            "the autosaved edit shows up as a git diff",
+            git_after.returncode == 0 and git_after.stdout.strip() != "",
+            "git status --short:\n"
+            + "\n".join(
+                f"        {line}" for line in git_after.stdout.strip().splitlines()
+            )
+            if git_after.stdout.strip()
+            else f"`git status --short` is empty (it was {git_before.strip()!r} before the edit)",
+        )
+
+        # --- the rest of the toolbelt against a live document -------------
+        try:
+            shot = connection.call_tool("get_screenshot", {"max_dimension": 512}, timeout=180)
+            image = shot[0] if shot else {}
+            data = image.get("data") or ""
+            report.check(
+                "get_screenshot renders the open page",
+                image.get("type") == "image"
+                and image.get("mimeType") == "image/png"
+                and len(data) > 1000,
+                f"{len(data)} base64 chars of {image.get('mimeType')}"
+                if image.get("type") == "image"
+                else excerpt(shot),
+            )
+        except RpcError as error:
+            report.check("get_screenshot renders the open page", False, str(error))
+
+        try:
+            nodes = connection.call_tool_json("batch_get", {"ids": created}, timeout=60)
+            fetched_names = [node.get("name") for node in nodes.get("nodes") or []]
+            report.check(
+                "batch_get reads the node batch_design just made",
+                RECTANGLE_NAME in fetched_names,
+                f"names {fetched_names}",
+            )
+        except RpcError as error:
+            report.check("batch_get reads the node batch_design just made", False, str(error))
+
+        if not autosaved:
+            report.note(
+                "the autosave assertion is the one that matters: a red line there means "
+                "the canvas-to-git loop is broken, whatever else passed"
+            )
+        exit_code = report.summary()
+    finally:
+        if connection is not None:
+            connection.close()
+        if started_process is not None:
+            if args.quit_app:
+                started_process.send_signal(signal.SIGTERM)
+                print(f"\nquit the app (pid {started_process.pid})")
+            else:
+                print(
+                    f"\nleft the app running (pid {started_process.pid}); "
+                    f"quit it with: kill {started_process.pid}"
+                )
+        print(
+            "the project now carries the smoke edit; discard it with: "
+            + shlex.join(["git", "-C", str(project), "checkout", "--", "."])
+        )
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
