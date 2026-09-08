@@ -970,8 +970,9 @@
     // (get_editor_state / batch_get / batch_design / get_screenshot /
     // read_fnx_source) to external agents over a Unix socket. The socket
     // path is advertised in `fanta_live_mcp.json` in the application
-    // support directory.
-    "enabled": false,
+    // support directory; stdio clients such as Claude Code and Codex reach
+    // that socket by running `fanta --mcp-stdio`.
+    "enabled": true,
   },
   "fanta_properties_panel": {
     // Whether to show the Fanta properties panel button in the status bar.

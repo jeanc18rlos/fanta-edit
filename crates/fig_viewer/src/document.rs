@@ -149,6 +149,12 @@ pub enum FigItemEvent {
     TextSelectionChanged,
     /// The document finished (re)loading or was saved.
     StateChanged,
+    /// The document was replaced by an external reload (`merged: false`) or by
+    /// a clean three-way merge of the external edit into the canvas's unsaved
+    /// edits (`merged: true`). Only the watcher-driven paths emit this; the
+    /// user's own discard-and-reload does not, so it never reads as somebody
+    /// else's change.
+    ReloadedFromDisk { merged: bool },
     /// The project diverged from disk while the canvas had unsaved edits, or
     /// that conflict was resolved by saving or reloading.
     ConflictChanged,
@@ -1135,6 +1141,7 @@ impl FigItem {
                     // The canvas edits were saved or discarded mid-merge;
                     // plain reload semantics apply.
                     this.apply_reloaded_document(theirs, cx);
+                    cx.emit(FigItemEvent::ReloadedFromDisk { merged: false });
                     return;
                 }
                 if this
@@ -1152,6 +1159,7 @@ impl FigItem {
                 match merge {
                     Ok(merge) if merge.is_clean() => {
                         this.adopt_merged_document(merge.doc, theirs, cx);
+                        cx.emit(FigItemEvent::ReloadedFromDisk { merged: true });
                     }
                     Ok(merge) => {
                         log::info!(
@@ -1268,7 +1276,10 @@ impl FigItem {
                     return;
                 }
                 match loaded {
-                    Ok(document) => this.apply_reloaded_document(document, cx),
+                    Ok(document) => {
+                        this.apply_reloaded_document(document, cx);
+                        cx.emit(FigItemEvent::ReloadedFromDisk { merged: false });
+                    }
                     Err(error) => {
                         log::error!(
                             "reloading Fanta project after a disk change failed: {error:#}"
@@ -1716,7 +1727,42 @@ pub(crate) fn write_project(
         .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
     fanta_format::write_project_tree(root, doc, raw_assets)
         .with_context(|| format!("writing Fanta project at {}", root.display()))?;
+    git_init_if_needed(root);
     Ok(())
+}
+
+/// Turn a freshly written project into a git repository, so that every later
+/// canvas edit is a reviewable diff.
+///
+/// The check walks the ancestors, not just `root`: a nested repository created
+/// inside an existing checkout would shadow the outer repo for `git_ui`, so the
+/// design's changes would stop appearing in the history the user already has.
+///
+/// A missing `git`, or a `git init` that fails, is logged and swallowed: a save
+/// must never fail because version control is unavailable.
+fn git_init_if_needed(root: &Path) {
+    if root.ancestors().any(|dir| dir.join(".git").exists()) {
+        return;
+    }
+    // No `-b`: the branch name is the user's `init.defaultBranch` to pick.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "write_project is sync and only ever runs on background_spawn"
+    )]
+    let result = util::command::new_std_command("git")
+        .args(["init", "-q"])
+        .current_dir(root)
+        .output();
+    match result {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => log::warn!(
+            "git init in {} exited with {}: {}",
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => log::warn!("running git init in {} failed: {error}", root.display()),
+    }
 }
 
 /// Pick a directory for a new project next to the source `.fig` file:

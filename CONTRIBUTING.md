@@ -30,7 +30,7 @@ If you're looking for concrete ideas:
 - [Area labels](https://github.com/zed-industries/zed/labels?q=area%3A*) to browse bugs in a specific part of the product you care about (after clicking on an area label, add type:Bug to the search)
 - [The board with the features](https://github.com/orgs/zed-industries/projects/78/views/4) we explicitly invited the community's contributions for.
 
-**Thinking about proposing or building a larger feature? Don't start with a PR**, start with reading the [Zed Feature Process](./docs/src/development/feature-process.md) for how we think about feature design — what context to provide, what integration points to consider, and how to put together a strong proposal. The right place for the proposals is [GitHub discussions](https://github.com/zed-industries/zed/discussions) (not GitHub issues).
+**Thinking about proposing or building a larger feature? Don't start with a PR.** Describe what you want to build, what context you have, and which integration points it touches. The right place for the proposals is [GitHub discussions](https://github.com/zed-industries/zed/discussions) (not GitHub issues).
 
 ## Sending changes
 
@@ -55,7 +55,7 @@ submitted. **If you'd like your PR to have the best chance of being merged**:
   confirmation that we want it, start with a [GitHub discussion](https://github.com/zed-industries/zed/discussions) rather than a PR.
   - This especially applies to any changes proposed to the Zed Extension API.
 - Include a clear description of **what you're solving**, and why it's important.
-- Include **tests**. For UI changes, consider updating visual regression tests (see [Building Zed for macOS](./docs/src/development/macos.md#visual-regression-tests)).
+- Include **tests**. For UI changes, consider updating visual regression tests.
 - If the change is visible in the UI, attach **screenshots or screen recordings**.
 - Make the PR about **one thing only**, e.g. if it's a bugfix, don't add two
   features and a refactoring on top of that.
@@ -155,8 +155,6 @@ When your changes affect UI, consult this checklist:
 - Is there a path from beginner → expert usage (progressive disclosure)?
 
 ## Bird's-eye view of Zed
-
-We suggest you keep the [Zed glossary](docs/src/development/glossary.md) at your side when starting out. It lists and explains some of the structures and terms you will see throughout the codebase.
 
 Zed is made up of several smaller crates - let's go over those you're most likely to interact with:
 

@@ -4,17 +4,17 @@ use agent_ui::ExternalSourcePrompt;
 use anyhow::{Context as _, Result, anyhow};
 use cli::{CliRequest, CliResponse, CliResponseSink};
 use cli::{IpcHandshake, ipc};
-use client::{ZedLink, parse_zed_link};
+use client::parse_zed_link;
 use db::kvp::KeyValueStore;
 use fs::Fs;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::{mpsc, oneshot};
 use futures::future;
 
+use super::FIRST_OPEN;
 use futures::{FutureExt, StreamExt};
 use git_ui::{file_diff_view::FileDiffView, multi_diff_view::MultiDiffView};
 use gpui::{App, AsyncApp, Global, TaskExt, WindowHandle};
-use onboarding::FIRST_OPEN;
 use recent_projects::{RemoteSettings, navigate_to_positions, open_remote_project};
 use remote::{RemoteConnectionOptions, WslConnectionOptions};
 use settings::Settings;
@@ -37,8 +37,6 @@ pub struct OpenRequest {
     pub diff_paths: Vec<[String; 2]>,
     pub diff_all: bool,
     pub dev_container: bool,
-    pub open_channel_notes: Vec<(u64, Option<String>)>,
-    pub join_channel: Option<u64>,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub open_behavior: Option<cli::OpenBehavior>,
 }
@@ -56,9 +54,6 @@ pub enum OpenRequestKind {
     },
     DockMenuAction {
         index: usize,
-    },
-    BuiltinJsonSchema {
-        schema_path: String,
     },
     Setting {
         /// `None` opens settings without navigating to a specific path.
@@ -87,10 +82,6 @@ impl std::fmt::Debug for OpenRequestKind {
                 .debug_struct("DockMenuAction")
                 .field("index", index)
                 .finish(),
-            Self::BuiltinJsonSchema { schema_path } => f
-                .debug_struct("BuiltinJsonSchema")
-                .field("schema_path", schema_path)
-                .finish(),
             Self::Setting { setting_path } => f
                 .debug_struct("Setting")
                 .field("setting_path", setting_path)
@@ -110,8 +101,6 @@ impl OpenRequest {
             && self.open_paths.is_empty()
             && self.diff_paths.is_empty()
             && self.remote_connection.is_none()
-            && self.join_channel.is_none()
-            && self.open_channel_notes.is_empty()
     }
 
     pub fn parse(request: RawOpenRequest, cx: &App) -> Result<Self> {
@@ -154,10 +143,6 @@ impl OpenRequest {
                 this.parse_agent_url(agent_path)
             } else if url == "zed://" || url == "zed://open" || url == "zed://open/" {
                 this.kind = Some(OpenRequestKind::FocusApp);
-            } else if let Some(schema_path) = url.strip_prefix("zed://schemas/") {
-                this.kind = Some(OpenRequestKind::BuiltinJsonSchema {
-                    schema_path: schema_path.to_string(),
-                });
             } else if url == "zed://settings" || url == "zed://settings/" {
                 this.kind = Some(OpenRequestKind::Setting { setting_path: None });
             } else if let Some(setting_path) = url.strip_prefix("zed://settings/") {
@@ -176,18 +161,11 @@ impl OpenRequest {
                 // to focus the app rather than reporting it as unhandled.
                 log::warn!("unrecognized fanta:// url, focusing the app instead: {url}");
                 this.kind = Some(OpenRequestKind::FocusApp);
-            } else if let Some(zed_link) = parse_zed_link(&url, cx) {
-                match zed_link {
-                    ZedLink::Channel { channel_id } => {
-                        this.join_channel = Some(channel_id);
-                    }
-                    ZedLink::ChannelNotes {
-                        channel_id,
-                        heading,
-                    } => {
-                        this.open_channel_notes.push((channel_id, heading));
-                    }
-                }
+            } else if parse_zed_link(&url, cx).is_some() {
+                // Collaboration links (channels, channel notes) are not supported
+                // in Fanta; focus the app rather than reporting the url unhandled.
+                log::warn!("unsupported collaboration url, focusing the app instead: {url}");
+                this.kind = Some(OpenRequestKind::FocusApp);
             } else {
                 log::error!("unhandled url: {}", url);
             }

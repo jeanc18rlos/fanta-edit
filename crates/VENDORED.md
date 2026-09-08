@@ -24,3 +24,15 @@ Changes made while vendoring, and nothing else:
 
 All source is otherwise byte-identical to upstream. Edits belong here now; the
 sibling checkouts are no longer part of the build.
+
+## Third-party crates
+
+`gpui_component` is not ours: it is [`longbridge/gpui-component`][gpui-component],
+Apache-2.0, Copyright 2024 - 2025 Longbridge. Unlike the Fanta crates above it
+keeps its own `LICENSE-APACHE` as a real file rather than a symlink, because
+Apache-2.0 section 4 requires retaining the upstream copyright notice and this
+repository's own `LICENSE-APACHE` carries a different one. `script/check-licenses`
+knows about this through its `vendored_license_dirs` list and rejects turning
+that file back into a symlink.
+
+[gpui-component]: https://github.com/longbridge/gpui-component

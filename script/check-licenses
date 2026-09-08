@@ -55,9 +55,50 @@ check_symlink_target () {
     fi
 }
 
+# Third-party crates vendored into this tree keep their upstream licence file
+# verbatim. Apache-2.0 section 4 requires retaining the original copyright
+# notice, and symlinking to this repository's own LICENSE-APACHE would replace
+# the upstream holder's notice with ours.
+vendored_license_dirs=("crates/gpui_component")
+
+is_vendored_license_dir () {
+    local dir="$1"
+
+    for vendored_dir in "${vendored_license_dirs[@]}"; do
+        if [[ "$dir" == "$vendored_dir" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+check_vendored_license () {
+    local dir="$1"
+    shift
+    local allowed_licenses=("$@")
+
+    for license in "${allowed_licenses[@]}"; do
+        if [[ -L "$dir/$license" ]]; then
+            echo "Error: $dir/$license is a symlink, but $dir is vendored third-party code that must keep its upstream licence file verbatim."
+            exit 1
+        elif [[ -s "$dir/$license" ]]; then
+            return 0
+        fi
+    done
+
+    echo "Error: $dir is listed as vendored but has no LICENSE-GPL or LICENSE-APACHE file"
+    exit 1
+}
+
 check_license () {
     local dir="$1"
     local allowed_licenses=("LICENSE-GPL" "LICENSE-APACHE")
+
+    if is_vendored_license_dir "$dir"; then
+        check_vendored_license "$dir" "${allowed_licenses[@]}"
+        return 0
+    fi
 
     for license in "${allowed_licenses[@]}"; do
         if [[ -L "$dir/$license" ]]; then

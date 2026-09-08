@@ -55,6 +55,11 @@ popd
 
 export ZED_BUNDLE=true
 
+# Compiled into the binary by auto_update's `option_env!`: it suppresses the
+# hourly poll of the Zed release endpoint (which this fork does not serve) and
+# turns "Check for Updates" into an info prompt instead of an error.
+export ZED_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG from Fanta.'
+
 # cargo bundle honours CARGO_TARGET_DIR, but the copy steps below read from the
 # repo-relative target/. With the variable set, the app is bundled from one tree
 # and then has binaries from another copied over it, silently producing a DMG
@@ -319,17 +324,32 @@ function sign_binary() {
     fi
 }
 
+# Every release must keep its dwarf: the shipped binary is stripped below, so
+# without this file a crash report from that build can never be symbolicated.
+# Skipped for `-d` builds, where the dwarf is several GB and takes many minutes.
+# dsymutil writes target/<triple>/<profile>/fanta.dwarf, which is the directory
+# holding the DMG but not the `dmg/` staging dir, so it never gets packaged.
+function generate_debug_symbols() {
+    if [[ "$target_dir" != "release" ]]; then
+        echo "debug build; skipping dsymutil."
+        return
+    fi
+
+    echo "Generating debug symbols for target/${target_triple}/${target_dir}/fanta"
+    if ! dsymutil --flat "target/${target_triple}/${target_dir}/fanta" 2> target/dsymutil.log; then
+        echo "dsymutil failed"
+        cat target/dsymutil.log
+        exit 1
+    fi
+}
+
 function upload_debug_symbols() {
     if [ "$local_install" = true ]; then
         echo "local install; skipping sentry upload."
+    elif [[ ! -f "target/${target_triple}/${target_dir}/fanta.dwarf" ]]; then
+        echo "no debug symbols were generated; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
         echo "Uploading zed debug symbols to sentry..."
-        exe_path="target/${target_triple}/release/Zed"
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/fanta" 2> target/dsymutil.log; then
-            echo "dsymutil failed"
-            cat target/dsymutil.log
-            exit 1
-        fi
         # note: this uploads the unstripped binary which is needed because it contains
         # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
         # Try uploading up to 3 times
@@ -351,11 +371,26 @@ function upload_debug_symbols() {
     fi
 }
 
+generate_debug_symbols
 upload_debug_symbols
-
-cp target/${target_triple}/${target_dir}/fanta "${app_path}/Contents/MacOS/fanta"
-cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
-sign_app_binaries
 
 # Use the same profile dir the build above produced; hardcoding `release`
 # broke `-d` (debug) bundles, which never create the release binary.
+cp target/${target_triple}/${target_dir}/fanta "${app_path}/Contents/MacOS/fanta"
+cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+
+# Ordering is load-bearing: dsymutil above needs the unstripped binaries in
+# target/, and the codesign calls in sign_app_binaries (invoked just below) must
+# run after strip or the signature is invalidated. The absolute path is spelled out because a bare
+# `strip` can resolve to a cctools build earlier on PATH (which emits a fake
+# signature); /usr/bin/codesign is hardcoded below for the same reason.
+# Cost: panic backtraces in ~/Library/Logs/Fanta/Fanta.log become bare
+# addresses, symbolicated with `atos -o fanta.dwarf -arch arm64 -l <load address>`.
+/usr/bin/strip "${app_path}/Contents/MacOS/fanta"
+/usr/bin/strip "${app_path}/Contents/MacOS/cli"
+
+sign_app_binaries
+
+if [[ "$target_dir" = "release" ]]; then
+    echo "Debug symbols: target/${target_triple}/${target_dir}/fanta.dwarf"
+fi

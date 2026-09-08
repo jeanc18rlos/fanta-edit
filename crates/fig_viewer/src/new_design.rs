@@ -96,7 +96,9 @@ fn prompt_and_create(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
     .detach_and_log_err(cx);
 }
 
-/// Scaffold a project tree at `root` and write a one-page document into it.
+/// Scaffold a project tree at `root`, write a one-page document into it, and
+/// make the folder a git repository (see [`crate::document::write_project`]),
+/// so the design's history is reviewable from the first save.
 ///
 /// Refuses when `root` already holds anything. [`fanta_format::scaffold_project_tree`]
 /// uses `create_dir_all` and unconditionally rewrites `fanta.json` and

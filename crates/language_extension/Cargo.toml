@@ -11,6 +11,12 @@ workspace = true
 [lib]
 path = "src/language_extension.rs"
 
+[features]
+# Fanta ships without tree-sitter's wasm runtime, so the loader that would parse
+# extension-provided grammars is compiled out. Kept as a feature so re-enabling
+# `language/wasm-grammars` restores registration rather than needing a code change.
+wasm-grammars = ["language/wasm-grammars"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

@@ -290,7 +290,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
     {
         drop(window.prompt(
             gpui::PromptLevel::Info,
-            "Fanta was installed via a package manager.",
+            "Fanta alpha builds do not update themselves.",
             Some(&message),
             &["OK"],
             cx,

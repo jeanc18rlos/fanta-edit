@@ -284,9 +284,11 @@ pub struct FantaLiveMcpSettingsContent {
     /// Whether to run a local MCP server exposing the focused design canvas
     /// (get_editor_state / batch_get / batch_design / get_screenshot /
     /// read_fnx_source) to external agents. The socket path is advertised in
-    /// a `fanta_live_mcp.json` file in the application support directory.
+    /// a `fanta_live_mcp.json` file in the application support directory;
+    /// stdio clients such as Claude Code and Codex reach it through
+    /// `fanta --mcp-stdio`.
     ///
-    /// Default: false
+    /// Default: true
     pub enabled: Option<bool>,
 }
 

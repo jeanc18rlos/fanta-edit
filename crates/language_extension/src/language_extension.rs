@@ -39,7 +39,12 @@ struct LanguageServerRegistryProxy {
 impl ExtensionGrammarProxy for LanguageServerRegistryProxy {
     #[ztracing::instrument(skip_all)]
     fn register_grammars(&self, grammars: Vec<(Arc<str>, PathBuf)>) {
-        self.language_registry.register_wasm_grammars(grammars)
+        #[cfg(feature = "wasm-grammars")]
+        self.language_registry.register_wasm_grammars(grammars);
+        // Without the wasm grammar loader there is nothing that can parse these
+        // files, so extension grammars are dropped instead of registered unusable.
+        #[cfg(not(feature = "wasm-grammars"))]
+        drop(grammars);
     }
 }
 

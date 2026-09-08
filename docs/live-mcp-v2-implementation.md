@@ -138,9 +138,11 @@ frontmatter; registered in `builtin_skills()` agent_skills.rs:701).
 `crates/fig_viewer/src/live_mcp.rs`: use `context_server::listener::McpServer`
 (UDS, McpServerTool trait, AsyncApp) registering tools that call the SAME
 DesignSurfaceRegistry: get_editor_state, batch_get, batch_design,
-get_screenshot, read_fnx_source. Socket path under the app's support dir;
-enabled via setting `fanta_live_mcp: { "enabled": true }`. TCP/3846
-Streamable-HTTP shim is phase 2 (old codex config compatibility).
+get_screenshot, read_fnx_source. Socket path under the app's support dir; on
+by default, and turned off with `fanta_live_mcp: { "enabled": false }`. The
+server answers `initialize` and `ping` itself, so stdio clients reach it
+through `fanta --mcp-stdio`. TCP/3846 Streamable-HTTP shim is phase 2 (old
+codex config compatibility).
 
 ## Verification
 

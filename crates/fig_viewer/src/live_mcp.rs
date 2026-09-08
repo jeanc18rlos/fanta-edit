@@ -1,24 +1,36 @@
 //! A local MCP server exposing the focused design canvas to EXTERNAL agents
 //! (codex, Claude Code, etc.), sharing the same [`design_surface`] provider
-//! the built-in agent tools use. Off by default; enabled with
-//! `"fanta_live_mcp": { "enabled": true }`.
+//! the built-in agent tools use. On by default; disabled with
+//! `"fanta_live_mcp": { "enabled": false }`.
 //!
 //! Transport is a Unix socket (`context_server::listener::McpServer`). The
 //! socket lives in a private temp dir, so the path is advertised in
 //! `<data_dir>/fanta_live_mcp.json` for clients to discover:
 //! `{ "socket": "/…/mcp.sock", "pid": 1234 }`.
+//!
+//! Because it is on by default, every launch — including each dev
+//! `cargo run` — binds a new socket and overwrites that discovery file, and
+//! nothing removes the file when the app quits (only turning the setting off
+//! does). So a reader can find a file naming a dead process: the
+//! `--mcp-stdio` bridge has to check the recorded pid before trusting the
+//! socket path next to it.
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
 use context_server::listener::{McpServer, McpServerTool, ToolResponse};
-use context_server::types::ToolAnnotations;
+use context_server::types::{
+    Implementation, InitializeResponse, LATEST_PROTOCOL_VERSION, ProtocolVersion,
+    ServerCapabilities, ToolAnnotations, ToolsCapabilities, VERSION_2024_11_05, VERSION_2025_03_26,
+    VERSION_2025_06_18, requests,
+};
 use design_surface::{DesignOp, NodeQuery, ScreenshotTarget};
-use gpui::{App, AppContext as _, AsyncApp};
+use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings, SettingsStore};
 use std::path::PathBuf;
 use util::ResultExt as _;
+use workspace::Workspace;
 
 #[derive(Debug, RegisterSetting)]
 pub struct FantaLiveMcpSettings {
@@ -32,7 +44,7 @@ impl Settings for FantaLiveMcpSettings {
                 .fanta_live_mcp
                 .as_ref()
                 .and_then(|content| content.enabled)
-                .unwrap_or(false),
+                .unwrap_or(true),
         }
     }
 }
@@ -80,6 +92,59 @@ fn apply_setting(cx: &mut App) {
             server.add_tool(BatchDesignTool);
             server.add_tool(GetScreenshotTool);
             server.add_tool(ReadFnxSourceTool);
+            server.handle_request::<requests::Initialize>(|params, cx| {
+                let client_name = params.client_info.name;
+                // The handler only holds `&App`, and the connecting agent is
+                // typically in a terminal, so the platform-focused window is
+                // usually None: notice every window instead.
+                cx.spawn(async move |cx| {
+                    cx.update(|cx| {
+                        for window in cx.windows() {
+                            window
+                                .update(cx, |_, window, cx| {
+                                    crate::view::show_canvas_notice(
+                                        format!("Agent connected: {client_name}"),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        }
+                    });
+                })
+                .detach();
+
+                let requested = params.protocol_version.0;
+                let protocol_version = if matches!(
+                    requested.as_str(),
+                    VERSION_2024_11_05
+                        | VERSION_2025_03_26
+                        | VERSION_2025_06_18
+                        | LATEST_PROTOCOL_VERSION
+                ) {
+                    requested
+                } else {
+                    LATEST_PROTOCOL_VERSION.to_string()
+                };
+
+                Task::ready(Ok(InitializeResponse {
+                    protocol_version: ProtocolVersion(protocol_version),
+                    capabilities: ServerCapabilities {
+                        tools: Some(ToolsCapabilities {
+                            list_changed: Some(false),
+                        }),
+                        ..Default::default()
+                    },
+                    server_info: Implementation {
+                        name: "fanta".into(),
+                        title: Some("Fanta".into()),
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        description: None,
+                    },
+                    meta: None,
+                }))
+            });
+            server.handle_request::<Ping>(|_, _| Task::ready(Ok(Default::default())));
             anyhow::Ok(server)
         }
         .await
@@ -119,6 +184,52 @@ fn apply_setting(cx: &mut App) {
 
 fn discovery_path() -> PathBuf {
     paths::data_dir().join("fanta_live_mcp.json")
+}
+
+/// `ping`, declared locally rather than reusing
+/// [`context_server::types::requests::Ping`]: that one's response is `()`,
+/// which serialises to `null`, and clients reject a ping result that is not
+/// an object.
+struct Ping;
+
+impl context_server::types::Request for Ping {
+    type Params = Option<serde_json::Value>;
+    type Response = serde_json::Map<String, serde_json::Value>;
+    const METHOD: &'static str = "ping";
+}
+
+/// Hook `Connect External Agent` up to a freshly created workspace. Called
+/// from [`crate::workspace_hooks::init`]'s `observe_new` so every window gets
+/// it.
+pub(crate) fn register(workspace: &mut Workspace) {
+    workspace.register_action(
+        |_workspace, _: &zed_actions::fanta::ConnectExternalAgent, window, cx| {
+            let executable = match std::env::current_exe() {
+                Ok(executable) => executable,
+                Err(error) => {
+                    log::error!("locating the Fanta executable failed: {error:#}");
+                    crate::view::show_canvas_notice(
+                        format!("Fanta could not locate its own executable: {error}"),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            };
+            let executable = executable.display().to_string();
+            cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                "claude mcp add -s user fanta -- {executable} --mcp-stdio"
+            )));
+            crate::view::show_canvas_notice(
+                format!(
+                    "Claude Code command copied. For Codex, add to ~/.codex/config.toml: \
+                     [mcp_servers.fanta] command = \"{executable}\" args = [\"--mcp-stdio\"]"
+                ),
+                window,
+                cx,
+            );
+        },
+    );
 }
 
 /// Deserialize helper: treat omitted/`null` MCP `arguments` as the default
@@ -257,6 +368,9 @@ impl McpServerTool for BatchGetTool {
 /// transaction: create_node (frame/rectangle/ellipse/text), create_image
 /// (base64 source), set_props, reparent, delete, select, set_viewport. If any
 /// op fails the whole batch rolls back and the result names the failing op.
+/// Strokes, gradients, shadows, auto-layout, fonts and components are not
+/// batch_design properties: read the page .fnx with read_fnx_source, edit the
+/// file, and the canvas reloads (the change is a git diff).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct BatchDesignArgs {
     /// The ops to apply, in order.
@@ -349,7 +463,9 @@ impl McpServerTool for GetScreenshotTool {
 
 /// List the open Fanta project's FNX source files (omit `path`), or return one
 /// file's text (e.g. `pages/<id>/page.fnx`). Edit sources with your own file
-/// tools; the canvas hot-reloads about 300ms after a save.
+/// tools; while the project is open in Fanta the canvas hot-reloads about
+/// 300ms after a save, and otherwise the edit is picked up the next time it is
+/// opened.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 struct ReadFnxSourceArgs {
     /// Project-relative source path; omit to list the source files.

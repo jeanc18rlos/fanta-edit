@@ -158,6 +158,10 @@ actions!(
         ToggleLayersSidebar,
         /// Show or hide the embedded inspector sidebar.
         ToggleInspectorSidebar,
+        /// Select every top-level node on the current page.
+        SelectAll,
+        /// Fit the viewport around the current selection.
+        ZoomToSelection,
     ]
 );
 
@@ -608,7 +612,25 @@ impl FigView {
                     }
                     cx.emit(FigViewEvent::TitleChanged);
                 }
+                FigItemEvent::ReloadedFromDisk { merged } => {
+                    let source = this.active_page_source_label(cx);
+                    let message = if *merged {
+                        format!(
+                            "{source} changed on disk — merged into your unsaved canvas edits"
+                        )
+                    } else {
+                        format!("{source} changed on disk — canvas updated")
+                    };
+                    show_canvas_notice_deferred(message, cx);
+                }
                 FigItemEvent::ConflictChanged => {
+                    if this.item.read(cx).has_conflict() {
+                        show_canvas_notice_deferred(
+                            "External edits conflict with unsaved canvas edits — save or reload to resolve"
+                                .to_string(),
+                            cx,
+                        );
+                    }
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::SourceEditLockChanged => {
@@ -685,6 +707,32 @@ impl FigView {
             }
             cx.notify();
         })
+    }
+
+    /// Name the file an external reload changed: the active page's source,
+    /// relative to the project root. Falls back to the generic "Design" when
+    /// the document is not a project on disk, has no page scope, or has no
+    /// materialised source for that page yet.
+    fn active_page_source_label(&self, cx: &App) -> String {
+        let item = self.item.read(cx);
+        let fallback = "Design".to_string();
+        let Some(root) = item.project_root() else {
+            return fallback;
+        };
+        let Some(page) = item
+            .document()
+            .and_then(|document| document.doc.active_page())
+        else {
+            return fallback;
+        };
+        let Some(source) = fanta_format::locate_page_source(root, page) else {
+            return fallback;
+        };
+        source
+            .strip_prefix(root)
+            .unwrap_or(&source)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn cancel_canvas_edits_for_source_lock(&mut self, cx: &mut Context<Self>) {
@@ -2284,7 +2332,16 @@ impl FigView {
     }
 
     fn reset_zoom(&mut self, _: &ResetZoom, _window: &mut Window, cx: &mut Context<Self>) {
-        self.fit_page_to_view(cx);
+        self.zoom_to_percent(100, cx);
+    }
+
+    fn zoom_to_selection_action(
+        &mut self,
+        _: &ZoomToSelection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.zoom_to_selection(cx);
     }
 
     fn fit_to_view(&mut self, _: &FitToView, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2456,6 +2513,34 @@ impl FigView {
         cx: &mut Context<Self>,
     ) {
         self.duplicate_selected_nodes(cx);
+    }
+
+    /// Select every top-level node of the page the canvas is showing.
+    ///
+    /// A document with no active page renders all of its roots, and
+    /// `children_of(None)` would then hand back the pages themselves —
+    /// selecting pages is not what "select all" means, so bail instead.
+    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+        // The inline text session owns its own selection; selecting canvas
+        // nodes underneath it mid-typing is never what the user asked for.
+        if self.text_edit.is_some() {
+            return;
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let Some(root) = document.doc.active_page() else {
+                    return ((), DocChange::None);
+                };
+                // `children_of` borrows the scene that the selection sits
+                // beside, so the ids must be copied out before mutating it.
+                let nodes = document.doc.scene.children_of(Some(root)).to_vec();
+                document.doc.selection.clear();
+                for node in nodes {
+                    document.doc.selection.add(node);
+                }
+                ((), DocChange::Selection)
+            });
+        });
     }
 
     pub(crate) fn copy_selected_nodes(&mut self, cx: &mut Context<Self>) {
@@ -3822,6 +3907,58 @@ impl Render for FigView {
             .on_action(cx.listener(Self::cut_selection))
             .on_action(cx.listener(Self::paste_selection))
             .on_action(cx.listener(Self::duplicate_selection))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::zoom_to_selection_action))
+            // The application Edit menu dispatches `editor::actions::*`, which
+            // nothing on the canvas would otherwise answer. Each forwarder
+            // stands aside while the inline text session is live: that session
+            // is a `CanvasTextEdit`, not an `Editor`, so without the guard
+            // Edit > Undo mid-typing would commit and close the session and
+            // then undo an unrelated node operation.
+            .on_action(cx.listener(|this, _: &editor::actions::Undo, window, cx| {
+                if this.text_edit.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                this.undo(&Undo, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor::actions::Redo, window, cx| {
+                if this.text_edit.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                this.redo(&Redo, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor::actions::Cut, window, cx| {
+                if this.text_edit.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                this.cut_selection(&CutSelection, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor::actions::Copy, window, cx| {
+                if this.text_edit.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                this.copy_selection(&CopySelection, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &editor::actions::Paste, window, cx| {
+                if this.text_edit.is_some() {
+                    cx.propagate();
+                    return;
+                }
+                this.paste_selection(&PasteSelection, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &editor::actions::SelectAll, window, cx| {
+                    if this.text_edit.is_some() {
+                        cx.propagate();
+                        return;
+                    }
+                    this.select_all(&SelectAll, window, cx);
+                }),
+            )
             .on_action(cx.listener(Self::play_prototype))
             .on_action(cx.listener(Self::exit_prototype))
             .on_action(cx.listener(Self::restart_prototype))
@@ -5388,6 +5525,60 @@ mod tests {
         assert!(motion_panel.top() > inspector.top());
     }
 
+    /// Select All takes the active page's own children — never the page
+    /// roots, which is what an unscoped `children_of(None)` would return.
+    #[gpui::test]
+    async fn select_all_selects_the_active_pages_top_level_nodes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut first = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        first.parent = Some(page);
+        let first_id = first.id;
+        doc.apply(Operation::create_node(first))
+            .expect("create first node");
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.parent = Some(page);
+        let second_id = second.id;
+        doc.apply(Operation::create_node(second))
+            .expect("create second node");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.select_all(&SelectAll, window, cx));
+            })
+            .expect("select all");
+
+        view.read_with(cx, |view, cx| {
+            let mut selection = view
+                .item
+                .read(cx)
+                .doc()
+                .expect("document")
+                .selection
+                .as_slice()
+                .to_vec();
+            let mut expected = vec![first_id, second_id];
+            // The selection does not promise insertion order, so compare as sets.
+            selection.sort();
+            expected.sort();
+            assert_eq!(selection, expected);
+        });
+    }
+
     #[gpui::test]
     async fn tool_activation_updates_before_canvas_viewport_exists(cx: &mut TestAppContext) {
         init_test(cx);
@@ -5923,7 +6114,6 @@ impl FigView {
     /// scroll and keyboard zooms use, anchored at the canvas center. The
     /// factor comes from the live viewport zoom — not the rounded display
     /// percent — so ladder steps and the 100% entry land exactly.
-    #[cfg(feature = "fanta-gpui-ui")]
     fn zoom_to_percent(&mut self, percent: u16, cx: &mut Context<Self>) {
         let Some(viewport) = self.viewport else {
             return;
@@ -5938,7 +6128,6 @@ impl FigView {
     /// Fit the viewport around the current selection: `fit_page_to_view`'s
     /// framing applied to the union of the selected nodes' world bounds.
     /// No-op when nothing is selected or no selected node has finite bounds.
-    #[cfg(feature = "fanta-gpui-ui")]
     fn zoom_to_selection(&mut self, cx: &mut Context<Self>) {
         let viewport = self
             .container_bounds
@@ -6344,6 +6533,21 @@ pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut 
             Toast::new(NotificationId::named(CANVAS_NOTICE_ID.into()), message).autohide(),
             cx,
         );
+    });
+}
+
+/// Show a canvas notice from a place that holds no `Window` — an item event
+/// subscription. The notice lands on the active window at the next effect
+/// flush, which is also when the reload it announces has finished applying.
+fn show_canvas_notice_deferred(message: String, cx: &mut App) {
+    cx.defer(move |cx| {
+        let Some(window) = cx.active_window() else {
+            log::warn!("fanta: no active window to show a canvas notice in: {message}");
+            return;
+        };
+        window
+            .update(cx, |_, window, cx| show_canvas_notice(message, window, cx))
+            .log_err();
     });
 }
 

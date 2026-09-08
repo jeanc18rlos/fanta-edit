@@ -2,6 +2,10 @@
 use std::process::Command;
 
 fn main() {
+    // Without this the cfg below only flips when the build script happens to
+    // rerun for another reason, so an incremental bundle can ship a cli that
+    // disagrees with the binary built alongside it.
+    println!("cargo:rerun-if-env-changed=ZED_UPDATE_EXPLANATION");
     if std::env::var("ZED_UPDATE_EXPLANATION").is_ok() {
         println!(r#"cargo:rustc-cfg=feature="no-bundled-uninstall""#);
     }

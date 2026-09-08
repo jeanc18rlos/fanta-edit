@@ -24,8 +24,6 @@ test-support = [
     "settings/test-support",
     "util/test-support",
     "workspace/test-support",
-
-    "title_bar/test-support",
 ]
 
 [dependencies]

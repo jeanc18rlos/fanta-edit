@@ -948,6 +948,8 @@ pub mod fanta {
     actions!(
         fanta,
         [
+            /// Copies the command that connects Claude Code to the open design, and shows the Codex snippet.
+            ConnectExternalAgent,
             /// Creates a new Fanta design.
             NewDesign
         ]
