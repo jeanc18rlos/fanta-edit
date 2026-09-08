@@ -55,6 +55,16 @@ popd
 
 export ZED_BUNDLE=true
 
+# cargo bundle honours CARGO_TARGET_DIR, but the copy steps below read from the
+# repo-relative target/. With the variable set, the app is bundled from one tree
+# and then has binaries from another copied over it, silently producing a DMG
+# that mixes two builds.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    echo "CARGO_TARGET_DIR is set to '${CARGO_TARGET_DIR}'."
+    echo "Unset it before bundling: the bundle and the binaries would come from different trees."
+    exit 1
+fi
+
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
 if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
     cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
