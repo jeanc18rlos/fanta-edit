@@ -121,9 +121,32 @@ first co-presence surface. Tracked separately.
 
 ## Status
 
-As of `fe2612c` (0.1.0-alpha.1). Checked boxes were verified against the tree
-and, where noted, against a running build by
-[`script/smoke-mcp`](../script/smoke-mcp).
+As of `16309b2` (0.1.0-alpha.1). Checked boxes were verified against the tree,
+and the write plane additionally against a running build:
+[`script/smoke-mcp`](../script/smoke-mcp) asserts 18 things about the loop and
+passed **18/18, exit 0** twice at `fe2612c`, the second time after a full quit
+and a cold reload of a 43 MB page. It then passed 18/18 twice more at `16309b2`
+against the release build installed at `/Applications/Fanta.app`, once reusing a
+running instance and once launching it cold. The Unix-socket fallback path passed
+18/18 at `6e14229`, in the rehearsal, and has not been re-run since. Unchecked
+boxes are **not started**, not "in progress".
+
+The transport is a Unix socket, not the TCP + Streamable-HTTP server §1 proposes:
+`fig_viewer::live_mcp` listens on a socket in a per-launch temp dir and
+advertises it in `<data_dir>/fanta_live_mcp.json`, and `fanta --mcp-stdio`
+(`crates/zed/src/zed/mcp_stdio.rs`) bridges stdio clients onto it. The setting
+that gates it is `fanta_live_mcp.enabled`, which defaults to **true** in every
+build, not just dev ones.
+
+What is *not* covered by that evidence: nothing behind a mouse click. The
+in-app agent panel, the welcome page's Connect buttons and every menu path were
+never driven — see [`docs/alpha/REHEARSAL.md`](alpha/REHEARSAL.md).
+
+Naming, because the sections above are a design and not a changelog: the tool
+names proposed in §2 (`design_read`, `design_batch`, `design_screenshot`,
+`fnx_edit`) **do not exist**. The five that ship are `get_editor_state`,
+`batch_get`, `batch_design`, `get_screenshot` and `read_fnx_source`. If you are
+writing a test or a doc, use those.
 
 - [x] Research pass (7 readers + Figma/Pencil MCP study)
 - [x] Worktree `feat/live-mcp-v2` (sibling checkout so `../fanta-engine-migration` resolves)

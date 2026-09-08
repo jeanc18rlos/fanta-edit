@@ -18,6 +18,16 @@ This is an **alpha**. It is rough in places, and
 [`docs/alpha/KNOWN_ISSUES.md`](docs/alpha/KNOWN_ISSUES.md) is honest rather than
 short.
 
+```
+cargo run -p zed                     # build and run; the binary is named fanta
+claude mcp add -s user fanta -- \
+  /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio   # connect an agent
+script/smoke-mcp <fanta-binary> <project-dir>   # prove the whole loop, 18 checks
+```
+
+[Build from source](#build-from-source) · [Connect an agent](#connect-an-agent)
+· [Install the DMG](#install)
+
 ## Requirements
 
 - **Apple Silicon.** The bundle script builds for the host triple and the alpha
@@ -87,13 +97,20 @@ The binary is named `fanta`. Useful entry points:
   it. The fastest way to know a build works.
 
 The design engine lives in the vendored `crates/fanta-*` crates; the app shell
-is a fork of Zed with the IDE removed.
+is a fork of Zed with the IDE removed — 179 workspace members remain, of which
+164 link into the app binary, inside a 904-crate dependency graph
+(`cargo tree -p zed --edges normal`). The debugger, vim, edit prediction,
+Copilot, collab, livekit, dev containers, the file finder, the project panel,
+the outline panel, onboarding, the extension host, wasmtime and the AWS SDK are
+no longer linked.
 
 ## Getting started in the app
 
 1. **File > Open...** a `.fig` file, or **File > New Design...** to start empty.
-   Opening a `.fig` writes a Fanta project folder beside it; that folder, not the
-   original `.fig`, is what your edits go to.
+   Opening a `.fig` writes a Fanta project folder beside it on open, and
+   `git init`s it; that folder, not the original `.fig`, is what your edits go
+   to. Large files take a while — a 9.6 MB `.fig` took 30-40 s to reach a
+   rendered canvas on a debug build.
 2. Draw. Edits autosave about a second after you stop — no `cmd-s` needed.
 3. **File > Review Changes** shows the diff your edits made; **File > Commit…**
    commits them.
@@ -117,15 +134,26 @@ meet first:
 - Copy and paste works within one document only; pasting an image or a file from
   another app does nothing.
 - Opening a folder that is *not* a design project raises an inherited
-  Restricted Mode dialog that Escape will not dismiss.
+  Restricted Mode dialog that Escape will not dismiss. A design project Fanta
+  scaffolded is trusted automatically; one you received as a zip or a copied
+  folder is only trusted if its `.git` has no hooks and a config every line of
+  which is on a short allowlist of keys known to be inert, so a shared project
+  can prompt too.
 - Without Xcode Command Line Tools installed, a new project saves but is not
   git-initialised.
 - Very large community `.fig` files (100 MB and up) are slow to open.
 
 ## Feedback
 
-Please file issues at [ISSUES_URL_TODO]. Logs live in `~/Library/Logs/Fanta/`
-and attaching `Fanta.log` makes almost every report easier to act on.
+There is no public issue tracker for the alpha yet — report back through
+whoever gave you the build. Logs live in `~/Library/Logs/Fanta/`, and attaching
+`Fanta.log` makes almost every report easier to act on. Two ERROR lines in there
+are known and cosmetic (`language not found` from the agent composer, and the
+Metal renderer's `scene too large … retrying`); anything else is worth sending.
+
+If the app crashed, the shipped binary is stripped, so a backtrace is bare
+addresses. `script/bundle-mac` writes `fanta.dwarf` next to the binary it built;
+symbolicate with `atos -o fanta.dwarf -arch arm64 -l <load address> <address>`.
 
 ## License
 

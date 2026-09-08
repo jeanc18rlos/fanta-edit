@@ -13,10 +13,12 @@ Fanta writes a project folder — `fanta.json`, a `pages/` tree of `.fnx` source
 the folder changes; `git diff` shows you what you did. An agent editing the same
 folder is doing exactly what your cursor does.
 
-Every feature sentence below was checked against this tree at commit `fe2612c`.
-Where something was measured, the number is the measurement. Where nothing was
-run, [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and [`REHEARSAL.md`](REHEARSAL.md) say
-so instead.
+Every feature sentence below was re-checked against this tree at commit
+`16309b2`, by grepping for the thing it claims. Where something was measured,
+the number is the measurement and the command that produced it, and the commit
+it was taken at. Where nothing was run, [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and
+[`REHEARSAL.md`](REHEARSAL.md) say so instead — and `REHEARSAL.md`'s "could not
+verify" rows are not restated here as features.
 
 ## Install
 
@@ -108,13 +110,17 @@ while a prototype is playing and while a keyframe is being dragged
 frame of a drag.
 
 A new project is `git init`-ed the first time it is written
-(`git_init_if_needed`, `crates/fig_viewer/src/document.rs`) unless it already
-sits inside a repository, in which case its changes show up in the repository
-you already have.
+(`git_init_if_needed`, `crates/fig_viewer/src/document.rs:1787`) unless it
+already sits inside a repository, in which case its changes show up in the
+repository you already have. That call shells out to `git` on `PATH`, and a
+failure is logged and swallowed so that a save never fails because version
+control is unavailable — which on a Mac with no Xcode Command Line Tools means
+the design saves and the folder is *not* a repository. See
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
 
-That loop was measured on a live document, not asserted. One rectangle created
-over MCP by an outside process, nobody at the keyboard, on the **first** edit
-after importing a 9.6 MB `.fig`:
+That loop was measured on a live document at `fe2612c`, not asserted. One
+rectangle created over MCP by an outside process, nobody at the keyboard, on the
+**first** edit after importing a 9.6 MB `.fig`:
 
 ```
  doc/metadata.json          | 2 +-
@@ -144,9 +150,17 @@ uncommitted canvas work.
 
 ## What else is in this build
 
+A warning about this section: it is a list of what the code contains, not a list
+of what was tested. The only canvas operations ever driven end to end are the
+ones `script/smoke-mcp` performs — create a rectangle with a fill, read it back,
+render it, and watch it reach git. Everything else below is a source reading.
+[`SMOKE.md`](SMOKE.md) is the checklist that would turn these into claims.
+
 - **Canvas editing**: shapes, frames, text, selection and transforms, auto
-  layout (horizontal and vertical only — see Known Issues), gradients, shadows
-  and blurs, components and instances, variables and modes.
+  layout (horizontal and vertical only — grid is ignored, see Known Issues),
+  gradients, shadows and blurs (four effect kinds only), components and
+  instances, and variables with modes (`variable_binding.rs`,
+  `mode_overrides.rs`).
 - **Prototype flows and presentation**, motion clips with a timeline, and pinned
   comments. These are compiled in but were **not exercised** in the alpha smoke
   run at all; treat them as unverified.
@@ -169,20 +183,28 @@ uncommitted canvas work.
 Two cut waves ran before this alpha. Every number here was measured against this
 repository just now, with the command that produced it.
 
-- **80 workspace members deleted: 259 → 179.** Counted from the `members` list
-  in `Cargo.toml` at `d25c2a8~1` and at `fe2612c`.
-- **375,444 lines deleted across 1,291 files**, against 5,759 inserted.
-  `git diff --shortstat d25c2a8~1 fe2612c`.
-- **164 workspace crates** now link into the app binary, inside a **904-crate**
-  total dependency graph. `cargo tree -p zed --edges normal`. The equivalent
-  figure before the cuts is not quoted here, because measuring it would require
-  checking out the old tree.
-- **No longer linked into the app binary**, each one checked against
-  `cargo tree -p zed --edges normal`: the debugger, vim, edit prediction, GitHub
-  Copilot, collab, livekit, dev containers, the file finder, the project panel,
-  the outline panel, onboarding, the extension host, wasmtime and the AWS SDK.
-  Some of these still exist as workspace members — the claim is that the app
-  does not link them, not that the directories are gone.
+- **80 workspace members deleted: 259 → 179.** Counted just now from the
+  `members` list in `Cargo.toml` at `d25c2a8~1` and at `16309b2`.
+- **375,496 lines deleted across 1,292 files.** `git diff --shortstat
+  d25c2a8~1 HEAD`, re-run just now. The insertion side of that stat is not
+  quoted, because it moves every time one of these documents is edited.
+- **164 of the 179 workspace members link into the app binary**, inside a
+  **904-crate** total dependency graph. Re-measured just now with
+  `cargo tree -p zed --edges normal --offline`, intersected against the package
+  name in each member's `Cargo.toml`. The fifteen members that do not link are
+  `etw_tracing`, `eval_utils`, `go_to_line`, `gpui_linux`, `gpui_web`,
+  `gpui_wgpu`, `gpui_windows`, `json_schema_store`, `languages`,
+  `markdown_preview`, `outline`, `outline_panel`, `project_panel`, `vim` and
+  `windows_resources`. The equivalent figure before the cuts is not quoted here,
+  because measuring it would require checking out the old tree.
+- **No longer linked into the app binary.** Each of these was checked by name
+  against that dependency list and is absent: `debugger_ui`, `vim`, `zeta`
+  (edit prediction), `copilot`, `collab`, `livekit_client`, `dev_container`,
+  `file_finder`, `project_panel`, `outline_panel`, `onboarding`,
+  `extension_host`, `edit_prediction_button`, `wasmtime` and `aws-sdk-s3`.
+  Some still exist as workspace members — the claim is that the app does not
+  link them, not that the directories are gone. `terminal_view` **is** still
+  linked, deliberately: an external ACP agent runs in one.
 - **Fanta registers six grammars and zero language servers.** `fanta_languages`
   registers `fnx`, `tsx`, `typescript`, `json`, `jsonc` and `regex` for syntax
   highlighting, with no LSP adapters, no toolchain listers and no task providers
@@ -198,9 +220,11 @@ repository just now, with the command that produced it.
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) is the honest list and it is not short.
 The headlines: parts of the toolbar and inspector are visible but not wired up
 and say so when clicked; there is no Group or Ungroup; cross-document and image
-paste do not work; and the first launch goes through macOS Gatekeeper. Design
-projects no longer raise the Restricted Mode prompt — a folder that is *not* a
-design project still does, and that dialog cannot be dismissed with Escape.
+paste do not work; and the first launch goes through macOS Gatekeeper. A design
+project Fanta scaffolded opens without the Restricted Mode prompt; a folder that
+is *not* a design project — and a design project whose copied `.git` carries
+anything this build does not recognise as inert — still raises it, and that
+dialog cannot be dismissed with Escape.
 
 ## What was verified for this release
 
@@ -209,20 +233,52 @@ The external-agent loop was proven mechanically against a live document by
 handshake, `ping`, the tool list, editor state naming each page's source file,
 `read_fnx_source`, `batch_design` creating a node, the canvas going dirty, the
 autosave reaching disk, the resulting git diff, `get_screenshot` and
-`batch_get`. It was run twice against the built binary on a project freshly
-imported from a 9.6 MB `.fig` — the second time after a full quit and a cold
-reload of the 43 MB page — and passed **18 of 18** both times, exit 0. It also
-fails correctly: pointed at a directory that is not a repository, or at a path
-that is not an executable, it reports the failed assertion and exits 1.
+`batch_get`. At `fe2612c` it was run twice against the built binary on a project
+freshly imported from a 9.6 MB `.fig` — the second time after a full quit and a
+cold reload of the 43 MB page — and passed **18 of 18** both times, exit 0. The
+Unix-socket fallback (`--socket`) passed 18/18 earlier, at `6e14229`, and has
+not been re-run since. It also fails correctly: pointed at a directory that is
+not a repository, or at a path that is not an executable, it reports the failed
+assertion and exits 1.
 
-Also verified directly, by running the binary built from this tree:
-`fanta --version` prints `fanta 0.1.0-alpha.1`; `fanta --help | grep -ic zed`
-returns `0`, and `--mcp-stdio` is documented in that help output;
-`fanta --system-specs` opens with `Fanta: v0.1.0-alpha.1+stable.<sha>` and no
-longer says `Zed`; and filtering `fanta --dump-all-actions` (1,031 actions)
-through the namespace and action-type filter this build installs leaves 929
-visible, with nothing matching "vim", "debugger", "project panel" or "new
-file".
+**The release build has since been made and smoke-tested.** `script/bundle-mac`
+at `16309b2` exited 0, and `script/smoke-mcp` was then run twice against the
+shipped app installed at `/Applications/Fanta.app` — once reusing a running
+instance, once launching it cold — and passed **18 of 18** both times. So the
+loop is proven in the artefact a tester downloads, not only in a dev build. The
+one thing that build cannot prove about itself is Gatekeeper: it was never
+downloaded through a browser, so it carries no quarantine attribute and the
+"Apple could not verify" dialog above has still never been seen. Row G of
+[`SMOKE.md`](SMOKE.md) is the only way to settle that.
+
+The CLI checks below were re-run against that release binary, not carried over.
+
+- `fanta --version` → `fanta 0.1.0-alpha.1`.
+- `fanta --help | grep -ic zed` → `0`, and `--mcp-stdio` appears in that help
+  output. The flag is no longer `hide = true` — verified in the tree just now at
+  `crates/zed/src/main.rs:1598`.
+- `fanta --system-specs` → `Fanta System Specs (from CLI):` /
+  `Fanta: v0.1.0-alpha.1+stable.<sha> (debug build)`. No `Zed` anywhere.
+- `fanta --dump-all-actions` → **1,031** actions, of which **929** survived
+  `HIDDEN_NAMESPACES` and `hide_action_types`, **44** of those in the `zed`
+  namespace, with **zero** matches for "vim", "debugger", "project panel" or
+  "new file" — and one for "terminal", `agent: new terminal thread`, which is a
+  real feature rather than a leftover. This is a derivation over the action
+  registry, **not** the palette as a human sees it: nobody has typed into the
+  palette in a running build. What *was* re-checked in the tree just now is the
+  filter itself — `crates/zed/src/main.rs` hides the `terminal`, `terminal_panel`
+  and `vim` namespaces, and `hide_action_types` names `workspace::NewFile`,
+  `NewFileSplit`, `NewFileSplitHorizontal`, `NewFileSplitVertical` and
+  `pane::RevealInProjectPanel`, which are exactly the four rows the rehearsal
+  recorded as failing.
+
+Measured against the tree just now rather than against a binary: 179 workspace
+members, 164 of them linked, a 904-crate graph, and the deletion totals above.
+`~/Library/Logs/Fanta/Fanta.log` (103 KB, five launches of that older binary)
+holds **13 ERROR lines — twelve `language not found`, one `scene too large`**,
+**zero** `didn't find an action` lines, and no panic beyond
+`panic handler registered`. Re-counted just now; the log itself pre-dates
+`16309b2`.
 
 Everything behind a mouse click — the welcome page as rendered, the menus,
 drawing with a tool, undo/redo by hand, the toolbar, the in-app agent panel —
