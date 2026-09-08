@@ -13,7 +13,9 @@ use language::{LanguageRegistry, LoadedLanguage};
 
 /// Languages Fanta registers. FNX reuses the TSX grammar and queries (see
 /// `grammars::load_queries`), so the whole set needs only two parser crates.
-const LANGUAGES: &[&str] = &["fnx", "tsx", "typescript", "json", "jsonc"];
+// `regex` is here because the buffer search bar highlights its own query
+// field with it; without it search logs an error on every window.
+const LANGUAGES: &[&str] = &["fnx", "tsx", "typescript", "json", "jsonc", "regex"];
 
 pub fn init(languages: Arc<LanguageRegistry>) {
     languages.register_native_grammars(grammars::fanta_native_grammars());
@@ -92,5 +94,22 @@ mod tests {
             .expect("JSON loads with its grammar");
         assert!(json.grammar().is_some());
         assert!(languages.lsp_adapters(&json.name()).is_empty());
+    }
+
+    /// The buffer search bar highlights its own query field with the regex
+    /// grammar and logs an error at startup if it is missing.
+    #[gpui::test]
+    async fn regex_is_registered_for_the_search_bar(cx: &mut gpui::TestAppContext) {
+        let languages = Arc::new(LanguageRegistry::new(cx.executor()));
+        init(languages.clone());
+
+        let regex = languages
+            .language_for_name("Regex")
+            .await
+            .expect("the search bar's regex language must be registered");
+        assert!(
+            regex.grammar().is_some(),
+            "the regex grammar should have resolved"
+        );
     }
 }

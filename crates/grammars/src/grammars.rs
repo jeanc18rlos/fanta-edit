@@ -50,6 +50,7 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
 pub fn fanta_native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
     vec![
         ("json", tree_sitter_json::LANGUAGE.into()),
+        ("regex", tree_sitter_regex::LANGUAGE.into()),
         ("jsonc", tree_sitter_json::LANGUAGE.into()),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
         (

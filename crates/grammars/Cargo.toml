@@ -62,6 +62,7 @@ load-grammars = [
 fanta-grammars = [
     "tree-sitter",
     "tree-sitter-json",
+    "tree-sitter-regex",
     "tree-sitter-typescript",
 ]
 test-support = ["load-grammars"]
