@@ -508,24 +508,7 @@ fn git_repository_cannot_execute_anything(abs_path: &Path) -> bool {
     let config_path = git_dir.join("config");
     match std::fs::read_to_string(&config_path) {
         Ok(config) => {
-            const EXECUTABLE_CONFIG_KEYS: &[&str] = &[
-                "hookspath",
-                "sshcommand",
-                "credential",
-                "external",
-                "textconv",
-                "fsmonitor",
-                "pager",
-                "smudge",
-                "clean",
-                "[alias]",
-                "protocol.ext",
-            ];
-            let config = config.to_ascii_lowercase();
-            if EXECUTABLE_CONFIG_KEYS
-                .iter()
-                .any(|key| config.contains(key))
-            {
+            if !git_config_is_entirely_inert(&config) {
                 return false;
             }
         }
@@ -534,6 +517,82 @@ fn git_repository_cannot_execute_anything(abs_path: &Path) -> bool {
     }
 
     true
+}
+
+/// Whether every setting in a git config is known to be inert.
+///
+/// This is an allowlist rather than a list of dangerous keys, because the
+/// dangerous set is open-ended and not even bounded by the file: `include.path`
+/// and `includeIf` pull in settings from anywhere else on disk, so scanning this
+/// text for bad keys can miss them entirely. Anything not recognised — including
+/// any include directive, and any line that is not a plain `key = value` — means
+/// we do not understand the repository well enough to grant it trust, and the
+/// user is asked instead.
+fn git_config_is_entirely_inert(config: &str) -> bool {
+    let mut section = String::new();
+    for line in config.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|line| line.strip_suffix(']')) {
+            // `[remote "origin"]` names a subsection we do not need to look at;
+            // the section alone decides which keys are meaningful.
+            section = header
+                .split('"')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        if !git_setting_is_inert(
+            &section,
+            key.trim().to_ascii_lowercase().as_str(),
+            value.trim(),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn git_setting_is_inert(section: &str, key: &str, value: &str) -> bool {
+    match section {
+        "core" => matches!(
+            key,
+            "repositoryformatversion"
+                | "filemode"
+                | "bare"
+                | "logallrefupdates"
+                | "ignorecase"
+                | "precomposeunicode"
+                | "symlinks"
+                | "autocrlf"
+                | "safecrlf"
+                | "quotepath"
+                | "longpaths"
+                | "untrackedcache"
+                | "commitgraph"
+        ),
+        // An `ext::` remote runs the rest of the URL as a command on fetch, which
+        // is the whole reason git gates it behind `protocol.ext.allow`.
+        "remote" => {
+            matches!(key, "url" | "pushurl" | "fetch" | "push" | "tagopt" | "prune")
+                && !value.to_ascii_lowercase().starts_with("ext::")
+        }
+        "branch" => matches!(key, "remote" | "merge" | "rebase" | "description"),
+        "pull" => matches!(key, "rebase" | "ff"),
+        "push" => matches!(key, "default" | "autosetupremote" | "followtags"),
+        "fetch" | "gc" => matches!(key, "prune" | "auto"),
+        "init" => key == "defaultbranch",
+        "user" => matches!(key, "name" | "email"),
+        "submodule" => key == "active",
+        _ => false,
+    }
 }
 
 fn trust_worktree_if_design_project(
@@ -2641,6 +2700,61 @@ mod trust_tests {
         let root = scratch("hook");
         init_repo(&root);
         fs::write(root.join(".git/hooks/post-checkout"), "#!/bin/sh\nid\n").expect("hook");
+        assert!(!git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_cloned_design_repository_is_trusted() {
+        let root = scratch("cloned");
+        init_repo(&root);
+        fs::write(
+            root.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\
+             [remote \"origin\"]\n\turl = https://example.com/design.git\n\
+             \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+             [branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+        )
+        .expect("config");
+        assert!(git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_include_directive_is_refused() {
+        let root = scratch("include");
+        init_repo(&root);
+        fs::write(
+            root.join(".git/config"),
+            "[core]\n\tbare = false\n[include]\n\tpath = ../evil\n",
+        )
+        .expect("config");
+        assert!(!git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_ext_remote_url_is_refused() {
+        let root = scratch("ext");
+        init_repo(&root);
+        fs::write(
+            root.join(".git/config"),
+            "[remote \"origin\"]\n\turl = ext::sh -c id\n",
+        )
+        .expect("config");
+        assert!(!git_repository_cannot_execute_anything(&root));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_unknown_section_is_refused() {
+        let root = scratch("unknown");
+        init_repo(&root);
+        fs::write(
+            root.join(".git/config"),
+            "[core]\n\tbare = false\n[gpg]\n\tprogram = /tmp/evil\n",
+        )
+        .expect("config");
         assert!(!git_repository_cannot_execute_anything(&root));
         fs::remove_dir_all(&root).ok();
     }
