@@ -1,7 +1,6 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+    CloseWindow, Open, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible, SplitDirection,
+    ToggleZoom, Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
     item::{
@@ -4241,17 +4240,10 @@ fn default_render_tab_bar_buttons(
                 .with_handle(pane.new_item_context_menu_handle.clone())
                 .menu(move |window, cx| {
                     Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New File", NewFile.boxed_clone())
-                            .action("Open File", ToggleFileFinder::default().boxed_clone())
+                        menu.action("New Design…", zed_actions::fanta::NewDesign.boxed_clone())
+                            .action("Open…", Open::DEFAULT.boxed_clone())
                             .separator()
                             .action("Search Project", DeploySearch::default().boxed_clone())
-                            .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
-                            .separator()
-                            .action("New Terminal", NewTerminal::default().boxed_clone())
-                            .action(
-                                "New Center Terminal",
-                                NewCenterTerminal::default().boxed_clone(),
-                            )
                     }))
                 }),
         )
@@ -4494,7 +4486,6 @@ impl Render for Pane {
                 pane.child((self.render_tab_bar.clone())(self, window, cx))
             })
             .child({
-                let has_worktrees = project.read(cx).visible_worktrees(cx).next().is_some();
                 // main content
                 div()
                     .flex_1()
@@ -4530,7 +4521,7 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            if !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {
@@ -4541,7 +4532,7 @@ impl Render for Pane {
                                         )
                                     }));
                                 }
-                                placeholder.child(self.welcome_page.clone().unwrap())
+                                placeholder.children(self.welcome_page.clone())
                             }
                         }
                         .focus_follows_mouse(self.focus_follows_mouse, cx)
@@ -5058,6 +5049,8 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        // Fanta hides the tab bar buttons by default; this test is about them.
+        set_show_tab_bar_buttons(cx, true);
         let item = add_labeled_item(&pane, "A", false, cx);
 
         pane.update_in(cx, |pane, window, cx| {
@@ -7059,7 +7052,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_double_click_pinned_tab_bar_empty_space_creates_new_tab(cx: &mut TestAppContext) {
+    async fn test_double_click_pinned_tab_bar_empty_space_dispatches_new_design(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
 
@@ -7068,16 +7063,16 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
-        // The real NewFile handler lives in editor::init, which isn't initialized
+        // The real NewDesign handler lives in the zed crate, which isn't initialized
         // in workspace tests. Register a global action handler that sets a flag so
-        // we can verify the action is dispatched without depending on the editor crate.
-        // TODO: If editor::init is ever available in workspace tests, remove this
-        // flag and assert the resulting tab bar state directly instead.
-        let new_file_dispatched = Rc::new(Cell::new(false));
+        // we can verify the action is dispatched without depending on that crate.
+        // TODO: If the zed crate's handler is ever available in workspace tests,
+        // remove this flag and assert the resulting tab bar state directly instead.
+        let new_design_dispatched = Rc::new(Cell::new(false));
         cx.update(|_, cx| {
-            let new_file_dispatched = new_file_dispatched.clone();
-            cx.on_action(move |_: &NewFile, _cx| {
-                new_file_dispatched.set(true);
+            let new_design_dispatched = new_design_dispatched.clone();
+            cx.on_action(move |_: &zed_actions::fanta::NewDesign, _cx| {
+                new_design_dispatched.set(true);
             });
         });
 
@@ -7118,11 +7113,12 @@ mod tests {
 
         cx.run_until_parked();
 
-        // TODO: If editor::init is ever available in workspace tests, replace this
-        // with an assert_item_labels check that verifies a new tab is actually created.
+        // TODO: If the zed crate's handler is ever available in workspace tests,
+        // replace this with an assert_item_labels check that verifies a new tab
+        // is actually created.
         assert!(
-            new_file_dispatched.get(),
-            "Double-clicking pinned tab bar empty space should dispatch the new file action"
+            new_design_dispatched.get(),
+            "Double-clicking pinned tab bar empty space should dispatch the new design action"
         );
     }
 
@@ -8435,18 +8431,22 @@ mod tests {
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
         cx.simulate_resize(size(px(300.), px(300.)));
+        // The assertions below measure the tab bar's '+' button, which Fanta
+        // hides by default.
+        set_show_tab_bar_buttons(cx, true);
 
-        add_labeled_item(&pane, "untitled", false, cx);
-        add_labeled_item(&pane, "untitled", false, cx);
-        add_labeled_item(&pane, "untitled", false, cx);
-        add_labeled_item(&pane, "untitled", false, cx);
-        // Act: this should trigger a scroll
-        add_labeled_item(&pane, "untitled", false, cx);
+        // Enough tabs that the last one cannot fit in a 300px window.
+        const TAB_COUNT: usize = 10;
+        for _ in 0..TAB_COUNT {
+            // Act: the last of these should trigger a scroll
+            add_labeled_item(&pane, "untitled", false, cx);
+        }
         // Assert
         let tab_bar_scroll_handle =
             pane.update_in(cx, |pane, _window, _cx| pane.tab_bar_scroll_handle.clone());
-        assert_eq!(tab_bar_scroll_handle.children_count(), 6);
-        let tab_bounds = cx.debug_bounds("TAB-4").unwrap();
+        assert_eq!(tab_bar_scroll_handle.children_count(), TAB_COUNT + 1);
+        // The debug id of the last tab; `debug_bounds` needs a `'static` name.
+        let tab_bounds = cx.debug_bounds("TAB-9").unwrap();
         let new_tab_button_bounds = cx.debug_bounds("ICON-Plus").unwrap();
         let scroll_bounds = tab_bar_scroll_handle.bounds();
         let scroll_offset = tab_bar_scroll_handle.offset();
@@ -8905,6 +8905,17 @@ mod tests {
         cx.update_global(|store: &mut SettingsStore, cx| {
             store.update_user_settings(cx, |settings| {
                 settings.workspace.max_tabs = value.map(|v| NonZero::new(v).unwrap())
+            });
+        });
+    }
+
+    fn set_show_tab_bar_buttons(cx: &mut TestAppContext, enabled: bool) {
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .tab_bar
+                    .get_or_insert_default()
+                    .show_tab_bar_buttons = Some(enabled);
             });
         });
     }

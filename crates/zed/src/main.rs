@@ -20,6 +20,7 @@ use clap::Parser;
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
 use client::{Client, ProxySettings, RefreshLlmTokenListener, UserStore, parse_zed_link};
 use collections::HashMap;
+use command_palette_hooks::CommandPaletteFilter;
 use crashes::InitCrashHandler;
 use db::kvp::{GlobalKeyValueStore, KeyValueStore};
 use fs::{Fs, RealFs};
@@ -48,6 +49,7 @@ use session::{AppSession, Session};
 use settings::{BaseKeymap, Settings, SettingsStore, watch_config_file};
 use smol::future::poll_once;
 use std::{
+    any::TypeId,
     cell::RefCell,
     env,
     io::{self, IsTerminal},
@@ -210,6 +212,19 @@ fn main() {
     if let Some(socket) = &args.askpass {
         askpass::main(socket);
         return;
+    }
+
+    // `fanta --mcp-stdio` proxies stdio JSON-RPC to the running app's live MCP
+    // socket. It must short-circuit before `ensure_only_instance()` below,
+    // which would otherwise refuse to start a second process.
+    #[cfg(not(target_os = "windows"))]
+    if args.mcp_stdio {
+        // The discovery file lives under the data dir, so the override has to
+        // be applied before it is read.
+        if let Some(dir) = &args.user_data_dir {
+            paths::set_custom_data_dir(dir);
+        }
+        process::exit(zed::mcp_stdio::run());
     }
 
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
@@ -631,6 +646,7 @@ fn main() {
 
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
         command_palette::init(cx);
+        hide_unshipped_actions_from_command_palette(cx);
         language_model::init(cx);
         RefreshLlmTokenListener::register(
             app_state.client.clone(),
@@ -812,7 +828,6 @@ fn main() {
                 diff_paths,
                 wsl,
                 diff_all: diff_all_mode,
-                dev_container: args.dev_container,
                 ..Default::default()
             })
         }
@@ -1061,7 +1076,6 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     }
 
     let mut task = None;
-    let dev_container = request.dev_container;
     if !request.open_paths.is_empty() || !request.diff_paths.is_empty() {
         let base_open_options = zed::open_options_for_request(
             request.open_behavior,
@@ -1076,10 +1090,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 &request.diff_paths,
                 request.diff_all,
                 app_state,
-                workspace::OpenOptions {
-                    open_in_dev_container: dev_container,
-                    ..base_open_options
-                },
+                base_open_options,
                 cx,
             )
             .await?;
@@ -1414,15 +1425,89 @@ fn stdout_is_a_pty() -> bool {
     !*FORCE_CLI_MODE && io::stdout().is_terminal()
 }
 
+/// Fanta links a fraction of Zed's crates, but the palette still enumerates
+/// every action that is registered anywhere in the binary. Hide the ones whose
+/// surfaces do not exist here so the palette only advertises what works.
+///
+/// Must run after `command_palette::init`: `CommandPaletteFilter::update_global`
+/// is a silent no-op until that call installs the global.
+fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
+    const HIDDEN_NAMESPACES: &[&str] = &[
+        "auto_update",
+        "call",
+        "channel",
+        "chat_panel",
+        "cli",
+        "collab",
+        "collab_panel",
+        "copilot",
+        "debug_panel",
+        "debugger",
+        "dev_container",
+        "diagnostics",
+        "edit_prediction",
+        "encoding",
+        "extensions",
+        "file_finder",
+        "git_panel",
+        "journal",
+        "keymap_editor",
+        "language_selector",
+        "line_ending",
+        "lsp",
+        "markdown",
+        "notification_panel",
+        "onboarding",
+        "outline",
+        "outline_panel",
+        "project_panel",
+        "projects",
+        "repl",
+        "settings_editor",
+        "snippets",
+        "tab_switcher",
+        "task",
+        "terminal_panel",
+        "toolchain",
+        "vim",
+        "wsl",
+        "zeta",
+    ];
+
+    CommandPaletteFilter::update_global(cx, |filter, _| {
+        for namespace in HIDDEN_NAMESPACES {
+            filter.hide_namespace(namespace);
+        }
+        // Leftovers in namespaces that must stay visible.
+        filter.hide_action_types(&[
+            TypeId::of::<zed::OpenTasks>(),
+            TypeId::of::<zed::OpenDebugTasks>(),
+            TypeId::of::<zed::OpenProjectTasks>(),
+            TypeId::of::<zed::ShowDefaultSemanticTokenRules>(),
+            TypeId::of::<zed_actions::OpenProjectDebugTasks>(),
+            TypeId::of::<zed_actions::OpenStatusPage>(),
+            TypeId::of::<zed_actions::GetMerch>(),
+            TypeId::of::<zed_actions::OpenOnboarding>(),
+            TypeId::of::<install_cli::RegisterZedScheme>(),
+            TypeId::of::<workspace::NewFile>(),
+            TypeId::of::<workspace::NewTerminal>(),
+            TypeId::of::<workspace::NewCenterTerminal>(),
+            TypeId::of::<workspace::ToggleLeftDock>(),
+            TypeId::of::<workspace::ToggleRightDock>(),
+        ]);
+    });
+}
+
 #[derive(Parser, Debug)]
-#[command(name = "zed", disable_version_flag = true, max_term_width = 100)]
+#[command(name = "fanta", version, max_term_width = 100)]
 struct Args {
     /// A sequence of space-separated paths or urls that you want to open.
     ///
+    /// Designs (`.fig` files and Fanta project folders) open on the canvas.
     /// Use `path:line:row` syntax to open a file at a specific location.
     /// Non-existing paths and directories will ignore `:line:row` suffix.
     ///
-    /// URLs can either be `file://` or `zed://` scheme, or relative to <https://zed.dev>.
+    /// URLs can either be `file://` or `fanta://` scheme.
     paths_or_urls: Vec<String>,
 
     /// Pairs of file paths to diff. Can be specified multiple times.
@@ -1451,13 +1536,6 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long, value_name = "USER@DISTRO")]
     wsl: Option<String>,
-
-    /// Open the project in a dev container.
-    ///
-    /// Automatically triggers "Reopen in Dev Container" if a `.devcontainer/`
-    /// configuration is found in the project directory.
-    #[arg(long)]
-    dev_container: bool,
 
     /// Instructs zed to run as a dev server on this machine. (not implemented)
     #[arg(long)]
@@ -1494,6 +1572,12 @@ struct Args {
     #[cfg(not(target_os = "windows"))]
     #[arg(hide = true)]
     askpass: Option<String>,
+
+    /// Bridges stdin/stdout to the running app's live MCP socket, so stdio MCP
+    /// clients (Claude Code, Codex) can reach the open design.
+    #[cfg(not(target_os = "windows"))]
+    #[arg(long, hide = true)]
+    mcp_stdio: bool,
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,

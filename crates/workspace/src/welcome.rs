@@ -9,7 +9,7 @@ use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     ParentElement, Render, Styled, Task, TaskExt, Window, actions,
 };
-use gpui::{WeakEntity, linear_color_stop, linear_gradient};
+use gpui::{ClipboardItem, WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
 
 use schemars::JsonSchema;
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
-use zed_actions::{OpenSettings, assistant::ToggleFocus, command_palette};
+use zed_actions::{OpenSettings, assistant::ToggleFocus};
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -33,6 +33,21 @@ actions!(
         ShowWelcome
     ]
 );
+
+/// The one-line statement of what Fanta is. Kept public so the docs and the
+/// release notes quote exactly what the first screen says.
+pub const HERO_HEADLINE: &str = "Your design is code.";
+
+/// The paragraph under [`HERO_HEADLINE`], also quoted verbatim by the docs.
+pub const HERO_SUBTITLE: &str = "A Fanta project is a git-tracked folder of .fnx source. Every canvas edit is a reviewable change; every source edit reloads the canvas.";
+
+/// The command that registers this app as an MCP server for Claude Code, shown
+/// on the welcome page and copied by its "Copy command" button.
+pub const CONNECT_CLAUDE_CODE_COMMAND: &str =
+    "claude mcp add -s user fanta -- /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio";
+
+/// The equivalent entry for `~/.codex/config.toml`.
+pub const CONNECT_CODEX_CONFIG: &str = "[mcp_servers.fanta]\ncommand = \"/Applications/Fanta.app/Contents/MacOS/fanta\"\nargs = [\"--mcp-stdio\"]\n";
 
 #[derive(IntoElement)]
 struct SectionHeader {
@@ -174,9 +189,9 @@ const CONTENT: (Section<3>, Section<1>) = (
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
-                icon: IconName::ListCollapse,
-                title: "Open Command Palette",
-                action: &command_palette::Toggle,
+                icon: IconName::AiClaude,
+                title: "Connect Claude Code / Codex",
+                action: &zed_actions::fanta::ConnectExternalAgent,
                 visibility_guard: SectionVisibility::Always,
             },
         ],
@@ -321,7 +336,7 @@ impl WelcomePage {
                 h_flex()
                     .gap_1p5()
                     .child(
-                        Icon::new(IconName::ZedAssistant)
+                        Icon::new(IconName::AiClaude)
                             .color(Color::Muted)
                             .size(IconSize::Small),
                     )
@@ -346,6 +361,87 @@ impl WelcomePage {
                         focus.dispatch_action(&ToggleWorkspaceSidebar, window, cx);
                         focus.dispatch_action(&ToggleFocus, window, cx);
                     }),
+            )
+    }
+
+    fn render_bring_your_own_agent(
+        &self,
+        tab_index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let color = cx.theme().colors();
+
+        let description = "Run this once and Claude Code can drive the open canvas over MCP. It registers Fanta user-wide, so every Claude Code session sees it.";
+
+        v_flex()
+            .w_full()
+            .p_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(color.border_variant)
+            .bg(color.panel_background)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
+                    )
+                    .child(Label::new("Bring Your Own Agent")),
+            )
+            .child(
+                Label::new(description)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .p_1p5()
+                    .rounded_sm()
+                    .bg(color.editor_background)
+                    .border_1()
+                    .border_color(color.border_variant)
+                    .child(
+                        Label::new(CONNECT_CLAUDE_CODE_COMMAND)
+                            .buffer_font(cx)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Default),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(
+                        Button::new("copy-claude-command", "Copy command")
+                            .full_width()
+                            .tab_index(tab_index as isize)
+                            .style(ButtonStyle::Outlined)
+                            .on_click(|_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    CONNECT_CLAUDE_CODE_COMMAND.to_string(),
+                                ));
+                            }),
+                    )
+                    .child(
+                        Button::new("copy-codex-config", "Copy Codex config")
+                            .full_width()
+                            .tab_index(tab_index as isize + 1)
+                            .style(ButtonStyle::Outlined)
+                            .on_click(|_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    CONNECT_CODEX_CONFIG.to_string(),
+                                ));
+                            }),
+                    ),
+            )
+            .child(
+                Label::new("Codex has no per-project MCP file: paste that block into ~/.codex/config.toml.")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
             )
     }
 
@@ -421,12 +517,6 @@ impl Render for WelcomePage {
                 .into_any_element()
         };
 
-        let welcome_label = if self.fallback_to_recent_projects {
-            "Welcome back to Fanta"
-        } else {
-            "Welcome to Fanta"
-        };
-
         h_flex()
             .key_context("Welcome")
             .track_focus(&self.focus_handle(cx))
@@ -446,26 +536,30 @@ impl Render for WelcomePage {
                     .justify_center()
                     .overflow_y_scroll()
                     .child(
-                        h_flex()
+                        v_flex()
                             .w_full()
-                            .justify_center()
                             .mb_4()
-                            .gap_4()
-                            .child(Vector::square(VectorName::FantaLogo, rems_from_px(45.)))
+                            .gap_2()
                             .child(
-                                v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("Design with an agent that speaks your source.")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .italic(),
-                                ),
+                                h_flex()
+                                    .w_full()
+                                    .justify_center()
+                                    .gap_4()
+                                    .child(Vector::square(VectorName::FantaLogo, rems_from_px(45.)))
+                                    .child(Headline::new(HERO_HEADLINE)),
+                            )
+                            .child(
+                                Label::new(HERO_SUBTITLE)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
                             ),
                     )
                     .child(first_section.render(Default::default(), &self.focus_handle))
                     .child(second_section)
                     .when(ai_enabled && !showing_recent_projects, |this| {
                         this.child(self.render_agent_card(next_tab_index, cx))
-                    }),
+                    })
+                    .child(self.render_bring_your_own_agent(next_tab_index + 1, cx)),
             )
     }
 }

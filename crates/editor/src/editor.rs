@@ -378,15 +378,12 @@ pub fn init(cx: &mut App) {
     })
     .on_action(move |_: &workspace::NewWindow, cx| {
         let app_state = workspace::AppState::global(cx);
-        workspace::open_new(
-            Default::default(),
-            app_state,
-            cx,
-            |workspace, window, cx| {
-                cx.activate(true);
-                Editor::new_file(workspace, &Default::default(), window, cx)
-            },
-        )
+        // This global handler runs when no window has focus (File > New Window
+        // with every window closed). Fanta's empty pane shows the welcome page,
+        // so the new window must not open an untitled buffer.
+        workspace::open_new(Default::default(), app_state, cx, |_, _, cx| {
+            cx.activate(true);
+        })
         .detach_and_log_err(cx);
     });
     _ = ui_input::ERASED_EDITOR_FACTORY.set(|window, cx| {

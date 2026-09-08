@@ -1965,8 +1965,10 @@ pub(crate) fn icon_for_remote_connection(options: Option<&RemoteConnectionOption
             RemoteConnectionOptions::Ssh(_) => IconName::Server,
             RemoteConnectionOptions::Wsl(_) => IconName::Linux,
             RemoteConnectionOptions::Docker(_) => IconName::Box,
-            #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionOptions::Mock(_) => IconName::Server,
+            // See `remote_connections.rs`: the `Mock` variant's existence depends on how
+            // `remote` was built, not on this crate's own features.
+            #[allow(unreachable_patterns)]
+            _ => IconName::Server,
         },
     }
 }

@@ -108,9 +108,14 @@ pub(crate) const AGENTS_MD: &str = r##"# Working on this Fanta design project
 This directory is a Fanta *design project*: a Figma-class design stored as
 editable source files. **The design is the source of truth.** Editing these
 files edits the design. When this project is open in the editor, saving your
-edits to the `.fnx` files live-reloads the canvas, and edits made on the canvas
-save back to these same files. So working here as a text agent *is* the
-design-to-canvas loop — no export step.
+edits to the `.fnx` files reloads the canvas about 300 ms later, and edits made
+on the canvas save back to these same files. So working here as a text agent
+*is* the design-to-canvas loop — no export step.
+
+If Fanta is running with this project open you also have a more direct route: a
+live MCP server that reads and edits the focused canvas. Jump to *Driving the
+open canvas over MCP* below — prefer it when the app is up, and fall back to
+editing the files by hand when it is not.
 
 ## Directory layout
 
@@ -203,10 +208,26 @@ id), `overrides` (per-instance changes such as swapped text or colors),
 `x`/`y` are the node's translation in pixels relative to its parent (they are
 the pure-translation part of the node's transform). Change them to move a node;
 change `clip_size` / `local_size` to resize. You may also write `width={…}`
-`height={…}` — on load they fold into `clip_size` (Frame) or `local_size`
-(everything else); the editor writes the canonical fields back. A node with
-rotation, scale, or skew shows a raw `transform={[a, b, c, d, tx, ty]}` array
-instead of `x`/`y` — leave that verbatim unless you mean to change the matrix.
+`height={…}`: on load they fold into `clip_size` on a `Frame` and into
+`local_size` on every other sized tag, and an explicit `clip_size`/`local_size`
+already on the element wins over the sugar. The one exception is `Vector`, whose
+`local_size` is the SVG-viewport *clip* rather than the shape's geometry —
+`width`/`height` on a `<Vector>` are ignored, so resize a vector by editing its
+`path`, or author it as `<Rect>`/`<Ellipse>` sugar where `width`/`height` do
+generate the path. If you spell a size as `width`/`height`, an in-place edit of
+that element keeps your spelling; a full reprint of the file emits the canonical
+field instead.
+
+Leaving the size off entirely is tolerated, not encouraged: a `Text`, media or
+`Instance` element with neither `local_size` nor `width`/`height` is backfilled
+on read — media from its intrinsic `natural_size`, text from an estimate of its
+style and content, anything else with a 200 x 100 placeholder box — instead of
+failing the whole design. Expect the next save to write that guess back as a
+real `local_size`.
+
+A node with rotation, scale, or skew shows a raw
+`transform={[a, b, c, d, tx, ty]}` array instead of `x`/`y` — leave that
+verbatim unless you mean to change the matrix.
 
 ### Ids live in the sidecar, not the source
 
@@ -248,34 +269,126 @@ Editing the readable source changes the design directly:
   rotation/scale shows a raw `transform={[a,b,c,d,tx,ty]}` instead — writing
   BOTH `x`/`y` and `transform` on one element is an error, not a merge.
 
-## Rendering and verifying headlessly
+## Driving the open canvas over MCP
 
-The `fanta-harness` CLI is the agent-facing render/validate loop — you do not
-need the editor open to see your work:
+While the project is open in Fanta, a local MCP server exposes **the design
+canvas that is focused right now**. It is on by default; it is turned off with
+`"fanta_live_mcp": { "enabled": false }` in settings.
 
-```sh
-fanta-harness render <this-project-dir> out.svg --png   # validate + render a bundle
-fanta-harness render <page.fnx> --watch --open          # live-rerender on save
-fanta-harness apply <page.fnx>                          # validate + repair sidecar after an editor save
-fanta-harness verify out.svg                            # check a bundle's hash manifest
-fanta-harness new project <dir> [--from sketch.fnx]     # scaffold a project (or graduate a sketch)
-fanta-harness new page <project> --name <n>             # add a page (also: new component)
-fanta-harness diff <a.svg> <b.svg>                      # semantic + pixel diff of two bundles
-```
+- **Connecting.** In Fanta, run the **Connect External Agent** command (Help
+  menu, or the command palette). It copies a ready-to-paste
+  `claude mcp add -s user fanta -- /path/to/Fanta --mcp-stdio` to the clipboard,
+  and shows the equivalent `[mcp_servers.fanta]` snippet for
+  `~/.codex/config.toml`. There is deliberately no `.mcp.json` committed in this
+  project: it would have to hard-code an install path, and the user-scope
+  command above covers the same ground.
+- **How the transport works.** The server listens on a Unix socket in a private
+  temp directory and advertises the path in
+  `~/Library/Application Support/Fanta/fanta_live_mcp.json` (the platform data
+  directory elsewhere) as `{"socket": "…/mcp.sock", "pid": 1234}`.
+  `fanta --mcp-stdio` reads that file and bridges stdio to the socket. The file
+  is rewritten on every launch and is *not* deleted on quit, so anything reading
+  it directly must check that `pid` is still alive before trusting `socket`.
 
-`render` writes an SVG (and `--png` a raster) plus a semantic scene snapshot,
-a source-address trace, and a diagnostics report; parse errors come back with
-`line:column`, a source excerpt, and a caret. Headless renders solve
-auto-layout, so `auto_layout={…}` attributes are trustworthy in the output.
+### The five tools
 
-## Selection context
+**`get_editor_state`** — takes no arguments. Returns the project name and
+`project_root`, every page (`index`, `name`, root node id, node count, and which
+one is `active`), the current `selection` ids, the `viewport`, `total_nodes`,
+and whether the canvas `is_editable` and is `dirty`. Call it first: the page
+indices and node ids it returns are what every other tool takes.
 
-There is no live "current selection" file to read. When the user wants you to
-act on a specific node or frame ("the selected frame", "this button"), ask them
-to paste its **layer name** (the `name="…"` attribute) — or the page name — and
-find it in the relevant `page.fnx` / `master.fnx`. Names are not guaranteed
-unique, so confirm the match (parent frame, position, or surrounding text) if
-several elements share a name.
+**`batch_get`** — `{ ids?, page?, depth?, include_geometry? }`. With `ids`,
+returns those nodes in full detail. Without them it lists one page's tree in
+compact form, where `page` is a page *index* (default: the active page), `depth`
+limits how many levels of children come back, and `include_geometry: true` adds
+world-space bounding boxes.
+
+**`batch_design`** — `{ ops, label? }`. Applies `ops` in order as **one undo
+step**, named by `label` (default `"MCP edit"`). If any op fails the whole batch
+rolls back and the error names the op that failed. Each op is an object tagged
+by `"op"`:
+
+- `create_node` — `node_type` (`"frame"`, `"rectangle"`, `"ellipse"` or
+  `"text"`), `x`, `y`, `width`, `height` (all required; `x`/`y` are the world
+  coordinates of the top-left corner), plus optional `parent` (a frame id; omit
+  to place on the active page), `name`, `fill` (`"#RRGGBB"` or `"#RRGGBBAA"`;
+  the glyph color for text), `text` and `font_size`.
+- `create_image` — `source` (a `data:image/…;base64,…` URI or raw base64 of
+  encoded PNG/JPEG/WebP/GIF bytes; `http(s)` URLs are *not* fetched), `x`, `y`,
+  plus optional `parent`, `name`, `width`/`height` (give one and the other
+  scales to preserve aspect; give neither for the natural pixel size) and `meta`
+  (JSON stored in the node's metadata, e.g. generation provenance). The bytes
+  become a project asset under `assets/images/` on the next save.
+- `set_props` — `id` plus only the fields you are changing: `name`, `x`, `y`,
+  `width`, `height`, `opacity` (0.0–1.0), `fill`, `corner_radius`, `text`,
+  `hidden`, `locked`.
+- `reparent` — `id`, optional `parent` (omit to move to the active page root)
+  and optional `index` among the new siblings (0 = bottom; omit to append on
+  top). The node keeps its world position.
+- `delete` — `id`; removes that node and its whole subtree.
+- `select` — `ids`, replacing the editor selection.
+- `set_viewport` — optional `center` (`[x, y]`) and `zoom`.
+
+Strokes, gradients, shadows, auto-layout, fonts and components are **not**
+`batch_design` properties. For those, read the page's `.fnx`, edit the file with
+your normal file tools, and let the canvas reload — that edit is also a reviewable
+git diff, which a `batch_design` call is not until the editor saves.
+
+**`get_screenshot`** — `{ page?, node?, max_dimension? }`, all optional. Renders
+a PNG of the active page, of another page by index, or of a single node's region,
+capped so the longer side is at most `max_dimension` pixels (default 1024). Use
+it to check your own work before telling the user it is done.
+
+**`read_fnx_source`** — `{ path? }`. Omit `path` for the project `root` and the
+list of its source files; pass a project-relative path (for example
+`pages/<page-slug>/page.fnx`) for that file's text. Paths that escape the project
+root are rejected. This tool only reads — write with your own file tools. On a
+document that has never been saved it fails with *the document has no on-disk
+Fanta project yet; save the canvas once to materialize one*.
+
+### When no canvas is open
+
+Every one of these tools fails with *no design canvas is open; open a .fig file
+or Fanta project in Fanta first* unless a design canvas is focused in the app.
+That is not something to work around — stop and ask the user to open the project
+(or, if they cannot, edit the `.fnx` files directly and tell them the canvas will
+pick the change up when they next open it).
+
+## Saving, reloading, and committing
+
+The two directions have different latencies, and mixing them up is the usual way
+to commit a broken tree:
+
+- **You edit a `.fnx`; the canvas follows.** The editor watches this directory
+  and reloads roughly **300 ms** after a burst of external writes settles, so a
+  multi-file rewrite lands as one reload rather than several. A parse error
+  keeps the old canvas and surfaces the `line:column` error instead.
+- **The canvas edits; the files follow.** Canvas edits — including everything
+  `batch_design` does — are held in the editor's document until it saves, so
+  treat the on-disk tree as *behind* the canvas until you have checked. Cmd-S
+  saves immediately; the editor may also save on its own about a second after
+  the last edit. Never assume either has happened.
+
+`get_editor_state`'s `dirty` field is how you check: while it is `true` the
+editor is still holding changes that have not reached disk, and re-reading the
+`.fnx` will show you the state *before* those edits.
+
+Saving rewrites the project tree, which also **regenerates the `.ids.json`
+sidecars**. So after any edit — yours or the user's — let the editor save once
+*before* you `git add`. Committing while `dirty` is `true` captures sources whose
+sidecars, manifest timestamps and asset files do not match them.
+
+## Finding the node the user means
+
+When the user says "the selected frame" or "this button", call
+`get_editor_state` and read `selection` — those are the node ids the canvas has
+selected right now, and `batch_get` turns them into names, geometry and parents.
+If the app is not running there is no live selection to read: ask the user for
+the **layer name** (the `name="…"` attribute) or the page name and find it in
+the relevant `page.fnx` / `master.fnx`. Names are not unique, so when several
+elements share one, confirm the match by its parent frame, position or
+surrounding text before editing.
 "##;
 
 /// `fanta.json` — the root manifest of a project directory.

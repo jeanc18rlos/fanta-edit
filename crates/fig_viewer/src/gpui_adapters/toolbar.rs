@@ -33,6 +33,7 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Paste,
     ToolbarCommand::Duplicate,
     ToolbarCommand::Delete,
+    ToolbarCommand::SelectAll,
     ToolbarCommand::ZoomToFit,
     ToolbarCommand::ZoomToSelection,
     ToolbarCommand::Export,
@@ -532,10 +533,14 @@ mod tests {
 
     /// Both zoom commands the component's zoom menu emits are advertised, so
     /// the Actions palette and the menu agree on what the host implements.
+    /// Select all rides along: the palette prints its ⌘A shortcut, so the
+    /// command has to be advertised or the palette shows a key that works
+    /// while the entry claiming it does not exist.
     #[test]
     fn the_zoom_command_family_is_advertised() {
         assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::ZoomToFit));
         assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::ZoomToSelection));
+        assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::SelectAll));
     }
 
     /// The style catalog mirrors motion_panel.rs's entrance presets (minus

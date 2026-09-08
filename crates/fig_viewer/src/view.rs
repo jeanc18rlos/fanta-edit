@@ -42,7 +42,9 @@ use crate::clipboard::{
 use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
-use crate::document::{DocChange, FigDocument, FigItem, FigItemEvent, FigScope, ScopeRequester};
+use crate::document::{
+    DocChange, FigDocument, FigItem, FigItemEvent, FigScope, SaveKind, ScopeRequester,
+};
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
@@ -200,6 +202,11 @@ const MIN_LAYERS_SIDEBAR_WIDTH: f32 = 220.0;
 const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 = 260.0;
 const MAX_SIDEBAR_WIDTH: f32 = 560.0;
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.);
+/// How long the canvas waits after the last committing edit before writing the
+/// project tree. A Fanta project is meant to be readable as source by an agent
+/// and reviewable as a diff, so edits reach disk on their own; the delay keeps
+/// a burst of edits (or a gesture that commits per step) to one write.
+const AUTOSAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarKind {
@@ -257,6 +264,17 @@ pub struct FigView {
     pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
+    /// A pointer button is down on the canvas, from the press until the
+    /// release (wherever it lands). Broader than `primary_pressed`, which the
+    /// tool paths only set once an event reaches a tool: the autosave must
+    /// also stand down for a text-selection drag or a comment click.
+    canvas_pointer_down: bool,
+    /// The debounced autosave armed by the last committing edit.
+    autosave_task: Option<Task<()>>,
+    /// The selection handle the cursor is over, resolved on hover so
+    /// `render` only reads it — hit-testing eight handles per redraw would
+    /// run on every window frame, not just on pointer movement.
+    hover_resize_handle: Option<fanta_canvas::ResizeHandle>,
     /// Space is held: the canvas temporarily pans with any active tool, the
     /// Figma/Illustrator "hold space to pan" gesture. Cleared on key-up.
     space_pan: bool,
@@ -501,6 +519,9 @@ impl FigView {
             viewport: None,
             pan_last_position: None,
             primary_pressed: false,
+            canvas_pointer_down: false,
+            autosave_task: None,
+            hover_resize_handle: None,
             space_pan: false,
             container_bounds: None,
             rendered_canvas: None,
@@ -550,6 +571,7 @@ impl FigView {
             match event {
                 FigItemEvent::Edited => {
                     this.invalidate_canvas_cache();
+                    this.schedule_autosave(cx);
                     this.sync_motion_timeline(cx);
                     this.hovered_node = None;
                     // The edit may have removed the node under the inline
@@ -565,7 +587,21 @@ impl FigView {
                     this.invalidate_canvas_cache();
                     cx.notify();
                 }
-                FigItemEvent::SelectionChanged | FigItemEvent::TextSelectionChanged => {}
+                FigItemEvent::SelectionChanged => {
+                    // The cached handle belongs to the node that was
+                    // selected; a resize cursor over a now-empty selection
+                    // would promise a gesture the press would not start.
+                    this.hover_resize_handle = None;
+                }
+                FigItemEvent::TextSelectionChanged => {}
+                // An autosave wrote the document without replacing it, so
+                // nothing view-side is stale: only the tab's dirty mark
+                // changes. Deliberately NOT `StateChanged`, which every
+                // listener reads as a reload and answers by dropping
+                // in-flight sessions.
+                FigItemEvent::Saved => {
+                    cx.emit(FigViewEvent::TitleChanged);
+                }
                 FigItemEvent::StateChanged => {
                     // A reload replaces the document while prototype state
                     // contains node/variable IDs from the previous tree. Drop
@@ -759,7 +795,8 @@ impl FigView {
                     crate::text_edit::rewind_preview(&mut document.doc, session);
                 }
                 if let (Some(viewport), Some(screen_size)) = (viewport.as_mut(), screen_size) {
-                    let mut tool_context = tool_context(&mut document.doc, viewport, screen_size);
+                    let mut tool_context =
+                        tool_context(&mut document.doc, viewport, screen_size, ToolKind::Select);
                     tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
                 } else {
                     tools.activate_without_context(ToolKind::Select);
@@ -1690,6 +1727,7 @@ impl FigView {
         let overlays_before = self.tools.overlays.clone();
         let cursor_before = self.tools.cursor;
 
+        let active_tool = self.tools.kind();
         let tools = &mut self.tools;
         let mut wants_exit = false;
         let mut content_changed = false;
@@ -1700,7 +1738,8 @@ impl FigView {
                 let selection_before: Vec<NodeId> =
                     document.doc.selection.iter().copied().collect();
 
-                let mut ctx = tool_context(&mut document.doc, &mut viewport, screen_size);
+                let mut ctx =
+                    tool_context(&mut document.doc, &mut viewport, screen_size, active_tool);
                 let response = tools.handle_event(&mut ctx, event);
                 wants_exit = response.wants_exit;
 
@@ -1881,7 +1920,7 @@ impl FigView {
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let revision_before = document.doc.scene.revision();
-                let mut ctx = tool_context(&mut document.doc, &mut viewport, screen_size);
+                let mut ctx = tool_context(&mut document.doc, &mut viewport, screen_size, kind);
                 tools.activate(kind, &mut ctx);
                 let change = if document.doc.scene.revision() != revision_before {
                     DocChange::Content
@@ -1937,6 +1976,12 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Left {
+            // Set before any of the branches below can return early: the
+            // autosave stands down for the whole gesture, including the text
+            // and comment paths that never reach a tool.
+            self.canvas_pointer_down = true;
+        }
         if self.prototype_player.is_some() {
             self.focus_handle.focus(window, cx);
             if event.button == MouseButton::Left {
@@ -2081,6 +2126,9 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Left {
+            self.canvas_pointer_down = false;
+        }
         if self.prototype_player.is_some() {
             if event.button == MouseButton::Left {
                 let should_click =
@@ -2123,7 +2171,14 @@ impl FigView {
     /// in flight: element listeners stop firing once the cursor leaves the
     /// canvas, which would strand the tool mid-gesture.
     pub(crate) fn handle_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
-        if !self.primary_pressed || event.button != MouseButton::Left {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        // Cleared before the `primary_pressed` guard: a release that lands
+        // outside the canvas comes through here only, and leaving the flag set
+        // would hold the autosave off indefinitely.
+        self.canvas_pointer_down = false;
+        if !self.primary_pressed {
             return;
         }
         let Some(bounds) = self.container_bounds else {
@@ -2162,6 +2217,13 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Self-heal the gesture flag. The window-level release listener only
+        // exists while a TOOL drag is live, so a release outside the canvas
+        // during a text-selection or comment gesture is never delivered; a
+        // hover move with no button held proves the pointer came up.
+        if event.pressed_button.is_none() {
+            self.canvas_pointer_down = false;
+        }
         if self.prototype_player.is_some() {
             if let Some(origin) = self.prototype_pointer_down {
                 let delta = event.position - origin;
@@ -2220,11 +2282,13 @@ impl FigView {
 
     fn update_hover(&mut self, screen: DVec2, cx: &mut Context<Self>) {
         if self.tools.kind() != ToolKind::Select {
-            if self.hovered_node.take().is_some() {
+            let had_handle = self.hover_resize_handle.take().is_some();
+            if self.hovered_node.take().is_some() || had_handle {
                 cx.notify();
             }
             return;
         }
+        self.update_hover_resize_handle(screen, cx);
         let Some(bounds) = self.container_bounds else {
             return;
         };
@@ -2261,6 +2325,54 @@ impl FigView {
             self.hovered_node = hovered;
             cx.notify();
         }
+    }
+
+    /// Resolve which selection handle (if any) the cursor is over, so
+    /// `render` can show a directional resize cursor by reading one field.
+    /// Mirrors the Select tool's own precondition — a single selected node,
+    /// the same handle threshold — so the cursor never promises a resize the
+    /// press would not start. Rotated nodes are skipped: their handles sit on
+    /// the oriented box, which this AABB hit-test would misreport.
+    fn update_hover_resize_handle(&mut self, screen: DVec2, cx: &mut Context<Self>) {
+        let handle = self.resize_handle_at(screen, cx);
+        if handle != self.hover_resize_handle {
+            self.hover_resize_handle = handle;
+            cx.notify();
+        }
+    }
+
+    fn resize_handle_at(&self, screen: DVec2, cx: &App) -> Option<fanta_canvas::ResizeHandle> {
+        let viewport = self.viewport?;
+        let bounds = self.container_bounds?;
+        let (width, height) = bounds_size(bounds);
+        let document = self.item.read(cx).document()?;
+        let selection = document.doc.selection.as_slice();
+        let [id] = selection else {
+            return None;
+        };
+        let world_transform = document.doc.scene.world_transform(*id)?;
+        if fanta_canvas::handles::transform_angle(&world_transform).abs() > 1e-4 {
+            return None;
+        }
+        let world = document.doc.scene.world_bounds(*id)?;
+        fanta_canvas::handles::hit_test_resize_handle_screen(
+            world,
+            screen,
+            &viewport,
+            DVec2::new(width, height),
+            fanta_canvas::handles::DEFAULT_HANDLE_THRESHOLD,
+        )
+    }
+
+    /// Whether the page the canvas is showing has no children yet. Cheap
+    /// enough for `render`: `children_of` hands back a slice.
+    fn active_page_is_empty(&self, cx: &App) -> bool {
+        self.item.read(cx).document().is_some_and(|document| {
+            document
+                .doc
+                .active_page()
+                .is_some_and(|root| document.doc.scene.children_of(Some(root)).is_empty())
+        })
     }
 
     fn handle_scroll_wheel(
@@ -2979,6 +3091,69 @@ impl FigView {
 
     // === Chrome ===========================================================
 
+    /// Arm the debounced autosave. Every committing edit re-arms it, so a
+    /// burst of edits (or a gesture that commits per step) costs one write
+    /// about a second after the user stops.
+    fn schedule_autosave(&mut self, cx: &mut Context<Self>) {
+        if !self.autosave_allowed(cx) {
+            self.autosave_task = None;
+            return;
+        }
+        self.autosave_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor().timer(AUTOSAVE_DEBOUNCE).await;
+            view.update(cx, |view, cx| view.autosave_now(cx)).log_err();
+        }));
+    }
+
+    /// Whether writing the document right now is both possible and harmless.
+    ///
+    /// A bare `.fig` with no materialized project is excluded on purpose: its
+    /// first save scaffolds a directory next to the file, and creating one
+    /// behind the user's back is not something a timer should do.
+    fn autosave_allowed(&self, cx: &App) -> bool {
+        let item = self.item.read(cx);
+        item.project_root().is_some()
+            && item.is_dirty()
+            && !item.has_conflict()
+            && !item.source_edit_locked()
+            // An open text session, a running prototype, or a keyframe drag
+            // each hold document state that a write would freeze mid-gesture.
+            && self.text_edit.is_none()
+            && self.pending_text_edit.is_none()
+            && self.prototype_player.is_none()
+            && self.motion_keyframe_drag.is_none()
+    }
+
+    /// The debounce elapsed: write the document as it stands.
+    ///
+    /// Deliberately does NOT run `finish_document_edits`: that commits
+    /// half-typed inspector values through `finish_panel_edits`. Any in-flight
+    /// panel edit emits its own `Edited` when the user commits it, which
+    /// re-arms this timer.
+    fn autosave_now(&mut self, cx: &mut Context<Self>) {
+        self.autosave_task = None;
+        if self.canvas_pointer_down {
+            // `mark_edited` announces the dirty transition on the FIRST
+            // preview frame of a drag from a clean document, so the timer can
+            // expire mid-gesture. Writing here would put an intermediate
+            // position on disk; wait for the release instead.
+            self.schedule_autosave(cx);
+            return;
+        }
+        if !self.autosave_allowed(cx) {
+            return;
+        }
+        let save = self
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+        cx.spawn(async move |_, _| {
+            if let Err(error) = save.await {
+                log::error!("autosaving the canvas failed: {error:#}");
+            }
+        })
+        .detach();
+    }
+
     /// Commit any in-flight text session and persist the document. Returns the
     /// project directory the save materialized (only on the first save of a
     /// lone `.fig`, which turns it into an on-disk project), or `None` when the
@@ -2992,7 +3167,8 @@ impl FigView {
         }
         // Persist committed state, not a transient preview mid-session.
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| item.save(cx))
+        self.item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
     }
 
     fn toggle_layers_sidebar(
@@ -3468,6 +3644,38 @@ struct FigViewSnapshot {
     error: Option<std::sync::Arc<anyhow::Error>>,
 }
 
+/// The centred "draw something" hint shown over an empty page. The keys match
+/// the `FigViewer` tool bindings in `assets/keymaps/default-macos.json`.
+fn render_empty_page_hint(cx: &App) -> AnyElement {
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        // No listeners and no `occlude`, so the press that draws the first
+        // shape passes straight through to the canvas container beneath.
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().colors().text_muted)
+                .child("R rectangle · F frame · T text"),
+        )
+        .into_any_element()
+}
+
+/// The cursor for a selection handle: each handle resizes along its own axis
+/// or diagonal.
+fn resize_cursor(handle: fanta_canvas::ResizeHandle) -> CursorStyle {
+    use fanta_canvas::ResizeHandle;
+    match handle {
+        ResizeHandle::North | ResizeHandle::South => CursorStyle::ResizeUpDown,
+        ResizeHandle::East | ResizeHandle::West => CursorStyle::ResizeLeftRight,
+        ResizeHandle::NorthWest | ResizeHandle::SouthEast => CursorStyle::ResizeUpLeftDownRight,
+        ResizeHandle::NorthEast | ResizeHandle::SouthWest => CursorStyle::ResizeUpRightDownLeft,
+    }
+}
+
 fn clamp_sidebar_width(width: Pixels, sidebar: SidebarKind) -> Pixels {
     let minimum = match sidebar {
         SidebarKind::Layers => MIN_LAYERS_SIDEBAR_WIDTH,
@@ -3862,7 +4070,14 @@ impl Render for FigView {
             // Space-hold pan shows the grab/grabbing hand over any tool.
             None if self.space_pan && self.is_panning() => CursorStyle::ClosedHand,
             None if self.space_pan => CursorStyle::OpenHand,
-            None => self.tools.cursor_style(self.is_panning()),
+            // A directional cursor over a selection handle, Figma-style. The
+            // handle was resolved on the last hover move, so this is a field
+            // read: `render` runs on every window redraw, hit-testing would
+            // not belong here.
+            None => match self.hover_resize_handle {
+                Some(handle) if self.prototype_player.is_none() => resize_cursor(handle),
+                _ => self.tools.cursor_style(self.is_panning()),
+            },
         };
 
         div()
@@ -4180,6 +4395,21 @@ impl Render for FigView {
                                                                     );
                                                                 c.push(play_button);
                                                             }
+                                                            // A loading or
+                                                            // failed document
+                                                            // is not an empty
+                                                            // page, and a
+                                                            // running
+                                                            // prototype is not
+                                                            // an invitation to
+                                                            // draw.
+                                                            if !is_loading
+                                                                && !has_error
+                                                                && self.prototype_player.is_none()
+                                                                && self.active_page_is_empty(cx)
+                                                            {
+                                                                c.push(render_empty_page_hint(cx));
+                                                            }
                                                             c
                                                         }),
                                                 ),
@@ -4466,7 +4696,7 @@ impl Item for FigView {
             let project = self.project.clone();
             return cx.spawn(async move |_, cx| {
                 discard_source.await?;
-                let save_document = item.update(cx, |item, cx| item.save(cx));
+                let save_document = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
                 let Some(root) = save_document.await? else {
                     return Ok(());
                 };
@@ -4627,6 +4857,9 @@ impl Item for FigView {
                 viewport,
                 pan_last_position: None,
                 primary_pressed: false,
+                canvas_pointer_down: false,
+                autosave_task: None,
+                hover_resize_handle: None,
                 space_pan: false,
                 container_bounds: None,
                 rendered_canvas: None,
@@ -4873,6 +5106,342 @@ mod tests {
                 });
             })
             .expect("dispatch canvas click");
+    }
+
+    /// A project on disk with one page and no children, plus the view that
+    /// owns its autosave timer.
+    async fn autosave_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Entity<FigItem>,
+        Entity<FigView>,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("Design");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            dir.path().join("Design.fig"),
+            Some(root.clone()),
+            doc_with_one_page(),
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        (dir, root, item, view)
+    }
+
+    fn add_rect(item: &Entity<FigItem>, cx: &mut TestAppContext) {
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let page = document.doc.active_page().expect("active page");
+                let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    10.0,
+                    10.0,
+                    Color::BLACK,
+                )));
+                rect.parent = Some(page);
+                document
+                    .doc
+                    .apply(Operation::create_node(rect))
+                    .expect("create rect");
+                ((), DocChange::Content)
+            });
+        });
+    }
+
+    /// The hero promise: an edit reaches the project tree on its own, so
+    /// `git diff` shows it without the user pressing cmd-s.
+    #[gpui::test]
+    async fn an_edit_autosaves_the_project_after_the_debounce(cx: &mut TestAppContext) {
+        let (_dir, root, item, view) = autosave_fixture(cx).await;
+        add_rect(&item, cx);
+        item.read_with(cx, |item, _| assert!(item.is_dirty()));
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert!(
+                !item.is_dirty(),
+                "the debounce elapsed and the canvas saved"
+            )
+        });
+        assert!(
+            root.join("fanta.json").is_file(),
+            "the project tree was written to disk"
+        );
+        view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+    }
+
+    /// A drag longer than the debounce must not have an intermediate position
+    /// written under it: `mark_edited` announces the dirty transition on the
+    /// first preview frame, so the timer expires mid-gesture.
+    #[gpui::test]
+    async fn the_autosave_waits_for_the_pointer_to_come_up(cx: &mut TestAppContext) {
+        let (_dir, root, item, view) = autosave_fixture(cx).await;
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let position = point(px(10.), px(10.));
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.handle_mouse_down(
+                        &MouseDownEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: gpui::Modifiers::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("press the canvas");
+        add_rect(&item, cx);
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.is_dirty(), "a save mid-gesture would disrupt the drag")
+        });
+        assert!(
+            !root.exists(),
+            "nothing was written while the pointer was down"
+        );
+
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.handle_mouse_up(
+                        &MouseUpEvent {
+                            button: MouseButton::Left,
+                            position,
+                            modifiers: gpui::Modifiers::default(),
+                            click_count: 1,
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("release the canvas");
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert!(
+                !item.is_dirty(),
+                "the release let the pending autosave through"
+            )
+        });
+        assert!(root.join("fanta.json").is_file());
+    }
+
+    /// A bare `.fig` has no project directory; the first save would scaffold
+    /// one next to it, which a timer must never do behind the user's back.
+    #[gpui::test]
+    async fn a_fig_without_a_project_is_never_autosaved(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            dir.path().join("Design.fig"),
+            doc_with_one_page(),
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        add_rect(&item, cx);
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| assert!(item.is_dirty()));
+        assert!(
+            !dir.path().join("Design").exists(),
+            "the autosave must not materialize a project directory"
+        );
+        view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+    }
+
+    /// The cursor must promise only what a press would actually start, and
+    /// the hover result is cached for `render` — never recomputed per frame.
+    #[gpui::test]
+    async fn hovering_a_handle_of_the_single_selected_node_caches_a_resize_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            100.0,
+            50.0,
+            Color::BLACK,
+        )));
+        rect.parent = Some(page);
+        let rect_id = rect.id;
+        doc.apply(Operation::create_node(rect))
+            .expect("create rect");
+        doc.selection.add(rect_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        let screen_size = DVec2::new(800.0, 600.0);
+        let viewport = Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        };
+        view.update(cx, |view, _| {
+            view.viewport = Some(viewport);
+            view.container_bounds = Some(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(800.), px(600.)),
+            });
+        });
+        let world = item
+            .read_with(cx, |item, _| {
+                item.doc().and_then(|doc| doc.scene.world_bounds(rect_id))
+            })
+            .expect("world bounds");
+
+        for handle in fanta_canvas::ResizeHandle::ALL {
+            let at = fanta_canvas::handles::handle_screen_position(
+                handle,
+                world,
+                &viewport,
+                screen_size,
+            );
+            view.update(cx, |view, cx| view.update_hover_resize_handle(at, cx));
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.hover_resize_handle, Some(handle));
+            });
+        }
+
+        // The middle of the node is not a handle.
+        let north_west = fanta_canvas::handles::handle_screen_position(
+            fanta_canvas::ResizeHandle::NorthWest,
+            world,
+            &viewport,
+            screen_size,
+        );
+        let south_east = fanta_canvas::handles::handle_screen_position(
+            fanta_canvas::ResizeHandle::SouthEast,
+            world,
+            &viewport,
+            screen_size,
+        );
+        view.update(cx, |view, cx| {
+            view.update_hover_resize_handle((north_west + south_east) / 2.0, cx)
+        });
+        view.read_with(cx, |view, _| assert!(view.hover_resize_handle.is_none()));
+
+        // Two selected nodes: the Select tool would move them, not resize.
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let page = document.doc.active_page().expect("active page");
+                document.doc.selection.add(page);
+                ((), DocChange::Selection)
+            });
+        });
+        let corner = fanta_canvas::handles::handle_screen_position(
+            fanta_canvas::ResizeHandle::NorthWest,
+            world,
+            &viewport,
+            screen_size,
+        );
+        view.update(cx, |view, cx| view.update_hover_resize_handle(corner, cx));
+        view.read_with(cx, |view, _| assert!(view.hover_resize_handle.is_none()));
+    }
+
+    /// The hint is the only thing on an empty canvas, so it must disappear the
+    /// moment the page has content — and never claim an unloaded document is
+    /// empty.
+    #[gpui::test]
+    async fn the_empty_page_hint_tracks_the_active_pages_children(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc_with_one_page(),
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        view.read_with(cx, |view, cx| assert!(view.active_page_is_empty(cx)));
+        add_rect(&item, cx);
+        view.read_with(cx, |view, cx| assert!(!view.active_page_is_empty(cx)));
+    }
+
+    #[test]
+    fn every_selection_handle_maps_to_its_own_resize_cursor() {
+        use fanta_canvas::ResizeHandle;
+        assert_eq!(
+            resize_cursor(ResizeHandle::North),
+            CursorStyle::ResizeUpDown
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::South),
+            CursorStyle::ResizeUpDown
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::East),
+            CursorStyle::ResizeLeftRight
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::West),
+            CursorStyle::ResizeLeftRight
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::NorthWest),
+            CursorStyle::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::SouthEast),
+            CursorStyle::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::NorthEast),
+            CursorStyle::ResizeUpRightDownLeft
+        );
+        assert_eq!(
+            resize_cursor(ResizeHandle::SouthWest),
+            CursorStyle::ResizeUpRightDownLeft
+        );
     }
 
     #[test]
@@ -6296,6 +6865,7 @@ impl FigView {
                     self.duplicate_selection(&DuplicateSelection, window, cx)
                 }
                 ToolbarCommand::Delete => self.delete_selection(&DeleteSelection, window, cx),
+                ToolbarCommand::SelectAll => self.select_all(&SelectAll, window, cx),
                 ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
                 ToolbarCommand::ZoomToSelection => self.zoom_to_selection(cx),
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),

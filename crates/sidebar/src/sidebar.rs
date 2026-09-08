@@ -104,6 +104,9 @@ gpui::actions!(
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
+// Worktree creation is an IDE workflow that Fanta does not surface yet; the
+// implementation is kept behind this flag rather than deleted.
+const SHOW_CREATE_WORKTREE_MENU: bool = false;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SerializedSidebarView {
@@ -2668,7 +2671,9 @@ impl Sidebar {
                         project.is_via_collab() || project.repositories(cx).is_empty()
                     });
 
-                    if let Some(base_workspace) = base_workspace.filter(|_| !creation_blocked) {
+                    if SHOW_CREATE_WORKTREE_MENU
+                        && let Some(base_workspace) = base_workspace.filter(|_| !creation_blocked)
+                    {
                         menu = menu.separator().submenu("Create New Worktree…", {
                             let this = this.clone();
                             move |mut submenu, _window, submenu_cx| {
@@ -2742,6 +2747,9 @@ impl Sidebar {
     // the result synchronously when it opens. Worktrees of a repository share the
     // same default branch, so any workspace in the group yields the same answer.
     fn prefetch_worktree_default_branches(&mut self, cx: &mut Context<Self>) {
+        if !SHOW_CREATE_WORKTREE_MENU {
+            return;
+        }
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
@@ -2982,7 +2990,7 @@ impl Sidebar {
                         let menu = if open_workspaces.is_empty() {
                             menu
                         } else {
-                            let mut menu = menu.separator().header("Open Worktrees");
+                            let mut menu = menu.separator().header("Open Projects");
 
                             for (
                                 workspace_index,
@@ -7466,11 +7474,22 @@ impl Sidebar {
                     .max_w_full()
                     .gap_1()
                     .child(
-                        div().text_center().mb_2().child(
-                            Label::new("Open a .fig file or a Fanta project to start chatting.")
+                        v_flex()
+                            .text_center()
+                            .mb_2()
+                            .gap_1()
+                            .child(
+                                Label::new(
+                                    "Open a .fig file or a Fanta project to start chatting.",
+                                )
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
-                        ),
+                            )
+                            .child(
+                                Label::new("Claude Code and Codex can edit it over MCP too.")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     )
                     .child(
                         Button::new("open_project", "Open Design")
@@ -7750,7 +7769,7 @@ impl Sidebar {
         render_import_onboarding_banner(
             "acp",
             "Looking for threads from external agents?",
-            "Import threads from agents like Claude Agent, Codex, and more, whether started in Zed or another client.",
+            "Import threads from agents like Claude Agent, Codex, and more, whether started in Fanta or another client.",
             if verbose_labels {
                 "Import Threads from External Agents"
             } else {

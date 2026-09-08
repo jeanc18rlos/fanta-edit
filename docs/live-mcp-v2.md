@@ -71,6 +71,29 @@ Long jobs poll internally (60s budget) then hand back a generation_id.
 - **tools.json compat**: `dump_tool_specs` equivalent kept so external
   harnesses can diff the surface.
 
+### 1b. Editor state names the source files
+
+`get_editor_state` (MCP) and `design_state` (the built-in agent tool) share
+one implementation (`fig_viewer::agent_surface`), and both report where each
+design lives on disk, because an agent that cannot name the file cannot edit
+the source:
+
+- `pages[].source` — the page's `.fnx` path relative to `project_root`, e.g.
+  `pages/home/page.fnx`. `null` when the document has no project on disk yet
+  (an unsaved `.fig` import); edit the canvas through `batch_design` in that
+  case, or save once to materialize the project tree.
+- `components[]` — component masters are not pages, so they get their own
+  list: `{id, name, root, source}`, with `source` the master's
+  `components/<slug>/master.fnx` path under the same rules.
+
+Both are resolved by scanning the project tree (design directories are
+slug-named, so paths cannot be derived from ids). That is one `read_dir` per
+page and per component: fine per tool call, never on a render path.
+
+The Code tab shows the same project-relative path in its header — click it to
+copy, or use the reveal button beside it — so what the agent is told to edit
+and what the user is looking at are the same string.
+
 ### 2. Native agent tools (agent panel)
 
 Register the same core as built-in agent tools (design_read, design_batch,

@@ -1,9 +1,11 @@
-// Zed settings
+// Fanta settings
 //
-// For information on how to configure Zed, see the Zed
-// documentation: https://zed.dev/docs/configuring-zed
+// For information on how to configure Fanta, see the Fanta
+// documentation: https://fantaisa.net/docs
 //
-// To see all of Zed's default settings without changing your
+// Reopen this file any time from Fanta > Settings > Open Settings File.
+//
+// To see all of Fanta's default settings without changing your
 // custom settings, run `zed: open default settings` from the
 // command palette (cmd-shift-p / ctrl-shift-p)
 {

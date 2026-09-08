@@ -241,10 +241,11 @@ impl RemoteConnectionModal {
                 (options.distro_name.clone(), None, true, false)
             }
             RemoteConnectionOptions::Docker(options) => (options.name.clone(), None, false, true),
-            #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionOptions::Mock(options) => {
-                (format!("mock-{}", options.id), None, false, false)
-            }
+            // `RemoteConnectionOptions::Mock` is gated on the `remote` crate's test-support
+            // feature, which a dependent can enable without enabling this crate's own, so a
+            // cfg'd arm here is non-exhaustive in exactly that configuration.
+            #[allow(unreachable_patterns)]
+            _ => (connection_options.display_name(), None, false, false),
         };
         Self {
             prompt: cx.new(|cx| {

@@ -7,6 +7,10 @@
 use std::process::Command;
 
 #[test]
+// This test shells out to `cargo tree` to assert the dependency seam. clippy.toml
+// denies `Command::output` in favour of smol's, but this is a synchronous test with
+// no async runtime to schedule on.
+#[allow(clippy::disallowed_methods)]
 fn skia_seam_is_enforced() {
     // When running as a package test, CARGO_MANIFEST_DIR is the crate dir.
     // Walk up to the workspace root.

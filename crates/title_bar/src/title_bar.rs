@@ -596,8 +596,11 @@ impl TitleBar {
             RemoteConnectionOptions::Docker(_dev_container_connection) => {
                 (None, "Dev Container", IconName::Box)
             }
-            #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionOptions::Mock(_) => (None, "Mock Remote Project", IconName::Server),
+            // `RemoteConnectionOptions::Mock` is gated on the `remote` crate's test-support
+            // feature, which a dependent can enable without enabling this crate's own, so a
+            // cfg'd arm here is non-exhaustive in exactly that configuration.
+            #[allow(unreachable_patterns)]
+            _ => (None, "Remote Project", IconName::Server),
         };
 
         let nickname = nickname.unwrap_or_else(|| host.clone());

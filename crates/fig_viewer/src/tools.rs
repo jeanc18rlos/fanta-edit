@@ -15,10 +15,17 @@ use glam::DVec2;
 use gpui::{CursorStyle, Modifiers, MouseButton};
 use ui::IconName;
 
-/// Fill (and text color) assigned to newly drawn shapes/text until the shell
-/// grows a full color palette UI. Black default so newly added elements land
-/// with visible/opaque color (not low-contrast gray or "without color").
-const NEW_SHAPE_FILL: Color = Color::BLACK;
+/// Fill assigned to newly drawn shapes until the shell grows a full color
+/// palette UI. Figma's neutral grey: a pure black rectangle on a light canvas
+/// reads as a rendering fault rather than a placeholder.
+const NEW_SHAPE_FILL: Color = Color::rgb(0xD9, 0xD9, 0xD9);
+
+/// Fill for tools whose result is a mark rather than a surface. `ToolContext`
+/// carries ONE `new_shape_fill`, shared by every creation tool, and the vector
+/// tools spend it on a STROKE (`line.rs`, `pencil.rs`, and `pen.rs` for an open
+/// path), where placeholder grey would be near-invisible on a light canvas —
+/// as it would be for text. Those keep black.
+const NEW_MARK_FILL: Color = Color::BLACK;
 
 /// The floating toolbar's tools, grouped Figma-style. Each group renders as one
 /// button showing the group's active/last-used tool plus a caret that opens a
@@ -260,17 +267,27 @@ impl ToolShell {
 
 /// Build the shared context every tool event needs. `viewport` is the view's
 /// local copy; the caller writes it back after the event since tools like the
-/// hand mutate it.
+/// hand mutate it. `kind` is the tool the event is for, which only picks the
+/// default fill new nodes are created with.
 pub fn tool_context<'a>(
     doc: &'a mut Doc,
     viewport: &'a mut Viewport,
     screen_size: DVec2,
+    kind: ToolKind,
 ) -> ToolContext<'a> {
     let snap = fanta_canvas::SnapEngine {
         zoom: viewport.zoom,
         ..Default::default()
     };
-    ToolContext::new(doc, viewport, snap, screen_size).with_new_shape_fill(NEW_SHAPE_FILL)
+    ToolContext::new(doc, viewport, snap, screen_size).with_new_shape_fill(new_fill_for(kind))
+}
+
+/// The fill a tool creates its node with.
+fn new_fill_for(kind: ToolKind) -> Color {
+    match kind {
+        ToolKind::Text | ToolKind::Line | ToolKind::Pencil | ToolKind::Pen => NEW_MARK_FILL,
+        _ => NEW_SHAPE_FILL,
+    }
 }
 
 pub fn modifier_keys(modifiers: Modifiers) -> ModifierKeys {
@@ -336,6 +353,29 @@ pub fn key_event(key: LogicalKey, modifiers: Modifiers) -> ToolEvent {
 mod tests {
     use super::*;
     use gpui::NavigationDirection;
+
+    /// Filled shapes land in Figma's neutral grey; the tools that spend the
+    /// same field on a stroke or on glyphs keep black, where grey would be
+    /// near-invisible.
+    #[test]
+    fn shape_tools_default_to_grey_and_mark_tools_to_black() {
+        for kind in [
+            ToolKind::Rect,
+            ToolKind::Ellipse,
+            ToolKind::Polygon,
+            ToolKind::Star,
+        ] {
+            assert_eq!(new_fill_for(kind), Color::rgb(0xD9, 0xD9, 0xD9), "{kind:?}");
+        }
+        for kind in [
+            ToolKind::Text,
+            ToolKind::Line,
+            ToolKind::Pencil,
+            ToolKind::Pen,
+        ] {
+            assert_eq!(new_fill_for(kind), Color::BLACK, "{kind:?}");
+        }
+    }
 
     #[test]
     fn pointer_buttons_map_and_navigation_buttons_are_dropped() {

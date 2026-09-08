@@ -5761,11 +5761,22 @@ impl AgentPanel {
                     .max_w_full()
                     .gap_1()
                     .child(
-                        div().text_center().mb_2().child(
-                            Label::new("Open a .fig file or a Fanta project to start chatting.")
+                        v_flex()
+                            .text_center()
+                            .mb_2()
+                            .gap_1()
+                            .child(
+                                Label::new(
+                                    "Open a .fig file or a Fanta project to start chatting.",
+                                )
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
-                        ),
+                            )
+                            .child(
+                                Label::new("Claude Code and Codex can edit it over MCP too.")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     )
                     .child(
                         Button::new("open_project", "Open Design")

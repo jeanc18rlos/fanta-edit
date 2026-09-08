@@ -147,8 +147,16 @@ pub enum FigItemEvent {
     /// changed, or its effective typography changed. This refreshes inspector
     /// values without changing which document node the inspector is bound to.
     TextSelectionChanged,
-    /// The document finished (re)loading or was saved.
+    /// The document finished (re)loading, or an explicit save replaced its
+    /// persisted state. Listeners treat this as "the document may have been
+    /// replaced": in-flight text sessions, inspector previews and rename
+    /// gestures are dropped. The debounced autosave deliberately emits
+    /// [`Saved`](Self::Saved) instead, so it never cancels what the user is
+    /// doing.
     StateChanged,
+    /// The document was written to disk without being replaced: the dirty
+    /// flag cleared and nothing else about the in-memory state changed.
+    Saved,
     /// The document was replaced by an external reload (`merged: false`) or by
     /// a clean three-way merge of the external edit into the canvas's unsaved
     /// edits (`merged: true`). Only the watcher-driven paths emit this; the
@@ -185,6 +193,16 @@ pub enum ScopeRequester {
     /// The pending scope was applied when the initial load landed; there is
     /// no requesting view, so the focused view follows.
     Load,
+}
+
+/// Whether a save came from the user (Cmd-S, File > Save) or from the
+/// canvas's debounced autosave. Explicit saves announce
+/// [`FigItemEvent::StateChanged`]; autosaves announce
+/// [`FigItemEvent::Saved`], which listeners must not treat as a reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveKind {
+    Explicit,
+    Auto,
 }
 
 impl EventEmitter<FigItemEvent> for FigItem {}
@@ -1597,7 +1615,17 @@ impl FigItem {
     /// Returns the newly materialized project directory on the save that
     /// creates it — so the view can add it to the workspace as a visible
     /// worktree — and `None` when the project already existed.
-    pub fn save(&mut self, cx: &mut Context<Self>) -> Task<Result<Option<PathBuf>>> {
+    ///
+    /// `kind` only picks the event announced on success: an explicit save
+    /// emits [`FigItemEvent::StateChanged`], which every listener reads as
+    /// "the document may have been replaced" and uses to drop in-flight
+    /// sessions; the debounced autosave emits [`FigItemEvent::Saved`] so a
+    /// rename or half-typed inspector value survives it.
+    pub fn save(
+        &mut self,
+        kind: SaveKind,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
         if self.source_edit_locked {
             return Task::ready(Err(anyhow::anyhow!(
                 "the FNX source is dirty; save it through the code workspace before saving the canvas"
@@ -1659,7 +1687,10 @@ impl FigItem {
                     this.preview_dirty_before = None;
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
-                    cx.emit(FigItemEvent::StateChanged);
+                    match kind {
+                        SaveKind::Explicit => cx.emit(FigItemEvent::StateChanged),
+                        SaveKind::Auto => cx.emit(FigItemEvent::Saved),
+                    }
                     cx.notify();
                 }
             })?;
@@ -1675,6 +1706,19 @@ pub(crate) fn ready_item_for_test(
     doc: Doc,
     cx: &mut gpui::TestAppContext,
 ) -> Entity<FigItem> {
+    ready_item_with_root_for_test(project, abs_path, None, doc, cx)
+}
+
+/// As [`ready_item_for_test`], with an already-materialized project root — the
+/// state every save path after the first one runs in.
+#[cfg(test)]
+pub(crate) fn ready_item_with_root_for_test(
+    project: &Entity<Project>,
+    abs_path: PathBuf,
+    project_root: Option<PathBuf>,
+    doc: Doc,
+    cx: &mut gpui::TestAppContext,
+) -> Entity<FigItem> {
     use util::rel_path::RelPath;
 
     let item = cx.new(|_| FigItem {
@@ -1685,7 +1729,7 @@ pub(crate) fn ready_item_for_test(
         abs_path,
         entry_id: None,
         document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
-        project_root: None,
+        project_root,
         dirty: false,
         preview_dirty_before: None,
         conflict: false,
@@ -2537,7 +2581,10 @@ mod tests {
 
         item.update(cx, |item, _| item.dirty = true);
 
-        let materialized = item.update(cx, |item, cx| item.save(cx)).await.unwrap();
+        let materialized = item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .unwrap();
         let root = dir.path().join("Design");
         assert_eq!(
             materialized.as_deref(),
@@ -2554,7 +2601,10 @@ mod tests {
 
         // A second save overwrites the same tree and materializes nothing new.
         item.update(cx, |item, _| item.dirty = true);
-        let again = item.update(cx, |item, cx| item.save(cx)).await.unwrap();
+        let again = item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .unwrap();
         assert_eq!(
             again, None,
             "a save into an existing project materializes nothing"
@@ -2563,6 +2613,50 @@ mod tests {
             assert_eq!(item.project_root(), Some(root.as_path()));
             assert!(!item.is_dirty());
         });
+    }
+
+    #[gpui::test]
+    async fn an_autosave_announces_saved_instead_of_state_changed(cx: &mut TestAppContext) {
+        // `StateChanged` means "the document may have been replaced": every
+        // listener drops in-flight text sessions, inspector previews and
+        // rename gestures on it. The debounced autosave must not do that.
+        let project = empty_project(cx).await;
+        let dir = tempfile::tempdir().unwrap();
+        let item = ready_item(
+            &project,
+            dir.path().join("Design.fig"),
+            None,
+            doc_with_one_page(),
+            cx,
+        );
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .unwrap();
+
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&item, {
+                let events = events.clone();
+                move |_, event: &FigItemEvent, _| events.borrow_mut().push(*event)
+            })
+        });
+
+        item.update(cx, |item, _| item.dirty = true);
+        item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let observed = events.borrow().clone();
+        assert!(
+            observed.contains(&FigItemEvent::Saved),
+            "an autosave announces Saved, saw {observed:?}"
+        );
+        assert!(
+            !observed.contains(&FigItemEvent::StateChanged),
+            "an autosave must not announce StateChanged, saw {observed:?}"
+        );
+        item.read_with(cx, |item, _| assert!(!item.is_dirty()));
     }
 
     #[gpui::test]
@@ -2586,7 +2680,9 @@ mod tests {
         let item = ready_item(&project, fig_path, None, doc_with_one_page(), cx);
         item.update(cx, |item, _| item.dirty = true);
 
-        let result = item.update(cx, |item, cx| item.save(cx)).await;
+        let result = item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await;
         assert!(
             result.is_err(),
             "saving a stale .fig over an existing project must fail, not overwrite"

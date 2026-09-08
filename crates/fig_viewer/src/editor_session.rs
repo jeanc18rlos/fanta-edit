@@ -165,6 +165,7 @@ impl RenderOnce for EditorModeTabs {
 #[derive(IntoElement)]
 pub struct EditorWorkspaceTabs {
     selected: EditorWorkspace,
+    code_source: Option<SharedString>,
     on_select: WorkspaceHandler,
 }
 
@@ -175,8 +176,18 @@ impl EditorWorkspaceTabs {
     ) -> Self {
         Self {
             selected,
+            code_source: None,
             on_select: Rc::new(on_select),
         }
+    }
+
+    /// Name the file the Code tab opens on its own pill — "the design is
+    /// text" is more convincing when the tab says which text. `None` keeps
+    /// the plain "Code" label, which is also what a document with no
+    /// materialized source must show.
+    pub fn code_source(mut self, source: Option<SharedString>) -> Self {
+        self.code_source = source;
+        self
     }
 }
 
@@ -185,11 +196,17 @@ impl RenderOnce for EditorWorkspaceTabs {
         let mut tabs = CollapsibleIconTabBar::new("fanta-editor-workspace-tabs");
         for (index, workspace) in EditorWorkspace::ALL.into_iter().enumerate() {
             let on_select = self.on_select.clone();
+            let label: SharedString = match (workspace, self.code_source.as_ref()) {
+                (EditorWorkspace::Code, Some(source)) => {
+                    format!("{} · {source}", workspace.label()).into()
+                }
+                _ => workspace.label().into(),
+            };
             tabs = tabs.tab(CollapsibleIconTab::new(
                 "fanta-editor-workspace",
                 index,
                 workspace.icon(),
-                workspace.label(),
+                label,
                 workspace == self.selected,
                 move |window, cx| on_select(workspace, window, cx),
             ));

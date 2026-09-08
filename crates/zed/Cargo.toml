@@ -39,6 +39,7 @@ cli.workspace = true
 client.workspace = true
 collections.workspace = true
 command_palette.workspace = true
+command_palette_hooks.workspace = true
 component.workspace = true
 crashes.workspace = true
 db.workspace = true
@@ -67,6 +68,7 @@ language.workspace = true
 language_model.workspace = true
 language_models.workspace = true
 fanta_languages.workspace = true
+libc.workspace = true
 log.workspace = true
 markdown.workspace = true
 menu.workspace = true
@@ -153,6 +155,8 @@ image.workspace = true
 pkg-config = "0.3.22"
 
 [package.metadata.bundle-dev]
+category = "public.app-category.graphics-design"
+copyright = "Copyright 2026 Fanta"
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
 identifier = "dev.fanta.Fanta-Dev"
 name = "Fanta Dev"
@@ -161,6 +165,8 @@ osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
 
 [package.metadata.bundle-nightly]
+category = "public.app-category.graphics-design"
+copyright = "Copyright 2026 Fanta"
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]
 identifier = "dev.fanta.Fanta-Nightly"
 name = "Fanta Nightly"
@@ -169,6 +175,8 @@ osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
 
 [package.metadata.bundle-preview]
+category = "public.app-category.graphics-design"
+copyright = "Copyright 2026 Fanta"
 icon = ["resources/app-icon-preview@2x.png", "resources/app-icon-preview.png"]
 identifier = "dev.fanta.Fanta-Preview"
 name = "Fanta Preview"
@@ -177,6 +185,8 @@ osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["fanta"]
 
 [package.metadata.bundle-stable]
+category = "public.app-category.graphics-design"
+copyright = "Copyright 2026 Fanta"
 icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
 identifier = "dev.fanta.Fanta"
 name = "Fanta"

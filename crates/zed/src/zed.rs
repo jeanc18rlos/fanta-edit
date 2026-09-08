@@ -1,6 +1,8 @@
 mod app_menus;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
+#[cfg(unix)]
+pub mod mcp_stdio;
 mod migrate;
 #[cfg(target_os = "macos")]
 pub(crate) mod move_to_applications;
@@ -76,22 +78,20 @@ use workspace::notifications::{NotificationId, dismiss_app_notification, show_ap
 
 use workspace::welcome::{ShowWelcome, WelcomePage};
 use workspace::{
-    AppState, MultiWorkspace, NewFile, NewWindow, OpenLog, Panel, Toast, Workspace,
-    WorkspaceSettings, create_and_open_local_file,
-    notifications::simple_message_notification::MessageNotification, open_new,
+    AppState, MultiWorkspace, NewWindow, OpenLog, Panel, Toast, Workspace, WorkspaceSettings,
+    create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
+    open_new,
 };
 use workspace::{
     CloseIntent, CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace,
 };
 use workspace::{Pane, notifications::DetachAndPromptErr};
 use zed_actions::{
-    About, GetMerch, OpenAccountSettings, OpenBrowser, OpenDocs, OpenServerSettings,
-    OpenSettingsFile, OpenStatusPage, OpenZedUrl, Quit,
+    About, OpenAccountSettings, OpenBrowser, OpenDocs, OpenServerSettings, OpenSettingsFile,
+    OpenZedUrl, Quit,
 };
 
-const DOCS_URL: &str = "https://zed.dev/docs/";
-const STATUS_URL: &str = "https://status.zed.dev";
-const MERCH_URL: &str = "https://merch.zed.dev/";
+const DOCS_URL: &str = "https://fantaisa.net/docs";
 
 pub struct CrashHandler(pub Arc<crashes::Client>);
 
@@ -250,6 +250,18 @@ pub fn init(cx: &mut App) {
         });
     })
     .on_action(|_: &OpenSettingsFile, cx| {
+        with_active_or_new_workspace(cx, |_, window, cx| {
+            open_settings_file(
+                paths::settings_file(),
+                || settings::initial_user_settings_content().as_ref().into(),
+                window,
+                cx,
+            );
+        });
+    })
+    // Fanta has no settings UI, so the generic `OpenSettings` dispatched by
+    // the welcome page, the user menu and `zed://settings` opens the file.
+    .on_action(|_: &zed_actions::OpenSettings, cx| {
         with_active_or_new_workspace(cx, |_, window, cx| {
             open_settings_file(
                 paths::settings_file(),
@@ -676,7 +688,7 @@ fn show_software_emulation_warning_if_needed(
         };
         let message = format!(
             db::indoc! {r#"
-            Zed uses {} for rendering and requires a compatible GPU.
+            Fanta uses {} for rendering and requires a compatible GPU.
 
             Currently you are using a software emulated GPU ({}) which
             will result in awful performance.
@@ -819,8 +831,6 @@ fn register_actions(
 ) {
     workspace
         .register_action(|_, _: &OpenDocs, _, cx| cx.open_url(DOCS_URL))
-        .register_action(|_, _: &OpenStatusPage, _, cx| cx.open_url(STATUS_URL))
-        .register_action(|_, _: &GetMerch, _, cx| cx.open_url(MERCH_URL))
         .register_action(
             |workspace: &mut Workspace,
              _: &input_latency_ui::DumpInputLatencyHistogram,
@@ -1092,23 +1102,8 @@ fn register_actions(
                     Default::default(),
                     app_state.clone(),
                     cx,
-                    |workspace, window, cx| {
+                    |_, _, cx| {
                         cx.activate(true);
-                        // Create buffer synchronously to avoid flicker
-                        let project = workspace.project().clone();
-                        let buffer = project.update(cx, |project, cx| {
-                            project.create_local_buffer("", None, true, cx)
-                        });
-                        let editor = cx.new(|cx| {
-                            Editor::for_buffer(buffer, Some(project), window, cx)
-                        });
-                        workspace.add_item_to_active_pane(
-                            Box::new(editor),
-                            None,
-                            true,
-                            window,
-                            cx,
-                        );
                     },
                 )
                 .detach();
@@ -1141,22 +1136,8 @@ fn register_actions(
                                 },
                                 app_state,
                                 cx,
-                                |workspace, window, cx| {
+                                |_, _, cx| {
                                     cx.activate(true);
-                                    let project = workspace.project().clone();
-                                    let buffer = project.update(cx, |project, cx| {
-                                        project.create_local_buffer("", None, true, cx)
-                                    });
-                                    let editor = cx.new(|cx| {
-                                        Editor::for_buffer(buffer, Some(project), window, cx)
-                                    });
-                                    workspace.add_item_to_active_pane(
-                                        Box::new(editor),
-                                        None,
-                                        true,
-                                        window,
-                                        cx,
-                                    );
                                 },
                             )
                         })?;
@@ -1169,20 +1150,6 @@ fn register_actions(
                         Ok(())
                     }
                 })
-                .detach_and_log_err(cx);
-            }
-        })
-        .register_action({
-            let app_state = app_state.clone();
-            move |_, _: &NewFile, _, cx| {
-                open_new(
-                    Default::default(),
-                    app_state.clone(),
-                    cx,
-                    |workspace, window, cx| {
-                        Editor::new_file(workspace, &Default::default(), window, cx)
-                    },
-                )
                 .detach_and_log_err(cx);
             }
         });

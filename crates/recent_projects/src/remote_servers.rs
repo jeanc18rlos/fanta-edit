@@ -207,9 +207,11 @@ impl ProjectPicker {
                 connection_string: "".into(),
                 nickname: None,
             },
-            #[cfg(any(test, feature = "test-support"))]
-            RemoteConnectionOptions::Mock(options) => ProjectPickerData::Ssh {
-                connection_string: format!("mock-{}", options.id).into(),
+            // See `remote_connections.rs`: the `Mock` variant's existence depends on how
+            // `remote` was built, not on this crate's own features.
+            #[allow(unreachable_patterns)]
+            _ => ProjectPickerData::Ssh {
+                connection_string: connection.display_name().into(),
                 nickname: None,
             },
         };

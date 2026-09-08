@@ -10,12 +10,13 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Zoom Out", fig_viewer::ZoomOut),
         MenuItem::action("Actual Size", fig_viewer::ResetZoom),
         MenuItem::action("Zoom to Fit", fig_viewer::FitToView),
+        MenuItem::action("Zoom to Selection", fig_viewer::ZoomToSelection),
         MenuItem::separator(),
         MenuItem::action("Layers Sidebar", fig_viewer::ToggleLayersSidebar),
         MenuItem::action("Inspector Sidebar", fig_viewer::ToggleInspectorSidebar),
         MenuItem::separator(),
         MenuItem::action("Toggle Agent Panel", zed_actions::assistant::ToggleFocus),
-        MenuItem::action("Toggle Left Dock", workspace::ToggleLeftDock),
+        MenuItem::action("Toggle Threads Rail", workspace::ToggleWorkspaceSidebar),
         MenuItem::separator(),
         MenuItem::action("Command Palette...", zed_actions::command_palette::Toggle),
     ];
@@ -74,6 +75,11 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Save", workspace::Save { save_intent: None }),
                 MenuItem::action("Save As…", workspace::SaveAs),
                 MenuItem::separator(),
+                // Declared in git_ui's `actions!(git, [Diff, ..])`, not in the
+                // git crate, and registered on every workspace by git_ui::init.
+                MenuItem::action("Review Changes", git_ui::project_diff::Diff),
+                MenuItem::action("Commit…", git::Commit),
+                MenuItem::separator(),
                 MenuItem::action(
                     "Close Tab",
                     workspace::CloseActiveItem {
@@ -128,13 +134,10 @@ pub fn app_menus() -> Vec<Menu> {
                         url: "https://fantaisa.net/docs".into(),
                     },
                 ),
+                MenuItem::separator(),
                 MenuItem::action(
-                    "Report a Bug",
-                    super::OpenBrowser {
-                        // TODO(release): point this at the real issue tracker once the
-                        // public repository name is decided.
-                        url: "https://fantaisa.net/docs".into(),
-                    },
+                    "Connect Claude Code / Codex…",
+                    zed_actions::fanta::ConnectExternalAgent,
                 ),
             ],
         },

@@ -8,28 +8,29 @@
 //! half-wired. Live: position/size/rotation, appearance (visibility, opacity,
 //! blend with Pass-through modeling), corners, solid fills and strokes,
 //! stroke geometry, drop/inner shadows and layer/background blurs,
-//! single-axis auto layout, whole-layer typography, instance props, and the
-//! Page background. Gated off: layout grids, exports, style registries,
-//! aspect-ratio lock, smart selection, constraints, arrange/transform
-//! commands, text-path, and pattern/shader/media paint editing (gradient and
-//! image paints are displayed read-only).
+//! single-axis auto layout, whole-layer typography, instance props, the
+//! Page background, the rotate/flip transforms, and multi-selection
+//! align/distribute. Gated off: layout grids, exports, style registries,
+//! aspect-ratio lock, smart selection, constraints, resize-to-fit, Tidy up,
+//! single-node align, text-path, and pattern/shader/media paint editing
+//! (gradient and image paints are displayed read-only).
 
 use std::collections::HashMap;
 
 use fanta_doc::{
     BlendMode, Blur, BlurKind, BoundProp, Color as FantaColor, ComponentId, Doc, Fill, Gradient,
     LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, Shadow,
-    ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize,
+    ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, Transform2D,
     VAlign as TextVAlign, VarValue,
 };
 use fanta_gpui::design::{
-    DesignAutoLayoutItem, DesignBlendMode, DesignColor, DesignComponentContext,
-    DesignComponentProperty, DesignComponentPropertyValue, DesignComponentReference,
-    DesignComponentRole, DesignCornerCapabilities, DesignEffect, DesignEffectKind,
-    DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop, DesignLayout,
-    DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType, DesignPageBackground,
-    DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintProperty, DesignPaintValue,
-    DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
+    DesignArrangeOperation, DesignAutoLayoutItem, DesignBlendMode, DesignColor,
+    DesignComponentContext, DesignComponentProperty, DesignComponentPropertyValue,
+    DesignComponentReference, DesignComponentRole, DesignCornerCapabilities, DesignEffect,
+    DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop,
+    DesignLayout, DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
+    DesignPageBackground, DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintProperty,
+    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
     DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
     DesignPanelEditPhase, DesignPanelInspectionContext, DesignPanelMultipleSelection,
     DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout,
@@ -37,7 +38,8 @@ use fanta_gpui::design::{
     DesignPanelTarget, DesignPanelValue, DesignSizingMode, DesignStroke, DesignStrokeAlign,
     DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeJoin,
     DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
-    DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment, DesignTypography,
+    DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment,
+    DesignTransformOperation, DesignTypography,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 
@@ -47,8 +49,8 @@ use crate::properties_ops::{
     apply_preview_operation, blurs_operations, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
     format_number, instance_prop_operations, layout_gap_operations, layout_limit_operations,
-    layout_padding_operations, replace_data_operation, restore_snapshot,
-    set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
+    layout_padding_operations, parse_number, read_field_text, replace_data_operation,
+    restore_snapshot, set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
     shadow_field_operations, stroke_list_mut,
 };
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
@@ -71,6 +73,11 @@ pub(crate) fn design_enabled() -> bool {
 fn node_id(id: &SharedString) -> Option<NodeId> {
     id.parse().ok()
 }
+
+/// What a click-driven inspector control the adapter has not wired is called
+/// in the notice it raises. `notify_unavailable` appends the rest of the
+/// sentence.
+const UNWIRED_CONTROL: &str = "This inspector control";
 
 // =============================================================================
 // Read model: colors, blend, kinds
@@ -468,8 +475,11 @@ fn design_stroke(
     Some(stroke)
 }
 
-/// Honest capability gates for wave 1: what the adapter has not wired stays
-/// off even when the coarse kind preset would advertise it.
+/// Honest capability gates: what the adapter has not wired stays off even
+/// when the coarse kind preset would advertise it. `transforms` is wired
+/// (rotate 90°, flip H/V); `arrange` is not, because aligning a lone node to
+/// its own bounds is a no-op — align/distribute only turn on for the
+/// multi-selection context built by `aggregate_selection`.
 fn gate_capabilities(
     kind: DesignPanelNodeKind,
     is_mask: bool,
@@ -490,7 +500,7 @@ fn gate_capabilities(
     capabilities.aspect_ratio_lock = false;
     capabilities.constraints = false;
     capabilities.arrange = false;
-    capabilities.transforms = false;
+    capabilities.transforms = true;
     capabilities.resize_to_fit = false;
     capabilities.add_auto_layout = false;
     capabilities.grid_auto_layout = false;
@@ -791,8 +801,8 @@ fn aggregate_selection(
     capabilities.sections = vec![DesignPanelSection::Position, DesignPanelSection::Layer];
     capabilities.aspect_ratio_lock = false;
     capabilities.constraints = false;
-    capabilities.arrange = false;
-    capabilities.transforms = false;
+    capabilities.arrange = true;
+    capabilities.transforms = true;
     capabilities.resize_to_fit = false;
     capabilities.add_auto_layout = false;
     capabilities.grid_auto_layout = false;
@@ -1121,7 +1131,7 @@ impl FigView {
         &mut self,
         _panel: &Entity<DesignPanel>,
         action: &DesignPanelAction,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match action {
@@ -1134,12 +1144,18 @@ impl FigView {
                     return;
                 };
                 self.finish_document_edits_for_external_change(cx);
+                let mut unhandled = false;
                 let ops = self.design_ops(cx, |doc| {
                     property_operations(doc, id, *property, value).unwrap_or_else(|| {
-                        log::debug!("fig design adapter: unhandled property {property:?}");
+                        unhandled = true;
                         Vec::new()
                     })
                 });
+                if unhandled {
+                    log::debug!("fig design adapter: unhandled property {property:?}");
+                    crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+                    return;
+                }
                 self.design_apply_ops(ops, cx);
             }
             DesignPanelAction::PropertyEditRequested {
@@ -1151,10 +1167,16 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                self.handle_design_phased_edit(id, *property, value, *phase, cx);
+                self.handle_design_phased_edit(id, *property, value, *phase, window, cx);
             }
             DesignPanelAction::TargetedNodeActionRequested { target, action } => {
-                self.handle_design_targeted_action(target, action, cx);
+                self.handle_design_targeted_action(target, action, window, cx);
+            }
+            DesignPanelAction::ArrangeRequested { target, operation } => {
+                self.handle_design_arrange(target, *operation, window, cx);
+            }
+            DesignPanelAction::TransformRequested { target, operation } => {
+                self.handle_design_transform(target, *operation, cx);
             }
             DesignPanelAction::PaintEditRequested {
                 node_id: id,
@@ -1168,7 +1190,7 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                self.handle_design_paint_edit(id, *collection, *index, edit, *phase, cx);
+                self.handle_design_paint_edit(id, *collection, *index, edit, *phase, window, cx);
             }
             DesignPanelAction::PaintChangeRequested {
                 node_id: id,
@@ -1346,7 +1368,7 @@ impl FigView {
                 let Some(reference) = effect_ref(effect_id) else {
                     return;
                 };
-                self.handle_design_effect_edit(id, reference, *property, value, *phase, cx);
+                self.handle_design_effect_edit(id, reference, *property, value, *phase, window, cx);
             }
             DesignPanelAction::ComponentPropertyChangeRequested {
                 node_id: id,
@@ -1472,6 +1494,7 @@ impl FigView {
         &mut self,
         target: &DesignPanelTarget,
         action: &DesignPanelAction,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.design_target_matches_selection(target, cx) {
@@ -1499,8 +1522,21 @@ impl FigView {
                 }
                 (*property, value.clone())
             }
+            // A wrapped leaf that is still mid-gesture must stay silent: its
+            // Preview frames arrive continuously while a slider is dragged,
+            // so one notice per frame would bury the canvas. Multi-selection
+            // capabilities render neither paints nor effects today, but these
+            // are the first phased leaves a widened capability would emit.
+            DesignPanelAction::PaintEditRequested { phase, .. }
+            | DesignPanelAction::EffectEditRequested { phase, .. }
+                if *phase != DesignPanelEditPhase::Commit =>
+            {
+                log::debug!("fig design adapter: unhandled targeted leaf {action:?}");
+                return;
+            }
             _ => {
                 log::debug!("fig design adapter: unhandled targeted leaf {action:?}");
+                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
                 return;
             }
         };
@@ -1509,6 +1545,61 @@ impl FigView {
             ids.iter()
                 .flat_map(|id| property_operations(doc, *id, property, &value).unwrap_or_default())
                 .collect()
+        });
+        self.design_apply_ops(ops, cx);
+    }
+
+    /// Align or distribute the exact ordered target as one history entry.
+    fn handle_design_arrange(
+        &mut self,
+        target: &DesignPanelTarget,
+        operation: DesignArrangeOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.design_target_matches_selection(target, cx) {
+            log::warn!("fig design adapter: rejecting stale arrange target");
+            return;
+        }
+        let DesignPanelTarget::Nodes { node_ids } = target else {
+            return;
+        };
+        let ids: Vec<NodeId> = node_ids.iter().filter_map(node_id).collect();
+        self.finish_document_edits_for_external_change(cx);
+        let mut unsupported = false;
+        let ops = self.design_ops(cx, |doc| {
+            arrange_operations(doc, &ids, operation).unwrap_or_else(|| {
+                unsupported = true;
+                Vec::new()
+            })
+        });
+        if unsupported {
+            crate::view::notify_unavailable("Tidy up", window, cx);
+            return;
+        }
+        self.design_apply_ops(ops, cx);
+    }
+
+    /// Rotate or flip the exact ordered target as one history entry.
+    fn handle_design_transform(
+        &mut self,
+        target: &DesignPanelTarget,
+        operation: DesignTransformOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.design_target_matches_selection(target, cx) {
+            log::warn!("fig design adapter: rejecting stale transform target");
+            return;
+        }
+        let DesignPanelTarget::Nodes { node_ids } = target else {
+            return;
+        };
+        let ids: Vec<NodeId> = node_ids.iter().filter_map(node_id).collect();
+        self.finish_document_edits_for_external_change(cx);
+        let ops = self.design_ops(cx, |doc| match operation {
+            DesignTransformOperation::RotateClockwise90 => rotate_clockwise_operations(doc, &ids),
+            DesignTransformOperation::FlipHorizontal => flip_operations(doc, &ids, true),
+            DesignTransformOperation::FlipVertical => flip_operations(doc, &ids, false),
         });
         self.design_apply_ops(ops, cx);
     }
@@ -1538,6 +1629,7 @@ impl FigView {
         property: DesignPanelProperty,
         value: &DesignPanelValue,
         phase: DesignPanelEditPhase,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match phase {
@@ -1613,15 +1705,23 @@ impl FigView {
                 } else {
                     self.finish_document_edits_for_external_change(cx);
                 }
+                let mut unhandled = false;
                 let ops = self.design_ops(cx, |doc| {
                     property_operations(doc, id, property, value).unwrap_or_else(|| {
-                        log::debug!("fig design adapter: unhandled property {property:?}");
+                        unhandled = true;
                         Vec::new()
                     })
                 });
                 let committed = self.design_apply_ops(ops, cx);
                 if session.is_some() {
                     item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
+                }
+                // Only the commit end of a gesture may speak: Preview runs on
+                // every frame of a slider drag, so toasting there would fire
+                // dozens of notices for one drag.
+                if unhandled {
+                    log::debug!("fig design adapter: unhandled property {property:?}");
+                    crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
                 }
             }
             DesignPanelEditPhase::Cancel => {
@@ -1652,6 +1752,7 @@ impl FigView {
         index: usize,
         edit: &fanta_gpui::design::DesignPaintEdit,
         phase: DesignPanelEditPhase,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let is_stroke = match collection {
@@ -1685,6 +1786,7 @@ impl FigView {
                     DesignPanelProperty::Opacity,
                     &DesignPanelValue::Number(0.0),
                     DesignPanelEditPhase::Begin,
+                    window,
                     cx,
                 );
                 // Begin captured the snapshot; nothing document-facing yet.
@@ -1743,6 +1845,7 @@ impl FigView {
                     DesignPanelProperty::Opacity,
                     &DesignPanelValue::Number(0.0),
                     DesignPanelEditPhase::Cancel,
+                    window,
                     cx,
                 );
             }
@@ -1756,6 +1859,7 @@ impl FigView {
         property: DesignPanelProperty,
         value: &DesignPanelValue,
         phase: DesignPanelEditPhase,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if phase != DesignPanelEditPhase::Commit && phase != DesignPanelEditPhase::Begin {
@@ -1767,7 +1871,14 @@ impl FigView {
             return;
         }
         if phase == DesignPanelEditPhase::Begin {
-            self.handle_design_phased_edit(id, property, value, DesignPanelEditPhase::Begin, cx);
+            self.handle_design_phased_edit(
+                id,
+                property,
+                value,
+                DesignPanelEditPhase::Begin,
+                window,
+                cx,
+            );
             return;
         }
         let session = self
@@ -1875,6 +1986,111 @@ impl FigView {
 // =============================================================================
 // Intent → operation builders
 // =============================================================================
+
+/// Maps one panel arrange command onto engine operations, or `None` when the
+/// engine has no equivalent (Tidy up, which is auto-layout inference rather
+/// than an align pass).
+///
+/// `distribute` deliberately returns nothing for fewer than three nodes:
+/// two nodes are already as far apart as they can be, so there is no gap to
+/// equalize. That is engine behavior, not a missing case.
+fn arrange_operations(
+    doc: &Doc,
+    ids: &[NodeId],
+    operation: DesignArrangeOperation,
+) -> Option<Vec<Operation>> {
+    use fanta_canvas::{Axis, HAlign, VAlign, align_horizontal, align_vertical, distribute};
+
+    let scene = &doc.scene;
+    Some(match operation {
+        DesignArrangeOperation::AlignLeft => align_horizontal(scene, ids, HAlign::Left),
+        DesignArrangeOperation::AlignHorizontalCenter => {
+            align_horizontal(scene, ids, HAlign::Center)
+        }
+        DesignArrangeOperation::AlignRight => align_horizontal(scene, ids, HAlign::Right),
+        DesignArrangeOperation::AlignTop => align_vertical(scene, ids, VAlign::Top),
+        DesignArrangeOperation::AlignVerticalCenter => align_vertical(scene, ids, VAlign::Middle),
+        DesignArrangeOperation::AlignBottom => align_vertical(scene, ids, VAlign::Bottom),
+        DesignArrangeOperation::DistributeHorizontal => distribute(scene, ids, Axis::X),
+        DesignArrangeOperation::DistributeVertical => distribute(scene, ids, Axis::Y),
+        DesignArrangeOperation::TidyUp => return None,
+    })
+}
+
+/// Turns every target a further 90° clockwise.
+///
+/// Each member turns about its own center rather than orbiting the selection
+/// box: the rotation goes through the same `InspectorField::Rotation` writer
+/// the numeric field uses, so the value the panel then echoes back is exactly
+/// the one the button produced.
+fn rotate_clockwise_operations(doc: &Doc, ids: &[NodeId]) -> Vec<Operation> {
+    ids.iter()
+        .flat_map(|id| {
+            let field = InspectorField::Rotation(*id);
+            let Some(degrees) = read_field_text(doc, &field)
+                .as_deref()
+                .and_then(|text| parse_number(text.trim_end_matches('°')))
+            else {
+                return Vec::new();
+            };
+            field_operations(doc, &field, &format_number(degrees + 90.0))
+        })
+        .collect()
+}
+
+/// Mirrors every target about the selection's world-bounds center axis.
+///
+/// Mirroring the whole selection box — rather than each node about its own
+/// center — is Figma's behavior and is what makes a multi-node flip reverse
+/// the members' order; for a lone node the two are the same thing.
+fn flip_operations(doc: &Doc, ids: &[NodeId], horizontal: bool) -> Vec<Operation> {
+    let scene = &doc.scene;
+    let mut selection_bounds: Option<fanta_doc::Bounds> = None;
+    for id in ids {
+        if let Some(bounds) = scene.world_bounds(*id) {
+            selection_bounds = Some(match selection_bounds {
+                Some(accumulated) => accumulated.union(&bounds),
+                None => bounds,
+            });
+        }
+    }
+    let Some(selection_bounds) = selection_bounds else {
+        return Vec::new();
+    };
+    let center = selection_bounds.center();
+    let (scale_x, scale_y) = if horizontal { (-1.0, 1.0) } else { (1.0, -1.0) };
+    let mirror = Transform2D::translation(-center.x, -center.y)
+        .then(&Transform2D::scale_xy(scale_x, scale_y))
+        .then(&Transform2D::translation(center.x, center.y));
+
+    let mut operations = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(node) = scene.get(*id) else {
+            continue;
+        };
+        let parent_world = node
+            .parent
+            .and_then(|parent| scene.world_transform(parent))
+            .unwrap_or(Transform2D::IDENTITY);
+        let determinant = parent_world.0.matrix2.determinant();
+        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+            continue;
+        }
+        // The mirror is a world-space map, so it wraps the node's world
+        // transform and the result is pulled back into the parent's frame.
+        let new = node
+            .transform
+            .then(&parent_world)
+            .then(&mirror)
+            .then(&parent_world.inverse());
+        operations.push(Operation::SetTransform {
+            id: *id,
+            old: node.transform,
+            new,
+        });
+    }
+    operations
+}
 
 enum PaintEditValue {
     Color(FantaColor),
@@ -2657,6 +2873,121 @@ mod tests {
         (doc, page_id, rect_id)
     }
 
+    /// One page holding three 20×20 squares on a row at x = 10, 50 and 120.
+    /// Left-aligning them must move two; distributing them must move only the
+    /// middle one.
+    fn doc_with_three_squares() -> (Doc, NodeId, [NodeId; 3]) {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut ids = Vec::with_capacity(3);
+        for (index, x) in [10.0_f64, 50.0, 120.0].into_iter().enumerate() {
+            let mut square = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                20.0,
+                20.0,
+                FantaColor::rgb(0xe0, 0x30, 0x30),
+            )));
+            square.name = format!("Square {index}");
+            square.transform = Transform2D::translation(x, 0.0);
+            square.parent = Some(page_id);
+            ids.push(square.id);
+            doc.scene.insert(square).expect("insert square");
+        }
+        let ids = [ids[0], ids[1], ids[2]];
+        (doc, page_id, ids)
+    }
+
+    fn min_x(doc: &Doc, id: NodeId) -> f64 {
+        doc.scene
+            .world_bounds(id)
+            .expect("the square has world bounds")
+            .min_x
+    }
+
+    #[test]
+    fn arrange_maps_align_and_distribute_and_declines_tidy_up() {
+        let (mut doc, _page, ids) = doc_with_three_squares();
+
+        // Align Left leaves the already-leftmost square alone: the engine
+        // emits no operation for a zero delta.
+        let ops = arrange_operations(&doc, &ids, DesignArrangeOperation::AlignLeft)
+            .expect("align left is wired");
+        assert_eq!(ops.len(), 2, "only the two trailing squares move");
+        assert!(
+            ops.iter()
+                .all(|op| matches!(op, Operation::SetTransform { .. })),
+            "aligning is expressed as transform writes"
+        );
+        for op in ops {
+            doc.apply(op).expect("apply align");
+        }
+        for id in ids {
+            assert!(
+                (min_x(&doc, id) - 10.0).abs() < 1e-9,
+                "every square aligned"
+            );
+        }
+
+        // Distributing needs three nodes; two are already as far apart as
+        // they can be, so the engine returns nothing.
+        let (doc, _page, ids) = doc_with_three_squares();
+        assert!(
+            arrange_operations(
+                &doc,
+                &ids[..2],
+                DesignArrangeOperation::DistributeHorizontal
+            )
+            .expect("distribute is wired")
+            .is_empty(),
+            "a two-node distribute is a no-op"
+        );
+        let ops = arrange_operations(&doc, &ids, DesignArrangeOperation::DistributeHorizontal)
+            .expect("distribute is wired");
+        assert_eq!(ops.len(), 1, "the outermost squares stay anchored");
+
+        assert!(
+            arrange_operations(&doc, &ids, DesignArrangeOperation::TidyUp).is_none(),
+            "Tidy up has no engine equivalent and must be declined, not faked"
+        );
+    }
+
+    #[test]
+    fn flipping_mirrors_the_selection_box_and_rotating_adds_ninety_degrees() {
+        let (mut doc, _page, ids) = doc_with_three_squares();
+
+        // The selection spans x = 10..140, so a horizontal flip swaps the
+        // outer squares and leaves the middle one where it is.
+        let ops = flip_operations(&doc, &ids, true);
+        assert_eq!(ops.len(), 3, "every member is remapped");
+        for op in ops {
+            doc.apply(op).expect("apply flip");
+        }
+        assert!((min_x(&doc, ids[0]) - 120.0).abs() < 1e-9);
+        assert!((min_x(&doc, ids[1]) - 80.0).abs() < 1e-9);
+        assert!((min_x(&doc, ids[2]) - 10.0).abs() < 1e-9);
+
+        let (doc, _page, ids) = doc_with_three_squares();
+        let ops = rotate_clockwise_operations(&doc, &ids[..1]);
+        assert_eq!(ops.len(), 1, "one square, one transform write");
+        let mut doc = doc;
+        for op in ops {
+            doc.apply(op).expect("apply rotation");
+        }
+        let rotated = read_field_text(&doc, &InspectorField::Rotation(ids[0]))
+            .and_then(|text| parse_number(text.trim_end_matches('°')))
+            .expect("the square reports a rotation");
+        assert!(
+            (rotated - 90.0).abs() < 0.01,
+            "a square at 0° turns to 90°, got {rotated}"
+        );
+    }
+
     async fn setup_view(
         doc: Doc,
         cx: &mut TestAppContext,
@@ -2825,6 +3156,59 @@ mod tests {
             assert!(
                 !item.undo(cx).expect("undo call succeeds"),
                 "a cancelled preview must not create an undo step"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn aligning_a_three_node_selection_is_one_undo_step(cx: &mut TestAppContext) {
+        let (mut doc, _page, ids) = doc_with_three_squares();
+        doc.selection.replace_with(ids);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ArrangeRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: ids
+                        .iter()
+                        .map(|id| SharedString::from(id.to_string()))
+                        .collect(),
+                },
+                operation: DesignArrangeOperation::AlignLeft,
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            for id in ids {
+                assert!(
+                    (min_x(doc, id) - 10.0).abs() < 1e-9,
+                    "every selected square aligned to the selection's left edge"
+                );
+            }
+        });
+
+        // One undo restores all three: the arrange is a single history entry.
+        item.update(cx, |item, cx| {
+            item.undo(cx).expect("undo applies");
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            for (id, x) in ids.into_iter().zip([10.0_f64, 50.0, 120.0]) {
+                assert!(
+                    (min_x(doc, id) - x).abs() < 1e-9,
+                    "one undo restores the whole arrange"
+                );
+            }
+            assert!(
+                !doc.history.can_undo(),
+                "the arrange left exactly one history entry behind"
             );
         });
     }

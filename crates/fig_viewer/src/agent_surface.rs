@@ -5,7 +5,7 @@
 //! failure), so agent work is undoable like any canvas gesture.
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -21,7 +21,7 @@ use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::document::{AssetStores, DocChange, FigDocument, FigItem, page_bounds};
+use crate::document::{AssetStores, DocChange, FigDocument, FigItem, FigPage, page_bounds};
 use crate::export::render_inputs;
 use crate::properties_ops::{
     DEFAULT_FILL_COLOR, parse_color, replace_data_operation, resize_operations, set_corner_radius,
@@ -69,33 +69,16 @@ impl DesignSurface for FigDesignSurface {
         let item = item.read(cx);
         let document = ready_document(item)?;
         let doc = &document.doc;
-        let active_page = doc.active_page();
-        let pages: Vec<Value> = document
-            .pages
-            .iter()
-            .enumerate()
-            .map(|(index, page)| {
-                json!({
-                    "index": index,
-                    "name": page.name.as_ref(),
-                    "root": page.root.map(|id| id.to_string()),
-                    "hidden": page.hidden,
-                    "active": page.root.is_some() && page.root == active_page,
-                    "nodes": page
-                        .root
-                        .map(|root| doc.scene.descendants_of(root).count().saturating_sub(1))
-                        .unwrap_or(0),
-                })
-            })
-            .collect();
+        let project_root = item.project_root();
         Ok(json!({
             "project": item.title().as_ref(),
-            "project_root": item.project_root().map(|root| root.display().to_string()),
+            "project_root": project_root.map(|root| root.display().to_string()),
             "is_editable": item.is_editable(),
             "source_edit_locked": item.source_edit_locked(),
             "dirty": item.is_dirty(),
             "total_nodes": doc.scene.len(),
-            "pages": pages,
+            "pages": pages_json(&document.pages, doc, project_root),
+            "components": components_json(doc, project_root),
             "selection": selection_ids(doc),
             "viewport": { "center": doc.viewport.center, "zoom": doc.viewport.zoom },
         }))
@@ -253,6 +236,73 @@ fn parse_node_id(raw: &str) -> Result<NodeId> {
 
 fn selection_ids(doc: &Doc) -> Vec<String> {
     doc.selection.iter().map(ToString::to_string).collect()
+}
+
+/// One entry per page, each naming the `.fnx` file that page IS — the whole
+/// point of a Fanta project is that an agent edits the source, so the state
+/// an agent reads has to say which file to open.
+///
+/// Resolving a source path scans the project's `pages/` directory (design
+/// directories are slug-named, so paths cannot be derived from ids). That is
+/// fine for a tool call and must never happen in a `render`.
+fn pages_json(pages: &[FigPage], doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
+    let active_page = doc.active_page();
+    pages
+        .iter()
+        .enumerate()
+        .map(|(index, page)| {
+            let source = page
+                .root
+                .zip(project_root)
+                .and_then(|(root, project_root)| {
+                    fanta_format::locate_page_source(project_root, root)
+                });
+            json!({
+                "index": index,
+                "name": page.name.as_ref(),
+                "root": page.root.map(|id| id.to_string()),
+                "hidden": page.hidden,
+                "active": page.root.is_some() && page.root == active_page,
+                "nodes": page
+                    .root
+                    .map(|root| doc.scene.descendants_of(root).count().saturating_sub(1))
+                    .unwrap_or(0),
+                "source": relative_source(project_root, source),
+            })
+        })
+        .collect()
+}
+
+/// Component masters are not pages, so their sources live in their own list
+/// rather than overloading `pages`.
+fn components_json(doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
+    doc.components
+        .defs
+        .values()
+        .map(|def| {
+            let source = project_root
+                .and_then(|project_root| fanta_format::locate_master_source(project_root, def.id));
+            json!({
+                "id": def.id.to_string(),
+                "name": def.name,
+                "root": def.root.to_string(),
+                "source": relative_source(project_root, source),
+            })
+        })
+        .collect()
+}
+
+/// A located source as the project sees it — `pages/<slug>/page.fnx` — which
+/// is the form an agent pastes into a file tool. `null` when the document has
+/// no project on disk yet (an unsaved `.fig` import).
+fn relative_source(project_root: Option<&Path>, source: Option<PathBuf>) -> Value {
+    let (Some(project_root), Some(source)) = (project_root, source) else {
+        return Value::Null;
+    };
+    match source.strip_prefix(project_root) {
+        Ok(relative) => json!(relative.to_string_lossy()),
+        Err(_) => json!(source.to_string_lossy()),
+    }
 }
 
 fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
@@ -1101,6 +1151,37 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encoding the fixture PNG");
         base64::engine::general_purpose::STANDARD.encode(&png)
+    }
+
+    /// An agent that cannot tell which file backs a page cannot edit the
+    /// source, so the state has to name it — relative to the project, the way
+    /// a file tool wants it.
+    #[test]
+    fn page_state_names_the_fnx_source_on_disk() {
+        let (doc, page_id) = doc_with_page();
+        let temporary = tempfile::tempdir().expect("temporary project");
+        fanta_format::write_project_tree(
+            temporary.path(),
+            &doc,
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("write project tree");
+        let pages = vec![FigPage {
+            root: Some(page_id),
+            name: "Page 1".into(),
+            bounds: fanta_doc::Bounds::ZERO,
+            hidden: false,
+        }];
+
+        let located = pages_json(&pages, &doc, Some(temporary.path()));
+        let source = located[0]["source"]
+            .as_str()
+            .expect("the page names its source");
+        assert!(source.ends_with("page.fnx"), "{source}");
+        assert!(source.starts_with("pages/"), "{source}");
+
+        // A `.fig` import with no project on disk has no source to name.
+        assert_eq!(pages_json(&pages, &doc, None)[0]["source"], Value::Null);
     }
 
     #[test]

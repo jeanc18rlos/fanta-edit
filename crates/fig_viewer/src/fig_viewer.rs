@@ -65,8 +65,8 @@ pub use timeline::{
 pub use tools::ToolKind;
 pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{
-    FigView, FigViewEvent, FitToView, ResetZoom, ToggleInspectorSidebar, ToggleLayersSidebar,
-    ZoomIn, ZoomOut,
+    FigView, FigViewEvent, FitToView, ResetZoom, SelectAll, ToggleInspectorSidebar,
+    ToggleLayersSidebar, ZoomIn, ZoomOut, ZoomToSelection,
 };
 
 pub fn init(cx: &mut App) {

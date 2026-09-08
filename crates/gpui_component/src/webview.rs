@@ -11,8 +11,6 @@ use gpui::{
     ParentElement as _, Pixels, Render, Size, Style, Styled as _, Window, canvas, div,
 };
 
-use crate::PixelsExt;
-
 /// A webview based on wry WebView.
 ///
 /// [experimental]

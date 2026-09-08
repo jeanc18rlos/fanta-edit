@@ -22,7 +22,33 @@ Changes made while vendoring, and nothing else:
 - Each crate directory gained a `LICENSE-GPL` symlink, as `script/check-licenses`
   requires.
 
-All source is otherwise byte-identical to upstream. Edits belong here now; the
+Divergences from upstream made *after* vendoring, to be re-applied on a resync:
+
+- `fanta-format`: the `AGENTS_MD` seed constant in
+  `src/project/layout.rs` was rewritten for this product. The upstream text
+  documented a `fanta-harness` CLI that Fanta does not ship; the Fanta text
+  documents the live MCP server instead (`fanta --mcp-stdio`, the
+  `fanta_live_mcp.json` discovery file, and the five canvas tools), plus the
+  save/reload timing an agent needs before committing. The `.fnx` authoring
+  guidance around it is upstream's, corrected where the parser had moved on.
+  Nothing else in `fanta-format` diverges. A resync must keep the Fanta text:
+  the constant is the only source of the file every project scaffolds, and a
+  test pins the seeded file to it byte-for-byte.
+- `gpui_component`: `src/webview.rs` lost its `use crate::PixelsExt;`. This
+  workspace's `gpui` fork gives `Pixels` an inherent `as_f32`, which shadows the
+  trait method the import existed to bring into scope, so the import is dead
+  here and `script/clippy` (`--all-features`, which turns the `webview` feature
+  on) rejects it. Behaviour is unchanged: an inherent method already wins over a
+  trait method. Re-apply on a resync only if the fork drops `Pixels::as_f32`.
+
+- `fanta-doc`: `tests/seam.rs` gained an `#[allow(clippy::disallowed_methods)]`
+  on `skia_seam_is_enforced`. This workspace's `clippy.toml` denies
+  `std::process::Command::output`, which that test uses to shell out to
+  `cargo tree`; upstream has no such lint. Test-only, no behaviour change, and
+  it never enters the shipped binary. Drop it if a resync brings a `clippy.toml`
+  that permits the call.
+
+All other source is byte-identical to upstream. Edits belong here now; the
 sibling checkouts are no longer part of the build.
 
 ## Third-party crates

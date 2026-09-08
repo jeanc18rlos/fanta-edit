@@ -1676,7 +1676,7 @@ impl Workspace {
                 project.clone(),
                 pane_history_timestamp.clone(),
                 None,
-                NewFile.boxed_clone(),
+                zed_actions::fanta::NewDesign.boxed_clone(),
                 true,
                 window,
                 cx,
@@ -4512,7 +4512,7 @@ impl Workspace {
                 self.project.clone(),
                 self.pane_history_timestamp.clone(),
                 None,
-                NewFile.boxed_clone(),
+                zed_actions::fanta::NewDesign.boxed_clone(),
                 true,
                 window,
                 cx,
@@ -15898,10 +15898,10 @@ mod tests {
         let (workspace, _cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        // Test with status bar shown (default)
+        // Fanta ships with the status bar off, so the default is hidden.
         workspace.read_with(cx, |workspace, cx| {
             let visible = workspace.status_bar_visible(cx);
-            assert!(visible, "Status bar should be visible by default");
+            assert!(!visible, "Status bar should be hidden by default");
         });
 
         // Test with status bar hidden

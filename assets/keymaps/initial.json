@@ -1,7 +1,9 @@
-// Zed keymap
+// Fanta keymap
 //
-// For information on binding keys, see the Zed
-// documentation: https://zed.dev/docs/key-bindings
+// For information on binding keys, see the Fanta
+// documentation: https://fantaisa.net/docs
+//
+// Reopen this file any time from Fanta > Settings > Open Keymap File.
 //
 // To see the default key bindings run `zed: open default keymap`
 // from the command palette.
@@ -9,13 +11,7 @@
   {
     "context": "Workspace",
     "bindings": {
-      // "shift shift": "file_finder::Toggle"
-    },
-  },
-  {
-    "context": "Editor && vim_mode == insert",
-    "bindings": {
-      // "j k": "vim::NormalBefore"
+      // "cmd-shift-p": "command_palette::Toggle"
     },
   },
 ]

@@ -319,10 +319,11 @@ pub async fn open_remote_project(
                                 RemoteConnectionOptions::Docker(_) => {
                                     "Failed to connect to Dev Container"
                                 }
-                                #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
+                                // The `Mock` variant exists whenever `remote` is built with
+                                // test-support, which this crate cannot detect from its own
+                                // features, so cover it with a wildcard instead of a cfg'd arm.
+                                #[allow(unreachable_patterns)]
+                                _ => "Failed to connect to remote project",
                             },
                             Some(&format!("{e:#}")),
                             &["Retry", "Cancel"],
@@ -380,10 +381,11 @@ pub async fn open_remote_project(
                                 RemoteConnectionOptions::Docker(_) => {
                                     "Failed to connect to Dev Container"
                                 }
-                                #[cfg(any(test, feature = "test-support"))]
-                                RemoteConnectionOptions::Mock(_) => {
-                                    "Failed to connect to mock server"
-                                }
+                                // The `Mock` variant exists whenever `remote` is built with
+                                // test-support, which this crate cannot detect from its own
+                                // features, so cover it with a wildcard instead of a cfg'd arm.
+                                #[allow(unreachable_patterns)]
+                                _ => "Failed to connect to remote project",
                             },
                             Some(&format!("{e:#}")),
                             &["Retry", "Cancel"],
