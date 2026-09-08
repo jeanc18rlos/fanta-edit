@@ -88,6 +88,7 @@ members = [
     "crates/fanta-render",
     "crates/fanta-text",
     "crates/fanta-tools",
+    "crates/fanta_languages",
     "crates/fanta_ui",
     "crates/fig_viewer",
     "crates/file_finder",
@@ -354,6 +355,7 @@ extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
+fanta_languages = { path = "crates/fanta_languages" }
 fanta_ui = { path = "crates/fanta_ui" }
 fig_viewer = { path = "crates/fig_viewer" }
 file_finder = { path = "crates/file_finder" }
@@ -829,7 +831,7 @@ toml_edit = { version = "0.22", default-features = false, features = [
     "serde",
 ] }
 tower-http = "0.4.4"
-tree-sitter = { version = "0.26.9", features = ["wasm"] }
+tree-sitter = "0.26.9"
 tree-sitter-bash = "0.25.1"
 tree-sitter-c = "0.24.1"
 tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "5cb9b693cfd7bfacab1d9ff4acac1a4150700609" }

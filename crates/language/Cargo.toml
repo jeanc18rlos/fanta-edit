@@ -13,6 +13,7 @@ path = "src/language.rs"
 doctest = false
 
 [features]
+wasm-grammars = ["tree-sitter/wasm"]
 test-support = [
     "rand",
     "collections/test-support",

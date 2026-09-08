@@ -1,9 +1,13 @@
+#[cfg(feature = "wasm-grammars")]
+use crate::with_parser;
 use crate::{
     CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
     LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
-    language_settings::all_language_settings, task_context::ContextProvider, with_parser,
+    language_settings::all_language_settings, task_context::ContextProvider,
 };
-use anyhow::{Context as _, Result, anyhow};
+#[cfg(feature = "wasm-grammars")]
+use anyhow::Context as _;
+use anyhow::{Result, anyhow};
 use collections::{FxHashMap, HashMap, HashSet, hash_map};
 pub use language_core::{
     BinaryStatus, LanguageName, LanguageQueries, LanguageServerStatusUpdate,
@@ -22,18 +26,16 @@ use parking_lot::{Mutex, RwLock};
 use postage::watch;
 
 use smallvec::SmallVec;
-use std::{
-    cell::LazyCell,
-    ffi::OsStr,
-    ops::Not,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{cell::LazyCell, ops::Not, path::Path, sync::Arc};
+#[cfg(feature = "wasm-grammars")]
+use std::{ffi::OsStr, path::PathBuf};
 use sum_tree::Bias;
 use text::{Point, Rope};
 use theme::Theme;
 use unicase::UniCase;
-use util::{maybe, post_inc};
+#[cfg(feature = "wasm-grammars")]
+use util::maybe;
+use util::post_inc;
 
 pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
@@ -106,12 +108,16 @@ enum LanguageMatchPrecedence {
 
 enum AvailableGrammar {
     Native(tree_sitter::Language),
+    #[cfg(feature = "wasm-grammars")]
     Loaded(#[allow(unused)] PathBuf, tree_sitter::Language),
+    #[cfg(feature = "wasm-grammars")]
     Loading(
         #[allow(unused)] PathBuf,
         Vec<oneshot::Sender<Result<tree_sitter::Language, Arc<anyhow::Error>>>>,
     ),
+    #[cfg(feature = "wasm-grammars")]
     Unloaded(PathBuf),
+    #[cfg(feature = "wasm-grammars")]
     LoadFailed(Arc<anyhow::Error>),
 }
 
@@ -453,6 +459,7 @@ impl LanguageRegistry {
     }
 
     /// Adds paths to WASM grammar files, which can be loaded if needed.
+    #[cfg(feature = "wasm-grammars")]
     pub fn register_wasm_grammars(&self, grammars: Vec<(Arc<str>, PathBuf)>) {
         if grammars.is_empty() {
             return;
@@ -980,15 +987,22 @@ impl LanguageRegistry {
 
         if let Some(grammar) = state.grammars.get_mut(name.as_ref()) {
             match grammar {
+                #[cfg(feature = "wasm-grammars")]
                 AvailableGrammar::LoadFailed(error) => {
                     tx.send(Err(error.clone())).ok();
                 }
-                AvailableGrammar::Native(grammar) | AvailableGrammar::Loaded(_, grammar) => {
+                AvailableGrammar::Native(grammar) => {
                     tx.send(Ok(grammar.clone())).ok();
                 }
+                #[cfg(feature = "wasm-grammars")]
+                AvailableGrammar::Loaded(_, grammar) => {
+                    tx.send(Ok(grammar.clone())).ok();
+                }
+                #[cfg(feature = "wasm-grammars")]
                 AvailableGrammar::Loading(_, txs) => {
                     txs.push(tx);
                 }
+                #[cfg(feature = "wasm-grammars")]
                 AvailableGrammar::Unloaded(wasm_path) => {
                     log::trace!("start loading grammar {name:?}");
                     let this = self.clone();

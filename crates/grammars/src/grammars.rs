@@ -41,6 +41,24 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
     ]
 }
 
+/// The grammars Fanta needs: TSX (which also backs the FNX design language),
+/// TypeScript, and JSON (reused for JSONC).
+///
+/// This is the `native_grammars` subset that survives once the IDE language
+/// support is dropped, so the binary does not link the other parser crates.
+#[cfg(feature = "fanta-grammars")]
+pub fn fanta_native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
+    vec![
+        ("json", tree_sitter_json::LANGUAGE.into()),
+        ("jsonc", tree_sitter_json::LANGUAGE.into()),
+        ("tsx", tree_sitter_typescript::LANGUAGE_TSX.into()),
+        (
+            "typescript",
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        ),
+    ]
+}
+
 /// Load and parse the `config.toml` for a given language name.
 pub fn load_config(name: &str) -> LanguageConfig {
     let config_toml = String::from_utf8(
@@ -132,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "load-grammars")]
+    #[cfg(any(feature = "load-grammars", feature = "fanta-grammars"))]
     fn generated_fnx_shape_is_valid_tsx() {
         let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TSX.into();
         let mut parser = tree_sitter::Parser::new();

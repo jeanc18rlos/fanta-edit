@@ -57,4 +57,11 @@ load-grammars = [
     "tree-sitter-typescript",
     "tree-sitter-yaml",
 ]
+# Fanta ships a design canvas, not an IDE: only the grammars behind FNX (which
+# reuses TSX), TypeScript, and JSON are needed.
+fanta-grammars = [
+    "tree-sitter",
+    "tree-sitter-json",
+    "tree-sitter-typescript",
+]
 test-support = ["load-grammars"]

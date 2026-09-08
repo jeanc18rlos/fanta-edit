@@ -3,7 +3,6 @@ use collections::HashMap;
 use context_server::{ContextServerCommand, ContextServerId};
 use editor::{Editor, EditorElement, EditorStyle};
 
-use extension_host::ExtensionStore;
 use gpui::{
     AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, ScrollHandle,
     Subscription, Task, TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, prelude::*,
@@ -25,8 +24,8 @@ use settings::{Settings as _, update_settings_file};
 use std::sync::Arc;
 use theme_settings::ThemeSettings;
 use ui::{
-    CommonAnimationExt, KeyBinding, Modal, ModalFooter, ModalHeader, Section, Tooltip,
-    WithScrollbar, prelude::*,
+    CommonAnimationExt, KeyBinding, Modal, ModalFooter, ModalHeader, Section, WithScrollbar,
+    prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
@@ -45,7 +44,6 @@ enum ConfigurationTarget {
 
     Extension {
         id: ContextServerId,
-        repository_url: Option<SharedString>,
         installation: Option<extension::ContextServerConfiguration>,
     },
 }
@@ -63,7 +61,6 @@ enum ConfigurationSource {
     Extension {
         id: ContextServerId,
         editor: Option<Entity<Editor>>,
-        repository_url: Option<SharedString>,
         installation_instructions: Option<Entity<markdown::Markdown>>,
         settings_validator: Option<jsonschema::Validator>,
     },
@@ -124,11 +121,7 @@ impl ConfigurationSource {
                 server_type: ExistingServerType::Remote,
             },
 
-            ConfigurationTarget::Extension {
-                id,
-                repository_url,
-                installation,
-            } => {
+            ConfigurationTarget::Extension { id, installation } => {
                 let settings_validator = installation.as_ref().and_then(|installation| {
                     jsonschema::validator_for(&installation.settings_schema)
                         .context("Failed to load JSON schema for context server settings")
@@ -146,7 +139,6 @@ impl ConfigurationSource {
                 });
                 ConfigurationSource::Extension {
                     id,
-                    repository_url,
                     installation_instructions,
                     settings_validator,
                     editor: installation.map(|installation| {
@@ -378,12 +370,6 @@ fn resolve_context_server_extension(
         return Task::ready(None);
     };
 
-    let extension = ExtensionStore::global(cx)
-        .read(cx)
-        .installed_extensions()
-        .iter()
-        .find(|(_, entry)| entry.manifest.context_servers.contains_key(&id.0))
-        .map(|(id, entry)| (id.clone(), entry.manifest.clone()));
     cx.spawn(async move |cx| {
         let installation = descriptor
             .configuration(worktree_store, cx)
@@ -392,12 +378,7 @@ fn resolve_context_server_extension(
             .log_err()
             .flatten();
 
-        Some(ConfigurationTarget::Extension {
-            id,
-            repository_url: extension
-                .and_then(|(_, manifest)| manifest.repository.clone().map(SharedString::from)),
-            installation,
-        })
+        Some(ConfigurationTarget::Extension { id, installation })
     })
 }
 
@@ -870,72 +851,40 @@ impl ConfigureContextServerModal {
         let focus_handle = self.focus_handle(cx);
         let is_busy = matches!(self.state, State::Waiting | State::Authenticating { .. });
 
-        ModalFooter::new()
-            .start_slot::<Button>(
-                if let ConfigurationSource::Extension {
-                    repository_url: Some(repository_url),
-                    ..
-                } = &self.source
-                {
-                    Some(
-                        Button::new("open-repository", "Open Repository")
-                            .end_icon(
-                                Icon::new(IconName::ArrowUpRight)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .tooltip({
-                                let repository_url = repository_url.clone();
-                                move |_window, cx| {
-                                    Tooltip::with_meta(
-                                        "Open Repository",
-                                        None,
-                                        repository_url.clone(),
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click({
-                                let repository_url = repository_url.clone();
-                                move |_, _, cx| cx.open_url(&repository_url)
-                            }),
+        ModalFooter::new().end_slot(
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new(
+                        "cancel",
+                        if self.source.has_configuration_options() {
+                            "Cancel"
+                        } else {
+                            "Dismiss"
+                        },
                     )
-                } else {
-                    None
-                },
-            )
-            .end_slot(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new(
-                            "cancel",
-                            if self.source.has_configuration_options() {
-                                "Cancel"
-                            } else {
-                                "Dismiss"
-                            },
-                        )
+                    .key_binding(
+                        KeyBinding::for_action_in(&menu::Cancel, &focus_handle, cx)
+                            .map(|kb| kb.size(rems_from_px(12.))),
+                    )
+                    .on_click(
+                        cx.listener(|this, _event, _window, cx| this.cancel(&menu::Cancel, cx)),
+                    ),
+                )
+                .children(self.source.has_configuration_options().then(|| {
+                    Button::new("configure-server", "Configure Server")
+                        .disabled(is_busy)
                         .key_binding(
-                            KeyBinding::for_action_in(&menu::Cancel, &focus_handle, cx)
+                            KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
                                 .map(|kb| kb.size(rems_from_px(12.))),
                         )
                         .on_click(
-                            cx.listener(|this, _event, _window, cx| this.cancel(&menu::Cancel, cx)),
-                        ),
-                    )
-                    .children(self.source.has_configuration_options().then(|| {
-                        Button::new("configure-server", "Configure Server")
-                            .disabled(is_busy)
-                            .key_binding(
-                                KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(12.))),
-                            )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
+                            cx.listener(|this, _event, _window, cx| {
                                 this.confirm(&menu::Confirm, cx)
-                            }))
-                    })),
-            )
+                            }),
+                        )
+                })),
+        )
     }
 
     fn render_loading(&self, label: impl Into<SharedString>) -> Div {

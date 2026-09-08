@@ -7,7 +7,6 @@ mod migrate;
 pub(crate) mod move_to_applications;
 mod open_listener;
 mod open_url_modal;
-mod quick_action_bar;
 pub mod remote_debug;
 pub mod telemetry_log;
 #[cfg(target_os = "windows")]
@@ -23,9 +22,7 @@ use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
 use collections::VecDeque;
 use editor::{Editor, MultiBuffer};
-use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
-use fs::Fs;
 use futures::{StreamExt, channel::mpsc, select_biased};
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::project_diff::{BranchDiffToolbar, ProjectDiffToolbar};
@@ -52,7 +49,6 @@ use paths::{
     local_tasks_file_relative_path,
 };
 use project::{DirectoryLister, DisableAiSettings, ProjectItem};
-use quick_action_bar::QuickActionBar;
 use recent_projects::open_remote_project;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use rope::Rope;
@@ -73,8 +69,8 @@ use std::{
     sync::Arc,
     sync::atomic::{self, AtomicBool},
 };
-use theme::{ActiveTheme, SystemAppearance, ThemeRegistry, deserialize_icon_theme};
-use theme_settings::{ThemeSettings, load_user_theme};
+use theme::ActiveTheme;
+use theme_settings::ThemeSettings;
 use ui::{Navigable, NavigableEntry, PopoverMenuHandle, TintColor, prelude::*};
 use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
@@ -566,12 +562,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let diagnostic_summary =
             cx.new(|cx| diagnostics::items::DiagnosticIndicator::new(workspace, cx));
         let active_file_name = cx.new(|_| workspace::active_file_name::ActiveFileName::new());
-        let activity_indicator = activity_indicator::ActivityIndicator::new(
-            workspace,
-            workspace.project().read(cx).languages().clone(),
-            window,
-            cx,
-        );
         let active_buffer_encoding =
             cx.new(|_| encoding_selector::ActiveBufferEncoding::new(workspace));
         let active_buffer_language =
@@ -604,7 +594,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(active_file_name, window, cx);
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
-            status_bar.add_left_item(activity_indicator, window, cx);
             status_bar.add_right_item(edit_prediction_ui, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
@@ -1319,10 +1308,7 @@ fn initialize_pane(
                     cx,
                 )
             });
-            toolbar.add_item(buffer_search_bar.clone(), window, cx);
-            let quick_action_bar =
-                cx.new(|cx| QuickActionBar::new(buffer_search_bar, workspace, cx));
-            toolbar.add_item(quick_action_bar, window, cx);
+            toolbar.add_item(buffer_search_bar, window, cx);
             let diagnostic_editor_controls = cx.new(|_| diagnostics::ToolbarControls::new());
             toolbar.add_item(diagnostic_editor_controls, window, cx);
             let project_search_bar = cx.new(|_| ProjectSearchBar::new());
@@ -2526,99 +2512,4 @@ fn open_settings_file(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
-}
-
-/// Eagerly loads the active theme and icon theme based on the selections in the
-/// theme settings.
-///
-/// This fast path exists to load these themes as soon as possible so the user
-/// doesn't see the default themes while waiting on extensions to load.
-pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut App) {
-    let extension_store = ExtensionStore::global(cx);
-    let theme_registry = ThemeRegistry::global(cx);
-    let theme_settings = ThemeSettings::get_global(cx);
-    let appearance = SystemAppearance::global(cx).0;
-
-    enum LoadTarget {
-        Theme(PathBuf),
-        IconTheme((PathBuf, PathBuf)),
-    }
-
-    let theme_name = theme_settings.theme.name(appearance);
-    let icon_theme_name = theme_settings.icon_theme.name(appearance);
-    let themes_to_load = [
-        theme_registry
-            .get(&theme_name.0)
-            .is_err()
-            .then(|| {
-                extension_store
-                    .read(cx)
-                    .path_to_extension_theme(&theme_name.0)
-            })
-            .flatten()
-            .map(LoadTarget::Theme),
-        theme_registry
-            .get_icon_theme(&icon_theme_name.0)
-            .is_err()
-            .then(|| {
-                extension_store
-                    .read(cx)
-                    .path_to_extension_icon_theme(&icon_theme_name.0)
-            })
-            .flatten()
-            .map(LoadTarget::IconTheme),
-    ];
-
-    enum ReloadTarget {
-        Theme,
-        IconTheme,
-    }
-
-    let executor = cx.background_executor();
-    let reload_tasks = parking_lot::Mutex::new(Vec::with_capacity(themes_to_load.len()));
-
-    let mut themes_to_load = themes_to_load.into_iter().flatten().peekable();
-
-    if themes_to_load.peek().is_none() {
-        return;
-    }
-
-    cx.foreground_executor().block_on(executor.scoped(|scope| {
-        for load_target in themes_to_load {
-            let theme_registry = &theme_registry;
-            let reload_tasks = &reload_tasks;
-            let fs = fs.clone();
-
-            scope.spawn(async move {
-                match load_target {
-                    LoadTarget::Theme(theme_path) => {
-                        if let Some(bytes) = fs.load_bytes(&theme_path).await.log_err()
-                            && load_user_theme(theme_registry, &bytes).log_err().is_some()
-                        {
-                            reload_tasks.lock().push(ReloadTarget::Theme);
-                        }
-                    }
-                    LoadTarget::IconTheme((icon_theme_path, icons_root_path)) => {
-                        if let Some(bytes) = fs.load_bytes(&icon_theme_path).await.log_err()
-                            && let Some(icon_theme_family) =
-                                deserialize_icon_theme(&bytes).log_err()
-                            && theme_registry
-                                .load_icon_theme(icon_theme_family, &icons_root_path)
-                                .log_err()
-                                .is_some()
-                        {
-                            reload_tasks.lock().push(ReloadTarget::IconTheme);
-                        }
-                    }
-                }
-            });
-        }
-    }));
-
-    for reload_target in reload_tasks.into_inner() {
-        match reload_target {
-            ReloadTarget::Theme => theme_settings::reload_theme(cx),
-            ReloadTarget::IconTheme => theme_settings::reload_icon_theme(cx),
-        };
-    }
 }

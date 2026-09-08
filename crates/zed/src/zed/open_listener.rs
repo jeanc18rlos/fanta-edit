@@ -51,15 +51,8 @@ pub enum OpenRequestKind {
         ),
     ),
     FocusApp,
-    Extension {
-        extension_id: String,
-    },
     AgentPanel {
         external_source_prompt: Option<ExternalSourcePrompt>,
-    },
-    InstallSkill {
-        /// Full `SKILL.md` contents embedded in a `zed://skill` share link.
-        content: String,
     },
     DockMenuAction {
         index: usize,
@@ -84,19 +77,11 @@ impl std::fmt::Debug for OpenRequestKind {
         match self {
             Self::CliConnection(_) => write!(f, "CliConnection(..)"),
             Self::FocusApp => write!(f, "FocusApp"),
-            Self::Extension { extension_id } => f
-                .debug_struct("Extension")
-                .field("extension_id", extension_id)
-                .finish(),
             Self::AgentPanel {
                 external_source_prompt,
             } => f
                 .debug_struct("AgentPanel")
                 .field("external_source_prompt", external_source_prompt)
-                .finish(),
-            Self::InstallSkill { content } => f
-                .debug_struct("InstallSkill")
-                .field("content_len", &content.len())
                 .finish(),
             Self::DockMenuAction { index } => f
                 .debug_struct("DockMenuAction")
@@ -165,12 +150,6 @@ impl OpenRequest {
             } else if let Some(file) = url.strip_prefix("zed://ssh") {
                 let ssh_url = "ssh:/".to_string() + file;
                 this.parse_ssh_file_path(&ssh_url, cx)?
-            } else if let Some(extension_id) = url.strip_prefix("zed://extension/") {
-                this.kind = Some(OpenRequestKind::Extension {
-                    extension_id: extension_id.to_string(),
-                });
-            } else if url.starts_with(agent_skills::SKILL_SHARE_LINK_PREFIX) {
-                this.parse_skill_install_url(&url)?
             } else if let Some(agent_path) = url.strip_prefix("zed://agent") {
                 this.parse_agent_url(agent_path)
             } else if url == "zed://" || url == "zed://open" || url == "zed://open/" {
@@ -234,13 +213,6 @@ impl OpenRequest {
         self.kind = Some(OpenRequestKind::AgentPanel {
             external_source_prompt,
         });
-    }
-
-    fn parse_skill_install_url(&mut self, url: &str) -> Result<()> {
-        // Format: zed://skill?data=<base64url of SKILL.md contents>
-        let content = agent_skills::decode_skill_share_link(url)?;
-        self.kind = Some(OpenRequestKind::InstallSkill { content });
-        Ok(())
     }
 
     fn parse_git_clone_url(&mut self, clone_path: &str) -> Result<()> {

@@ -90,7 +90,9 @@ pub use toolchain::{
     LanguageToolchainStore, LocalLanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister,
     ToolchainMetadata, ToolchainScope,
 };
-use tree_sitter::{self, QueryCursor, WasmStore, wasmtime};
+use tree_sitter::{self, QueryCursor};
+#[cfg(feature = "wasm-grammars")]
+use tree_sitter::{WasmStore, wasmtime};
 use util::rel_path::RelPath;
 
 pub use buffer::Operation;
@@ -122,18 +124,26 @@ pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings:
 static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
 static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
 
+#[cfg(feature = "wasm-grammars")]
+fn new_parser() -> Parser {
+    let mut parser = Parser::new();
+    parser
+        .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+        .unwrap();
+    parser
+}
+
+#[cfg(not(feature = "wasm-grammars"))]
+fn new_parser() -> Parser {
+    Parser::new()
+}
+
 #[ztracing::instrument(skip_all)]
 pub fn with_parser<F, R>(func: F) -> R
 where
     F: FnOnce(&mut Parser) -> R,
 {
-    let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
-        let mut parser = Parser::new();
-        parser
-            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
-            .unwrap();
-        parser
-    });
+    let mut parser = PARSERS.lock().pop().unwrap_or_else(new_parser);
     // Tree-sitter auto-resets the parser at the end of a successful parse,
     // but the cancellation paths (progress callback returning `Break`,
     // cancelled balancing) leave outstanding state on the parser. The next
@@ -154,6 +164,7 @@ where
     func(cursor.deref_mut())
 }
 
+#[cfg(feature = "wasm-grammars")]
 static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
     wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
 });
