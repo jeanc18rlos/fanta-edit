@@ -67,6 +67,8 @@ jobs:
         run: |
           cargo test --locked -p sidebar --lib closing_a_project_releases_its_workspace
           cargo test --locked -p sidebar --lib adding_a_ready_agent_panel_synchronizes_the_current_sidebar_selection
+          cargo test --locked -p sidebar --lib creating_a_sidebar_synchronizes_an_existing_agent_panel
+          cargo test --locked -p sidebar --lib property_test::test_sidebar_invariants
 
       - name: Test canvas toolbar text entry
         run: |

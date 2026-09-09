@@ -88,7 +88,17 @@ for testing. Signed builds and version tags require these repository secrets:
 
 `MACOS_SIGNING_IDENTITY` is optional when automatic identity selection works.
 `FANTA_CLIENT_CHECKSUM_SEED` is optional telemetry configuration, not an AI key.
-None of these GitHub secrets was configured when checked.
+`MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were configured and their
+names verified on 2026-09-09. Apple issued Developer ID Application certificate
+`ML3GCBU926` for team `SP6J7Q6M3J`, expiring 2031-09-10; the private-key match,
+G2 certificate chain, and encrypted signing package were verified. The signing
+material is backed up outside the repository with restricted file permissions.
+
+Notarization credentials remain pending. App Store Connect requires accepting
+its API-use terms before API access can be requested; that agreement is awaiting
+the account holder's approval. After access is granted, a Team API key with the
+Developer role supports the workflow. Its issuer UUID is separate from the
+Developer Team ID. No notarization key has been created or stored yet.
 
 A `v*` tag must match the version in `crates/zed/Cargo.toml`. Successful tag
 builds prepare a **draft** GitHub release. Publish only after checking the DMG
@@ -176,15 +186,15 @@ after the installer and payment checks pass. No outreach was sent or published.
 
 - [Desktop integration and macOS builds](https://github.com/jeanc18rlos/fanta-edit/pull/1) — draft PR based on the existing Fanta branch.
 - [Backend billing and analytics](https://github.com/jeanc18rlos/fanta-backend/pull/1) — draft PR based on backend `main`.
-- 55 targeted desktop authentication, provider, and context-server tests passed; affected Rust crates passed compilation checks.
-- 332 backend tests passed across all 42 test files, and type checking passed in an isolated checkout containing only the proposed changes.
+- Desktop account/provider checks, 27 native generation tests, 30 document lifecycle tests, and four new Sidebar regressions passed. The full Sidebar suite has 133 passes and seven existing failures; it is not fully green.
+- 365 backend tests passed across all 42 test files, with type checking and 73 isolated GPU tests passing.
 - Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
-- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34367299913), including GPU tests and the Docker build. [Desktop app compilation and AI/media tests passed on GitHub](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34367136595) at `847aa1a`; subsequent changes only update this guide and include the shared credential tests in CI. A signed installer, authenticated production AI/media request, and end-to-end payment still require verification.
+- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415) at `b0523fe`. A later Sidebar startup-selection correction passed locally and needs its final hosted run. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
 
 See [the current validation record](RELEASE_VALIDATION.md) for later successful
 GitHub checks, native generation tests, UI observations, and measured memory
-changes. The newest local feature changes require their own release build and
-UI verification; the earlier successful CI run does not cover them.
+changes. The final local native build passed in 3m32s and was exercised through
+the UI. Local fixtures verify interactions, not production inference or billing.
 
 The review branches contain only these release fixes. Pre-existing local
 design, import, GPU, and motion work was preserved.

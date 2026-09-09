@@ -1635,6 +1635,31 @@ async fn adding_a_ready_agent_panel_synchronizes_the_current_sidebar_selection(
 }
 
 #[gpui::test]
+async fn creating_a_sidebar_synchronizes_an_existing_agent_panel(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/current-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let panel = add_agent_panel(&workspace, cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.new_thread(&NewThread, window, cx)
+    });
+    cx.run_until_parked();
+    let expected_thread = panel
+        .read_with(cx, |panel, cx| panel.active_thread_id(cx))
+        .expect("existing panel has a draft");
+
+    let sidebar = setup_sidebar_closed(&multi_workspace, cx);
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(matches!(
+            &sidebar.active_entry,
+            Some(ActiveEntry::Thread { thread_id, workspace: selected_workspace, .. })
+                if *thread_id == expected_thread && selected_workspace == &workspace
+        ));
+    });
+}
+
+#[gpui::test]
 async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =

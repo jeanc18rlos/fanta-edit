@@ -1070,6 +1070,7 @@ impl Sidebar {
 
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
+            self.sync_active_entry_from_panel(&agent_panel, cx);
         }
     }
 
