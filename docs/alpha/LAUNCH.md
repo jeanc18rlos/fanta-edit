@@ -162,7 +162,7 @@ after the installer and payment checks pass. No outreach was sent or published.
 - 55 targeted desktop authentication, provider, and context-server tests passed; affected Rust crates passed compilation checks.
 - 332 backend tests passed across all 42 test files, and type checking passed in an isolated checkout containing only the proposed changes.
 - Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
-- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34367299913), including GPU tests and the Docker build. Desktop GitHub checks are running. A signed installer, authenticated production AI/media request, and end-to-end payment still require verification.
+- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34367299913), including GPU tests and the Docker build. [Desktop app compilation and AI/media tests passed on GitHub](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34367136595) at `847aa1a`; subsequent changes only update this guide and include the shared credential tests in CI. A signed installer, authenticated production AI/media request, and end-to-end payment still require verification.
 
 The review branches contain only these release fixes. Pre-existing local
 design, import, GPU, and motion work was preserved.
