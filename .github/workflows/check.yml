@@ -65,7 +65,14 @@ jobs:
         run: |
           cargo test --locked -p fig_viewer --lib generation_
           cargo test --locked -p fig_viewer --lib document::tests
+          cargo test --locked -p fig_viewer --lib save_as_
+          cargo test --locked -p open_path_prompt --lib save_as_
           cargo test --locked -p fig_viewer --lib switching_pages_clears_the_inspected_selection_but_reselecting_a_page_keeps_it
+
+      - name: Test macOS font ownership and selection
+        run: |
+          cargo test --locked -p gpui_macos --features font-kit --lib text_system::tests
+          cargo test --locked -p gpui_macos --features font-kit --lib open_type::tests
 
       - name: Test the agent panel toggle
         run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus

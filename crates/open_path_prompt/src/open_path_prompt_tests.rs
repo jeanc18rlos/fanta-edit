@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic};
 
 use fuzzy::{StringMatch, StringMatchCandidate};
-use gpui::{AppContext, Entity, TestAppContext, VisualTestContext};
+use gpui::{AppContext, BorrowAppContext as _, Entity, TestAppContext, VisualTestContext};
 use picker::{Picker, PickerDelegate};
 use project::Project;
 use serde_json::json;
@@ -9,6 +9,80 @@ use util::path;
 use workspace::{AppState, MultiWorkspace};
 
 use crate::{CandidateInfo, DirectoryState, OpenPathDelegate};
+
+#[gpui::test]
+async fn save_as_custom_picker_uses_initial_directory_and_preserves_defaults(
+    cx: &mut TestAppContext,
+) {
+    let app_state = init_test(cx);
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(path!("/designs/Original"), json!({"fanta.json": "{}"}))
+        .await;
+    let project = Project::test(
+        app_state.fs.clone(),
+        [path!("/designs/Original").as_ref()],
+        cx,
+    )
+    .await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+    workspace.update_in(cx, |workspace, window, cx| {
+        crate::OpenPathPrompt::register_new_path(workspace, Some(window), cx);
+        cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+            settings
+                .set_user_settings(r#"{"use_system_path_prompts":false}"#, cx)
+                .expect("custom path prompt settings");
+        });
+    });
+    let selected = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.prompt_for_new_path_in(
+            project::DirectoryLister::Local(project.clone(), app_state.fs.clone()),
+            Some("Original Copy".into()),
+            Some(path!("/designs").into()),
+            window,
+            cx,
+        )
+    });
+    let picker = workspace
+        .read_with(cx, |workspace, cx| {
+            workspace.active_modal::<Picker<OpenPathDelegate>>(cx)
+        })
+        .expect("custom save picker");
+    assert_eq!(
+        picker.read_with(cx, |picker, cx| picker.query(cx)),
+        path!("/designs/Original Copy")
+    );
+    picker.update_in(cx, |picker, window, cx| {
+        picker.cancel(&Default::default(), window, cx)
+    });
+    assert_eq!(selected.await.expect("cancel copy picker"), None);
+    cx.run_until_parked();
+
+    let selected = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.prompt_for_new_path(
+            project::DirectoryLister::Local(project, app_state.fs.clone()),
+            Some("notes.txt".into()),
+            window,
+            cx,
+        )
+    });
+    let picker = workspace
+        .read_with(cx, |workspace, cx| {
+            workspace.active_modal::<Picker<OpenPathDelegate>>(cx)
+        })
+        .expect("default save picker");
+    assert_eq!(
+        picker.read_with(cx, |picker, cx| picker.query(cx)),
+        path!("/designs/Original/notes.txt")
+    );
+    picker.update_in(cx, |picker, window, cx| {
+        picker.cancel(&Default::default(), window, cx)
+    });
+    assert_eq!(selected.await.expect("cancel default picker"), None);
+}
 
 #[gpui::test]
 async fn test_open_path_prompt(cx: &mut TestAppContext) {

@@ -45,10 +45,14 @@ struct ProjectWrites {
 #[derive(Default)]
 struct ProjectWriteState {
     active: usize,
+    changing_destination: bool,
     quiet_until: Option<Instant>,
 }
 
-struct ProjectWriteLease(Arc<ProjectWrites>);
+struct ProjectWriteLease {
+    writes: Arc<ProjectWrites>,
+    changing_destination: bool,
+}
 
 impl ProjectWrites {
     fn begin(self: &Arc<Self>) -> Arc<ProjectWriteLease> {
@@ -56,7 +60,31 @@ impl ProjectWrites {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .active += 1;
-        Arc::new(ProjectWriteLease(self.clone()))
+        Arc::new(ProjectWriteLease {
+            writes: self.clone(),
+            changing_destination: false,
+        })
+    }
+
+    fn begin_destination_change(self: &Arc<Self>) -> Result<Arc<ProjectWriteLease>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            state.active == 0,
+            "A save is already running. Try Save As again when it finishes."
+        );
+        state.active += 1;
+        state.changing_destination = true;
+        Ok(Arc::new(ProjectWriteLease {
+            writes: self.clone(),
+            changing_destination: true,
+        }))
+    }
+
+    fn changing_destination(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .changing_destination
     }
 
     fn suppresses_watcher(&self, now: Instant) -> bool {
@@ -68,11 +96,14 @@ impl ProjectWrites {
 impl Drop for ProjectWriteLease {
     fn drop(&mut self) {
         let mut state = self
-            .0
+            .writes
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.active = state.active.saturating_sub(1);
+        if self.changing_destination {
+            state.changing_destination = false;
+        }
         state.quiet_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
     }
 }
@@ -1788,6 +1819,14 @@ impl FigItem {
         kind: SaveKind,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
+        if self.project_writes.changing_destination() {
+            return Task::ready(match kind {
+                SaveKind::Auto => Ok(None),
+                SaveKind::Explicit => Err(anyhow::anyhow!(
+                    "Save As is still running. Wait for it to finish before saving again."
+                )),
+            });
+        }
         if self.source_edit_locked {
             return Task::ready(Err(anyhow::anyhow!(
                 "the FNX source is dirty; save it through the code workspace before saving the canvas"
@@ -1879,6 +1918,142 @@ impl FigItem {
             })?;
             drop(write_lease);
             result.map(|()| materializing.then_some(target))
+        })
+    }
+
+    pub(crate) fn save_as(
+        &mut self,
+        project: Entity<Project>,
+        destination: ProjectPath,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let preparation = (|| {
+            anyhow::ensure!(
+                !self.source_edit_locked,
+                "Save or discard the current FNX edit before using Save As."
+            );
+            let document = self
+                .document
+                .ready()
+                .context("The design is still loading.")?;
+            let target = project
+                .read(cx)
+                .absolute_path(&destination, cx)
+                .context("Save As requires a local destination folder.")?;
+            let manifest_path = ProjectPath {
+                worktree_id: destination.worktree_id,
+                path: destination
+                    .path
+                    .join(util::rel_path::RelPath::unix("fanta.json")?),
+            };
+            let lease = self.project_writes.begin_destination_change()?;
+            Ok((
+                target,
+                manifest_path,
+                document.doc.clone_for_persist(),
+                document.raw_assets.clone(),
+                document.render_generation(),
+                lease,
+            ))
+        })();
+        let (target, manifest_path, document, assets, generation, lease) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                if self.dirty {
+                    cx.emit(FigItemEvent::Edited);
+                    cx.notify();
+                }
+                return Task::ready(Err(error));
+            }
+        };
+        let previous_root = self.project_root.clone();
+        self.reload_task = None;
+        self.sync_epoch += 1;
+        cx.spawn(async move |this, cx| {
+            let result: Result<()> = async {
+                let (root, document, cache) = cx
+                    .background_spawn({
+                        let lease = lease.clone();
+                        async move {
+                            let _lease = lease;
+                            let (root, cache) = write_project_copy(
+                                &target,
+                                previous_root.as_deref(),
+                                &document,
+                                &assets,
+                            )?;
+                            anyhow::Ok((root, document, cache))
+                        }
+                    })
+                    .await?;
+                let projects = this.update(cx, |this, cx| {
+                    this.entry_id = project
+                        .read(cx)
+                        .entry_for_path(&manifest_path, cx)
+                        .map(|entry| entry.id);
+                    this.path = manifest_path;
+                    this.abs_path = root.join("fanta.json");
+                    this.project_root = Some(root.clone());
+                    this.merge_base = Some(document);
+                    this.write_cache = Some(cache);
+                    this.dirty = this
+                        .document
+                        .ready()
+                        .is_none_or(|document| document.render_generation() != generation);
+                    this.preview_dirty_before = None;
+                    this.sync_epoch += 1;
+                    this.set_conflict(false, cx);
+                    this.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+                    this.subscribe_to_project(&project, cx);
+                    // All split/scoped views share this document. Remove its old
+                    // lookup keys so reopening the original reads the original tree.
+                    let entity_id = cx.entity_id();
+                    cx.default_global::<SharedProjectItems>()
+                        .0
+                        .retain(|_, item| item.entity_id() != entity_id);
+                    let key = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    register_shared_project_item(key, &cx.entity(), cx);
+                    cx.emit(FigItemEvent::StateChanged);
+                    if this.dirty {
+                        cx.emit(FigItemEvent::Edited);
+                    }
+                    cx.notify();
+                    this.project_subscriptions
+                        .iter()
+                        .filter_map(|(project, _)| project.upgrade())
+                        .collect::<Vec<_>>()
+                })?;
+                drop(lease);
+                // Other windows sharing this document need a watcher for its new
+                // directory even after the window performing Save As closes.
+                for project in projects {
+                    let worktree = project.update(cx, |project, cx| {
+                        project.find_or_create_worktree(root.clone(), true, cx)
+                    });
+                    if let Err(error) = worktree.await {
+                        log::error!(
+                            "adding saved Fanta project {} to the workspace failed: {error:#}",
+                            root.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                // Save As consumed each view's autosave timer while it held
+                // the destination lease. Re-arm them after releasing it so
+                // a rejected copy does not silently disable normal saving.
+                if let Err(error) = this.update(cx, |this, cx| {
+                    if this.dirty {
+                        cx.emit(FigItemEvent::Edited);
+                        cx.notify();
+                    }
+                }) {
+                    log::debug!("the design closed before autosave could resume: {error:#}");
+                }
+            }
+            result
         })
     }
 }
@@ -2017,6 +2192,71 @@ pub(crate) fn write_project(
         raw_assets,
         &mut fanta_format::ProjectWriteCache::default(),
     )
+}
+
+fn write_project_copy(
+    target: &Path,
+    source: Option<&Path>,
+    document: &Doc,
+    assets: &BTreeMap<AssetId, Vec<u8>>,
+) -> Result<(PathBuf, fanta_format::ProjectWriteCache)> {
+    let requested_target = target.to_path_buf();
+    let target = validate_project_copy_destination(target, source)?;
+    let parent = target
+        .parent()
+        .context("Choose a destination folder with a parent directory.")?;
+    // Publish only a complete project. A failed/cancelled background write
+    // must not leave a half-written fanta.json that future opens would adopt.
+    let staging = tempfile::Builder::new()
+        .prefix(".fanta-save-as-")
+        .tempdir_in(parent)?;
+    let mut cache = fanta_format::ProjectWriteCache::default();
+    write_project_cached(staging.path(), document, assets, &mut cache)?;
+    std::fs::rename(staging.path(), &target)
+        .with_context(|| format!("saving the copied design at {}", target.display()))?;
+    Ok((requested_target, cache))
+}
+
+pub(crate) fn validate_project_copy_destination(
+    target: &Path,
+    source: Option<&Path>,
+) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .context("Choose a destination folder with a parent directory.")?
+        .canonicalize()?;
+    let target = parent.join(
+        target
+            .file_name()
+            .context("Choose a name for the copied design.")?,
+    );
+    if let Some(source) = source {
+        match source.canonicalize() {
+            Ok(source) => anyhow::ensure!(
+                !target.starts_with(&source),
+                "Choose a destination outside the original Fanta project."
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking the original project directory"),
+        }
+    }
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "{} already exists. Choose a new or empty folder.",
+                target.display()
+            );
+            anyhow::ensure!(
+                std::fs::read_dir(&target)?.next().is_none(),
+                "{} is not empty. Choose a new or empty folder.",
+                target.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", target.display())),
+    }
+    Ok(target)
 }
 
 /// [`write_project`] reusing the per-design projection memoized in `cache`
@@ -3106,6 +3346,284 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
         let roots: [&Path; 0] = [];
         Project::test(fs, roots, cx).await
+    }
+
+    #[gpui::test]
+    async fn save_as_preserves_original_edits_assets_and_subsequent_destination(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let document = doc_with_one_page();
+            let page = document.active_page().context("active page")?;
+            write_project(&original, &document, &BTreeMap::new())?;
+            let original_source =
+                fanta_format::locate_page_source(&original, page).context("page source")?;
+            let original_bytes = std::fs::read(&original_source)?;
+            let original_manifest = std::fs::read(original.join("fanta.json"))?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("worktree")
+                    .read(cx)
+                    .id()
+            });
+            let item = ready_item(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let original_key = original.canonicalize()?;
+            cx.update(|cx| register_shared_project_item(original_key.clone(), &item, cx));
+            let asset = AssetId::new();
+            let bytes = b"encoded asset copied without conversion".to_vec();
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.clone());
+                    ((), DocChange::Content)
+                });
+                item.apply(
+                    Operation::SetName {
+                        id: page,
+                        old: "Page 1".into(),
+                        new: "Current edits".into(),
+                    },
+                    cx,
+                )
+            })?;
+            let destination = ProjectPath {
+                worktree_id,
+                path: util::rel_path::rel_path("Copy").into(),
+            };
+            let save_as = item.update(cx, |item, cx| {
+                item.save_as(project.clone(), destination, cx)
+            });
+            // Edits while the snapshot is being written must remain dirty and
+            // must never be autosaved back to the old project during the copy.
+            item.update(cx, |item, cx| {
+                item.apply(
+                    Operation::SetName {
+                        id: page,
+                        old: "Current edits".into(),
+                        new: "Edited during copy".into(),
+                    },
+                    cx,
+                )
+            })?;
+            assert!(
+                item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+                    .await?
+                    .is_none()
+            );
+            save_as.await?;
+            let (copied_document, copied_assets) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(
+                copied_document.scene.get(page).context("copied page")?.name,
+                "Current edits"
+            );
+            assert_eq!(copied_assets.get(&asset), Some(&bytes));
+            assert_eq!(std::fs::read(&original_source)?, original_bytes);
+            assert_eq!(
+                std::fs::read(original.join("fanta.json"))?,
+                original_manifest
+            );
+            item.read_with(cx, |item, cx| {
+                assert!(
+                    item.is_dirty(),
+                    "the newer edit is not part of the copied snapshot"
+                );
+                assert_eq!(item.project_root(), Some(copy.as_path()));
+                assert_eq!(item.abs_path(), copy.join("fanta.json"));
+                assert_eq!(
+                    project.read(cx).absolute_path(&item.path, cx),
+                    Some(copy.join("fanta.json"))
+                );
+                assert_eq!(item.title().as_ref(), "Copy");
+            });
+            cx.update(|cx| {
+                assert!(shared_project_item(&original_key, cx).is_none());
+                assert_eq!(
+                    shared_project_item(&copy.canonicalize().expect("saved copy"), cx)
+                        .map(|item| item.entity_id()),
+                    Some(item.entity_id())
+                );
+            });
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await?;
+            let (saved_again, saved_assets) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(
+                saved_again.scene.get(page).context("saved page")?.name,
+                "Edited during copy"
+            );
+            assert_eq!(saved_assets.get(&asset), Some(&bytes));
+            assert_eq!(std::fs::read(&original_source)?, original_bytes);
+            assert_eq!(
+                std::fs::read(original.join("fanta.json"))?,
+                original_manifest
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            Ok(())
+        }
+        .await;
+        result.expect(
+            "Save As preserves the original, copies edits/assets and retargets subsequent saves",
+        );
+    }
+
+    #[gpui::test]
+    async fn save_as_rejects_existing_content_without_retargeting(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let occupied = directory.path().join("Occupied");
+            let document = doc_with_one_page();
+            write_project(&original, &document, &BTreeMap::new())?;
+            std::fs::create_dir(&occupied)?;
+            std::fs::write(occupied.join("keep.txt"), "keep this file")?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {}, "Occupied": {}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("worktree")
+                    .read(cx)
+                    .id()
+            });
+            let item = ready_item(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, _| item.dirty = true);
+            let destination = ProjectPath {
+                worktree_id,
+                path: util::rel_path::rel_path("Occupied").into(),
+            };
+            let result = item
+                .update(cx, |item, cx| {
+                    item.save_as(project.clone(), destination, cx)
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(occupied.join("keep.txt"))?,
+                "keep this file"
+            );
+            assert!(!occupied.join("fanta.json").exists());
+            item.read_with(cx, |item, _| {
+                assert_eq!(item.project_root(), Some(original.as_path()));
+                assert_eq!(item.abs_path(), original.join("fanta.json"));
+                assert!(item.is_dirty());
+                assert!(!item.project_writes.changing_destination());
+            });
+            Ok(())
+        }
+        .await;
+        result.expect("a failed Save As preserves the occupied destination and current design");
+    }
+
+    #[test]
+    fn save_as_recovers_when_original_folder_is_missing() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let original = directory.path().join("Original");
+        let copy = directory.path().join("Recovered");
+        let document = doc_with_one_page();
+        let page = document.active_page().context("active page")?;
+        write_project(&original, &document, &BTreeMap::new())?;
+        std::fs::remove_dir_all(&original)?;
+        write_project_copy(&copy, Some(&original), &document, &BTreeMap::new())?;
+        let (recovered, _) = fanta_format::read_project_tree(&copy)?;
+        assert!(recovered.scene.contains(page));
+        assert!(
+            !original.exists(),
+            "recovery must not recreate the original folder"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn save_as_rejects_nested_and_aliased_destinations() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let original = directory.path().join("Original");
+        let document = doc_with_one_page();
+        write_project(&original, &document, &BTreeMap::new())?;
+        assert!(
+            write_project_copy(&original, Some(&original), &document, &BTreeMap::new()).is_err()
+        );
+        assert!(
+            write_project_copy(
+                &original.join("Nested"),
+                Some(&original),
+                &document,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(!original.join("Nested").exists());
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("Alias");
+            std::os::unix::fs::symlink(&original, &alias)?;
+            assert!(
+                write_project_copy(&alias, Some(&original), &document, &BTreeMap::new()).is_err()
+            );
+            assert!(
+                write_project_copy(
+                    &alias.join("Nested"),
+                    Some(&original),
+                    &document,
+                    &BTreeMap::new()
+                )
+                .is_err()
+            );
+        }
+        let empty = directory.path().join("Empty");
+        std::fs::create_dir(&empty)?;
+        write_project_copy(&empty, Some(&original), &document, &BTreeMap::new())?;
+        assert!(empty.join("fanta.json").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn save_as_write_lease_survives_foreground_cancellation() -> Result<()> {
+        let writes = Arc::new(ProjectWrites::default());
+        let save = writes.begin();
+        assert!(writes.begin_destination_change().is_err());
+        drop(save);
+        let foreground = writes.begin_destination_change()?;
+        let background = foreground.clone();
+        assert!(writes.changing_destination());
+        drop(foreground);
+        assert!(writes.changing_destination());
+        assert!(writes.begin_destination_change().is_err());
+        drop(background);
+        assert!(!writes.changing_destination());
+        assert!(writes.begin_destination_change().is_ok());
+        Ok(())
     }
 
     /// A document with a single (empty) page, so a save writes a `pages/<id>/`

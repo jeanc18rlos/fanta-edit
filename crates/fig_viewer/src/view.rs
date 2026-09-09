@@ -613,6 +613,14 @@ impl FigView {
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::StateChanged => {
+                    if let Some(root) = this.item.read(cx).project_root() {
+                        this.opened_entry_id = this.opened_entry_id.filter(|entry_id| {
+                            let project = this.project.read(cx);
+                            project.path_for_entry(*entry_id, cx)
+                                .and_then(|path| project.absolute_path(&path, cx))
+                                .is_some_and(|path| path.starts_with(root))
+                        });
+                    }
                     // A reload replaces the document while prototype state
                     // contains node/variable IDs from the previous tree. Drop
                     // the session locally without trying to update the item
@@ -5012,9 +5020,16 @@ impl Item for FigView {
         // the entry this view was actually opened from instead.
         match self.opened_entry_id {
             Some(entry_id) => [entry_id].into_iter().collect(),
-            None => project::ProjectItem::entry_id(self.item.read(cx), cx)
-                .into_iter()
-                .collect(),
+            None => {
+                let project = self.project.read(cx);
+                project
+                    .find_project_path(self.item.read(cx).abs_path(), cx)
+                    .and_then(|path| project.entry_for_path(&path, cx))
+                    .map(|entry| entry.id)
+                    .or_else(|| project::ProjectItem::entry_id(self.item.read(cx), cx))
+                    .into_iter()
+                    .collect()
+            }
         }
     }
 
@@ -5066,6 +5081,50 @@ impl Item for FigView {
 
     fn can_save(&self, cx: &App) -> bool {
         self.item.read(cx).has_ready_document()
+    }
+
+    fn can_save_as(&self, cx: &App) -> bool {
+        self.item.read(cx).has_ready_document() && self.project.read(cx).is_local()
+    }
+
+    fn suggested_filename(&self, cx: &App) -> SharedString {
+        format!("{} Copy", self.item.read(cx).title()).into()
+    }
+
+    fn suggested_save_as_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let item = self.item.read(cx);
+        item.project_root()
+            .unwrap_or_else(|| item.abs_path())
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    }
+
+    fn validate_save_as(&self, path: std::path::PathBuf, cx: &App) -> Task<Result<()>> {
+        let source = self
+            .item
+            .read(cx)
+            .project_root()
+            .map(std::path::Path::to_path_buf);
+        cx.background_spawn(async move {
+            crate::document::validate_project_copy_destination(&path, source.as_deref())?;
+            Ok(())
+        })
+    }
+
+    fn save_as(
+        &mut self,
+        project: Entity<Project>,
+        path: project::ProjectPath,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+        }
+        self.finish_document_edits(cx);
+        self.autosave_task = None;
+        self.item
+            .update(cx, |item, cx| item.save_as(project, path, cx))
     }
 
     fn save(
@@ -5566,6 +5625,367 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    #[gpui::test]
+    async fn save_as_updates_shared_views_and_their_project_entries(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system.clone(), [directory.path()], cx).await;
+            let original_entry = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path(original.join("fanta.json"), cx)
+                    .expect("original path");
+                project
+                    .entry_for_path(&path, cx)
+                    .expect("original entry")
+                    .id
+            });
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&copy, cx))
+                .context("copy path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let views = scratch.update(cx, |_, window, cx| {
+                (0..2)
+                    .map(|_| {
+                        cx.new(|cx| {
+                            let mut view = FigView::new(item.clone(), project.clone(), window, cx);
+                            view.opened_entry_id = Some(original_entry);
+                            view
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            let view = views.first().context("first view")?;
+            view.read_with(cx, |view, cx| {
+                assert!(view.can_save_as(cx));
+                assert_eq!(view.suggested_filename(cx).as_ref(), "Original Copy");
+            });
+            add_rect(&item, cx);
+            scratch
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        Item::save_as(view, project.clone(), destination, window, cx)
+                    })
+                })?
+                .await?;
+            file_system
+                .insert_tree(&copy, serde_json::json!({"fanta.json": "{}"}))
+                .await;
+            cx.run_until_parked();
+            let copied_entry = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path(copy.join("fanta.json"), cx)
+                    .expect("copied path");
+                project.entry_for_path(&path, cx).expect("copied entry").id
+            });
+            for view in &views {
+                view.read_with(cx, |view, cx| {
+                    assert_eq!(view.tab_content_text(0, cx).as_ref(), "Copy");
+                    assert_eq!(view.item.entity_id(), item.entity_id());
+                    assert_eq!(view.project_entry_ids(cx).as_slice(), &[copied_entry]);
+                    assert_ne!(copied_entry, original_entry);
+                    assert!(!view.is_dirty(cx));
+                });
+            }
+            let (original_document, _) = fanta_format::read_project_tree(&original)?;
+            let (copied_document, _) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(original_document.scene.len(), 1);
+            assert_eq!(copied_document.scene.len(), 2);
+            Ok(())
+        }
+        .await;
+        result.expect("Save As updates shared views and their project entries");
+    }
+
+    #[gpui::test]
+    async fn save_as_native_picker_starts_beside_the_original_project(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(&original, serde_json::json!({"fanta.json": "{}"}))
+                .await;
+            let project = Project::test(file_system, [original.as_path()], cx).await;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, cx| {
+                item.path = project
+                    .read(cx)
+                    .find_project_path(item.abs_path(), cx)
+                    .expect("original path");
+            });
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let (workspace, view) = scratch.update(cx, |_, window, cx| {
+                let workspace =
+                    cx.new(|cx| workspace::Workspace::test_new(project.clone(), window, cx));
+                let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    )
+                });
+                (workspace, view)
+            })?;
+            assert_eq!(
+                view.read_with(cx, |view, cx| view.suggested_filename(cx)),
+                "Original Copy"
+            );
+            let save = scratch.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::SaveAs, window, cx)
+                })
+            })?;
+            cx.run_until_parked();
+            assert!(
+                cx.did_prompt_for_new_path(),
+                "Save As reaches the native path prompt"
+            );
+            cx.simulate_new_path_selection(|initial_directory| {
+                assert_eq!(
+                    initial_directory,
+                    directory.path(),
+                    "a copied design belongs beside its original, not inside it"
+                );
+                None
+            });
+            save.await?;
+            assert_eq!(
+                item.read_with(cx, |item, _| item
+                    .project_root()
+                    .map(std::path::Path::to_path_buf)),
+                Some(original)
+            );
+            assert!(
+                !directory.path().join("Original Copy").exists(),
+                "cancel does not create a copy"
+            );
+            Ok(())
+        }
+        .await;
+        result.expect("Save As uses the project parent as its native initial directory");
+    }
+
+    #[gpui::test]
+    async fn save_as_rejects_existing_design_before_opening_its_worktree(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| {
+                workspace::register_project_item::<FigView>(cx);
+                crate::workspace_hooks::init(cx);
+            });
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Original Copy");
+            let document = doc_with_one_page();
+            let page = document.active_page().context("active page")?;
+            for root in [&original, &copy] {
+                crate::document::write_project(root, &document, &BTreeMap::new())?;
+            }
+            let original_manifest = std::fs::read(original.join("fanta.json"))?;
+            let original_source =
+                fanta_format::locate_page_source(&original, page).context("original page")?;
+            let original_bytes = std::fs::read(&original_source)?;
+            let copy_source =
+                fanta_format::locate_page_source(&copy, page).context("copied page")?;
+            let copy_bytes = std::fs::read(&copy_source)?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({
+                        "Original": {"fanta.json": std::fs::read_to_string(original.join("fanta.json"))?},
+                        "Original Copy": {"fanta.json": std::fs::read_to_string(copy.join("fanta.json"))?},
+                    }),
+                )
+                .await;
+            let project = Project::test(file_system, [copy.as_path()], cx).await;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                copy.join("fanta.json"),
+                Some(copy.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, cx| {
+                item.path = project
+                    .read(cx)
+                    .find_project_path(item.abs_path(), cx)
+                    .expect("copied design path");
+            });
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let (workspace, view) = scratch.update(cx, |_, window, cx| {
+                let workspace =
+                    cx.new(|cx| workspace::Workspace::test_new(project.clone(), window, cx));
+                let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                (workspace, view)
+            })?;
+            cx.run_until_parked();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project.worktrees(cx).count()),
+                1
+            );
+            assert_eq!(
+                workspace.read_with(cx, |workspace, cx| workspace.items_of_type::<FigView>(cx).count()),
+                1
+            );
+            add_rect(&item, cx);
+            let save = scratch.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::SaveAs, window, cx)
+                })
+            })?;
+            cx.run_until_parked();
+            assert!(cx.did_prompt_for_new_path());
+            cx.simulate_new_path_selection(|_| Some(original.clone()));
+            let error = save.await.expect_err("an existing design rejects Save As");
+            assert!(error.to_string().contains("is not empty"));
+            cx.run_until_parked();
+            project.read_with(cx, |project, cx| {
+                assert_eq!(
+                    project.worktrees(cx).count(),
+                    1,
+                    "a rejected destination must not become a worktree"
+                );
+                assert!(project.find_project_path(&original, cx).is_none());
+            });
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.items_of_type::<FigView>(cx).count(),
+                    1,
+                    "the destination must not open a tab"
+                );
+                assert_eq!(
+                    workspace.active_item(cx).map(|item| item.item_id()),
+                    Some(view.entity_id())
+                );
+            });
+            assert_eq!(std::fs::read(original.join("fanta.json"))?, original_manifest);
+            assert_eq!(std::fs::read(original_source)?, original_bytes);
+            assert_eq!(std::fs::read(copy_source)?, copy_bytes);
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.item.read(cx).project_root(), Some(copy.as_path()));
+                assert!(view.is_dirty(cx));
+                assert!(view.autosave_task.is_some());
+            });
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            assert_eq!(fanta_format::read_project_tree(&copy)?.0.scene.len(), 2);
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 1);
+            Ok(())
+        }
+        .await;
+        result
+            .expect("rejected Save As preserves the active design without opening its destination");
+    }
+
+    #[gpui::test]
+    async fn save_as_failure_resumes_autosave_on_the_original_design(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let occupied = directory.path().join("Occupied");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            std::fs::create_dir(&occupied)?;
+            std::fs::write(occupied.join("keep.txt"), "untouched")?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}, "Occupied": {}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&occupied, cx))
+                .context("occupied path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let view = scratch.update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })?;
+            add_rect(&item, cx);
+            let save_as = scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    Item::save_as(view, project, destination, window, cx)
+                })
+            })?;
+            assert!(
+                save_as.await.is_err(),
+                "the occupied destination must reject Save As"
+            );
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert!(
+                    view.autosave_task.is_some(),
+                    "the failed copy re-arms autosave"
+                );
+                assert!(view.is_dirty(cx));
+                assert_eq!(view.item.read(cx).project_root(), Some(original.as_path()));
+            });
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 1);
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 2);
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(
+                std::fs::read_to_string(occupied.join("keep.txt"))?,
+                "untouched"
+            );
+            assert!(!occupied.join("fanta.json").exists());
+            Ok(())
+        }
+        .await;
+        result.expect("a failed Save As must not disable autosaving the original design");
     }
 
     /// The hero promise: an edit reaches the project tree on its own, so
