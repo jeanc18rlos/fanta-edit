@@ -860,8 +860,18 @@ impl Sidebar {
                     this.subscribe_to_workspace(workspace, window, cx);
                     this.schedule_update_entries(false, cx);
                 }
-                MultiWorkspaceEvent::WorkspaceRemoved(_)
-                | MultiWorkspaceEvent::ProjectGroupsChanged => {
+                MultiWorkspaceEvent::WorkspaceRemoved(workspace_id) => {
+                    if this
+                        .active_entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.workspace().entity_id() == *workspace_id)
+                    {
+                        this.active_entry = None;
+                        this.sync_active_entry_from_active_workspace(cx);
+                    }
+                    this.schedule_update_entries(false, cx);
+                }
+                MultiWorkspaceEvent::ProjectGroupsChanged => {
                     this.schedule_update_entries(false, cx);
                 }
             },
@@ -1048,6 +1058,7 @@ impl Sidebar {
                 if let workspace::Event::PanelAdded(view) = event {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
+                        this.sync_active_entry_from_panel(&agent_panel, cx);
                         this.schedule_update_entries(false, cx);
                     }
                 }
@@ -1163,6 +1174,8 @@ impl Sidebar {
             .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx));
         if let Some(panel) = panel {
             self.sync_active_entry_from_panel(&panel, cx);
+        } else {
+            self.active_entry = None;
         }
     }
 
@@ -1209,6 +1222,16 @@ impl Sidebar {
             return false;
         }
 
+        // The replacement may never acquire a draft (for example, Close Project
+        // opens an empty workspace). Its selection must not own the old workspace.
+        if self
+            .active_entry
+            .as_ref()
+            .is_some_and(|entry| entry.workspace() != &active_workspace)
+        {
+            self.active_entry = None;
+        }
+
         let panel = agent_panel.read(cx);
 
         if let Some(pending_thread_id) = self.pending_thread_activation {
@@ -1251,7 +1274,11 @@ impl Sidebar {
                     session_id,
                     workspace: active_workspace,
                 });
+            } else {
+                self.active_entry = None;
             }
+        } else {
+            self.active_entry = None;
         }
 
         false

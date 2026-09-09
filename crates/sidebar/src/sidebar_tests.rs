@@ -1532,6 +1532,109 @@ fn setup_sidebar_with_agent_panel(
 }
 
 #[gpui::test]
+async fn closing_a_project_releases_its_workspace_before_the_replacement_panel_loads(
+    cx: &mut TestAppContext,
+) {
+    assert_closed_project_is_released(false, cx).await;
+}
+
+#[gpui::test]
+async fn closing_a_project_releases_its_workspace_with_an_empty_replacement_panel(
+    cx: &mut TestAppContext,
+) {
+    assert_closed_project_is_released(true, cx).await;
+}
+
+async fn assert_closed_project_is_released(
+    replacement_panel_loaded: bool,
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/closing-project", cx).await;
+    let fs = project.read_with(cx, |project, _| project.fs().clone());
+    let replacement_project = project::Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let sidebar = setup_sidebar_closed(&multi_workspace, cx);
+    let panel = add_agent_panel(&workspace, cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.new_thread(&NewThread, window, cx)
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_active_draft(
+            sidebar,
+            &workspace,
+            "the closing project has an active draft",
+        );
+    });
+
+    let group_key = workspace.read_with(cx, |workspace, cx| workspace.project_group_key(cx));
+    let replacement =
+        cx.update(|window, cx| cx.new(|cx| Workspace::test_new(replacement_project, window, cx)));
+    if replacement_panel_loaded {
+        let replacement_panel = add_agent_panel(&replacement, cx);
+        assert!(replacement_panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).is_none()));
+    }
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(replacement.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    let removed = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.remove_project_group(&group_key, window, cx)
+    });
+    assert!(removed.await.expect("the old project group should close"));
+    let weak_workspace = workspace.downgrade();
+    drop(panel);
+    drop(workspace);
+    cx.run_until_parked();
+
+    weak_workspace.assert_released();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(
+            sidebar.active_entry.is_none(),
+            "the replacement has no active thread yet"
+        );
+    });
+    assert_eq!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspaces().count()),
+        1
+    );
+}
+
+#[gpui::test]
+async fn adding_a_ready_agent_panel_synchronizes_the_current_sidebar_selection(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/current-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+    let sidebar = setup_sidebar_closed(&multi_workspace, cx);
+    let panel = workspace.update_in(cx, |workspace, window, cx| {
+        cx.new(|cx| AgentPanel::test_new(workspace, window, cx))
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        panel.new_thread(&NewThread, window, cx)
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| assert!(sidebar.active_entry.is_none()));
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.add_panel(panel, window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.read_with(cx, |sidebar, _| {
+        assert_active_draft(
+            sidebar,
+            &workspace,
+            "mounting a ready panel synchronizes its draft",
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_agent_panel_terminals_appear_in_sidebar_and_search(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
@@ -12774,9 +12877,6 @@ mod property_test {
         // 1. active_entry should be Some when the panel has content.
         //    It may be None when the panel is uninitialized (no drafts,
         //    no threads), which is fine.
-        //    It may also temporarily point at a different workspace
-        //    when the workspace just changed and the new panel has no
-        //    content yet.
         let panel = active_workspace.read(cx).panel::<AgentPanel>(cx).unwrap();
         let panel_has_content = panel.read(cx).active_thread_id(cx).is_some()
             || panel.read(cx).active_conversation_view().is_some()
@@ -12788,13 +12888,6 @@ mod property_test {
             }
             return Ok(());
         };
-
-        // If the entry workspace doesn't match the active workspace
-        // and the panel has no content, this is a transient state that
-        // will resolve when the panel gets content.
-        if entry.workspace().entity_id() != active_workspace.entity_id() && !panel_has_content {
-            return Ok(());
-        }
 
         // 2. The entry's workspace must agree with the multi-workspace's
         //    active workspace.

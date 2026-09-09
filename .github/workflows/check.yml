@@ -63,6 +63,11 @@ jobs:
       - name: Test the agent panel toggle
         run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
 
+      - name: Test closed project ownership
+        run: |
+          cargo test --locked -p sidebar --lib closing_a_project_releases_its_workspace
+          cargo test --locked -p sidebar --lib adding_a_ready_agent_panel_synchronizes_the_current_sidebar_selection
+
       - name: Test canvas toolbar text entry
         run: |
           cargo test --locked -p fanta-gpui --lib organisms::toolbar::component::interaction_tests

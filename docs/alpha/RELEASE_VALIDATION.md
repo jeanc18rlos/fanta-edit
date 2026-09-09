@@ -6,14 +6,20 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 
 ## GitHub and local checks
 
-Both hosted `Check` runs passed at
-`c27b7a36f34dc020ee2316f381eb76c26a93dc8a`:
-[pull request run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34369734047)
-and [branch run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34369730134).
-They cover app compilation and account/provider/media regressions. They do
-**not** cover the subsequent memory, generation workspace, or UI fixes.
+The desktop [push CI run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34380329072)
+and [pull request CI run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34380334599)
+both passed at `5181599`.
+A later full native release build including the six-tool whitelist passed in
+5m27s. The subsequent sidebar ownership and generation-interface fixes have
+passed their focused tests; a final native build and fresh hosted checks are
+pending. Those later fixes have not yet been retested in the running app.
 
-For the current copy-on-write scene change, these local checks passed:
+The backend [CI run](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196)
+passed at pull request head `9d05908`, with **365 TypeScript tests**, **73
+isolated GPU tests**, and type checking. These checks do not establish deployed
+GPU readiness or successful production AI requests.
+
+Local validation results:
 
 | Check | Result |
 | --- | --- |
@@ -21,11 +27,17 @@ For the current copy-on-write scene change, these local checks passed:
 | `cargo test --locked --offline -p fanta-format` | 181 passed, including integration tests and doctests; 2 ignored |
 | Focused Rust formatting and `git diff --check` | Passed |
 | `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; now includes `cargo test --locked -p fanta-doc -p fanta-format` |
-| `cargo build --locked --release -p zed --bin fanta` | Passed in 8m06s; before the subsequent prompt-to-SVG follow-up |
+| `cargo build --locked --release -p zed --bin fanta` | Latest build passed in 5m27s, including the six-tool whitelist; before the sidebar ownership fix |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
 | Document lifecycle suite | 30 passed; bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
 | Native toolbar interaction suite | 32 passed, including pointer focus, popup dismissal, input editing, and keyboard navigation |
 | Toolbar input with the shipped canvas keymap | 1 passed; typing and clicking in search preserve the query, Escape restores shortcuts |
+| Native generation/media suite | 27 passed, including actual toolbar activation, catalog authorization, prompt-to-SVG, visible prompt rendering, accurate source clicks, and scrollable inpainting controls |
+| Sidebar suite with ownership fix | 131 passed, 8 failed; baseline was 128 passed with the same 8 failures. Three new tests passed; the suite is not fully green. |
+
+The local CI workflow now includes the focused sidebar ownership regressions
+so future runs cover them without adding the eight known baseline failures.
+This workflow change is not evidence that those baseline failures are fixed.
 
 New tests cover snapshot isolation through node/hierarchy edits and unchanged
 JSON serialization. A GPUI test also covers closing the visible assistant
@@ -36,11 +48,9 @@ focus. It passed locally (1 test; 0.37s) with:
 cargo test --locked --offline -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
 ```
 
-The native generation/media suite passed **23 targeted tests**, including the
-total SVG geometry budget and prompt-to-SVG follow-up. The isolated backend release source passed **365 tests in
-42 files**, **73 GPU tests**, and type checking after early idempotent recovery,
-Gateway planner routing, worker source fixes, and safe validation-error
-formatting. Production deployment remains pending.
+Backend coverage includes early idempotent recovery, Gateway planner routing,
+worker source fixes, and safe validation-error formatting. Production
+deployment and authenticated end-to-end verification remain pending.
 
 ## Measured snapshot improvement
 
@@ -97,15 +107,43 @@ GitHub and local history both report commit
 private import fixture.
 
 The app command palette opens the native Image workspace with Image, Video,
-Vector, Design, and Masks modes. A separate AI-toolbar search defect was
-reproduced: typing invokes canvas shortcuts and dismisses the search. Its
-focus/keymap fix and the prompt-to-SVG follow-up require another build and UI
-check. The production sign-in page visibly identifies its Clerk instance as
-Development mode; production account configuration needs verification. Native
-sign-in succeeded with the existing Google session. A slow first attempt
-outlived the 100-second callback listener. The signed-in model catalog also
-returned 401 because the client omitted authorization. The callback and
-catalog fixes passed focused tests and await the next native app build.
+Vector, Design, and Masks modes. The toolbar focus/keymap, ten-minute sign-in
+callback, catalog authorization, and prompt-to-SVG fixes are included in the
+latest native build. The production sign-in page previously identified its
+Clerk instance as Development mode; production account configuration still
+needs verification. An earlier native sign-in succeeded with the existing
+Google session. The final production account/catalog check is currently
+blocked by a macOS Keychain approval that requires manual interaction; the
+automation tool cannot approve it.
+
+In a separate local QA profile, the rebuilt native app signed in to a
+loopback fixture and loaded its authenticated, visibly QA-labeled catalog.
+Image submission, automatic polling, a gallery with two results, PNG saving,
+placement on the canvas, and saving the design passed. Mask output and local
+background removal also passed. The prompt-to-editable-SVG fixture passed
+preview and Add to design; the expanded tree showed `QA-label`,
+`QA-editable-shapes`, and `QA-background`. Shift-2 framed the result correctly,
+and Cmd-S persisted the editable layers in `page.fnx`.
+
+Video submission returned HTTP 202, automatic polling completed, and Play
+video opened the one-second MP4 in QuickTime. Clicking Play advanced the
+position to 0.409 seconds. Add to design and save persisted the MP4 layer.
+File verification found the saved PNG was 4,771 bytes with a SHA-256 identical
+to the fixture; the design contained the 4,771-byte PNG and 5,921-byte MP4
+assets, with the named layers persisted. The fixture also accepted the saved
+PNG through its upload-reuse path and completed image tracing with an SVG
+preview. Design mode prepared the requested brief in the assistant without
+sending it; it did not generate a complete design. After tracing, counters
+recorded four generated jobs, five polls, one Messages request, one reused
+upload, thirteen authenticated requests, and zero authentication rejections.
+
+These checks use deterministic local fixtures and a fake account; they do
+not exercise real GPU inference, AI Gateway generation, or billing. Subsequent
+rendered tests reproduced invisible prompt text (the editor measured 0×0) and
+source-click bounds 200 px below the preview. Both are fixed in source, with
+separate prompt drafts for each mode and an inpainting action that scrolls
+into view at 1000×768. The full generation suite now has 27 passing tests.
+Native verification of these later fixes and production checks remain pending.
 
 A QA copy of `/Users/jeanrojas/Desktop/basic.fig` (9,589,921 bytes) was imported
 through Open; `get_editor_state` reported 29,301 nodes. The converted editable
@@ -128,19 +166,28 @@ account state, not a controlled benchmark:
 | After closing the project | 3,892,704 | 4,858,416 |
 
 The synthetic snapshot improvement does not translate to a demonstrated
-whole-app memory improvement here. Retained memory after closing remains a
-release concern requiring allocation attribution and repeatable profiling;
-these samples alone cannot establish a leak. After further UI activity and
-idle time, RSS receded to 2,615,312 KiB. A heap census then reported 132,776
-live allocations totaling 48,184,824 bytes, versus roughly 13.2 million
-allocations/1.6 GiB in an earlier post-close vmmap sample. This suggests delayed
-cleanup and allocator retention need separating from live document ownership.
-A source race was found: the one-second self-write suppression could expire
-while a long save was still writing, starting a redundant full reload. The
-fix holds suppression through foreground and background write completion and
-passed four new lifecycle regressions; its whole-app effect needs measurement.
-The later physical footprint was 1.8 GiB (peak 3.8 GiB). Reopening the saved
-imported project and sustained edit cycles remain pending.
+whole-app memory improvement here. A source race was found: the one-second
+self-write suppression could expire while a long save was still writing,
+starting a redundant full reload. The fix holds suppression through
+foreground and background write completion and is covered by the 30-test
+document lifecycle suite.
+
+The latest memory guard run (PID 76062) showed RSS falling to about 180 MiB
+after Close Project. That did **not** demonstrate document memory release:
+`vmmap` still reported about 2.1 GiB physical footprint, 13.2 million
+allocations, roughly 1.5 GiB of live allocation bytes, and about 1.6 GiB
+swapped. The low RSS reflected compression/swapping, not released ownership.
+Earlier lower-RSS or heap-census observations must not be treated as evidence
+that the close-project retention was resolved.
+
+A strong `active_entry` reference in the sidebar was found retaining the
+document. A regression using the real Close Project path and a `WeakEntity`
+failed before the fix, then passed with the panel absent and with an empty
+panel. The full fixed sidebar suite reports 131 passes and the same 8 failures
+as the baseline's 128 passes; the three new tests pass. The source fix is
+frozen but has not been rebuilt or retested in the native app. Repeat
+allocation/footprint measurements after close, reopen, and sustained editing
+before drawing a whole-app memory conclusion.
 
 The earlier [release rehearsal](REHEARSAL.md) measured the 128 MB, 40,141-node,
 31-page UI kit opening in 48.5–54.1 seconds. It settled at 1952–1960 MiB, then
@@ -153,12 +200,12 @@ by repeated edits, undo/redo, page changes, saves, close/reopen, and idle checks
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
-| Backend and AI Gateway | Public health/plans and account/provider tests passed. Apply the backend migration and deploy reviewed changes; verify authenticated streaming, debit, errors, and sign-out against production. |
-| Charge customers | Billing fixes and backend tests exist. Production Polar configuration, matching products/currency, checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No customer was charged. |
-| Native generation | Source and 23 targeted tests are ready. Verify account registration/sign-in, real media jobs, progress/failure/cancel states, and inserting results into a saved design. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
-| GPU service | Backend CI tests passed; deployed GPU availability and successful end-to-end generation are not established. |
+| Backend and AI Gateway | Backend head `9d05908` is green in CI. Apply the migration and deploy reviewed changes; verify authenticated streaming, debit, errors, and sign-out against production. Final native account/catalog verification awaits manual Keychain approval. |
+| Charge customers | Billing fixes and backend tests exist. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No customer was charged. |
+| Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Recheck prompt, point-selection, and scrolling fixes in the final native build, then verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
+| GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
 | Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Import/edit/undo/redo/save passed on the baseline fixture; repeat that import workflow on the final build. |
-| Performance and UI quality | Repeat full-app large-file and sustained-memory tests. Review usable layouts and interaction feedback. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
+| Performance and UI quality | Build and retest the sidebar ownership fix in the native app, then repeat full-app large-file and sustained-memory measurements. Low post-close RSS alone is not release evidence. Review layouts and interaction feedback. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
 | Installer | No valid local signing identity was found. Configure Developer ID/notarization secrets, build a signed DMG, verify notarization, and install/launch on a clean Mac. |
 | Leads | US PostHog project 410640 and the existing landing page are accessible. Validate direct visit-to-signup reporting and durable contact handling; no improved conversion rate or outreach result is established. |
 

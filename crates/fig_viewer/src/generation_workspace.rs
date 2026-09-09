@@ -281,6 +281,7 @@ struct GenerationWorkspace {
     selected_model: Option<String>,
     size: String,
     prompt: Entity<InputField>,
+    prompt_drafts: Vec<(GenerationMode, Entity<InputField>)>,
     negative: Entity<InputField>,
     seed: Entity<InputField>,
     steps: Entity<InputField>,
@@ -406,6 +407,7 @@ impl GenerationWorkspace {
             models: Vec::new(),
             selected_model: None,
             size: "1024x1024".into(),
+            prompt_drafts: vec![(mode, prompt.clone())],
             prompt,
             negative: cx.new(|cx| InputField::new(window, cx, "What to avoid (optional)")),
             seed: cx.new(|cx| InputField::new(window, cx, "Random")),
@@ -564,13 +566,50 @@ impl GenerationWorkspace {
             .find(|model| Some(model.id.as_str()) == self.selected_model.as_deref())
     }
 
-    fn set_mode(&mut self, mode: GenerationMode, cx: &mut Context<Self>) {
+    fn set_mode(&mut self, mode: GenerationMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == mode {
+            return;
+        }
+        self.prompt = if let Some((_, prompt)) = self
+            .prompt_drafts
+            .iter()
+            .find(|(draft_mode, _)| *draft_mode == mode)
+        {
+            prompt.clone()
+        } else {
+            let prompt =
+                cx.new(|cx| InputField::new(window, cx, "Describe what you want to create"));
+            prompt
+                .read(cx)
+                .editor()
+                .clone()
+                .set_multiline(Some(6), window, cx);
+            self.prompt_drafts.push((mode, prompt.clone()));
+            prompt
+        };
         self.mode = mode;
         if mode != GenerationMode::Image {
             self.mask = None;
         }
         self.choose_default_model();
         self.error = None;
+        if self.task.is_none() {
+            self.status = match mode {
+                GenerationMode::Image => "Describe your image, then choose Generate.",
+                GenerationMode::Video => "Describe a video, or choose an image to animate.",
+                GenerationMode::Vector => {
+                    "Create editable vectors from a prompt or trace an image."
+                }
+                GenerationMode::Design => {
+                    "Describe your design to prepare a brief for Fanta Agent."
+                }
+                GenerationMode::Masks => {
+                    "Click your source image to mark an area, or describe what to select."
+                }
+            }
+            .into();
+        }
+        self.prompt.read(cx).focus_handle(cx).focus(window, cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -1185,7 +1224,7 @@ impl GenerationWorkspace {
         cx.notify();
     }
 
-    fn use_result(&mut self, cx: &mut Context<Self>) {
+    fn use_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_account(cx);
         if self.task.is_some() {
             return;
@@ -1202,7 +1241,7 @@ impl GenerationWorkspace {
                 };
                 self.source = Some(source);
                 self.mask = Some(bytes.clone());
-                self.mode = GenerationMode::Image;
+                self.set_mode(GenerationMode::Image, window, cx);
                 self.selected_model = self
                     .models
                     .iter()
@@ -1596,6 +1635,8 @@ impl GenerationWorkspace {
         let bounds = self.source_bounds;
         let mask_mode = self.mode == GenerationMode::Masks;
         v_flex()
+            .w_full()
+            .flex_shrink_0()
             .gap_2()
             .child(
                 h_flex()
@@ -1616,14 +1657,18 @@ impl GenerationWorkspace {
             .child(
                 div()
                     .id("source-preview")
+                    .debug_selector(|| "generation-source-preview".into())
                     .relative()
                     .w_full()
                     .h(px(200.))
+                    .flex_shrink_0()
                     .overflow_hidden()
                     .bg(cx.theme().colors().editor_background)
                     .rounded_md()
                     .child(
                         img(preview.image)
+                            .absolute()
+                            .inset_0()
                             .size_full()
                             .object_fit(ObjectFit::Contain),
                     )
@@ -1636,6 +1681,7 @@ impl GenerationWorkspace {
                             |_, _, _, _| {},
                         )
                         .absolute()
+                        .inset_0()
                         .size_full(),
                     )
                     .when(mask_mode, |element| {
@@ -1846,7 +1892,7 @@ impl GenerationWorkspace {
                                         self.task.is_some() || self.preview.is_none()
                                             || (is_mask && self.active_run.as_ref().is_none_or(|run| run.source.is_none())),
                                     )
-                                    .on_click(cx.listener(|this, _, _, cx| this.use_result(cx))),
+                                    .on_click(cx.listener(|this, _, window, cx| this.use_result(window, cx))),
                                 )
                             })
                             .when(output.as_ref().is_some_and(|output| !output.mask) && self.canvas_item.is_some(), |element| {
@@ -1908,7 +1954,7 @@ impl Render for GenerationWorkspace {
             .map(|credits| format!("From {credits:.2} credits per output"));
         v_flex().id("fanta-generation-workspace").size_full().min_h_0().p_5().gap_4().overflow_y_scroll()
             .bg(cx.theme().colors().panel_background)
-            .child(h_flex().gap_2().flex_wrap().justify_between()
+            .child(h_flex().flex_shrink_0().gap_2().flex_wrap().justify_between()
                 .child(Label::new("Create with Fanta").size(LabelSize::Large).weight(gpui::FontWeight::SEMIBOLD))
                 .child(h_flex().gap_2()
                     .child(Label::new(if signed_in { "Fanta account connected" } else { "Connect your account to generate" }).color(Color::Muted))
@@ -1917,11 +1963,11 @@ impl Render for GenerationWorkspace {
                     .child(Button::new("generation-billing", "Credits & billing").on_click(|_, _, cx| {
                         cx.open_url(&client::zed_urls::account_url(cx));
                     }))))
-            .child(h_flex().gap_1().flex_wrap().children(GenerationMode::ALL.into_iter().map(|mode| {
+            .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::ALL.into_iter().map(|mode| {
                 Button::new(("generation-mode", mode as usize), mode.label()).toggle_state(self.mode == mode)
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
             })))
-            .child(h_flex().items_start().gap_5().flex_wrap()
+            .child(h_flex().flex_shrink_0().items_start().gap_5().flex_wrap()
                 .child(v_flex().w(px(330.)).max_w_full().flex_shrink_0().gap_3()
                     .when(self.mode == GenerationMode::Vector, |element| element
                         .child(Label::new("Vector tool").color(Color::Muted))
@@ -1941,7 +1987,13 @@ impl Render for GenerationWorkspace {
                         .child(Button::new("refresh-generation-models", "Refresh models").disabled(self.catalog_task.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_catalog(cx)))))
                     .child(Label::new(if self.mode == GenerationMode::Masks { "What to select (optional)" } else if trace_vectors { "Guidance (optional)" } else { "Your idea" }).color(Color::Muted))
-                    .child(self.prompt.clone())
+                    // Auto-height editors need a definite width; InputField's
+                    // horizontal row measures this editor as zero-sized.
+                    .child(v_flex().id("generation-prompt").w_full().min_h_8().flex_shrink_0().p_2()
+                        .rounded_md().border_1().border_color(cx.theme().colors().border_variant)
+                        .bg(cx.theme().colors().editor_background)
+                        .when(self.prompt.read(cx).focus_handle(cx).contains_focused(window, cx), |element| element.border_color(cx.theme().colors().border_focused))
+                        .child(self.prompt.read(cx).editor().render(window, cx)))
                     .when(is_design, |element| element.child(Label::new("Create editable frames, text, and shapes with the Fanta Agent. Review and send your brief in the Agent panel.").color(Color::Muted)))
                     .when(!is_design, |element| element
                         .when(self.mode != GenerationMode::Masks && !trace_vectors, |element| element
@@ -1966,10 +2018,10 @@ impl Render for GenerationWorkspace {
                             .child(Button::new("clear-generation-mask", "Clear mask").on_click(cx.listener(|this, _, _, cx| { this.mask = None; cx.notify(); })))))
                     .when(prompt_vectors, |element| element.child(Label::new("Uses your Fanta AI credits. The final charge depends on AI usage.").size(LabelSize::Small).color(Color::Muted)))
                     .when_some(price.filter(|_| !is_design && !prompt_vectors), |element, price| element.child(Label::new(price).size(LabelSize::Small).color(Color::Muted)))
-                    .child(Button::new("submit-generation", if is_design { "Prepare design brief" } else if self.mode == GenerationMode::Masks { "Generate masks" } else if prompt_vectors { "Create vectors" } else if trace_vectors { "Trace image" } else { "Generate" })
+                    .child(div().debug_selector(|| "generation-submit".into()).child(Button::new("submit-generation", if is_design { "Prepare design brief" } else if self.mode == GenerationMode::Masks { "Generate masks" } else if prompt_vectors { "Create vectors" } else if trace_vectors { "Trace image" } else { "Generate" })
                         .style(ButtonStyle::Filled).full_width()
                         .disabled(self.task.is_some() || !signed_in || (!is_design && (self.model().is_none() || self.unresolved_submission.is_some())))
-                        .on_click(cx.listener(|this, _, window, cx| this.generate(window, cx))))
+                        .on_click(cx.listener(|this, _, window, cx| this.generate(window, cx)))))
                     .when(self.unresolved_submission.is_some() && self.task.is_none(), |element| element
                         .child(Label::new("The previous submission was not confirmed. Retry it with the same request to avoid a duplicate charge.").color(Color::Muted))
                         .child(Button::new("retry-generation-submission", "Retry same request")
@@ -2635,6 +2687,149 @@ fn preview_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn visual_workspace(
+        mode: GenerationMode,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<GenerationWorkspace>, &mut gpui::VisualTestContext) {
+        let http = http_client::FakeHttpClient::create(|_| async {
+            panic!("Rendering a signed-out workspace must not submit requests")
+        });
+        let client = catalog_client(cx, http);
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            Client::set_global(client, cx);
+        });
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            GenerationWorkspace::new(WeakEntity::new_invalid(), None, mode, window, cx)
+        });
+        cx.simulate_resize(gpui::size(px(1000.), px(768.)));
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn generation_prompt_is_visible_and_modes_keep_separate_drafts(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        let prompt = view.read_with(cx, |view, _| view.prompt.clone());
+        let bounds = prompt.read_with(cx, |prompt, cx| {
+            *prompt
+                .editor()
+                .as_any()
+                .downcast_ref::<Entity<editor::Editor>>()
+                .expect("prompt editor")
+                .read(cx)
+                .last_bounds()
+                .expect("rendered prompt")
+        });
+        assert!(
+            bounds.size.width > px(250.),
+            "prompt text must have visible width: {bounds:?}"
+        );
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        cx.simulate_input("a green landscape");
+        view.update_in(cx, |view, window, cx| {
+            view.set_mode(GenerationMode::Masks, window, cx)
+        });
+        let mask_prompt = view.read_with(cx, |view, _| view.prompt.clone());
+        assert!(mask_prompt.read_with(cx, |prompt, cx| prompt.text(cx).is_empty()));
+        mask_prompt.update_in(cx, |prompt, window, cx| {
+            prompt.set_text("orange circle", window, cx)
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.set_mode(GenerationMode::Image, window, cx)
+        });
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.prompt.read(cx).text(cx)),
+            "a green landscape"
+        );
+    }
+
+    #[gpui::test]
+    fn generation_source_clicks_map_to_the_visible_image(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Masks, cx);
+        let image = image::DynamicImage::new_rgba8(512, 512);
+        let mut png = Cursor::new(Vec::new());
+        image
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("fixture image");
+        let preview = make_preview(png.get_ref(), "image/png").expect("source preview");
+        view.update(cx, |view, cx| {
+            view.set_source(
+                SourceImage {
+                    reference: json!({"asset_id":"fixture"}),
+                    name: "Source".into(),
+                    preview,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let bounds = cx
+            .debug_bounds("generation-source-preview")
+            .expect("source bounds");
+        assert_eq!(
+            bounds.size.height,
+            px(200.),
+            "the source must not shrink or crop"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| view.source_bounds),
+            Some(bounds)
+        );
+        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+        view.read_with(cx, |view, _| {
+            let point = view.points.first().expect("click should add a point");
+            assert!((point.x - 256.).abs() < 1. && (point.y - 256.).abs() < 1.);
+        });
+    }
+
+    #[gpui::test]
+    fn generation_inpaint_controls_scroll_into_view_at_laptop_height(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        view.update_in(cx, |view, window, cx| {
+            let mut model = model("image");
+            model.capabilities =
+                json!({"steps":{}, "guidance":{}, "negative_prompt":{"supported":true}});
+            view.selected_model = Some(model.id.clone());
+            view.models = vec![model];
+            view.mask = Some(Arc::from([0u8]));
+            let prompt = view.prompt.clone();
+            prompt.read(cx).editor().clone().set_text(
+                "one\ntwo\nthree\nfour\nfive\nsix",
+                window,
+                cx,
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: gpui::point(px(320.), px(650.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-1200.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let submit = cx
+            .debug_bounds("generation-submit")
+            .expect("generate button after scrolling");
+        assert!(
+            submit.top() >= px(0.) && submit.bottom() <= px(768.),
+            "Generate must be reachable: {submit:?}"
+        );
+        view.update_in(cx, |view, window, cx| {
+            view.status = "Mask selected. White areas will be edited.".into();
+            view.set_mode(GenerationMode::Vector, window, cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert!(view.mask.is_none());
+            assert!(!view.status.contains("Mask selected"));
+        });
+    }
 
     fn catalog_client(
         cx: &mut gpui::TestAppContext,
