@@ -1177,6 +1177,8 @@ impl RealGitRepository {
         system_git_binary_path: Option<PathBuf>,
         executor: BackgroundExecutor,
     ) -> Result<Self> {
+        let system_git_binary_path =
+            system_git_binary_path.filter(|path| crate::executable::is_usable_system_git(path));
         let any_git_binary_path = system_git_binary_path
             .clone()
             .or(bundled_git_binary_path)
@@ -1251,6 +1253,13 @@ impl RealGitRepository {
         self.working_directory
             .clone()
             .unwrap_or_else(|| self.git_dir.clone())
+    }
+
+    fn remote_git_binary_path(&self) -> Result<PathBuf> {
+        crate::executable::select_git(
+            self.system_git_binary_path.clone(),
+            Some(self.any_git_binary_path.clone()),
+        )
     }
 
     fn git_binary_in_worktree(&self) -> Result<GitBinary> {
@@ -2526,12 +2535,12 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let executor = cx.background_executor().clone();
-        let git_binary_path = self.system_git_binary_path.clone();
+        let git_binary_path = self.remote_git_binary_path();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let git_binary_path = git_binary_path.context("git not found on $PATH, can't push")?;
+            let git_binary_path = git_binary_path?;
             let git = GitBinary::new(
                 git_binary_path,
                 working_directory,
@@ -2569,12 +2578,12 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let executor = cx.background_executor().clone();
-        let git_binary_path = self.system_git_binary_path.clone();
+        let git_binary_path = self.remote_git_binary_path();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let git_binary_path = git_binary_path.context("git not found on $PATH, can't pull")?;
+            let git_binary_path = git_binary_path?;
             let git = GitBinary::new(
                 git_binary_path,
                 working_directory,
@@ -2610,13 +2619,13 @@ impl GitRepository for RealGitRepository {
         let working_directory = self.command_directory();
         let git_directory = self.path();
         let remote_name = format!("{}", fetch_options);
-        let git_binary_path = self.system_git_binary_path.clone();
+        let git_binary_path = self.remote_git_binary_path();
         let executor = cx.background_executor().clone();
         let is_trusted = self.is_trusted();
         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
         // which we want to block on.
         async move {
-            let git_binary_path = git_binary_path.context("git not found on $PATH, can't fetch")?;
+            let git_binary_path = git_binary_path?;
             let git = GitBinary::new(
                 git_binary_path,
                 working_directory,
@@ -3611,7 +3620,7 @@ impl GitBinary {
     where
         S: AsRef<OsStr>,
     {
-        let mut command = new_command(&self.git_binary_path);
+        let mut command = crate::executable::command(&self.git_binary_path);
         command.current_dir(&self.working_directory);
         // Disabled to stop malicious actors from running arbitrary commands via fsmonitor hooks
         command.args(["-c", "core.fsmonitor=false"]);
@@ -3991,6 +4000,168 @@ mod tests {
         let mut env = checkpoint_author_envs();
         env.insert("GIT_ASKPASS".to_string(), "false".to_string());
         env
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_git_bundle(directory: &Path) -> PathBuf {
+        use std::os::unix::fs::symlink;
+
+        let system_git = which::which("git").unwrap();
+        let output = std::process::Command::new(&system_git)
+            .arg("--exec-path")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let helpers = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        let contents = directory.join("Fanta Test.app/Contents");
+        let binary = contents.join("MacOS/git");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::create_dir_all(contents.join("Resources/git/libexec")).unwrap();
+        fs::create_dir_all(contents.join("Resources/git/share/git-core/templates")).unwrap();
+        symlink(system_git, &binary).unwrap();
+        symlink(helpers, contents.join("Resources/git/libexec/git-core")).unwrap();
+        assert!(crate::executable::bundled_support_directory(&binary).is_some());
+        binary
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn bundled_git_clones_pushes_fetches_and_pulls_without_system_git(
+        cx: &mut TestAppContext,
+    ) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let binary = test_git_bundle(directory.path());
+        let (remote_directory, _) = clone_remote_repository_with_main_and_feature(directory.path());
+        let checkout = directory.path().join("bundled checkout");
+        let empty_path = directory.path().join("empty-path");
+        fs::create_dir(&empty_path).unwrap();
+        let env = Arc::new(HashMap::from_iter([
+            ("PATH".to_owned(), empty_path.to_string_lossy().into_owned()),
+            ("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned()),
+            ("GIT_CONFIG_SYSTEM".to_owned(), "/dev/null".to_owned()),
+            ("GIT_ASKPASS".to_owned(), "/usr/bin/false".to_owned()),
+            (
+                "GIT_EXEC_PATH".to_owned(),
+                "/missing-git-helpers".to_owned(),
+            ),
+        ]));
+        let output = crate::executable::command(&binary)
+            .args([
+                OsString::from("clone"),
+                remote_directory.as_os_str().into(),
+                checkout.as_os_str().into(),
+            ])
+            .envs(env.iter())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let repository = RealGitRepository::new(
+            &checkout.join(".git"),
+            Some(binary.clone()),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        assert!(repository.system_git_binary_path.is_none());
+        assert_eq!(repository.remote_git_binary_path().unwrap(), binary);
+        fs::write(checkout.join("pushed.txt"), "from bundled Git").unwrap();
+        git_command(&checkout, ["add", "pushed.txt"]);
+        git_command(&checkout, ["commit", "-m", "push via bundled Git"]);
+        repository
+            .push(
+                "main".into(),
+                "main".into(),
+                "origin".into(),
+                None,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {
+                    panic!("local push prompted for credentials")
+                }),
+                env.clone(),
+                cx.to_async(),
+            )
+            .await
+            .unwrap();
+
+        let seed = directory.path().join("seed");
+        git_command(&seed, ["switch", "main"]);
+        git_command(&seed, ["pull", "--ff-only", "origin", "main"]);
+        assert_eq!(
+            fs::read_to_string(seed.join("pushed.txt")).unwrap(),
+            "from bundled Git"
+        );
+        fs::write(seed.join("fetched.txt"), "from remote").unwrap();
+        git_command(&seed, ["add", "fetched.txt"]);
+        git_command(&seed, ["commit", "-m", "remote update"]);
+        git_command(&seed, ["push", "origin", "main"]);
+        repository
+            .fetch(
+                FetchOptions::Remote(Remote {
+                    name: "origin".into(),
+                }),
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {
+                    panic!("local fetch prompted for credentials")
+                }),
+                env.clone(),
+                cx.to_async(),
+            )
+            .await
+            .unwrap();
+        assert!(!checkout.join("fetched.txt").exists());
+        repository
+            .pull(
+                Some("main".into()),
+                "origin".into(),
+                false,
+                AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {
+                    panic!("local pull prompted for credentials")
+                }),
+                env,
+                cx.to_async(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.join("fetched.txt")).unwrap(),
+            "from remote"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn bundled_git_requires_complete_helpers_and_preserves_system_preference(
+        cx: &mut TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = test_git_bundle(directory.path());
+        let system_git = PathBuf::from("preferred-system-git");
+        assert_eq!(
+            crate::executable::select_git(Some(system_git.clone()), Some(binary.clone())).unwrap(),
+            system_git
+        );
+        let helpers = binary
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("Resources/git/libexec/git-core");
+        fs::remove_file(helpers).unwrap();
+        assert!(crate::executable::select_git(None, Some(binary.clone())).is_err());
+        git_init_repo(directory.path());
+        let repository = RealGitRepository::new(
+            &directory.path().join(".git"),
+            Some(binary),
+            None,
+            cx.executor(),
+        )
+        .unwrap();
+        assert!(repository.remote_git_binary_path().is_err());
     }
 
     #[track_caller]

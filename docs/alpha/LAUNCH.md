@@ -79,7 +79,10 @@ before relying on the repository home page or manual release workflow.
 
 `Check` runs on pushes and pull requests. `Build macOS release` produces an
 Apple Silicon DMG and checksum as run artifacts. Manual unsigned builds are
-for testing. Signed builds and version tags require these repository secrets:
+for testing. A narrow bootstrap trigger also requests an unsigned packaging
+build when packaging files change on `codex-release-backend-gateway`; this is
+not a signed customer release. Signed builds and version tags require these
+repository secrets:
 
 - `MACOS_CERTIFICATE`: base64 Developer ID Application `.p12` certificate.
 - `MACOS_CERTIFICATE_PASSWORD`: certificate password.
@@ -99,6 +102,12 @@ its API-use terms before API access can be requested; that agreement is awaiting
 the account holder's approval. After access is granted, a Team API key with the
 Developer role supports the workflow. Its issuer UUID is separate from the
 Developer Team ID. No notarization key has been created or stored yet.
+
+The app now packages the complete Dugite Git 2.53.0 distribution, verified
+against its published SHA-256, including helpers, templates, Git LFS, and Git
+Credential Manager. Nested ad-hoc signatures and startup with an empty `PATH`
+were checked; public HTTPS access and clone/push/fetch/pull regression checks
+passed. This does not replace a clean-Mac installer check.
 
 A `v*` tag must match the version in `crates/zed/Cargo.toml`. Successful tag
 builds prepare a **draft** GitHub release. Publish only after checking the DMG
@@ -186,15 +195,19 @@ after the installer and payment checks pass. No outreach was sent or published.
 
 - [Desktop integration and macOS builds](https://github.com/jeanc18rlos/fanta-edit/pull/1) — draft PR based on the existing Fanta branch.
 - [Backend billing and analytics](https://github.com/jeanc18rlos/fanta-backend/pull/1) — draft PR based on backend `main`.
-- Desktop account/provider checks, 27 native generation tests, 30 document lifecycle tests, and four new Sidebar regressions passed. The full Sidebar suite has 133 passes and seven existing failures; it is not fully green.
+- Desktop account/provider checks, 27 native generation tests, 31 document tests, and four new Sidebar regressions passed. The full Sidebar suite has 133 passes and seven existing failures; it is not fully green.
 - 365 backend tests passed across all 42 test files, with type checking and 73 isolated GPU tests passing.
 - Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
-- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415) at `b0523fe`. A later Sidebar startup-selection correction passed locally and needs its final hosted run. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
+- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415) at `b0523fe`. Checks at the later head `94dab81` were in progress at this update; the latest local hidden-page and bundled Git fixes still need final hosted/native verification. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
 
 See [the current validation record](RELEASE_VALIDATION.md) for later successful
 GitHub checks, native generation tests, UI observations, and measured memory
-changes. The final local native build passed in 3m32s and was exercised through
-the UI. Local fixtures verify interactions, not production inference or billing.
+changes. The latest completed local native build passed in 3m32s and was
+exercised through the UI; it predates the hidden-active-page and complete
+bundled Git fixes. The 128 MB UI kit exposed a hidden initial page that blanked
+its fills; a pixel regression now passes, and fresh-import native verification
+is pending. Local fixtures verify interactions, not production inference or
+billing.
 
 The review branches contain only these release fixes. Pre-existing local
 design, import, GPU, and motion work was preserved.

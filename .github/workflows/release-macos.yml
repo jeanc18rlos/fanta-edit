@@ -3,6 +3,13 @@ name: Build macOS release
 on:
   push:
     tags: ['v*']
+    branches: ['codex-release-backend-gateway']
+    paths:
+      - '.github/workflows/release-macos.yml'
+      - 'script/bundle-mac'
+      - 'script/bundle-git'
+      - 'script/verify-bundled-git'
+      - 'script/verify-macos-document-icon'
   workflow_dispatch:
     inputs:
       signed:
@@ -94,6 +101,7 @@ jobs:
         run: |
           app_path=target/aarch64-apple-darwin/release/dmg/Fanta.app
           ./script/verify-macos-document-icon "$app_path"
+          ./script/verify-bundled-git "$app_path" --network
           /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes' "$app_path/Contents/Info.plist" | grep -q fanta
           cd target/aarch64-apple-darwin/release

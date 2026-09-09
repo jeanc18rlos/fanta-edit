@@ -6,19 +6,16 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 
 ## GitHub and local checks
 
-The desktop [push CI run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34380329072)
-and [pull request CI run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34380334599)
-both passed at `5181599`.
-A later full native release build including the six-tool whitelist passed in
-5m27s; the next build including sidebar ownership and generation-interface
-fixes passed in 5m09s. The final native build, including the sidebar
-startup-selection correction, passed in **3m32s** and was used for the final
-local checks below. Both hosted runs at the newer desktop head `b0523fe`
-passed: [CI run 34384719415](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415)
-and [CI run 34384726796](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384726796).
-The startup-selection follow-up is included in this change; its hosted
-validation remains pending. Native QA used the original checkout, including
-the user’s separate staged edits; hosted CI validates the isolated PR branch.
+Desktop push and pull request CI passed at `5181599` and `b0523fe`; the latter
+runs are [34384719415](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415)
+and [34384726796](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384726796).
+Checks at the later head `94dab81` were in progress at this update. The latest
+completed native release build passed in **3m32s**, including sidebar ownership,
+startup-selection synchronization, and generation-interface fixes. It was used
+for the UI checks below and predates the hidden-active-page and complete bundled
+Git fixes. Those fixes passed local tests; a rebuilt native check is pending.
+Native QA used the original checkout, including the user’s separate staged
+edits; hosted CI validates the isolated PR branch.
 
 The backend [CI run](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196)
 passed at pull request head `9d05908`, with **365 TypeScript tests**, **73
@@ -33,9 +30,10 @@ Local validation results:
 | `cargo test --locked --offline -p fanta-format` | 181 passed, including integration tests and doctests; 2 ignored |
 | Focused Rust formatting and `git diff --check` | Passed |
 | `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; now includes `cargo test --locked -p fanta-doc -p fanta-format` |
-| `cargo build --locked --release -p zed --bin fanta` | Final build passed in 3m32s, including sidebar ownership, startup-selection synchronization, and generation-interface fixes |
+| `cargo build --locked --release -p zed --bin fanta` | Latest completed build passed in 3m32s; native verification of the subsequent hidden-page and complete bundled Git fixes is pending |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
-| Document lifecycle suite | 30 passed; bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
+| Document suite | 31 passed; hidden active-page recovery with background/shape pixel assertions, bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
+| Bundled Git transport | 2 Rust regressions passed, including clone/push/fetch/pull without system Git and with a bad inherited `GIT_EXEC_PATH`; replay against actual Dugite passed with clean repository integrity checks |
 | Native toolbar interaction suite | 32 passed, including pointer focus, popup dismissal, input editing, and keyboard navigation |
 | Toolbar input with the shipped canvas keymap | 1 passed; typing and clicking in search preserve the query, Escape restores shortcuts |
 | Native generation/media suite | 27 passed, including actual toolbar activation, catalog authorization, prompt-to-SVG, visible prompt rendering, accurate source clicks, and scrollable inpainting controls |
@@ -112,6 +110,16 @@ GitHub and local history both report commit
 `origin/main`. This repository contains only the synthetic design, not the
 private import fixture.
 
+The subsequent packaging fix includes the complete Dugite Git 2.53.0
+archive, with its published SHA-256 and nested ad-hoc signatures verified.
+Checks with an empty `PATH` passed public HTTPS access and Git LFS/Credential
+Manager startup. Two Rust transport regressions passed; replay against actual
+Dugite covered clone, push, fetch, and pull with no system Git and a deliberately
+invalid inherited `GIT_EXEC_PATH`. Repository integrity checks were clean.
+These latest changes still require the rebuilt app/clean-Mac check. The release
+workflow now has a narrow branch-and-packaging-path trigger for an unsigned
+bootstrap build; no signed release has been produced.
+
 The app command palette opens the native Image workspace with Image, Video,
 Vector, Design, and Masks modes. The toolbar focus/keymap, ten-minute sign-in
 callback, catalog authorization, and prompt-to-SVG fixes are included in the
@@ -185,8 +193,8 @@ These earlier RSS observations did not demonstrate a whole-app memory
 improvement. A source race was found: the one-second
 self-write suppression could expire while a long save was still writing,
 starting a redundant full reload. The fix holds suppression through
-foreground and background write completion and is covered by the 30-test
-document lifecycle suite.
+foreground and background write completion and is covered by the 31-test
+document suite.
 
 An earlier memory guard run (PID 76062) showed RSS falling to about 180 MiB
 after Close Project. That did **not** demonstrate document memory release:
@@ -241,9 +249,8 @@ was 4,519,232 KiB. The roughly
 432.5M footprint increase was largely accounted for by 218.4M additional
 default-malloc fragmentation and 201.6M of empty large allocations. IOSurface
 (247.5M) and GPU allocations (28.1M) were unchanged between the close samples.
-An idle sample taken nine minutes after the second close, without trimming
-or other intervention, showed footprint
-falling to 475.1M, with 115,873 live allocations, 63.5M allocated bytes, and
+An idle sample at 20:22:46.110 +0200, 541.9 seconds after the second close,
+without trimming or other intervention, showed footprint falling to 475.1M, with 115,873 live allocations, 63.5M allocated bytes, and
 32.8M fragmentation in the default malloc zone. IOSurface and GPU allocations
 remained unchanged. Automatic allocator reclamation reduced the temporary
 post-close growth sometime within that sampling interval. No explicit
@@ -251,12 +258,36 @@ allocator-trimming change was warranted or implemented. These results do not est
 freedom, stable overall memory across sustained use, or performance relative
 to Figma.
 
+The same final app opened a fresh private UI-kit copy of **128,246,530 bytes**.
+Canvas labels appeared within **16.2 seconds**, but this was not a usable full
+render: the importer left `Internal Only Canvas` active with a hidden root, so
+fills and newly created shapes were invisible. A green rectangle was saved to
+`page.fnx:8871` despite its invisible canvas fill. Reopening the converted
+project rendered Grid and Icons with their backgrounds and colored fills.
+The loader now replaces a hidden active page with its visible default while
+preserving hidden library content. Its regression failed before the fix and
+now passes active-root and background/green-shape pixel checks as part of the
+31-test document suite. Fresh native import and page switching after this fix
+remain pending.
+
+| UI-kit checkpoint | Default malloc allocation count | Default malloc allocated bytes |
+| --- | ---: | ---: |
+| After opening | 1,441,606 | 663.1M |
+| After edit and save | 1,571,923 | 654.2M |
+| After Close Project | 137,137 | 75.6M |
+
+The immediate post-close footprint was 961.2M. These snapshots are
+`/tmp/fanta-release-qa-20260909/import-ui-kit-{opened,edited,closed}.vmmap`.
+They show document-sized allocation release for this observation, without
+establishing sustained overall memory stability or full rendering correctness.
+
 The earlier [release rehearsal](REHEARSAL.md) measured the 128 MB, 40,141-node,
 31-page UI kit opening in 48.5–54.1 seconds. It settled at 1952–1960 MiB, then
 rose from 1960 to 5788 MiB after one rectangle and 25 seconds for autosave.
 Later samples partly receded; these observations do not demonstrate an
-unbounded leak. Repeat the same fixture and timing after rebuilding, followed
-by repeated edits, undo/redo, page changes, saves, close/reopen, and idle checks.
+unbounded leak. The current 16.2-second label appearance cannot be compared
+with that rehearsal as a full-render timing. Repeat controlled rendering, edits,
+undo/redo, page changes, saves, close/reopen, and idle checks after the fix.
 
 ## Remaining release requirements
 
@@ -266,8 +297,8 @@ by repeated edits, undo/redo, page changes, saves, close/reopen, and idle checks
 | Charge customers | Billing fixes and backend tests exist. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No customer was charged. |
 | Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save passed for the 29,301-node fixture. Reopening preserved the green edit, and a second Right/Left edit, save, and close completed. |
-| Performance and UI quality | Final native measurements demonstrate document-sized allocation release across two cycles. Footprint rose temporarily from 526.5M to 959.0M after the second close, then fell to 475.1M while idle without intervention. No trimming change was implemented. Repeat sustained-memory measurements, including the larger UI kit. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The 128 MB UI kit exposed a hidden initial page; reopening rendered Grid/Icons correctly. The tested default-page fix and complete bundled Git still need rebuilt native verification. |
+| Performance and UI quality | Final native measurements demonstrate document-sized allocation release across two cycles. Footprint rose temporarily from 526.5M to 959.0M after the second close, then fell to 475.1M while idle without intervention. No trimming change was implemented. The larger UI kit also released document-sized allocations on close; repeat sustained-memory measurements and verify fresh-import rendering after its page-selection fix. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | US PostHog project 410640 and the existing landing page are accessible. Validate direct visit-to-signup reporting and durable contact handling; no improved conversion rate or outreach result is established. |
 

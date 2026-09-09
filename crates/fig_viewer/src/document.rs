@@ -447,8 +447,14 @@ impl FigDocument {
         // renders it with a selected-page fallback — leaving it unset sends new
         // shapes/text/frames to the scene root where the page-scoped render
         // never paints them (invisible until a drag reparents them into the
-        // page). Default it to the page the canvas will show.
-        if doc.active_page().is_none() {
+        // page). Imports can instead arrive with a hidden library page active,
+        // because add_page activates the first root. Rendering that root hides
+        // every new shape even though the default viewport fits a visible page.
+        if doc.active_page().is_none_or(|active| {
+            pages
+                .iter()
+                .any(|page| page.root == Some(active) && page.hidden)
+        }) {
             doc.set_active_page(pages.get(default_page_index).and_then(|page| page.root));
         }
 
@@ -3133,8 +3139,8 @@ mod tests {
         assert!(document.doc.active_page().is_some());
     }
 
-    /// An already-set active page (e.g. carried by a `.fig` import) wins over
-    /// the default.
+    /// An already-set visible active page (e.g. carried by a `.fig` import)
+    /// wins over the default.
     #[test]
     fn from_doc_keeps_an_existing_active_page() {
         use fanta_doc::{CanvasNode, GroupNode, NodeData};
@@ -3148,6 +3154,77 @@ mod tests {
         doc.set_active_page(Some(second_root));
         let document = FigDocument::from_doc(doc, BTreeMap::new());
         assert_eq!(document.doc.active_page(), Some(second_root));
+    }
+
+    #[test]
+    fn from_doc_replaces_an_imported_hidden_active_page_with_the_visible_default() -> Result<()> {
+        use fanta_doc::{CanvasNode, Color, Fill, GroupNode, NodeData, NodeFlags, VectorNode};
+
+        let mut doc = Doc::new();
+        let mut hidden_page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        hidden_page.name = "Internal Only Canvas".to_owned();
+        hidden_page.flags.insert(NodeFlags::HIDDEN);
+        hidden_page.meta = serde_json::json!({"hidden_page": true});
+        let hidden_root = hidden_page.id;
+        doc.apply(Operation::create_node(hidden_page))?;
+        doc.add_page(hidden_root);
+
+        let mut visible_page = CanvasNode::new(NodeData::Group(GroupNode {
+            background: Some(Fill::solid(Color::WHITE)),
+            ..GroupNode::default()
+        }));
+        visible_page.name = "Design".to_owned();
+        let visible_root = visible_page.id;
+        doc.apply(Operation::create_node(visible_page))?;
+        doc.add_page(visible_root);
+        assert_eq!(doc.active_page(), Some(hidden_root));
+
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(document.doc.active_page(), Some(visible_root));
+        assert_eq!(
+            document.page(None).and_then(|page| page.root),
+            Some(visible_root)
+        );
+        assert!(
+            document
+                .pages
+                .iter()
+                .any(|page| page.root == Some(hidden_root) && page.hidden)
+        );
+        assert!(
+            document
+                .doc
+                .scene
+                .get(hidden_root)
+                .is_some_and(|node| node.flags.contains(NodeFlags::HIDDEN))
+        );
+
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -10.0,
+            -10.0,
+            20.0,
+            20.0,
+            Color::rgb(34, 197, 94),
+        )));
+        rectangle.parent = document.doc.active_page();
+        document.doc.apply(Operation::create_node(rectangle))?;
+        let mut renderer = fanta_render::RasterRenderer::new(64, 64)?;
+        renderer.render_page(
+            &document.doc.scene,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            document.doc.active_page(),
+        );
+        let pixels = renderer.copy_rgba();
+        assert_eq!(pixels.get(..4), Some([255, 255, 255, 255].as_slice()));
+        let center = (32 * 64 + 32) * 4;
+        assert_eq!(
+            pixels.get(center..center + 4),
+            Some([34, 197, 94, 255].as_slice())
+        );
+        Ok(())
     }
 
     /// The load that materializes a bare `.fig` hands the item both the

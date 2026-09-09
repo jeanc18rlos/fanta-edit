@@ -38,13 +38,16 @@ jobs:
         run: ./script/check-licenses
 
       - name: Check release scripts
-        run: bash -n script/bundle-mac script/generate-licenses script/verify-macos-document-icon
+        run: bash -n script/bundle-mac script/bundle-git script/verify-bundled-git script/generate-licenses script/verify-macos-document-icon
 
       - name: Check the app and command line tool build
         run: cargo check --locked -p zed -p cli
 
       - name: Test document snapshots and file compatibility
         run: cargo test --locked -p fanta-doc -p fanta-format
+
+      - name: Test Git sync without a system installation
+        run: cargo test --locked -p git --lib bundled_git_
 
       - name: Test AI provider authentication
         run: cargo test --locked -p language_model -p language_models --lib
