@@ -79,9 +79,10 @@ before relying on the repository home page or manual release workflow.
 
 `Check` runs on pushes and pull requests. `Build macOS release` produces an
 Apple Silicon DMG and checksum as run artifacts. Manual unsigned builds are
-for testing. A narrow bootstrap trigger also requests an unsigned packaging
-build when packaging files change on `codex-release-backend-gateway`; this is
-not a signed customer release. Signed builds and version tags require these
+for testing. A narrow branch trigger also requests an unsigned packaging
+build when app code, assets, Cargo/build scripts, or packaging files change on
+`codex-release-backend-gateway`; docs-only changes do not rebuild. These branch
+builds create test artifacts, not customer releases or draft releases. Signed builds and version tags require these
 repository secrets:
 
 - `MACOS_CERTIFICATE`: base64 Developer ID Application `.p12` certificate.
@@ -105,9 +106,11 @@ Developer Team ID. No notarization key has been created or stored yet.
 
 The app now packages the complete Dugite Git 2.53.0 distribution, verified
 against its published SHA-256, including helpers, templates, Git LFS, and Git
-Credential Manager. Nested ad-hoc signatures and startup with an empty `PATH`
-were checked; public HTTPS access and clone/push/fetch/pull regression checks
-passed. This does not replace a clean-Mac installer check.
+Credential Manager. The latest 410 MB candidate app passed deep, strict
+ad-hoc signature verification and public HTTPS access with an empty `PATH`.
+Clone/push/fetch/pull regressions also passed against the packaged Git. This
+does not replace Developer ID signing, notarization, or a clean-Mac installer
+check.
 
 A `v*` tag must match the version in `crates/zed/Cargo.toml`. Successful tag
 builds prepare a **draft** GitHub release. Publish only after checking the DMG
@@ -195,19 +198,23 @@ after the installer and payment checks pass. No outreach was sent or published.
 
 - [Desktop integration and macOS builds](https://github.com/jeanc18rlos/fanta-edit/pull/1) — draft PR based on the existing Fanta branch.
 - [Backend billing and analytics](https://github.com/jeanc18rlos/fanta-backend/pull/1) — draft PR based on backend `main`.
-- Desktop account/provider checks, 27 native generation tests, 31 document tests, and four new Sidebar regressions passed. The full Sidebar suite has 133 passes and seven existing failures; it is not fully green.
+- Desktop account/provider checks, 27 native generation tests, 31 document tests, 34 inspector tests, and four new Sidebar regressions passed. The full Sidebar suite has 133 passes and seven existing failures; it is not fully green.
 - 365 backend tests passed across all 42 test files, with type checking and 73 isolated GPU tests passing.
 - Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
-- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415) at `b0523fe`. Checks at the later head `94dab81` were in progress at this update; the latest local hidden-page and bundled Git fixes still need final hosted/native verification. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
+- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415) at `b0523fe`. Desktop checks and unsigned packaging at `0a2ae52` were running at this update; the candidate app has now passed native hidden-page rendering and complete bundled Git checks. The later inspector-selection correction also passed native verification in the 5m30s build. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
 
 See [the current validation record](RELEASE_VALIDATION.md) for later successful
 GitHub checks, native generation tests, UI observations, and measured memory
-changes. The latest completed local native build passed in 3m32s and was
-exercised through the UI; it predates the hidden-active-page and complete
-bundled Git fixes. The 128 MB UI kit exposed a hidden initial page that blanked
-its fills; a pixel regression now passes, and fresh-import native verification
-is pending. Local fixtures verify interactions, not production inference or
-billing.
+changes. The latest local native build passed in 5m30s, following the 7m19s rendering
+and complete-Git candidate. A fresh
+128 MB UI-kit import showed rendered Icons content by the first observation
+at 14.544 seconds; this is a single upper-bound observation, not a benchmark
+or Figma comparison. Grid/Icons switching, a visible fill edit, Undo/Redo, and
+saving passed. Closing released document-sized live allocations; sustained
+overall memory stability is unproven. The final build also passed saved-design
+reopening and inspector selection checks: changing pages clears selection,
+clicking the same page preserves it, and saved source remains unchanged. Local fixtures verify
+interactions, not production inference or billing.
 
 The review branches contain only these release fixes. Pre-existing local
 design, import, GPU, and motion work was preserved.

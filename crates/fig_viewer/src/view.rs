@@ -3318,7 +3318,9 @@ impl FigView {
                 item.with_document(cx, |document| {
                     document.ensure_page_solved(index);
                     let root = document.pages.get(index).and_then(|page| page.root);
-                    document.doc.set_active_page(root);
+                    if document.doc.set_active_page(root) {
+                        document.doc.selection.clear();
+                    }
                     let prewarm = root.and_then(|root| document.take_page_prewarm(root));
                     ((root, prewarm), DocChange::Selection)
                 })
@@ -4701,7 +4703,7 @@ fn single_selection(doc: &fanta_doc::Doc) -> Option<NodeId> {
 
 /// The layers a structural command (group, frame, ungroup) acts on: the
 /// selection, unless the command came from a layer row that is not part of
-/// it, in which case only that row's node. Switching pages keeps the
+/// it, in which case only that row's node. Scoped navigation can retain the
 /// selection, so layers left behind on another page are dropped here — a
 /// group built from them would land out of view, or pull them onto this page.
 fn structure_targets(doc: &Doc, clicked: Option<NodeId>) -> Vec<NodeId> {

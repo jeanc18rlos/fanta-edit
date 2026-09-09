@@ -9,11 +9,16 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 Desktop push and pull request CI passed at `5181599` and `b0523fe`; the latter
 runs are [34384719415](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415)
 and [34384726796](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384726796).
-Checks at the later head `94dab81` were in progress at this update. The latest
-completed native release build passed in **3m32s**, including sidebar ownership,
-startup-selection synchronization, and generation-interface fixes. It was used
-for the UI checks below and predates the hidden-active-page and complete bundled
-Git fixes. Those fixes passed local tests; a rebuilt native check is pending.
+Desktop checks and unsigned packaging at `0a2ae52` were running at this
+update: [34390503562](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390503562),
+[34390500431](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390500431), and
+[34390500529](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390500529).
+The latest native release build passed in **5m30s**, including the page-switch
+inspector correction. Candidate app `dev.fanta.CandidateQA` (PID 93583)
+reopened the saved large design and passed the selection checks below. The
+preceding 7m19s build (PID 90909) passed fresh-import rendering, complete
+bundled Git checks, and the measured large-design lifecycle. Earlier
+observations are identified separately.
 Native QA used the original checkout, including the user’s separate staged
 edits; hosted CI validates the isolated PR branch.
 
@@ -30,10 +35,11 @@ Local validation results:
 | `cargo test --locked --offline -p fanta-format` | 181 passed, including integration tests and doctests; 2 ignored |
 | Focused Rust formatting and `git diff --check` | Passed |
 | `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; now includes `cargo test --locked -p fanta-doc -p fanta-format` |
-| `cargo build --locked --release -p zed --bin fanta` | Latest completed build passed in 3m32s; native verification of the subsequent hidden-page and complete bundled Git fixes is pending |
+| `cargo build --locked --release -p zed --bin fanta` | Latest build passed in 5m30s; native inspector navigation passed, following the 7m19s build’s rendering and complete bundled Git checks |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
 | Document suite | 31 passed; hidden active-page recovery with background/shape pixel assertions, bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
 | Bundled Git transport | 2 Rust regressions passed, including clone/push/fetch/pull without system Git and with a bad inherited `GIT_EXEC_PATH`; replay against actual Dugite passed with clean repository integrity checks |
+| Inspector integration suite | 34 passed; real page switching clears off-page selection, preserves selection on the current page, updates the inspector, and leaves the old shape unchanged |
 | Native toolbar interaction suite | 32 passed, including pointer focus, popup dismissal, input editing, and keyboard navigation |
 | Toolbar input with the shipped canvas keymap | 1 passed; typing and clicking in search preserve the query, Escape restores shortcuts |
 | Native generation/media suite | 27 passed, including actual toolbar activation, catalog authorization, prompt-to-SVG, visible prompt rendering, accurate source clicks, and scrollable inpainting controls |
@@ -116,9 +122,13 @@ Checks with an empty `PATH` passed public HTTPS access and Git LFS/Credential
 Manager startup. Two Rust transport regressions passed; replay against actual
 Dugite covered clone, push, fetch, and pull with no system Git and a deliberately
 invalid inherited `GIT_EXEC_PATH`. Repository integrity checks were clean.
-These latest changes still require the rebuilt app/clean-Mac check. The release
-workflow now has a narrow branch-and-packaging-path trigger for an unsigned
-bootstrap build; no signed release has been produced.
+The rebuilt 410 MB candidate bundle passed deep, strict ad-hoc signature
+verification and public HTTPS access with an empty `PATH`. Developer ID signing,
+notarization, and a clean-Mac installer check remain pending. The release
+workflow requests unsigned test artifacts for app code, assets, Cargo/build
+scripts, and packaging changes on `codex-release-backend-gateway`. Docs-only
+changes do not rebuild; these branch runs do not create customer or draft
+releases.
 
 The app command palette opens the native Image workspace with Image, Video,
 Vector, Design, and Masks modes. The toolbar focus/keymap, ten-minute sign-in
@@ -258,7 +268,8 @@ allocator-trimming change was warranted or implemented. These results do not est
 freedom, stable overall memory across sustained use, or performance relative
 to Figma.
 
-The same final app opened a fresh private UI-kit copy of **128,246,530 bytes**.
+The earlier final app (PID 82910) opened a fresh private UI-kit copy of
+**128,246,530 bytes**.
 Canvas labels appeared within **16.2 seconds**, but this was not a usable full
 render: the importer left `Internal Only Canvas` active with a hidden root, so
 fills and newly created shapes were invisible. A green rectangle was saved to
@@ -267,8 +278,8 @@ project rendered Grid and Icons with their backgrounds and colored fills.
 The loader now replaces a hidden active page with its visible default while
 preserving hidden library content. Its regression failed before the fix and
 now passes active-root and background/green-shape pixel checks as part of the
-31-test document suite. Fresh native import and page switching after this fix
-remain pending.
+31-test document suite. The candidate native verification below now confirms
+fresh import and page switching after this fix.
 
 | UI-kit checkpoint | Default malloc allocation count | Default malloc allocated bytes |
 | --- | ---: | ---: |
@@ -281,13 +292,46 @@ The immediate post-close footprint was 961.2M. These snapshots are
 They show document-sized allocation release for this observation, without
 establishing sustained overall memory stability or full rendering correctness.
 
+The rebuilt candidate (PID 90909) then opened another fresh 128 MB UI-kit
+copy. Actual white Icons content was visible at the first observation
+**14.544 seconds after Open**. Grid rendered immediately on selection, and
+switching between Grid and Icons rendered both pages. A new Grid rectangle
+changed from gray to `#22C55E` through the picker; Undo visibly restored gray
+and Redo restored green. Save persisted the edit in `pages/grid/page.fnx:308`.
+A later 5m30s build (PID 93583) fixed selection retained across page changes.
+Native verification reopened the saved green shape, selected it, and clicked
+the same Grid page: selection and the Rectangle inspector remained. Switching
+to Icons cleared selection and showed the Page inspector; returning to Grid
+kept the green shape intact and unselected. The saved page’s SHA-256 was
+unchanged throughout navigation. All 34 inspector integration tests passed;
+the new regression failed before the fix. Evidence is in
+`/tmp/fanta-release-qa-20260909/candidate-page-selection-native.json`.
+
+| Candidate UI-kit checkpoint | Physical footprint | Default malloc allocation count | Default malloc allocated bytes |
+| --- | ---: | ---: | ---: |
+| Before import | 122.9M | 68,917 | 19.5M |
+| After opening | 808.7M | 666,370 | 507.5M |
+| After edit and save | 999.6M | 684,136 | 514.6M |
+| After Close Project | 724.0M | 106,995 | 39.1M |
+| After close and idle | 301.0M | 106,869 | 38.9M |
+
+Snapshots are
+`/tmp/fanta-release-qa-20260909/candidate-ui-kit-{before,opened,edited,closed,closed-idle}.vmmap`.
+The drop in live allocation bytes and count confirms document-sized heap
+release in this cycle. An idle sample about 397 seconds later showed physical
+footprint dropping naturally from 724.0M to 301.0M. This observation does not
+establish sustained overall memory stability. The 14.544-second observation
+is an upper bound from a single UI observation, not a controlled import
+benchmark or a comparison with Figma.
+
 The earlier [release rehearsal](REHEARSAL.md) measured the 128 MB, 40,141-node,
 31-page UI kit opening in 48.5–54.1 seconds. It settled at 1952–1960 MiB, then
 rose from 1960 to 5788 MiB after one rectangle and 25 seconds for autosave.
 Later samples partly receded; these observations do not demonstrate an
-unbounded leak. The current 16.2-second label appearance cannot be compared
-with that rehearsal as a full-render timing. Repeat controlled rendering, edits,
-undo/redo, page changes, saves, close/reopen, and idle checks after the fix.
+unbounded leak. Neither the earlier 16.2-second label appearance nor the
+candidate’s single 14.544-second rendered observation is a controlled comparison with that
+rehearsal. Repeat sustained edits, page changes, close/reopen, and idle checks
+under the same conditions.
 
 ## Remaining release requirements
 
@@ -297,8 +341,8 @@ undo/redo, page changes, saves, close/reopen, and idle checks after the fix.
 | Charge customers | Billing fixes and backend tests exist. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No customer was charged. |
 | Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The 128 MB UI kit exposed a hidden initial page; reopening rendered Grid/Icons correctly. The tested default-page fix and complete bundled Git still need rebuilt native verification. |
-| Performance and UI quality | Final native measurements demonstrate document-sized allocation release across two cycles. Footprint rose temporarily from 526.5M to 959.0M after the second close, then fell to 475.1M while idle without intervention. No trimming change was implemented. The larger UI kit also released document-sized allocations on close; repeat sustained-memory measurements and verify fresh-import rendering after its page-selection fix. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. |
+| Performance and UI quality | Final native measurements demonstrate document-sized allocation release across two cycles. Footprint rose temporarily from 526.5M to 959.0M after the second close, then fell to 475.1M while idle without intervention. No trimming change was implemented. The candidate UI kit rendered after the page-selection fix and released live default-malloc bytes from 514.6M to 39.1M on close; physical footprint then fell naturally from 724.0M to 301.0M during idle. Repeat sustained-memory measurements. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | US PostHog project 410640 and the existing landing page are accessible. Validate direct visit-to-signup reporting and durable contact handling; no improved conversion rate or outreach result is established. |
 

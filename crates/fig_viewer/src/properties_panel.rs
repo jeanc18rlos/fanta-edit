@@ -3156,6 +3156,92 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn switching_pages_clears_the_inspected_selection_but_reselecting_a_page_keeps_it(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let view = &harness._view;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let (first_root, second_root, original_data) = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let first_root = document.doc.active_page().expect("first page");
+                let original_data = document
+                    .doc
+                    .scene
+                    .get(harness.vector_id)
+                    .expect("selected rectangle")
+                    .data
+                    .clone();
+                let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                page.name = "Page Two".to_owned();
+                let second_root = page.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(page))
+                    .expect("create second page");
+                document.doc.add_page(second_root);
+                document.pages.push(crate::document::FigPage {
+                    root: Some(second_root),
+                    name: "Page Two".into(),
+                    bounds: crate::document::page_bounds(&document.doc, Some(second_root)),
+                    hidden: false,
+                });
+                ((first_root, second_root, original_data), DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        view.update(cx, |view, cx| view.select_page(0, cx));
+        cx.run_until_parked();
+        assert!(
+            harness
+                .panel
+                .read_with(cx, |panel, cx| matches!(
+                    panel.build_snapshot(cx),
+                    InspectorSnapshot::Ready {
+                        selection_len: 1,
+                        body: InspectorBody::Node(node),
+                        ..
+                    } if node.id == harness.vector_id
+                ))
+                .expect("inspector remains open"),
+            "clicking the current page must preserve its selected node"
+        );
+
+        for (index, root) in [(1, second_root), (0, first_root)] {
+            view.update(cx, |view, cx| view.select_page(index, cx));
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("loaded document").doc;
+                assert_eq!(doc.active_page(), Some(root));
+                assert!(doc.selection.is_empty(), "the previous page is deselected");
+                assert_eq!(
+                    doc.scene
+                        .get(harness.vector_id)
+                        .expect("original rectangle")
+                        .data,
+                    original_data,
+                    "page navigation must not alter the previous page's shape"
+                );
+            });
+            assert!(
+                harness
+                    .panel
+                    .read_with(cx, |panel, cx| matches!(
+                        panel.build_snapshot(cx),
+                        InspectorSnapshot::Ready {
+                            selection_len: 0,
+                            body: InspectorBody::Page(page),
+                            ..
+                        } if page.id == Some(root)
+                    ))
+                    .expect("inspector remains open"),
+                "the inspector must show the page currently on the canvas"
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn export_action_writes_every_preset_for_every_selected_layer_and_reports_completion(
         cx: &mut TestAppContext,
     ) {

@@ -6,10 +6,13 @@ on:
     branches: ['codex-release-backend-gateway']
     paths:
       - '.github/workflows/release-macos.yml'
-      - 'script/bundle-mac'
-      - 'script/bundle-git'
-      - 'script/verify-bundled-git'
-      - 'script/verify-macos-document-icon'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'assets/**'
+      - 'script/**'
   workflow_dispatch:
     inputs:
       signed:
