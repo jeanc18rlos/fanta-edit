@@ -18,6 +18,17 @@
 //! one place that bumps it: after any scene-mutating op, the doc calls it with
 //! the touched node, and it bumps `rev` on every def whose `root` is an
 //! ancestor-or-self of that node (index-free, O(depth) via `scene.ancestors_of`).
+//!
+//! `rev` is *not* a pure cache counter: it is persisted, and `rev != 0` is the
+//! document's record that the master was edited since import, which decides
+//! whether Figma's baked `derivedSymbolData` fills still apply
+//! ([`crate::resolve::expand_instance`]). So only committed ops may move it.
+//! Transient previews that write straight into the scene without going through
+//! history — a drag frame, a text-edit preview, a properties slider — need the
+//! same memo invalidation without claiming the master was edited, and use
+//! [`ComponentLibrary::bump_preview_for_node`] instead. That bumps `preview_rev`,
+//! which is part of the memo key but is never serialized and never consulted by
+//! the derived-data logic.
 
 use crate::binding::BoundProp;
 use crate::id::{ComponentId, ComponentPropId, ModeId, NodeId, VariableCollectionId};
@@ -56,6 +67,10 @@ impl ComponentLibrary {
     /// containing the touched node get re-expanded. O(depth) — walks the touched
     /// node's ancestor chain (plus itself) and matches roots against it.
     ///
+    /// Only committed ops may call this: `rev` is persisted and doubles as the
+    /// "master was edited since import" flag. Transient previews use
+    /// [`Self::bump_preview_for_node`].
+    ///
     /// Returns the number of defs whose `rev` changed (mostly for tests).
     pub fn bump_rev_for_node(&mut self, scene: &Scene, node_id: NodeId) -> usize {
         self.bump_rev_for_nodes(scene, [node_id])
@@ -63,13 +78,43 @@ impl ComponentLibrary {
 
     /// [`Self::bump_rev_for_node`] for a whole set of touched nodes at once:
     /// a def whose root contains several of them is bumped once, and the defs
-    /// are scanned a single time rather than once per node. For transient
-    /// previews that write straight into the scene (a drag frame moving many
-    /// nodes) — those bypass `Doc::apply`, which is otherwise the only caller.
+    /// are scanned a single time rather than once per node.
     pub fn bump_rev_for_nodes(
         &mut self,
         scene: &Scene,
         node_ids: impl IntoIterator<Item = NodeId>,
+    ) -> usize {
+        self.bump_containing_defs(scene, node_ids, |def| def.rev = def.rev.wrapping_add(1))
+    }
+
+    /// [`Self::bump_rev_for_node`]'s counterpart for transient previews that
+    /// write straight into the scene without going through `Doc::apply` — a
+    /// drag frame, a text-edit preview, a properties slider. It invalidates the
+    /// same memoized instance expansions but leaves the persisted `rev` alone,
+    /// so a preview that is later cancelled cannot leave the master permanently
+    /// marked as edited (which would drop Figma's baked per-instance fills).
+    pub fn bump_preview_for_node(&mut self, scene: &Scene, node_id: NodeId) -> usize {
+        self.bump_preview_for_nodes(scene, [node_id])
+    }
+
+    /// [`Self::bump_preview_for_node`] for a whole set of touched nodes at once.
+    pub fn bump_preview_for_nodes(
+        &mut self,
+        scene: &Scene,
+        node_ids: impl IntoIterator<Item = NodeId>,
+    ) -> usize {
+        self.bump_containing_defs(scene, node_ids, |def| {
+            def.preview_rev = def.preview_rev.wrapping_add(1)
+        })
+    }
+
+    /// Run `bump` on every def whose `root` is an ancestor-or-self of one of
+    /// `node_ids`, returning how many defs matched.
+    fn bump_containing_defs(
+        &mut self,
+        scene: &Scene,
+        node_ids: impl IntoIterator<Item = NodeId>,
+        mut bump: impl FnMut(&mut ComponentDef),
     ) -> usize {
         if self.defs.is_empty() {
             return 0;
@@ -87,7 +132,7 @@ impl ComponentLibrary {
         let mut bumped = 0;
         for def in self.defs.values_mut() {
             if chain.contains(&def.root) {
-                def.rev = def.rev.wrapping_add(1);
+                bump(def);
                 bumped += 1;
             }
         }
@@ -115,6 +160,12 @@ pub struct ComponentDef {
     /// JSON when zero so a freshly-defined, never-edited master stays compact.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub rev: u64,
+    /// Monotonic revision for transient previews (see
+    /// [`ComponentLibrary::bump_preview_for_node`]). Part of the render layer's
+    /// instance memo key, but never persisted and never read as an "edited"
+    /// signal, so an aborted preview leaves no trace in the document.
+    #[serde(skip)]
+    pub preview_rev: u64,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -131,6 +182,7 @@ impl ComponentDef {
             variant_of: None,
             props: Vec::new(),
             rev: 0,
+            preview_rev: 0,
         }
     }
 }
@@ -367,6 +419,41 @@ mod tests {
         assert_eq!(lib.defs[&other_def_id].rev, 0);
         assert_eq!(lib.bump_rev_for_nodes(&scene, []), 0);
         assert_eq!(lib.bump_rev_for_nodes(&scene, [child_id, other_id]), 2);
+    }
+
+    #[test]
+    fn preview_bumps_leave_the_persisted_edited_flag_alone() {
+        // `rev != 0` is the document's record that the master was edited since
+        // import, which is what stops instances trusting Figma's baked
+        // `derivedSymbolData` fills — a transient preview must never move it.
+        let mut scene = Scene::new();
+        let root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let root_id = root.id;
+        scene.insert(root).unwrap();
+
+        let mut lib = ComponentLibrary::new();
+        let def_id = ComponentId::from_u128(1);
+        lib.defs
+            .insert(def_id, ComponentDef::new(def_id, root_id, "M"));
+
+        assert_eq!(lib.bump_preview_for_node(&scene, root_id), 1);
+        assert_eq!(lib.defs[&def_id].preview_rev, 1);
+        assert_eq!(lib.defs[&def_id].rev, 0);
+        assert_eq!(lib.bump_preview_for_nodes(&scene, [root_id, root_id]), 1);
+        assert_eq!(lib.defs[&def_id].preview_rev, 2);
+        assert_eq!(lib.defs[&def_id].rev, 0);
+
+        // And a committed edit moves `rev` without touching `preview_rev`.
+        lib.bump_rev_for_node(&scene, root_id);
+        assert_eq!(lib.defs[&def_id].rev, 1);
+        assert_eq!(lib.defs[&def_id].preview_rev, 2);
+
+        // `preview_rev` never reaches the file.
+        let json = serde_json::to_string(&lib).unwrap();
+        assert!(!json.contains("preview_rev"));
+        let back: ComponentLibrary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.defs[&def_id].preview_rev, 0);
+        assert_eq!(back.defs[&def_id].rev, 1);
     }
 
     #[test]

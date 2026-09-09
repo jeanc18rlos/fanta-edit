@@ -1213,10 +1213,12 @@ fn changes_since_gives_up_on_structural_and_unknown_edits() {
 
 #[test]
 fn changes_since_gives_up_when_a_touched_node_is_missing() {
-    let mut deep = DeepScene::build();
+    let deep = DeepScene::build();
     let start = deep.scene.revision();
-    assert!(deep.scene.get_mut(NodeId::new()).is_none());
-    assert_ne!(deep.scene.revision(), start, "get_mut bumps even on a miss");
+    // No public mutator logs a node it does not hold any more (`get_mut`
+    // returns before logging on a miss), so the guard is exercised at the
+    // log directly.
+    deep.scene.record_change(SceneChange::Node(NodeId::new()));
     assert!(deep.scene.changes_since(start).is_none());
 }
 
@@ -1375,4 +1377,308 @@ fn patch_node_logs_a_node_change_and_targets_its_invalidation() {
         assert!(local.contains_key(&deep.b_leaf));
     }
     assert_geometry_matches_cold_fold(&deep.scene, &deep.all_ids());
+}
+
+#[test]
+fn get_mut_of_a_missing_node_leaves_revision_log_and_caches_untouched() {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    let start = deep.scene.revision();
+    let warm_world_entries = deep.scene.world_cache.borrow().len();
+    let warm_local_entries = deep.scene.local_bounds_cache.borrow().len();
+    let missing = rect_node(0.0, 0.0, 1.0, 1.0).id;
+
+    assert!(deep.scene.get_mut(missing).is_none());
+
+    assert_eq!(
+        deep.scene.revision(),
+        start,
+        "a miss must not bump the revision"
+    );
+    assert_eq!(
+        deep.scene.changes_since(start),
+        Some(SceneDelta::default()),
+        "a miss must not be logged"
+    );
+    assert_eq!(deep.scene.world_cache.borrow().len(), warm_world_entries);
+    assert_eq!(
+        deep.scene.local_bounds_cache.borrow().len(),
+        warm_local_entries
+    );
+    assert_eq!(deep.scene.node_stamp(missing), 0);
+}
+
+/// A batch whose parents come both before and after their children, with
+/// equal and distinct index keys under every parent, some of which already
+/// exist in the scene. Returns the nodes in the batch order to feed
+/// `insert_many`, plus the same nodes in a parent-first order a sequential
+/// `insert` accepts.
+fn interleaved_batch(scene: &Scene, existing_group: NodeId) -> (Vec<CanvasNode>, Vec<CanvasNode>) {
+    let mut group_a = group_node();
+    group_a.index = IndexKey::FIRST;
+    let mut group_b = group_node();
+    group_b.index = IndexKey::FIRST;
+    let mut leaf_a1 = rect_node(0.0, 0.0, 1.0, 1.0);
+    leaf_a1.parent = Some(group_a.id);
+    leaf_a1.index = IndexKey::from_raw(2.0);
+    let mut leaf_a2 = rect_node(0.0, 0.0, 1.0, 1.0);
+    leaf_a2.parent = Some(group_a.id);
+    leaf_a2.index = IndexKey::from_raw(2.0);
+    let mut leaf_a3 = rect_node(0.0, 0.0, 1.0, 1.0);
+    leaf_a3.parent = Some(group_a.id);
+    leaf_a3.index = IndexKey::from_raw(0.5);
+    let mut leaf_b1 = rect_node(0.0, 0.0, 1.0, 1.0);
+    leaf_b1.parent = Some(group_b.id);
+    leaf_b1.index = IndexKey::FIRST;
+    let mut nested = group_node();
+    nested.parent = Some(group_b.id);
+    nested.index = IndexKey::FIRST;
+    let mut nested_leaf = rect_node(0.0, 0.0, 1.0, 1.0);
+    nested_leaf.parent = Some(nested.id);
+    nested_leaf.index = IndexKey::FIRST;
+    // Under the pre-existing group: one key equal to the existing children's
+    // and one that sorts between them.
+    let existing_key = scene.children_of(Some(existing_group))[0];
+    let mut under_existing_equal = rect_node(0.0, 0.0, 1.0, 1.0);
+    under_existing_equal.parent = Some(existing_group);
+    under_existing_equal.index = scene.get(existing_key).unwrap().index;
+    let mut under_existing_between = rect_node(0.0, 0.0, 1.0, 1.0);
+    under_existing_between.parent = Some(existing_group);
+    under_existing_between.index = IndexKey::from_raw(1.5);
+    let mut new_root = rect_node(0.0, 0.0, 1.0, 1.0);
+    new_root.index = IndexKey::from_raw(0.0);
+
+    let sequential = vec![
+        group_a.clone(),
+        group_b.clone(),
+        nested.clone(),
+        leaf_a1.clone(),
+        leaf_a2.clone(),
+        leaf_a3.clone(),
+        leaf_b1.clone(),
+        nested_leaf.clone(),
+        under_existing_equal.clone(),
+        under_existing_between.clone(),
+        new_root.clone(),
+    ];
+    let batch = vec![
+        nested_leaf,
+        leaf_a2,
+        under_existing_between,
+        group_b,
+        leaf_a1,
+        nested,
+        new_root,
+        leaf_b1,
+        group_a,
+        under_existing_equal,
+        leaf_a3,
+    ];
+    (batch, sequential)
+}
+
+fn seeded_scene() -> (Scene, NodeId) {
+    let mut scene = Scene::new();
+    let mut group = group_node();
+    group.index = IndexKey::from_raw(3.0);
+    let group_id = group.id;
+    scene.insert(group).unwrap();
+    for _ in 0..3 {
+        let mut child = rect_node(0.0, 0.0, 1.0, 1.0);
+        child.parent = Some(group_id);
+        child.index = IndexKey::FIRST;
+        scene.insert(child).unwrap();
+    }
+    let mut child = rect_node(0.0, 0.0, 1.0, 1.0);
+    child.parent = Some(group_id);
+    child.index = IndexKey::from_raw(2.0);
+    scene.insert(child).unwrap();
+    (scene, group_id)
+}
+
+#[test]
+fn insert_many_matches_sequential_insert_order_byte_for_byte() {
+    let (mut batched, existing_group) = seeded_scene();
+    let mut sequential = batched.clone();
+    let (batch, ordered) = interleaved_batch(&batched, existing_group);
+    let expected_ids: Vec<NodeId> = batch.iter().map(|node| node.id).collect();
+
+    let inserted = batched.insert_many(batch).unwrap();
+    for node in ordered {
+        sequential.insert(node).unwrap();
+    }
+
+    assert_eq!(inserted, expected_ids, "ids come back in batch order");
+    assert_eq!(batched.len(), sequential.len());
+    for id in std::iter::once(None).chain(sequential.nodes.keys().copied().map(Some)) {
+        assert_eq!(
+            batched.children_of(id),
+            sequential.children_of(id),
+            "child order under {id:?} diverges from sequential insertion"
+        );
+    }
+    assert_eq!(batched.child_index.len(), sequential.child_index.len());
+    batched.validate().unwrap();
+    for id in &inserted {
+        let batched_node = batched.get(*id).unwrap();
+        let sequential_node = sequential.get(*id).unwrap();
+        assert_eq!(batched_node.parent, sequential_node.parent);
+        assert_eq!(batched_node.index, sequential_node.index);
+    }
+}
+
+#[test]
+fn insert_many_rejections_leave_the_scene_untouched() {
+    let (mut scene, existing_group) = seeded_scene();
+    let existing_leaf = scene.children_of(Some(existing_group))[0];
+    scene.world_bounds(existing_group);
+    let len = scene.len();
+    let start = scene.revision();
+    let warm_world_entries = scene.world_cache.borrow().len();
+    let stamps_before: Vec<u64> = scene.nodes.keys().map(|id| scene.node_stamp(*id)).collect();
+
+    let assert_untouched = |scene: &Scene, label: &str| {
+        assert_eq!(scene.len(), len, "{label}: node count changed");
+        assert_eq!(scene.revision(), start, "{label}: revision changed");
+        assert_eq!(
+            scene.changes_since(start),
+            Some(SceneDelta::default()),
+            "{label}: change logged"
+        );
+        assert_eq!(
+            scene.world_cache.borrow().len(),
+            warm_world_entries,
+            "{label}: caches cleared"
+        );
+        let stamps_after: Vec<u64> = scene.nodes.keys().map(|id| scene.node_stamp(*id)).collect();
+        assert_eq!(stamps_after, stamps_before, "{label}: stamps moved");
+        scene.validate().unwrap();
+    };
+
+    // Duplicate against the scene, placed after a valid node so the valid
+    // node must not slip in before the batch is rejected.
+    let duplicate_of_existing = scene.get(existing_leaf).unwrap().clone();
+    let fresh = rect_node(0.0, 0.0, 1.0, 1.0);
+    let fresh_id = fresh.id;
+    assert!(matches!(
+        scene.insert_many(vec![fresh, duplicate_of_existing]),
+        Err(SceneError::Duplicate(id)) if id == existing_leaf
+    ));
+    assert!(!scene.contains(fresh_id));
+    assert_untouched(&scene, "duplicate against scene");
+
+    let twice = rect_node(0.0, 0.0, 1.0, 1.0);
+    let twice_id = twice.id;
+    assert!(matches!(
+        scene.insert_many(vec![twice.clone(), twice]),
+        Err(SceneError::Duplicate(id)) if id == twice_id
+    ));
+    assert_untouched(&scene, "duplicate within batch");
+
+    let mut orphan = rect_node(0.0, 0.0, 1.0, 1.0);
+    let missing_parent = rect_node(0.0, 0.0, 1.0, 1.0).id;
+    orphan.parent = Some(missing_parent);
+    assert!(matches!(
+        scene.insert_many(vec![orphan]),
+        Err(SceneError::ParentMissing(id)) if id == missing_parent
+    ));
+    assert_untouched(&scene, "missing parent");
+
+    let mut under_leaf = rect_node(0.0, 0.0, 1.0, 1.0);
+    under_leaf.parent = Some(existing_leaf);
+    assert!(matches!(
+        scene.insert_many(vec![under_leaf]),
+        Err(SceneError::ParentNotContainer(id)) if id == existing_leaf
+    ));
+    assert_untouched(&scene, "non-container parent in scene");
+
+    let batch_leaf = rect_node(0.0, 0.0, 1.0, 1.0);
+    let batch_leaf_id = batch_leaf.id;
+    let mut under_batch_leaf = rect_node(0.0, 0.0, 1.0, 1.0);
+    under_batch_leaf.parent = Some(batch_leaf_id);
+    assert!(matches!(
+        scene.insert_many(vec![under_batch_leaf, batch_leaf]),
+        Err(SceneError::ParentNotContainer(id)) if id == batch_leaf_id
+    ));
+    assert_untouched(&scene, "non-container parent in batch");
+
+    let mut ring_a = group_node();
+    let mut ring_b = group_node();
+    let mut ring_c = group_node();
+    ring_a.parent = Some(ring_c.id);
+    ring_b.parent = Some(ring_a.id);
+    ring_c.parent = Some(ring_b.id);
+    let mut hanging = rect_node(0.0, 0.0, 1.0, 1.0);
+    hanging.parent = Some(ring_a.id);
+    assert!(matches!(
+        scene.insert_many(vec![hanging, ring_a, ring_b, ring_c]),
+        Err(SceneError::Cycle { .. })
+    ));
+    assert_untouched(&scene, "cycle within batch");
+}
+
+#[test]
+fn insert_many_logs_one_structural_change_and_stamps_inserted_nodes_and_parents() {
+    let (mut scene, existing_group) = seeded_scene();
+    let mut bystander = group_node();
+    bystander.index = IndexKey::from_raw(9.0);
+    let bystander_id = bystander.id;
+    scene.insert(bystander).unwrap();
+    scene.world_bounds(existing_group);
+    let start = scene.revision();
+    let group_stamp_before = scene.node_stamp(existing_group);
+    let bystander_stamp_before = scene.node_stamp(bystander_id);
+
+    let mut batch_group = group_node();
+    batch_group.index = IndexKey::from_raw(4.0);
+    let mut under_batch_group = rect_node(0.0, 0.0, 1.0, 1.0);
+    under_batch_group.parent = Some(batch_group.id);
+    let mut under_existing = rect_node(0.0, 0.0, 1.0, 1.0);
+    under_existing.parent = Some(existing_group);
+    under_existing.index = IndexKey::from_raw(5.0);
+    let inserted = scene
+        .insert_many(vec![under_batch_group, batch_group, under_existing])
+        .unwrap();
+
+    assert_eq!(
+        scene.revision(),
+        start + 1,
+        "one revision bump for the batch"
+    );
+    assert_eq!(
+        scene.changes_since(start),
+        None,
+        "the batch is a structural change a copy cannot patch"
+    );
+    assert!(
+        scene.world_cache.borrow().is_empty(),
+        "derived caches cleared"
+    );
+    for id in &inserted {
+        assert!(scene.node_stamp(*id) > 0, "inserted node {id} is stamped");
+    }
+    assert!(
+        scene.node_stamp(existing_group) > group_stamp_before,
+        "an existing parent that gained children is stamped"
+    );
+    assert_eq!(
+        scene.node_stamp(bystander_id),
+        bystander_stamp_before,
+        "an untouched node keeps its stamp"
+    );
+    scene.validate().unwrap();
+
+    let untouched = scene.revision();
+    assert_eq!(scene.insert_many(Vec::new()).unwrap(), Vec::<NodeId>::new());
+    assert_eq!(scene.revision(), untouched, "an empty batch is not an edit");
+}
+
+#[test]
+fn rebuild_child_index_matches_insert_many_order() {
+    let (mut scene, existing_group) = seeded_scene();
+    let (batch, _) = interleaved_batch(&scene, existing_group);
+    scene.insert_many(batch).unwrap();
+    let live = scene.child_index.clone();
+    scene.rebuild_child_index();
+    assert_eq!(scene.child_index, live);
 }

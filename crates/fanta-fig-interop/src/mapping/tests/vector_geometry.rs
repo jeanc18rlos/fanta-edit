@@ -20,7 +20,7 @@ fn vector_family_maps_to_bbox_fallback_vector() {
                 ("size", vector(24.0, 18.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -100,11 +100,11 @@ fn vector_with_fill_geometry_decodes_real_path() {
                 ("size", vector(24.0, 18.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
                 ),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -151,7 +151,7 @@ fn vector_odd_winding_rule_maps_to_even_odd() {
                 ("guid", guid(0, 1)),
                 ("type", KiwiValue::Enum("VECTOR".into())),
                 ("size", vector(5.0, 5.0)),
-                ("fillGeometry", KiwiValue::Array(vec![fig_path(0, "ODD")])),
+                ("fillGeometry", KiwiValue::array(vec![fig_path(0, "ODD")])),
             ],
         )],
         vec![blob],
@@ -186,7 +186,7 @@ fn multiple_fill_geometry_paths_concatenate_into_one_path() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO"), fig_path(1, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO"), fig_path(1, "NONZERO")]),
                 ),
             ],
         )],
@@ -222,7 +222,7 @@ fn vector_with_garbage_blob_keeps_bbox_fallback() {
                 ("size", vector(12.0, 12.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -255,7 +255,7 @@ fn vector_with_out_of_range_blob_index_keeps_bbox_fallback() {
                 ("size", vector(8.0, 8.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(999, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(999, "NONZERO")]),
                 ),
             ],
         )],
@@ -302,14 +302,14 @@ fn vector_no_fill_with_stroke_is_stroke_only_outline_not_a_width_stroke() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
                 (
                     "strokeGeometry",
-                    KiwiValue::Array(vec![fig_path(1, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(1, "NONZERO")]),
                 ),
                 ("strokeWeight", KiwiValue::Float(2.0)),
-                ("strokePaints", KiwiValue::Array(vec![stroke_paint])),
+                ("strokePaints", KiwiValue::array(vec![stroke_paint])),
             ],
         )],
         vec![fill, stroke_outline],
@@ -357,12 +357,12 @@ fn line_with_stroke_geometry_fills_the_baked_outline() {
                 ("size", vector(100.0, 0.0)),
                 (
                     "strokePaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
                 ),
                 ("strokeWeight", KiwiValue::Float(2.0)),
                 (
                     "strokeGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -408,12 +408,12 @@ fn boolean_operation_without_fill_geometry_uses_stroke_geometry() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "strokePaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
                 ),
                 ("strokeWeight", KiwiValue::Float(1.0)),
                 (
                     "strokeGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -450,16 +450,16 @@ fn node_with_fills_keeps_bbox_fallback_over_stroke_geometry() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
                 ),
                 (
                     "strokePaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
                 ),
                 ("strokeWeight", KiwiValue::Float(1.0)),
                 (
                     "strokeGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -499,11 +499,11 @@ fn mixed_winding_rules_are_preserved_per_subpath() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
                 ),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO"), fig_path(1, "ODD")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO"), fig_path(1, "ODD")]),
                 ),
             ],
         )],
@@ -544,7 +544,7 @@ fn uniform_winding_rules_leave_subpath_rules_empty() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "ODD"), fig_path(1, "ODD")]),
+                    KiwiValue::array(vec![fig_path(0, "ODD"), fig_path(1, "ODD")]),
                 ),
             ],
         )],

@@ -48,7 +48,7 @@ fn symbol_override_text_replaces_master_default_on_expand() {
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("guidPath", guid_path(0, 2)),
@@ -104,7 +104,7 @@ fn symbol_override_text_alignment_snapshot_does_not_recolor_text() {
                 ("textData", text_data("Row item")),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(
+                    KiwiValue::array(vec![solid_paint(
                         235.0 / 255.0,
                         235.0 / 255.0,
                         235.0 / 255.0,
@@ -128,14 +128,14 @@ fn symbol_override_text_alignment_snapshot_does_not_recolor_text() {
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("guidPath", guid_path(0, 2)),
                                         ("textAlignHorizontal", KiwiValue::Enum("RIGHT".into())),
                                         (
                                             "fillPaints",
-                                            KiwiValue::Array(vec![solid_paint(
+                                            KiwiValue::array(vec![solid_paint(
                                                 34.0 / 255.0,
                                                 34.0 / 255.0,
                                                 34.0 / 255.0,
@@ -189,7 +189,7 @@ fn length2_guidpath_override_routes_onto_nested_instance_and_applies() {
                 ("symbolID", guid(0, 10)),
                 (
                     "symbolOverrides",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "NodeChange",
                         vec![
                             ("guidPath", guid_path2((0, 11), (0, 2))),
@@ -305,7 +305,7 @@ fn overridden_symbol_id_swaps_the_nested_component_on_import() {
                             ("symbolID", guid(0, 10)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("guidPath", guid_path(0, 11)),

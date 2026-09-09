@@ -48,7 +48,7 @@ fn symbol_on_canvas_maps_to_component_def_and_stays_on_page() {
                 ("size", vector(120.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -138,7 +138,7 @@ fn symbol_embedded_in_design_frame_renders_in_place() {
                 ("size", vector(120.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -417,7 +417,7 @@ fn instance_of_a_component_set_resolves_to_a_member_and_expands() {
                 ("size", vector(120.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.1, 0.4, 0.9, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.1, 0.4, 0.9, 1.0)]),
                 ),
             ],
         ),

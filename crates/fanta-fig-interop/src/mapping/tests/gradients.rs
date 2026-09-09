@@ -20,7 +20,7 @@ fn linear_gradient_fill_maps_to_fill_gradient_with_endpoints_and_stops() {
             ("size", vector(100.0, 100.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![gradient_paint(
+                KiwiValue::array(vec![gradient_paint(
                     "GRADIENT_LINEAR",
                     m,
                     vec![
@@ -67,7 +67,7 @@ fn radial_gradient_fill_maps_to_fill_gradient_radial() {
             ("size", vector(80.0, 80.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![gradient_paint(
+                KiwiValue::array(vec![gradient_paint(
                     "GRADIENT_RADIAL",
                     m,
                     vec![
@@ -117,7 +117,7 @@ fn angular_gradient_fill_maps_to_fill_gradient_angular() {
             ("size", vector(80.0, 80.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![gradient_paint(
+                KiwiValue::array(vec![gradient_paint(
                     "GRADIENT_ANGULAR",
                     m,
                     vec![
@@ -156,7 +156,7 @@ fn diamond_gradient_fill_maps_to_fill_gradient_diamond() {
             ("size", vector(80.0, 80.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![gradient_paint(
+                KiwiValue::array(vec![gradient_paint(
                     "GRADIENT_DIAMOND",
                     m,
                     vec![
@@ -211,7 +211,7 @@ fn per_paint_opacity_multiplies_gradient_stop_alpha() {
             ("parentIndex", parent_index(0, 1)),
             ("type", KiwiValue::Enum("RECTANGLE".into())),
             ("size", vector(10.0, 10.0)),
-            ("fillPaints", KiwiValue::Array(vec![paint])),
+            ("fillPaints", KiwiValue::array(vec![paint])),
         ],
     );
     let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
@@ -249,7 +249,7 @@ fn rotated_radial_gradient_keeps_axis_handles() {
             ("size", vector(100.0, 100.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![gradient_paint(
+                KiwiValue::array(vec![gradient_paint(
                     "GRADIENT_RADIAL",
                     m,
                     vec![

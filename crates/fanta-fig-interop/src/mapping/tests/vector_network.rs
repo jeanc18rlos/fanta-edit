@@ -326,7 +326,7 @@ fn fill_geometry_is_preferred_over_vector_network() {
         1, // vectorNetworkBlob index
         vec![(
             "fillGeometry",
-            KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+            KiwiValue::array(vec![fig_path(0, "NONZERO")]),
         )],
     );
     let fig = doc_from_with_blobs(
@@ -435,7 +435,7 @@ fn build_stroke_emits_one_stroke_per_visible_paint() {
             ("strokeAlign", KiwiValue::Enum("OUTSIDE".into())),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![
+                KiwiValue::array(vec![
                     solid_paint(1.0, 0.0, 0.0, 1.0), // red, bottom
                     hidden,                          // skipped
                     solid_paint(0.0, 0.0, 1.0, 1.0), // blue, top
@@ -530,7 +530,7 @@ fn build_stroke_drops_all_when_no_visible_paint_or_zero_weight() {
         vec![
             ("type", KiwiValue::Enum("VECTOR".into())),
             ("strokeWeight", KiwiValue::Float(2.0)),
-            ("strokePaints", KiwiValue::Array(vec![hidden])),
+            ("strokePaints", KiwiValue::array(vec![hidden])),
         ],
     );
     assert!(
@@ -546,7 +546,7 @@ fn build_stroke_drops_all_when_no_visible_paint_or_zero_weight() {
             ("strokeWeight", KiwiValue::Float(0.0)),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![
+                KiwiValue::array(vec![
                     solid_paint(0.0, 0.0, 0.0, 1.0),
                     solid_paint(1.0, 1.0, 1.0, 1.0),
                 ]),

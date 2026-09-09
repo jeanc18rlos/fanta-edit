@@ -598,7 +598,7 @@ pub(crate) fn doc_from_with_blobs(changes: Vec<KiwiValue>, blobs: Vec<Vec<u8>>) 
     FigDocument {
         version: 0,
         schema: schema(),
-        root: o("Message", vec![("nodeChanges", KiwiValue::Array(changes))]),
+        root: o("Message", vec![("nodeChanges", KiwiValue::array(changes))]),
         root_type_name: "Message".into(),
         blobs,
         images: std::collections::HashMap::new(),
@@ -615,7 +615,7 @@ pub(crate) fn doc_from_with_images(
     FigDocument {
         version: 0,
         schema: schema(),
-        root: o("Message", vec![("nodeChanges", KiwiValue::Array(changes))]),
+        root: o("Message", vec![("nodeChanges", KiwiValue::array(changes))]),
         root_type_name: "Message".into(),
         blobs: Vec::new(),
         images,
@@ -631,7 +631,7 @@ pub(crate) fn symbol_data(sid: u32, lid: u32) -> KiwiValue {
 pub(crate) fn guid_path(sid: u32, lid: u32) -> KiwiValue {
     o(
         "GUIDPath",
-        vec![("guids", KiwiValue::Array(vec![guid(sid, lid)]))],
+        vec![("guids", KiwiValue::array(vec![guid(sid, lid)]))],
     )
 }
 
@@ -641,7 +641,7 @@ pub(crate) fn guid_path2(a: (u32, u32), b: (u32, u32)) -> KiwiValue {
         "GUIDPath",
         vec![(
             "guids",
-            KiwiValue::Array(vec![guid(a.0, a.1), guid(b.0, b.1)]),
+            KiwiValue::array(vec![guid(a.0, a.1), guid(b.0, b.1)]),
         )],
     )
 }
@@ -863,7 +863,7 @@ pub(crate) fn gradient_paint(kind: &str, m: [f32; 6], stops: Vec<KiwiValue>) -> 
         vec![
             ("type", KiwiValue::Enum(kind.into())),
             ("transform", transform),
-            ("stops", KiwiValue::Array(stops)),
+            ("stops", KiwiValue::array(stops)),
         ],
     )
 }

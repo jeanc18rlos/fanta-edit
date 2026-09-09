@@ -33,7 +33,7 @@ fn root_targeted_guidpath_repaints_the_expansion_root_surface() {
                 // with a background, the surface the override recolors.
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -52,14 +52,14 @@ fn root_targeted_guidpath_repaints_the_expansion_root_surface() {
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     // guidPath == [master root 0:1] → the root.
                                     vec![
                                         ("guidPath", guid_path(0, 1)),
                                         (
                                             "fillPaints",
-                                            KiwiValue::Array(vec![solid_paint(
+                                            KiwiValue::array(vec![solid_paint(
                                                 0.114, 0.114, 0.114, 1.0,
                                             )]),
                                         ),
@@ -198,7 +198,7 @@ fn swapped_nested_instance_routes_content_override_into_the_swapped_master() {
                             ("symbolID", guid(0, 10)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![
+                                KiwiValue::array(vec![
                                     // 1. swap the nested instance to ChipB.
                                     o(
                                         "NodeChange",

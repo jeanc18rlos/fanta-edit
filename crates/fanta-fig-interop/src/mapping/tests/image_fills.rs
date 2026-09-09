@@ -8,7 +8,7 @@ use super::*;
 
 /// Build an IMAGE `Paint` referencing `hash_bytes` with the given scale mode.
 fn image_paint(hash_bytes: &[u8], scale_mode: &str) -> KiwiValue {
-    let hash = KiwiValue::Array(hash_bytes.iter().map(|b| KiwiValue::Byte(*b)).collect());
+    let hash = KiwiValue::array(hash_bytes.iter().map(|b| KiwiValue::Byte(*b)).collect());
     o(
         "Paint",
         vec![
@@ -32,7 +32,7 @@ fn image_paint(hash_bytes: &[u8], scale_mode: &str) -> KiwiValue {
 
 /// A `CROP` IMAGE `Paint` carrying an `imageTransform` (2x3 affine `m`).
 fn crop_image_paint(hash_bytes: &[u8], m: [f32; 6]) -> KiwiValue {
-    let hash = KiwiValue::Array(hash_bytes.iter().map(|b| KiwiValue::Byte(*b)).collect());
+    let hash = KiwiValue::array(hash_bytes.iter().map(|b| KiwiValue::Byte(*b)).collect());
     o(
         "Paint",
         vec![
@@ -64,7 +64,7 @@ fn rect_with_paints(paints: Vec<KiwiValue>) -> KiwiValue {
             ("parentIndex", parent_index(0, 1)),
             ("type", KiwiValue::Enum("RECTANGLE".into())),
             ("size", vector(40.0, 40.0)),
-            ("fillPaints", KiwiValue::Array(paints)),
+            ("fillPaints", KiwiValue::array(paints)),
         ],
     )
 }
@@ -212,7 +212,7 @@ fn background_image_paint_extracts_asset_bytes() {
                     ("size", vector(52.0, 52.0)),
                     (
                         "backgroundPaints",
-                        KiwiValue::Array(vec![image_paint(&hash_bytes, "FILL")]),
+                        KiwiValue::array(vec![image_paint(&hash_bytes, "FILL")]),
                     ),
                 ],
             ),
@@ -255,13 +255,13 @@ fn derived_background_image_paint_extracts_asset_bytes() {
                 ("type", KiwiValue::Enum("INSTANCE".into())),
                 (
                     "derivedSymbolData",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "NodeChange",
                         vec![
                             ("guid", guid(0, 2)),
                             (
                                 "backgroundPaints",
-                                KiwiValue::Array(vec![image_paint(&hash_bytes, "FILL")]),
+                                KiwiValue::array(vec![image_paint(&hash_bytes, "FILL")]),
                             ),
                         ],
                     )]),
@@ -468,7 +468,7 @@ fn distinct_image_paints_dedupe_to_one_asset() {
             ("size", vector(10.0, 10.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![image_paint(&hash_bytes, "FILL")]),
+                KiwiValue::array(vec![image_paint(&hash_bytes, "FILL")]),
             ),
         ],
     );
@@ -481,7 +481,7 @@ fn distinct_image_paints_dedupe_to_one_asset() {
             ("size", vector(10.0, 10.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![image_paint(&hash_bytes, "FILL")]),
+                KiwiValue::array(vec![image_paint(&hash_bytes, "FILL")]),
             ),
         ],
     );

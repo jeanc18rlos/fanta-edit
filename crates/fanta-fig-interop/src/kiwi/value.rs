@@ -33,7 +33,14 @@ pub enum KiwiValue {
     String(String),
     Int64(i64),
     Uint64(u64),
-    Array(Vec<KiwiValue>),
+    /// Array payloads are shared: cloning a value that holds one — the
+    /// shared-style pre-pass copies every consuming node before rewriting a
+    /// field or two of it — bumps a count instead of deep-copying the
+    /// `derivedSymbolData` / geometry arrays that make up most of a large
+    /// document. The two writers in that pre-pass go through
+    /// [`Arc::make_mut`], so a shared payload is copied only when it is
+    /// actually edited. Build one with [`KiwiValue::array`].
+    Array(Arc<Vec<KiwiValue>>),
     /// A `byte[]` field as one contiguous buffer. Figma's path-command blobs
     /// and image hashes are `byte[]`; decoding them as `Array` of [`Byte`]
     /// costs 32 bytes and a dispatch per source byte, which for a large file
@@ -116,6 +123,11 @@ impl<K: Into<Arc<str>>> FromIterator<(K, KiwiValue)> for KiwiFields {
 }
 
 impl KiwiValue {
+    /// An array value over `items`.
+    pub fn array(items: Vec<KiwiValue>) -> Self {
+        KiwiValue::Array(Arc::new(items))
+    }
+
     // ---- ergonomic accessors (used heavily by the mapping layer) -----------
 
     /// Borrow a field of an [`KiwiValue::Object`].
@@ -184,7 +196,7 @@ impl KiwiValue {
     /// [`KiwiValue::as_bytes`].
     pub fn as_array(&self) -> Option<&[KiwiValue]> {
         match self {
-            KiwiValue::Array(v) => Some(v),
+            KiwiValue::Array(v) => Some(v.as_slice()),
             _ => None,
         }
     }
@@ -313,7 +325,7 @@ impl KiwiValue {
             for _ in 0..len {
                 items.push(Self::decode_type(schema, field.ty, r)?);
             }
-            Ok(KiwiValue::Array(items))
+            Ok(KiwiValue::array(items))
         } else {
             Self::decode_type(schema, field.ty, r)
         }
@@ -345,7 +357,7 @@ impl KiwiValue {
             KiwiValue::Uint64(v) => w.write_var_uint64(*v),
             KiwiValue::Array(items) => {
                 w.write_var_uint(items.len() as u32);
-                for item in items {
+                for item in items.iter() {
                     item.encode_into(schema, w)?;
                 }
             }
@@ -526,7 +538,7 @@ mod tests {
                         ],
                     ),
                 ),
-                ("children", KiwiValue::Array(vec![])),
+                ("children", KiwiValue::array(vec![])),
                 ("z", KiwiValue::Int(7)),
             ],
         );
@@ -574,7 +586,7 @@ mod tests {
                 ("name", KiwiValue::String("parent".to_owned())),
                 (
                     "children",
-                    KiwiValue::Array(vec![child("a"), child("b"), child("c")]),
+                    KiwiValue::array(vec![child("a"), child("b"), child("c")]),
                 ),
                 ("z", KiwiValue::Int(1)),
             ],
@@ -711,7 +723,7 @@ mod tests {
             "Poly",
             vec![(
                 "pts",
-                KiwiValue::Array(vec![
+                KiwiValue::array(vec![
                     KiwiValue::Float(0.0),
                     KiwiValue::Float(1.5),
                     KiwiValue::Float(-3.25),
@@ -760,7 +772,7 @@ mod tests {
             "Blob",
             vec![(
                 "bytes",
-                KiwiValue::Array(vec![KiwiValue::Byte(7), KiwiValue::Byte(9)]),
+                KiwiValue::array(vec![KiwiValue::Byte(7), KiwiValue::Byte(9)]),
             )],
         );
         let compact = obj("Blob", vec![("bytes", KiwiValue::Bytes(vec![7, 9]))]);
@@ -839,7 +851,7 @@ mod tests {
                 ),
                 (
                     "children",
-                    KiwiValue::Array(vec![obj(
+                    KiwiValue::array(vec![obj(
                         "Node",
                         vec![
                             ("name", KiwiValue::String("Frame".to_owned())),

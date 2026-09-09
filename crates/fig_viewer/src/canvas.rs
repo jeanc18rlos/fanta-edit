@@ -493,8 +493,9 @@ pub(crate) enum GpuFrame {
 /// coarse for either job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InputsFingerprint {
-    /// `(def count, sum of every def's rev, set count)`: a master edit bumps
-    /// its def's rev, adding or removing a def changes a count.
+    /// `(def count, sum of every def's revisions, set count)`: a master edit
+    /// bumps its def's `rev` and an in-flight preview inside a master bumps its
+    /// `preview_rev`; adding or removing a def changes a count.
     components: (usize, u64, usize),
     /// Hash of the variable registry and the doc-level active modes.
     variables: u64,
@@ -511,10 +512,9 @@ impl InputsFingerprint {
     fn components_of(doc: &fanta_doc::Doc) -> (usize, u64, usize) {
         (
             doc.components.defs.len(),
-            doc.components
-                .defs
-                .values()
-                .fold(0u64, |sum, def| sum.wrapping_add(def.rev)),
+            doc.components.defs.values().fold(0u64, |sum, def| {
+                sum.wrapping_add(def.rev).wrapping_add(def.preview_rev)
+            }),
             doc.components.sets.len(),
         )
     }
@@ -4668,6 +4668,16 @@ mod tests {
         }
         let bumped = InputsFingerprint::of(&doc);
         assert_ne!(with_def, bumped, "a master edit changes it");
+
+        if let Some(def) = doc.components.defs.get_mut(&component) {
+            def.preview_rev += 1;
+        }
+        let previewed = InputsFingerprint::of(&doc);
+        assert_ne!(
+            bumped, previewed,
+            "a transient preview inside a master changes it too"
+        );
+        let bumped = previewed;
 
         doc.active_modes
             .insert(VariableCollectionId::new(), ModeId::new());

@@ -24,7 +24,7 @@ fn fill_style_def(sid: u32, lid: u32, r: f32, g: f32, b: f32) -> KiwiValue {
             ("name", KiwiValue::String("dark/bg".to_owned())),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(r, g, b, 1.0)]),
+                KiwiValue::array(vec![solid_paint(r, g, b, 1.0)]),
             ),
         ],
     )
@@ -41,7 +41,7 @@ fn text_style_def(sid: u32, lid: u32, r: f32, g: f32, b: f32) -> KiwiValue {
             ("fontSize", KiwiValue::Float(18.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(r, g, b, 1.0)]),
+                KiwiValue::array(vec![solid_paint(r, g, b, 1.0)]),
             ),
         ],
     )
@@ -69,7 +69,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
             vec![
                 ("guid", guid(0, 2)),
                 ("type", KiwiValue::Enum("RECTANGLE".into())),
-                ("fillPaints", KiwiValue::Array(vec![])),
+                ("fillPaints", KiwiValue::array(vec![])),
                 ("styleIdForFill", style_ref(10, 5)),
             ],
         ),
@@ -81,7 +81,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
                 ("type", KiwiValue::Enum("RECTANGLE".into())),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -99,7 +99,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
                             ("symbolID", guid(0, 20)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("guidPath", guid_path(0, 21)),
@@ -126,7 +126,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
                             ("characters", KiwiValue::String("ab".to_owned())),
                             (
                                 "styleOverrideTable",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("styleID", KiwiValue::Uint(1)),
@@ -170,7 +170,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
     // The direct consumer got the style's paints; the untouched rect is equal.
     assert_eq!(
         resolved[2].get("fillPaints"),
-        Some(&KiwiValue::Array(vec![dark.clone()]))
+        Some(&KiwiValue::array(vec![dark.clone()]))
     );
     assert_eq!(*resolved[3], changes[3]);
     // The override entry and the run entry were rewritten in place.
@@ -181,7 +181,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
         .unwrap()[0];
     assert_eq!(
         override_entry.get("fillPaints"),
-        Some(&KiwiValue::Array(vec![dark.clone()]))
+        Some(&KiwiValue::array(vec![dark.clone()]))
     );
     let run_entry = &resolved[5]
         .get("textData")
@@ -190,7 +190,7 @@ fn style_pre_pass_copies_only_the_changes_it_rewrites() {
         .unwrap()[0];
     assert_eq!(
         run_entry.get("fillPaints"),
-        Some(&KiwiValue::Array(vec![dark]))
+        Some(&KiwiValue::array(vec![dark]))
     );
     // The unresolvable ref is counted as an empty-fill ref, never resolved.
     assert!(resolved[6].get("fillPaints").is_none());
@@ -263,7 +263,7 @@ fn empty_fillpaints_with_style_ref_resolves_to_the_styles_paints() {
                 ("parentIndex", parent_index(0, 1)),
                 ("type", KiwiValue::Enum("RECTANGLE".into())),
                 ("size", vector(10.0, 10.0)),
-                ("fillPaints", KiwiValue::Array(vec![])),
+                ("fillPaints", KiwiValue::array(vec![])),
                 ("styleIdForFill", style_ref(10, 5)),
             ],
         ),
@@ -319,7 +319,7 @@ fn nonempty_fillpaints_with_style_ref_takes_the_styles_paint() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
                 ("styleIdForFill", style_ref(10, 5)),
             ],
@@ -394,7 +394,7 @@ fn solid_paint_with_a_variable_binding_resolves_to_its_baked_color() {
                 ("type", KiwiValue::Enum("ROUNDED_RECTANGLE".into())),
                 ("name", KiwiValue::String("Color Background".to_owned())),
                 ("size", vector(330.0, 283.0)),
-                ("fillPaints", KiwiValue::Array(vec![bound_solid])),
+                ("fillPaints", KiwiValue::array(vec![bound_solid])),
                 ("styleIdForFill", style_ref(10, 7)),
             ],
         ),
@@ -444,7 +444,7 @@ fn instance_own_surface_fill_overrides_master_root_background() {
                 ("size", vector(100.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -459,7 +459,7 @@ fn instance_own_surface_fill_overrides_master_root_background() {
                 ("size", vector(100.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(
+                    KiwiValue::array(vec![solid_paint(
                         26.0 / 255.0,
                         26.0 / 255.0,
                         26.0 / 255.0,
@@ -524,7 +524,7 @@ fn instance_own_surface_fill_equal_to_master_records_no_override() {
                 ("size", vector(100.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -539,7 +539,7 @@ fn instance_own_surface_fill_equal_to_master_records_no_override() {
                 ("size", vector(100.0, 40.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
                 (
                     "symbolData",
@@ -600,7 +600,7 @@ fn frame_with_only_background_paints_uses_them_as_background() {
                 // No fillPaints; only backgroundPaints (a dark navy).
                 (
                     "backgroundPaints",
-                    KiwiValue::Array(vec![solid_paint(0.1, 0.1, 0.2, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.1, 0.1, 0.2, 1.0)]),
                 ),
             ],
         ),
@@ -630,7 +630,7 @@ fn invisible_node_is_marked_hidden() {
             ("size", vector(10.0, 10.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
             ),
             ("visible", KiwiValue::Bool(false)),
         ],
@@ -654,7 +654,7 @@ fn zero_opacity_node_is_marked_hidden() {
             ("size", vector(10.0, 10.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
             ),
             ("opacity", KiwiValue::Float(0.0)),
         ],
@@ -696,7 +696,7 @@ fn frame_fillpaints_set_group_background_through_full_import() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
                 ),
             ],
         ),
@@ -742,7 +742,7 @@ fn symbol_override_style_ref_resolves_to_dark_fill_on_expand() {
                 ("size", vector(80.0, 24.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -762,11 +762,11 @@ fn symbol_override_style_ref_resolves_to_dark_fill_on_expand() {
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("guidPath", guid_path(0, 2)),
-                                        ("fillPaints", KiwiValue::Array(vec![])),
+                                        ("fillPaints", KiwiValue::array(vec![])),
                                         ("styleIdForFill", style_ref(9, 42)),
                                     ],
                                 )]),
@@ -821,7 +821,7 @@ fn symbol_override_text_style_ref_does_not_synthesize_fill_override() {
                 ("fontSize", KiwiValue::Float(16.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                 ),
             ],
         ),
@@ -843,7 +843,7 @@ fn symbol_override_text_style_ref_does_not_synthesize_fill_override() {
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("guidPath", guid_path(0, 2)),

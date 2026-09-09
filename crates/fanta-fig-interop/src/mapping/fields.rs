@@ -8,6 +8,7 @@ use super::{
     VectorNode, build_stroke, stable_hash_u128,
 };
 use std::borrow::Cow;
+use std::sync::Arc;
 
 /// Resolve a Figma `Number { value, units }` to an absolute pixel amount.
 pub(crate) fn read_number_px(number: Option<&KiwiValue>, font_px: f64) -> Option<f64> {
@@ -374,7 +375,7 @@ pub(crate) fn resolve_style_references(
                 .get_mut("symbolData")
                 .and_then(|sd| sd.get_mut("symbolOverrides"))
                 .and_then(|a| match a {
-                    KiwiValue::Array(v) => v.get_mut(i),
+                    KiwiValue::Array(v) => Arc::make_mut(v).get_mut(i),
                     _ => None,
                 })
             {
@@ -581,7 +582,7 @@ fn resolve_rich_text_run_styles(
                 .get_mut(field)
                 .and_then(|td| td.get_mut("styleOverrideTable"))
                 .and_then(|a| match a {
-                    KiwiValue::Array(v) => v.get_mut(i),
+                    KiwiValue::Array(v) => Arc::make_mut(v).get_mut(i),
                     _ => None,
                 })
             {

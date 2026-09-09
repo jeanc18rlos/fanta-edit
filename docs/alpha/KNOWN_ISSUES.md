@@ -338,11 +338,10 @@ actually driven. Nothing here claims more than that record supports.
   frames versus groups, auto layout, spacing and type scales, naming,
   components, a working method, and when to edit `.fnx` instead. The seeded
   `AGENTS.md` (`crates/fanta-format/src/project/layout.rs`, "The six tools")
-  documents all six. `script/smoke-mcp`'s assertion is still labelled *"tools/list
-  carries the five canvas tools"*; it checks that the five names in
-  `REQUIRED_TOOLS` are present rather than that the list has five entries, so it
-  passes against six — the label is stale, the check is not. No client has
-  listed this tree's tools.
+  documents all six. `script/smoke-mcp`'s assertion *"tools/list carries the
+  six canvas tools"* now requires `get_guidelines` in `REQUIRED_TOOLS` too; it
+  checks that the six names are present rather than that the list has six
+  entries. No client has listed this tree's tools since the sixth was added.
 - **`batch_design` (and the built-in agent's `design_edit`) accept fourteen new
   ops that only unit tests have exercised.** The shared vocabulary is
   `design_surface::DesignOp` (`crates/design_surface/src/design_surface.rs`,

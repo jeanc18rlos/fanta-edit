@@ -642,7 +642,11 @@ mod tests {
         assert_eq!(doc.components.defs.len(), defs_before);
         assert!(!doc.is_component_root(frame));
         assert_eq!(doc.scene.get(frame).unwrap().transform, original);
-        assert_eq!(doc.history.undo_depth(), 1, "only the frame's creation remains");
+        assert_eq!(
+            doc.history.undo_depth(),
+            1,
+            "only the frame's creation remains"
+        );
     }
 
     #[test]
@@ -695,6 +699,7 @@ mod tests {
                 variant_of: None,
                 props: Vec::new(),
                 rev: 0,
+                preview_rev: 0,
             }),
         })
         .unwrap();

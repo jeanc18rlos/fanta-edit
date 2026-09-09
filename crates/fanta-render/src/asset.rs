@@ -187,9 +187,13 @@ struct DecodedCache {
     decoded_bytes: usize,
     /// Encoded bytes already handed out through [`AssetResolver::resolve_bytes`],
     /// so a caller asking every frame (the audio waveform painter) gets a
-    /// refcount bump, not a copy of the whole file. Not budgeted: each entry is
-    /// the one copy of an asset the document already holds.
+    /// refcount bump, not a copy of the whole file. Each entry is a SECOND copy
+    /// of bytes `LazyAssetResolver::encoded` already holds — a 200 MB embedded
+    /// audio asset costs 200 MB here — so it counts against the same budget as
+    /// the decoded pixels and is swept when the cache runs over.
     shared_bytes: HashMap<AssetId, Arc<Vec<u8>>>,
+    /// Bytes held by [`Self::shared_bytes`].
+    shared_bytes_total: usize,
 }
 
 struct CacheEntry {
@@ -208,6 +212,12 @@ impl DecodedCache {
         Some(entry.image.clone())
     }
 
+    /// Everything the cache holds on top of the document's own copy: decoded
+    /// pixels plus the duplicated encoded bytes handed out by `resolve_bytes`.
+    fn held_bytes(&self) -> usize {
+        self.decoded_bytes + self.shared_bytes_total
+    }
+
     fn insert(&mut self, id: AssetId, image: Option<DecodedImage>, budget_bytes: usize) {
         if self.entries.contains_key(&id) {
             return;
@@ -217,15 +227,34 @@ impl DecodedCache {
         self.decoded_bytes += image.as_ref().map_or(0, |image| image.pixels_rgba.len());
         self.entries.insert(id, CacheEntry { image, tick });
         self.recency.insert(tick, id);
-        // The entry just inserted is the most recent and is never evicted
-        // here, even if it alone exceeds the budget: an image the renderer
-        // needs right now that can never be cached would otherwise be
-        // re-decoded on every single frame.
-        while self.decoded_bytes > budget_bytes {
+        self.evict_to(budget_bytes, Some(id));
+    }
+
+    /// Drop cached bytes until the cache is back inside `budget_bytes`,
+    /// keeping `keep` whatever happens.
+    ///
+    /// Shared encoded bytes go first, and only the ones no caller still holds:
+    /// they are a pure duplicate of what the document already owns, so dropping
+    /// one costs a single re-copy on the next `resolve_bytes`, while dropping a
+    /// decoded image costs a full re-decode. `keep` is the entry the caller
+    /// needs right now, never evicted even if it alone exceeds the budget —
+    /// otherwise an oversized image the renderer is drawing would be re-decoded
+    /// on every single frame.
+    fn evict_to(&mut self, budget_bytes: usize, keep: Option<AssetId>) {
+        if self.held_bytes() > budget_bytes {
+            self.shared_bytes.retain(|id, bytes| {
+                let in_use = Arc::strong_count(bytes) > 1 || Some(*id) == keep;
+                if !in_use {
+                    self.shared_bytes_total = self.shared_bytes_total.saturating_sub(bytes.len());
+                }
+                in_use
+            });
+        }
+        while self.held_bytes() > budget_bytes {
             let Some((&oldest_tick, &oldest)) = self.recency.iter().next() else {
                 break;
             };
-            if oldest == id {
+            if Some(oldest) == keep {
                 break;
             }
             self.recency.remove(&oldest_tick);
@@ -278,7 +307,14 @@ impl LazyAssetResolver {
         self.lock().decoded_bytes
     }
 
-    /// The decoded-pixel cap this resolver evicts down to.
+    /// Everything the cache holds on top of the document's own copy of the
+    /// assets: decoded pixels plus the encoded bytes `resolve_bytes` shares.
+    /// This is what [`Self::budget_bytes`] caps.
+    pub fn held_bytes(&self) -> usize {
+        self.lock().held_bytes()
+    }
+
+    /// The cap this resolver evicts down to.
     pub fn budget_bytes(&self) -> usize {
         self.budget_bytes
     }
@@ -327,11 +363,16 @@ impl AssetResolver for LazyAssetResolver {
         // The copy happened outside the lock; a racing caller's copy is
         // equally valid, so whichever landed first is the one kept.
         let mut cache = self.lock();
-        let shared = cache
-            .shared_bytes
-            .entry(id)
-            .or_insert_with(|| Arc::clone(&bytes));
-        Some(Arc::clone(shared))
+        let shared = match cache.shared_bytes.get(&id) {
+            Some(shared) => Arc::clone(shared),
+            None => {
+                cache.shared_bytes_total += bytes.len();
+                cache.shared_bytes.insert(id, Arc::clone(&bytes));
+                bytes
+            }
+        };
+        cache.evict_to(self.budget_bytes, Some(id));
+        Some(shared)
     }
 }
 
@@ -523,5 +564,38 @@ mod tests {
             "a repeat request must not copy the asset again"
         );
         assert!(resolver.resolve_bytes(AssetId::from_u128(99)).is_none());
+    }
+
+    #[test]
+    fn shared_encoded_bytes_are_budgeted_and_released_once_nobody_holds_them() {
+        // `resolve_bytes` hands out a COPY of bytes the document already owns,
+        // so an unbudgeted memo of them doubles a media-heavy document's
+        // resident memory for good. Every visible audio node asks once a frame.
+        let ids: Vec<AssetId> = (1..=4).map(AssetId::from_u128).collect();
+        let assets: Vec<(AssetId, Vec<u8>)> = ids.iter().map(|id| (*id, vec![1u8; 100])).collect();
+        let (resolver, _decodes) = lazy(&assets, 250);
+
+        for id in &ids {
+            // Dropped immediately, as the waveform painter does once it has
+            // read the samples for the frame.
+            assert_eq!(resolver.resolve_bytes(*id).unwrap().len(), 100);
+        }
+        assert!(
+            resolver.held_bytes() <= 250,
+            "shared encoded bytes must be swept back inside the budget, held {}",
+            resolver.held_bytes()
+        );
+
+        // Bytes a caller is still holding are never swept out from under it.
+        let held: Vec<Arc<Vec<u8>>> = ids
+            .iter()
+            .map(|id| resolver.resolve_bytes(*id).expect("asset bytes"))
+            .collect();
+        for (bytes, id) in held.iter().zip(&ids) {
+            assert!(
+                Arc::ptr_eq(bytes, &resolver.resolve_bytes(*id).expect("asset bytes")),
+                "a live handout must stay the one shared allocation"
+            );
+        }
     }
 }

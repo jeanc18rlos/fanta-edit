@@ -73,7 +73,7 @@ pub(super) fn figma_like_doc() -> FigDocument {
         type_name: "Message".into(),
         fields: [(
             "nodeChanges".to_owned(),
-            KiwiValue::Array(vec![
+            KiwiValue::array(vec![
                 node(0, 0, "DOCUMENT", "Document"),
                 node(0, 1, "CANVAS", "Page 1"),
                 node(0, 2, "FRAME", "Frame 1"),
@@ -138,9 +138,9 @@ fn blob_byte_arrays_decode_compactly_and_flatten_into_the_blob_table() {
         type_name: "Message".into(),
         fields: [(
             "blobs",
-            KiwiValue::Array(vec![
+            KiwiValue::array(vec![
                 blob(KiwiValue::Bytes(vec![1, 2, 3])),
-                blob(KiwiValue::Array(vec![KiwiValue::Byte(9)])),
+                blob(KiwiValue::array(vec![KiwiValue::Byte(9)])),
             ]),
         )]
         .into_iter()

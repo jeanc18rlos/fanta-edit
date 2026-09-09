@@ -97,7 +97,6 @@ fn wrap_operations(doc: &Doc, ids: &[NodeId], name: &str, clip: bool) -> Result<
         .find(|id| !member_set.contains(id))
         .and_then(|id| doc.scene.get(*id))
         .map(|node| node.index);
-    let group_index = slot_between(below, above);
 
     let size = [union.width(), union.height()];
     let mut group = CanvasNode::new(NodeData::Group(GroupNode {
@@ -106,11 +105,32 @@ fn wrap_operations(doc: &Doc, ids: &[NodeId], name: &str, clip: bool) -> Result<
     }));
     group.name = name.to_owned();
     group.parent = parent;
-    group.index = group_index;
     group.transform = group_local;
     let group_id = group.id;
 
-    let mut operations = vec![Operation::create_node(group)];
+    let mut operations = Vec::new();
+    match slot_between(below, above) {
+        Some(index) => group.index = index,
+        None => {
+            let mut order = Vec::with_capacity(siblings.len() + 1);
+            for sibling in siblings {
+                if *sibling == topmost {
+                    order.push(Slot::Incoming);
+                }
+                if !member_set.contains(sibling) {
+                    order.push(Slot::Existing(*sibling));
+                }
+            }
+            let renumbered = renumber(doc, &order)?;
+            group.index = renumbered
+                .incoming
+                .into_iter()
+                .next()
+                .context("the group has no slot among its siblings")?;
+            operations.extend(renumbered.operations);
+        }
+    }
+    operations.push(Operation::create_node(group));
     let group_world_inverse = group_world.inverse();
     for (position, member) in members.iter().enumerate() {
         let node = doc.scene.get(*member).context("a selected layer is gone")?;
@@ -143,6 +163,35 @@ fn wrap_operations(doc: &Doc, ids: &[NodeId], name: &str, clip: bool) -> Result<
     })
 }
 
+/// Dissolve every group in `groups` as ONE transaction's worth of operations.
+///
+/// Each group is planned against a scratch document that already carries the
+/// earlier groups' edits, because [`ungroup_operations`] is not isolated to the
+/// group it dissolves: when the wrapper's key gap is too narrow it renumbers
+/// the whole parent, rewriting every staying sibling's key. Two sibling groups
+/// planned from the same pre-edit document would then disagree about that
+/// parent's z-order — colliding keys that reshuffle a bystander layer, or a
+/// `SetIndex` naming a wrapper the first plan already deleted, which fails and
+/// aborts the whole transaction. Ungroup is not a hot path, so one clone per
+/// invocation is fine.
+pub(crate) fn ungroup_many_operations(
+    doc: &Doc,
+    groups: &[NodeId],
+) -> Result<(Vec<Operation>, Vec<NodeId>)> {
+    let mut operations = Vec::new();
+    let mut children = Vec::new();
+    let mut scratch = doc.clone();
+    for group in groups {
+        let ungrouped = ungroup_operations(&scratch, *group)?;
+        for operation in &ungrouped.operations {
+            scratch.apply(operation.clone())?;
+        }
+        operations.extend(ungrouped.operations);
+        children.extend(ungrouped.children);
+    }
+    Ok((operations, children))
+}
+
 /// Dissolve one group or frame: its children move to the group's parent in
 /// the group's slot with their world transforms kept, then the empty wrapper
 /// is deleted.
@@ -167,7 +216,9 @@ pub(crate) fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> 
 
     // Children land strictly between the group and its next sibling so their
     // keys cannot collide with the group's own while it still exists; once
-    // the wrapper is deleted they occupy exactly its slot.
+    // the wrapper is deleted they occupy exactly its slot. When that gap is
+    // too narrow to hold them, the parent is renumbered with the wrapper's
+    // slot widened to one key per child instead.
     let siblings = doc.scene.children_of(parent);
     let above = siblings
         .iter()
@@ -175,9 +226,24 @@ pub(crate) fn ungroup_operations(doc: &Doc, group: NodeId) -> Result<Ungrouped> 
         .nth(1)
         .and_then(|id| doc.scene.get(*id))
         .map(|node| node.index);
-    let keys = keys_between(node.index, above, children.len());
-
     let mut operations = Vec::new();
+    let keys = match keys_between(node.index, above, children.len()) {
+        Some(keys) => keys,
+        None => {
+            let mut order = Vec::with_capacity(siblings.len() + children.len());
+            for sibling in siblings {
+                if *sibling == group {
+                    order.extend(std::iter::repeat_n(Slot::Incoming, children.len()));
+                } else {
+                    order.push(Slot::Existing(*sibling));
+                }
+            }
+            let renumbered = renumber(doc, &order)?;
+            operations.extend(renumbered.operations);
+            renumbered.incoming
+        }
+    };
+
     for (child, new_index) in children.iter().zip(keys) {
         let child_node = doc.scene.get(*child).context("a child layer is gone")?;
         let world = doc
@@ -341,25 +407,87 @@ fn parent_world_transform(doc: &Doc, parent: Option<NodeId>) -> Result<Transform
     Ok(world)
 }
 
-fn slot_between(below: Option<IndexKey>, above: Option<IndexKey>) -> IndexKey {
+/// A key between two neighbouring siblings' keys; `None` when the gap is too
+/// narrow for f64 to hold another key (or the keys are equal), in which case
+/// the caller renumbers the parent with [`renumber`].
+fn slot_between(below: Option<IndexKey>, above: Option<IndexKey>) -> Option<IndexKey> {
     match (below, above) {
-        (Some(below), Some(above)) => IndexKey::between(below, above),
-        (Some(below), None) => IndexKey::after(below),
-        (None, Some(above)) => IndexKey::before(above),
-        (None, None) => IndexKey::FIRST,
+        (Some(below), Some(above)) => (below < above
+            && !IndexKey::near_precision_limit(below, above))
+        .then(|| IndexKey::between(below, above)),
+        (Some(below), None) => Some(IndexKey::after(below)),
+        (None, Some(above)) => Some(IndexKey::before(above)),
+        (None, None) => Some(IndexKey::FIRST),
     }
 }
 
 /// `count` ascending keys strictly greater than `lower` and, when present,
-/// strictly less than `upper`.
-fn keys_between(lower: IndexKey, upper: Option<IndexKey>, count: usize) -> Vec<IndexKey> {
+/// strictly less than `upper`; `None` when the gap is too narrow for f64 to
+/// hold that many distinct keys.
+fn keys_between(lower: IndexKey, upper: Option<IndexKey>, count: usize) -> Option<Vec<IndexKey>> {
     let step = match upper {
-        Some(upper) => (upper.raw() - lower.raw()) / (count as f64 + 1.0),
+        Some(upper) => {
+            if upper <= lower || IndexKey::near_precision_limit(lower, upper) {
+                return None;
+            }
+            (upper.raw() - lower.raw()) / (count as f64 + 1.0)
+        }
         None => 1.0,
     };
-    (1..=count)
+    let keys: Vec<IndexKey> = (1..=count)
         .map(|position| IndexKey::from_raw(lower.raw() + step * position as f64))
-        .collect()
+        .collect();
+    let mut previous = lower;
+    for key in &keys {
+        if *key <= previous || upper.is_some_and(|upper| *key >= upper) {
+            return None;
+        }
+        previous = *key;
+    }
+    Some(keys)
+}
+
+/// One entry of a parent's z-order after a structural edit: a sibling that
+/// stays, or a node the edit brings in.
+#[derive(Clone, Copy)]
+enum Slot {
+    Existing(NodeId),
+    Incoming,
+}
+
+struct Renumbered {
+    /// `SetIndex` for every staying sibling whose key changes.
+    operations: Vec<Operation>,
+    /// The key each [`Slot::Incoming`] takes, in order.
+    incoming: Vec<IndexKey>,
+}
+
+/// Normalize a parent's z-order to `1.0, 2.0, …` along `order` — the fallback
+/// when the gap a new key must land in is too narrow for f64, mirroring the
+/// layer panel's drop handling so both paths leave the same keys behind.
+fn renumber(doc: &Doc, order: &[Slot]) -> Result<Renumbered> {
+    let mut operations = Vec::new();
+    let mut incoming = Vec::new();
+    for (position, slot) in order.iter().enumerate() {
+        let key = IndexKey::from_raw(position as f64 + 1.0);
+        match slot {
+            Slot::Incoming => incoming.push(key),
+            Slot::Existing(id) => {
+                let node = doc.scene.get(*id).context("a sibling layer is gone")?;
+                if node.index != key {
+                    operations.push(Operation::SetIndex {
+                        id: *id,
+                        old: node.index,
+                        new: key,
+                    });
+                }
+            }
+        }
+    }
+    Ok(Renumbered {
+        operations,
+        incoming,
+    })
 }
 
 #[cfg(test)]
@@ -385,6 +513,31 @@ mod tests {
         doc.apply(Operation::create_node(node)).unwrap();
         doc.history = Default::default();
         id
+    }
+
+    fn insert_with_index(doc: &mut Doc, mut node: CanvasNode, index: IndexKey) -> NodeId {
+        node.index = index;
+        let id = node.id;
+        doc.apply(Operation::create_node(node)).unwrap();
+        doc.history = Default::default();
+        id
+    }
+
+    fn assert_strictly_increasing_keys(doc: &Doc, parent: Option<NodeId>) {
+        let keys: Vec<IndexKey> = doc
+            .scene
+            .children_of(parent)
+            .iter()
+            .map(|id| doc.scene.get(*id).unwrap().index)
+            .collect();
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "z-order keys {:?} and {:?} are not strictly increasing",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     fn rect(parent: NodeId, x: f64, y: f64, width: f64, height: f64) -> CanvasNode {
@@ -653,6 +806,208 @@ mod tests {
             doc.scene.get(child).unwrap().transform,
             Transform2D::translation(11.0, 11.0),
         );
+    }
+
+    /// Repeated inserts into the same gap exhaust f64 precision; grouping
+    /// there must renumber the parent rather than mint a colliding key (or
+    /// trip `IndexKey::between`'s ordering assertion).
+    #[test]
+    fn grouping_into_an_exhausted_gap_renumbers_the_siblings() {
+        let (mut doc, page) = page_doc();
+        let below = insert_with_index(
+            &mut doc,
+            rect(page, 0.0, 0.0, 10.0, 10.0),
+            IndexKey::from_raw(1.0),
+        );
+        let member = insert_with_index(
+            &mut doc,
+            rect(page, 20.0, 0.0, 10.0, 10.0),
+            IndexKey::from_raw(1.0 + f64::EPSILON),
+        );
+        let above_key = IndexKey::from_raw(1.0 + 2.0 * f64::EPSILON);
+        let above = insert_with_index(&mut doc, rect(page, 40.0, 0.0, 10.0, 10.0), above_key);
+        assert_eq!(doc.scene.children_of(Some(page)), &[below, member, above]);
+        let member_before = world_bounds(&doc, member);
+
+        let grouped = group_operations(&doc, &[member], None).unwrap();
+        assert!(apply_transaction(&mut doc, "Group", grouped.operations).unwrap());
+
+        assert_eq!(
+            doc.scene.children_of(Some(page)),
+            &[below, grouped.group, above]
+        );
+        assert_strictly_increasing_keys(&doc, Some(page));
+        assert_eq!(doc.scene.children_of(Some(grouped.group)), &[member]);
+        assert_bounds_close(world_bounds(&doc, member), member_before);
+
+        assert_eq!(doc.history.undo_depth(), 1);
+        assert!(doc.undo().unwrap());
+        assert_eq!(doc.scene.children_of(Some(page)), &[below, member, above]);
+        assert_eq!(doc.scene.get(above).unwrap().index, above_key);
+    }
+
+    #[test]
+    fn grouping_between_equal_keys_renumbers_instead_of_colliding() {
+        let (mut doc, page) = page_doc();
+        for position in 0..3 {
+            insert_with_index(
+                &mut doc,
+                rect(page, position as f64 * 20.0, 0.0, 10.0, 10.0),
+                IndexKey::FIRST,
+            );
+        }
+        let order_before = doc.scene.children_of(Some(page)).to_vec();
+        let member = order_before[1];
+
+        let grouped = group_operations(&doc, &[member], None).unwrap();
+        assert!(apply_transaction(&mut doc, "Group", grouped.operations).unwrap());
+
+        assert_eq!(
+            doc.scene.children_of(Some(page)),
+            &[order_before[0], grouped.group, order_before[2]]
+        );
+        assert_strictly_increasing_keys(&doc, Some(page));
+    }
+
+    #[test]
+    fn ungrouping_into_an_exhausted_gap_renumbers_the_siblings() {
+        let (mut doc, page) = page_doc();
+        let below = insert_with_index(
+            &mut doc,
+            rect(page, 0.0, 0.0, 10.0, 10.0),
+            IndexKey::from_raw(1.0),
+        );
+        let group_id = insert_with_index(
+            &mut doc,
+            frame(page, Transform2D::translation(10.0, 10.0), [50.0, 50.0]),
+            IndexKey::from_raw(2.0),
+        );
+        let above_key = IndexKey::from_raw(2.0 + 2.0 * f64::EPSILON);
+        let above = insert_with_index(&mut doc, rect(page, 300.0, 0.0, 10.0, 10.0), above_key);
+        let children: Vec<NodeId> = (0..3)
+            .map(|position| {
+                insert(
+                    &mut doc,
+                    rect(group_id, position as f64 * 5.0, 0.0, 4.0, 4.0),
+                )
+            })
+            .collect();
+        let worlds_before: Vec<Transform2D> = children
+            .iter()
+            .map(|child| doc.scene.world_transform(*child).unwrap())
+            .collect();
+
+        let ungrouped = ungroup_operations(&doc, group_id).unwrap();
+        assert!(apply_transaction(&mut doc, "Ungroup", ungrouped.operations).unwrap());
+
+        let mut expected = vec![below];
+        expected.extend(children.iter().copied());
+        expected.push(above);
+        assert_eq!(doc.scene.children_of(Some(page)), expected.as_slice());
+        assert_strictly_increasing_keys(&doc, Some(page));
+        for (child, before) in children.iter().zip(worlds_before) {
+            assert_transform_close(doc.scene.world_transform(*child).unwrap(), before);
+        }
+
+        assert_eq!(doc.history.undo_depth(), 1);
+        assert!(doc.undo().unwrap());
+        assert_eq!(doc.scene.children_of(Some(page)), &[below, group_id, above]);
+        assert_eq!(doc.scene.children_of(Some(group_id)), children.as_slice());
+        assert_eq!(doc.scene.get(above).unwrap().index, above_key);
+    }
+
+    /// A gap can clear `near_precision_limit` and still be too narrow for
+    /// one distinct key per child; the sequence check has to catch that too.
+    #[test]
+    fn ungrouping_many_children_into_a_narrow_gap_keeps_keys_distinct() {
+        let (mut doc, page) = page_doc();
+        let group_id = insert_with_index(
+            &mut doc,
+            frame(page, Transform2D::IDENTITY, [500.0, 50.0]),
+            IndexKey::from_raw(1.0),
+        );
+        let above = insert_with_index(
+            &mut doc,
+            rect(page, 600.0, 0.0, 10.0, 10.0),
+            IndexKey::from_raw(1.0 + 24.0 * f64::EPSILON),
+        );
+        let children: Vec<NodeId> = (0..40)
+            .map(|position| {
+                insert(
+                    &mut doc,
+                    rect(group_id, position as f64 * 10.0, 0.0, 8.0, 8.0),
+                )
+            })
+            .collect();
+
+        let ungrouped = ungroup_operations(&doc, group_id).unwrap();
+        assert!(apply_transaction(&mut doc, "Ungroup", ungrouped.operations).unwrap());
+
+        let mut expected = children;
+        expected.push(above);
+        assert_eq!(doc.scene.children_of(Some(page)), expected.as_slice());
+        assert_strictly_increasing_keys(&doc, Some(page));
+    }
+
+    /// Two sibling groups ungrouped in one command, both in gaps narrow enough
+    /// to trigger the renumber fallback. Planning the second against the
+    /// pre-edit document made the two plans disagree about the parent's
+    /// z-order: colliding keys that dragged the bystander layer into the middle
+    /// of the stack, or a `SetIndex` on a wrapper the first plan had already
+    /// deleted, which fails and aborts the whole transaction.
+    #[test]
+    fn ungrouping_two_siblings_at_once_keeps_the_z_order_consistent() {
+        let (mut doc, page) = page_doc();
+        let below = insert_with_index(
+            &mut doc,
+            rect(page, 0.0, 0.0, 10.0, 10.0),
+            IndexKey::from_raw(0.5),
+        );
+        let first = insert_with_index(
+            &mut doc,
+            frame(page, Transform2D::translation(10.0, 10.0), [50.0, 50.0]),
+            IndexKey::from_raw(1.0),
+        );
+        let second = insert_with_index(
+            &mut doc,
+            frame(page, Transform2D::translation(80.0, 10.0), [50.0, 50.0]),
+            IndexKey::from_raw(1.0 + 2.0 * f64::EPSILON),
+        );
+        let bystander = insert_with_index(
+            &mut doc,
+            rect(page, 300.0, 0.0, 10.0, 10.0),
+            IndexKey::from_raw(1.0 + 4.0 * f64::EPSILON),
+        );
+        let first_children: Vec<NodeId> = (0..3)
+            .map(|position| insert(&mut doc, rect(first, position as f64 * 5.0, 0.0, 4.0, 4.0)))
+            .collect();
+        let second_children: Vec<NodeId> = vec![insert(&mut doc, rect(second, 0.0, 0.0, 4.0, 4.0))];
+        let worlds_before: Vec<(NodeId, Transform2D)> = first_children
+            .iter()
+            .chain(second_children.iter())
+            .map(|child| (*child, doc.scene.world_transform(*child).unwrap()))
+            .collect();
+
+        let (operations, children) =
+            ungroup_many_operations(&doc, &[first, second]).expect("planning both ungroups");
+        assert!(apply_transaction(&mut doc, "Ungroup", operations).unwrap());
+        assert_eq!(children.len(), first_children.len() + second_children.len());
+
+        let mut expected = vec![below];
+        expected.extend(first_children.iter().copied());
+        expected.extend(second_children.iter().copied());
+        expected.push(bystander);
+        assert_eq!(
+            doc.scene.children_of(Some(page)),
+            expected.as_slice(),
+            "both groups' children keep their place and the bystander stays on top"
+        );
+        assert_strictly_increasing_keys(&doc, Some(page));
+        for (child, before) in worlds_before {
+            assert_transform_close(doc.scene.world_transform(child).unwrap(), before);
+        }
+        assert!(!doc.scene.contains(first));
+        assert!(!doc.scene.contains(second));
     }
 
     #[test]

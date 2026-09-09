@@ -58,7 +58,7 @@ fn action_button_variant_master_doc() -> FigDocument {
                 ("isStateGroup", KiwiValue::Bool(true)),
                 (
                     "componentPropDefs",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         prop_def(hold_parent, "Hold Icon ?", "BOOL", var_value_bool(true)),
                         prop_def(label_parent, "Label ?", "BOOL", var_value_bool(true)),
                         prop_def(icon_parent, "Icon ?", "BOOL", var_value_bool(true)),
@@ -83,7 +83,7 @@ fn action_button_variant_master_doc() -> FigDocument {
                 ("size", vector(88.0, 32.0)),
                 (
                     "componentPropDefs",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         thin_prop_def(guid(8, 1), guid(7, 0)),
                         thin_prop_def(guid(8, 2), guid(7, 100)),
                         thin_prop_def(guid(8, 3), guid(7, 200)),
@@ -103,7 +103,7 @@ fn action_button_variant_master_doc() -> FigDocument {
                 ("visible", KiwiValue::Bool(true)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![prop_ref(hold_member, "VISIBLE")]),
+                    KiwiValue::array(vec![prop_ref(hold_member, "VISIBLE")]),
                 ),
             ],
         ),
@@ -121,7 +121,7 @@ fn action_button_variant_master_doc() -> FigDocument {
                 ("visible", KiwiValue::Bool(true)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![prop_ref(label_member, "VISIBLE")]),
+                    KiwiValue::array(vec![prop_ref(label_member, "VISIBLE")]),
                 ),
             ],
         ),
@@ -137,7 +137,7 @@ fn action_button_variant_master_doc() -> FigDocument {
                 ("visible", KiwiValue::Bool(true)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![prop_ref(icon_member, "VISIBLE")]),
+                    KiwiValue::array(vec![prop_ref(icon_member, "VISIBLE")]),
                 ),
             ],
         ),
@@ -211,7 +211,7 @@ fn plain_non_variant_master_placeholders_are_untouched() {
                 ("size", vector(88.0, 32.0)),
                 (
                     "componentPropDefs",
-                    KiwiValue::Array(vec![prop_def(
+                    KiwiValue::array(vec![prop_def(
                         guid(7, 0),
                         "Hold Icon ?",
                         "BOOL",
@@ -231,7 +231,7 @@ fn plain_non_variant_master_placeholders_are_untouched() {
                 ("visible", KiwiValue::Bool(true)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![prop_ref(guid(7, 0), "VISIBLE")]),
+                    KiwiValue::array(vec![prop_ref(guid(7, 0), "VISIBLE")]),
                 ),
             ],
         ),

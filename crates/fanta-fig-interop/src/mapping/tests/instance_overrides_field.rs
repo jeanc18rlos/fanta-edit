@@ -24,7 +24,7 @@ fn rect_master_instance(
         ("size", vector(100.0, 40.0)),
         (
             "fillPaints",
-            KiwiValue::Array(vec![solid_paint(0.5, 0.5, 0.5, 1.0)]),
+            KiwiValue::array(vec![solid_paint(0.5, 0.5, 0.5, 1.0)]),
         ),
     ];
     child_fields.extend(master_child_extra);
@@ -56,7 +56,7 @@ fn rect_master_instance(
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o("NodeChange", ov_fields)]),
+                                KiwiValue::array(vec![o("NodeChange", ov_fields)]),
                             ),
                         ],
                     ),
@@ -136,7 +136,7 @@ fn ov2_effects_override_applies() {
     );
     let fig = rect_master_instance(
         vec![],
-        vec![("effects", KiwiValue::Array(vec![shadow, blur]))],
+        vec![("effects", KiwiValue::array(vec![shadow, blur]))],
     );
     let (doc, report, _) = fig_to_doc(&fig).unwrap();
     assert!(report.override_fields_applied >= 2, "effects + blurs keys");
@@ -229,7 +229,7 @@ fn text_master_instance(override_fields: Vec<(&str, KiwiValue)>) -> FigDocument 
                             ("symbolID", guid(0, 1)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o("NodeChange", ov_fields)]),
+                                KiwiValue::array(vec![o("NodeChange", ov_fields)]),
                             ),
                         ],
                     ),
@@ -299,7 +299,7 @@ fn ov7_style_runs_apply() {
             ("characters", KiwiValue::String("Go bold".to_owned())),
             (
                 "characterStyleIDs",
-                KiwiValue::Array(vec![
+                KiwiValue::array(vec![
                     KiwiValue::Uint(1),
                     KiwiValue::Uint(1),
                     KiwiValue::Uint(0),
@@ -309,7 +309,7 @@ fn ov7_style_runs_apply() {
                     KiwiValue::Uint(0),
                 ]),
             ),
-            ("styleOverrideTable", KiwiValue::Array(vec![run_style])),
+            ("styleOverrideTable", KiwiValue::array(vec![run_style])),
         ],
     );
     let fig = text_master_instance(vec![("textData", override_text)]);

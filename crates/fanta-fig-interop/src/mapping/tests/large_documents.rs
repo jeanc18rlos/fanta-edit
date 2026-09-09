@@ -107,7 +107,7 @@ fn many_masters_with_overriding_instances(masters: u32, children_per_master: u32
                             ("symbolID", guid(0, master_guid)),
                             (
                                 "symbolOverrides",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         (
@@ -182,5 +182,203 @@ fn thousands_of_masters_with_overriding_instances_import_within_budget() {
     assert!(
         elapsed < Duration::from_secs(5),
         "many-masters import took {elapsed:?}"
+    );
+}
+
+/// A CANVAS with `count` RECTANGLE children whose positions are a fixed
+/// permutation of stream order (neither ascending nor reversed), so the
+/// position sort has real work to do and no accidental run helps it.
+fn canvas_with_shuffled_children(count: u32) -> FigDocument {
+    // `count` and the stride are coprime, so `i * stride mod count` visits
+    // every slot exactly once.
+    const STRIDE: u64 = 7_919;
+    let mut changes = document_and_canvas();
+    for i in 0..count {
+        let slot = (u64::from(i) * STRIDE) % u64::from(count);
+        let position = format!("{slot:08}");
+        changes.push(o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 10 + i)),
+                ("parentIndex", parent_index_pos(0, CANVAS_GUID, &position)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("name", KiwiValue::String(position)),
+                ("size", vector(10.0, 10.0)),
+            ],
+        ));
+    }
+    doc_from(changes)
+}
+
+/// `frames` FRAMEs on the page, each with `children_per_frame` RECTANGLEs in
+/// reverse position order. Every odd frame's children are emitted in the
+/// stream BEFORE the frame itself, so the batch insert sees parents that
+/// follow their children as well as ones that precede them.
+fn canvas_with_frames(frames: u32, children_per_frame: u32) -> FigDocument {
+    let mut changes = document_and_canvas();
+    for frame in 0..frames {
+        let frame_guid = 1_000_000 + frame;
+        let frame_change = o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, frame_guid)),
+                (
+                    "parentIndex",
+                    parent_index_pos(0, CANVAS_GUID, &format!("{frame:08}")),
+                ),
+                ("type", KiwiValue::Enum("FRAME".into())),
+                ("name", KiwiValue::String(format!("Frame {frame}"))),
+                ("size", vector(100.0, 100.0)),
+            ],
+        );
+        let children_first = frame % 2 == 1;
+        if !children_first {
+            changes.push(frame_change.clone());
+        }
+        for child in 0..children_per_frame {
+            let position = format!("{:08}", children_per_frame - 1 - child);
+            changes.push(o(
+                "NodeChange",
+                vec![
+                    (
+                        "guid",
+                        guid(0, 2_000_000 + frame * children_per_frame + child),
+                    ),
+                    ("parentIndex", parent_index_pos(0, frame_guid, &position)),
+                    ("type", KiwiValue::Enum("RECTANGLE".into())),
+                    ("name", KiwiValue::String(position)),
+                    ("size", vector(10.0, 10.0)),
+                ],
+            ));
+        }
+        if children_first {
+            changes.push(frame_change);
+        }
+    }
+    doc_from(changes)
+}
+
+/// The whole page goes into the scene as one batch, so the scene revision
+/// after import is a handful of edits however many nodes there are. A
+/// per-node insert or reparent would put it in the tens of thousands.
+const IMPORT_REVISION_CEILING: u64 = 64;
+
+#[test]
+fn fifty_thousand_shuffled_siblings_import_as_one_batch_within_budget() {
+    let fig = canvas_with_shuffled_children(50_000);
+    let (doc, report, elapsed) = timed_import(&fig);
+    assert_eq!(report.mapped, 50_001, "page + every rectangle");
+    let names = child_names(&doc);
+    assert_eq!(names.len(), 50_000);
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        names, sorted,
+        "children attach bottom→top in ascending position order"
+    );
+    doc.scene.validate().unwrap();
+    assert!(
+        doc.scene.revision() < IMPORT_REVISION_CEILING,
+        "import made {} scene edits for 50k nodes — a per-node mutation is back",
+        doc.scene.revision()
+    );
+    eprintln!("50k shuffled siblings imported in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "50k-sibling import took {elapsed:?}"
+    );
+}
+
+#[test]
+fn frames_whose_children_precede_them_attach_in_one_batch_within_budget() {
+    let fig = canvas_with_frames(400, 50);
+    let (doc, report, elapsed) = timed_import(&fig);
+    assert_eq!(report.mapped, 1 + 400 + 400 * 50);
+    let canvas = doc.scene.roots()[0];
+    let frames = doc.scene.children_of(Some(canvas));
+    assert_eq!(frames.len(), 400);
+    for (position, frame) in frames.iter().enumerate() {
+        let frame_node = doc.scene.get(*frame).unwrap();
+        assert_eq!(frame_node.name, format!("Frame {position}"));
+        let children: Vec<&str> = doc
+            .scene
+            .children_of(Some(*frame))
+            .iter()
+            .map(|id| doc.scene.get(*id).unwrap().name.as_str())
+            .collect();
+        assert_eq!(children.len(), 50);
+        let mut sorted = children.clone();
+        sorted.sort_unstable();
+        assert_eq!(children, sorted, "frame {position} children out of order");
+    }
+    doc.scene.validate().unwrap();
+    assert!(
+        doc.scene.revision() < IMPORT_REVISION_CEILING,
+        "import made {} scene edits",
+        doc.scene.revision()
+    );
+    eprintln!("400 frames × 50 children imported in {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "frames import took {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_built_node_whose_guid_a_later_change_reclaims_still_reaches_the_scene() {
+    // Pass 1 keys `guid_to_node` by guid, and a later change sharing a guid
+    // overwrites the entry with `None` (structural, unsupported, or motion).
+    // The node it built is then invisible to pass 2's attach loop, so it is in
+    // neither the planned nor the dropped set — the batch must still carry it
+    // rather than dropping content silently.
+    let mut changes = document_and_canvas();
+    changes.push(o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 10)),
+            ("parentIndex", parent_index_pos(0, CANVAS_GUID, "00")),
+            ("type", KiwiValue::Enum("RECTANGLE".into())),
+            ("name", KiwiValue::String("Reclaimed".to_owned())),
+            ("size", vector(10.0, 10.0)),
+        ],
+    ));
+    // Same guid, a type the mapper does not build a node for.
+    changes.push(o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 10)),
+            ("parentIndex", parent_index_pos(0, CANVAS_GUID, "01")),
+            ("type", KiwiValue::Enum("STICKY".into())),
+        ],
+    ));
+    // A sibling that keeps its guid, so the page still has ordinary content.
+    changes.push(o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 11)),
+            ("parentIndex", parent_index_pos(0, CANVAS_GUID, "02")),
+            ("type", KiwiValue::Enum("RECTANGLE".into())),
+            ("name", KiwiValue::String("Kept".to_owned())),
+            ("size", vector(10.0, 10.0)),
+        ],
+    ));
+
+    let (doc, _, _) = fig_to_doc(&doc_from(changes)).expect("import");
+    let mut names: Vec<String> = Vec::new();
+    for root in doc.scene.roots().to_vec() {
+        for id in doc.scene.descendants_of(root) {
+            if let Some(node) = doc.scene.get(id) {
+                names.push(node.name.clone());
+            }
+        }
+    }
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    assert!(
+        names.contains(&"Kept"),
+        "the ordinary sibling must import, got {names:?}"
+    );
+    assert!(
+        names.contains(&"Reclaimed"),
+        "a node whose guid a later change reclaimed must not vanish, got {names:?}"
     );
 }

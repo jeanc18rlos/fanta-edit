@@ -5,6 +5,7 @@
 //! failure), so agent work is undoable like any canvas gesture.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -27,7 +28,9 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use crate::clipboard::{create_operations, duplicate_operations};
-use crate::document::{AssetStores, DocChange, FigDocument, FigItem, FigPage, page_bounds};
+use crate::document::{
+    AssetStores, DocChange, FigDocument, FigItem, FigPage, MAX_IMAGE_SOURCE_BYTES, page_bounds,
+};
 use crate::export::render_inputs;
 use crate::properties_ops::{
     DEFAULT_FILL_COLOR, create_component_operations, default_shadow, effects_operations,
@@ -506,10 +509,15 @@ fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: boo
     Value::Object(object)
 }
 
+/// Characters of a text node's content a compact listing carries; longer
+/// content is cut there and reported with its full `text_length`, so a page
+/// listing stays bounded per node (fetch the node by id for the whole text).
+const SUMMARY_TEXT_CHARS: usize = 120;
+
 /// Kind-specific facts a model needs to reason about a node without fetching
-/// it in full: a frame's size and layout mode, a text's font and content, a
-/// shape's fill, an instance's component. Only present facts are emitted so
-/// large page listings stay compact.
+/// it in full: a frame's size and layout mode, a text's font and (truncated)
+/// content, a shape's fill, an instance's component. Only present facts are
+/// emitted so large page listings stay compact.
 fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<String, Value>) {
     match &node.data {
         NodeData::Group(group) => {
@@ -528,7 +536,19 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
             }
         }
         NodeData::Text(text) => {
-            object.insert("text".into(), json!(text.content));
+            let text_length = text.content.chars().count();
+            if text_length > SUMMARY_TEXT_CHARS {
+                let preview: String = text
+                    .content
+                    .chars()
+                    .take(SUMMARY_TEXT_CHARS)
+                    .chain(std::iter::once('…'))
+                    .collect();
+                object.insert("text".into(), json!(preview));
+                object.insert("text_length".into(), json!(text_length));
+            } else {
+                object.insert("text".into(), json!(text.content));
+            }
             object.insert(
                 "font".into(),
                 json!({
@@ -681,7 +701,9 @@ impl Applied {
 /// Apply the batch inside one history transaction: all content ops commit as
 /// a single undo step, and any failure rolls the content back (selection and
 /// viewport changes are not transactional). Image assets ingested by
-/// `create_image` ops are removed again when the batch rolls back.
+/// `create_image` ops are removed again when the batch rolls back, and nodes
+/// the batch removed leave the selection only once it has committed, so a
+/// rolled-back batch leaves the selection exactly as it found it.
 fn apply_batch(
     doc: &mut Doc,
     assets: &mut AssetStores<'_>,
@@ -691,13 +713,14 @@ fn apply_batch(
     let mut created: Vec<String> = Vec::new();
     let mut statuses: Vec<Value> = Vec::new();
     let mut ingested_assets: Vec<AssetId> = Vec::new();
+    let mut removed_nodes: HashSet<NodeId> = HashSet::new();
     let mut content_changed = false;
     let mut selection_changed = false;
     let mut failure: Option<(usize, String)> = None;
 
     doc.history.begin(label, &mut doc.scene);
     for (index, op) in ops.iter().enumerate() {
-        match apply_one(doc, assets, &mut ingested_assets, op) {
+        match apply_one(doc, assets, &mut ingested_assets, &mut removed_nodes, op) {
             Ok(Applied::Content {
                 created: id,
                 detail,
@@ -732,6 +755,19 @@ fn apply_batch(
     match failure {
         None => {
             doc.history.commit(&mut doc.scene);
+            if doc
+                .selection
+                .iter()
+                .any(|selected| removed_nodes.contains(selected))
+            {
+                let surviving: Vec<NodeId> = doc
+                    .selection
+                    .iter()
+                    .copied()
+                    .filter(|selected| !removed_nodes.contains(selected))
+                    .collect();
+                doc.selection.replace_with(surviving);
+            }
             BatchOutcome {
                 value: json!({ "applied": true, "created": created, "ops": statuses }),
                 change: if content_changed {
@@ -770,10 +806,14 @@ fn apply_batch(
     }
 }
 
+/// Apply one op. Assets it ingests go into `ingested_assets` and nodes it
+/// removes from the scene into `removed_nodes`, both for [`apply_batch`] to
+/// settle once the whole batch has committed or rolled back.
 fn apply_one(
     doc: &mut Doc,
     assets: &mut AssetStores<'_>,
     ingested_assets: &mut Vec<AssetId>,
+    removed_nodes: &mut HashSet<NodeId>,
     op: &DesignOp,
 ) -> Result<Applied> {
     match op {
@@ -1277,9 +1317,9 @@ fn apply_one(
                 bail!("font_size must be positive");
             }
             if let Some(weight) = font_weight
-                && !(100..=1000).contains(weight)
+                && !(100..=900).contains(weight)
             {
-                bail!("font_weight must be between 100 and 1000");
+                bail!("font_weight must be between 100 and 900");
             }
             if let Some(line_height) = line_height
                 && !(line_height.is_finite() && *line_height > 0.0)
@@ -1522,13 +1562,7 @@ fn apply_one(
             for operation in ungrouped.operations {
                 doc.apply(operation)?;
             }
-            let surviving: Vec<NodeId> = doc
-                .selection
-                .iter()
-                .copied()
-                .filter(|selected| *selected != id)
-                .collect();
-            doc.selection.replace_with(surviving);
+            removed_nodes.insert(id);
             Ok(Applied::Content {
                 created: None,
                 detail: Some(json!({
@@ -1639,15 +1673,8 @@ fn apply_one(
                 .descendants_of(id)
                 .filter_map(|descendant| doc.scene.get(descendant).cloned())
                 .collect();
-            let deleted: Vec<NodeId> = snapshot.iter().map(|node| node.id).collect();
+            removed_nodes.extend(snapshot.iter().map(|node| node.id));
             doc.apply(Operation::DeleteSubtree { snapshot })?;
-            let surviving: Vec<NodeId> = doc
-                .selection
-                .iter()
-                .copied()
-                .filter(|selected| !deleted.contains(selected))
-                .collect();
-            doc.selection.replace_with(surviving);
             Ok(Applied::changed())
         }
         DesignOp::Select { ids } => {
@@ -1906,10 +1933,6 @@ fn layer_position_index(
     };
     Ok(Some(new))
 }
-
-/// Cap on a `create_image` payload after base64 decoding. Generous for any
-/// generated PNG while keeping a bad tool call from ballooning the document.
-const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Decode a `create_image` source: a `data:` URI or raw base64. URLs are
 /// deliberately not fetched here — the surface is synchronous and network
@@ -2312,6 +2335,53 @@ mod tests {
         assert!(!doc.scene.contains(frame));
         assert!(!doc.scene.contains(ellipse));
         assert!(doc.selection.iter().next().is_none());
+    }
+
+    /// Delete and ungroup prune the selection only once the batch commits:
+    /// a batch that rolls back restores the nodes, so it must hand back the
+    /// selection it started with too, or the caller would lose the user's
+    /// selection to an edit that never happened.
+    #[test]
+    fn a_failed_batch_leaves_the_selection_untouched() {
+        let (mut doc, _) = doc_with_page();
+        let first = create_rect(&mut doc, 0.0, 0.0, 20.0, 20.0);
+        let second = create_rect(&mut doc, 40.0, 0.0, 20.0, 20.0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "group", "ids": [second.to_string()]}])),
+            "Group",
+        );
+        assert_applied(&outcome);
+        let group = created_id(&outcome, 0);
+        doc.selection.replace_with([first, group]);
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "delete", "id": first.to_string()},
+                {"op": "ungroup", "id": group.to_string()},
+                {"op": "delete", "id": "not-a-node"},
+            ])),
+            "Broken batch",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        assert!(doc.scene.contains(first));
+        assert!(doc.scene.contains(group));
+        assert_eq!(
+            doc.selection.iter().copied().collect::<Vec<_>>(),
+            vec![first, group]
+        );
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "delete", "id": first.to_string()},
+                {"op": "ungroup", "id": group.to_string()},
+            ])),
+            "Working batch",
+        );
+        assert_applied(&outcome);
+        assert!(doc.selection.is_empty());
     }
     fn create_rect(doc: &mut Doc, x: f64, y: f64, width: f64, height: f64) -> NodeId {
         let outcome = run_batch(
@@ -2814,7 +2884,75 @@ mod tests {
         assert_eq!(children[0]["auto_layout"], json!("horizontal"));
         assert_eq!(children[0]["fill"], json!("#FAFAFA"));
         assert_eq!(children[1]["text"], json!("Title"));
+        assert!(children[1].get("text_length").is_none());
         assert_eq!(children[1]["font"]["size"], json!(16.0));
         assert_eq!(children[2]["fill"], json!("#123456"));
+    }
+
+    /// A page listing must stay bounded per node, so long text is cut in the
+    /// summary and its full length reported; the whole content is still
+    /// there when the node is fetched by id.
+    #[test]
+    fn node_summary_truncates_long_text_and_reports_its_length() {
+        let (mut doc, page_id) = doc_with_page();
+        let long_text = "é".repeat(SUMMARY_TEXT_CHARS + 30);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "text", "text": long_text,
+                 "x": 0.0, "y": 0.0, "width": 100.0, "height": 20.0},
+            ])),
+            "Create",
+        );
+        assert_applied(&outcome);
+        let text = created_id(&outcome, 0);
+
+        let summary = node_summary(&doc, page_id, None, false);
+        let listed = &summary["children"][0];
+        let preview = listed["text"].as_str().expect("text is a string");
+        assert_eq!(preview.chars().count(), SUMMARY_TEXT_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        assert_eq!(listed["text_length"], json!(SUMMARY_TEXT_CHARS + 30));
+
+        let NodeData::Text(node) = &doc.scene.get(text).unwrap().data else {
+            panic!("expected a text node");
+        };
+        assert_eq!(node.content, long_text);
+    }
+
+    #[test]
+    fn set_text_style_rejects_weights_outside_the_opentype_range() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "text", "text": "Hi",
+                 "x": 0.0, "y": 0.0, "width": 80.0, "height": 20.0},
+            ])),
+            "Text",
+        );
+        let text = created_id(&outcome, 0);
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_text_style", "id": text.to_string(), "font_weight": 1000},
+            ])),
+            "Weight",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        let error = outcome.value["ops"][0]["error"]
+            .as_str()
+            .expect("the failed op carries its error");
+        assert!(error.contains("between 100 and 900"), "{error}");
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_text_style", "id": text.to_string(), "font_weight": 900},
+            ])),
+            "Weight",
+        );
+        assert_applied(&outcome);
     }
 }

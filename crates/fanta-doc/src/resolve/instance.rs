@@ -67,6 +67,11 @@ pub struct ResolvedComponentDefRef {
     pub resolved_component: crate::id::ComponentId,
     pub resolved_root: NodeId,
     pub rev: u64,
+    /// The def's transient-preview revision. Memo keys must include it
+    /// alongside `rev`; nothing else may read it (see
+    /// [`crate::component::ComponentLibrary::bump_preview_for_node`]).
+    #[serde(default)]
+    pub preview_rev: u64,
 }
 
 impl<'a> InstanceExpansionContext<'a> {
@@ -255,6 +260,7 @@ pub fn resolved_component(
         resolved_component: def.id,
         resolved_root: def.root,
         rev: def.rev,
+        preview_rev: def.preview_rev,
     })
 }
 
@@ -300,6 +306,7 @@ pub fn resolved_component_with_context(
         resolved_component: def.id,
         resolved_root: def.root,
         rev: def.rev,
+        preview_rev: def.preview_rev,
     })
 }
 

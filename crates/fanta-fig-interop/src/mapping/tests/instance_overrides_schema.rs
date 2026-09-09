@@ -22,7 +22,7 @@ fn component_prop_defs_parse_onto_component_def() {
             ("size", vector(120.0, 40.0)),
             (
                 "componentPropDefs",
-                KiwiValue::Array(vec![
+                KiwiValue::array(vec![
                     prop_def(label_prop, "Label", "TEXT", var_value_text("Click")),
                     prop_def(icon_prop, "Show Icon", "BOOL", var_value_bool(true)),
                 ]),
@@ -67,7 +67,7 @@ fn unset_prop_default_drives_bound_text_on_expand() {
                 ("size", vector(120.0, 40.0)),
                 (
                     "componentPropDefs",
-                    KiwiValue::Array(vec![prop_def(
+                    KiwiValue::array(vec![prop_def(
                         label_prop.clone(),
                         "Label",
                         "TEXT",
@@ -88,7 +88,7 @@ fn unset_prop_default_drives_bound_text_on_expand() {
                 ("fontSize", KiwiValue::Float(16.0)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropRef",
                         vec![
                             ("defID", label_prop),
@@ -149,7 +149,7 @@ fn assigned_prop_overrides_its_default() {
                 ("size", vector(120.0, 40.0)),
                 (
                     "componentPropDefs",
-                    KiwiValue::Array(vec![prop_def(
+                    KiwiValue::array(vec![prop_def(
                         label_prop.clone(),
                         "Label",
                         "TEXT",
@@ -170,7 +170,7 @@ fn assigned_prop_overrides_its_default() {
                 ("fontSize", KiwiValue::Float(16.0)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropRef",
                         vec![
                             ("defID", label_prop.clone()),
@@ -196,7 +196,7 @@ fn assigned_prop_overrides_its_default() {
                 ),
                 (
                     "componentPropAssignments",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropAssignment",
                         vec![
                             ("defID", label_prop),

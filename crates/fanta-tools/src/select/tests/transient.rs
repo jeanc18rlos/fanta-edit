@@ -200,3 +200,103 @@ fn resize_drag_is_transient_and_commits_one_step() {
     assert!((restored.width() - 60.0).abs() < 1e-6);
     assert!((restored.height() - 60.0).abs() < 1e-6);
 }
+
+#[test]
+fn cancelled_drag_inside_a_master_leaves_its_baked_derived_fills_intact() {
+    // `ComponentDef.rev` is persisted and `rev != 0` is the document's record
+    // that the master was edited since import, which is what makes an instance
+    // stop trusting Figma's baked `derivedSymbolData` fills. A drag that is
+    // previewed and then cancelled must therefore leave `rev` at 0 — the
+    // preview revision carries the memo invalidation instead.
+    use fanta_doc::{ComponentDef, ComponentId, DerivedOverride, Fill, InstanceNode};
+    use smallvec::smallvec;
+
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    master.index = IndexKey::FIRST;
+    let master_id = master.id;
+    doc.apply(Operation::create_node(master)).unwrap();
+    let mut inner = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        -30.0,
+        -30.0,
+        60.0,
+        60.0,
+        Color::WHITE,
+    )));
+    inner.parent = Some(master_id);
+    inner.index = IndexKey::FIRST;
+    let inner_id = inner.id;
+    doc.apply(Operation::create_node(inner)).unwrap();
+
+    let component = ComponentId::new();
+    doc.components
+        .defs
+        .insert(component, ComponentDef::new(component, master_id, "Header"));
+
+    // An instance whose baked derived data paints the master's inner rect.
+    let baked = Fill::solid(Color::rgb(9, 9, 9));
+    let instance = InstanceNode {
+        component,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: vec![DerivedOverride {
+            path: smallvec![inner_id],
+            transform: None,
+            size: None,
+            fills: Some(smallvec![baked.clone()]),
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        }],
+        local_size: [100.0, 100.0],
+    };
+    let baked_fill = |doc: &Doc| {
+        fanta_doc::expand_instance(&doc.scene, &doc.components, &instance)
+            .into_iter()
+            .find(|expanded| expanded.def_path.as_slice() == [inner_id])
+            .and_then(|expanded| match expanded.node.data {
+                NodeData::Vector(vector) => vector.fills.first().cloned(),
+                _ => None,
+            })
+    };
+    assert_eq!(
+        baked_fill(&doc),
+        Some(baked.clone()),
+        "a pristine master's instances draw the baked fill"
+    );
+
+    // Drag the master's inner rect and abort with Esc.
+    doc.selection.select_only(inner_id);
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, no_snap_engine(), size);
+    let mut tool = SelectTool::new();
+    let center = screen_center(size);
+    tool.handle_event(&mut ctx, pe_press(center, ModifierKeys::empty()));
+    for i in 1..=5 {
+        let dx = (i as f64) * 8.0;
+        tool.handle_event(
+            &mut ctx,
+            pe_move([center[0] + dx, center[1]], ModifierKeys::empty()),
+        );
+    }
+    tool.handle_event(
+        &mut ctx,
+        ToolEvent::Key(KeyEvent::press(LogicalKey::Escape)),
+    );
+
+    assert_eq!(
+        doc.components.defs[&component].rev, 0,
+        "a cancelled preview must not mark the master as edited"
+    );
+    assert!(
+        doc.components.defs[&component].preview_rev > 0,
+        "the preview must still have re-keyed the instance memo"
+    );
+    assert_eq!(
+        baked_fill(&doc),
+        Some(baked),
+        "the baked fill must survive an aborted drag"
+    );
+}

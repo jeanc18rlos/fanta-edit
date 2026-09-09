@@ -272,6 +272,10 @@ pub(crate) const INSTANCE_CACHE_IDLE_FRAMES: u64 = 240;
 pub(crate) struct InstanceCacheKey {
     pub(crate) instance: NodeId,
     pub(crate) rev: u64,
+    /// The resolved master's transient-preview revision, which moves while a
+    /// drag/text/properties preview writes straight into the scene without
+    /// going through history (and so without moving `rev`).
+    pub(crate) preview_rev: u64,
     pub(crate) override_hash: u64,
     pub(crate) mode_generation: u64,
     /// Hash of the frame mode pins on the instance's ancestor chain (see
@@ -1611,6 +1615,7 @@ mod instance_cache_tests {
         InstanceCacheKey {
             instance,
             rev: 1,
+            preview_rev: 0,
             override_hash,
             mode_generation,
             mode_pins: 0,

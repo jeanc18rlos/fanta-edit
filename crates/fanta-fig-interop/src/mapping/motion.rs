@@ -374,7 +374,11 @@ pub(crate) fn collect_motion_consumers(
 ) {
     // The fixture carries IDENTICAL entries in both maps; scanning both and
     // deduping on (track, node, field) keeps a file that authors only one of
-    // them working without double-importing the other.
+    // them working without double-importing the other. A binding carries its
+    // `node`, and this runs once per node, so a duplicate can only be among
+    // the bindings THIS call pushed: comparing against those alone is the
+    // same check without rescanning every earlier node's bindings per entry.
+    let first_binding_of_this_node = pending.bindings.len();
     for map_name in ["variableConsumptionMap", "parameterConsumptionMap"] {
         let Some(entries) = change
             .get(map_name)
@@ -387,7 +391,11 @@ pub(crate) fn collect_motion_consumers(
             let Some(binding) = read_keyframe_binding(node, entry) else {
                 continue;
             };
-            if !pending.bindings.contains(&binding) {
+            let already_pushed = pending
+                .bindings
+                .get(first_binding_of_this_node..)
+                .is_some_and(|own| own.contains(&binding));
+            if !already_pushed {
                 pending.bindings.push(binding);
             }
         }

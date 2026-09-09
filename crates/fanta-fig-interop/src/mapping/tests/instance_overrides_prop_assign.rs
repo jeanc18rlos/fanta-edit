@@ -28,7 +28,7 @@ fn component_prop_assignment_text_drives_bound_master_text() {
                 ("fontSize", KiwiValue::Float(45.0)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropRef",
                         vec![
                             ("defID", prop_def.clone()),
@@ -54,7 +54,7 @@ fn component_prop_assignment_text_drives_bound_master_text() {
                 ),
                 (
                     "componentPropAssignments",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropAssignment",
                         vec![
                             ("defID", prop_def),
@@ -161,7 +161,7 @@ fn component_prop_assignments_drive_icon_swap_visibility_and_label() {
                 ),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropRef",
                         vec![
                             ("defID", icon_prop.clone()),
@@ -187,7 +187,7 @@ fn component_prop_assignments_drive_icon_swap_visibility_and_label() {
                 ("fontSize", KiwiValue::Float(14.0)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropRef",
                         vec![
                             ("defID", label_prop.clone()),
@@ -211,7 +211,7 @@ fn component_prop_assignments_drive_icon_swap_visibility_and_label() {
                 ("size", vector(8.0, 8.0)),
                 (
                     "componentPropRefs",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "ComponentPropRef",
                         vec![
                             ("defID", hold_prop.clone()),
@@ -235,7 +235,7 @@ fn component_prop_assignments_drive_icon_swap_visibility_and_label() {
                 ),
                 (
                     "componentPropAssignments",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         o(
                             "ComponentPropAssignment",
                             vec![("defID", icon_prop), ("value", prop_value_guid(41, 35424))],

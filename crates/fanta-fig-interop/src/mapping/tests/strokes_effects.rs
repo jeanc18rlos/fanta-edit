@@ -13,11 +13,11 @@ fn stroke_imports_paint_weight_and_align() {
             ("size", vector(100.0, 50.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
             ),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(3.0)),
             ("strokeAlign", KiwiValue::Enum("INSIDE".into())),
@@ -48,11 +48,11 @@ fn frame_imports_border_stroke_and_corner_radius() {
             ("size", vector(120.0, 80.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
             ),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(2.0)),
             ("strokeAlign", KiwiValue::Enum("INSIDE".into())),
@@ -91,7 +91,7 @@ fn frame_imports_independent_per_corner_radii() {
             ("size", vector(100.0, 60.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
             ),
             ("rectangleTopLeftCornerRadius", KiwiValue::Float(8.0)),
             ("rectangleTopRightCornerRadius", KiwiValue::Float(8.0)),
@@ -123,7 +123,7 @@ fn stroke_imports_per_side_border_weights() {
             ("size", vector(100.0, 50.0)),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(1.0)),
             ("borderStrokeWeightsIndependent", KiwiValue::Bool(true)),
@@ -158,7 +158,7 @@ fn uniform_independent_border_weights_collapse_to_none() {
             ("size", vector(60.0, 60.0)),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(3.0)),
             ("borderStrokeWeightsIndependent", KiwiValue::Bool(true)),
@@ -197,7 +197,7 @@ fn ellipse_with_arc_data_tessellates_pie() {
             ("size", vector(40.0, 40.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
             ),
             ("arcData", arc),
         ],
@@ -264,7 +264,7 @@ fn ellipse_with_donut_arc_data_has_a_hole() {
             ("size", vector(40.0, 40.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
             ),
             ("arcData", arc),
         ],
@@ -309,7 +309,7 @@ fn full_ellipse_arc_data_stays_a_full_ellipse() {
             ("size", vector(40.0, 40.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
             ),
             ("arcData", arc),
         ],
@@ -334,7 +334,7 @@ fn frame_without_border_imports_no_stroke() {
             ("size", vector(100.0, 60.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
             ),
         ],
     );
@@ -358,7 +358,7 @@ fn filled_rectangle_without_stroke_paints_does_not_gain_default_black_stroke() {
             ("size", vector(100.0, 2.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(0.3, 0.3, 0.3, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.3, 0.3, 0.3, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(1.0)),
         ],
@@ -398,7 +398,7 @@ fn rounded_rect_imports_uniform_corner_radius() {
             ("size", vector(100.0, 40.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
             ),
             ("cornerRadius", KiwiValue::Float(8.0)),
         ],
@@ -421,7 +421,7 @@ fn mixed_per_corner_radii_import_as_independent_corner_radii() {
             ("size", vector(100.0, 40.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
             ),
             ("rectangleTopLeftCornerRadius", KiwiValue::Float(4.0)),
             ("rectangleTopRightCornerRadius", KiwiValue::Float(12.0)),
@@ -459,7 +459,7 @@ fn equal_per_corner_radii_collapse_to_uniform() {
             ("size", vector(100.0, 40.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 1.0, 0.0, 1.0)]),
             ),
             ("rectangleTopLeftCornerRadius", KiwiValue::Float(7.0)),
             ("rectangleTopRightCornerRadius", KiwiValue::Float(7.0)),
@@ -495,11 +495,11 @@ fn node_opacity_blend_and_drop_shadow_import() {
             ("size", vector(20.0, 20.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
             ),
             ("opacity", KiwiValue::Float(0.4)),
             ("blendMode", KiwiValue::Enum("MULTIPLY".into())),
-            ("effects", KiwiValue::Array(vec![shadow])),
+            ("effects", KiwiValue::array(vec![shadow])),
         ],
     );
     let (doc, report, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();
@@ -550,11 +550,11 @@ fn boolean_operation_carries_winding_rule_from_baked_geometry() {
                 ("size", vector(10.0, 10.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
                 ),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "ODD"), fig_path(1, "ODD")]),
+                    KiwiValue::array(vec![fig_path(0, "ODD"), fig_path(1, "ODD")]),
                 ),
             ],
         )],
@@ -653,11 +653,11 @@ fn layer_and_background_blur_effects_import() {
             ("size", vector(20.0, 20.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
             ),
             (
                 "effects",
-                KiwiValue::Array(vec![layer_blur, bg_blur, hidden_blur, zero_blur, shadow]),
+                KiwiValue::array(vec![layer_blur, bg_blur, hidden_blur, zero_blur, shadow]),
             ),
         ],
     );
@@ -708,7 +708,7 @@ fn image_paint_without_a_hash_is_dropped_not_a_phantom_fill() {
             ("parentIndex", parent_index(0, 1)),
             ("type", KiwiValue::Enum("RECTANGLE".into())),
             ("size", vector(50.0, 50.0)),
-            ("fillPaints", KiwiValue::Array(vec![image_paint])),
+            ("fillPaints", KiwiValue::array(vec![image_paint])),
         ],
     );
     let (doc, report, assets) = fig_to_doc(&doc_with_shape(rect)).unwrap();
@@ -739,7 +739,7 @@ fn invisible_paint_is_skipped() {
             ("size", vector(10.0, 10.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![hidden, solid_paint(0.0, 1.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![hidden, solid_paint(0.0, 1.0, 0.0, 1.0)]),
             ),
         ],
     );
@@ -777,9 +777,9 @@ fn drop_shadow_show_behind_node_imports() {
                 ("size", vector(20.0, 20.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 0.5)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 0.5)]),
                 ),
-                ("effects", KiwiValue::Array(vec![shadow_with(behind_field)])),
+                ("effects", KiwiValue::array(vec![shadow_with(behind_field)])),
             ],
         );
         let (doc, _, _) = fig_to_doc(&doc_with_shape(rect)).unwrap();

@@ -84,16 +84,19 @@ pub(crate) fn expand_instance_memoized(
         ctx.inputs.active_modes,
         mode_anchor,
     );
-    // The RESOLVED master's rev (a variant instance's `component` is the *set*
-    // id, which is not itself a def — `def(set)` is `None` and would wrongly
-    // report rev 0, never invalidating on a member edit). `> 0` also means the
-    // master was edited, which drives the live-solve decision below.
-    let rev = fanta_doc::resolved_component_rev_with_context(
+    // The RESOLVED master's revisions (a variant instance's `component` is the
+    // *set* id, which is not itself a def — `def(set)` is `None` and would
+    // wrongly report rev 0, never invalidating on a member edit). `rev` moves
+    // for committed edits, `preview_rev` for in-flight previews that bypass
+    // history; both must key the memo or a drag inside a master would not
+    // refresh its instances.
+    let (rev, preview_rev) = fanta_doc::resolved_component_with_context(
         ctx.scene,
         ctx.inputs.components,
         inst,
         &expansion_context,
-    );
+    )
+    .map_or((0, 0), |resolved| (resolved.rev, resolved.preview_rev));
     // Only a live-scene instance has a stamp to memoize its override hash on;
     // a nested transient clone (fresh id, not in the scene) hashes directly.
     let stamp = ctx
@@ -103,6 +106,7 @@ pub(crate) fn expand_instance_memoized(
     let key = InstanceCacheKey {
         instance: instance_id,
         rev,
+        preview_rev,
         override_hash: ctx.instance_cache.override_hash(instance_id, stamp, inst),
         mode_generation: ctx.inputs.mode_generation,
         mode_pins: hash_mode_pins(ctx.scene, mode_anchor),

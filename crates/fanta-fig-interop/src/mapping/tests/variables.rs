@@ -68,7 +68,7 @@ fn variable_set_maps_to_collection_with_modes_and_variable_values() {
                 ("name", KiwiValue::String("Theme".to_owned())),
                 (
                     "variableSetModes",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         var_set_mode(0, 10, "Light"),
                         var_set_mode(0, 11, "Dark"),
                     ]),
@@ -89,7 +89,7 @@ fn variable_set_maps_to_collection_with_modes_and_variable_values() {
                         "VariableDataValues",
                         vec![(
                             "entries",
-                            KiwiValue::Array(vec![
+                            KiwiValue::array(vec![
                                 o(
                                     "VariableDataValuesEntry",
                                     vec![
@@ -148,7 +148,7 @@ fn float_variable_resolves_type_and_value() {
                 ("name", KiwiValue::String("Spacing".to_owned())),
                 (
                     "variableSetModes",
-                    KiwiValue::Array(vec![var_set_mode(0, 10, "Base")]),
+                    KiwiValue::array(vec![var_set_mode(0, 10, "Base")]),
                 ),
             ],
         ),
@@ -166,7 +166,7 @@ fn float_variable_resolves_type_and_value() {
                         "VariableDataValues",
                         vec![(
                             "entries",
-                            KiwiValue::Array(vec![o(
+                            KiwiValue::array(vec![o(
                                 "VariableDataValuesEntry",
                                 vec![
                                     ("modeID", guid(0, 10)),
@@ -206,7 +206,7 @@ fn variable_consumption_map_binds_a_node_property() {
                     "VariableDataMap",
                     vec![(
                         "entries",
-                        KiwiValue::Array(vec![o(
+                        KiwiValue::array(vec![o(
                             "VariableDataMapEntry",
                             vec![
                                 (
@@ -248,11 +248,11 @@ fn paint_bound_variables_bind_vector_fill_and_stroke_colors() {
             ("size", vector(50.0, 50.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![bound_solid_paint(1.0, 0.0, 0.0, 1.0, 0, 99)]),
+                KiwiValue::array(vec![bound_solid_paint(1.0, 0.0, 0.0, 1.0, 0, 99)]),
             ),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![bound_solid_paint(0.0, 0.0, 0.0, 1.0, 0, 100)]),
+                KiwiValue::array(vec![bound_solid_paint(0.0, 0.0, 0.0, 1.0, 0, 100)]),
             ),
             ("strokeWeight", KiwiValue::Float(2.0)),
         ],
@@ -283,7 +283,7 @@ fn paint_bound_variables_bind_frame_background_and_text_color() {
                 ("size", vector(50.0, 50.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![bound_solid_paint(1.0, 1.0, 1.0, 1.0, 0, 101)]),
+                    KiwiValue::array(vec![bound_solid_paint(1.0, 1.0, 1.0, 1.0, 0, 101)]),
                 ),
             ],
         ),
@@ -297,7 +297,7 @@ fn paint_bound_variables_bind_frame_background_and_text_color() {
                 ("textData", text_data("Label")),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![bound_solid_paint(0.0, 0.0, 0.0, 1.0, 0, 102)]),
+                    KiwiValue::array(vec![bound_solid_paint(0.0, 0.0, 0.0, 1.0, 0, 102)]),
                 ),
             ],
         ),
@@ -349,7 +349,7 @@ fn explicit_variable_modes_pin_a_frame_to_a_nondefault_mode() {
                 ("name", KiwiValue::String("Theme".to_owned())),
                 (
                     "variableSetModes",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         var_set_mode(0, 10, "Light"),
                         var_set_mode(0, 11, "Dark"),
                     ]),
@@ -365,7 +365,7 @@ fn explicit_variable_modes_pin_a_frame_to_a_nondefault_mode() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "explicitVariableModes",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "VariableModeBySet",
                         vec![("variableSetID", guid(0, 1)), ("modeID", guid(0, 11))],
                     )]),
@@ -399,7 +399,7 @@ fn explicit_variable_modes_accept_wrapped_guid_shape() {
                 ("name", KiwiValue::String("Theme".to_owned())),
                 (
                     "variableSetModes",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         var_set_mode(0, 10, "Light"),
                         var_set_mode(0, 11, "Dark"),
                     ]),
@@ -415,7 +415,7 @@ fn explicit_variable_modes_accept_wrapped_guid_shape() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "explicitVariableModes",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "VariableModeBySet",
                         // variableSetID wrapped as `{ guid: GUID }`.
                         vec![

@@ -695,8 +695,10 @@ pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
     // A `get_mut` write bypasses `Doc::apply`, so the master revision that
     // keys memoized instance expansions must move by hand or every instance
     // of an edited master keeps drawing the pre-edit text until the commit.
+    // The preview revision, since nothing is committed yet — `rev` is persisted
+    // and doubles as the "master was edited" flag.
     doc.components
-        .bump_rev_for_node(&doc.scene, session.node_id);
+        .bump_preview_for_node(&doc.scene, session.node_id);
 }
 
 /// Restore the pre-edit content, rich-text styles, and box size so the
@@ -723,7 +725,7 @@ pub(crate) fn rewind_preview(doc: &mut Doc, session: &TextEditSession) {
     text.style = session.original.style.clone();
     text.style_runs = session.original.style_runs.clone();
     doc.components
-        .bump_rev_for_node(&doc.scene, session.node_id);
+        .bump_preview_for_node(&doc.scene, session.node_id);
 }
 
 /// The single undoable operation committing the session, built against the

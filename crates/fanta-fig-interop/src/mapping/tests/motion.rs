@@ -76,7 +76,7 @@ fn keyframe_binding_entry(
                                             ),
                                             (
                                                 "expressionArguments",
-                                                KiwiValue::Array(vec![
+                                                KiwiValue::array(vec![
                                                     o(
                                                         "VariableData",
                                                         vec![
@@ -118,7 +118,7 @@ fn keyframe_binding_entry(
                                                                             "KeyframeTrackParameterValue",
                                                                             vec![(
                                                                                 "parameters",
-                                                                                KiwiValue::Array(
+                                                                                KiwiValue::array(
                                                                                     vec![
                                                                                     track_parameter,
                                                                                 ],
@@ -147,7 +147,7 @@ fn keyframe_binding_entry(
 fn consumption_map(entries: Vec<KiwiValue>) -> KiwiValue {
     o(
         "VariableDataMap",
-        vec![("entries", KiwiValue::Array(entries))],
+        vec![("entries", KiwiValue::array(entries))],
     )
 }
 
@@ -158,7 +158,7 @@ fn timeline_definitions(timeline: (u32, u32), duration_us: u64) -> KiwiValue {
         "TimelineDefinitionsMap",
         vec![(
             "entries",
-            KiwiValue::Array(vec![o(
+            KiwiValue::array(vec![o(
                 "TimelineDefinitionsMapEntry",
                 vec![
                     ("id", guid(timeline.0, timeline.1)),

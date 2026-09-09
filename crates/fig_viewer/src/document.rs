@@ -30,6 +30,13 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 /// missed (the next edit's events will still arrive).
 const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
 
+/// Cap on the encoded bytes of one image ingested as a project asset (a paste,
+/// a drop, an agent's `create_image`). Generous for any generated PNG while
+/// keeping a bad payload from ballooning the document — and enforced before
+/// decoding, since a decoder handed arbitrary bytes can allocate far more
+/// than it was given.
+pub(crate) const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
 pub struct FigItem {
     pub(crate) path: ProjectPath,
     pub(crate) abs_path: PathBuf,
@@ -313,8 +320,20 @@ pub(crate) struct PagePrewarm {
 impl PagePrewarm {
     /// Decode the page's images into the shared resolver. Safe to run on any
     /// thread; a frame that draws one of them first simply wins the decode.
+    ///
+    /// Decodes one asset at a time, stopping as soon as this task is the last
+    /// owner of the resolver. The document that owns it can be replaced while
+    /// the walk runs — a reload or a merge installs a brand-new `FigDocument`
+    /// with a brand-new resolver — and from that moment nothing will ever read
+    /// what this decodes, while the orphaned cache would still fill to the full
+    /// decode budget alongside the replacement's own decode of the same images.
     pub(crate) fn run(self) {
-        self.resolver.prewarm(self.assets);
+        for asset in self.assets {
+            if Arc::strong_count(&self.resolver) <= 1 {
+                return;
+            }
+            self.resolver.prewarm([asset]);
+        }
     }
 }
 
@@ -341,20 +360,28 @@ impl FigDocument {
         // master edits from propagating. Drop them on load (both `.fig` imports
         // and already-materialized projects) so editing a component master
         // reaches its unmodified instances.
+        let started = Instant::now();
         fanta_doc::strip_redundant_instance_overrides(&mut doc.scene, &doc.components);
+        crate::report_slow("document load: strip redundant overrides", started);
         // Legacy migration: projects saved before vectors carried an SVG viewport
         // get one inferred from geometry, so a stroke thickened past the box is
         // clipped like a freshly imported file. A no-op once the doc is viewport-aware.
+        let started = Instant::now();
         fanta_doc::backfill_vector_viewports(&mut doc.scene);
+        crate::report_slow("document load: backfill vector viewports", started);
         let visible_page_roots = visible_page_roots(&doc);
         let default_page_root = default_page_root(&doc, &visible_page_roots);
         let uses_auto_layout = scene_uses_auto_layout(&doc.scene);
         let mut solved_pages = HashSet::new();
         if let Some(page_root) = default_page_root {
+            let started = Instant::now();
             solve_scene_layout(&mut doc.scene, page_root);
+            crate::report_slow("document load: solve default page layout", started);
             solved_pages.insert(page_root);
         }
+        let started = Instant::now();
         let gpui_images = decode_gpui_images(&raw_assets);
+        crate::report_slow("document load: gpui thumbnails", started);
         let raw_assets = Arc::new(raw_assets);
         let embedded_assets = (!raw_assets.is_empty()).then(|| {
             Arc::new(LazyAssetResolver::new(
@@ -427,7 +454,9 @@ impl FigDocument {
             return;
         };
         if let Some(prewarm) = self.take_page_prewarm(page_root) {
+            let started = Instant::now();
             prewarm.run();
+            crate::report_slow("document load: prewarm default page images", started);
         }
     }
 
@@ -683,6 +712,11 @@ impl AssetStores<'_> {
     /// (so a corrupt payload fails the op instead of rendering a placeholder)
     /// and returns the new id plus the natural pixel size.
     pub(crate) fn add_image(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2])> {
+        anyhow::ensure!(
+            bytes.len() <= MAX_IMAGE_SOURCE_BYTES,
+            "the image is {} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES} bytes",
+            bytes.len()
+        );
         let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
         let rgba = decoded.to_rgba8();
         let (width, height) = rgba.dimensions();
@@ -696,13 +730,12 @@ impl AssetStores<'_> {
         // batch imports should get a shared-bytes representation first.
         Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
 
-        if self.overlay.is_none() {
-            *self.overlay = Some(Arc::new(OverlayAssetResolver {
+        let overlay = self.overlay.get_or_insert_with(|| {
+            Arc::new(OverlayAssetResolver {
                 base: self.asset_resolver.clone(),
                 added: std::sync::RwLock::new(HashMap::default()),
-            }));
-        }
-        let overlay = self.overlay.as_ref().expect("just ensured above");
+            })
+        });
         overlay.added.write().unwrap().insert(
             id,
             DecodedImage::new(Arc::new(rgba.into_raw()), width, height),
@@ -844,89 +877,20 @@ impl project::ProjectItem for FigItem {
                                     // parse is still shown and the first save
                                     // retries the write.
                                     None => load_fig_document(&load_path).map(|document| {
-                                        let target = available_project_dir(&load_path);
-                                        if fanta_format::is_project_dir(&target) {
-                                            // Appeared since the redirect check
-                                            // in `try_open`; never overwrite it.
-                                            return (document, None);
-                                        }
-                                        let created_here = !target.exists();
-                                        match write_project(
-                                            &target,
-                                            &document.doc,
-                                            &document.raw_assets,
-                                        ) {
-                                            Ok(()) => (document, Some(target)),
-                                            Err(error) => {
-                                                log::error!(
-                                                    "materializing Fanta project at {} on open failed: {error:#}",
-                                                    target.display()
-                                                );
-                                                // A half-written dir is already
-                                                // tagged as a project (the
-                                                // manifest is scaffolded first),
-                                                // so leaving it would hijack
-                                                // every reopen AND block the
-                                                // save that could repair it.
-                                                // Remove what we created; the
-                                                // first save re-materializes.
-                                                if created_here
-                                                    && let Err(error) =
-                                                        std::fs::remove_dir_all(&target)
-                                                {
-                                                    log::error!(
-                                                        "cleaning up partial Fanta project at {} failed: {error:#}",
-                                                        target.display()
-                                                    );
-                                                }
-                                                (document, None)
-                                            }
-                                        }
+                                        let materialized =
+                                            materialize_project_on_open(&load_path, &document);
+                                        (document, materialized)
                                     }),
                                 }
                             })
                             .await;
 
-                        let adopted_root = load_result
-                            .as_ref()
-                            .ok()
-                            .and_then(|(_, root)| root.clone());
-                        let document = load_result.map(|(document, _)| document);
+                        let (document, materialized) = match load_result {
+                            Ok((document, materialized)) => (Ok(document), materialized),
+                            Err(error) => (Err(error), None),
+                        };
                         if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
-                            if this.sync_epoch != 0 {
-                                // An external change already reloaded a newer
-                                // document while this initial load ran (the
-                                // project root was known from open, so the
-                                // watcher was live); installing this older
-                                // snapshot would regress it and poison
-                                // merge_base for the next save.
-                                return;
-                            }
-                            if let Some(root) = adopted_root {
-                                // The write above echoes back through the
-                                // worktree watcher once the folder is adopted;
-                                // suppress it exactly like a save's self-write.
-                                this.suppress_watcher_until =
-                                    Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
-                                this.project_root = Some(root.clone());
-                                // The project directory now exists; share this
-                                // item so later scoped opens reuse it.
-                                let key = root.canonicalize().unwrap_or(root);
-                                register_shared_project_item(key, &cx.entity(), cx);
-                            }
-                            this.document = FigDocumentState::from_result(document);
-                            this.write_cache = None;
-                            if let Some(scope) = this.pending_scope.take()
-                                && let FigDocumentState::Ready(document) = &mut this.document
-                            {
-                                apply_scope(document, scope);
-                                this.last_scope = Some(scope);
-                                cx.emit(FigItemEvent::ScopeApplied(scope, ScopeRequester::Load));
-                            }
-                            this.merge_base =
-                                this.document.ready().map(|document| document.doc.clone());
-                            cx.emit(FigItemEvent::StateChanged);
-                            cx.notify();
+                            this.adopt_initial_load(document, materialized, cx);
                         }) {
                             log::debug!("dropping loaded update for closed .fig item: {error:#}");
                             return;
@@ -1706,6 +1670,50 @@ impl FigItem {
         }
     }
 
+    /// Install the initial load's outcome: the parsed document and, for a bare
+    /// `.fig`, the project directory the load materialized next to it. The
+    /// materializing write's memo becomes the item's write cache, so the first
+    /// autosave re-prints only what changed instead of starting cold and
+    /// re-projecting every page. A no-op when an external change already
+    /// installed a newer document while the load ran.
+    fn adopt_initial_load(
+        &mut self,
+        document: Result<FigDocument>,
+        materialized: Option<MaterializedProject>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sync_epoch != 0 {
+            // The project root was known from open, so the watcher was live
+            // and reloaded a newer document; installing this older snapshot
+            // would regress it and poison merge_base for the next save.
+            return;
+        }
+        self.write_cache = None;
+        if let Some(MaterializedProject { root, write_cache }) = materialized {
+            // The materializing write echoes back through the worktree
+            // watcher once the folder is adopted; suppress it exactly like a
+            // save's self-write.
+            self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+            self.project_root = Some(root.clone());
+            self.write_cache = Some(write_cache);
+            // The project directory now exists; share this item so later
+            // scoped opens reuse it.
+            let key = root.canonicalize().unwrap_or(root);
+            register_shared_project_item(key, &cx.entity(), cx);
+        }
+        self.document = FigDocumentState::from_result(document);
+        if let Some(scope) = self.pending_scope.take()
+            && let FigDocumentState::Ready(document) = &mut self.document
+        {
+            apply_scope(document, scope);
+            self.last_scope = Some(scope);
+            cx.emit(FigItemEvent::ScopeApplied(scope, ScopeRequester::Load));
+        }
+        self.merge_base = self.document.ready().map(|document| document.doc.clone());
+        cx.emit(FigItemEvent::StateChanged);
+        cx.notify();
+    }
+
     /// Persist the current document state, materializing an on-disk Fanta
     /// project the first time a lone `.fig` is saved.
     ///
@@ -1882,6 +1890,64 @@ pub enum DocChange {
     /// frame): the item is dirtied but layout re-solving is deferred to the
     /// gesture's committing event.
     ContentPreview,
+}
+
+/// A project directory materialized while a bare `.fig` loaded, with the
+/// write cache that write warmed: every design's projection is memoized in
+/// it, so handing it to the item makes the first autosave incremental.
+struct MaterializedProject {
+    root: PathBuf,
+    write_cache: fanta_format::ProjectWriteCache,
+}
+
+/// Materialize `document` (parsed from the bare `.fig` at `fig_path`) into a
+/// project directory next to it, so the editor is project-backed and editable
+/// from the first frame instead of leaving a folder to appear only on the
+/// first save. Runs on the background load thread. `None` when a project has
+/// appeared at the target since `try_open`'s redirect check (it is never
+/// overwritten) or the write failed — the parse is still shown in-memory and
+/// the first save retries the write.
+fn materialize_project_on_open(
+    fig_path: &Path,
+    document: &FigDocument,
+) -> Option<MaterializedProject> {
+    let target = available_project_dir(fig_path);
+    if fanta_format::is_project_dir(&target) {
+        return None;
+    }
+    let created_here = !target.exists();
+    let mut write_cache = fanta_format::ProjectWriteCache::default();
+    let started = Instant::now();
+    let written = write_project_cached(
+        &target,
+        &document.doc,
+        &document.raw_assets,
+        &mut write_cache,
+    );
+    crate::report_slow("document load: materialize project", started);
+    match written {
+        Ok(()) => Some(MaterializedProject {
+            root: target,
+            write_cache,
+        }),
+        Err(error) => {
+            log::error!(
+                "materializing Fanta project at {} on open failed: {error:#}",
+                target.display()
+            );
+            // A half-written dir is already tagged as a project (the manifest
+            // is scaffolded first), so leaving it would hijack every reopen
+            // AND block the save that could repair it. Remove what we
+            // created; the first save re-materializes.
+            if created_here && let Err(error) = std::fs::remove_dir_all(&target) {
+                log::error!(
+                    "cleaning up partial Fanta project at {} failed: {error:#}",
+                    target.display()
+                );
+            }
+            None
+        }
+    }
 }
 
 pub(crate) fn write_project(
@@ -2100,17 +2166,25 @@ fn apply_scope(document: &mut FigDocument, scope: FigScope) {
 }
 
 fn load_fig_document(path: &Path) -> Result<FigDocument> {
+    let started = Instant::now();
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    crate::report_slow("document load: read .fig", started);
+    let started = Instant::now();
     let fig = read_fig(&bytes).context("parsing .fig")?;
+    crate::report_slow("document load: parse .fig", started);
+    let started = Instant::now();
     let (doc, _report, assets) = fig_to_doc(&fig).context("mapping .fig to Fanta document")?;
+    crate::report_slow("document load: map .fig to doc", started);
     let mut document = FigDocument::from_doc(doc, assets.into_iter().collect());
     document.prewarm_default_page_assets();
     Ok(document)
 }
 
 fn load_project_document(root: &Path) -> Result<FigDocument> {
+    let started = Instant::now();
     let (doc, assets) = fanta_format::read_project_tree(root)
         .with_context(|| format!("reading Fanta project at {}", root.display()))?;
+    crate::report_slow("document load: read project tree", started);
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
@@ -2260,21 +2334,96 @@ fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage
     }
 }
 
-/// The image assets drawn somewhere under `page_root`: every bitmap's asset
-/// and every video's poster frame. Other asset kinds (audio, 3D models, the
+/// The image assets drawn somewhere under `page_root`: every bitmap's asset,
+/// every video's poster frame, and every image paint in a fill, stroke, or
+/// frame background. An instance draws its component master's subtree, which
+/// lives on the (hidden) components page rather than under this one, so the
+/// masters the page instantiates are walked too, along with the paints the
+/// instances' overrides swap in. Other asset kinds (audio, 3D models, the
 /// videos themselves) are not decoded as images.
 fn page_image_assets(doc: &Doc, page_root: NodeId) -> Vec<AssetId> {
+    use fanta_doc::{NodeData, OverrideValue};
+
     let mut assets = Vec::new();
-    for node_id in doc.scene.descendants_of(page_root) {
-        match doc.scene.get(node_id).map(|node| &node.data) {
-            Some(fanta_doc::NodeData::Bitmap(bitmap)) => assets.push(bitmap.asset),
-            Some(fanta_doc::NodeData::Video(video)) => assets.extend(video.poster),
-            _ => {}
+    let mut pending_roots = vec![page_root];
+    let mut visited_components = HashSet::new();
+    while let Some(root) = pending_roots.pop() {
+        for node_id in doc.scene.descendants_of(root) {
+            let Some(node) = doc.scene.get(node_id) else {
+                continue;
+            };
+            match &node.data {
+                NodeData::Bitmap(bitmap) => assets.push(bitmap.asset),
+                NodeData::Video(video) => assets.extend(video.poster),
+                NodeData::Group(group) => {
+                    assets.extend(group.background.iter().filter_map(image_fill_asset));
+                    assets.extend(group.background_fills.iter().filter_map(image_fill_asset));
+                    assets.extend(group.strokes.iter().filter_map(image_stroke_asset));
+                }
+                NodeData::Vector(vector) => {
+                    assets.extend(vector.fills.iter().filter_map(image_fill_asset));
+                    assets.extend(vector.strokes.iter().filter_map(image_stroke_asset));
+                }
+                NodeData::Boolean(boolean) => {
+                    assets.extend(boolean.fills.iter().filter_map(image_fill_asset));
+                    assets.extend(boolean.strokes.iter().filter_map(image_stroke_asset));
+                }
+                NodeData::Instance(instance) => {
+                    for override_entry in &instance.overrides {
+                        match &override_entry.value {
+                            OverrideValue::Fills { fills } => {
+                                assets.extend(fills.iter().filter_map(image_fill_asset));
+                            }
+                            OverrideValue::Strokes { strokes } => {
+                                assets.extend(strokes.iter().filter_map(image_stroke_asset));
+                            }
+                            // A swap redirects a descendant of the expansion
+                            // to a DIFFERENT master, whose subtree the page
+                            // then draws.
+                            OverrideValue::SwapInstance { component } => {
+                                if visited_components.insert(*component)
+                                    && let Some(def) = doc.components.defs.get(component)
+                                {
+                                    pending_roots.push(def.root);
+                                }
+                            }
+                            OverrideValue::Text { .. }
+                            | OverrideValue::Visible { .. }
+                            | OverrideValue::Field { .. } => {}
+                        }
+                    }
+                    for derived in &instance.derived {
+                        assets.extend(derived.fills.iter().flatten().filter_map(image_fill_asset));
+                    }
+                    if visited_components.insert(instance.component)
+                        && let Some(def) = doc.components.defs.get(&instance.component)
+                    {
+                        pending_roots.push(def.root);
+                    }
+                }
+                NodeData::Text(_)
+                | NodeData::Audio(_)
+                | NodeData::NodeGraph(_)
+                | NodeData::Model3d(_)
+                | NodeData::AiArtifact(_)
+                | NodeData::Embed(_) => {}
+            }
         }
     }
     assets.sort();
     assets.dedup();
     assets
+}
+
+fn image_fill_asset(fill: &fanta_doc::Fill) -> Option<AssetId> {
+    match fill {
+        fanta_doc::Fill::Image { asset, .. } => Some(*asset),
+        fanta_doc::Fill::Solid { .. } | fanta_doc::Fill::Gradient { .. } => None,
+    }
+}
+
+fn image_stroke_asset(stroke: &fanta_doc::Stroke) -> Option<AssetId> {
+    image_fill_asset(&stroke.paint)
 }
 
 /// Wrap every embedded asset GPUI can decode as an [`Image`] behind its content
@@ -2343,6 +2492,50 @@ pub(crate) fn fit_bounds(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_page_prewarm_stops_once_the_document_that_owns_its_resolver_is_gone() {
+        use fanta_render::DecodedImage;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let assets: Vec<AssetId> = (1..=4).map(AssetId::from_u128).collect();
+        let encoded: BTreeMap<AssetId, Vec<u8>> =
+            assets.iter().map(|id| (*id, vec![2u8; 4])).collect();
+        let build = || {
+            let decodes = decodes.clone();
+            Arc::new(LazyAssetResolver::new(
+                Arc::new(encoded.clone()),
+                Arc::new(move |_id, _bytes: &[u8]| {
+                    decodes.fetch_add(1, Ordering::SeqCst);
+                    Some(DecodedImage::new(Arc::new(vec![0u8; 4]), 1, 1))
+                }),
+            ))
+        };
+
+        // A document swap drops the resolver's other owners before the task
+        // runs: nothing will read what it decodes, so it must decode nothing.
+        let orphaned = PagePrewarm {
+            resolver: build(),
+            assets: assets.clone(),
+        };
+        orphaned.run();
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            0,
+            "an orphaned prewarm must not fill a cache nobody will read"
+        );
+
+        // While the document is alive, the walk still decodes the whole page.
+        let live = build();
+        PagePrewarm {
+            resolver: live.clone(),
+            assets: assets.clone(),
+        }
+        .run();
+        assert_eq!(decodes.load(Ordering::SeqCst), assets.len());
+        drop(live);
+    }
+
     /// A doc with one page and one component master (an ordinary group
     /// promoted via DefineComponent), for scope tests.
     fn doc_with_page_and_component() -> (Doc, NodeId, fanta_doc::ComponentId, NodeId) {
@@ -2368,6 +2561,7 @@ mod tests {
                 variant_of: None,
                 props: Vec::new(),
                 rev: 0,
+                preview_rev: 0,
             }),
         })
         .expect("define component");
@@ -2538,6 +2732,213 @@ mod tests {
         );
     }
 
+    /// Prewarming decodes what a page's first frame will draw. Images that
+    /// only appear as paints (a rectangle's image fill, an image stroke, a
+    /// frame background) or through an instance's component master used to
+    /// be skipped, so a prewarmed page still stalled on decoding them.
+    #[test]
+    fn page_image_assets_covers_paints_and_instance_masters() {
+        use fanta_doc::{
+            BitmapNode, BlendMode, BoundProp, CanvasNode, Color, Fill, GroupNode, ImageAdjust,
+            ImageFitMode, InstanceNode, NodeData, Override, OverridePath, OverrideValue, Stroke,
+            VectorNode,
+        };
+
+        fn image_fill(asset: AssetId) -> Fill {
+            Fill::Image {
+                asset,
+                mode: ImageFitMode::Fill,
+                opacity: 1.0,
+                crop: None,
+                scale: None,
+                rotation: None,
+                blend: BlendMode::Normal,
+                adjust: ImageAdjust::default(),
+            }
+        }
+
+        let (mut doc, page_root, component, master_root) = doc_with_page_and_component();
+        let fill_asset = AssetId::new();
+        let stroke_asset = AssetId::new();
+        let background_asset = AssetId::new();
+        let override_asset = AssetId::new();
+        let master_asset = AssetId::new();
+        let swapped_asset = AssetId::new();
+        let unrelated_asset = AssetId::new();
+
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::WHITE,
+        )));
+        if let NodeData::Vector(vector) = &mut rectangle.data {
+            vector.fills.clear();
+            vector.fills.push(image_fill(fill_asset));
+            let mut stroke = Stroke::solid(Color::WHITE, 1.0);
+            stroke.paint = image_fill(stroke_asset);
+            vector.strokes.push(stroke);
+        }
+        rectangle.parent = Some(page_root);
+        doc.apply(Operation::create_node(rectangle))
+            .expect("create rectangle");
+
+        // The rectangle's fill asset again as a stacked frame background:
+        // the result lists it once.
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([20.0, 20.0]),
+            background: Some(image_fill(background_asset)),
+            ..GroupNode::default()
+        }));
+        if let NodeData::Group(group) = &mut frame.data {
+            group.background_fills.push(image_fill(fill_asset));
+        }
+        frame.parent = Some(page_root);
+        doc.apply(Operation::create_node(frame))
+            .expect("create frame");
+
+        let mut master_bitmap = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+            asset: master_asset,
+            natural_size: [1, 1],
+            local_size: [10.0, 10.0],
+            crop: None,
+            fit: ImageFitMode::Fill,
+            tint: None,
+        }));
+        master_bitmap.parent = Some(master_root);
+        let master_bitmap_id = master_bitmap.id;
+        doc.apply(Operation::create_node(master_bitmap))
+            .expect("create master bitmap");
+
+        // A second master the page never instantiates directly — an instance
+        // inside the first one's expansion is SWAPPED onto it, so the page
+        // still draws its bitmap.
+        let mut swapped_master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let swapped_master_root = swapped_master.id;
+        swapped_master.name = "Icon".to_owned();
+        doc.apply(Operation::create_node(swapped_master))
+            .expect("create swap target master");
+        let swapped_component = fanta_doc::ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(fanta_doc::ComponentDef::new(
+                swapped_component,
+                swapped_master_root,
+                "Icon",
+            )),
+        })
+        .expect("define swap target component");
+        let mut swapped_bitmap = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+            asset: swapped_asset,
+            natural_size: [1, 1],
+            local_size: [10.0, 10.0],
+            crop: None,
+            fit: ImageFitMode::Fill,
+            tint: None,
+        }));
+        swapped_bitmap.parent = Some(swapped_master_root);
+        doc.apply(Operation::create_node(swapped_bitmap))
+            .expect("create swap target bitmap");
+
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: vec![
+                Override {
+                    target_path: OverridePath::from_iter([master_bitmap_id]),
+                    target_prop: BoundProp::FillColor { index: 0 },
+                    value: OverrideValue::Fills {
+                        fills: [image_fill(override_asset)].into_iter().collect(),
+                    },
+                },
+                Override {
+                    target_path: OverridePath::from_iter([master_bitmap_id]),
+                    target_prop: BoundProp::Visible,
+                    value: OverrideValue::SwapInstance {
+                        component: swapped_component,
+                    },
+                },
+            ],
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [10.0, 10.0],
+        }));
+        instance.parent = Some(page_root);
+        doc.apply(Operation::create_node(instance))
+            .expect("create instance");
+
+        // A shape outside the page is not part of its prewarm.
+        let mut elsewhere = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::WHITE,
+        )));
+        if let NodeData::Vector(vector) = &mut elsewhere.data {
+            vector.fills.clear();
+            vector.fills.push(image_fill(unrelated_asset));
+        }
+        doc.apply(Operation::create_node(elsewhere))
+            .expect("create unrelated rectangle");
+
+        let mut expected = vec![
+            fill_asset,
+            stroke_asset,
+            background_asset,
+            override_asset,
+            master_asset,
+            swapped_asset,
+        ];
+        expected.sort();
+        assert_eq!(page_image_assets(&doc, page_root), expected);
+    }
+
+    /// The cap is checked before the decoder sees the bytes: a decoder handed
+    /// an arbitrary payload can allocate far more than it was given.
+    #[test]
+    fn add_image_refuses_bytes_over_the_source_cap() {
+        let mut stores = TestAssetStores::default();
+        let error = stores
+            .stores()
+            .add_image(vec![0; MAX_IMAGE_SOURCE_BYTES + 1])
+            .expect_err("an over-cap payload is refused");
+        assert!(
+            error
+                .to_string()
+                .contains(&MAX_IMAGE_SOURCE_BYTES.to_string()),
+            "the error names the cap: {error:#}"
+        );
+        assert!(stores.raw_assets().is_empty(), "nothing is ingested");
+        assert!(
+            stores.resolver().is_none(),
+            "no overlay resolver is installed for a refused image"
+        );
+    }
+
+    /// The write that materializes a bare `.fig`'s project on open projects
+    /// every design already; its memo is what makes the first autosave
+    /// incremental, so it must come back warm alongside the adopted root.
+    #[test]
+    fn materializing_on_open_warms_the_write_cache_and_never_overwrites_a_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fig_path = dir.path().join("Design.fig");
+        let document = FigDocument::from_doc(doc_with_one_page(), BTreeMap::new());
+
+        let materialized = materialize_project_on_open(&fig_path, &document)
+            .expect("materializes next to the .fig");
+        assert_eq!(materialized.root, dir.path().join("Design"));
+        assert!(fanta_format::is_project_dir(&materialized.root));
+        assert_eq!(
+            materialized.write_cache.cached_designs(),
+            1,
+            "the one page's projection is memoized for the first autosave"
+        );
+
+        // A project that appeared at the target since the open began is left
+        // alone.
+        assert!(materialize_project_on_open(&fig_path, &document).is_none());
+    }
+
     #[test]
     fn project_dir_prefers_the_fig_files_stem() {
         let dir = available_project_dir(Path::new("/tmp/definitely-missing-dir/Design.fig"));
@@ -2673,6 +3074,71 @@ mod tests {
         doc.set_active_page(Some(second_root));
         let document = FigDocument::from_doc(doc, BTreeMap::new());
         assert_eq!(document.doc.active_page(), Some(second_root));
+    }
+
+    /// The load that materializes a bare `.fig` hands the item both the
+    /// adopted root and the materializing write's memo; without the memo the
+    /// first autosave starts cold and re-prints every page.
+    #[gpui::test]
+    async fn the_initial_load_adopts_the_materialized_root_and_its_write_cache(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fig_path = dir.path().join("Design.fig");
+        let item = ready_item(&project, fig_path.clone(), None, Doc::new(), cx);
+        item.update(cx, |item, _| {
+            item.document = FigDocumentState::Loading {
+                message: "Opening document...".into(),
+            };
+        });
+
+        let document = FigDocument::from_doc(doc_with_one_page(), BTreeMap::new());
+        let materialized = materialize_project_on_open(&fig_path, &document)
+            .expect("materializes next to the .fig");
+        let root = materialized.root.clone();
+        item.update(cx, |item, cx| {
+            item.adopt_initial_load(Ok(document), Some(materialized), cx)
+        });
+
+        item.read_with(cx, |item, _| {
+            assert!(item.has_ready_document());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            assert_eq!(
+                item.write_cache
+                    .as_ref()
+                    .map(|cache| cache.cached_designs()),
+                Some(1),
+                "the materializing write's memo seeds the first autosave"
+            );
+            assert!(
+                item.merge_base.is_some(),
+                "disk and canvas agree right after the materializing write"
+            );
+        });
+        let key = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let shared = cx.update(|cx| shared_project_item(&key, cx));
+        assert_eq!(
+            shared.map(|shared| shared.entity_id()),
+            Some(item.entity_id()),
+            "the materialized project is registered for scoped re-opens"
+        );
+
+        // The first autosave takes the seeded memo and hands it back.
+        item.update(cx, |item, _| item.dirty = true);
+        item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+            .await
+            .expect("autosave into the materialized project");
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert_eq!(
+                item.write_cache
+                    .as_ref()
+                    .map(|cache| cache.cached_designs()),
+                Some(1),
+                "the memo survives the save round trip"
+            );
+        });
     }
 
     /// Build a `FigItem` around an already-parsed document, bypassing the async

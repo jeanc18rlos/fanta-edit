@@ -35,6 +35,7 @@ DISCOVERY_PATH = (
 )
 REQUIRED_TOOLS = [
     "get_editor_state",
+    "get_guidelines",
     "batch_get",
     "batch_design",
     "get_screenshot",
@@ -515,12 +516,12 @@ def main():
             names = sorted(tool.get("name") for tool in listed.get("tools") or [])
             missing = [name for name in REQUIRED_TOOLS if name not in names]
             report.check(
-                "tools/list carries the five canvas tools",
+                "tools/list carries the six canvas tools",
                 not missing,
                 f"missing {missing}; got {names}" if missing else ", ".join(names),
             )
         except RpcError as error:
-            report.check("tools/list carries the five canvas tools", False, str(error))
+            report.check("tools/list carries the six canvas tools", False, str(error))
 
         # --- the open document ------------------------------------------
         report.check(

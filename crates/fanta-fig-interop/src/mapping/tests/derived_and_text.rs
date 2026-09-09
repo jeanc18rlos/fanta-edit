@@ -41,7 +41,7 @@ fn derived_symbol_data_applies_baked_geometry_size_transform_on_expand() {
                     ("size", vector(10.0, 10.0)),
                     (
                         "fillPaints",
-                        KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                        KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                     ),
                 ],
             ),
@@ -58,7 +58,7 @@ fn derived_symbol_data_applies_baked_geometry_size_transform_on_expand() {
                     ),
                     (
                         "derivedSymbolData",
-                        KiwiValue::Array(vec![o(
+                        KiwiValue::array(vec![o(
                             "NodeChange",
                             vec![
                                 ("guidPath", guid_path(0, 2)),
@@ -69,7 +69,7 @@ fn derived_symbol_data_applies_baked_geometry_size_transform_on_expand() {
                                 // decoded from blob index 0.
                                 (
                                     "fillGeometry",
-                                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                                 ),
                             ],
                         )]),
@@ -158,7 +158,7 @@ fn derived_text_color_and_weight_themes_an_instance_label() {
                 // Master glyph color: near-black.
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.05, 0.05, 0.05, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.05, 0.05, 0.05, 1.0)]),
                 ),
             ],
         ),
@@ -175,14 +175,14 @@ fn derived_text_color_and_weight_themes_an_instance_label() {
                 ),
                 (
                     "derivedSymbolData",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "NodeChange",
                         vec![
                             ("guidPath", guid_path(0, 2)),
                             // Resolved (theme) glyph color: white.
                             (
                                 "fillPaints",
-                                KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                                KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
                             ),
                             // Resolved font: SemiBold (weight 600).
                             (
@@ -308,7 +308,7 @@ fn text_style_override_table_preserves_metric_changing_runs() {
                         ("characters", KiwiValue::String("Hello".to_owned())),
                         (
                             "characterStyleIDs",
-                            KiwiValue::Array(vec![
+                            KiwiValue::array(vec![
                                 KiwiValue::Uint(0),
                                 KiwiValue::Uint(1),
                                 KiwiValue::Uint(1),
@@ -318,14 +318,14 @@ fn text_style_override_table_preserves_metric_changing_runs() {
                         ),
                         (
                             "styleOverrideTable",
-                            KiwiValue::Array(vec![o(
+                            KiwiValue::array(vec![o(
                                 "NodeChange",
                                 vec![
                                     ("fontSize", KiwiValue::Float(24.0)),
                                     ("fontName", font_name("Inter", "Semi Bold Italic")),
                                     (
                                         "fillPaints",
-                                        KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                                        KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
                                     ),
                                     (
                                         "textDecoration",
@@ -376,7 +376,7 @@ fn text_style_override_table_uses_sparse_style_ids() {
                         ("characters", KiwiValue::String("Hello".to_owned())),
                         (
                             "characterStyleIDs",
-                            KiwiValue::Array(vec![
+                            KiwiValue::array(vec![
                                 KiwiValue::Uint(0),
                                 KiwiValue::Uint(20),
                                 KiwiValue::Uint(20),
@@ -386,7 +386,7 @@ fn text_style_override_table_uses_sparse_style_ids() {
                         ),
                         (
                             "styleOverrideTable",
-                            KiwiValue::Array(vec![o(
+                            KiwiValue::array(vec![o(
                                 "NodeChange",
                                 vec![
                                     ("styleID", KiwiValue::Uint(20)),
@@ -426,7 +426,7 @@ fn text_style_override_table_resolves_fill_style_refs() {
                 ("styleType", KiwiValue::Enum("FILL".into())),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(
+                    KiwiValue::array(vec![solid_paint(
                         20.0 / 255.0,
                         115.0 / 255.0,
                         230.0 / 255.0,
@@ -449,7 +449,7 @@ fn text_style_override_table_resolves_fill_style_refs() {
                             ("characters", KiwiValue::String("Hello".to_owned())),
                             (
                                 "characterStyleIDs",
-                                KiwiValue::Array(vec![
+                                KiwiValue::array(vec![
                                     KiwiValue::Uint(0),
                                     KiwiValue::Uint(20),
                                     KiwiValue::Uint(20),
@@ -459,7 +459,7 @@ fn text_style_override_table_resolves_fill_style_refs() {
                             ),
                             (
                                 "styleOverrideTable",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "NodeChange",
                                     vec![
                                         ("styleID", KiwiValue::Uint(20)),
@@ -472,7 +472,7 @@ fn text_style_override_table_resolves_fill_style_refs() {
                 ),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(
+                    KiwiValue::array(vec![solid_paint(
                         34.0 / 255.0,
                         34.0 / 255.0,
                         34.0 / 255.0,
@@ -655,7 +655,7 @@ fn font_variations_weight_axis_overrides_style_name_weight() {
             ("fontName", font_name("Inter", "Medium")),
             (
                 "fontVariations",
-                KiwiValue::Array(vec![
+                KiwiValue::array(vec![
                     variation("Weight", 2003265652, 450.0),
                     variation("Slant", 1936486004, 0.0),
                 ]),
@@ -677,7 +677,7 @@ fn font_variations_weight_axis_overrides_style_name_weight() {
             ("size", vector(100.0, 20.0)),
             ("textData", text_data("body")),
             ("fontName", font_name("Inter", "Medium")),
-            ("fontVariations", KiwiValue::Array(vec![])),
+            ("fontVariations", KiwiValue::array(vec![])),
         ],
     )]);
     let (doc, _, _) = fig_to_doc(&fig).unwrap();

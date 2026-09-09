@@ -41,12 +41,12 @@ fn gap_a_stroke_only_vector_paints_outline_as_fill_without_width_stroke() {
                 // No fillPaints at all → no visible fill.
                 (
                     "strokePaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
                 ),
                 ("strokeWeight", KiwiValue::Float(2.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -96,16 +96,16 @@ fn gap_a_vector_with_visible_fill_keeps_normal_fill_plus_stroke() {
                 ("size", vector(24.0, 18.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
                 ),
                 (
                     "strokePaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 1.0, 1.0)]),
                 ),
                 ("strokeWeight", KiwiValue::Float(2.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -150,11 +150,11 @@ fn gap_a_invisible_stroke_paint_is_not_stroke_only() {
                 ("guid", guid(0, 1)),
                 ("type", KiwiValue::Enum("VECTOR".into())),
                 ("size", vector(12.0, 10.0)),
-                ("strokePaints", KiwiValue::Array(vec![hidden_stroke])),
+                ("strokePaints", KiwiValue::array(vec![hidden_stroke])),
                 ("strokeWeight", KiwiValue::Float(2.0)),
                 (
                     "fillGeometry",
-                    KiwiValue::Array(vec![fig_path(0, "NONZERO")]),
+                    KiwiValue::array(vec![fig_path(0, "NONZERO")]),
                 ),
             ],
         )],
@@ -243,14 +243,14 @@ fn gap_c_stroke_cap_join_and_dash_are_imported() {
             ("size", vector(100.0, 50.0)),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(2.0)),
             ("strokeCap", KiwiValue::Enum("ROUND".into())),
             ("strokeJoin", KiwiValue::Enum("BEVEL".into())),
             (
                 "dashPattern",
-                KiwiValue::Array(vec![KiwiValue::Float(4.0), KiwiValue::Float(3.0)]),
+                KiwiValue::array(vec![KiwiValue::Float(4.0), KiwiValue::Float(3.0)]),
             ),
         ],
     );
@@ -276,7 +276,7 @@ fn gap_c_default_cap_join_no_dash_not_counted() {
             ("size", vector(100.0, 50.0)),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(2.0)),
         ],
@@ -305,7 +305,7 @@ fn gap_c_miter_limit_field_maps_to_miter_limit() {
             ("size", vector(100.0, 50.0)),
             (
                 "strokePaints",
-                KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
             ),
             ("strokeWeight", KiwiValue::Float(2.0)),
             ("miterLimit", KiwiValue::Float(16.0)),
@@ -998,7 +998,7 @@ fn pr4_named_flows_and_prototype_device_import() {
                 ("type", KiwiValue::Enum("CANVAS".into())),
                 (
                     "flowStartingPoints",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         o(
                             "FlowStartingPoint",
                             vec![
@@ -1112,7 +1112,7 @@ fn glass_effect_approximates_as_background_blur_and_is_counted() {
                 ("type", KiwiValue::Enum("FRAME".into())),
                 ("name", KiwiValue::String("Panel".to_owned())),
                 ("size", vector(200.0, 100.0)),
-                ("effects", KiwiValue::Array(vec![glass, noise])),
+                ("effects", KiwiValue::array(vec![glass, noise])),
             ],
         ),
     ]);
@@ -1163,7 +1163,7 @@ fn swap_state_navigation_imports_as_update_variant() {
                 ("size", vector(100.0, 40.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeInteraction",
                         vec![
                             (
@@ -1175,7 +1175,7 @@ fn swap_state_navigation_imports_as_update_variant() {
                             ),
                             (
                                 "actions",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "PrototypeAction",
                                     vec![
                                         ("navigationType", KiwiValue::Enum("SWAP_STATE".into())),

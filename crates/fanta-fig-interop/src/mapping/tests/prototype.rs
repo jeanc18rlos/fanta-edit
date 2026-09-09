@@ -34,13 +34,13 @@ fn prototype_interaction_maps_to_click_navigate_reaction() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeInteraction",
                         vec![
                             ("event", prototype_event("ON_CLICK")),
                             (
                                 "actions",
-                                KiwiValue::Array(vec![navigate_action(
+                                KiwiValue::array(vec![navigate_action(
                                     guid(0, 2),
                                     Some("DISSOLVE"),
                                 )]),
@@ -136,7 +136,7 @@ fn after_delay_trigger_converts_seconds_to_ms() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeInteraction",
                         vec![
                             (
@@ -154,7 +154,7 @@ fn after_delay_trigger_converts_seconds_to_ms() {
                             ),
                             (
                                 "actions",
-                                KiwiValue::Array(vec![navigate_action(guid(0, 2), None)]),
+                                KiwiValue::array(vec![navigate_action(guid(0, 2), None)]),
                             ),
                         ],
                     )]),
@@ -195,13 +195,13 @@ fn smart_animate_transition_is_imported() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeInteraction",
                         vec![
                             ("event", prototype_event("ON_CLICK")),
                             (
                                 "actions",
-                                KiwiValue::Array(vec![navigate_action(
+                                KiwiValue::array(vec![navigate_action(
                                     guid(0, 2),
                                     Some("SMART_ANIMATE"),
                                 )]),
@@ -283,13 +283,13 @@ fn update_variant_action_uses_real_component_member_id() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeInteraction",
                         vec![
                             ("event", prototype_event("ON_CLICK")),
                             (
                                 "actions",
-                                KiwiValue::Array(vec![o(
+                                KiwiValue::array(vec![o(
                                     "PrototypeAction",
                                     vec![
                                         ("variantNodeID", guid(0, 3)),
@@ -347,7 +347,7 @@ fn key_trigger_imports_key_codes() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeInteraction",
                         vec![
                             (
@@ -358,7 +358,7 @@ fn key_trigger_imports_key_codes() {
                                         ("interactionType", KiwiValue::Enum("ON_KEY_DOWN".into())),
                                         (
                                             "keyCodes",
-                                            KiwiValue::Array(vec![
+                                            KiwiValue::array(vec![
                                                 KiwiValue::String("Space".to_owned()),
                                                 KiwiValue::String("Enter".to_owned()),
                                             ]),
@@ -368,7 +368,7 @@ fn key_trigger_imports_key_codes() {
                             ),
                             (
                                 "actions",
-                                KiwiValue::Array(vec![navigate_action(guid(0, 2), None)]),
+                                KiwiValue::array(vec![navigate_action(guid(0, 2), None)]),
                             ),
                         ],
                     )]),
@@ -417,14 +417,14 @@ fn other_actions_imported() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         o(
                             "PrototypeInteraction",
                             vec![
                                 ("event", prototype_event("ON_CLICK")),
                                 (
                                     "actions",
-                                    KiwiValue::Array(vec![o(
+                                    KiwiValue::array(vec![o(
                                         "PrototypeAction",
                                         vec![("type", KiwiValue::Enum("BACK".into()))],
                                     )]),
@@ -437,7 +437,7 @@ fn other_actions_imported() {
                                 ("event", prototype_event("ON_CLICK")),
                                 (
                                     "actions",
-                                    KiwiValue::Array(vec![o(
+                                    KiwiValue::array(vec![o(
                                         "PrototypeAction",
                                         vec![("type", KiwiValue::Enum("CLOSE".into()))],
                                     )]),
@@ -450,7 +450,7 @@ fn other_actions_imported() {
                                 ("event", prototype_event("ON_CLICK")),
                                 (
                                     "actions",
-                                    KiwiValue::Array(vec![o(
+                                    KiwiValue::array(vec![o(
                                         "PrototypeAction",
                                         vec![
                                             ("overlayNodeID", guid(0, 3)),
@@ -466,7 +466,7 @@ fn other_actions_imported() {
                                 ("event", prototype_event("ON_CLICK")),
                                 (
                                     "actions",
-                                    KiwiValue::Array(vec![o(
+                                    KiwiValue::array(vec![o(
                                         "PrototypeAction",
                                         vec![("targetNodeID", guid(0, 4))],
                                     )]),
@@ -541,14 +541,14 @@ fn slide_transition_and_empty_key_import() {
                 ("size", vector(100.0, 100.0)),
                 (
                     "prototypeInteractions",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         o(
                             "PrototypeInteraction",
                             vec![
                                 ("event", prototype_event("ON_CLICK")),
                                 (
                                     "actions",
-                                    KiwiValue::Array(vec![navigate_action(
+                                    KiwiValue::array(vec![navigate_action(
                                         guid(0, 2),
                                         Some("SLIDE_FROM_LEFT"),
                                     )]),
@@ -570,7 +570,7 @@ fn slide_transition_and_empty_key_import() {
                                 ),
                                 (
                                     "actions",
-                                    KiwiValue::Array(vec![navigate_action(guid(0, 3), None)]),
+                                    KiwiValue::array(vec![navigate_action(guid(0, 3), None)]),
                                 ),
                             ],
                         ),
@@ -636,7 +636,7 @@ fn frame_a_with_actions(actions: Vec<KiwiValue>) -> FigDocument {
         "PrototypeInteraction",
         vec![
             ("event", prototype_event("ON_CLICK")),
-            ("actions", KiwiValue::Array(actions)),
+            ("actions", KiwiValue::array(actions)),
         ],
     )])
 }
@@ -650,7 +650,7 @@ fn frame_a_with_interactions(interactions: Vec<KiwiValue>) -> FigDocument {
                 ("type", KiwiValue::Enum("FRAME".into())),
                 ("name", KiwiValue::String("A".to_owned())),
                 ("size", vector(100.0, 100.0)),
-                ("prototypeInteractions", KiwiValue::Array(interactions)),
+                ("prototypeInteractions", KiwiValue::array(interactions)),
             ],
         ),
         o(
@@ -735,7 +735,7 @@ fn pr6_out_transitions_and_scroll_animate_map() {
                 (
                     "actions",
                     // Figma's UI spelling ("slide out TO left").
-                    KiwiValue::Array(vec![navigate_action(guid(0, 2), Some("SLIDE_OUT_TO_LEFT"))]),
+                    KiwiValue::array(vec![navigate_action(guid(0, 2), Some("SLIDE_OUT_TO_LEFT"))]),
                 ),
             ],
         ),
@@ -747,7 +747,7 @@ fn pr6_out_transitions_and_scroll_animate_map() {
                     "actions",
                     // The shorter spelling must map identically (ASSUMPTION in
                     // reactions.rs — internal member name unpinned).
-                    KiwiValue::Array(vec![navigate_action(guid(0, 2), Some("MOVE_OUT_RIGHT"))]),
+                    KiwiValue::array(vec![navigate_action(guid(0, 2), Some("MOVE_OUT_RIGHT"))]),
                 ),
             ],
         ),
@@ -757,7 +757,7 @@ fn pr6_out_transitions_and_scroll_animate_map() {
                 ("event", prototype_event("ON_CLICK")),
                 (
                     "actions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeAction",
                         vec![
                             ("targetNodeID", guid(0, 3)),
@@ -811,7 +811,7 @@ fn pr7_spring_preset_and_custom_params_map() {
                 ("event", prototype_event("ON_CLICK")),
                 (
                     "actions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeAction",
                         vec![
                             ("transitionNodeID", guid(0, 2)),
@@ -828,7 +828,7 @@ fn pr7_spring_preset_and_custom_params_map() {
                 ("event", prototype_event("ON_CLICK")),
                 (
                     "actions",
-                    KiwiValue::Array(vec![o(
+                    KiwiValue::array(vec![o(
                         "PrototypeAction",
                         vec![
                             ("transitionNodeID", guid(0, 2)),
@@ -884,7 +884,7 @@ fn pr8_hover_family_triggers_map_distinctly() {
                 ("event", prototype_event(trigger)),
                 (
                     "actions",
-                    KiwiValue::Array(vec![navigate_action(guid(0, 2), None)]),
+                    KiwiValue::array(vec![navigate_action(guid(0, 2), None)]),
                 ),
             ],
         )
@@ -920,7 +920,7 @@ fn pr8_unknown_trigger_drops_the_reaction_and_counts_it() {
                 ("event", prototype_event("ON_MEDIA_END")),
                 (
                     "actions",
-                    KiwiValue::Array(vec![navigate_action(guid(0, 2), None)]),
+                    KiwiValue::array(vec![navigate_action(guid(0, 2), None)]),
                 ),
             ],
         ),
@@ -930,7 +930,7 @@ fn pr8_unknown_trigger_drops_the_reaction_and_counts_it() {
                 ("event", prototype_event("ON_CLICK")),
                 (
                     "actions",
-                    KiwiValue::Array(vec![navigate_action(guid(0, 3), None)]),
+                    KiwiValue::array(vec![navigate_action(guid(0, 3), None)]),
                 ),
             ],
         ),

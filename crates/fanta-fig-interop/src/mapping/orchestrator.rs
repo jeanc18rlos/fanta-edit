@@ -4,15 +4,15 @@
 
 use super::{
     AssetId, BoundProp, CanvasNode, Doc, FigDocument, FigError, FigResult, Fill, GroupNode,
-    HashMap, KiwiValue, MapReport, NodeBuild, NodeData, NodeId, PendingMotion, PropDefInfo,
-    PropRefKind, Stroke, VarValue, VariableId, VariableType, apply_bindings, apply_explicit_modes,
-    apply_instance_overrides, apply_motion, apply_paint_color_bindings, apply_reactions,
-    asset_id_for_image, build_components_and_sets, build_node, build_stroke, build_variables,
-    clips_content, collect_motion_change, collect_motion_consumers, collect_prop_def_infos,
-    guid_key, hide_master_variant_placeholders, image_hash_hex, is_state_group, node_name,
-    populate_instance_prop_values, read_component_prop_refs, read_explicit_modes, read_fills,
-    read_paint, read_paint_color_bindings, read_pending_variable, read_prop_defs_raw,
-    read_set_modes, resolve_style_references, tally_fidelity,
+    HashMap, IndexKey, KiwiValue, MapReport, NodeBuild, NodeData, NodeId, PendingMotion,
+    PropDefInfo, PropRefKind, Stroke, VarValue, VariableId, VariableType, apply_bindings,
+    apply_explicit_modes, apply_instance_overrides, apply_motion, apply_paint_color_bindings,
+    apply_reactions, asset_id_for_image, build_components_and_sets, build_node, build_stroke,
+    build_variables, clips_content, collect_motion_change, collect_motion_consumers,
+    collect_prop_def_infos, guid_key, hide_master_variant_placeholders, image_hash_hex,
+    is_state_group, node_name, populate_instance_prop_values, read_component_prop_refs,
+    read_explicit_modes, read_fills, read_paint, read_paint_color_bindings, read_pending_variable,
+    read_prop_defs_raw, read_set_modes, resolve_style_references, tally_fidelity,
 };
 use std::collections::HashSet;
 
@@ -66,6 +66,11 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     let mut guid_to_position: HashMap<String, Option<String>> = HashMap::new();
     // The order nodes were created, so attachment is deterministic.
     let mut order: Vec<String> = Vec::new();
+    // Every node pass 1 built, parentless until pass 2 has resolved each
+    // parent and z-index and inserts the whole document into the scene in one
+    // batch. Boxed as `build_node` hands them over, so the map holds pointers
+    // rather than shuffling the nodes themselves.
+    let mut built: HashMap<NodeId, Box<CanvasNode>> = HashMap::new();
     // Node ids of CANVAS-derived nodes, in document order, registered as pages
     // once the scene is fully assembled.
     let mut page_ids: Vec<NodeId> = Vec::new();
@@ -186,7 +191,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
 
         match build_node(type_name, change, &fig.blobs) {
             NodeBuild::Node {
-                mut node,
+                node,
                 is_page,
                 geometry_decoded,
             } => {
@@ -194,24 +199,13 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
                 if node.constraints.is_some() {
                     report.constraints_imported += 1;
                 }
-                // Every node lands at the root for now (pass 2 detaches and
-                // re-attaches all of them). The root bucket is a Vec sorted by
-                // (index, id); with every node at `IndexKey::FIRST` the order
-                // falls to the id, so each insert memmoves past every
-                // same-millisecond ULID already present — a cost that grows
-                // with how fast ids are minted. A key above every sibling
-                // keeps the insert an append.
-                node.index = doc.scene.next_root_index();
-                doc.scene
-                    .insert(*node)
-                    .map_err(|e| FigError::Mapping(e.to_string()))?;
                 guid_to_node.insert(guid.clone(), Some(id));
                 if is_page {
                     page_ids.push(id);
                 }
                 report.mapped += 1;
-                tally_recovered_geometry(&mut report, &doc, id, type_name, geometry_decoded);
-                tally_fidelity(&mut report, change, doc.scene.get(id));
+                tally_recovered_geometry(&mut report, &node, type_name, geometry_decoded);
+                tally_fidelity(&mut report, change, Some(&node));
                 // Count frame-like containers whose "clip content" toggle is OFF
                 // (`frameMaskDisabled == true`), so they import with their box
                 // intact and `meta.clip_content=false`. Counted off the source
@@ -227,6 +221,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
 
                 collect_typed_side_tables(&mut pending, &mut report, type_name, &guid, id, change);
                 collect_per_node_side_tables(&mut pending, &guid, id, change);
+                built.insert(id, node);
             }
             NodeBuild::Structural => {
                 guid_to_node.insert(guid, None);
@@ -260,24 +255,17 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     // Which NodeIds are instances — so pass 2 can prune their virtual subtrees.
     // An INSTANCE only becomes `NodeData::Instance` when it named a component;
     // one without a symbol ref fell back to a Group and keeps its real children.
-    // Nodes are still detached at this point (pass 2 wires parentage), so we
-    // consult the guid→NodeId map directly rather than a scene walk.
-    let all_instance_ids: std::collections::HashSet<NodeId> = guid_to_node
-        .values()
-        .filter_map(|opt| *opt)
-        .filter(|id| {
-            matches!(
-                doc.scene.get(*id).map(|n| &n.data),
-                Some(NodeData::Instance(_))
-            )
-        })
+    let all_instance_ids: HashSet<NodeId> = built
+        .iter()
+        .filter(|(_, node)| matches!(node.data, NodeData::Instance(_)))
+        .map(|(id, _)| *id)
         .collect();
 
     // ---- pass 2: attach to parents ----
     //
     // The order we *attach* siblings in is what mints their `IndexKey` z-order
-    // (each `set_parent`/`set_index` via `next_child_index` lands ABOVE the last
-    // sibling attached under that parent — higher key = painted later = on top).
+    // (each sibling planned under a parent lands ABOVE the last one planned
+    // there — higher key = painted later = on top).
     // Figma's `.fig` stores nodes in an arbitrary STREAM order that is unrelated
     // to stacking; the authoritative sibling order lives in
     // `parentIndex.position` (a fractional-index STRING, compared
@@ -292,6 +280,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     attach_to_parents(
         &mut doc,
         &mut report,
+        built,
         &attach_order,
         &guid_to_parent,
         &mut guid_to_node,
@@ -453,97 +442,157 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     Ok((doc, report, assets))
 }
 
-/// Pass 2 — attach each recognized node to its resolved parent in `attach_order`.
-/// The order siblings are attached in mints their `IndexKey` z-order, so this
-/// visits nodes in Figma's authoritative sibling order. A node inside an
-/// instance's virtual subtree (or under a non-container) is dropped — partial
-/// import beats a hard failure.
+/// Pass 2 — resolve each recognized node's parent and z-index in
+/// `attach_order`, then insert the whole document into the scene as one
+/// batch. The order siblings are planned in mints their `IndexKey` z-order,
+/// so this visits nodes in Figma's authoritative sibling order. A node inside
+/// an instance's virtual subtree (or under a non-container) is dropped —
+/// partial import beats a hard failure — and takes any descendant planned
+/// before it along, exactly as removing its subtree from a live scene would.
 fn attach_to_parents(
     doc: &mut Doc,
     report: &mut MapReport,
+    mut built: HashMap<NodeId, Box<CanvasNode>>,
     attach_order: &[String],
     guid_to_parent: &HashMap<String, Option<String>>,
     guid_to_node: &mut HashMap<String, Option<NodeId>>,
-    all_instance_ids: &std::collections::HashSet<NodeId>,
+    all_instance_ids: &HashSet<NodeId>,
 ) -> FigResult<()> {
-    // Pass 1 inserted every node as a root, so the root child bucket holds
-    // the whole document; per-node `set_parent` removal from that bucket is
-    // O(N) scan + memmove, which is quadratic over a large import. Detach the
-    // whole attach set in one pass first — every node below is re-attached
-    // (or removed as instance-virtual) by this very loop.
-    let attach_set: std::collections::HashSet<NodeId> = attach_order
-        .iter()
-        .filter_map(|guid| guid_to_node.get(guid).copied().flatten())
-        .collect();
-    doc.scene.detach_many(&attach_set);
+    let mut plan = AttachPlan::default();
     for guid in attach_order {
         let Some(Some(node_id)) = guid_to_node.get(guid).copied() else {
             continue; // structural/unsupported/skipped — nothing to attach
         };
         match resolve_parent(guid, guid_to_parent, guid_to_node, all_instance_ids) {
             ParentResolution::Node(parent_id) => {
-                attach_under_node(doc, report, guid, node_id, parent_id, guid_to_node)?;
+                // The resolved parent should be a container, but a malformed /
+                // unusual chain can land on a non-container (e.g. an instance
+                // the pre-scan missed) or on a node already dropped with its
+                // subtree; rather than abort the whole import, that node is
+                // treated as virtual instance content and dropped.
+                let parent_accepts_children = built
+                    .get(&parent_id)
+                    .is_some_and(|parent| parent.can_have_children());
+                if parent_accepts_children {
+                    plan.attach(&mut built, node_id, Some(parent_id));
+                } else {
+                    drop_virtual_node(report, guid, node_id, &mut built, &mut plan, guid_to_node);
+                }
             }
-            ParentResolution::Root => {
-                let idx = doc.scene.next_root_index();
-                doc.scene
-                    .set_index(node_id, idx)
-                    .map_err(|e| FigError::Mapping(e.to_string()))?;
-            }
+            ParentResolution::Root => plan.attach(&mut built, node_id, None),
             ParentResolution::InsideInstance => {
                 // Inside an instance's virtual subtree — drop it. The expansion
                 // (`expand_instance`) reproduces this content from the master.
-                drop_virtual_node(doc, report, guid, node_id, guid_to_node)?;
+                drop_virtual_node(report, guid, node_id, &mut built, &mut plan, guid_to_node);
             }
         }
     }
-    Ok(())
-}
-
-/// Attach `node_id` under the recognized container `parent_id`. The resolved
-/// parent should be a container, but a malformed/unusual chain can land on a
-/// non-container (e.g. an instance the pre-scan missed); rather than abort the
-/// whole import, that node is treated as virtual instance content and dropped.
-fn attach_under_node(
-    doc: &mut Doc,
-    report: &mut MapReport,
-    guid: &str,
-    node_id: NodeId,
-    parent_id: NodeId,
-    guid_to_node: &mut HashMap<String, Option<NodeId>>,
-) -> FigResult<()> {
-    let idx = doc.scene.next_child_index(Some(parent_id));
-    if doc
-        .scene
-        .get(parent_id)
-        .map(|p| !p.can_have_children())
-        .unwrap_or(true)
-    {
-        return drop_virtual_node(doc, report, guid, node_id, guid_to_node);
+    // A node the loop above never reached: pass 1 built it, but a LATER change
+    // sharing its guid (a motion change, a structural node, an unsupported one)
+    // overwrote `guid_to_node[guid]` with `None`, so the loop skipped it and it
+    // is in neither `plan.order` nor the dropped set. Before pass 2 planned the
+    // whole batch, pass 1 inserted every built node at the root and only
+    // re-parented what it visited, so these landed as root layers; keep that
+    // rather than discarding content with no counter. Sorted so the order is
+    // the pass-1 build order (ULIDs are minted in sequence) and not the
+    // `built` map's iteration order.
+    let mut unplanned: Vec<NodeId> = built
+        .keys()
+        .copied()
+        .filter(|id| !plan.planned.contains(id))
+        .collect();
+    unplanned.sort_unstable();
+    for id in unplanned {
+        plan.attach(&mut built, id, None);
     }
+    // A dropped subtree's descendants are still listed in `plan.order`; they
+    // left `built` when their ancestor was dropped, so the filter skips them.
+    let batch = plan
+        .order
+        .into_iter()
+        .filter_map(|id| built.remove(&id))
+        .map(|node| *node);
     doc.scene
-        .set_parent(node_id, Some(parent_id), idx)
+        .insert_many(batch)
         .map_err(|e| FigError::Mapping(e.to_string()))?;
     Ok(())
 }
 
-/// Remove a node that lives in an instance's virtual subtree (or under a
-/// non-container), update the mapped/dropped counters, and forget its guid→id
-/// mapping so later passes don't reference a dead node.
+/// Pass 2's stand-in for the live scene while parents and z-indexes are
+/// resolved: which nodes attach under which parent, in what order, and the
+/// key the next sibling under each parent takes — what
+/// `Scene::next_child_index` would answer had the nodes already been
+/// inserted one by one.
+#[derive(Default)]
+struct AttachPlan {
+    /// Planned nodes in attach order — the batch handed to `insert_many`.
+    order: Vec<NodeId>,
+    /// Planned children per parent, so dropping a parent drops the subtree
+    /// planned under it.
+    children: HashMap<NodeId, Vec<NodeId>>,
+    /// The highest `IndexKey` minted under each parent (`None` = root) so far.
+    last_index: HashMap<Option<NodeId>, IndexKey>,
+    /// Every node the plan has decided on — attached or dropped. What is built
+    /// but in neither set was never visited, and would otherwise be discarded
+    /// silently when the batch is filtered out of `order`.
+    planned: HashSet<NodeId>,
+}
+
+impl AttachPlan {
+    fn attach(
+        &mut self,
+        built: &mut HashMap<NodeId, Box<CanvasNode>>,
+        id: NodeId,
+        parent: Option<NodeId>,
+    ) {
+        let Some(node) = built.get_mut(&id) else {
+            return;
+        };
+        self.planned.insert(id);
+        let index = self
+            .last_index
+            .get(&parent)
+            .copied()
+            .map(IndexKey::after)
+            .unwrap_or(IndexKey::FIRST);
+        node.parent = parent;
+        node.index = index;
+        self.last_index.insert(parent, index);
+        self.order.push(id);
+        if let Some(parent) = parent {
+            self.children.entry(parent).or_default().push(id);
+        }
+    }
+
+    /// Forget `root` and every node planned under it, transitively.
+    fn drop_subtree(&mut self, built: &mut HashMap<NodeId, Box<CanvasNode>>, root: NodeId) {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            self.planned.insert(id);
+            built.remove(&id);
+            if let Some(children) = self.children.remove(&id) {
+                stack.extend(children);
+            }
+        }
+    }
+}
+
+/// Drop a node that lives in an instance's virtual subtree (or under a
+/// non-container) together with whatever was planned under it, update the
+/// mapped/dropped counters, and forget its guid→id mapping so later passes
+/// don't reference a node that never reached the scene.
 fn drop_virtual_node(
-    doc: &mut Doc,
     report: &mut MapReport,
     guid: &str,
     node_id: NodeId,
+    built: &mut HashMap<NodeId, Box<CanvasNode>>,
+    plan: &mut AttachPlan,
     guid_to_node: &mut HashMap<String, Option<NodeId>>,
-) -> FigResult<()> {
-    doc.scene
-        .remove(node_id)
-        .map_err(|e| FigError::Mapping(e.to_string()))?;
+) {
+    plan.drop_subtree(built, node_id);
     report.mapped = report.mapped.saturating_sub(1);
     report.instance_children_dropped += 1;
     guid_to_node.insert(guid.to_owned(), None);
-    Ok(())
 }
 
 /// Relocate component masters (and component-set roots) under the hidden
@@ -686,13 +735,12 @@ struct Pending<'a> {
     motion: PendingMotion,
 }
 
-/// Tally a freshly-inserted node's geometry-recovery counters: decoded-vs-fallback
+/// Tally a freshly-built node's geometry-recovery counters: decoded-vs-fallback
 /// geometry (splitting out the `vector_network` blob fallback by `meta`) and the
 /// VECTOR-family recovery count.
 fn tally_recovered_geometry(
     report: &mut MapReport,
-    doc: &Doc,
-    id: NodeId,
+    node: &CanvasNode,
     type_name: &str,
     geometry_decoded: bool,
 ) {
@@ -700,13 +748,7 @@ fn tally_recovered_geometry(
         report.geometry_decoded += 1;
         // STEP 2b vectorNetworkBlob fallbacks are tagged in `meta` so the fixture
         // report can split them out of `geometry_decoded`.
-        if doc
-            .scene
-            .get(id)
-            .and_then(|n| n.meta.get("geometry"))
-            .and_then(|g| g.as_str())
-            == Some("vector_network")
-        {
+        if node.meta.get("geometry").and_then(|g| g.as_str()) == Some("vector_network") {
             report.vector_network_decoded += 1;
         }
     }

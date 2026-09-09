@@ -1269,6 +1269,7 @@ mod tests {
                 variant_of: None,
                 props: Vec::new(),
                 rev: 0,
+                preview_rev: 0,
             }),
         })
         .unwrap();

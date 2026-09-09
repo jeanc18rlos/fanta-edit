@@ -8,9 +8,10 @@ use std::collections::HashSet;
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp, Doc, Easing,
-    Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, MotionTarget,
-    MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue, Transaction, Viewport,
+    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, BoundProp,
+    CanvasNode, Doc, Easing, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
+    MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue,
+    Transaction, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -45,7 +46,8 @@ use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
 use crate::document::{
-    AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigScope, SaveKind, ScopeRequester,
+    AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigScope, MAX_IMAGE_SOURCE_BYTES,
+    SaveKind, ScopeRequester,
 };
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
@@ -2708,14 +2710,7 @@ impl FigView {
                 if groups.is_empty() {
                     anyhow::bail!("select a group or frame to ungroup");
                 }
-                let mut operations = Vec::new();
-                let mut children = Vec::new();
-                for group in groups {
-                    let ungrouped = crate::structure::ungroup_operations(doc, group)?;
-                    operations.extend(ungrouped.operations);
-                    children.extend(ungrouped.children);
-                }
-                Ok((operations, children))
+                crate::structure::ungroup_many_operations(doc, &groups)
             },
             window,
             cx,
@@ -2886,10 +2881,8 @@ impl FigView {
         self.finish_document_edits(cx);
         let read = cx.background_spawn(async move {
             paths
-                .into_iter()
-                .map(|path| {
-                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
-                })
+                .iter()
+                .map(|path| read_pastable_image_file(path))
                 .collect::<Vec<Result<Vec<u8>>>>()
         });
         cx.spawn(async move |this, cx| {
@@ -2916,9 +2909,10 @@ impl FigView {
         .detach_and_log_err(cx);
     }
 
-    /// Ingest each image as a project asset and place it as a bitmap layer
-    /// centred on the viewport, one "Paste image" transaction per image so
-    /// a corrupt file in the middle of a batch does not undo its neighbours.
+    /// Ingest every image as a project asset and place them as bitmap layers
+    /// centred on the viewport in one transaction, so a multi-file paste is a
+    /// single undo step. An image that cannot be ingested (undecodable, or
+    /// over the asset cap) is reported and skipped without failing the rest.
     fn place_pasted_images(&mut self, images: Vec<Vec<u8>>, cx: &mut Context<Self>) {
         let viewport = self.viewport.unwrap_or(Viewport {
             center: [0.0, 0.0],
@@ -2930,33 +2924,41 @@ impl FigView {
             .map(|(width, height)| [width / viewport.zoom, height / viewport.zoom])
             .unwrap_or([1024.0, 768.0]);
 
-        let mut placed = Vec::new();
-        for (position, bytes) in images.into_iter().enumerate() {
-            let offset = position as f64 * 16.0;
-            let result = self.item.update(cx, |item, cx| {
-                item.with_document(cx, |document| {
-                    let (doc, mut assets) = document.doc_and_assets();
-                    match paste_image(doc, &mut assets, bytes, viewport.center, visible, offset) {
-                        Ok(id) => (Ok(id), DocChange::Content),
-                        Err(error) => (Err(error), DocChange::None),
+        let pasted = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (doc, mut assets) = document.doc_and_assets();
+                match paste_images(doc, &mut assets, images, viewport.center, visible) {
+                    Ok(pasted) => {
+                        let change = if pasted.placed.is_empty() {
+                            DocChange::None
+                        } else {
+                            DocChange::Content
+                        };
+                        (Ok(pasted), change)
                     }
-                })
-                .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
-            });
-            match result {
-                Ok(id) => placed.push(id),
-                Err(error) => {
-                    log::warn!("pasting an image failed: {error:#}");
-                    show_canvas_notice_deferred(format!("Pasting an image failed: {error:#}"), cx);
+                    Err(error) => (Err(error), DocChange::None),
                 }
+            })
+            .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
+        });
+        let pasted = match pasted {
+            Ok(pasted) => pasted,
+            Err(error) => {
+                log::warn!("pasting images failed: {error:#}");
+                show_canvas_notice_deferred(format!("Pasting images failed: {error:#}"), cx);
+                return;
             }
+        };
+        for error in &pasted.skipped {
+            log::warn!("pasting an image failed: {error:#}");
+            show_canvas_notice_deferred(format!("Pasting an image failed: {error:#}"), cx);
         }
-        if placed.is_empty() {
+        if pasted.placed.is_empty() {
             return;
         }
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                document.doc.selection.replace_with(placed);
+                document.doc.selection.replace_with(pasted.placed);
                 ((), DocChange::Selection)
             });
         });
@@ -4746,56 +4748,108 @@ fn is_pastable_image_path(path: &std::path::Path) -> bool {
         })
 }
 
-/// Ingest `bytes` as an asset and create its bitmap layer on the active page,
-/// centred on `center` (world) at natural size, shrunk to fit 80% of the
-/// `visible` world-space viewport when larger. The asset is dropped again
-/// when the node cannot be created so a failed paste leaves no orphan bytes.
-fn paste_image(
+/// Read an image file for pasting, refusing one over the asset cap before its
+/// bytes are read or decoded.
+fn read_pastable_image_file(path: &std::path::Path) -> Result<Vec<u8>> {
+    let length = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if usize::try_from(length)
+        .ok()
+        .is_none_or(|length| length > MAX_IMAGE_SOURCE_BYTES)
+    {
+        anyhow::bail!(
+            "{} is {length} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES} bytes",
+            path.display()
+        );
+    }
+    std::fs::read(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// What a paste of several images produced.
+struct PastedImages {
+    placed: Vec<NodeId>,
+    /// Images that could not be ingested (undecodable, or over the asset
+    /// cap); they are skipped rather than failing their neighbours.
+    skipped: Vec<anyhow::Error>,
+}
+
+/// Ingest `images` as assets, then create one bitmap layer per image on the
+/// active page in a single transaction: each centred on `center` (world) at
+/// natural size, shrunk to fit 80% of the `visible` world-space viewport when
+/// larger, and cascaded by 16 world units so a batch stays distinguishable.
+/// Every ingested asset is dropped again when the layers cannot be created,
+/// so a failed paste leaves no orphan bytes.
+fn paste_images(
     doc: &mut Doc,
     assets: &mut AssetStores<'_>,
-    bytes: Vec<u8>,
+    images: Vec<Vec<u8>>,
     center: [f64; 2],
     visible: [f64; 2],
-    offset: f64,
-) -> Result<NodeId> {
-    let (asset, natural_size) = assets.add_image(bytes)?;
-    let natural = [
-        f64::from(natural_size[0].max(1)),
-        f64::from(natural_size[1].max(1)),
-    ];
-    let mut fit = 1.0_f64;
-    for axis in 0..2 {
-        if visible[axis].is_finite() && visible[axis] > 0.0 {
-            fit = fit.min(visible[axis] * 0.8 / natural[axis]);
+) -> Result<PastedImages> {
+    let mut ingested = Vec::new();
+    let mut skipped = Vec::new();
+    for bytes in images {
+        match assets.add_image(bytes) {
+            Ok(image) => ingested.push(image),
+            Err(error) => skipped.push(error),
         }
     }
-    let size = [natural[0] * fit, natural[1] * fit];
-    let x = center[0] - size[0] * 0.5 + offset;
-    let y = center[1] - size[1] * 0.5 + offset;
-    let node = match crate::structure::image_layer_node(
-        doc,
-        asset,
-        natural_size,
-        size,
-        None,
-        x,
-        y,
-        None,
-    ) {
-        Ok(node) => node,
+    match place_ingested_images(doc, &ingested, center, visible) {
+        Ok(placed) => Ok(PastedImages { placed, skipped }),
         Err(error) => {
-            assets.remove(asset);
-            return Err(error);
-        }
-    };
-    let id = node.id;
-    match apply_canvas_transaction(doc, "Paste image", vec![Operation::create_node(node)]) {
-        Ok(_) => Ok(id),
-        Err(error) => {
-            assets.remove(asset);
+            for (asset, _) in ingested {
+                assets.remove(asset);
+            }
             Err(error)
         }
     }
+}
+
+fn place_ingested_images(
+    doc: &mut Doc,
+    ingested: &[(AssetId, [u32; 2])],
+    center: [f64; 2],
+    visible: [f64; 2],
+) -> Result<Vec<NodeId>> {
+    let mut nodes: Vec<CanvasNode> = Vec::with_capacity(ingested.len());
+    for (position, (asset, natural_size)) in ingested.iter().copied().enumerate() {
+        let natural = [
+            f64::from(natural_size[0].max(1)),
+            f64::from(natural_size[1].max(1)),
+        ];
+        let mut fit = 1.0_f64;
+        for axis in 0..2 {
+            if visible[axis].is_finite() && visible[axis] > 0.0 {
+                fit = fit.min(visible[axis] * 0.8 / natural[axis]);
+            }
+        }
+        let size = [natural[0] * fit, natural[1] * fit];
+        let offset = position as f64 * 16.0;
+        let x = center[0] - size[0] * 0.5 + offset;
+        let y = center[1] - size[1] * 0.5 + offset;
+        let mut node =
+            crate::structure::image_layer_node(doc, asset, natural_size, size, None, x, y, None)?;
+        // `image_layer_node` mints its key from the scene, which does not see
+        // the layers built earlier in this loop until the transaction applies,
+        // so later images stack above the ones before them explicitly.
+        if let Some(previous) = nodes.last() {
+            node.index = IndexKey::after(previous.index);
+        }
+        nodes.push(node);
+    }
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placed: Vec<NodeId> = nodes.iter().map(|node| node.id).collect();
+    let label = if nodes.len() == 1 {
+        "Paste image"
+    } else {
+        "Paste images"
+    };
+    let operations = nodes.into_iter().map(Operation::create_node).collect();
+    apply_canvas_transaction(doc, label, operations)?;
+    Ok(placed)
 }
 
 fn motion_property(property: TimelineProperty) -> MotionProperty {

@@ -45,7 +45,7 @@ fn frame_with_rectangle_maps_to_group_with_vector_child() {
                 ("size", vector(100.0, 50.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
                 ),
             ],
         ),
@@ -155,7 +155,7 @@ fn frame_import_preserves_stacked_background_fills() {
                 ("size", vector(100.0, 80.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![
+                    KiwiValue::array(vec![
                         solid_paint(1.0, 0.0, 0.0, 1.0),
                         solid_paint(0.0, 0.0, 1.0, 1.0),
                     ]),
@@ -389,7 +389,7 @@ fn text_node_maps_to_text_with_content_size_weight_and_align() {
             ("textAlignHorizontal", KiwiValue::Enum("CENTER".into())),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+                KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
             ),
         ],
     )]);
@@ -545,7 +545,7 @@ fn invisible_and_gradient_paints_are_not_taken_as_solid_fill() {
             ("size", vector(10.0, 10.0)),
             (
                 "fillPaints",
-                KiwiValue::Array(vec![invisible_solid, gradient]),
+                KiwiValue::array(vec![invisible_solid, gradient]),
             ),
         ],
     )]);
@@ -589,7 +589,7 @@ fn end_to_end_through_the_container() {
                 ("size", vector(64.0, 64.0)),
                 (
                     "fillPaints",
-                    KiwiValue::Array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
                 ),
             ],
         ),

@@ -111,7 +111,8 @@ pub struct Scene {
     /// *could* invalidate an entry clears the **whole** cache
     /// ([`Scene::clear_derived_caches`]):
     ///
-    /// - [`Scene::insert`], [`Scene::remove`] — add/drop nodes and subtrees.
+    /// - [`Scene::insert`], [`Scene::insert_many`], [`Scene::remove`] — add/drop
+    ///   nodes and subtrees.
     /// - [`Scene::set_parent`], [`Scene::set_index`] — change ancestor chains.
     /// - [`Scene::rebuild_child_index`] — wholesale index rebuild after load.
     /// - [`Scene::get_mut`] — opaque `&mut CanvasNode`; the caller may write
@@ -338,11 +339,16 @@ impl Scene {
         // transform cache. A node's cached world transform is the product of
         // its and its ancestors' locals, so a mutated `transform` here would
         // also invalidate every descendant — clearing wholesale covers that.
+        //
+        // A missing id hands out nothing, so nothing can change: bail before
+        // touching the caches or the log, otherwise every probe for a stale
+        // id would force a render-thread copy to refresh for no reason.
+        if !self.nodes.contains_key(&id) {
+            return None;
+        }
         self.clear_derived_caches();
         self.record_change(SceneChange::Node(id));
-        if self.nodes.contains_key(&id) {
-            self.touch_stamp(id);
-        }
+        self.touch_stamp(id);
         self.nodes.get_mut(&id)
     }
 
@@ -406,6 +412,140 @@ impl Scene {
             self.touch_stamp(parent);
         }
         Ok(id)
+    }
+
+    /// Insert a batch of nodes as ONE structural edit: one derived-cache
+    /// clear, one [`SceneChange::Structural`] log entry, one revision bump,
+    /// and each touched child bucket sorted once instead of one binary-search
+    /// insert per node. The result is byte-for-byte what inserting the same
+    /// nodes one at a time with [`Scene::insert`] (in any valid order) would
+    /// have produced: `children_of` is the `(index, id)` total order either
+    /// way. Returns the inserted ids in batch order; an empty batch is a
+    /// no-op that leaves the revision alone.
+    ///
+    /// Every node's `parent` and `index` are honored as-is. A parent may be
+    /// an existing node or another node anywhere in the batch (before or
+    /// after its child); either way it must be able to have children. The
+    /// whole batch is validated first — duplicate ids within the batch or
+    /// against the scene, a missing or non-container parent, a parent chain
+    /// that cycles inside the batch — so an error leaves the scene untouched.
+    pub fn insert_many(
+        &mut self,
+        nodes: impl IntoIterator<Item = CanvasNode>,
+    ) -> Result<Vec<NodeId>, SceneError> {
+        let batch: Vec<CanvasNode> = nodes.into_iter().collect();
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut batch_position: IdHashMap<NodeId, usize> = IdHashMap::default();
+        batch_position.reserve(batch.len());
+        for (position, node) in batch.iter().enumerate() {
+            if self.nodes.contains_key(&node.id)
+                || batch_position.insert(node.id, position).is_some()
+            {
+                return Err(SceneError::Duplicate(node.id));
+            }
+        }
+        for node in &batch {
+            let Some(parent) = node.parent else {
+                continue;
+            };
+            let parent_node = match self.nodes.get(&parent) {
+                Some(existing) => existing,
+                None => batch_position
+                    .get(&parent)
+                    .and_then(|position| batch.get(*position))
+                    .ok_or(SceneError::ParentMissing(parent))?,
+            };
+            if !parent_node.can_have_children() {
+                return Err(SceneError::ParentNotContainer(parent));
+            }
+        }
+        Self::check_batch_acyclic(&batch, &batch_position)?;
+
+        let mut new_children: IdHashMap<Option<NodeId>, Vec<NodeId>> = IdHashMap::default();
+        let mut inserted = Vec::with_capacity(batch.len());
+        for node in batch {
+            let id = node.id;
+            new_children.entry(node.parent).or_default().push(id);
+            self.nodes.insert(id, node);
+            inserted.push(id);
+        }
+        let mut touched_parents = Vec::with_capacity(new_children.len());
+        for (parent, mut children) in new_children {
+            let bucket = self.child_index.entry(parent).or_default();
+            bucket.append(&mut children);
+            sort_children(&self.nodes, bucket);
+            if let Some(parent) = parent {
+                touched_parents.push(parent);
+            }
+        }
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
+        for id in inserted.iter().chain(touched_parents.iter()) {
+            self.touch_stamp(*id);
+        }
+        Ok(inserted)
+    }
+
+    /// Refuse a batch whose parent links, followed through nodes of the batch
+    /// itself, come back around. Parents already in the scene end a walk:
+    /// the scene is acyclic and a batch node cannot become an ancestor of an
+    /// existing one. Each node is walked once, so this is linear in the batch.
+    fn check_batch_acyclic(
+        batch: &[CanvasNode],
+        batch_position: &IdHashMap<NodeId, usize>,
+    ) -> Result<(), SceneError> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Walk {
+            Unvisited,
+            OnPath,
+            Done,
+        }
+        let mut state = vec![Walk::Unvisited; batch.len()];
+        let mut path: Vec<usize> = Vec::new();
+        for start in 0..batch.len() {
+            if state.get(start) != Some(&Walk::Unvisited) {
+                continue;
+            }
+            path.clear();
+            let mut cursor = Some(start);
+            while let Some(position) = cursor {
+                let Some(node) = batch.get(position) else {
+                    break;
+                };
+                match state.get(position).copied() {
+                    Some(Walk::Done) | None => break,
+                    Some(Walk::OnPath) => {
+                        let descendant = path
+                            .last()
+                            .and_then(|last| batch.get(*last))
+                            .map(|last| last.id)
+                            .unwrap_or(node.id);
+                        return Err(SceneError::Cycle {
+                            descendant,
+                            ancestor: node.id,
+                        });
+                    }
+                    Some(Walk::Unvisited) => {}
+                }
+                if let Some(slot) = state.get_mut(position) {
+                    *slot = Walk::OnPath;
+                }
+                path.push(position);
+                cursor = node
+                    .parent
+                    .and_then(|parent| batch_position.get(&parent))
+                    .copied();
+            }
+            for position in path.drain(..) {
+                if let Some(slot) = state.get_mut(position) {
+                    *slot = Walk::Done;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove a node and all of its descendants. Returns the removed root.
@@ -615,16 +755,7 @@ impl Scene {
             expected.entry(n.parent).or_default().push(n.id);
         }
         for v in expected.values_mut() {
-            // Total order: equal IndexKeys tie-break by the node's stable ULID,
-            // so a post-deserialize rebuild matches the live incremental insert
-            // order exactly (otherwise equal-index siblings get a process-random
-            // HashMap order → non-deterministic replay/snapshot diffs).
-            v.sort_by(|a, b| {
-                self.nodes[a]
-                    .index
-                    .cmp(&self.nodes[b].index)
-                    .then_with(|| a.cmp(b))
-            });
+            sort_children(&self.nodes, v);
         }
         if expected.len() != self.child_index.len() {
             return Err(SceneError::InvariantViolated(
@@ -691,37 +822,6 @@ impl Scene {
         }
     }
 
-    /// Bulk-detach nodes from the child index in one pass per bucket — the
-    /// importer-grade primitive for "insert everything, then reparent
-    /// everything". Detached nodes keep existing in the node map with
-    /// `parent = None` but are NOT listed under the root bucket until they
-    /// are re-attached via [`set_parent`]/[`set_index`]; between the two
-    /// steps `children_of(None)` intentionally omits them. Callers must
-    /// re-attach (or [`remove`]) every detached node before handing the
-    /// scene to anything else.
-    ///
-    /// [`set_parent`]: Self::set_parent
-    /// [`set_index`]: Self::set_index
-    /// [`remove`]: Self::remove
-    pub fn detach_many(&mut self, ids: &std::collections::HashSet<NodeId>) {
-        if ids.is_empty() {
-            return;
-        }
-        for bucket in self.child_index.values_mut() {
-            bucket.retain(|id| !ids.contains(id));
-        }
-        self.child_index.retain(|_, bucket| !bucket.is_empty());
-        for id in ids {
-            if let Some(node) = self.nodes.get_mut(id) {
-                node.parent = None;
-                node.index = IndexKey::FIRST;
-            }
-        }
-        self.clear_derived_caches();
-        self.record_change(SceneChange::Structural);
-        self.stamp_floor.set(next_geometry_stamp());
-    }
-
     /// Rebuild the child index from scratch. Used after deserialization
     /// (the index is `#[serde(skip)]`) and as a recovery tool.
     pub fn rebuild_child_index(&mut self) {
@@ -731,16 +831,7 @@ impl Scene {
             buckets.entry(n.parent).or_default().push(n.id);
         }
         for v in buckets.values_mut() {
-            // Total order: equal IndexKeys tie-break by the node's stable ULID,
-            // so a post-deserialize rebuild matches the live incremental insert
-            // order exactly (otherwise equal-index siblings get a process-random
-            // HashMap order → non-deterministic replay/snapshot diffs).
-            v.sort_by(|a, b| {
-                self.nodes[a]
-                    .index
-                    .cmp(&self.nodes[b].index)
-                    .then_with(|| a.cmp(b))
-            });
+            sort_children(&self.nodes, v);
         }
         self.child_index = buckets;
         // The index rebuild follows a bulk mutation (typically a deserialize);
@@ -905,6 +996,22 @@ impl Scene {
         }
         Some(SceneDelta { transforms, nodes })
     }
+}
+
+/// Sort one child bucket into child-index order: ascending `IndexKey`,
+/// equal keys tie-broken by the node's stable ULID. This is the total order
+/// [`Scene::child_index_insert`] binary-searches on, so a bucket sorted here
+/// — after a deserialize, a bulk insert, or the `validate` re-derivation —
+/// is exactly what the same nodes inserted one at a time would have
+/// produced; without the id tie-break, equal-index siblings would land in
+/// process-random `HashMap` order and replay / snapshot diffs would be
+/// non-deterministic. A node missing from the map cannot occur for a bucket
+/// derived from it; it sorts first rather than panicking.
+fn sort_children(nodes: &IdHashMap<NodeId, CanvasNode>, bucket: &mut [NodeId]) {
+    bucket.sort_by(|a, b| {
+        let index_of = |id: &NodeId| nodes.get(id).map(|node| node.index);
+        index_of(a).cmp(&index_of(b)).then_with(|| a.cmp(b))
+    });
 }
 
 // =============================================================================
