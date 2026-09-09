@@ -12,6 +12,9 @@ and [34384726796](https://github.com/jeanc18rlos/fanta-edit/actions/runs/3438472
 Both desktop CI runs passed at inspector-fix source `d0bc2d7`:
 [push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882554)
 and [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392886767).
+Both checks also passed at current source `bccc5fd`, verified at 21:34 UTC:
+[push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34404096365)
+and [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34404101640).
 The first unsigned `0a2ae52` installer was uploaded by
 [34390500529](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390500529)
 and downloaded for package verification. The published SHA-256 matched, as
@@ -160,7 +163,15 @@ stopped early. The panel still had a placeholder editor; the logs alone do
 not prove basic commits failed. The correction registers the existing Git
 Commit file configuration without a parser or language server. Its regression
 and the three existing language tests pass, and GitHub CI now runs this suite.
-The corrected native build and installer still require validation.
+The corrected native build passed in 4m23s. In a stateless synthetic QA
+project, the commit template loaded visibly, an edited draft survived closing
+and reopening the commit dialog, and the native Stage All/Commit flow created
+`ff7bf4a3a0b00e6ae525cee0fe4b88007ea10922` with 15 design files and a clean
+working tree. No `language not found` error occurred in that session. No
+production credentials or paid calls were used. Current source `bccc5fd` is
+pushed; both GitHub checks passed, verified at 21:34 UTC, and its installer
+build is queued behind `d0bc2d7`. The exact corrected installer still requires
+validation.
 
 The app command palette opens the native Image workspace with Image, Video,
 Vector, Design, and Masks modes. The toolbar focus/keymap, ten-minute sign-in
@@ -365,18 +376,62 @@ candidate’s single 14.544-second rendered observation is a controlled comparis
 rehearsal. Repeat sustained edits, page changes, close/reopen, and idle checks
 under the same conditions.
 
+## Repeated native document lifecycle
+
+A later stateless native session (PID 10469, binary SHA-256
+`ab43d5661495cb847e8f31c6e1f6a8e9dcd801d0101984c50b221be9dece3758`)
+opened the same converted 29,301-node design once for warm-up and four more
+times. Each open visibly rendered the same page, and File > Close Project
+returned to the empty project. There were no edits, saves, process restarts,
+or allocator-trimming calls during this sequence. The local binary includes
+`bccc5fd` changes and the separately preserved user edits; this is not a test
+of the exact GitHub installer or persistent workspace restoration.
+
+Every open sample had about 1.5 GiB of live default-malloc allocations and
+13.2 million allocations. The table shows samples approximately 60 seconds
+after each close. Sizes use binary units and are rounded by `vmmap`.
+
+| Close checkpoint | Live default-malloc bytes | Allocation count | Physical footprint |
+| --- | ---: | ---: | ---: |
+| Warm-up | 27.0 MiB | 96,091 | 1,843.2 MiB |
+| Cycle 1 | 28.7 MiB | 98,278 | 215.8 MiB |
+| Cycle 2 | 30.5 MiB | 100,962 | 265.8 MiB |
+| Cycle 3 | 38.5 MiB | 106,680 | 265.7 MiB |
+| Cycle 4 | 33.3 MiB | 105,686 | 218.9 MiB |
+| Cycle 4 after 300 seconds | 33.3 MiB | 105,163 | 218.9 MiB |
+
+Document-sized allocations were released on every close, with no swapped
+malloc bytes in the close samples. The later decrease makes the residual
+non-monotonic, but the final sample still has 6.3 MiB and 9,072 allocations
+above the warm-up close. That residual is not attributed to a specific owner.
+Physical footprint recovered while resident pages remained high; these
+metrics must not be treated as interchangeable.
+
+After all timed samples, a memory graph was captured with allocation contents
+excluded. Offline Apple's `leaks` analysis reported **340 allocations totaling
+23,120 bytes**, including NSXPCConnection cycles and anonymous cycles. There
+is no pre-soak leak graph or allocation-stack history for attribution. This
+finding does not explain the larger residual and is not a clean leak scan.
+No speculative memory fix was applied. The run supports document release for
+this workflow, not universal leak freedom, sustained editing stability, or
+performance superiority to Figma.
+
+Raw snapshots, parsed metrics, native close timestamps, fixture hashes, and
+the content-excluded memory graph are in
+`/tmp/fanta-release-qa-20260909/memory-soak-bccc5fd/`.
+
 ## Remaining release requirements
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
-| Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed on the live API; verify authenticated streaming, debit, errors, and sign-out against production. Final native account/catalog verification awaits manual Keychain approval. |
-| Charge customers | Billing fixes and backend tests exist. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No customer was charged. |
+| Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Authenticated native streaming, debit, errors, and sign-out remain unverified against production. Final native account/catalog verification awaits manual Keychain approval. |
+| Charge customers | The existing authenticated owner session displayed Pro and 389 credits after migration, with an explicit checkout-not-configured notice and no purchase or manage buttons. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
 | Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
 | Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. |
-| Performance and UI quality | Final native measurements demonstrate document-sized allocation release across two cycles. Footprint rose temporarily from 526.5M to 959.0M after the second close, then fell to 475.1M while idle without intervention. No trimming change was implemented. The candidate UI kit rendered after the page-selection fix and released live default-malloc bytes from 514.6M to 39.1M on close; physical footprint then fell naturally from 724.0M to 301.0M during idle. Repeat sustained-memory measurements. A Figma comparison needs the same fixture, hardware, operations, and measurement method. |
+| Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. No leak-free or Figma-performance claim is established; attribute the scanner findings and test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
-| Leads | US PostHog project 410640 and the existing landing page are accessible. Validate direct visit-to-signup reporting and durable contact handling; no improved conversion rate or outreach result is established. |
+| Leads | Landing runtime `388e70d` is live as `dpl_HQURSm5XizjgZvvWUtPExb39tbd1`. Workflow head `e61e547` passed push/PR CI runs `34406236688`/`34406236734`. Seven analytics/navigation tests, nine initial-HTML checks, and desktop/mobile direct-hash and CTA checks passed with the complete waitlist form server-rendered. US PostHog project 410640 is accessible. No real lead was submitted; visit-to-signup reporting and durable contact capture still need end-to-end verification. No conversion improvement is established. |
 
 Do not publish a release or enable customer checkout on the strength of the
 synthetic benchmark, public health checks, or the earlier green CI runs alone.
