@@ -1,4 +1,4 @@
-# Release validation — 2026-09-09
+# Release validation — 2026-09-10
 
 **The customer release is not yet validated.** This records completed checks
 and the remaining work for the Apple Silicon alpha. Configuration and launch
@@ -28,8 +28,15 @@ inspector-selection fix; the matching `d0bc2d7`
 completed successfully at 22:22 UTC. Its downloaded checksum, embedded source
 revision, and strict signatures passed. It precedes the Git commit-buffer and
 memory corrections below. The `bccc5fd` installer started building at 22:24 UTC.
-Both checks passed at documentation head `95bbef4`; the new memory-fix source
-has separate local validation below and still requires hosted checks.
+Both checks passed at documentation head `95bbef4` and callback/list memory-fix
+source `96d366a`. Its
+[installer run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34412799333)
+is pending behind the `bccc5fd` build. The subsequent Save As and font changes
+have local automated validation below. The final native build passed in
+**5m45s**, and Save As passed copy/adoption, original-file preservation,
+autosave recovery, and rejection without opening the destination tab. The
+font correction at `8ab306a` has completed local allocation review below.
+Final hosted checks and exact installer validation remain pending.
 No signed/notarized installer is validated.
 An earlier native release build passed in **5m30s**, including the page-switch
 inspector correction. Candidate app `dev.fanta.CandidateQA` (PID 93583)
@@ -38,7 +45,11 @@ preceding 7m19s build (PID 90909) passed fresh-import rendering, complete
 bundled Git checks, and the measured large-design lifecycle. Earlier
 observations are identified separately.
 Native QA used the original checkout, including the user’s separate staged
-edits; hosted CI validates the isolated PR branch.
+edits; hosted CI validates the isolated PR branch. Retired QA sessions have
+been closed. Cleaning the retired secondary Cargo target recovered about
+49.24 GiB of disk space; the current local target and user-active installer
+were preserved. The two retired disk-image mounts were unmounted normally;
+downloaded images and untouched app copies remain available.
 
 The backend [CI run](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196)
 passed at pull request head `9d05908`, with **365 TypeScript tests**, **73
@@ -64,9 +75,9 @@ Local validation results:
 | `cargo test --locked --offline -p fanta-format` | 181 passed, including integration tests and doctests; 2 ignored |
 | Focused Rust formatting and `git diff --check` | Passed |
 | `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; now includes `cargo test --locked -p fanta-doc -p fanta-format` |
-| `cargo build --locked --release -p zed --bin fanta` | Latest build passed in 5m30s; native inspector navigation passed, following the 7m19s build’s rendering and complete bundled Git checks |
+| `cargo build --locked --release -p zed --bin fanta` | Final Save As/font build passed in 5m45s; native copy/adoption, data protection, rejection without destination-tab activation, autosave recovery, and reopen passed |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
-| Document suite | 31 passed; hidden active-page recovery with background/shape pixel assertions, bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
+| Document suite | 36 passed, including Save As regressions; hidden active-page recovery with background/shape pixel assertions, bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
 | Production language registration | 4 passed, including named Git Commit lookup and COMMIT_EDITMSG file recognition without a parser or language server |
 | Bundled Git transport | 2 Rust regressions passed, including clone/push/fetch/pull without system Git and with a bad inherited `GIT_EXEC_PATH`; replay against actual Dugite passed with clean repository integrity checks |
 | Inspector integration suite | 34 passed; real page switching clears off-page selection, preserves selection on the current page, updates the inspector, and leaves the old shape unchanged |
@@ -183,10 +194,10 @@ callback, catalog authorization, and prompt-to-SVG fixes are included in the
 latest native build. The production sign-in page previously identified its
 Clerk instance as Development mode; production account configuration still
 needs verification. An earlier native sign-in succeeded with the existing
-Google session. The final production account/catalog check is currently
-blocked by a macOS Keychain approval that requires manual interaction; the
-automation tool cannot approve it. That approval remains pending for the
-production-account app process (PID 76062).
+Google session. The later production account/catalog check encountered a
+macOS Keychain approval that requires manual interaction; the automation
+tool cannot approve it. That QA process has since been closed. A fresh
+production sign-in and authenticated native verification remain required.
 
 In a separate local QA profile, the rebuilt native app signed in to a
 loopback fixture and loaded its authenticated, visibly QA-labeled catalog.
@@ -469,16 +480,115 @@ fixture hashes, native event timestamps, and the independent review are in
 The before-fix traces are in
 `/tmp/fanta-release-qa-20260909/leak-attribution-bccc5fd/`.
 
+## Save As automated and native validation — September 10
+
+Save As on an existing design was a silent no-op. The correction copies the
+current document and assets to a valid destination, updates shared views and
+project entries, and preserves the original. Rejected destinations do not
+overwrite existing content, and autosave resumes on the source design. Native
+and custom pickers now receive an initial directory beside the original
+project; unrelated picker defaults remain unchanged.
+
+The `fig_viewer` `save_as_` filter now passes **9 tests**, including the
+correction that validates an occupied destination before opening its worktree.
+That new regression also passed **20 scheduler seeds**. An earlier run of the
+other GPUI cases passed its own 20-seed sweep; the three ordinary Rust tests
+are not scheduler tests. The full `open_path_prompt` suite
+passed **9 tests**, with one existing Windows test ignored. The document suite
+passed **36 tests**, and the existing autosave regression passed separately. CI includes both
+`fig_viewer --lib save_as_` and `open_path_prompt --lib save_as_` filters.
+
+Evidence is in `/tmp/fanta-release-qa-20260909/save-as-validation/`:
+`focused-tests-5-prevalidation.log`, `prevalidation-seed-sweep.log`,
+`save-as-seed-sweep.log`, `all-picker-tests.log`,
+`document-regressions.log`, and `autosave-regression.log`, with the updated
+`verification-status.json`.
+
+The first combined native release build passed in **5m29s**. In the isolated QA
+profile, Save As suggested a sibling `Original Copy` destination. Cancel
+created no copy and preserved the original. Successful Save As adopted the
+copy; a subsequent edit/save and close/reopen preserved its changed geometry.
+All **15 original file hashes** remained unchanged, and reopening the original
+showed its unchanged rectangle. Selecting an occupied destination produced a
+visible rejection; a later edit to the source copy autosaved after the error.
+
+That first run exposed unwanted destination-tab activation after rejection.
+The correction validates the destination before opening its worktree and
+passed the nine-test suite and new 20-seed regression above. The final native
+build then passed in **5m45s**. Rejecting the occupied `Original` destination
+left exactly one `Original Copy` tab after dismissing the alert, with its path
+unchanged. Changing the copy's height from 144 to 160 autosaved without Cmd-S;
+all **15 original hashes** remained unchanged. A valid Save As to
+`Verified Copy` adopted that path, and Close Project/reopen restored the
+**208×160** design in both canvas and inspector. The QA process quit normally
+with exit code 0.
+
+Evidence is in `native-prevalidation-events.json`,
+`native-prevalidation-integrity.json`, and `build-provenance-prevalidation.json`;
+`native-events.json`, `native-fixture-integrity.json`, and `build-provenance.json`
+retain the earlier observations. Both local builds include preserved user
+changes and are not exact GitHub installers.
+**Final hosted checks and exact-installer verification remain pending.**
+
+## Font ownership reproduction — September 10
+
+A standalone CoreText harness on macOS 26.6.2 arm64 reproduced the descriptor
+array ownership sequence in pinned `zed-font-kit` / `core-text 21.0.0`.
+Adding the extra retain used by the wrapper left **16 arrays / 1,280 bytes**
+after 16 queries and **128 arrays / 10,240 bytes** after 128 queries. Matched
+Create-ownership controls left zero scanner leaks, as did the zero-operation
+baseline. Each process first performed four balanced warm-up operations.
+All processes exited normally.
+
+The allocation stack matches the native font-array finding, but the harness
+queries one system family and reproduces the ownership operations directly;
+it is not the full Rust dependency or app. Its 80-byte arrays also differ
+from the native 320-byte array. Raw retain counts alone were not used as
+proof. The evidence supports correcting the ownership wrapper, without
+establishing supported-OS behavior or whole-app leak freedom.
+
+Source, logs, graphs, and reproduction instructions are in
+`/tmp/fanta-release-qa-20260909/coretext-ownership-repro/README.md` and
+`report.json`. The full macOS `text_system::tests` suite subsequently passed
+**6 tests**, including face ordering, missing-family behavior, and virtual
+family/cached selection, in `save-as-validation/font-tests.log`. Two additional
+`open_type::tests` passed after the feature-array ownership correction:
+retained tag/value ownership and a usable font after applying features,
+including glyph lookup and valid metrics. These tests **do not verify feature
+shaping**, such as ligature substitution. Their log is
+`save-as-validation/font-feature-tests.log`.
+
+CI runs both `text_system::tests` and `open_type::tests` with
+`cargo test --locked -p gpui_macos --features font-kit --lib`.
+
+The independent review of both saved native snapshots from the **5m29s**
+build found neither the prior CoreText matching-descriptor array signature
+nor the previously fixed chooser/save/alert callback and ThreadView/ListState
+signatures among scanner roots. The final closed-project snapshot still
+flags **314 blocks / 19,936 bytes across 20 roots**, largely framework XPC and
+accessibility graphs plus one app-version allocation; their ownership remains
+unresolved. A framework alert-completion stack remains distinct from the
+former Rust callback cycle.
+
+The first snapshot was captured after opening a design and starting Save As,
+so it is not a clean startup baseline. The earlier app run used different
+operations; its raw totals are not a controlled before/after comparison.
+These findings do not establish leak freedom, feature shaping, supported-OS
+coverage, or long-duration stability. The snapshots also precede the separate
+Save As focus correction. Evidence is in
+`save-as-validation/independent-memory-review.md` and `.json`.
+**Exact installer validation remains pending.**
+
 ## Remaining release requirements
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
-| Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Authenticated native streaming, debit, errors, and sign-out remain unverified against production. Final native account/catalog verification awaits manual Keychain approval. |
+| Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Authenticated native streaming, debit, errors, and sign-out remain unverified against production. A fresh production sign-in and authenticated native check remain required; the earlier QA session was closed. |
 | Charge customers | The existing authenticated owner session displayed Pro and 389 credits after migration, with an explicit checkout-not-configured notice and no purchase or manage buttons. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
 | Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. Save As on an existing design is currently a silent no-op and is being corrected separately. |
-| Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans; other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. Final hosted checks and exact-installer verification remain pending. |
+| Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans. The previously observed descriptor-array scanner signature is absent after the later font correction; its final native snapshot still flags 314 blocks / 19,936 bytes across 20 roots. Other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | Landing runtime `388e70d` is live as `dpl_HQURSm5XizjgZvvWUtPExb39tbd1`. Workflow head `e61e547` passed push/PR CI runs `34406236688`/`34406236734`. Seven analytics/navigation tests, nine initial-HTML checks, and desktop/mobile direct-hash and CTA checks passed with the complete waitlist form server-rendered. US PostHog project 410640 is accessible. No real lead was submitted; visit-to-signup reporting and durable contact capture still need end-to-end verification. No conversion improvement is established. |
 
