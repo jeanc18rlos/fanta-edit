@@ -12,7 +12,7 @@ and [34384726796](https://github.com/jeanc18rlos/fanta-edit/actions/runs/3438472
 Both desktop CI runs passed at inspector-fix source `d0bc2d7`:
 [push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882554)
 and [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392886767).
-Both checks also passed at current source `bccc5fd`, verified at 21:34 UTC:
+Both checks also passed at Git-commit-fix source `bccc5fd`, verified at 21:34 UTC:
 [push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34404096365)
 and [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34404101640).
 The first unsigned `0a2ae52` installer was uploaded by
@@ -25,9 +25,13 @@ This used a stateless QA profile and does not establish session persistence.
 No production credentials or paid calls were used. It lacks the final
 inspector-selection fix; the matching `d0bc2d7`
 [installer build](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882537)
-is now running. Both artifacts precede the subsequent Git commit-buffer
-registration correction below. No signed/notarized installer is validated.
-The latest native release build passed in **5m30s**, including the page-switch
+completed successfully at 22:22 UTC. Its downloaded checksum, embedded source
+revision, and strict signatures passed. It precedes the Git commit-buffer and
+memory corrections below. The `bccc5fd` installer started building at 22:24 UTC.
+Both checks passed at documentation head `95bbef4`; the new memory-fix source
+has separate local validation below and still requires hosted checks.
+No signed/notarized installer is validated.
+An earlier native release build passed in **5m30s**, including the page-switch
 inspector correction. Candidate app `dev.fanta.CandidateQA` (PID 93583)
 reopened the saved large design and passed the selection checks below. The
 preceding 7m19s build (PID 90909) passed fresh-import rendering, complete
@@ -170,7 +174,7 @@ and reopening the commit dialog, and the native Stage All/Commit flow created
 working tree. No `language not found` error occurred in that session. No
 production credentials or paid calls were used. Current source `bccc5fd` is
 pushed; both GitHub checks passed, verified at 21:34 UTC, and its installer
-build is queued behind `d0bc2d7`. The exact corrected installer still requires
+build is now in progress after `d0bc2d7` completed. The exact corrected installer still requires
 validation.
 
 The app command palette opens the native Image workspace with Image, Video,
@@ -412,13 +416,58 @@ excluded. Offline Apple's `leaks` analysis reported **340 allocations totaling
 23,120 bytes**, including NSXPCConnection cycles and anonymous cycles. There
 is no pre-soak leak graph or allocation-stack history for attribution. This
 finding does not explain the larger residual and is not a clean leak scan.
-No speculative memory fix was applied. The run supports document release for
+This soak did not identify ownership; the subsequent stack-attribution work
+below found and corrected two specific leaks. The soak supports document release for
 this workflow, not universal leak freedom, sustained editing stability, or
 performance superiority to Figma.
 
 Raw snapshots, parsed metrics, native close timestamps, fixture hashes, and
 the content-excluded memory graph are in
 `/tmp/fanta-release-qa-20260909/memory-soak-bccc5fd/`.
+
+## Targeted native memory fixes — September 9, 22:29 UTC
+
+A separate allocation-stack session on the small synthetic design identified
+one leaked Open dialog callback/capture pair per invocation (112 bytes) and
+a ThreadView scroll-handler cycle retaining its own ListState and SumTree
+(1,488 bytes in the instrumented scan). The callback was passed by value
+through Objective-C FFI, losing Rust's release; the scroll handler captured
+a strong clone of its own list state.
+
+The fix borrows copied callbacks at seven macOS registration sites and reads
+the list state through a weak ThreadView in the deferred scroll callback.
+A standalone real-Foundation regression harness failed both capture-release
+checks with the old ownership and passed both after the fix, including
+executed and discarded callbacks. The full native release build passed in
+10m27s. Its QA bundle SHA-256 is
+`e62282f7ae238d30a3c0994c1412ba76f5f1d1a0dea4946af8261f343e355437`.
+
+The fixed app (PID 18114) used a new stateless profile and allocation-stack
+logging. After a warm-up, two project open/render/Close Project cycles and
+two Open cancellations completed normally. New Design's native Save dialog
+was cancelled once and then used to create a separate blank QA design.
+Presenting that design produced the expected native no-frames alert, which
+was dismissed before closing the project. The original fixture's 15 files
+remained byte-for-byte unchanged, and the app quit normally with exit 0.
+
+Independent content-excluded offline scans found neither targeted retain
+cycle in any after-fix snapshot, including the final Save/alert snapshot.
+No leaked Rust Open, Save, or native-alert callback signature was found.
+The final scanner still reports 316 allocations / 20,320 bytes, including
+startup AppIntents/XPC and semver findings plus font/accessibility findings.
+An AppKit alert completion frame appears in an accessibility allocation
+stack; this is not the traced Rust callback cycle and remains unresolved.
+These small findings do not establish overall memory stability or explain
+the larger residual from the earlier large-design soak. Screen-capture and
+URL-handler registration changes share the tested ownership pattern but
+were not exercised through their native permission flows.
+
+This is local candidate validation with preserved user worktree edits,
+not exact-installer validation or a performance comparison. Evidence,
+fixture hashes, native event timestamps, and the independent review are in
+`/tmp/fanta-release-qa-20260909/memory-fix-native-validation/`.
+The before-fix traces are in
+`/tmp/fanta-release-qa-20260909/leak-attribution-bccc5fd/`.
 
 ## Remaining release requirements
 
@@ -428,8 +477,8 @@ the content-excluded memory graph are in
 | Charge customers | The existing authenticated owner session displayed Pro and 389 credits after migration, with an explicit checkout-not-configured notice and no purchase or manage buttons. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
 | Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. |
-| Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. No leak-free or Figma-performance claim is established; attribute the scanner findings and test sustained edits under controlled conditions. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. Save As on an existing design is currently a silent no-op and is being corrected separately. |
+| Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans; other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | Landing runtime `388e70d` is live as `dpl_HQURSm5XizjgZvvWUtPExb39tbd1`. Workflow head `e61e547` passed push/PR CI runs `34406236688`/`34406236734`. Seven analytics/navigation tests, nine initial-HTML checks, and desktop/mobile direct-hash and CTA checks passed with the complete waitlist form server-rendered. US PostHog project 410640 is accessible. No real lead was submitted; visit-to-signup reporting and durable contact capture still need end-to-end verification. No conversion improvement is established. |
 

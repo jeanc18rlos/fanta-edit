@@ -723,7 +723,7 @@ impl Platform for MacPlatform {
                 }
             });
             let block = block.copy();
-            let _: () = msg_send![workspace, setDefaultApplicationAtURL: app toOpenURLsWithScheme: scheme completionHandler: block];
+            let _: () = msg_send![workspace, setDefaultApplicationAtURL: app toOpenURLsWithScheme: scheme completionHandler: &*block];
         }
 
         self.background_executor()
@@ -777,7 +777,7 @@ impl Platform for MacPlatform {
                         let _: () = msg_send![panel, setPrompt: ns_string(&prompt)];
                     }
 
-                    let _: () = msg_send![panel, beginWithCompletionHandler: block];
+                    let _: () = msg_send![panel, beginWithCompletionHandler: &*block];
                 }
             })
             .detach();
@@ -848,7 +848,7 @@ impl Platform for MacPlatform {
                         }
                     });
                     let block = block.copy();
-                    let _: () = msg_send![panel, beginWithCompletionHandler: block];
+                    let _: () = msg_send![panel, beginWithCompletionHandler: &*block];
                 }
             })
             .detach();
