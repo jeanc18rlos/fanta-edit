@@ -44,7 +44,7 @@ jobs:
         run: cargo check --locked -p zed -p cli
 
       - name: Test AI provider authentication
-        run: cargo test --locked -p language_models --lib
+        run: cargo test --locked -p language_model -p language_models --lib
 
       - name: Test Fanta media server account lifecycle
         run: cargo test --locked -p project --lib --test integration test_fanta_mcp
