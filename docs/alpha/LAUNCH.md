@@ -20,17 +20,25 @@ Verified on 2026-09-09. First release target: Apple Silicon Mac.
 
 ## Required before accepting payment
 
-Production Vercel currently has the AI Gateway, database, and Clerk settings.
-It has **no Polar or PostHog settings**. Set these in the existing backend
-project, without putting secret values in either repository:
+Production Vercel has the AI Gateway, database, and Clerk settings. The
+existing US PostHog project token and ingestion host are now saved for the
+next backend production deployment. It still has **no Polar settings**.
+Complete the configuration in the existing backend project, without putting
+secret values in either repository:
 
 | Service | Configuration |
 | --- | --- |
 | Polar | `POLAR_SERVER=production`, `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET`, `POLAR_SUCCESS_URL` |
 | Monthly subscriptions | `POLAR_PRODUCT_PRO_MONTHLY`, `POLAR_PRODUCT_TEAM_MONTHLY`; seed the matching product IDs into the plan rows |
 | Optional credit packs | `POLAR_CREDIT_PRODUCT_SMALL`, `POLAR_CREDIT_PRODUCT_MEDIUM`, `POLAR_CREDIT_PRODUCT_LARGE` |
-| PostHog | Existing project `POSTHOG_API_KEY` and matching region `POSTHOG_HOST` |
+| PostHog | `POSTHOG_API_KEY` and `POSTHOG_HOST=https://us.i.posthog.com` saved for the next deployment; project `410640` matches the live landing page |
 | Clerk | Verify the production instance and webhook secret; local environment snapshots contain a test instance and are not authoritative production configuration |
+
+Apply companion backend migration `0018_subscription_event_order` with
+`bun run db:migrate` **before deploying the backend changes**. It adds one
+nullable timestamp column used to reject delayed subscription events. The
+column is compatible with the existing deployment. No production migration
+or deployment has been performed.
 
 Register Polar's webhook at `https://api.fantaisa.net/webhooks/polar` for
 subscription lifecycle events and `order.paid`. Test a sandbox purchase,
@@ -111,7 +119,15 @@ visitors, and zero reaching the product-interaction step. This is not proof
 that nobody joined the waitlist: visitors may skip optional steps. Measure a
 direct landing-to-`waitlist_joined` funnel alongside this behavioral breakdown.
 
-Confirm the public interest-page URL before publishing a download or campaign.
+The public interest page is [fantaisa.net](https://www.fantaisa.net/#waitlist),
+served by `jeanc18rlos/fantaisa-landing`. Its production waitlist currently
+persists email, attribution, and submission identifiers in this PostHog project;
+no separate waitlist webhook or email-list service is configured. No test lead
+was submitted.
+
+The additional direct signup metric was not saved; dashboard changes await
+user approval. The existing dashboard is unchanged.
+
 Keep the first offer specific: an Apple Silicon Mac alpha for designers who
 want editable source and agent-assisted canvas changes.
 
@@ -138,3 +154,15 @@ Start with a short real demo: import a design, make a canvas edit, ask an agent
 for a change, and show the source diff. Prepare posts for the personal site
 and relevant design communities, and invite the existing opted-in waitlist
 after the installer and payment checks pass. No outreach was sent or published.
+
+## Review and validation
+
+- [Desktop integration and macOS builds](https://github.com/jeanc18rlos/fanta-edit/pull/1) — draft PR based on the existing Fanta branch.
+- [Backend billing and analytics](https://github.com/jeanc18rlos/fanta-backend/pull/1) — draft PR based on backend `main`.
+- 55 targeted desktop authentication, provider, and context-server tests passed; affected Rust crates passed compilation checks.
+- 332 backend tests passed across all 42 test files, and type checking passed in an isolated checkout containing only the proposed changes.
+- Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
+- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34367299913), including GPU tests and the Docker build. Desktop GitHub checks are running. A signed installer, authenticated production AI/media request, and end-to-end payment still require verification.
+
+The review branches contain only these release fixes. Pre-existing local
+design, import, GPU, and motion work was preserved.
