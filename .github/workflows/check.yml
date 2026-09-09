@@ -49,6 +49,9 @@ jobs:
       - name: Test Git sync without a system installation
         run: cargo test --locked -p git --lib bundled_git_
 
+      - name: Test languages used by designs and Git commit messages
+        run: cargo test --locked -p fanta_languages --lib
+
       - name: Test AI provider authentication
         run: cargo test --locked -p language_model -p language_models --lib
 

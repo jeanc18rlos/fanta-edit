@@ -9,10 +9,21 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 Desktop push and pull request CI passed at `5181599` and `b0523fe`; the latter
 runs are [34384719415](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415)
 and [34384726796](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384726796).
-Desktop checks and unsigned packaging at `0a2ae52` were running at this
-update: [34390503562](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390503562),
-[34390500431](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390500431), and
-[34390500529](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390500529).
+Both desktop CI runs passed at inspector-fix source `d0bc2d7`:
+[push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882554)
+and [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392886767).
+The first unsigned `0a2ae52` installer was uploaded by
+[34390500529](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34390500529)
+and downloaded for package verification. The published SHA-256 matched, as
+did deep/strict ad-hoc signature checks and isolated bundled-Git checks. An
+unchanged copy launched, created a design, drew a visible 176×120 rectangle,
+and saved `page.fnx`. Fanta Sonnet and the Fanta sign-in prompt were visible.
+This used a stateless QA profile and does not establish session persistence.
+No production credentials or paid calls were used. It lacks the final
+inspector-selection fix; the matching `d0bc2d7`
+[installer build](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882537)
+is now running. Both artifacts precede the subsequent Git commit-buffer
+registration correction below. No signed/notarized installer is validated.
 The latest native release build passed in **5m30s**, including the page-switch
 inspector correction. Candidate app `dev.fanta.CandidateQA` (PID 93583)
 reopened the saved large design and passed the selection checks below. The
@@ -27,6 +38,17 @@ passed at pull request head `9d05908`, with **365 TypeScript tests**, **73
 isolated GPU tests**, and type checking. These checks do not establish deployed
 GPU readiness or successful production AI requests.
 
+Production migration `0018_subscription_event_order` was applied at 20:13 UTC
+on September 9 after all 18 preceding migration timestamps and SQL hashes
+matched the committed files. The resulting 19-entry history and nullable
+subscription-event timestamp were verified; no seed was run. Backend
+`9d05908` was built from committed source as a separate production candidate,
+passed nine public smoke checks, and was promoted to `https://api.fantaisa.net`.
+Those checks passed again on the live domain. Account, upgrade, and trial links
+previously returned 404 and now redirect to dashboard/billing. Database reads,
+missing-credential rejection, and malformed sign-in handling passed. These
+checks do not authenticate a customer or incur AI/payment charges.
+
 Local validation results:
 
 | Check | Result |
@@ -38,6 +60,7 @@ Local validation results:
 | `cargo build --locked --release -p zed --bin fanta` | Latest build passed in 5m30s; native inspector navigation passed, following the 7m19s build’s rendering and complete bundled Git checks |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
 | Document suite | 31 passed; hidden active-page recovery with background/shape pixel assertions, bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
+| Production language registration | 4 passed, including named Git Commit lookup and COMMIT_EDITMSG file recognition without a parser or language server |
 | Bundled Git transport | 2 Rust regressions passed, including clone/push/fetch/pull without system Git and with a bad inherited `GIT_EXEC_PATH`; replay against actual Dugite passed with clean repository integrity checks |
 | Inspector integration suite | 34 passed; real page switching clears off-page selection, preserves selection on the current page, updates the inspector, and leaves the old shape unchanged |
 | Native toolbar interaction suite | 32 passed, including pointer focus, popup dismissal, input editing, and keyboard navigation |
@@ -59,8 +82,8 @@ cargo test --locked --offline -p agent_ui --lib test_toggle_closes_visible_agent
 ```
 
 Backend coverage includes early idempotent recovery, Gateway planner routing,
-worker source fixes, and safe validation-error formatting. Production
-deployment and authenticated end-to-end verification remain pending.
+worker source fixes, and safe validation-error formatting. The backend is
+deployed; authenticated end-to-end verification remains pending.
 
 ## Measured snapshot improvement
 
@@ -129,6 +152,15 @@ workflow requests unsigned test artifacts for app code, assets, Cargo/build
 scripts, and packaging changes on `codex-release-backend-gateway`. Docs-only
 changes do not rebuild; these branch runs do not create customer or draft
 releases.
+
+The exact GitHub artifact logged `language not found` while initializing
+its Git commit editor. Production language registration omitted Git Commit,
+so loading the repository buffer, commit template and draft subscriptions
+stopped early. The panel still had a placeholder editor; the logs alone do
+not prove basic commits failed. The correction registers the existing Git
+Commit file configuration without a parser or language server. Its regression
+and the three existing language tests pass, and GitHub CI now runs this suite.
+The corrected native build and installer still require validation.
 
 The app command palette opens the native Image workspace with Image, Video,
 Vector, Design, and Masks modes. The toolbar focus/keymap, ten-minute sign-in
@@ -337,7 +369,7 @@ under the same conditions.
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
-| Backend and AI Gateway | Backend head `9d05908` is green in CI. Apply the migration and deploy reviewed changes; verify authenticated streaming, debit, errors, and sign-out against production. Final native account/catalog verification awaits manual Keychain approval. |
+| Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed on the live API; verify authenticated streaming, debit, errors, and sign-out against production. Final native account/catalog verification awaits manual Keychain approval. |
 | Charge customers | Billing fixes and backend tests exist. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No customer was charged. |
 | Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |

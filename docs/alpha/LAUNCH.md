@@ -21,8 +21,9 @@ Verified on 2026-09-09. First release target: Apple Silicon Mac.
 ## Required before accepting payment
 
 Production Vercel has the AI Gateway, database, and Clerk settings. The
-existing US PostHog project token and ingestion host are now saved for the
-next backend production deployment. It still has **no Polar settings**.
+existing US PostHog project token and ingestion host are included in the
+September 9 backend production deployment. Live analytics delivery still needs
+an authenticated event check. Production still has **no Polar settings**.
 Complete the configuration in the existing backend project, without putting
 secret values in either repository:
 
@@ -39,14 +40,18 @@ product IDs to the current backend grants by name alone.
 | Polar | `POLAR_SERVER=production`, `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET`, `POLAR_SUCCESS_URL` |
 | Monthly subscriptions | `POLAR_PRODUCT_PRO_MONTHLY`, `POLAR_PRODUCT_TEAM_MONTHLY`; seed the matching product IDs into the plan rows |
 | Optional credit packs | `POLAR_CREDIT_PRODUCT_SMALL`, `POLAR_CREDIT_PRODUCT_MEDIUM`, `POLAR_CREDIT_PRODUCT_LARGE` |
-| PostHog | `POSTHOG_API_KEY` and `POSTHOG_HOST=https://us.i.posthog.com` saved for the next deployment; project `410640` matches the live landing page |
+| PostHog | `POSTHOG_API_KEY` and `POSTHOG_HOST=https://us.i.posthog.com` included in the current production deployment; project `410640` matches the live landing page |
 | Clerk | Verify the production instance and webhook secret; local environment snapshots contain a test instance and are not authoritative production configuration |
 
-Apply companion backend migration `0018_subscription_event_order` with
-`bun run db:migrate` **before deploying the backend changes**. It adds one
-nullable timestamp column used to reject delayed subscription events. The
-column is compatible with the existing deployment. No production migration
-or deployment has been performed.
+Companion backend migration `0018_subscription_event_order` was applied and
+verified in production on September 9 at 20:13 UTC, after all 18 preceding
+migration timestamps and hashes matched the committed history. It adds one
+nullable timestamp column used to reject delayed subscription events; no seed
+was run. Backend `9d05908` was then built from committed source, checked at its
+candidate URL, and promoted to `https://api.fantaisa.net`. All nine public
+checks passed after promotion, including database reads, missing-credential
+rejection, and the three account/billing redirects. Authenticated AI, GPU
+requests, and customer checkout remain unverified.
 
 Register Polar's webhook at `https://api.fantaisa.net/webhooks/polar` for
 subscription lifecycle events and `order.paid`. Test a sandbox purchase,
@@ -55,10 +60,11 @@ customer checkout. Confirm the customer receives credits exactly once and can
 open the billing portal. No real customer was charged during this work.
 
 Existing catalog amounts are 24/month for Pro (3,000 credits), 40/month for
-Team (6,000 credits), and credit packs of 500/1,500/5,000 for 5/12/35. Confirm
-currency: the built-in billing page currently displays EUR, while the backend
-pricing documentation describes USD. Polar product currency and displayed
-prices must agree before checkout is enabled.
+Team (6,000 credits), and credit packs of 500/1,500/5,000 for 5/12/35. The current
+billing UI and tier documentation use EUR; price fields and the API carry
+cents without a currency. USD references describe usage-cost and credit
+accounting. Displayed prices and currency must match the chosen Polar products
+before checkout is enabled.
 
 Keep yearly product IDs unset for the first release. The current yearly
 subscription implementation grants one monthly allocation per annual billing
@@ -111,6 +117,14 @@ ad-hoc signature verification and public HTTPS access with an empty `PATH`.
 Clone/push/fetch/pull regressions also passed against the packaged Git. This
 does not replace Developer ID signing, notarization, or a clean-Mac installer
 check.
+
+Packaged alpha builds use manual DMG updates. Automatic update checks are
+disabled, and the default menus and command palette do not expose a
+**Check for Updates** command. Keep automatic updates disabled until the installer’s mounted
+volume name, prerelease comparison, and compiled release-channel selection
+are corrected and an end-to-end upgrade passes. On-demand SSH remote-server
+downloads are separate; this first Apple Silicon workflow has no verified
+SSH remote-server artifact.
 
 A `v*` tag must match the version in `crates/zed/Cargo.toml`. Successful tag
 builds prepare a **draft** GitHub release. Publish only after checking the DMG
@@ -200,8 +214,8 @@ after the installer and payment checks pass. No outreach was sent or published.
 - [Backend billing and analytics](https://github.com/jeanc18rlos/fanta-backend/pull/1) — draft PR based on backend `main`.
 - Desktop account/provider checks, 27 native generation tests, 31 document tests, 34 inspector tests, and four new Sidebar regressions passed. The full Sidebar suite has 133 passes and seven existing failures; it is not fully green.
 - 365 backend tests passed across all 42 test files, with type checking and 73 isolated GPU tests passing.
-- Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
-- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415) at `b0523fe`. Desktop checks and unsigned packaging at `0a2ae52` were running at this update; the candidate app has now passed native hidden-page rendering and complete bundled Git checks. The later inspector-selection correction also passed native verification in the 5m30s build. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
+- The production backend is now `9d05908`, after the verified additive migration. Nine public smoke checks passed; the previously broken account, upgrade, and trial URLs now redirect to the dashboard/billing pages. The separate local smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
+- [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196) at `9d05908`, including GPU tests and Docker. [Desktop checks passed](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882554) at final source `d0bc2d7`. The first unsigned installer at `0a2ae52` has been uploaded for package verification; the matching `d0bc2d7` installer is queued behind it. The older installer lacks the final inspector-selection fix; the candidate app has now passed native hidden-page rendering and complete bundled Git checks. The later inspector-selection correction also passed native verification in the 5m30s build. A notarized installer, authenticated production AI/media request, and end-to-end payment still require verification.
 
 See [the current validation record](RELEASE_VALIDATION.md) for later successful
 GitHub checks, native generation tests, UI observations, and measured memory
