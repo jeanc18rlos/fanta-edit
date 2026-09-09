@@ -12,9 +12,9 @@ use std::rc::Rc;
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use design_surface::{
-    AlignEdge, CrossAxisAlignment, DesignNodeType, DesignOp, DesignSurface, DistributeAxis,
-    LayerPosition, LayoutDirection, MainAxisAlignment, NamedLayerPosition, NodeQuery,
-    ScreenshotTarget, StrokeAlignment, TextAlignment,
+    AlignEdge, CrossAxisAlignment, DEFAULT_CHILD_LIMIT, DesignNodeType, DesignOp, DesignSurface,
+    DistributeAxis, LayerPosition, LayoutDirection, MainAxisAlignment, NamedLayerPosition,
+    NodeQuery, ScreenshotTarget, StrokeAlignment, TextAlignment,
 };
 use fanta_doc::{
     AssetId, AutoLayout, BitmapNode, Bounds, CanvasNode, Color, ComponentId, CounterAlign, Doc,
@@ -168,7 +168,14 @@ impl DesignSurface for FigDesignSurface {
         Ok(json!({
             "page": page_index,
             "name": page.name.as_ref(),
-            "root": node_summary(doc, root, query.depth, query.include_geometry),
+            "root": paginated_node_summary(
+                doc,
+                root,
+                query.depth,
+                query.include_geometry,
+                query.offset.unwrap_or(0),
+                query.limit.unwrap_or(DEFAULT_CHILD_LIMIT),
+            ),
         }))
     }
 
@@ -466,6 +473,50 @@ fn resolve_page_index(document: &FigDocument, page: Option<usize>) -> Result<usi
     document
         .page_index(None)
         .context("the document has no pages")
+}
+
+/// [`node_summary`] with the listed node's direct children windowed to
+/// `offset..offset + limit`, reporting the facts a caller needs to continue:
+/// `child_count`, `children_offset`, `children_limit` and `more_children`.
+///
+/// A page of a real imported `.fig` can hold thousands of top-level nodes, so
+/// the whole child list does not fit in one response — and listing is the only
+/// way to discover node ids, so refusing the whole answer would leave no way
+/// in. Only this top level is windowed; the depth-limited subtrees below each
+/// windowed child are unchanged.
+fn paginated_node_summary(
+    doc: &Doc,
+    id: NodeId,
+    depth: Option<u32>,
+    include_geometry: bool,
+    offset: usize,
+    limit: usize,
+) -> Value {
+    let mut value = node_summary(doc, id, Some(0), include_geometry);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let children = doc.scene.children_of(Some(id));
+    object.insert("child_count".into(), json!(children.len()));
+    if depth == Some(0) {
+        return value;
+    }
+    let end = offset.saturating_add(limit).min(children.len());
+    let window = children.get(offset..end).unwrap_or_default();
+    let child_depth = depth.map(|depth| depth - 1);
+    object.insert(
+        "children".into(),
+        Value::Array(
+            window
+                .iter()
+                .map(|child| node_summary(doc, *child, child_depth, include_geometry))
+                .collect(),
+        ),
+    );
+    object.insert("children_offset".into(), json!(offset));
+    object.insert("children_limit".into(), json!(limit));
+    object.insert("more_children".into(), json!(end < children.len()));
+    value
 }
 
 /// A compact node-tree projection for page listings: enough for the model to
@@ -2918,6 +2969,113 @@ mod tests {
             panic!("expected a text node");
         };
         assert_eq!(node.content, long_text);
+    }
+
+    /// A page with `count` sibling rectangles, and their ids in z-order.
+    fn page_with_children(count: usize) -> (Doc, NodeId, Vec<String>) {
+        let (mut doc, page_id) = doc_with_page();
+        let requests: Vec<Value> = (0..count)
+            .map(|index| {
+                json!({"op": "create_node", "node_type": "rectangle", "name": format!("Row {index}"),
+                       "x": 0.0, "y": index as f64 * 20.0, "width": 10.0, "height": 10.0})
+            })
+            .collect();
+        let outcome = run_batch(&mut doc, &ops(json!(requests)), "Create");
+        assert_applied(&outcome);
+        let ids = (0..count)
+            .map(|index| created_id(&outcome, index).to_string())
+            .collect();
+        (doc, page_id, ids)
+    }
+
+    fn listed_child_ids(summary: &Value) -> Vec<String> {
+        summary["children"]
+            .as_array()
+            .expect("a listing carries a children array")
+            .iter()
+            .map(|child| child["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Listing is the only way to discover node ids, so a page too wide for one
+    /// response must still be enumerable: each call returns a window plus the
+    /// facts needed to ask for the next one.
+    #[test]
+    fn a_page_listing_windows_its_children_and_reports_how_to_continue() {
+        let (doc, page_id, all_children) = page_with_children(7);
+
+        let first = paginated_node_summary(&doc, page_id, Some(1), false, 0, 3);
+        assert_eq!(first["child_count"], json!(7));
+        assert_eq!(first["children_offset"], json!(0));
+        assert_eq!(first["children_limit"], json!(3));
+        assert_eq!(first["more_children"], json!(true));
+        let first_window = listed_child_ids(&first);
+        assert_eq!(first_window.len(), 3);
+
+        let second = paginated_node_summary(&doc, page_id, Some(1), false, 3, 3);
+        assert_eq!(second["children_offset"], json!(3));
+        assert_eq!(second["more_children"], json!(true));
+        let third = paginated_node_summary(&doc, page_id, Some(1), false, 6, 3);
+        assert_eq!(third["more_children"], json!(false));
+
+        let walked: Vec<String> = [
+            first_window,
+            listed_child_ids(&second),
+            listed_child_ids(&third),
+        ]
+        .concat();
+        assert_eq!(walked, all_children, "the windows must tile the child list");
+    }
+
+    #[test]
+    fn an_offset_past_the_end_lists_nothing_rather_than_failing() {
+        let (doc, page_id, _) = page_with_children(3);
+        let summary = paginated_node_summary(&doc, page_id, Some(1), false, 99, 200);
+        assert_eq!(summary["child_count"], json!(3));
+        assert_eq!(summary["children_offset"], json!(99));
+        assert_eq!(summary["more_children"], json!(false));
+        assert!(listed_child_ids(&summary).is_empty());
+    }
+
+    /// Only the listed node's own children are windowed; what hangs below a
+    /// listed child is governed by `depth` alone, so a windowed listing never
+    /// silently drops part of a subtree it did return.
+    #[test]
+    fn pagination_applies_to_the_top_level_only() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Card",
+                 "x": 0.0, "y": 0.0, "width": 200.0, "height": 100.0},
+            ])),
+            "Frame",
+        );
+        assert_applied(&outcome);
+        let frame = created_id(&outcome, 0);
+        let requests: Vec<Value> = (0..5)
+            .map(|index| {
+                json!({"op": "create_node", "node_type": "rectangle", "parent": frame.to_string(),
+                       "x": index as f64, "y": 0.0, "width": 4.0, "height": 4.0})
+            })
+            .collect();
+        assert_applied(&run_batch(&mut doc, &ops(json!(requests)), "Rows"));
+
+        let summary = paginated_node_summary(&doc, page_id, Some(2), false, 0, 1);
+        let listed = &summary["children"][0];
+        assert_eq!(listed["children"].as_array().map(Vec::len), Some(5));
+        assert!(listed.get("more_children").is_none());
+        assert!(listed.get("children_limit").is_none());
+    }
+
+    /// `depth: 0` asks for counts, not children, so it keeps its old shape.
+    #[test]
+    fn a_depth_zero_listing_still_reports_only_a_child_count() {
+        let (doc, page_id, _) = page_with_children(4);
+        let summary = paginated_node_summary(&doc, page_id, Some(0), false, 0, 2);
+        assert_eq!(summary["child_count"], json!(4));
+        assert!(summary.get("children").is_none());
+        assert!(summary.get("more_children").is_none());
     }
 
     #[test]

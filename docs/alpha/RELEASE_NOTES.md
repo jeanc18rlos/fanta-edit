@@ -17,11 +17,16 @@ Every feature sentence below was re-checked against the working tree of
 `perf/large-documents-ai-alignment` — the uncommitted work on top of
 `16309b2` — by grepping for the thing it claims. Where something was measured,
 the number is the measurement and the command that produced it, and the commit
-it was taken at; every measurement in this document was taken at `16309b2` or
-earlier, and **no binary has been built from this tree**. The tree changed the
-autosave write path, image decoding, drag rendering, the layers tree and the
-`.fig` import pipeline, so the memory and timing figures describe code this
-tree replaced; [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) says so entry by entry.
+it was taken at. **A release binary has now been built from this tree and
+driven**: on 2026-09-09, `cargo build --release -p zed` produced
+`target/release/fanta` (`Fanta: v0.1.0-alpha.1+stable.8f43236…`), and it was
+driven entirely over its own live MCP server on macOS 26.6.2, aarch64, 36 GiB —
+`script/smoke-mcp` passing **18 of 18, exit 0**, two documents opened, roughly
+forty operations issued. Timing, memory, the tool list, the design ops and the
+log are measurements of that binary and are dated where they appear; anything
+older is attributed to the build it came from. **Nothing was clicked** — no
+menu, no toolbar, no keyboard, no drag — so every mouse-reachable claim here is
+still a source reading.
 Where nothing was run, [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and
 [`REHEARSAL.md`](REHEARSAL.md) say so instead — and `REHEARSAL.md`'s "could not
 verify" rows are not restated here as features.
@@ -100,10 +105,14 @@ Fanta window raises a toast reading *"Agent connected: &lt;client name&gt;"*.
 | `get_screenshot` | renders the open page (or a node) to PNG |
 | `read_fnx_source` | returns a slice of a `.fnx` file — 64 KiB by default, 1 MiB ceiling |
 
-`get_guidelines` and most of the `batch_design` vocabulary landed on this
-branch and have only been exercised by unit tests; the five tools the release
-build was smoke-tested with were the other five, and `script/smoke-mcp` drives
-exactly one op, `create_node`.
+All six were exercised against the release build of this tree on 2026-09-09:
+`tools/list` returned the six names, `get_guidelines` answered with 4,075
+characters, `read_fnx_source` returned 60,719 characters for a page that used to
+come back as 43 MB, and `get_screenshot` rendered both test documents in under
+0.2 s. `script/smoke-mcp` itself still drives exactly one op, `create_node`; the
+rest of the `batch_design` vocabulary was driven by hand over MCP in the same
+session — twelve of the fourteen new ops, on both documents, all succeeding.
+`set_index` and `frame_selection` were not among them.
 
 **What to expect when it does not.** With the app closed, the bridge prints one
 line and exits 2 rather than pretending to be connected:
@@ -156,16 +165,20 @@ save path. Both `fanta-fnx` and `fanta-format` now enable serde_json's
 `float_roundtrip` feature, and `fanta.json` no longer carries a per-save
 timestamp, which took it out of the diff entirely.
 
-The write behind that diff changed on this branch and the diff has not been
-re-taken. `FigItem::save` now persists `Doc::clone_for_persist()` — the
+The write behind that diff changed on this branch, and the diff has been
+re-taken through the new path. `FigItem::save` now persists
+`Doc::clone_for_persist()` — the
 document without its undo history and selection, which were never written —
 through `fanta_format::write_project_tree_cached`, which fingerprints each
 page and component and reuses last save's bytes for any design that did not
 change (`ProjectWriteCache`, `crates/fanta-format/src/project/write.rs`). The
 crate's contract, and its tests (`tests/write_cache.rs`), is that the bytes are
 identical to a cold write and that the same write-if-changed and prune steps
-still run, so the three-file diff above is what the code says you should still
-get; nobody has run `git status` after a save from this tree.
+still run. On 2026-09-09 that is what `git status` reported after an MCP edit to
+the release build of this tree, on a freshly materialised project with a
+committed baseline: exactly `doc/metadata.json`, `pages/page-1/page.fnx` and
+`pages/page-1/page.ids.json`, three files, no `fanta.json`, with `page.fnx`'s
+mtime moving 2.5 s after the edit and no `cmd-s` at any point.
 
 Editing `.fnx` in your own editor works in the other direction: the canvas
 reloads and names the file that changed — *"&lt;file&gt; changed on disk —
@@ -175,10 +188,14 @@ uncommitted canvas work.
 ## What else is in this build
 
 A warning about this section: it is a list of what the code contains, not a list
-of what was tested. The only canvas operations ever driven end to end are the
-ones `script/smoke-mcp` performs — create a rectangle with a fill, read it back,
-render it, and watch it reach git. Everything else below is a source reading.
-[`SMOKE.md`](SMOKE.md) is the checklist that would turn these into claims.
+of what was tested. The canvas operations that have been driven end to end are
+the ones `script/smoke-mcp` performs — create a rectangle with a fill, read it
+back, render it, and watch it reach git — plus the twelve design ops driven by
+hand over MCP on 2026-09-09 (`set_auto_layout`, `align`, `distribute`, `group`,
+`ungroup`, `set_text_style`, `set_stroke`, `set_shadow`, `rotate`, `duplicate`,
+`create_component`, `create_instance`). **Everything a pointer or a key reaches
+is still a source reading**, because nothing was clicked in any build of this
+tree. [`SMOKE.md`](SMOKE.md) is the checklist that would turn those into claims.
 
 - **Canvas editing**: shapes, frames, text, selection and transforms, auto
   layout (horizontal and vertical only — grid is ignored, see Known Issues),
@@ -210,7 +227,11 @@ render it, and watch it reach git. Everything else below is a source reading.
   selections over 512 layers draw one outline (`SELECTION_OUTLINE_CAP`), and
   the `.fig` importer no longer decodes `byte[]` fields one value per byte or
   deep-clones the change tree to resolve shared styles
-  (`crates/fanta-fig-interop`). None of it has been timed in the app.
+  (`crates/fanta-fig-interop`). The app as a whole has now been timed on
+  2026-09-09 — a 9.6 MB `.fig` reaches an answering canvas in 2.1–2.4 s and a
+  128 MB one in 48.5–54.1 s, settling at about 2.0 GiB either way — but nothing
+  in those runs attributes a figure to one of these changes, and the drag path
+  in particular has never had a drag: see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
 - **Prototype flows and presentation**, motion clips with a timeline, and pinned
   comments. These are compiled in but were **not exercised** in the alpha smoke
   run at all; treat them as unverified.
@@ -270,10 +291,12 @@ repository just now, with the command that produced it.
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) is the honest list and it is not short.
 The headlines: parts of the toolbar and inspector are visible but not wired up
 and say so when clicked; cross-document paste does not work; nothing on this
-branch — Group/Ungroup, image paste, the new agent ops, the reworked save and
-render paths — has been driven in a running build; the memory and timing
-figures are from the previous build; and the first launch goes through macOS
-Gatekeeper. A design
+branch that needs a mouse or a keyboard — Group/Ungroup by shortcut, image
+paste, the toolbar, the agent panel — has been driven in a running build;
+memory still spikes by gigabytes on the first edit to a large document, and
+`batch_get` cannot list the children of a very wide page at all until the
+pagination in this same change is exercised; and the first launch goes through
+macOS Gatekeeper. A design
 project Fanta scaffolded opens without the Restricted Mode prompt; a folder that
 is *not* a design project — and a design project whose copied `.git` carries
 anything this build does not recognise as inert — still raises it, and that
@@ -304,20 +327,48 @@ downloaded through a browser, so it carries no quarantine attribute and the
 "Apple could not verify" dialog above has still never been seen. Row G of
 [`SMOKE.md`](SMOKE.md) is the only way to settle that.
 
-**Nothing on `perf/large-documents-ai-alignment` has been driven.** The smoke
-script has not been re-run against a build of this tree; if it were, its
-`tools/list` assertion would still pass — it checks that the five names in
-`REQUIRED_TOOLS` are present, not that there are five (`script/smoke-mcp`) —
-and its one `batch_design` op, `create_node`, is unchanged.
+Both paragraphs above are history: they describe binaries built at `fe2612c`
+and `16309b2`, and they are left as written.
 
-The CLI checks below were re-run against that release binary, not carried over.
+**`perf/large-documents-ai-alignment` has now been driven too.** On 2026-09-09,
+`cargo build --release -p zed` produced `target/release/fanta` from this tree
+and `script/smoke-mcp` was run against it on a freshly materialised project with
+a committed baseline: **18 of 18 assertions, exit 0**. Its `tools/list`
+assertion checks that the **six** names in `REQUIRED_TOOLS` are present, not
+that there are six (`script/smoke-mcp`), and all six came back —
+`batch_design, batch_get, get_editor_state, get_guidelines, get_screenshot,
+read_fnx_source`. Its one `batch_design` op, `create_node`, is unchanged.
+`read_fnx_source` returned 60,719 characters for the active page; the MCP edit
+reached `page.fnx` on disk with no `cmd-s`, its mtime moving after 2.5 s; and it
+showed up as a git diff of exactly three files — `doc/metadata.json`,
+`pages/page-1/page.fnx`, `pages/page-1/page.ids.json`.
+
+Beyond the script, that binary was driven by hand over MCP on two documents: the
+9.6 MB, 29,301-node `basic.fig` (2.1 s and 2.4 s to an answering canvas,
+settling at 2004 and 2173 MiB) and a 128 MB, 40,141-node, 31-page community UI
+kit that this project had never opened before (48.5 s, 48.6 s and 54.1 s,
+settling at 1952–1960 MiB, with the first edit and its autosave taking it to
+5788 MiB and later autosaves bringing it back to 5087 MiB). Twelve of the
+fourteen new design ops were issued on both documents and all succeeded;
+`create_component` wrote a real `components/drive-card/master.fnx` to disk
+through the autosave. Driving also found a defect the unit tests could not:
+`batch_get` at `depth: 1` with `include_geometry: false` on the UI kit's active
+page produced 967,017 bytes and was refused for exceeding the 262,144-byte cap,
+with no pagination to fall back on — see [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md),
+and [`REHEARSAL.md`](REHEARSAL.md)'s 2026-09-09 section for the full run.
+
+The CLI checks below were re-run against the `16309b2` release binary, not
+carried over from the debug build.
 
 - `fanta --version` → `fanta 0.1.0-alpha.1`.
 - `fanta --help | grep -ic zed` → `0`, and `--mcp-stdio` appears in that help
   output. The flag is no longer `hide = true` — verified in the tree just now at
   `crates/zed/src/main.rs:1598`.
 - `fanta --system-specs` → `Fanta System Specs (from CLI):` /
-  `Fanta: v0.1.0-alpha.1+stable.<sha> (debug build)`. No `Zed` anywhere.
+  `Fanta: v0.1.0-alpha.1+stable.<sha> (debug build)`. No `Zed` anywhere. Still
+  true of the release binary built from this tree on 2026-09-09, which prints
+  `Fanta: v0.1.0-alpha.1+stable.8f43236…`; the rehearsal's `Zed: v0.1.0…` on
+  that line is gone.
 - `fanta --dump-all-actions` → **1,031** actions, of which **929** survived
   `HIDDEN_NAMESPACES` and `hide_action_types`, **44** of those in the `zed`
   namespace, with **zero** matches for "vim", "debugger", "project panel" or
@@ -333,14 +384,18 @@ The CLI checks below were re-run against that release binary, not carried over.
 
 Measured against the tree just now rather than against a binary: 179 workspace
 members, 164 of them linked, a 904-crate graph, and the deletion totals above.
-`~/Library/Logs/Fanta/Fanta.log` (103 KB, five launches of that older binary)
-holds **13 ERROR lines — twelve `language not found`, one `scene too large`**,
-**zero** `didn't find an action` lines, and no panic beyond
-`panic handler registered`. Re-counted just now; the log itself pre-dates
-`16309b2`.
+`~/Library/Logs/Fanta/Fanta.log` holds **13 ERROR lines — twelve `language not
+found`, one `scene too large`** — **zero** `didn't find an action` lines, and no
+panic beyond `panic handler registered`, counted over a 103 KB log of five
+launches of an older binary. **All thirteen pre-date 2026-09-09.** Across every
+run that day — six launches of the release build, two documents, roughly forty
+MCP operations, several screenshots and many autosaves — the log gained **zero
+ERROR lines, zero panics and zero `language not found` lines**. The
+once-per-launch `agent_ui/src/message_editor.rs` `language not found` ERROR no
+longer fires.
 
 Everything behind a mouse click — the welcome page as rendered, the menus,
-drawing with a tool, undo/redo by hand, the toolbar, the in-app agent panel —
-was **not** exercised. [`REHEARSAL.md`](REHEARSAL.md) is the row-by-row record
+drawing with a tool, undo/redo by hand, the toolbar, the in-app agent panel, a
+DMG and the Gatekeeper dance — was **not** exercised in any build of this tree. [`REHEARSAL.md`](REHEARSAL.md) is the row-by-row record
 of what was and was not driven, and [`SMOKE.md`](SMOKE.md) is the checklist a
 human still has to walk before this DMG goes out.

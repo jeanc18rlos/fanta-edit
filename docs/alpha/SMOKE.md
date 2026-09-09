@@ -11,11 +11,14 @@ rm -rf ~/Library/Application\ Support/Fanta ~/Library/Logs/Fanta
 
 [`REHEARSAL.md`](REHEARSAL.md) is the record of a dry run of this checklist. It
 is the reference for what has and has not been exercised before: most rows below
-are marked *NOT VERIFIED* there because the rehearsal could drive nothing behind
-a mouse click. Rows 0, 5 (the external-edit half), 7 and 8 are the only rows that
-have ever passed end to end, and rows 0 and 5 are the two a machine can prove on
-its own. Every other row is waiting on a human, so treat an unexpected result as
-a finding rather than as your own mistake.
+are marked *NOT VERIFIED* there because neither rehearsal could drive anything
+behind a mouse click. Rows 0, 5 (the external-edit half), 7 and 8 are the only
+rows that have ever passed end to end, and rows 0 and 5 are the two a machine
+can prove on its own. Row 0 passed **18 of 18, exit 0** against a release build
+of `perf/large-documents-ai-alignment` on 2026-09-09, and the timing note at the
+foot of this page has been run for the first time; everything else is still
+waiting on a human, so treat an unexpected result as a finding rather than as
+your own mistake.
 
 Rows marked **new** were added after the rehearsal — from its wave-2 list, and
 from the Gatekeeper dance it never exercised because it ran an unbundled debug
@@ -33,7 +36,7 @@ binary. Nobody has run any of them.
 | 1e | **new** Fanta > Settings > Open Settings File, or `cmd-alt-,` | Your user `settings.json` opens in an editor tab. Do **not** use Open Project Settings — it is hidden from the palette on purpose, because writing `.zed/settings.json` into a design permanently disqualifies it from auto-trust (see KNOWN_ISSUES.md). |
 | 2 | File > New Design..., choose `~/Desktop/Smoke` | Canvas opens with one page. `Smoke/` appears in the rail and on disk holds `fanta.json`, `pages/`, `components/`, `AGENTS.md` and **`.git`**. Agent panel shows a composer, not "open a project". |
 | 3 | Press `R`, drag a rectangle. Change its fill in the inspector. Edit > Undo, then redo. `cmd-a`, then `cmd-0`. | Each step is visible on the canvas; Undo and Redo work from the **Edit menu** as well as `cmd-z`; `cmd-a` selects all; `cmd-0` shows 100% in the zoom control. |
-| 4 | With an Anthropic key set: ask the in-app agent to make the rectangle red, then to screenshot the page | The canvas changes and an image comes back. The tools involved are named **`batch_design`** and **`get_screenshot`** — if you are checking a tool list, those are the names, along with `get_editor_state`, `batch_get` and `read_fnx_source`. `cmd-z` undoes the agent's edit. |
+| 4 | With an Anthropic key set: ask the in-app agent to make the rectangle red, then to screenshot the page | The canvas changes and an image comes back. The tools involved are named **`batch_design`** and **`get_screenshot`** — if you are checking a tool list, those are the names, along with `get_editor_state`, `get_guidelines`, `batch_get` and `read_fnx_source` — six in all. `cmd-z` undoes the agent's edit. |
 | 5 | Wait ~2 s after the last canvas edit without pressing anything, then `git -C <project> status --short`. Then edit `page.fnx` in another editor and save. | **The edit is already on disk** — autosave writes about a second after you stop, so `page.fnx` is modified with no `cmd-s`. Expect three modified files for a one-node change: `pages/…/page.fnx`, `pages/…/page.ids.json`, `doc/metadata.json`. Do **not** assert an unchanged mtime anywhere in this row; autosave moves it. The external edit then updates both canvas and Code pane, and raises a *"&lt;file&gt; changed on disk — canvas updated"* notice. |
 | 5a | Open the Code tab | Source renders highlighted; the tab shows its file path; selecting a node on the canvas moves the Code tab to that node's source; typing does nothing (read-only by design). `~/Library/Application Support/Fanta/languages/` gains no new entries. |
 | 5b | **new** File > Review Changes, then File > Commit… | Review Changes opens the project diff on the design folder itself and shows the `page.fnx` / `page.ids.json` / `doc/metadata.json` changes row 5 just made; Commit… opens the commit flow on the same folder. Both are wired in `crates/zed/src/zed/app_menus.rs` (`git_ui::project_diff::Diff`, `git::Commit`). If Review Changes shows nothing, check the project actually has a `.git` — see the Xcode Command Line Tools entry in KNOWN_ISSUES.md. |
@@ -43,10 +46,21 @@ binary. Nobody has run any of them.
 | 8a | File > Open... a folder that is **not** a design project (any plain git checkout) | The inherited *"Unrecognized Project"* / Restricted Mode dialog **does** appear, and cannot be dismissed with Escape. This is expected — see KNOWN_ISSUES.md. Confirm the design projects in row 8 did not raise it. |
 | 8b | In the `Smoke` project, run `printf '#!/bin/sh\n' > .git/hooks/pre-commit`, quit, and reopen the folder. Delete the hook, then run `git -C <project> config core.hooksPath /tmp`, quit and reopen again | The Restricted Mode dialog **does** appear both times. Auto-trust requires a repository with demonstrably nothing to execute (`git_repository_cannot_execute_anything`, `crates/zed/src/zed.rs:480`): a real hook (anything in `.git/hooks` that is not a `.sample`), a `.git` that is a file or symlink, an unreadable config, or **any** config line outside the small allowlist in `git_setting_is_inert` all fall back to asking. The allowlist is why the second case prompts: `core.hooksPath` is not on it, and neither is any key the list does not name. Remove both and confirm the prompt goes away again. |
 | 9 | `nettop -P -p $(pgrep -x fanta)` over five idle minutes plus one agent turn | **Allow-list, all sourced from the tree:** `api.anthropic.com` (`crates/anthropic`), `api.fantaisa.net` (the `server_url` default in `assets/settings/default.json`, for accounts and the managed provider), `cdn.agentclientprotocol.com` (`agent_registry_store.rs`), **`raw.githubusercontent.com`** and **`github.com/adobe-fonts`** (font downloads, `fanta-text/src/font_resolver/download.rs` — `raw.githubusercontent.com` is also used for ACP registry icons), **`nodejs.org`** (`node_runtime.rs:656`) and **`registry.npmjs.org`** (`node_runtime::npm_install_packages`, reachable if you install an external ACP agent). Do **not** assert "nothing from github.com" or "nothing from npm" — both assertions are wrong for this build. `zed.dev` should not appear. Over ~1 idle minute the rehearsal saw zero bytes either way and no outbound connections at all. |
-| 10 | `~/Library/Logs/Fanta/Fanta.log` | No panics (the only `panic` matches should be `INFO [crashes] panic handler registered`). No `didn't find an action` lines. **One ERROR line is expected and cosmetic:** `gpui_macos::metal_renderer failed to render: scene too large … retrying with larger instance buffer size`, occasionally on a dense page — it retries and draws. The alpha.1 `agent_ui/src/message_editor.rs:601 language not found` line should no longer appear (the composer only requests a registered Markdown grammar); if it does, that is a finding, as is anything else at ERROR level. |
+| 10 | `~/Library/Logs/Fanta/Fanta.log` | No panics (the only `panic` matches should be `INFO [crashes] panic handler registered`). No `didn't find an action` lines. **One ERROR line is cosmetic if you see it:** `gpui_macos::metal_renderer failed to render: scene too large … retrying with larger instance buffer size`, occasionally on a dense page — it retries and draws. The alpha.1 `agent_ui/src/message_editor.rs:601 language not found` line **does not appear any more**: across six launches of the release build on 2026-09-09 — two documents, roughly forty MCP operations, several screenshots and many autosaves — the log gained **zero** ERROR lines, zero panics and zero `language not found` lines. Nothing in that run provoked the `scene too large` retry either, but nothing was dragged, zoomed or scrolled in it — a human at the keyboard is exactly the case that would. Treat any other ERROR line as a finding. |
 | 11 | Command palette: search "vim", "debugger", "project panel", "new file", "terminal" | Nothing comes back for **"vim"**, **"debugger"**, **"project panel"** or **"new file"**. **"terminal"** returns exactly one entry, `agent: new terminal thread` — that is a working feature (`terminal_view` is still linked so an external ACP agent can run), not a leftover. Entries prefixed `zed:` do still appear for other searches — 44 of them, including `zed: about` and `zed: quit`; that is a known deferral, not a failure of this row. Derived from the action registry, so treat a mismatch as a real finding: nobody has typed into this palette in a running build. |
 | 12 | Fanta > Check for Updates | An information prompt, not an error: *"Alpha builds are updated by downloading a new DMG from Fanta."* That string is exported as `ZED_UPDATE_EXPLANATION` by `script/bundle-mac` (line 61), so it only holds for a bundled build — `cargo run -p zed` has no such variable set. |
 
 Timing-only, not a gate: open the 128 MB community UI kit and record how long it
-takes and what the process settles at in Activity Monitor. Nobody has run this;
-the closest data point is a 9.6 MB `.fig` taking 30–40 s on a debug build.
+takes and what the process settles at in Activity Monitor. **This row has now
+been run** — headlessly, over MCP, on 2026-09-09, against a release build of
+`perf/large-documents-ai-alignment` (`target/release/fanta`, macOS 26.6.2,
+aarch64, 36 GiB). *UI3: Figma's UI Kit (Community)*, 128 MB, 40,141 nodes,
+31 pages, opened three times: **48.5 s, 48.6 s and 54.1 s** from launch to a
+canvas that answers `get_editor_state` with a node count, settling at
+**1952–1960 MiB** resident after 20 s. The first edit is the expensive part: one
+10×10 rectangle plus its debounced autosave took it from 1960 MiB to
+**5788 MiB**, and later autosaves brought it back to 5270 and then 5087 MiB. The
+9.6 MB `basic.fig` on the same build: **2.1 s and 2.4 s**, settling at
+2004–2173 MiB. Nobody has *looked* at either document — re-run this row with a
+human watching, and record what the window does rather than what the MCP server
+answers. See [`REHEARSAL.md`](REHEARSAL.md), the 2026-09-09 section.

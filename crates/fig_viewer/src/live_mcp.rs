@@ -265,7 +265,6 @@ fn text_response(value: serde_json::Value) -> ToolResponse<()> {
     }
 }
 
-
 /// Like [`text_response`], but refuses a result too large to be carried or
 /// read. `narrowing_hint` must tell the model how to ask a smaller question.
 fn bounded_text_response(
@@ -395,9 +394,11 @@ impl McpServerTool for GetGuidelinesTool {
 /// Read nodes from the open design document: pass `ids` for full node detail,
 /// or omit them to list a page's node tree in compact form (`page` defaults to
 /// the active page; `depth` limits recursion; `include_geometry` adds world
-/// bounding boxes). A listing is capped at 262144 bytes; if the tree is wider
-/// than that the call is refused rather than truncated, so lower `depth` or
-/// walk down through `ids`.
+/// bounding boxes). A listing returns at most `limit` (default 200) of the
+/// page's direct children starting at `offset`, and reports `child_count`,
+/// `children_offset`, `children_limit` and `more_children`: page through a
+/// wide page by calling again with `offset` advanced. A result over 262144
+/// bytes is refused rather than truncated.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 struct BatchGetArgs {
     /// Fetch these node ids in full detail.
@@ -415,6 +416,32 @@ struct BatchGetArgs {
     /// Include world-space bounding boxes.
     #[serde(default)]
     include_geometry: bool,
+    /// How many of the page's direct children to skip before listing any
+    /// (default 0). Applies to the listed page's own children only; nested
+    /// levels are governed by `depth`. Ignored when `ids` is given.
+    #[serde(default)]
+    offset: Option<usize>,
+    /// How many of the page's direct children to list, starting at `offset`
+    /// (default 200). Applies to the listed page's own children only; nested
+    /// levels are governed by `depth`. When the result says `more_children`,
+    /// call again with `offset` advanced by this limit. Ignored when `ids` is
+    /// given.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// How a caller narrows a result that overran [`MAX_JSON_RESPONSE_BYTES`].
+/// A listing must be told about `offset`/`limit` first: the caller may already
+/// be at `depth: 1` with no geometry, and cannot pass `ids` it has not been
+/// able to list.
+fn narrowing_hint(listing: bool) -> &'static str {
+    if listing {
+        "Narrow it: page the children with `limit` and `offset` (e.g. `limit: 50`, then \
+         `offset: 50` for the next window), and if that is still too large lower `depth` \
+         (try 1) or set `include_geometry` to false."
+    } else {
+        "Narrow it: ask for fewer `ids` per call, or set `include_geometry` to false."
+    }
 }
 
 #[derive(Clone)]
@@ -440,13 +467,11 @@ impl McpServerTool for BatchGetTool {
             // imported `.fig` that is tens of thousands of nodes.
             depth: args.depth.or(if listing { Some(2) } else { None }),
             include_geometry: args.include_geometry,
+            offset: args.offset,
+            limit: args.limit,
         };
         let value = with_surface(cx, move |surface, cx| surface.get_nodes(query, cx))?;
-        bounded_text_response(
-            value,
-            "Narrow it: lower `depth` (try 1), set `include_geometry` to false, or pass the \
-             `ids` of the specific nodes you need.",
-        )
+        bounded_text_response(value, narrowing_hint(listing))
     }
 }
 
@@ -897,5 +922,23 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("response budget"));
         assert!(message.contains("Lower `depth`."));
+    }
+
+    /// A listing refused for size must be told to page. The caller that found
+    /// this was already at `depth: 1` without geometry and had no ids to ask
+    /// by, because listing is how ids are discovered.
+    #[test]
+    fn a_refused_listing_is_told_to_page_with_offset_and_limit() {
+        let value = serde_json::json!({ "root": "n".repeat(MAX_JSON_RESPONSE_BYTES + 1) });
+        let error = bounded_text_response(value, narrowing_hint(true))
+            .expect_err("an oversized listing must be refused, not carried");
+        let message = error.to_string();
+        assert!(message.contains("`limit`"), "{message}");
+        assert!(message.contains("`offset`"), "{message}");
+        let pagination = message.find("`limit`").unwrap_or(usize::MAX);
+        let depth = message.find("`depth`").unwrap_or(usize::MAX);
+        assert!(pagination < depth, "pagination must come first: {message}");
+
+        assert!(!narrowing_hint(false).contains("`offset`"));
     }
 }

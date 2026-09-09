@@ -9,18 +9,36 @@ claims; entries that work closed have been deleted or rewritten rather than left
 standing, and entries that only a human at the keyboard could confirm are
 labelled as source readings.
 
-A release build was made from `16309b2` and driven afterwards, so the entries
-about the shipped CLI, the MCP loop and memory are measurements rather than
-readings — **of that build**. No binary has been built from this tree, and this
-tree changed five things those measurements ran through: the autosave write
-path (`Doc::clone_for_persist`, `fanta_format::ProjectWriteCache`), image
-decoding (`fanta_render::asset::LazyAssetResolver`), how a drag reaches the
-render thread (`ScenePatch` in `crates/fig_viewer/src/canvas.rs`), the layers
-tree (`layers_tree` built over the expanded set only) and the `.fig` import
-pipeline (`crates/fanta-fig-interop`). Every number below that touches one of
-those was measured before the change and has **not** been re-measured; each
-such entry says so. Everything reachable only by a mouse click is still a source
-reading: nobody has clicked a menu in any build of this tree.
+**A release binary has now been built from this tree and driven.** On
+2026-09-09, `cargo build --release -p zed` produced `target/release/fanta`,
+reporting `Fanta: v0.1.0-alpha.1+stable.8f43236…`, and it was driven over its
+own live MCP server on macOS 26.6.2, aarch64, 36 GiB. Two documents were
+opened: the 9.6 MB, 29,301-node, 3-page `basic.fig` the previous rehearsal used,
+and a 128 MB, 40,141-node, 31-page community UI kit ("UI3: Figma's UI Kit") that
+no build of this project had ever opened before. `script/smoke-mcp` passed
+**18 of 18, exit 0** against that binary. Roughly forty MCP operations were
+issued across six launches, including twelve of the fourteen design ops that
+were new on this branch — all but `set_index` and `frame_selection`. So the
+entries below about launch time, memory, the tool list,
+the design ops and the log are measurements of **this** tree, and the ones that
+used to say "not re-measured" have been replaced by the numbers rather than
+softened.
+
+One caveat on "this tree": the binary the bulk of the measurements come from
+reports `stable.8f43236`, and the tree moved after it was built. The
+`offset`/`limit` pagination this change adds to `batch_get` was written in
+response to the refusal that run found, so a **second** release binary was
+built afterwards and driven to check it; that pagination result is the only
+measurement here taken against the later binary, and it says so where it
+appears.
+
+**Nothing was clicked.** No mouse, no menu, no toolbar button, no keyboard
+shortcut, no canvas drag, no layers-panel interaction, no image paste, no DMG
+and no Gatekeeper path. Everything reachable only by a pointer or a key press is
+still a source reading and says so, including the drag path (`ScenePatch`,
+`crates/fig_viewer/src/canvas.rs`), which unit tests and whatever the MCP edits
+happened to trigger are the only things that have exercised it — no human has
+dragged a node in this build.
 
 [`REHEARSAL.md`](REHEARSAL.md) is the committed record of what was and was not
 actually driven. Nothing here claims more than that record supports.
@@ -146,7 +164,10 @@ actually driven. Nothing here claims more than that record supports.
   (*"an instance cannot be ungrouped; detach it first"*), a component master
   (*"… detach or delete the component instead"*), or something that is not a
   group (*"select a group or frame to ungroup"*). Unit-tested in
-  `structure.rs`; not driven in the app.
+  `structure.rs`. The keys have still not been pressed, but the same builders
+  were reached over MCP on 2026-09-09: `batch_design`'s `group` and `ungroup`
+  ops both succeeded on both test documents. `frame_selection` was not among
+  the ops driven.
 - Grid auto layout is offered in the inspector and the engine ignores it: the
   adapter logs a line and returns no operations at all
   (`gpui_adapters/design.rs::layout_mode_operations`). Horizontal and vertical
@@ -182,8 +203,10 @@ actually driven. Nothing here claims more than that record supports.
   copy, so correctness never rides on the patch. If applying a patch fails the
   render thread drops its copy, logs `the canvas render thread dropped its scene
   copy: …` at WARN, and the next paint sends the whole scene again; it is not
-  counted as a render failure. Unit-tested for parity; no frame of this tree has
-  been rendered.
+  counted as a render failure. Unit-tested for parity; **nobody has dragged a
+  node in this build**, so the only exercise this path has had outside those
+  tests is whatever the MCP edits and the `get_screenshot` calls of 2026-09-09
+  happened to trigger.
 
 ## Editing and files
 
@@ -233,8 +256,13 @@ actually driven. Nothing here claims more than that record supports.
   The module contract is that the bytes are exactly what a cold projection
   yields and every file still goes through the same write-if-changed and prune
   steps, and the crate's unit and integration tests (`tests/write_cache.rs`)
-  compare cached and cold trees byte for byte. The three-file diff above was
-  measured on the previous build; nobody has diffed a save from this one.
+  compare cached and cold trees byte for byte. The three-file diff has now been
+  taken from this write path too: on 2026-09-09 `script/smoke-mcp` made one node
+  over MCP against the release build of this tree, on a freshly materialised
+  project with a committed baseline, and `git status` afterwards showed exactly
+  `doc/metadata.json`, `pages/page-1/page.fnx` and `pages/page-1/page.ids.json`
+  — three files, no `fanta.json`. The edit reached `page.fnx` with no `cmd-s`,
+  its mtime moving after 2.5 s.
 - **A rectangle gains one attribute the first time a project is reloaded.**
   The loader backfills a vector's SVG viewport, so `<Rect width height />`
   becomes `<Rect width height local_size={[w, h]} />` on the first save after a
@@ -259,41 +287,60 @@ actually driven. Nothing here claims more than that record supports.
   verified in the rehearsal. Restoring a `.fig` that never materialised a
   project was **not** verified — if it does not come back, reopen it from
   File > Open Recent.
-- **Opening a very large community `.fig` (100 MB and up) is slow, and the
-  only number we have is from the previous build.** A 9.6 MB file took roughly
-  30–40 s to reach a rendered canvas on a debug build of `16309b2`'s
-  predecessor; the 128 MB case in the smoke checklist has never been run. This
-  branch reworked the import crate — `byte[]` fields decode to one
-  `KiwiValue::Bytes` instead of one value per byte (`kiwi/value.rs`), the
+- **A 128 MB community `.fig` takes about fifty seconds to open. A 9.6 MB one
+  takes about two.** Both measured on 2026-09-09 against the release build of
+  this tree, timing launch to a canvas that answers `get_editor_state` with a
+  node count. Nothing was clicked, so this is time-to-answering-canvas, not
+  time-to-a-frame-someone-looked-at. `~/Desktop/basic.fig` (9.6 MB, 29,301
+  nodes, 3 pages): **2.1 s and 2.4 s** over two runs. The 128 MB *UI3: Figma's
+  UI Kit (Community)* file (40,141 nodes, 31 pages), which no build of this
+  project had ever opened before today: **48.5 s, 48.6 s and 54.1 s** over three
+  runs. Every *edit* tried against it afterwards applied; the one thing that did
+  not work was listing a wide page's children, which the response cap refused —
+  see the `batch_get` entry under Agents. The smoke
+  checklist's timing row for that file, previously marked never-run, is now
+  these numbers. The 30–40 s once recorded for the 9.6 MB file was a **debug**
+  build of `16309b2`'s predecessor, so it is not a like-for-like comparison and
+  no speedup is claimed from it; treat the release figures as the first ones of
+  their kind. This branch did rework the import crate — `byte[]` fields decode
+  to one `KiwiValue::Bytes` instead of one value per byte (`kiwi/value.rs`), the
   shared-style pre-pass no longer deep-clones every node change
   (`fields.rs::resolve_style_references` returns `Cow`s), master paths are
   built once per master (`instance_overrides/paths.rs::MasterPathCache`), and
   per-instance side tables are borrowed rather than copied
-  (`orchestrator.rs`) — and it changed what happens after import (images are
-  no longer decoded up front; see below). None of that has been timed in the
-  app. Whoever measures next has a hook: `import_timing_diagnostic` in
+  (`orchestrator.rs`) — but nothing in these runs attributes a figure to a
+  change. Whoever wants the crate's own share of that time has a hook:
+  `import_timing_diagnostic` in
   `crates/fanta-fig-interop/src/fig/fixture_tests.rs` is an ignored test that
   prints `read_fig` and `fig_to_doc` timings for the file named by
   `FANTA_FIG_FIXTURE`. It covers the crate, not the canvas.
-- **Memory was high on the previous build, and the first edit cost about
-  2.3 GiB that was not given back. Those numbers have not been re-measured on
-  this tree.** Measured on the release build of `16309b2` with one 9.6 MB,
-  29,301-node `.fig`: importing it settled at 4.3 GiB resident, reopening the
-  saved project settled at 5.0 GiB, and the first edit-plus-autosave peaked at
-  7.6 GiB and stayed near 7.4 GiB. The cost was isolated to the autosave write
-  path — a screenshot added 96 MiB and reading the source added 41 MiB — and it
-  was a one-time high-water mark rather than a leak: four further edits stayed
-  flat. That write path is exactly what this branch replaced (the persisted
-  clone drops the undo history — the comment in `FigItem::save` names the undo
-  stack's subtree snapshots as the save path's high-water mark — and the
-  projection no
-  longer builds a whole-document `serde_json::Value`), and the import path now
-  keeps image assets encoded until they are drawn, under a 1.5 GiB cap on
-  decoded pixels (`DEFAULT_DECODED_BUDGET_BYTES`,
-  `crates/fanta-render/src/asset.rs`). So the figures above describe code that
-  is gone, and the new code has never been watched in Activity Monitor. Nobody
-  has opened the 128 MB community UI kit that the smoke checklist's timing row
-  calls for, on either build.
+- **Memory is high, and the first edit still costs gigabytes that only partly
+  come back.** Resident size, watched while the release build of this tree was
+  driven over MCP on 2026-09-09:
+  - 9.6 MB `basic.fig`: **2004 MiB and 2173 MiB** once the canvas was up, on two
+    runs. After about fifteen MCP operations including `create_component` and
+    `create_instance`: **3677 MiB and 3703 MiB**.
+  - 128 MB UI kit: **1952, 1960 and 1958 MiB** once open and settled for 20 s,
+    across three runs — no higher than the file thirteen times smaller, which is
+    an observation, not something these runs explain.
+  - The first edit on that document, isolated (open, settle, create one 10×10
+    rectangle, wait 25 s for the debounced autosave to finish): **1960 MiB →
+    5788 MiB**, about **3.8 GiB** for one rectangle and its save.
+  - That is a high-water mark that partly recedes, not a per-edit leak: a
+    following `set_props` left it at 5789 MiB, the next autosave brought it down
+    to 5270 MiB, and a second edit-plus-autosave cycle to 5087 MiB.
+
+  Read two things out of this and no more. Opening settles at roughly half what
+  the release build of `16309b2` recorded on the same 9.6 MB file (4.3 GiB
+  importing, 5.0 GiB reopening the saved project). And the first-edit high-water
+  mark is still there — larger in absolute terms on a 128 MB document than the
+  2.3 GiB that build's first edit cost on a 9.6 MB one — so the shape is
+  unchanged even though the resting figures improved. No cause is claimed for
+  either: this branch replaced the save path (`Doc::clone_for_persist` through
+  `fanta_format::write_project_tree_cached`) and made image decoding lazy under
+  a 1.5 GiB cap (`DEFAULT_DECODED_BUDGET_BYTES`,
+  `crates/fanta-render/src/asset.rs`), but nothing in these runs isolates which
+  change moved which number.
 - **The first frame of a page may decode its images.** Images are decoded
   lazily: `LazyAssetResolver::resolve` (`crates/fanta-render/src/asset.rs`)
   decodes an asset the first time the renderer asks for it, on whichever thread
@@ -306,8 +353,10 @@ actually driven. Nothing here claims more than that record supports.
   evicted image decodes it again; a single image larger than the whole budget is
   kept rather than re-decoded every frame. A corrupt image logs `failed to
   decode embedded .fig image asset …` at WARN **once** — the failure is cached —
-  and draws as missing from then on. Unit-tested in `asset.rs`; no page of this
-  tree has been drawn.
+  and draws as missing from then on. Unit-tested in `asset.rs`; the only
+  rendering asked of this build is `get_screenshot`, which returned valid PNGs
+  of both test documents on 2026-09-09 — no window has been watched, and no
+  document with more image pixels than the budget has been paged through.
 
 ## Agents
 
@@ -320,16 +369,37 @@ actually driven. Nothing here claims more than that record supports.
   `total_bytes` and `truncated`, with a `notice` naming the arguments for the
   next slice; `offset`, `limit` and `max_bytes` (ceiling 1 MiB,
   `MAX_SOURCE_BYTES`) ask for a different one. The page of a 9.6 MB `.fig` that
-  used to come back as 43,145,940 characters in one block now measures 60,719.
-  On a document that size, paging through it is still the wrong move — use
-  `get_editor_state` and `batch_get` for structure. `batch_get` with no `ids`
-  now defaults to `depth: 2` rather than walking the whole scene, and any result
-  over 256 KiB (`MAX_JSON_RESPONSE_BYTES`) is refused with a message naming its
-  size and how to narrow it.
+  used to come back as 43,145,940 characters in one block measured **60,719**
+  when `script/smoke-mcp` asked the release build of this tree for it on
+  2026-09-09. On a document that size, paging through it is still the wrong move
+  — use `get_editor_state` and `batch_get` for structure. `batch_get` with no
+  `ids` now defaults to `depth: 2` rather than walking the whole scene, and any
+  result over 256 KiB (`MAX_JSON_RESPONSE_BYTES`) is refused with a message
+  naming its size and how to narrow it. On a wide page that refusal is a dead
+  end; see the next entry.
+- **On a wide page, `batch_get` cannot list the children at all.** Driven
+  against the 128 MB UI kit on 2026-09-09: `batch_get` on the active page with
+  `depth: 1` and `include_geometry: false` — already the narrowest listing the
+  tool offers — produced **967,017 bytes** and was refused for exceeding the
+  262,144-byte cap, while the refusal text told the caller to *lower `depth`
+  (try 1)*, which is what it had just done. With no pagination there is no
+  argument combination that lists that page's children, so an agent that has not
+  been handed node ids some other way cannot get them. The fix — `offset` and
+  `limit` on `batch_get`, and a refusal message that names them — lands in this
+  same change, and **was** driven against the same document on a second release
+  build: the page that refused is *Internal Only Canvas*, whose 8,920 direct
+  children now come back in 45 windows of 200, every child exactly once and
+  `child_count` agreeing with the total. The seven next-widest pages of that
+  document list in a single call each. The unbounded request is still refused,
+  but now reads *"page the children with `limit` and `offset`"* before it
+  mentions `depth`.
 - `get_screenshot` is not bounded the same way: a dense page at a large
   `max_dimension` can produce several MB of base64. The default of 1024 measured
   64,844 characters in the rehearsal and is safe; pass a large `max_dimension`
-  only deliberately.
+  only deliberately. Measured on 2026-09-09 against this tree's release build:
+  `max_dimension` 1200 on the 9.6 MB document returned a 147,712-byte PNG in
+  0.19 s that visibly contained the edits made over MCP, and the same call on
+  the 128 MB UI kit returned 52,007 bytes in 0.15 s.
 - **`tools/list` now returns six tools, and every document that said five is
   a step behind.** `get_guidelines` was added next to `get_editor_state`,
   `batch_get`, `batch_design`, `get_screenshot` and `read_fnx_source`
@@ -341,9 +411,12 @@ actually driven. Nothing here claims more than that record supports.
   documents all six. `script/smoke-mcp`'s assertion *"tools/list carries the
   six canvas tools"* now requires `get_guidelines` in `REQUIRED_TOOLS` too; it
   checks that the six names are present rather than that the list has six
-  entries. No client has listed this tree's tools since the sixth was added.
+  entries. Confirmed by a client on 2026-09-09: the smoke run against this
+  tree's release build saw all six names in `tools/list`, and `get_guidelines`
+  answered with 4,075 characters.
 - **`batch_design` (and the built-in agent's `design_edit`) accept fourteen new
-  ops that only unit tests have exercised.** The shared vocabulary is
+  ops; twelve of them have now been driven, two have not.** The shared
+  vocabulary is
   `design_surface::DesignOp` (`crates/design_surface/src/design_surface.rs`,
   tagged by `"op"`): `create_instance`, `set_stroke`, `set_shadow`,
   `set_text_style`, `set_auto_layout`, `set_index`, `rotate`, `align`,
@@ -358,10 +431,19 @@ actually driven. Nothing here claims more than that record supports.
   `selection_bounds`, a `hints` list, and an optional `empty_space: [w, h]`
   query answered with a free `{page, x, y, width, height}` to the right of or
   below the page's content with a 100 px margin
-  (`agent_surface.rs::empty_space`, `EMPTY_SPACE_MARGIN`). The only op any
-  script has ever driven against a running app is `create_node`
-  (`script/smoke-mcp`, its one `"op"` literal); everything else here is a source
-  reading backed only by the unit tests at the bottom of `agent_surface.rs`.
+  (`agent_surface.rs::empty_space`, `EMPTY_SPACE_MARGIN`). On 2026-09-09,
+  `set_auto_layout`, `align`, `distribute`, `group`, `ungroup`,
+  `set_text_style`, `set_stroke`, `set_shadow`, `rotate`, `duplicate`,
+  `create_component` and `create_instance` were all issued over MCP against the
+  release build of this tree, on **both** the 9.6 MB document and the 128 MB UI
+  kit, and all succeeded; `create_component` wrote a real
+  `components/drive-card/master.fnx` to disk through the autosave, and
+  `get_editor_state` answered an `empty_space` query with a usable free
+  rectangle. Creating a frame plus three children in one `batch_design` took
+  0.06 s. **`set_index` and `frame_selection` were not among them** and remain
+  source readings backed only by the unit tests at the bottom of
+  `agent_surface.rs`, as does every path through the built-in agent's
+  `design_edit` — nothing has been driven through the agent panel.
 - **The built-in agent's system prompt is now Fanta's, with a design section
   that appears only when the design tools are available.**
   `crates/agent/src/templates/system_prompt.hbs` opens with *"You are the Fanta
@@ -459,8 +541,12 @@ actually driven. Nothing here claims more than that record supports.
   otherwise hidden, so nothing else matches. Searches for "vim", "debugger",
   "project panel" and "new file" return **zero** visible actions by the same
   derivation.
-- **The two wrong agent-panel strings from alpha.1 are gone from the tree, but
-  no running build has been driven since.** `crates/agent_ui/src/ui/end_trial_upsell.rs`
+- **The CLI no longer says `Zed`, and that is now an observation.** On the
+  release binary built from this tree, `fanta --system-specs` prints
+  `Fanta: v0.1.0-alpha.1+stable.8f43236…`. The rehearsal recorded that same line
+  as `Zed: v0.1.0-alpha.1+stable.6e14229 (Fanta)`; that leak is gone.
+- **The two wrong agent-panel strings from alpha.1 are gone from the tree, and
+  the panel itself still has not been looked at.** `crates/agent_ui/src/ui/end_trial_upsell.rs`
   (*"Upgrade to Fanta Pro"*, *"Your Fanta Pro Trial has expired"* — for a
   subscription that does not exist) was deleted together with its mount in the
   agent panel, and the free-usage-limit callout lost its "Upgrade" button. The
@@ -473,27 +559,31 @@ actually driven. Nothing here claims more than that record supports.
   documents `~/Library/Application Support/Fanta`, and there is no "Try Zed Pro
   for Free" or "Message the Zed Agent" string left in `crates/agent_ui`.
   Identifiers, the `zed://` URL scheme, `ZED_*` env vars and action namespaces
-  are unchanged on purpose.
+  are unchanged on purpose. Everything in this entry is a grep of the tree: the
+  agent panel has never been opened in a build of it.
 - **This build never updates itself.** `script/bundle-mac` exports
   `ZED_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG
   from Fanta.'`, so "Check for Updates" shows that as an information prompt
   instead of erroring, and the poll of the Zed release endpoint is suppressed.
   Get new alpha builds by downloading a new DMG.
-- The once-per-launch `ERROR … agent_ui/src/message_editor.rs:601 language not
-  found` from alpha.1 should no longer fire: the agent composer now asks for a
+- **The once-per-launch `language not found` ERROR is gone.** The alpha.1 line
+  — `ERROR … agent_ui/src/message_editor.rs:601 language not found`, once per
+  launch — did not fire once on 2026-09-09: the agent composer now asks for a
   Markdown grammar only when one is registered
-  (`available_language_for_name("Markdown")` in `message_editor.rs`). Logs
-  written by the alpha.1 binary still contain it; a fresh build has not been
-  launched to confirm its absence.
-- A second ERROR can appear under load and is also **cosmetic**:
+  (`available_language_for_name("Markdown")` in `message_editor.rs`). Across
+  every run of the release build that day — three opens of the 9.6 MB file,
+  three of the 128 MB UI kit, roughly forty MCP operations, several screenshots
+  and many autosaves — `~/Library/Logs/Fanta/Fanta.log` recorded **zero ERROR
+  lines, zero panics and zero `language not found` lines**. Every
+  `language not found` line the log still holds pre-dates that day.
+- A second ERROR can appear under load and is **cosmetic**:
   `gpui_macos::metal_renderer failed to render: scene too large: … retrying
   with larger instance buffer size`. It says what it does — the renderer grows
-  its instance buffer and draws the frame. Re-counted just now, the current
-  `~/Library/Logs/Fanta/Fanta.log` (103 KB, five launches) holds **13 ERROR
-  lines: twelve `language not found` and one `scene too large`**, zero
-  `didn't find an action` lines, and no `panic` match beyond
-  `panic handler registered`. That log was written by the older binary and
-  pre-dates `16309b2`.
+  its instance buffer and draws the frame. It did not fire on 2026-09-09
+  either, which is unsurprising: nothing was dragged, zoomed or scrolled. The
+  ERROR lines the log does contain — **13: twelve `language not found` and one
+  `scene too large`**, counted in an earlier pass over a 103 KB log of five
+  launches — were all written by older binaries, before `16309b2`.
 - Panic backtraces in the shipped build are **bare addresses**, because
   `script/bundle-mac` runs `/usr/bin/strip` over `Contents/MacOS/fanta` (and
   `cli`) before signing. The same script runs `dsymutil --flat` first, so the
@@ -527,8 +617,17 @@ actually driven. Nothing here claims more than that record supports.
   an earlier pass. Those counts were **not re-run for this documentation pass**
   — they are carried over from the pass that measured them, and the numbers may
   have drifted. Treat them as "these two suites are known red", not as a
-  current count. Re-running them was skipped again for this pass. Both crates
+  current count. Re-running them was skipped again for the 2026-09-09 pass, in
+  which a release binary was built and driven but these two suites were not
+  touched. Both crates
   still exist (`crates/sidebar`, `crates/agent_ui`); this branch edited
   `agent_ui` (the removed upsell, the agent display name, the Markdown-grammar
   guard) and added unit tests for the display-name helper, but the suite as a
   whole was not re-run.
+- A third suite has one red test: `cargo test -p agent --lib` finishes **681
+  passed, 1 failed, 11 ignored**, the failure being
+  `tools::write_file_tool::tests::test_streaming_format_on_save`, which panics
+  with *"Parking forbidden"* out of `crates/scheduler/src/test_scheduler.rs`.
+  Re-run on 2026-09-09 with this branch's code changes stashed, it fails
+  identically, so it is pre-existing and sits off every path this branch
+  touched. The design-tool tests in the same crate pass.

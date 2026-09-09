@@ -111,9 +111,11 @@ no longer linked.
 1. **File > Open...** a `.fig` file, or **File > New Design...** to start empty.
    Opening a `.fig` writes a Fanta project folder beside it on open, and
    `git init`s it; that folder, not the original `.fig`, is what your edits go
-   to. Large files take a while — a 9.6 MB `.fig` took 30-40 s to reach a
-   rendered canvas on a debug build of the previous release; the import path
-   has since been reworked and not re-timed.
+   to. Large files take a while: on a release build, a 9.6 MB `.fig` reaches a
+   canvas that answers in about 2 s and a 128 MB one in about 50 s (measured
+   over MCP on 2026-09-09, launch to a canvas that reports a node count — nobody
+   watched the window, so this is not time-to-a-frame-you-can-look-at; see
+   [`docs/alpha/REHEARSAL.md`](docs/alpha/REHEARSAL.md)).
 2. Draw. Edits autosave about a second after you stop — no `cmd-s` needed.
    `cmd-g` groups the selection, `cmd-alt-g` wraps it in a frame,
    `cmd-shift-g` ungroups; pasting an image from another app places it.
@@ -137,8 +139,13 @@ meet first:
   blurs do nothing.
 - Canvas copy and paste works within one document only. Pasting an image works;
   pasting any other kind of file still does nothing.
-- Group, Ungroup, Frame selection, image paste and the new agent operations
-  have only been exercised by unit tests, not in a running build.
+- Nothing in this build has been clicked. The agent operations behind Group,
+  Ungroup, align, components and the rest were driven over MCP against a release
+  build on 2026-09-09 and worked; the keyboard shortcuts, the toolbar, image
+  paste and dragging on the canvas have only been exercised by unit tests.
+- Memory is high. A large document settles at about 2 GiB, and the first edit
+  plus its autosave took that to 5.8 GiB on a 128 MB file — about 3.8 GiB for
+  one rectangle — before later autosaves brought it back to about 5 GiB.
 - Opening a folder that is *not* a design project raises an inherited
   Restricted Mode dialog that Escape will not dismiss. A design project Fanta
   scaffolded is trusted automatically; one you received as a zip or a copied
@@ -147,7 +154,12 @@ meet first:
   can prompt too.
 - Without Xcode Command Line Tools installed, a new project saves but is not
   git-initialised.
-- Very large community `.fig` files (100 MB and up) are slow to open.
+- Very large community `.fig` files are slow to open: a 128 MB, 40,141-node one
+  took 48-54 s across three runs.
+- On a very wide page, an unpaged `batch_get` listing overflows the 256 KiB
+  response cap — 967,017 bytes on a 40,141-node document. Page it with
+  `offset`/`limit`, new in this change: the page that refused has 8,920 direct
+  children and lists in 45 windows of 200.
 
 ## Feedback
 
@@ -155,10 +167,9 @@ There is no public issue tracker for the alpha yet — report back through
 whoever gave you the build. Logs live in `~/Library/Logs/Fanta/`, and attaching
 `Fanta.log` makes almost every report easier to act on. One ERROR line in there
 is known and cosmetic — the Metal renderer's `scene too large … retrying`. The
-`language not found` line older builds logged once per launch should be gone
-(the agent composer now only asks for a Markdown grammar when one is
-registered); if you still see it, or anything else at ERROR level, it is worth
-sending.
+`language not found` line older builds logged once per launch is gone: across
+six launches of a release build on 2026-09-09 the log recorded zero ERROR lines
+and zero panics. Anything at ERROR level is worth sending.
 
 If the app crashed, the shipped binary is stripped, so a backtrace is bare
 addresses. `script/bundle-mac` writes `fanta.dwarf` next to the binary it built;

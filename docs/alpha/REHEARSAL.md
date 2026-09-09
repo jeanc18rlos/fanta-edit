@@ -204,3 +204,119 @@ Ordered by severity.
   history committed to its own git repo (`Baseline from basic.fig` →
   `After first MCP edit` → `After second MCP edit`). Nothing in
   `fanta-edit` was committed, staged or reverted.
+
+---
+
+# 2026-09-09: the first release build of this tree, driven
+
+Everything above is the record of a **debug** build at `6e14229` and stays as
+written; it is an accurate account of a different binary. This section is a
+separate run, of a different build, and does not amend it.
+
+| | |
+|---|---|
+| Tree | `perf/large-documents-ai-alignment` at `stable.8f43236` plus the staged round-two fixes. This is everything on the branch **except** the `offset`/`limit` pagination, which was written afterwards in response to what this run found |
+| Binary | `cargo build --release -p zed` → `target/release/fanta` |
+| Version | `fanta --system-specs` prints `Fanta: v0.1.0-alpha.1+stable.8f43236…` — **`Fanta:`**, where the rehearsal above recorded `Zed:` |
+| Machine | macOS 26.6.2, aarch64, 36 GiB |
+| How it was driven | entirely over the app's own live MCP server. **Nothing was clicked.** No mouse, no menu, no keyboard shortcut, no drag |
+
+## `script/smoke-mcp` against the release build
+
+**18 of 18 assertions passed, exit 0**, on a freshly materialised project with a
+committed baseline. The rows worth quoting:
+
+| Assertion | Observed |
+|---|---|
+| `tools/list` carries the six canvas tools | `batch_design, batch_get, get_editor_state, get_guidelines, get_screenshot, read_fnx_source` |
+| `read_fnx_source` returns the active page's text | **60,719 chars** — the same page that returned 43,145,940 in the rehearsal above |
+| the edit reaches the `.fnx` on disk with no Cmd-S | `page.fnx` mtime moved after **2.5 s** |
+| the autosaved edit shows up as a git diff | exactly three files: `doc/metadata.json`, `pages/page-1/page.fnx`, `pages/page-1/page.ids.json` |
+
+The three-file diff is the one [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) documents;
+`fanta.json` is no longer in it.
+
+## Document A — `~/Desktop/basic.fig`, 9.6 MB, 29,301 nodes, 3 pages
+
+The same file the rehearsal above used.
+
+| Measurement | Observed |
+|---|---|
+| Launch → a canvas that answers `get_editor_state` with a node count | **2.1 s**, **2.4 s** (two runs) |
+| Resident memory once the canvas was up | **2004 MiB**, **2173 MiB** |
+| Resident memory after ~15 MCP ops including `create_component` and `create_instance` | **3677 MiB**, **3703 MiB** |
+| `get_screenshot`, `max_dimension` 1200 | **0.19 s**, a 147,712-byte PNG that visibly contains the edits |
+| A frame plus three children in one `batch_design` | **0.06 s** |
+
+The rehearsal's 30–40 s for this file was a debug build, so these are not a
+before/after pair — they are the first release-build figures for it.
+
+## Document B — the 128 MB "UI3: Figma's UI Kit (Community)", 40,141 nodes, 31 pages
+
+**This project had never opened this file before.** The timing row at the bottom
+of [`SMOKE.md`](SMOKE.md) had never been run; this is that row, run.
+
+| Measurement | Observed |
+|---|---|
+| Launch → answering canvas | **48.5 s**, **48.6 s**, **54.1 s** (three runs) |
+| Resident memory, open and settled for 20 s | **1952 MiB**, **1960 MiB**, **1958 MiB** |
+| Isolated first edit: open, settle, create one 10×10 rectangle, wait 25 s for the debounced autosave | **1960 MiB → 5788 MiB** — about **3.8 GiB** for the first edit and its save |
+| What happens next | a following `set_props` left it at 5789 MiB; the next autosave brought it to **5270 MiB**; a second edit-plus-autosave cycle to **5087 MiB** |
+| `get_screenshot` | **0.15 s**, 52,007 bytes |
+
+So the first-edit cost is a high-water mark that partly recedes, not a per-edit
+leak. The twelve design ops listed below all succeeded on this document too.
+
+## The new op vocabulary, exercised
+
+Driven over MCP on both documents, all succeeding: `set_auto_layout`, `align`,
+`distribute`, `group`, `ungroup`, `set_text_style`, `set_stroke`, `set_shadow`,
+`rotate`, `duplicate`, `create_component`, `create_instance`. `create_component`
+wrote a real `components/drive-card/master.fnx` to disk through the autosave.
+`get_guidelines` returned 4,075 characters. `get_editor_state` with an
+`empty_space` argument returned a usable free rectangle.
+
+`set_index` and `frame_selection` — the other two ops new on this branch — were
+**not** driven.
+
+## The log
+
+Across every run that day — three opens of the 9.6 MB file, three of the 128 MB
+file, roughly forty MCP operations, several screenshots and many autosaves —
+`~/Library/Logs/Fanta/Fanta.log` recorded **zero ERROR lines, zero panics and
+zero `language not found` lines**. The once-per-launch
+`agent_ui/src/message_editor.rs` `language not found` ERROR that the rehearsal
+above recorded no longer fires; every such line in the log pre-dates this run.
+
+## What driving found
+
+`batch_get` on document B's active page with `depth: 1` and
+`include_geometry: false` — already the narrowest listing the tool offers —
+returned **967,017 bytes** and was refused for exceeding the 262,144-byte cap,
+while the refusal message told the caller to lower `depth` (*"try 1"*), which is
+what it had done. With no pagination, an agent cannot enumerate that page's
+children by any combination of arguments. `offset`/`limit` pagination landed in
+this same change afterwards, and was driven against the same document on a
+second release build: *Internal Only Canvas*, the page that refused, has 8,920
+direct children and now pages in 45 windows of 200 with every child returned
+exactly once and `child_count` agreeing; the seven next-widest pages each list
+in one call; the unbounded request is still refused, with a message that names
+`limit` and `offset` first.
+
+## What was NOT driven
+
+Unchanged from the rehearsal above, and still the honest boundary of everything
+this document claims:
+
+- **Nothing was clicked.** No menu, no toolbar button, no keyboard shortcut, no
+  canvas drag, no layers-panel interaction, no group/ungroup through the UI, no
+  image paste.
+- No DMG was built and no Gatekeeper path was walked. The measurements are of
+  `target/release/fanta`, not of an installed `Fanta.app`.
+- The drag-performance work — targeted invalidation, the render-thread
+  `ScenePatch` — is exercised only by unit tests and by whatever these MCP edits
+  and screenshots happened to trigger. **No human has dragged a node in this
+  build.**
+- The in-app agent panel was never opened, so no thread has run against this
+  tree's system prompt.
+- The `sidebar` and `agent_ui` test suites were not re-run.

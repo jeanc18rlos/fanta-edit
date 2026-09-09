@@ -396,6 +396,14 @@ pub enum DesignOp {
 /// is this big is refused with instructions for narrowing it, never cut.
 pub const MAX_JSON_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// Direct children one page listing returns when the caller gives no `limit`.
+/// An imported `.fig` page can hold thousands of top-level nodes, and listing
+/// all of them at once overruns [`MAX_JSON_RESPONSE_BYTES`] — which used to
+/// leave an agent with no way to enumerate the page at all, since ids are
+/// discovered by listing. A windowed default always answers; a caller who
+/// wants more asks for it explicitly and may be refused for size.
+pub const DEFAULT_CHILD_LIMIT: usize = 200;
+
 /// Which nodes `DesignSurface::get_nodes` returns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct NodeQuery {
@@ -413,6 +421,20 @@ pub struct NodeQuery {
     /// Include world-space bounding boxes.
     #[serde(default)]
     pub include_geometry: bool,
+    /// How many of the listed node's direct children to skip before returning
+    /// any (default 0). Applies to the TOP-LEVEL listed node only — deeper
+    /// levels are governed by `depth`, never by `offset`/`limit`. Ignored when
+    /// fetching by `ids`.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// How many of the listed node's direct children to return, starting at
+    /// `offset` (default 200). Applies to the TOP-LEVEL listed node only —
+    /// deeper levels are governed by `depth`. The result reports
+    /// `child_count`, `children_offset`, `children_limit` and `more_children`
+    /// so a further call can continue where this one stopped. Ignored when
+    /// fetching by `ids`.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 /// What `DesignSurface::screenshot` renders.
@@ -509,7 +531,12 @@ live canvas at once. These guidelines apply whether you drive the canvas
 
 ## Working method
 1. Read state first (`design_state` / `get_editor_state`), then the page tree
-   with `depth` 1–2; fetch nodes by id for detail.
+   with `depth` 1–2; fetch nodes by id for detail. A page listing returns at
+   most 200 of the page's direct children at a time and reports `child_count`,
+   `children_offset`, `children_limit` and `more_children`: while
+   `more_children` is true, call again with `offset` advanced by the limit to
+   walk the rest of the page. Imported pages are wide — do not assume the
+   first window is the whole page.
 2. Batch related ops into ONE call with a descriptive `label` ("Add login
    card"); the batch is one undo step and rolls back entirely on failure.
    Use the `created` ids the result returns for follow-up ops.
@@ -535,8 +562,9 @@ live canvas at once. These guidelines apply whether you drive the canvas
 - Don't set `x`/`y` on children of an auto-layout frame; change the layout.
 - Don't scale text or images by editing `width`/`height` to fake a style
   change; use `set_text_style` or replace the image.
-- Don't delete or rewrite what you have not read; page trees are large, and
-  `child_count` means there is more below.
+- Don't delete or rewrite what you have not read; page trees are large,
+  `child_count` means there is more below, and `more_children` means there is
+  more beside what you were given.
 "#;
 
 #[derive(Default)]
@@ -557,4 +585,23 @@ pub fn register(provider: Rc<dyn DesignSurface>, cx: &mut App) {
 /// The registered design surface, if the editor has installed one.
 pub fn active(cx: &App) -> Option<Rc<dyn DesignSurface>> {
     cx.try_global::<DesignSurfaceRegistry>()?.provider.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Child pagination is additive: a caller that sends neither field asks
+    /// the same question it always did, and gets the surface's default window.
+    #[test]
+    fn a_query_without_pagination_fields_still_parses() {
+        let query: NodeQuery = serde_json::from_value(serde_json::json!({
+            "page": 0,
+            "depth": 1,
+            "include_geometry": false,
+        }))
+        .expect("the pre-pagination query shape stays valid");
+        assert_eq!(query.offset, None);
+        assert_eq!(query.limit, None);
+    }
 }
