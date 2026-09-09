@@ -46,12 +46,45 @@ done
 
 shift $((OPTIND-1))
 
+case "${FANTA_REQUIRE_NOTARIZATION:-false}" in
+    true|1) require_notarization=true;;
+    false|0) require_notarization=false;;
+    *)
+        echo "FANTA_REQUIRE_NOTARIZATION must be true or false."
+        exit 1
+        ;;
+esac
+
+if [[ -n "${MACOS_CERTIFICATE:-}" && -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || \
+   [[ -z "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+    echo "MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD must be provided together."
+    exit 1
+fi
+
+if [[ "$require_notarization" = true ]]; then
+    if [[ "$target_dir" != release ]]; then
+        echo "Notarized distribution requires a release build; remove -d."
+        exit 1
+    fi
+    if [[ -z "${APPLE_NOTARIZATION_KEYCHAIN_PROFILE:-}" ]] && \
+       [[ -z "${APPLE_NOTARIZATION_KEY:-}" || -z "${APPLE_NOTARIZATION_KEY_ID:-}" || -z "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+        echo "Distribution requires Apple notarization credentials: a keychain profile or an API key, key ID, and issuer ID."
+        exit 1
+    fi
+fi
 
 # Get release channel
 pushd crates/zed
 channel="${FANTA_RELEASE_CHANNEL:-$(<RELEASE_CHANNEL)}"
 export ZED_RELEASE_CHANNEL="${channel}"
 popd
+case "$channel" in
+    dev|nightly|preview|stable) ;;
+    *)
+        echo "Unsupported release channel: $channel"
+        exit 1
+        ;;
+esac
 
 export ZED_BUNDLE=true
 
@@ -72,7 +105,7 @@ fi
 
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
 if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
-    cargo install cargo-bundle --git https://github.com/zed-industries/cargo-bundle.git --branch zed-deploy
+    cargo install cargo-bundle --locked --git https://github.com/zed-industries/cargo-bundle.git --rev 2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
 fi
 
 # Deal with versions of macOS that don't include libstdc++ headers
@@ -134,22 +167,39 @@ else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
+signing_keychain_directory=""
+signing_keychain=""
+certificate_file=""
+notarization_key_file=""
+original_default_keychain=""
+
+function cleanup() {
+    local result=$?
+    if [[ -n "$certificate_file" ]]; then
+        rm -f "$certificate_file"
+    fi
+    if [[ -n "$notarization_key_file" ]]; then
+        rm -f "$notarization_key_file"
+    fi
+    if [[ -n "$signing_keychain" ]]; then
+        echo "Cleaning up keychain"
+        security default-keychain -d user -s "$original_default_keychain" || echo "Warning: could not restore the original default keychain." >&2
+        security delete-keychain "$signing_keychain" || echo "Warning: could not delete the temporary signing keychain." >&2
+    fi
+    if [[ -n "$signing_keychain_directory" ]]; then
+        rm -rf "$signing_keychain_directory"
+    fi
+    return "$result"
+}
+
+trap cleanup EXIT
+
 if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
     echo "Setting up keychain for code signing..."
-    original_default_keychain=$(security default-keychain -d user | tr -d '"')
+    original_default_keychain=$(security default-keychain -d user | sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
     signing_keychain_directory=$(mktemp -d)
     signing_keychain="${signing_keychain_directory}/fanta.keychain-db"
     certificate_file=$(mktemp)
-
-    function cleanup() {
-        echo "Cleaning up keychain"
-        rm -f "$certificate_file"
-        security default-keychain -d user -s "$original_default_keychain"
-        security delete-keychain "$signing_keychain" || true
-        rm -rf "$signing_keychain_directory"
-    }
-
-    trap cleanup EXIT
 
     security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$signing_keychain"
     security default-keychain -d user -s "$signing_keychain"
@@ -182,6 +232,10 @@ if [[ $can_code_sign = true && -n "${APPLE_NOTARIZATION_KEYCHAIN_PROFILE:-}" ]];
     can_notarize=true
 elif [[ $can_code_sign = true && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
     can_notarize=true
+fi
+if [[ "$require_notarization" = true && "$can_notarize" != true ]]; then
+    echo "Distribution requires a Developer ID Application signing identity and Apple notarization credentials."
+    exit 1
 fi
 
 GIT_VERSION="v2.43.3"
@@ -257,7 +311,7 @@ function sign_app_binaries() {
 
     if [ "$local_install" = true ]; then
         rm -rf "/Applications/$bundle_name"
-        mv "$app_path" "/Applications/$bundle_name"
+        ditto "$app_path" "/Applications/$bundle_name"
         echo "Installed application bundle: /Applications/$bundle_name"
         if [ "$open_result" = true ]; then
             echo "Opening /Applications/$bundle_name"
@@ -279,11 +333,11 @@ function sign_app_binaries() {
         dmg_file_path="${dmg_target_directory}/Fanta-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
 
-        rm -rf ${dmg_source_directory}
-        mkdir -p ${dmg_source_directory}
+        rm -rf "${dmg_source_directory}"
+        mkdir -p "${dmg_source_directory}"
         mv "${app_path}" "${dmg_source_directory}"
         echo "Adding symlink to /Applications to ${dmg_source_directory}"
-        ln -s /Applications ${dmg_source_directory}
+        ln -s /Applications "${dmg_source_directory}"
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
         hdiutil create -volname Fanta -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
@@ -291,7 +345,7 @@ function sign_app_binaries() {
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
         echo "Removing symlink to /Applications from ${dmg_source_directory}"
-        rm ${dmg_source_directory}/Applications
+        rm "${dmg_source_directory}/Applications"
 
         if [[ $can_notarize = true ]]; then
             echo "Notarizing DMG with Apple"
@@ -305,12 +359,13 @@ function sign_app_binaries() {
                 rm "$notarization_key_file"
             fi
             "${xcode_bin_dir_path}/stapler" staple "${dmg_file_path}"
+            "${xcode_bin_dir_path}/stapler" validate "${dmg_file_path}"
         elif [[ $can_code_sign = true ]]; then
             echo "Apple notarization credentials are missing; the signed DMG was not notarized."
         fi
 
         if [ "$open_result" = true ]; then
-            open $dmg_target_directory
+            open "$dmg_target_directory"
         fi
     fi
 }

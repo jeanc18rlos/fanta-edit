@@ -654,6 +654,11 @@ impl Client {
     pub fn global(cx: &App) -> Arc<Self> {
         cx.global::<GlobalClient>().0.clone()
     }
+
+    pub fn try_global(cx: &App) -> Option<Arc<Self>> {
+        cx.try_global::<GlobalClient>().map(|client| client.0.clone())
+    }
+
     pub fn set_global(client: Arc<Client>, cx: &mut App) {
         cx.set_global(GlobalClient(client))
     }

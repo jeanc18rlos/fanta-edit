@@ -1083,15 +1083,12 @@
     // Maximum content width in pixels when limit_content_width is enabled.
     // Content will be centered within the panel.
     "max_content_width": 850,
-    // The default model to use when creating new threads. By default this is
-    // Anthropic, authenticated with your own Anthropic API key. The managed
-    // "Fanta" provider is also available once you sign in with your account,
-    // and needs no API key of your own.
+    // New threads use Fanta's managed AI through your signed-in account.
     "default_model": {
       // The provider to use.
-      "provider": "anthropic",
+      "provider": "Fanta",
       // The model to use.
-      "model": "claude-opus-5",
+      "model": "claude-sonnet-5",
       // Whether thinking is enabled.
       "enable_thinking": false,
     },
@@ -2468,10 +2465,9 @@
     "anthropic": {
       "api_url": "https://api.anthropic.com",
     },
-    // Fanta managed provider (Anthropic Messages-compatible). Metered against
-    // your Fanta credits. Signing in to your Fanta account is all the setup
-    // needed — the account token authenticates this provider automatically.
-    // An explicit key (provider UI or FANTA_API_KEY) still wins if set.
+    // Fanta routes managed models through its backend and AI Gateway, metered
+    // against your Fanta credits. Your account token authenticates this provider.
+    // An explicit FANTA_API_KEY still wins if set.
     "anthropic_compatible": {
       "Fanta": {
         "api_url": "https://api.fantaisa.net",
@@ -2496,13 +2492,6 @@
             "max_tokens": 200000,
             "max_output_tokens": 32000,
             "capabilities": { "tools": true, "images": true, "prompt_caching": true }
-          },
-          {
-            "name": "glm-5.2-awq-v1",
-            "display_name": "Fanta Composer (GLM-5.2)",
-            "max_tokens": 131072,
-            "max_output_tokens": 64000,
-            "capabilities": { "tools": true, "images": false, "prompt_caching": false }
           }
         ]
       }
@@ -2815,16 +2804,13 @@
   "context_server_timeout": 60,
   // Configures context servers for use by the agent.
   // Fanta generation tools (image/compose/vectorize/upscale/animate/…) over
-  // the hosted MCP server. Disabled by default because it needs your Fanta
-  // key: enable it and add your key in your user settings.json, e.g.
-  //   "context_servers": { "fanta": { "enabled": true,
-  //     "url": "https://api.fantaisa.net/mcp",
-  //     "headers": { "Authorization": "Bearer fnt_live_…" } } }
-  // (Header auth is a stopgap until the hosted MCP OAuth flow ships.)
+  // the hosted MCP server. Connects automatically when you sign in to Fanta.
+  // Explicit authorization headers override account authentication.
   "context_servers": {
     "fanta": {
-      "enabled": false,
+      "enabled": true,
       "url": "https://api.fantaisa.net/mcp",
+      "timeout": 120,
       "headers": {}
     }
   },

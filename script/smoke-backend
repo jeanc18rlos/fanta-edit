@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Check Fanta's deployed API; --chat makes one metered, 64-token AI request."""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base-url", default="https://api.fantaisa.net")
+    parser.add_argument("--model", default="claude-sonnet-5")
+    parser.add_argument("--chat", action="store_true", help="Make one metered streaming AI request")
+    arguments = parser.parse_args()
+    base_url = arguments.base_url.rstrip("/")
+    origin = urllib.parse.urlsplit(base_url)
+    if origin.scheme != "https" and not (
+        origin.scheme == "http" and origin.hostname in ("localhost", "127.0.0.1", "::1")
+    ):
+        parser.error("Use HTTPS, or HTTP on localhost for development")
+    if origin.username or origin.password or origin.query or origin.fragment:
+        parser.error("The base URL cannot contain credentials, a query, or a fragment")
+    api_key = os.environ.get("FANTA_API_KEY")
+    if arguments.chat and not api_key:
+        parser.error("Set FANTA_API_KEY to a Fanta account key before using --chat")
+    opener = urllib.request.build_opener(NoRedirects())
+
+    def request(path, body=None, authenticated=False):
+        headers = {"Accept": "application/json", "User-Agent": "Fanta-release-smoke"}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        return opener.open(
+            urllib.request.Request(
+                base_url + path,
+                data=json.dumps(body).encode() if body is not None else None,
+                headers=headers,
+            ),
+            timeout=120 if arguments.chat else 20,
+        )
+
+    def read_json(path, authenticated=False):
+        with request(path, authenticated=authenticated) as response:
+            return json.load(response)
+
+    status = read_json("/v1/status")
+    if status.get("status") != "ok":
+        raise ValueError("Backend status is not healthy")
+    print("PASS: backend health")
+    plans = read_json("/v1/plans").get("plans", [])
+    if not any(plan.get("id") == "pro" for plan in plans):
+        raise ValueError("The Pro plan is missing")
+    print("PASS: public plan catalog (does not prove checkout is configured)")
+
+    if not api_key:
+        print("SKIP: authenticated models, credits, and MCP; set FANTA_API_KEY")
+        print("SKIP: live AI; add --chat to test one metered request")
+        return
+
+    models = read_json("/v1/models", authenticated=True).get("models", [])
+    if not any(model.get("id") == arguments.model and model.get("kind") == "chat" for model in models):
+        raise ValueError("The selected chat model is unavailable in the backend catalog")
+    print("PASS: account authentication and selected model")
+    credits = read_json("/v1/credits", authenticated=True)
+    if not isinstance(credits.get("balance"), (int, float)):
+        raise ValueError("Credits response has no numeric balance")
+    print("PASS: account credit balance")
+
+    with request("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}, True) as response:
+        tools = json.load(response)
+    if tools.get("error") or not tools.get("result", {}).get("tools"):
+        raise ValueError("Backend MCP did not return its tools")
+    print("PASS: authenticated backend MCP tools")
+
+    if not arguments.chat:
+        print("SKIP: live AI; add --chat to test one metered request")
+        return
+    if credits["balance"] <= 0:
+        raise ValueError("The test account needs credits before a live AI request")
+    body = {
+        "model": arguments.model,
+        "max_tokens": 64,
+        "stream": True,
+        "messages": [{"role": "user", "content": "Reply with the word OK."}],
+    }
+    events = set()
+    has_text = False
+    with request("/v1/messages", body, True) as response:
+        if "text/event-stream" not in response.headers.get("Content-Type", ""):
+            raise ValueError("AI response is not an event stream")
+        for line in response:
+            if not line.startswith(b"data:"):
+                continue
+            event = json.loads(line[5:])
+            kind = event.get("type")
+            if kind == "error":
+                raise ValueError("The AI gateway returned a streaming error")
+            events.add(kind)
+            has_text |= bool(event.get("delta", {}).get("text"))
+    if not {"message_start", "message_delta", "message_stop"}.issubset(events) or not has_text:
+        raise ValueError("AI stream ended without a complete text response and usage")
+    remaining = read_json("/v1/credits", authenticated=True)["balance"]
+    if remaining >= credits["balance"]:
+        raise ValueError("AI completed but the test account's credits were not debited")
+    print("PASS: complete AI stream and credit debit (use a dedicated test account)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except urllib.error.HTTPError as error:
+        print(f"FAIL: backend returned HTTP {error.code}", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, TimeoutError):
+        print("FAIL: backend network request failed", file=sys.stderr)
+        sys.exit(1)
+    except (ValueError, KeyError, TypeError) as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        sys.exit(1)

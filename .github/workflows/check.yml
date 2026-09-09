@@ -2,16 +2,49 @@ name: Check
 
 on:
   push:
+    branches: ['**']
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
 
 jobs:
   check:
-    runs-on: macos-latest
+    runs-on: macos-26
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-check
 
       - name: Check licenses
         run: ./script/check-licenses
 
-      - name: Check the app builds
-        run: cargo check -p zed
+      - name: Check release scripts
+        run: bash -n script/bundle-mac script/generate-licenses script/verify-macos-document-icon
+
+      - name: Check the app and command line tool build
+        run: cargo check --locked -p zed -p cli
+
+      - name: Test AI provider authentication
+        run: cargo test --locked -p language_models --lib
+
+      - name: Test Fanta media server account lifecycle
+        run: cargo test --locked -p project test_fanta_mcp
