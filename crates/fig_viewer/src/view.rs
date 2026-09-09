@@ -7309,6 +7309,29 @@ impl FigView {
                 self.zoom_to_percent(*percent, cx);
             }
             ToolbarAction::CommandInvoked { command } => match command {
+                ToolbarCommand::GenerateImage
+                | ToolbarCommand::GenerateVideo
+                | ToolbarCommand::GenerateVector
+                | ToolbarCommand::GenerateMasks
+                | ToolbarCommand::RemoveBackground
+                | ToolbarCommand::GenerateDesign => {
+                    use crate::generation_workspace::GenerationMode;
+                    let mode = match command {
+                        ToolbarCommand::GenerateVideo => GenerationMode::Video,
+                        ToolbarCommand::GenerateVector => GenerationMode::Vector,
+                        ToolbarCommand::GenerateMasks | ToolbarCommand::RemoveBackground => {
+                            GenerationMode::Masks
+                        }
+                        ToolbarCommand::GenerateDesign => GenerationMode::Design,
+                        _ => GenerationMode::Image,
+                    };
+                    crate::generation_workspace::open_from_canvas(
+                        mode,
+                        self.item.downgrade(),
+                        window,
+                        cx,
+                    );
+                }
                 ToolbarCommand::Undo => self.undo(&Undo, window, cx),
                 ToolbarCommand::Redo => self.redo(&Redo, window, cx),
                 ToolbarCommand::Cut => self.cut_selection(&CutSelection, window, cx),

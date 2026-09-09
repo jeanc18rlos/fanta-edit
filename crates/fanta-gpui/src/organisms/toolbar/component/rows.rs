@@ -89,6 +89,9 @@ impl EditorToolbar {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                            // The trigger's default focus would otherwise replace
+                            // the query focus set while opening the palette.
+                            window.prevent_default();
                             this.activate_tool_or_actions(tool, actions_open, window, cx);
                         }),
                     )
@@ -994,6 +997,7 @@ impl EditorToolbar {
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                window.prevent_default();
                 this.toggle_agent(open, window, cx);
             }),
         )

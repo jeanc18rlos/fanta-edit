@@ -1457,7 +1457,7 @@
     },
   },
   {
-    "context": "FigViewer && !Editor",
+    "context": "FigViewer && !Editor && !Input",
     "use_key_equivalents": true,
     "bindings": {
       "cmd-=": "fig_viewer::ZoomIn",
@@ -1506,7 +1506,7 @@
     },
   },
   {
-    "context": "FigViewerPrototype && !Editor",
+    "context": "FigViewerPrototype && !Editor && !Input",
     "use_key_equivalents": true,
     "bindings": {
       "escape": "fig_viewer::ExitPrototype",

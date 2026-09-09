@@ -5,7 +5,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -37,6 +37,46 @@ const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
 /// than it was given.
 pub(crate) const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Default)]
+struct ProjectWrites {
+    state: Mutex<ProjectWriteState>,
+}
+
+#[derive(Default)]
+struct ProjectWriteState {
+    active: usize,
+    quiet_until: Option<Instant>,
+}
+
+struct ProjectWriteLease(Arc<ProjectWrites>);
+
+impl ProjectWrites {
+    fn begin(self: &Arc<Self>) -> Arc<ProjectWriteLease> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active += 1;
+        Arc::new(ProjectWriteLease(self.clone()))
+    }
+
+    fn suppresses_watcher(&self, now: Instant) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active > 0 || state.quiet_until.is_some_and(|until| now < until)
+    }
+}
+
+impl Drop for ProjectWriteLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active = state.active.saturating_sub(1);
+        state.quiet_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+    }
+}
+
 pub struct FigItem {
     pub(crate) path: ProjectPath,
     pub(crate) abs_path: PathBuf,
@@ -59,6 +99,10 @@ pub struct FigItem {
     /// Ignore worktree events until this instant; set around our own project
     /// writes so saving from the canvas does not trigger a self-reload.
     suppress_watcher_until: Option<Instant>,
+    // A synchronous writer cannot be interrupted when its foreground task is
+    // canceled. Its shared lease keeps watcher suppression alive until both
+    // sides have released that save, including overlapping or failed saves.
+    project_writes: Arc<ProjectWrites>,
     /// The last document state both the canvas and the disk agreed on (as of
     /// the last load, reload, or save). The common ancestor for the
     /// three-way merge that reconciles concurrent canvas edits with external
@@ -961,6 +1005,7 @@ impl project::ProjectItem for FigItem {
                     conflict: false,
                     source_edit_locked: false,
                     suppress_watcher_until: None,
+                    project_writes: Arc::default(),
                     merge_base: None,
                     pending_scope: initial_scope,
                     last_scope: None,
@@ -1113,9 +1158,9 @@ impl FigItem {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        if self
-            .suppress_watcher_until
-            .is_some_and(|until| Instant::now() < until)
+        let now = Instant::now();
+        if self.project_writes.suppresses_watcher(now)
+            || self.suppress_watcher_until.is_some_and(|until| now < until)
         {
             return;
         }
@@ -1774,6 +1819,7 @@ impl FigItem {
         // materializing save this window also spans the moment the directory is
         // adopted as a worktree, so its initial scan does not bounce back as a
         // reload.
+        let write_lease = self.project_writes.begin();
         self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
         // A pending merge/reload holds a disk snapshot from before this save;
         // cancel it so it can't adopt that stale snapshot after the write
@@ -1789,7 +1835,9 @@ impl FigItem {
             let (result, saved_doc, write_cache) = cx
                 .background_spawn({
                     let target = target.clone();
+                    let write_lease = write_lease.clone();
                     async move {
+                        let _write_lease = write_lease;
                         let mut write_cache = write_cache;
                         let result =
                             write_project_cached(&target, &doc, &raw_assets, &mut write_cache);
@@ -1823,6 +1871,7 @@ impl FigItem {
                     this.write_cache = Some(write_cache);
                 }
             })?;
+            drop(write_lease);
             result.map(|()| materializing.then_some(target))
         })
     }
@@ -1864,6 +1913,7 @@ pub(crate) fn ready_item_with_root_for_test(
         conflict: false,
         source_edit_locked: false,
         suppress_watcher_until: None,
+        project_writes: Arc::default(),
         merge_base: None,
         pending_scope: None,
         last_scope: None,
@@ -1993,12 +2043,14 @@ fn git_init_if_needed(root: &Path) {
     if root.ancestors().any(|dir| dir.join(".git").exists()) {
         return;
     }
-    // No `-b`: the branch name is the user's `init.defaultBranch` to pick.
+    let git_binary = project_git_binary(std::env::current_exe().ok().as_deref());
+    // The macOS system Git can be an Xcode installation shim. Prefer the
+    // bundled binary so a designer can create history without developer tools.
     #[allow(
         clippy::disallowed_methods,
         reason = "write_project is sync and only ever runs on background_spawn"
     )]
-    let result = util::command::new_std_command("git")
+    let result = util::command::new_std_command(git_binary)
         .args(["init", "-q"])
         .current_dir(root)
         .output();
@@ -2012,6 +2064,14 @@ fn git_init_if_needed(root: &Path) {
         ),
         Err(error) => log::warn!("running git init in {} failed: {error}", root.display()),
     }
+}
+
+fn project_git_binary(executable: Option<&Path>) -> PathBuf {
+    executable
+        .and_then(Path::parent)
+        .map(|directory| directory.join(if cfg!(windows) { "git.exe" } else { "git" }))
+        .filter(|binary| binary.is_file())
+        .unwrap_or_else(|| PathBuf::from("git"))
 }
 
 /// Pick a directory for a new project next to the source `.fig` file:
@@ -2284,7 +2344,7 @@ pub(crate) fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> fanta_doc::Bo
         .unwrap_or_else(|| fanta_doc::Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
 }
 
-fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bounds> {
+pub(crate) fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bounds> {
     let mut bounds: Option<fanta_doc::Bounds> = None;
     let mut include = |node_id| {
         if let Some(node_bounds) = doc.scene.world_bounds(node_id)
@@ -2491,6 +2551,20 @@ pub(crate) fn fit_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_git_prefers_the_app_bundle_without_depending_on_system_tools() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("fanta");
+        let git = directory
+            .path()
+            .join(if cfg!(windows) { "git.exe" } else { "git" });
+        assert_eq!(project_git_binary(Some(&executable)), PathBuf::from("git"));
+        std::fs::write(&git, b"bundled git")?;
+        assert_eq!(project_git_binary(Some(&executable)), git);
+        assert_eq!(project_git_binary(None), PathBuf::from("git"));
+        Ok(())
+    }
 
     #[test]
     fn a_page_prewarm_stops_once_the_document_that_owns_its_resolver_is_gone() {
@@ -3080,6 +3154,170 @@ mod tests {
     /// adopted root and the materializing write's memo; without the memo the
     /// first autosave starts cold and re-prints every page.
     #[gpui::test]
+    async fn a_save_suppresses_its_watcher_after_the_initial_deadline_expires(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("Design");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&root, serde_json::json!({"fanta.json":"{}"}))
+            .await;
+        let project = Project::test(fs, [root.as_path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let item = ready_item(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(root),
+            doc_with_one_page(),
+            cx,
+        );
+        let changes: UpdatedEntriesSet = vec![(
+            util::rel_path::rel_path("pages/page-1/page.fnx").into(),
+            ProjectEntryId::from_proto(1),
+            PathChange::Updated,
+        )]
+        .into();
+        let save = item.update(cx, |item, cx| {
+            item.dirty = true;
+            let save = item.save(SaveKind::Explicit, cx);
+            // Model a writer still running after the old one-second deadline.
+            // Wall-clock Instant does not follow the GPUI test clock.
+            item.suppress_watcher_until = Some(Instant::now() - Duration::from_secs(2));
+            item.worktree_entries_updated(&project, worktree_id, &changes, cx);
+            assert!(
+                item.reload_task.is_none(),
+                "our own save must not start a reload or merge"
+            );
+            assert!(
+                !item.has_conflict(),
+                "our own save must not be treated as an external edit"
+            );
+            assert!(
+                item.project_writes
+                    .suppresses_watcher(Instant::now() + Duration::from_secs(2))
+            );
+            save
+        });
+        save.await.expect("save completes");
+        item.update(cx, |item, cx| {
+            assert_eq!(
+                item.project_writes
+                    .state
+                    .lock()
+                    .expect("write state")
+                    .active,
+                0
+            );
+            assert!(
+                item.project_writes.suppresses_watcher(Instant::now()),
+                "completion keeps the delivery cooldown"
+            );
+            item.suppress_watcher_until = None;
+            item.project_writes
+                .state
+                .lock()
+                .expect("write state")
+                .quiet_until = Some(Instant::now() - Duration::from_secs(1));
+            item.worktree_entries_updated(&project, worktree_id, &changes, cx);
+            assert!(
+                item.reload_task.is_some(),
+                "external edits still reload after the cooldown"
+            );
+            item.reload_task = None;
+        });
+    }
+
+    #[test]
+    fn write_leases_cover_cancellation_overlaps_and_background_completion() {
+        let writes = Arc::new(ProjectWrites::default());
+        let foreground = writes.begin();
+        let worker = foreground.clone();
+        let overlapping = writes.begin();
+        drop(foreground);
+        drop(overlapping);
+        assert!(
+            writes.suppresses_watcher(Instant::now() + Duration::from_secs(120)),
+            "a canceled foreground must not unprotect its still-running writer"
+        );
+        drop(worker);
+        assert!(!writes.suppresses_watcher(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW * 2));
+        assert!(
+            writes.suppresses_watcher(Instant::now()),
+            "even canceled writes get a completion cooldown"
+        );
+    }
+
+    #[gpui::test]
+    async fn failed_and_canceled_saves_release_their_write_leases(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("not-a-directory");
+        std::fs::write(&root, b"occupied").expect("block project directory creation");
+        let item = ready_item(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(root),
+            doc_with_one_page(),
+            cx,
+        );
+        let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        assert!(save.await.is_err());
+        let writes = item.read_with(cx, |item, _| item.project_writes.clone());
+        assert_eq!(
+            writes.state.lock().expect("write state").active,
+            0,
+            "a failed writer releases its lease"
+        );
+        let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        let overlapping = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        drop(save);
+        cx.run_until_parked();
+        drop(overlapping);
+        cx.run_until_parked();
+        assert_eq!(
+            writes.state.lock().expect("write state").active,
+            0,
+            "canceling queued or completed saves releases every lease"
+        );
+    }
+
+    #[gpui::test]
+    async fn closing_an_item_does_not_retain_its_document_entity_for_a_save(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let item = ready_item(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(directory.path().join("Design")),
+            doc_with_one_page(),
+            cx,
+        );
+        let weak_item = item.downgrade();
+        let writes = item.read_with(cx, |item, _| item.project_writes.clone());
+        let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.update(|_| drop(item));
+        assert!(
+            weak_item.upgrade().is_none(),
+            "the save captures a weak document entity"
+        );
+        assert!(
+            save.await.is_err(),
+            "the completed write cannot update a closed document"
+        );
+        assert_eq!(writes.state.lock().expect("write state").active, 0);
+    }
+
+    #[gpui::test]
     async fn the_initial_load_adopts_the_materialized_root_and_its_write_cache(
         cx: &mut TestAppContext,
     ) {
@@ -3165,6 +3403,7 @@ mod tests {
             conflict: false,
             source_edit_locked: false,
             suppress_watcher_until: None,
+            project_writes: Arc::default(),
             merge_base: None,
             pending_scope: None,
             last_scope: None,

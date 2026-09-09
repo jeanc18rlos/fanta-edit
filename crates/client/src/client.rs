@@ -1445,11 +1445,37 @@ impl Client {
         })
     }
 
+    fn parse_browser_sign_in_callback(
+        path: &str,
+        private_key: &rpc::auth::PrivateKey,
+    ) -> Option<Credentials> {
+        #[derive(Deserialize)]
+        struct CallbackParams {
+            user_id: u64,
+            access_token: String,
+        }
+
+        if !path.starts_with("/?") {
+            return None;
+        }
+        let url = Url::parse(&format!("http://localhost{path}")).ok()?;
+        let params: CallbackParams = serde_urlencoded::from_str(url.query()?).ok()?;
+        let access_token = private_key.decrypt_string(&params.access_token).ok()?;
+        if access_token.is_empty() {
+            return None;
+        }
+        Some(Credentials {
+            user_id: params.user_id,
+            access_token,
+        })
+    }
+
     pub fn authenticate_with_browser(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<Credentials>> {
         let http = self.http.clone();
         let this = self.clone();
         cx.spawn(async move |cx| {
             let background = cx.background_executor().clone();
+            let browser_client = this.clone();
 
             let (open_url_tx, open_url_rx) = oneshot::channel::<String>();
             cx.update(|cx| {
@@ -1476,7 +1502,7 @@ impl Client {
                         IMPERSONATE_LOGIN.as_ref().zip(ADMIN_API_TOKEN.as_ref())
                     {
                         if !*USE_WEB_LOGIN {
-                            eprintln!("authenticate as admin {login}, {token}");
+                            log::debug!("authenticating administrator account");
 
                             return this
                                 .authenticate_as_admin(http, login.clone(), token.clone())
@@ -1511,68 +1537,57 @@ impl Client {
                         })?
                     ));
 
-                    open_url_tx.send(url).log_err();
+                    open_url_tx
+                        .send(url)
+                        .map_err(|_| anyhow!("sign-in was canceled before opening the browser"))?;
 
-                    #[derive(Deserialize)]
-                    struct CallbackParams {
-                        pub user_id: String,
-                        pub access_token: String,
+                    let post_auth_url = http.build_url("/native_app_signin_succeeded");
+                    let redirect_header = tiny_http::Header::from_bytes(
+                        &b"Location"[..],
+                        post_auth_url.as_bytes(),
+                    )
+                    .map_err(|_| anyhow!("invalid sign-in completion URL"))?;
+                    let mut timeout = background.timer(Duration::from_secs(10 * 60)).fuse();
+                    loop {
+                        // Yield between nonblocking polls so canceling sign-in drops the listener promptly.
+                        futures::select_biased! {
+                            _ = timeout => anyhow::bail!("Sign-in timed out after 10 minutes. Please try signing in again."),
+                            _ = background.timer(Duration::from_millis(100)).fuse() => {}
+                        }
+                        let Some(request) = server.try_recv()? else {
+                            continue;
+                        };
+                        let credentials = if request.method() == &tiny_http::Method::Get {
+                            Self::parse_browser_sign_in_callback(request.url(), &private_key)
+                        } else {
+                            None
+                        };
+                        let Some(credentials) = credentials else {
+                            request
+                                .respond(tiny_http::Response::empty(400))
+                                .context("failed to reject unrelated sign-in callback")
+                                .log_err();
+                            continue;
+                        };
+                        request
+                            .respond(tiny_http::Response::empty(302).with_header(redirect_header))
+                            .context("failed to respond to sign-in callback")
+                            .log_err();
+                        return Ok(credentials);
                     }
-
-                    // Receive the HTTP request from the user's browser. Retrieve the user id and encrypted
-                    // access token from the query params.
-                    //
-                    // TODO - Avoid ever starting more than one HTTP server. Maybe switch to using a
-                    // custom URL scheme instead of this local HTTP server.
-                    let (user_id, access_token) = background
-                        .spawn(async move {
-                            for _ in 0..100 {
-                                if let Some(req) = server.recv_timeout(Duration::from_secs(1))? {
-                                    let path = req.url();
-                                    let url = Url::parse(&format!("http://example.com{}", path))
-                                        .context("failed to parse login notification url")?;
-                                    let callback_params: CallbackParams =
-                                        serde_urlencoded::from_str(url.query().unwrap_or_default())
-                                            .context(
-                                                "failed to parse sign-in callback query parameters",
-                                            )?;
-
-                                    let post_auth_url =
-                                        http.build_url("/native_app_signin_succeeded");
-                                    req.respond(
-                                        tiny_http::Response::empty(302).with_header(
-                                            tiny_http::Header::from_bytes(
-                                                &b"Location"[..],
-                                                post_auth_url.as_bytes(),
-                                            )
-                                            .unwrap(),
-                                        ),
-                                    )
-                                    .context("failed to respond to login http request")?;
-                                    return Ok((
-                                        callback_params.user_id,
-                                        callback_params.access_token,
-                                    ));
-                                }
-                            }
-
-                            anyhow::bail!("didn't receive login redirect");
-                        })
-                        .await?;
-
-                    let access_token = private_key
-                        .decrypt_string(&access_token)
-                        .context("failed to decrypt access token")?;
-
-                    Ok(Credentials {
-                        user_id: user_id.parse()?,
-                        access_token,
-                    })
                 })
-                .await?;
+                .await;
 
-            cx.update(|cx| cx.activate(true));
-            Ok(credentials)
+            if credentials.is_err() {
+                browser_client.set_status(Status::AuthenticationError, cx);
+            }
+            cx.update(|cx| {
+                if credentials.is_ok() {
+                    cx.activate(true);
+                }
+                cx.refresh_windows();
+            });
+            credentials
         })
     }
 
@@ -2029,6 +2044,93 @@ mod tests {
     use proto::TypedEnvelope;
     use settings::SettingsStore;
     use std::future;
+
+    #[test]
+    fn test_browser_sign_in_callback_ignores_invalid_requests() -> Result<()> {
+        let (public_key, private_key) = rpc::auth::keypair()?;
+        for path in [
+            "/favicon.ico",
+            "/",
+            "/?user_id=42",
+            "/?user_id=invalid&access_token=invalid",
+            "/?user_id=42&access_token=invalid",
+            "http://localhost/?user_id=42&access_token=invalid",
+        ] {
+            assert!(Client::parse_browser_sign_in_callback(path, &private_key).is_none());
+        }
+
+        for format in [
+            rpc::auth::EncryptionFormat::V0,
+            rpc::auth::EncryptionFormat::V1,
+        ] {
+            let encrypted = public_key.encrypt_string("test-access-token", format)?;
+            let query = serde_urlencoded::to_string([
+                ("user_id", "42"),
+                ("access_token", encrypted.as_str()),
+            ])?;
+            let credentials =
+                Client::parse_browser_sign_in_callback(&format!("/?{query}"), &private_key)
+                    .context("valid callback was rejected after invalid requests")?;
+            assert_eq!(credentials.user_id, 42);
+            assert_eq!(credentials.access_token, "test-access-token");
+        }
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn test_browser_sign_in_timeout_and_cancellation(
+        cx: &mut TestAppContext,
+        executor: BackgroundExecutor,
+    ) {
+        init_test(cx);
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_404_response(),
+                cx,
+            )
+        });
+        let mut authentication = client.authenticate_with_browser(&cx.to_async());
+        while cx.opened_url().is_none() {
+            assert!(
+                executor.tick(),
+                "browser sign-in did not open its URL: {:?}",
+                (&mut authentication).now_or_never().and_then(Result::err)
+            );
+        }
+        while executor.tick() {}
+
+        executor.advance_clock(Duration::from_secs(101));
+        while executor.tick() {}
+        assert!((&mut authentication).now_or_never().is_none());
+
+        executor.advance_clock(Duration::from_secs(499));
+        while executor.tick() {}
+        assert_eq!(
+            authentication
+                .await
+                .err()
+                .map(|error| error.to_string())
+                .as_deref(),
+            Some("Sign-in timed out after 10 minutes. Please try signing in again.")
+        );
+        assert!(matches!(
+            *client.status().borrow(),
+            Status::AuthenticationError
+        ));
+
+        client.set_status(Status::SignedOut, &cx.to_async());
+        let previous_url = cx.opened_url();
+        let authentication = client.authenticate_with_browser(&cx.to_async());
+        while cx.opened_url() == previous_url {
+            assert!(executor.tick(), "retry did not open a new sign-in URL");
+        }
+        drop(authentication);
+        while executor.tick() {}
+        executor.advance_clock(Duration::from_secs(601));
+        while executor.tick() {}
+        assert!(matches!(*client.status().borrow(), Status::SignedOut));
+    }
 
     #[test]
     fn test_proxy_settings_trims_and_ignores_empty_proxy() {

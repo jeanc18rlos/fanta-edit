@@ -1875,20 +1875,25 @@ impl Element for CanvasElement {
             // A component-scoped view renders a master root that is not a
             // listed page; the initial fit must frame the master's own bounds,
             // not the fallback page the paint path never shows.
-            let fit = document
-                .doc
-                .active_page()
-                .filter(|root| document.doc.is_component_root(*root))
-                .map(|root| crate::document::page_bounds(&document.doc, Some(root)))
-                .unwrap_or(page.bounds);
             let viewport = view.viewport().unwrap_or_else(|| {
-                crate::document::fit_bounds(
-                    fit,
-                    logical_size,
-                    crate::view::RENDER_PADDING,
-                    crate::view::MIN_ZOOM,
-                    crate::view::MAX_ZOOM,
-                )
+                let root = document
+                    .doc
+                    .active_page()
+                    .filter(|root| document.doc.is_component_root(*root))
+                    .or(page.root);
+                crate::document::try_page_bounds(&document.doc, root)
+                    .map(|bounds| {
+                        crate::document::fit_bounds(
+                            bounds,
+                            logical_size,
+                            crate::view::RENDER_PADDING,
+                            crate::view::MIN_ZOOM,
+                            crate::view::MAX_ZOOM,
+                        )
+                    })
+                    // An empty canvas has nothing to fit. Start at actual size
+                    // instead of shrinking a fictitious page to a narrow pane.
+                    .unwrap_or_default()
             });
             (
                 viewport,

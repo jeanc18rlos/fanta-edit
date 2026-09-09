@@ -43,8 +43,27 @@ jobs:
       - name: Check the app and command line tool build
         run: cargo check --locked -p zed -p cli
 
+      - name: Test document snapshots and file compatibility
+        run: cargo test --locked -p fanta-doc -p fanta-format
+
       - name: Test AI provider authentication
         run: cargo test --locked -p language_model -p language_models --lib
 
+      - name: Test browser sign-in recovery
+        run: cargo test --locked -p client --lib test_browser_sign_in
+
       - name: Test Fanta media server account lifecycle
         run: cargo test --locked -p project --lib --test integration test_fanta_mcp
+
+      - name: Test native media generation and document lifecycle
+        run: |
+          cargo test --locked -p fig_viewer --lib generation_
+          cargo test --locked -p fig_viewer --lib document::tests
+
+      - name: Test the agent panel toggle
+        run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
+
+      - name: Test canvas toolbar text entry
+        run: |
+          cargo test --locked -p fanta-gpui --lib organisms::toolbar::component::interaction_tests
+          cargo test --locked -p fig_viewer --lib toolbar_actions_query_keeps_text_input_with_canvas_keybindings

@@ -683,13 +683,10 @@ impl EditorToolbar {
     ) {
         cx.emit(ToolbarAction::CommandInvoked { command });
         match command {
-            ToolbarCommand::GenerateDesign
-            | ToolbarCommand::ReplaceContent
+            ToolbarCommand::ReplaceContent
             | ToolbarCommand::RewriteText
             | ToolbarCommand::TranslateText
             | ToolbarCommand::RenameLayers
-            | ToolbarCommand::RemoveBackground
-            | ToolbarCommand::GenerateImage
             | ToolbarCommand::MakePrototype => self.open_agent(window, cx),
             _ => {
                 self.set_overlay(None, cx);

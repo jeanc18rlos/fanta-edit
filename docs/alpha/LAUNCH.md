@@ -26,6 +26,14 @@ next backend production deployment. It still has **no Polar settings**.
 Complete the configuration in the existing backend project, without putting
 secret values in either repository:
 
+The existing Polar account is accessible. Its live catalog currently contains
+Starter ($20/month), Pro ($80/month), Max ($200/month), and one-time packs of
+100/$5, 500/$20, and 2,000/$60. These **do not match** the backend plan and pack
+definitions below. The inspected Starter product uses USD and grants the
+legacy “AI Image Editor Access” benefit, with no credit metadata. A launch
+catalog choice and credit allowance mapping are pending; do not connect these
+product IDs to the current backend grants by name alone.
+
 | Service | Configuration |
 | --- | --- |
 | Polar | `POLAR_SERVER=production`, `POLAR_ACCESS_TOKEN`, `POLAR_WEBHOOK_SECRET`, `POLAR_SUCCESS_URL` |
@@ -105,6 +113,15 @@ out of the release's advertised model list until their routes are verified.
 Media generation needs its own successful live job; backend health alone
 does not validate GPU availability.
 
+The September 9 infrastructure check found deployed image and video apps, but
+the health probe rejected the locally available signing credential. Production
+segmentation and SVG endpoint rows still point at localhost, and corresponding
+Fanta worker deployments are absent. Segmentation, vector, and compose model
+weights are also missing from the inspected worker volume. Source fixes and
+mock tests do not resolve this deployment gap. Verify the intended production
+signing configuration, deploy the required workers and weights, and update only
+their intended endpoint rows before advertising these capabilities.
+
 ## Lead capture and launch message
 
 The existing [Fanta Sales Funnel](https://us.posthog.com/project/410640/dashboard/1546459)
@@ -163,6 +180,11 @@ after the installer and payment checks pass. No outreach was sent or published.
 - 332 backend tests passed across all 42 test files, and type checking passed in an isolated checkout containing only the proposed changes.
 - Public production health/plans passed. The smoke script passed a mocked account, MCP, streaming, and credit-debit flow.
 - [Backend GitHub CI passed](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34367299913), including GPU tests and the Docker build. [Desktop app compilation and AI/media tests passed on GitHub](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34367136595) at `847aa1a`; subsequent changes only update this guide and include the shared credential tests in CI. A signed installer, authenticated production AI/media request, and end-to-end payment still require verification.
+
+See [the current validation record](RELEASE_VALIDATION.md) for later successful
+GitHub checks, native generation tests, UI observations, and measured memory
+changes. The newest local feature changes require their own release build and
+UI verification; the earlier successful CI run does not cover them.
 
 The review branches contain only these release fixes. Pre-existing local
 design, import, GPU, and motion work was preserved.

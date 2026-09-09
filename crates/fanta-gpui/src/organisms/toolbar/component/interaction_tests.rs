@@ -627,6 +627,41 @@ fn tool_menu_is_anchored_to_its_own_caret(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn text_entry_triggers_transfer_pointer_focus_to_their_input(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    cx.simulate_resize(size(px(900.), px(700.)));
+    cx.run_until_parked();
+
+    for (selector, agent) in [
+        ("toolbar-tool-actions", false),
+        ("toolbar-agent-launcher", true),
+    ] {
+        let trigger = cx
+            .debug_bounds(selector)
+            .expect("the text-entry trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        let input = cx.read(|app| {
+            let toolbar = toolbar.read(app);
+            if agent {
+                toolbar.ai_input.clone()
+            } else {
+                toolbar.command_input.clone()
+            }
+        });
+        assert!(
+            cx.update(|window, app| input.focus_handle(app).is_focused(window)),
+            "the trigger's default pointer focus must not replace the input focus"
+        );
+        cx.simulate_keystrokes("r e c t a n g l e");
+        assert_eq!(cx.read(|app| input.read(app).value()), "rectangle");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
 fn disclosure_triggers_close_their_own_open_popups(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     cx.simulate_resize(size(px(900.), px(700.)));

@@ -563,7 +563,7 @@ mod tests {
 
 #[cfg(test)]
 mod echo_tests {
-    use std::path::PathBuf;
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use fanta_doc::{
         AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, Operation, TextNode,
@@ -649,6 +649,69 @@ mod echo_tests {
         });
         let cx = cx.clone();
         (view, toolbar, cx)
+    }
+
+    #[gpui::test]
+    async fn toolbar_actions_query_keeps_text_input_with_canvas_keybindings(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let query = Rc::new(RefCell::new(gpui::SharedString::default()));
+        let query_changes = query.clone();
+        let _subscription = cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load the app's default key bindings");
+            app.bind_keys(bindings);
+            app.subscribe(&toolbar, move |_, action: &ToolbarAction, _| {
+                if let ToolbarAction::CommandQueryChanged { query } = action {
+                    *query_changes.borrow_mut() = query.clone();
+                }
+            })
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("toolbar-tool-actions")
+            .expect("the Actions trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("g e n e r a t e space i m a g e");
+        cx.run_until_parked();
+
+        assert_eq!(query.borrow().as_ref(), "generate image");
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Select
+        );
+
+        let palette = cx
+            .debug_bounds("toolbar-actions-palette")
+            .expect("typing must keep the palette open");
+        cx.simulate_click(
+            point(palette.left() + px(100.), palette.top() + px(27.)),
+            Modifiers::none(),
+        );
+        cx.simulate_keystrokes("secondary-a r e c t a n g l e");
+        cx.run_until_parked();
+        assert_eq!(query.borrow().as_ref(), "rectangle");
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Select
+        );
+
+        cx.simulate_keystrokes("escape r");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_none());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Rect
+        );
     }
 
     #[gpui::test]

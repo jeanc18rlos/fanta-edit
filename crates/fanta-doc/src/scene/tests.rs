@@ -1114,6 +1114,78 @@ fn clone_starts_without_a_spatial_index() {
 }
 
 #[test]
+fn snapshot_stays_unchanged_across_node_and_hierarchy_edits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    let snapshot = deep.scene.clone();
+    let expected = serde_json::to_value(&snapshot)?;
+    let expected_bounds = snapshot.world_bounds(deep.root_a);
+
+    deep.scene
+        .get_mut(deep.mid_leaf)
+        .ok_or(SceneError::NotFound(deep.mid_leaf))?
+        .name = "Renamed after snapshot".into();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(500.0, 250.0))?;
+    deep.scene.set_parent(
+        deep.sibling_leaf,
+        Some(deep.root_b),
+        deep.scene.next_child_index(Some(deep.root_b)),
+    )?;
+    deep.scene.set_index(deep.mid, IndexKey::from_raw(500.0))?;
+    let mut replacement = deep
+        .scene
+        .get(deep.b_leaf)
+        .ok_or(SceneError::NotFound(deep.b_leaf))?
+        .clone();
+    replacement.name = "Patched after snapshot".into();
+    deep.scene.patch_node(replacement, next_geometry_stamp())?;
+    let mut removed = deep.scene.remove(deep.inner)?;
+    removed.name = "Removed root is independently owned".into();
+    let mut shared_root_removed = deep.scene.remove(deep.root_a)?;
+    shared_root_removed.name = "Shared removed root is independently owned".into();
+    deep.scene
+        .insert_many([rect_node(0.0, 0.0, 20.0, 20.0), group_node()])?;
+    deep.scene.insert(rect_node(10.0, 10.0, 30.0, 30.0))?;
+
+    deep.scene.validate()?;
+    snapshot.validate()?;
+    assert_ne!(serde_json::to_value(&deep.scene)?, expected);
+    assert_eq!(serde_json::to_value(&snapshot)?, expected);
+    assert_eq!(snapshot.world_bounds(deep.root_a), expected_bounds);
+    assert_geometry_matches_cold_fold(&snapshot, &deep.all_ids());
+    Ok(())
+}
+
+#[test]
+fn snapshot_serializes_nodes_without_changing_the_document_shape()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut scene = Scene::new();
+    let node = rect_node(0.0, 0.0, 10.0, 10.0);
+    let id = node.id;
+    let expected_node = serde_json::to_value(&node)?;
+    scene.insert(node)?;
+    let snapshot = scene.clone();
+    let serialized = serde_json::to_value(&snapshot)?;
+    assert_eq!(
+        serialized
+            .get("nodes")
+            .and_then(|nodes| nodes.get(id.0.to_string())),
+        Some(&expected_node)
+    );
+
+    let mut restored: Scene = serde_json::from_value(serialized)?;
+    restored.rebuild_child_index();
+    restored.validate()?;
+    assert_eq!(restored.get(id), scene.get(id));
+    restored.get_mut(id).ok_or(SceneError::NotFound(id))?.name = "Restored edit".into();
+    assert_eq!(snapshot.get(id), scene.get(id));
+    assert_ne!(restored.get(id), snapshot.get(id));
+    Ok(())
+}
+
+#[test]
 fn changes_since_the_current_revision_is_empty() {
     let deep = DeepScene::build();
     let delta = deep.scene.changes_since(deep.scene.revision()).unwrap();

@@ -8,6 +8,8 @@ step: read the files here, or on GitHub.
   and [`KNOWN_ISSUES.md`](./alpha/KNOWN_ISSUES.md).
 - [`alpha/LAUNCH.md`](./alpha/LAUNCH.md) — backend, billing, analytics, and
   GitHub installer requirements for the first customer release.
+- [`alpha/RELEASE_VALIDATION.md`](./alpha/RELEASE_VALIDATION.md) — measured
+  performance, completed checks, and remaining release verification.
 - [`fanta/`](./fanta) — notes on the app itself, including
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
   the record of which inherited Zed services are switched off and why.

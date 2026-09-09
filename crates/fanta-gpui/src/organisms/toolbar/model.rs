@@ -635,6 +635,9 @@ pub enum ToolbarCommand {
     RenameLayers,
     RemoveBackground,
     GenerateImage,
+    GenerateVideo,
+    GenerateVector,
+    GenerateMasks,
     MakePrototype,
     OpenDesignMode,
     OpenMotionMode,
@@ -652,6 +655,9 @@ impl ToolbarCommand {
         Self::GenerateDesign,
         Self::ReplaceContent,
         Self::GenerateImage,
+        Self::GenerateVideo,
+        Self::GenerateVector,
+        Self::GenerateMasks,
         Self::MakePrototype,
         Self::RenameLayers,
         Self::RemoveBackground,
@@ -739,6 +745,9 @@ impl ToolbarCommand {
             Self::RenameLayers => "Rename layers",
             Self::RemoveBackground => "Remove background",
             Self::GenerateImage => "Generate an image",
+            Self::GenerateVideo => "Generate a video",
+            Self::GenerateVector => "Generate vectors",
+            Self::GenerateMasks => "Select and edit image areas",
             Self::MakePrototype => "Make a prototype",
             Self::OpenDesignMode => "Switch to Design",
             Self::OpenMotionMode => "Switch to Motion",
@@ -761,6 +770,9 @@ impl ToolbarCommand {
             | Self::RenameLayers
             | Self::RemoveBackground
             | Self::GenerateImage
+            | Self::GenerateVideo
+            | Self::GenerateVector
+            | Self::GenerateMasks
             | Self::MakePrototype => "AI",
             Self::OpenResources | Self::OpenPlugins | Self::OpenWidgets | Self::OpenVariables => {
                 "Resources"
@@ -788,9 +800,12 @@ impl ToolbarCommand {
 
     pub const fn description(self) -> &'static str {
         match self {
-            Self::GenerateDesign => "Create editable layers with Figma Agent",
+            Self::GenerateDesign => "Create editable frames, text, and shapes with Fanta",
             Self::ReplaceContent => "Generate replacement copy for selected layers",
-            Self::GenerateImage => "Create an image from a prompt",
+            Self::GenerateImage => "Create and refine images in a generation tab",
+            Self::GenerateVideo => "Create a video or animate a source image",
+            Self::GenerateVector => "Create SVG artwork or vectorize an image",
+            Self::GenerateMasks => "Select objects and edit masked areas of an image",
             Self::MakePrototype => "Connect selected frames into a prototype",
             Self::OpenPlugins => "Run a plugin from the Community",
             Self::OpenResources => "Search components, libraries, and assets",

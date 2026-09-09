@@ -15,6 +15,8 @@ mod design_panel;
 mod document;
 mod editor_session;
 mod export;
+mod generation_workspace;
+mod generation_media;
 #[cfg(feature = "fanta-gpui-ui")]
 mod gpui_adapters;
 mod inspector_components;
