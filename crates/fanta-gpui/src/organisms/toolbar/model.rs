@@ -747,7 +747,7 @@ impl ToolbarCommand {
             Self::GenerateImage => "Generate an image",
             Self::GenerateVideo => "Generate a video",
             Self::GenerateVector => "Generate vectors",
-            Self::GenerateMasks => "Select and edit image areas",
+            Self::GenerateMasks => "Generate masks",
             Self::MakePrototype => "Make a prototype",
             Self::OpenDesignMode => "Switch to Design",
             Self::OpenMotionMode => "Switch to Motion",

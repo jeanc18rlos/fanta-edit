@@ -40,6 +40,12 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Present,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::GenerateImage,
+    ToolbarCommand::GenerateVideo,
+    ToolbarCommand::GenerateVector,
+    ToolbarCommand::GenerateDesign,
+    ToolbarCommand::GenerateMasks,
+    ToolbarCommand::RemoveBackground,
 ];
 
 /// The entrance presets fig_viewer's Motion inspector can author — the same
@@ -712,6 +718,135 @@ mod echo_tests {
             view.read_with(cx, |view, _| view.tools().kind()),
             ToolKind::Rect
         );
+    }
+
+    #[gpui::test]
+    async fn generation_actions_are_searchable_and_open_native_workspace_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("default key bindings");
+            cx.bind_keys(bindings);
+        });
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Generation-toolbar.fig"),
+            test_doc(),
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item, project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter()
+                .expect("canvas toolbar")
+                .panel
+                .clone()
+        });
+        let invoked = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let invoked = invoked.clone();
+            cx.subscribe(&toolbar, move |_, event: &ToolbarAction, _| {
+                if let ToolbarAction::CommandInvoked { command } = event {
+                    invoked.borrow_mut().push(*command);
+                }
+            })
+        });
+        for (query, command, selector, expected_tab) in [
+            (
+                "generate image",
+                ToolbarCommand::GenerateImage,
+                "toolbar-command-generate-an-image",
+                "AI · Image",
+            ),
+            (
+                "GENERATE VIDEO",
+                ToolbarCommand::GenerateVideo,
+                "toolbar-command-generate-a-video",
+                "AI · Video",
+            ),
+            (
+                "generate vector",
+                ToolbarCommand::GenerateVector,
+                "toolbar-command-generate-vectors",
+                "AI · Create from prompt",
+            ),
+            (
+                "generate design",
+                ToolbarCommand::GenerateDesign,
+                "toolbar-command-generate-a-design",
+                "AI · Design",
+            ),
+            (
+                "generate masks",
+                ToolbarCommand::GenerateMasks,
+                "toolbar-command-generate-masks",
+                "AI · Masks",
+            ),
+            (
+                "remove background",
+                ToolbarCommand::RemoveBackground,
+                "toolbar-command-remove-background",
+                "AI · Masks",
+            ),
+        ] {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(&view, true, true, window, cx));
+                });
+            });
+            cx.run_until_parked();
+            let trigger = cx
+                .debug_bounds("toolbar-tool-actions")
+                .expect("Actions trigger");
+            cx.simulate_click(trigger.center(), Modifiers::none());
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+            let result = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("'{query}' must offer {command:?}"));
+            if command == ToolbarCommand::GenerateImage {
+                cx.simulate_keystrokes("enter");
+            } else {
+                cx.simulate_click(result.center(), Modifiers::none());
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                invoked.borrow().last().copied(),
+                Some(command),
+                "activate the matching result"
+            );
+            workspace.read_with(cx, |workspace, cx| {
+                let item = workspace.active_item(cx).expect("generation tab");
+                assert_eq!(
+                    item.tab_content_text(0, cx).as_ref(),
+                    expected_tab,
+                    "'{query}' opens the corresponding native tab"
+                );
+                assert_ne!(item.item_id(), view.entity_id());
+            });
+        }
     }
 
     #[gpui::test]
