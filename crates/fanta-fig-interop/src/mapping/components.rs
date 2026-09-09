@@ -56,7 +56,7 @@ struct RegisteredComponents {
 pub(crate) fn build_components_and_sets(
     doc: &mut Doc,
     report: &mut MapReport,
-    pending_components: &[PendingComponent],
+    pending_components: &[PendingComponent<'_>],
     pending_sets: &[PendingSet],
     pending_instances: &[(NodeId, String)],
 ) -> ComponentMaps {
@@ -79,7 +79,7 @@ pub(crate) fn build_components_and_sets(
 fn register_component_defs(
     doc: &mut Doc,
     report: &mut MapReport,
-    pending_components: &[PendingComponent],
+    pending_components: &[PendingComponent<'_>],
 ) -> RegisteredComponents {
     let mut guid_to_component = HashMap::new();
     let mut prop_guid_to_id = HashMap::new();
@@ -93,7 +93,7 @@ fn register_component_defs(
         let name = display_name(doc, pending.root, &pending.name);
         let mut definition = ComponentDef::new(component_id, pending.root, name);
         definition.props =
-            parse_component_prop_defs(&pending.prop_defs, component_id, &mut prop_guid_to_id);
+            parse_component_prop_defs(pending.prop_defs, component_id, &mut prop_guid_to_id);
         report.component_props += definition.props.len();
 
         doc.components.defs.insert(component_id, definition);
@@ -239,17 +239,16 @@ fn combined_component_map(
     guid_to_any
 }
 
-/// Capture a component master's raw `componentPropDefs` array (a
+/// Borrow a component master's raw `componentPropDefs` array (a
 /// `ComponentPropDef[]`) for later parsing. Empty when the master exposes no
 /// instance-settable properties. The legacy field name `componentPropertyDefinitions`
 /// is also honored for forward/back-compat with other `.fig` exporters.
-pub(crate) fn read_prop_defs_raw(change: &KiwiValue) -> Vec<KiwiValue> {
+pub(crate) fn read_prop_defs_raw(change: &KiwiValue) -> &[KiwiValue] {
     change
         .get("componentPropDefs")
         .or_else(|| change.get("componentPropertyDefinitions"))
         .and_then(KiwiValue::as_array)
-        .map(<[KiwiValue]>::to_vec)
-        .unwrap_or_default()
+        .unwrap_or(&[])
 }
 
 /// One `componentPropDef`'s identity for variant-placeholder resolution: its

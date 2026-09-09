@@ -585,7 +585,14 @@ impl MessageEditor {
             }
         }));
 
-        if let Some(language_registry) = language_registry {
+        // Fanta ships without a Markdown grammar, so only ask the registry to
+        // load one it actually has; otherwise the composer stays plain text
+        // instead of logging a "language not found" error on every launch.
+        if let Some(language_registry) = language_registry
+            && language_registry
+                .available_language_for_name("Markdown")
+                .is_some()
+        {
             let editor = editor.clone();
             cx.spawn(async move |_, cx| {
                 let markdown = language_registry.language_for_name("Markdown").await?;

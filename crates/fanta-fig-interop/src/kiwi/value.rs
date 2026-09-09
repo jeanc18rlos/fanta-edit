@@ -34,6 +34,14 @@ pub enum KiwiValue {
     Int64(i64),
     Uint64(u64),
     Array(Vec<KiwiValue>),
+    /// A `byte[]` field as one contiguous buffer. Figma's path-command blobs
+    /// and image hashes are `byte[]`; decoding them as `Array` of [`Byte`]
+    /// costs 32 bytes and a dispatch per source byte, which for a large file
+    /// is hundreds of MB of transient values for a few MB of blob data.
+    /// Encodes identically to the element-wise form.
+    ///
+    /// [`Byte`]: KiwiValue::Byte
+    Bytes(Vec<u8>),
     /// An enum value: the *member* name (e.g. `"RECTANGLE"`). The owning def's
     /// name is not retained — callers match on the member, which is what
     /// matters for mapping.
@@ -171,10 +179,33 @@ impl KiwiValue {
         }
     }
 
-    /// Borrow as a slice if this is a [`KiwiValue::Array`].
+    /// Borrow as a slice if this is a [`KiwiValue::Array`]. A
+    /// [`KiwiValue::Bytes`] is not an array of values; read it with
+    /// [`KiwiValue::as_bytes`].
     pub fn as_array(&self) -> Option<&[KiwiValue]> {
         match self {
             KiwiValue::Array(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The raw bytes of a `byte[]` value: a [`KiwiValue::Bytes`] directly, or
+    /// an element-wise [`KiwiValue::Array`] of integer items (the shape
+    /// hand-built values take; wider integers keep their low byte). `None`
+    /// for anything else, including an array with a non-integer item.
+    pub fn as_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            KiwiValue::Bytes(bytes) => Some(std::borrow::Cow::Borrowed(bytes)),
+            KiwiValue::Array(items) => items
+                .iter()
+                .map(|item| match *item {
+                    KiwiValue::Byte(b) => Some(b),
+                    KiwiValue::Uint(u) => Some(u as u8),
+                    KiwiValue::Int(i) => Some(i as u8),
+                    _ => None,
+                })
+                .collect::<Option<Vec<u8>>>()
+                .map(std::borrow::Cow::Owned),
             _ => None,
         }
     }
@@ -275,6 +306,9 @@ impl KiwiValue {
     fn decode_field(schema: &Schema, field: &Field, r: &mut ByteReader) -> FigResult<KiwiValue> {
         if field.is_array {
             let len = r.read_var_uint()?;
+            if field.ty == KiwiType::BYTE {
+                return Ok(KiwiValue::Bytes(r.read_bytes(len as usize)?.to_vec()));
+            }
             let mut items = Vec::with_capacity(len as usize);
             for _ in 0..len {
                 items.push(Self::decode_type(schema, field.ty, r)?);
@@ -314,6 +348,10 @@ impl KiwiValue {
                 for item in items {
                     item.encode_into(schema, w)?;
                 }
+            }
+            KiwiValue::Bytes(bytes) => {
+                w.write_var_uint(bytes.len() as u32);
+                w.write_bytes(bytes);
             }
             KiwiValue::Enum(member) => {
                 // An enum value on its own needs its def to resolve the member
@@ -382,6 +420,17 @@ impl KiwiValue {
         w: &mut ByteWriter,
     ) -> FigResult<()> {
         if field.is_array {
+            if let KiwiValue::Bytes(bytes) = value {
+                if field.ty != KiwiType::BYTE {
+                    return Err(FigError::Schema(format!(
+                        "field '{}' holds raw bytes but is not a byte array",
+                        field.name
+                    )));
+                }
+                w.write_var_uint(bytes.len() as u32);
+                w.write_bytes(bytes);
+                return Ok(());
+            }
             let items = value.as_array().ok_or_else(|| {
                 FigError::Schema(format!(
                     "field '{}' is an array but value is not",
@@ -673,6 +722,86 @@ mod tests {
         let bytes = v.encode(&schema).unwrap();
         let back = KiwiValue::decode(&schema, KiwiType::user(0), &bytes).unwrap();
         assert_eq!(v, back);
+    }
+
+    #[test]
+    fn byte_array_field_decodes_to_bytes_and_round_trips() {
+        let schema = Schema::new(vec![Def::new(
+            "Blob",
+            DefKind::Message,
+            vec![Field::array("bytes", KiwiType::BYTE, 1)],
+        )]);
+        let v = obj(
+            "Blob",
+            vec![("bytes", KiwiValue::Bytes(vec![0, 1, 254, 255]))],
+        );
+        let bytes = v.encode(&schema).unwrap();
+        // id 1, length 4, then the raw bytes, then the message terminator.
+        assert_eq!(bytes, [1, 4, 0, 1, 254, 255, 0]);
+        let back = KiwiValue::decode(&schema, KiwiType::user(0), &bytes).unwrap();
+        assert_eq!(back, v);
+        assert_eq!(
+            back.get("bytes").unwrap().as_bytes().unwrap().as_ref(),
+            &[0, 1, 254, 255]
+        );
+        assert!(back.get("bytes").unwrap().as_array().is_none());
+    }
+
+    #[test]
+    fn element_wise_byte_array_encodes_like_bytes_and_decodes_to_bytes() {
+        // A hand-built `Array` of `Byte`s is the same wire bytes as `Bytes`, and
+        // the decoder always produces the compact form.
+        let schema = Schema::new(vec![Def::new(
+            "Blob",
+            DefKind::Message,
+            vec![Field::array("bytes", KiwiType::BYTE, 1)],
+        )]);
+        let element_wise = obj(
+            "Blob",
+            vec![(
+                "bytes",
+                KiwiValue::Array(vec![KiwiValue::Byte(7), KiwiValue::Byte(9)]),
+            )],
+        );
+        let compact = obj("Blob", vec![("bytes", KiwiValue::Bytes(vec![7, 9]))]);
+        let encoded = element_wise.encode(&schema).unwrap();
+        assert_eq!(encoded, compact.encode(&schema).unwrap());
+        let back = KiwiValue::decode(&schema, KiwiType::user(0), &encoded).unwrap();
+        assert_eq!(back, compact);
+        assert_eq!(
+            element_wise
+                .get("bytes")
+                .unwrap()
+                .as_bytes()
+                .unwrap()
+                .as_ref(),
+            &[7, 9]
+        );
+    }
+
+    #[test]
+    fn bytes_on_a_non_byte_array_field_is_an_encode_error() {
+        let schema = Schema::new(vec![Def::new(
+            "Poly",
+            DefKind::Message,
+            vec![Field::array("pts", KiwiType::FLOAT, 1)],
+        )]);
+        let v = obj("Poly", vec![("pts", KiwiValue::Bytes(vec![1, 2]))]);
+        assert!(matches!(v.encode(&schema), Err(FigError::Schema(_))));
+    }
+
+    #[test]
+    fn truncated_byte_array_is_a_truncation_error() {
+        let schema = Schema::new(vec![Def::new(
+            "Blob",
+            DefKind::Message,
+            vec![Field::array("bytes", KiwiType::BYTE, 1)],
+        )]);
+        // id 1, length 4, but only two payload bytes follow.
+        assert!(matches!(
+            KiwiValue::decode(&schema, KiwiType::user(0), &[1, 4, 0, 1]),
+            Err(FigError::Truncated)
+        ));
     }
 
     #[test]

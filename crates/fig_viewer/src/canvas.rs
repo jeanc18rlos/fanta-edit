@@ -34,9 +34,14 @@ use core_video::{
     pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA},
 };
 use fanta_canvas::ResizeHandle;
+#[cfg(target_os = "macos")]
+use fanta_doc::scene::SceneDelta;
 use fanta_doc::{Action, AnimationClipId, MotionEvaluation, NodeId, Viewport};
 #[cfg(target_os = "macos")]
-use fanta_doc::{ComponentLibrary, ModeId, Scene, VariableCollectionId, VariableRegistry};
+use fanta_doc::{
+    CanvasNode, ComponentLibrary, ModeId, Scene, Transform2D, VariableCollectionId,
+    VariableRegistry,
+};
 #[cfg(target_os = "macos")]
 use fanta_render::AssetResolver;
 use fanta_render::{RasterRenderer, RenderInputs};
@@ -66,6 +71,12 @@ use crate::editor_session::EditorMode;
 use crate::view::FigView;
 
 const HANDLE_SIZE: f32 = 7.0;
+
+/// Above this many selected nodes the overlay outlines the selection's union
+/// box instead of every node (the size badge and handles already work off the
+/// union). Select-all on a page with thousands of top-level nodes otherwise
+/// paints thousands of outline quads per frame.
+const SELECTION_OUTLINE_CAP: usize = 512;
 
 /// Screen-space font size (logical px) for the on-canvas frame name labels and
 /// the badge/measurement readouts. Fixed regardless of zoom so the chrome stays
@@ -470,6 +481,83 @@ pub(crate) enum GpuFrame {
 }
 
 // ============================================================================
+// Render inputs beyond the scene
+// ============================================================================
+
+/// A cheap identity of everything a render reads from the document BESIDES the
+/// scene graph: the component library and the variable registry + active
+/// modes. Equal fingerprints mean a render-thread copy of those inputs is still
+/// current, and the variables half is what the renderer's instance memo keys
+/// its mode-dependent expansions on (`RenderInputs::mode_generation`) — the
+/// document's render generation, which moves on every drag frame, is far too
+/// coarse for either job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputsFingerprint {
+    /// `(def count, sum of every def's rev, set count)`: a master edit bumps
+    /// its def's rev, adding or removing a def changes a count.
+    components: (usize, u64, usize),
+    /// Hash of the variable registry and the doc-level active modes.
+    variables: u64,
+}
+
+impl InputsFingerprint {
+    fn of(doc: &fanta_doc::Doc) -> Self {
+        Self {
+            components: Self::components_of(doc),
+            variables: hash_variables(&doc.variables, &doc.active_modes),
+        }
+    }
+
+    fn components_of(doc: &fanta_doc::Doc) -> (usize, u64, usize) {
+        (
+            doc.components.defs.len(),
+            doc.components
+                .defs
+                .values()
+                .fold(0u64, |sum, def| sum.wrapping_add(def.rev)),
+            doc.components.sets.len(),
+        )
+    }
+}
+
+/// [`GpuCanvas::inputs_fingerprint`]'s memo: the fingerprint and the two
+/// document generations it was computed at.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct FingerprintMemo {
+    render_generation: u64,
+    variables_generation: u64,
+    fingerprint: InputsFingerprint,
+}
+
+/// Hash the registry and active modes through their serde projection: the
+/// registry carries `f64` values, so it has no `Hash` of its own, and the
+/// projection is complete by construction — a field added to a variable can
+/// never be missed. Called once per render generation (memoized by the caller),
+/// never per frame.
+fn hash_variables(
+    variables: &fanta_doc::VariableRegistry,
+    active_modes: &std::collections::BTreeMap<fanta_doc::VariableCollectionId, fanta_doc::ModeId>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    match serde_json::to_string(&(variables, active_modes)) {
+        Ok(json) => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            json.hash(&mut hasher);
+            hasher.finish()
+        }
+        Err(error) => {
+            // Never compare equal to anything: a fingerprint that cannot be
+            // computed must force the conservative path (re-copy, re-expand),
+            // not silently match the previous one.
+            static UNIQUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            log::warn!("hashing the variable registry failed: {error}");
+            u64::MAX - UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+}
+
+// ============================================================================
 // Render thread plumbing
 // ============================================================================
 
@@ -548,6 +636,124 @@ impl SceneSnapshot {
             asset_resolver: self.asset_resolver.as_ref(),
         }
     }
+
+    /// Bring the copy up to the document state `patch` was built against.
+    /// Transform-only and node patches address disjoint nodes, so the order
+    /// does not matter. Any error leaves the copy unusable — the caller drops
+    /// it and asks for a full snapshot.
+    fn apply(&mut self, patch: ScenePatch) -> Result<()> {
+        for (id, transform) in patch.transforms {
+            self.scene
+                .set_transform(id, transform)
+                .with_context(|| format!("patching the transform of {id}"))?;
+        }
+        for (node, stamp) in patch.nodes {
+            let id = node.id;
+            self.scene
+                .patch_node(node, stamp)
+                .with_context(|| format!("patching node {id}"))?;
+        }
+        self.stamp = patch.stamp;
+        Ok(())
+    }
+}
+
+/// What the UI knows about the render thread's [`SceneSnapshot`]: the document
+/// state it mirrors and the fingerprint of the non-scene inputs it was copied
+/// with. The two together decide whether the next render can reuse the copy,
+/// patch it, or must re-copy the document.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkerSnapshot {
+    stamp: SnapshotStamp,
+    fingerprint: InputsFingerprint,
+}
+
+/// The edits that bring the render thread's scene copy from its stamp to
+/// `stamp` without re-copying the document: the current local transform of
+/// every node whose only change was a move, and a clone of every node whose
+/// data may have changed, with the geometry stamp the document holds for it.
+#[cfg(target_os = "macos")]
+struct ScenePatch {
+    stamp: SnapshotStamp,
+    transforms: Vec<(NodeId, Transform2D)>,
+    nodes: Vec<(CanvasNode, u64)>,
+}
+
+/// How to bring the render thread's copy in line with the document for the
+/// next render — see [`plan_snapshot_sync`].
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotSync {
+    /// The copy already mirrors the document.
+    Reuse,
+    /// The copy differs only by these scene edits; everything else it holds is
+    /// current.
+    Patch(SceneDelta),
+    /// The copy cannot be patched (no copy, another scene instance, changed
+    /// components/variables/assets, or the scene cannot account for every
+    /// edit): copy the document again.
+    Recopy,
+}
+
+/// Decide how the render thread's copy catches up with the document. A patch
+/// is only offered when the copy is of THIS scene instance, its non-scene
+/// inputs are unchanged, and the scene's change log proves which nodes moved
+/// or changed since the copy's revision; anything the log cannot prove falls
+/// back to a full copy, so correctness never rides on the patch path.
+#[cfg(target_os = "macos")]
+fn plan_snapshot_sync(
+    worker: Option<&WorkerSnapshot>,
+    stamp: SnapshotStamp,
+    fingerprint: InputsFingerprint,
+    scene: &Scene,
+) -> SnapshotSync {
+    let Some(worker) = worker else {
+        return SnapshotSync::Recopy;
+    };
+    if worker.stamp == stamp {
+        return SnapshotSync::Reuse;
+    }
+    if worker.stamp.scene_instance != stamp.scene_instance
+        || worker.stamp.asset_resolver != stamp.asset_resolver
+        || worker.fingerprint != fingerprint
+    {
+        return SnapshotSync::Recopy;
+    }
+    match scene.changes_since(worker.stamp.scene_revision) {
+        Some(delta) => SnapshotSync::Patch(delta),
+        None => SnapshotSync::Recopy,
+    }
+}
+
+/// Copy out the nodes a [`SceneDelta`] names. `None` if one of them is gone
+/// (the delta was computed against this very scene, so this only guards the
+/// invariant), in which case the caller takes a full snapshot.
+#[cfg(target_os = "macos")]
+fn build_scene_patch(
+    scene: &Scene,
+    delta: &SceneDelta,
+    stamp: SnapshotStamp,
+) -> Option<ScenePatch> {
+    let transforms = delta
+        .transforms
+        .iter()
+        .map(|&id| scene.get(id).map(|node| (id, node.transform)))
+        .collect::<Option<Vec<_>>>()?;
+    let nodes = delta
+        .nodes
+        .iter()
+        .map(|&id| {
+            scene
+                .get(id)
+                .map(|node| (node.clone(), scene.node_stamp(id)))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ScenePatch {
+        stamp,
+        transforms,
+        nodes,
+    })
 }
 
 /// Borrowed render inputs — from a snapshot on the render thread, or from the
@@ -627,6 +833,10 @@ unsafe impl Send for SendBuffer {}
 enum RenderSource {
     /// The render thread's own snapshot; `Some` installs a fresh copy first.
     Snapshot(Option<Box<SceneSnapshot>>),
+    /// The render thread's own snapshot, brought up to date with these edits
+    /// first. A failed apply drops the snapshot and answers
+    /// [`RenderReply::SnapshotLost`] instead of a frame.
+    Patch(Box<ScenePatch>),
     /// The live document, with the UI thread blocked until the reply.
     Live(LiveInputs),
 }
@@ -638,6 +848,9 @@ struct RenderRequest {
     key: SurfaceKey,
     scale_factor: f32,
     motion: Option<MotionEvaluation>,
+    /// `RenderInputs::mode_generation` for this frame: the variables/modes
+    /// half of the document's [`InputsFingerprint`].
+    mode_generation: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -655,6 +868,10 @@ enum RenderReply {
         scale_factor: f32,
         result: Result<(SendBuffer, Duration)>,
     },
+    /// A [`RenderSource::Patch`] could not be applied (or found no snapshot to
+    /// apply to); the render thread dropped its copy and rendered nothing. Not
+    /// a render failure: the next paint sends a full snapshot.
+    SnapshotLost(anyhow::Error),
     /// The render thread could not bring up Metal/Skia; the canvas falls back
     /// to the CPU raster path.
     InitFailed(anyhow::Error),
@@ -767,6 +984,24 @@ fn render_thread_loop(
                     match snapshot.as_deref() {
                         Some(snapshot) => renderer.render_frame(snapshot.inputs(), &request),
                         None => Err(anyhow!("render thread has no scene snapshot")),
+                    }
+                }
+                RenderSource::Patch(patch) => {
+                    let applied = match snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.apply(*patch),
+                        None => Err(anyhow!("render thread has no scene snapshot to patch")),
+                    };
+                    match applied {
+                        Ok(()) => match snapshot.as_deref() {
+                            Some(snapshot) => renderer.render_frame(snapshot.inputs(), &request),
+                            None => Err(anyhow!("render thread has no scene snapshot")),
+                        },
+                        Err(error) => {
+                            // A half-applied copy is not a document state
+                            // anyone ever had; drop it rather than render it.
+                            snapshot = None;
+                            return RenderReply::SnapshotLost(error);
+                        }
                     }
                 }
                 RenderSource::Live(live) => {
@@ -939,7 +1174,7 @@ impl MacGpuRenderer {
             components: inputs.components,
             variables: inputs.variables,
             active_modes: inputs.active_modes,
-            mode_generation: request.key.revision,
+            mode_generation: request.mode_generation,
             motion: request.motion.as_ref(),
             playback: None,
             dark_ui: false,
@@ -1001,8 +1236,17 @@ pub(crate) struct GpuCanvas {
     retired: VecDeque<CVPixelBuffer>,
     /// Graduated buffers waiting to ride along with the next job.
     to_recycle: Vec<SendBuffer>,
-    /// The snapshot the render thread currently holds.
-    worker_snapshot: Option<SnapshotStamp>,
+    /// The snapshot the render thread currently holds, as the UI last left it
+    /// (full copy or patch). `None` until the first copy, and again after the
+    /// render thread reports it lost the copy.
+    worker_snapshot: Option<WorkerSnapshot>,
+    /// [`InputsFingerprint`] of the document, tagged with the render
+    /// generation and the variables generation it was computed at. The
+    /// components half follows every edit; the variables half — a
+    /// serialization of the whole registry — is reused until a variable or
+    /// mode edit moves the variables generation, so a drag frame (which moves
+    /// only the render generation) never re-hashes the registry.
+    inputs_fingerprint: Option<FingerprintMemo>,
     cost: RenderCost,
     last_render_at: Option<Instant>,
     /// Wall time of the most recent scene render. Drives the adaptive
@@ -1073,6 +1317,7 @@ impl GpuCanvas {
             retired: VecDeque::new(),
             to_recycle: Vec::new(),
             worker_snapshot: None,
+            inputs_fingerprint: None,
             cost: RenderCost::Unknown,
             last_render_at: None,
             last_render_duration: Duration::ZERO,
@@ -1127,11 +1372,45 @@ impl GpuCanvas {
                     }
                 }
             }
+            RenderReply::SnapshotLost(error) => {
+                self.in_flight = None;
+                self.worker_snapshot = None;
+                log::warn!("the canvas render thread dropped its scene copy: {error:#}");
+            }
             RenderReply::InitFailed(error) => {
                 self.in_flight = None;
                 self.failed = Some(format!("Skia Metal is unavailable: {error:#}"));
             }
         }
+    }
+
+    /// The document's [`InputsFingerprint`]: unchanged while the render
+    /// generation is, with the registry hash reused for as long as the
+    /// variables generation is.
+    fn inputs_fingerprint(&mut self, document: &FigDocument) -> InputsFingerprint {
+        let render_generation = document.render_generation();
+        let variables_generation = document.variables_generation();
+        if let Some(memo) = self.inputs_fingerprint
+            && memo.render_generation == render_generation
+        {
+            return memo.fingerprint;
+        }
+        let variables = match self.inputs_fingerprint {
+            Some(memo) if memo.variables_generation == variables_generation => {
+                memo.fingerprint.variables
+            }
+            _ => hash_variables(&document.doc.variables, &document.doc.active_modes),
+        };
+        let fingerprint = InputsFingerprint {
+            components: InputsFingerprint::components_of(&document.doc),
+            variables,
+        };
+        self.inputs_fingerprint = Some(FingerprintMemo {
+            render_generation,
+            variables_generation,
+            fingerprint,
+        });
+        fingerprint
     }
 
     fn install_frame(
@@ -1179,9 +1458,6 @@ impl GpuCanvas {
     fn dispatch(&mut self, source: RenderSource, request: RenderRequest) -> Result<()> {
         if let Some(reason) = &self.failed {
             return Err(anyhow!("{reason}"));
-        }
-        if let RenderSource::Snapshot(Some(snapshot)) = &source {
-            self.worker_snapshot = Some(snapshot.stamp);
         }
         let key = request.key;
         let job = RenderJob {
@@ -1301,30 +1577,67 @@ impl GpuCanvas {
             visible_logical,
             within_render_interval,
         );
-        let request = RenderRequest {
-            key,
-            scale_factor,
-            motion,
-        };
         let mut repaint = false;
         match plan {
             PaintPlan::Present | PaintPlan::PresentAndWait => {}
             PaintPlan::Reproject => repaint = true,
             PaintPlan::RenderBlocking => {
+                let request = RenderRequest {
+                    key,
+                    scale_factor,
+                    motion,
+                    mode_generation: self.inputs_fingerprint(document).variables,
+                };
                 self.render_blocking(LiveInputs::of(document), request)?;
             }
             PaintPlan::PresentAndRender => {
                 let stamp = SnapshotStamp::of(document);
-                let snapshot = (self.worker_snapshot != Some(stamp)).then(|| {
-                    let started = Instant::now();
-                    let snapshot = Box::new(SceneSnapshot::capture(document, stamp));
-                    crate::report_slow("canvas scene snapshot", started);
-                    snapshot
-                });
-                self.dispatch(RenderSource::Snapshot(snapshot), request)?;
+                let fingerprint = self.inputs_fingerprint(document);
+                let request = RenderRequest {
+                    key,
+                    scale_factor,
+                    motion,
+                    mode_generation: fingerprint.variables,
+                };
+                let source = self.snapshot_source(document, stamp, fingerprint);
+                self.dispatch(source, request)?;
+                self.worker_snapshot = Some(WorkerSnapshot { stamp, fingerprint });
             }
         }
         Ok((self.present(&key), repaint))
+    }
+
+    /// The scene source for an off-thread render: the worker's copy as is, a
+    /// patch that brings it up to `stamp`, or a full copy. A patch that turns
+    /// out empty (the generation moved for something the copy does not hold)
+    /// costs nothing — the copy is reused and only the UI-side stamp advances.
+    fn snapshot_source(
+        &self,
+        document: &FigDocument,
+        stamp: SnapshotStamp,
+        fingerprint: InputsFingerprint,
+    ) -> RenderSource {
+        let scene = &document.doc.scene;
+        let started = Instant::now();
+        let source =
+            match plan_snapshot_sync(self.worker_snapshot.as_ref(), stamp, fingerprint, scene) {
+                SnapshotSync::Reuse => RenderSource::Snapshot(None),
+                SnapshotSync::Patch(delta) if delta.is_empty() => RenderSource::Snapshot(None),
+                SnapshotSync::Patch(delta) => match build_scene_patch(scene, &delta, stamp) {
+                    Some(patch) => {
+                        crate::report_slow("canvas scene patch", started);
+                        return RenderSource::Patch(Box::new(patch));
+                    }
+                    None => RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(
+                        document, stamp,
+                    )))),
+                },
+                SnapshotSync::Recopy => {
+                    RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(document, stamp))))
+                }
+            };
+        crate::report_slow("canvas scene snapshot", started);
+        source
     }
 }
 
@@ -1410,11 +1723,13 @@ fn render_fig_canvas(
         center: viewport.center,
         zoom: viewport.zoom * f64::from(scale_factor),
     };
+    // The CPU path renders a whole frame per generation anyway, so hashing the
+    // variables here costs nothing measurable next to the raster.
     let inputs = RenderInputs {
         components: &document.doc.components,
         variables: &document.doc.variables,
         active_modes: &document.doc.active_modes,
-        mode_generation: document.render_generation(),
+        mode_generation: InputsFingerprint::of(&document.doc).variables,
         motion,
         playback: None,
         dark_ui: false,
@@ -2163,18 +2478,24 @@ impl CanvasElement {
                 });
             }
 
-            // Selection union + size badge.
+            // Selection union + size badge. Past the outline cap only the
+            // union is kept: thousands of per-node outlines are unreadable
+            // and cost a quad each per frame.
+            let per_node_outlines = doc.selection.len() <= SELECTION_OUTLINE_CAP;
             let mut selected_bounds = Vec::new();
             let mut text_baselines = Vec::new();
             for &id in doc.selection.iter() {
                 if let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) {
-                    selected_bounds.push(world);
+                    if per_node_outlines {
+                        selected_bounds.push(world);
+                    }
                     data.selection_union = Some(match data.selection_union {
                         Some(existing) => existing.union(&world),
                         None => world,
                     });
                 }
-                if editing_node != Some(id)
+                if per_node_outlines
+                    && editing_node != Some(id)
                     && let Some(node) = doc.scene.get(id)
                     && let fanta_doc::NodeData::Text(text) = &node.data
                     && let Some(transform) =
@@ -2187,6 +2508,9 @@ impl CanvasElement {
                             .transform_point(DVec2::new(text.local_size[0].max(1.0), baseline)),
                     ));
                 }
+            }
+            if !per_node_outlines && let Some(union) = data.selection_union {
+                selected_bounds.push(union);
             }
             data.frame_labels = Rc::new(frame_labels);
             data.selected_bounds = Rc::new(selected_bounds);
@@ -4087,6 +4411,271 @@ mod tests {
         assert_eq!(
             cost_after_install(None, &page_a, RenderCost::Unknown, cheap),
             RenderCost::Cheap
+        );
+    }
+
+    // ---- render-thread copy: reuse, patch, or re-copy ---------------------
+
+    fn stamp_of(scene: &Scene, generation: u64) -> SnapshotStamp {
+        SnapshotStamp {
+            scene_instance: scene.instance_id(),
+            scene_revision: scene.revision(),
+            generation,
+            asset_resolver: None,
+        }
+    }
+
+    fn rect(x: f64, y: f64) -> CanvasNode {
+        let mut node = CanvasNode::new(fanta_doc::NodeData::Vector(
+            fanta_doc::VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, fanta_doc::Color::WHITE),
+        ));
+        node.transform = Transform2D::translation(x, y);
+        node
+    }
+
+    fn worker(scene: &Scene, generation: u64) -> WorkerSnapshot {
+        WorkerSnapshot {
+            stamp: stamp_of(scene, generation),
+            fingerprint: InputsFingerprint::of(&fanta_doc::Doc::new()),
+        }
+    }
+
+    #[test]
+    fn without_a_worker_copy_the_document_is_copied() {
+        let scene = Scene::new();
+        let fingerprint = InputsFingerprint::of(&fanta_doc::Doc::new());
+        assert_eq!(
+            plan_snapshot_sync(None, stamp_of(&scene, 1), fingerprint, &scene),
+            SnapshotSync::Recopy
+        );
+    }
+
+    #[test]
+    fn an_unchanged_stamp_reuses_the_copy() {
+        let scene = Scene::new();
+        let worker = worker(&scene, 1);
+        assert_eq!(
+            plan_snapshot_sync(Some(&worker), worker.stamp, worker.fingerprint, &scene),
+            SnapshotSync::Reuse
+        );
+    }
+
+    #[test]
+    fn a_transform_edit_since_the_copy_is_patched() {
+        let mut scene = Scene::new();
+        let id = scene.insert(rect(0.0, 0.0)).unwrap();
+        scene.insert(rect(50.0, 0.0)).unwrap();
+        let worker = worker(&scene, 1);
+        scene
+            .set_transform(id, Transform2D::translation(5.0, 5.0))
+            .unwrap();
+        scene
+            .set_transform(id, Transform2D::translation(6.0, 6.0))
+            .unwrap();
+        let plan = plan_snapshot_sync(
+            Some(&worker),
+            stamp_of(&scene, 3),
+            worker.fingerprint,
+            &scene,
+        );
+        assert_eq!(
+            plan,
+            SnapshotSync::Patch(SceneDelta {
+                transforms: vec![id],
+                nodes: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_generation_bump_without_scene_edits_is_an_empty_patch() {
+        let scene = Scene::new();
+        let worker = worker(&scene, 1);
+        match plan_snapshot_sync(
+            Some(&worker),
+            stamp_of(&scene, 2),
+            worker.fingerprint,
+            &scene,
+        ) {
+            SnapshotSync::Patch(delta) => assert!(delta.is_empty()),
+            other => panic!("expected an empty patch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changed_components_or_variables_force_a_recopy() {
+        let mut scene = Scene::new();
+        let id = scene.insert(rect(0.0, 0.0)).unwrap();
+        let worker = worker(&scene, 1);
+        scene
+            .set_transform(id, Transform2D::translation(5.0, 5.0))
+            .unwrap();
+        let mut doc = fanta_doc::Doc::new();
+        doc.active_modes
+            .insert(VariableCollectionId::new(), ModeId::new());
+        let changed = InputsFingerprint::of(&doc);
+        assert_ne!(changed, worker.fingerprint);
+        assert_eq!(
+            plan_snapshot_sync(Some(&worker), stamp_of(&scene, 2), changed, &scene),
+            SnapshotSync::Recopy
+        );
+    }
+
+    #[test]
+    fn another_scene_instance_or_asset_resolver_forces_a_recopy() {
+        let mut scene = Scene::new();
+        scene.insert(rect(0.0, 0.0)).unwrap();
+        let worker = worker(&scene, 1);
+        let other_instance = scene.clone();
+        assert_eq!(
+            plan_snapshot_sync(
+                Some(&worker),
+                stamp_of(&other_instance, 1),
+                worker.fingerprint,
+                &other_instance
+            ),
+            SnapshotSync::Recopy
+        );
+        let mut swapped_assets = stamp_of(&scene, 1);
+        swapped_assets.asset_resolver = Some(0x1000);
+        assert_eq!(
+            plan_snapshot_sync(Some(&worker), swapped_assets, worker.fingerprint, &scene),
+            SnapshotSync::Recopy
+        );
+    }
+
+    #[test]
+    fn a_structural_edit_forces_a_recopy() {
+        let mut scene = Scene::new();
+        let id = scene.insert(rect(0.0, 0.0)).unwrap();
+        let worker = worker(&scene, 1);
+        scene
+            .set_transform(id, Transform2D::translation(5.0, 5.0))
+            .unwrap();
+        scene.insert(rect(20.0, 20.0)).unwrap();
+        assert_eq!(
+            plan_snapshot_sync(
+                Some(&worker),
+                stamp_of(&scene, 2),
+                worker.fingerprint,
+                &scene
+            ),
+            SnapshotSync::Recopy
+        );
+    }
+
+    #[test]
+    fn a_patch_brings_the_worker_copy_to_the_documents_geometry() {
+        let mut scene = Scene::new();
+        let group = scene
+            .insert(CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            )))
+            .unwrap();
+        let mut child = rect(1.0, 1.0);
+        child.parent = Some(group);
+        let child = scene.insert(child).unwrap();
+        let moved = scene.insert(rect(100.0, 100.0)).unwrap();
+        let untouched = scene.insert(rect(300.0, 300.0)).unwrap();
+        // Warm the copy's caches so a missed invalidation would show.
+        let copy_scene = scene.clone();
+        for id in [group, child, moved, untouched] {
+            copy_scene.world_bounds(id);
+        }
+        let mut copy = SceneSnapshot {
+            stamp: stamp_of(&scene, 1),
+            scene: copy_scene,
+            components: ComponentLibrary::default(),
+            variables: VariableRegistry::default(),
+            active_modes: BTreeMap::new(),
+            asset_resolver: None,
+        };
+        let worker = WorkerSnapshot {
+            stamp: copy.stamp,
+            fingerprint: InputsFingerprint::of(&fanta_doc::Doc::new()),
+        };
+
+        scene
+            .set_transform(moved, Transform2D::translation(-7.0, 12.0))
+            .unwrap();
+        {
+            let child = scene.get_mut(child).unwrap();
+            child.transform = Transform2D::translation(40.0, 0.0);
+            child.flags |= fanta_doc::NodeFlags::HIDDEN;
+        }
+        let stamp = stamp_of(&scene, 2);
+        let delta = match plan_snapshot_sync(Some(&worker), stamp, worker.fingerprint, &scene) {
+            SnapshotSync::Patch(delta) => delta,
+            other => panic!("expected a patch, got {other:?}"),
+        };
+        assert_eq!(delta.transforms, vec![moved]);
+        assert_eq!(delta.nodes, vec![child]);
+        let patch = build_scene_patch(&scene, &delta, stamp).unwrap();
+        assert_eq!(patch.transforms.len(), 1);
+        assert_eq!(patch.nodes.len(), 1);
+        assert_eq!(patch.nodes[0].1, scene.node_stamp(child));
+
+        copy.apply(patch).unwrap();
+        assert_eq!(copy.stamp, stamp);
+        for id in [group, child, moved, untouched] {
+            assert_eq!(copy.scene.get(id), scene.get(id));
+            assert_eq!(copy.scene.world_bounds(id), scene.world_bounds(id));
+            assert_eq!(copy.scene.node_stamp(id), scene.node_stamp(id));
+        }
+    }
+
+    #[test]
+    fn a_patch_that_cannot_apply_reports_an_error() {
+        let mut scene = Scene::new();
+        let id = scene.insert(rect(0.0, 0.0)).unwrap();
+        let mut copy = SceneSnapshot {
+            stamp: stamp_of(&scene, 1),
+            scene: scene.clone(),
+            components: ComponentLibrary::default(),
+            variables: VariableRegistry::default(),
+            active_modes: BTreeMap::new(),
+            asset_resolver: None,
+        };
+        let mut reparented = scene.get(id).unwrap().clone();
+        reparented.parent = Some(NodeId::new());
+        let patch = ScenePatch {
+            stamp: stamp_of(&scene, 2),
+            transforms: vec![(NodeId::new(), Transform2D::IDENTITY)],
+            nodes: vec![(reparented, 5)],
+        };
+        assert!(copy.apply(patch).is_err());
+    }
+
+    #[test]
+    fn the_inputs_fingerprint_tracks_components_and_variables_only() {
+        let mut doc = fanta_doc::Doc::new();
+        let base = InputsFingerprint::of(&doc);
+        assert_eq!(base, InputsFingerprint::of(&doc), "stable while unchanged");
+
+        // A scene edit leaves it alone: that is the scene revision's job.
+        doc.scene.insert(rect(0.0, 0.0)).unwrap();
+        assert_eq!(base, InputsFingerprint::of(&doc));
+
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, NodeId::new(), "Button"),
+        );
+        let with_def = InputsFingerprint::of(&doc);
+        assert_ne!(base, with_def, "a new master changes it");
+        if let Some(def) = doc.components.defs.get_mut(&component) {
+            def.rev += 1;
+        }
+        let bumped = InputsFingerprint::of(&doc);
+        assert_ne!(with_def, bumped, "a master edit changes it");
+
+        doc.active_modes
+            .insert(VariableCollectionId::new(), ModeId::new());
+        let with_mode = InputsFingerprint::of(&doc);
+        assert_ne!(bumped, with_mode, "an active-mode switch changes it");
+        assert_eq!(
+            bumped.components, with_mode.components,
+            "the components half is untouched by a mode switch"
         );
     }
 

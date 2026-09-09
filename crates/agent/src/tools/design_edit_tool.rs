@@ -13,17 +13,30 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
     LanguageModelToolResultContent::from(e.to_string())
 }
 
-/// Edit the open design canvas by applying a batch of ops in order:
-/// `create_node` (frame, rectangle, ellipse, text), `create_image` (base64 or
-/// data: URI source; becomes a project asset + bitmap layer), `set_props`,
-/// `reparent`, `delete`, `select`, and `set_viewport`.
+/// Edit the open design canvas by applying a batch of ops in order.
+///
+/// Create: `create_node` (frame, rectangle, ellipse, text), `create_image`
+/// (base64 or data: URI source; becomes a project asset + bitmap layer),
+/// `create_instance` (of a component by id or unique name), `duplicate`.
+/// Style: `set_props` (name, x, y, width, height, opacity, fill,
+/// corner_radius, text, hidden, locked), `set_stroke`, `set_shadow`,
+/// `set_text_style` (family, weight, size, line height, letter spacing,
+/// align, color), `set_auto_layout` (direction, gap, padding, align_items,
+/// justify; `none` turns it off). Arrange: `rotate`, `align`, `distribute`,
+/// `set_index` (z-order), `reparent`. Structure: `group`, `frame_selection`,
+/// `ungroup`, `create_component`, `delete`. Editor: `select`, `set_viewport`.
 ///
 /// The batch is one undoable transaction: if any op fails, everything rolls
 /// back and the result reports the failing op so it can be corrected. `x`/`y`
-/// are world (canvas) coordinates of a node's top-left corner. Created node
-/// ids are returned in creation order. Verify the result with
-/// `design_screenshot` after substantive edits. To place an image from a URL
-/// (e.g. a finished AI generation), use `place_generation` instead.
+/// are world (canvas) coordinates of a node's top-left corner (y grows down);
+/// ids are exact node ids from `design_state`. Created node ids are returned
+/// in `created` in creation order (`group`/`frame_selection`/`duplicate`/
+/// `create_instance` report their new node there; `ungroup` reports freed
+/// `children`; `create_component` reports the `component` id). Verify the
+/// result with `design_screenshot` after substantive edits. To place an image
+/// from a URL (e.g. a finished AI generation), use `place_generation` instead.
+/// Gradients, variables and per-run rich text are not ops: edit the page's
+/// `.fnx` source with the file tools when the project is on disk.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignEditToolInput {
     /// The ops to apply, in order.

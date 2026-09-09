@@ -18,13 +18,28 @@
 //! Presence/UI state (`active_page`, `selection`, `viewport`, `history`) is
 //! deliberately **not** written: spec 09 §A.2 moves it out of the persisted
 //! schema entirely.
+//!
+//! ## Incremental projection
+//!
+//! The disk diff was always incremental; the in-memory projection was not —
+//! every save re-serialized the whole document and re-printed every `.fnx`
+//! even when one node moved, which on a 30k-node document costs seconds of
+//! CPU and gigabytes of transient `serde_json::Value`. [`ProjectWriteCache`]
+//! fixes that: nodes are bucketed by walking the typed scene, each design is
+//! fingerprinted by streaming its nodes' serialization through a hash (no
+//! `Value` is built for it), and a design whose fingerprint is unchanged
+//! reuses the bytes produced last time. The bytes are exactly what a cold
+//! projection yields, so the byte-determinism contract and the disk diff
+//! semantics are untouched — a hit still runs through `write_if_changed`.
 
 use crate::error::{FormatError, Result};
-use fanta_doc::{AssetId, ComponentId, Doc, NodeId};
+use fanta_doc::{AssetId, ComponentId, Doc, DocId, NodeId};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::layout::{
     ACTIVE_MODES_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, EXPORTS_DIR, FANTA_JSON,
@@ -45,6 +60,42 @@ pub struct WriteReport {
     pub removed: Vec<PathBuf>,
 }
 
+/// The in-memory projection: every non-asset file the tree should contain,
+/// keyed by project-relative path. Bytes are shared with the
+/// [`ProjectWriteCache`] so a cache hit costs a refcount, not a copy.
+type ProjectedFiles = BTreeMap<PathBuf, Arc<Vec<u8>>>;
+
+/// Memo of the per-design projection across successive writes of the same
+/// document. Owned by whoever saves repeatedly (the editor's autosave);
+/// keyed by document id and reset when a different document is written
+/// through it. Holding it is purely an optimization: a stale or fresh cache
+/// yields byte-identical output, because an entry is only reused when the
+/// design's content fingerprint matches.
+#[derive(Default)]
+pub struct ProjectWriteCache {
+    doc_id: Option<DocId>,
+    designs: BTreeMap<PathBuf, CachedDesign>,
+}
+
+struct CachedDesign {
+    fingerprint: [u8; 32],
+    files: Vec<(PathBuf, Arc<Vec<u8>>)>,
+}
+
+impl ProjectWriteCache {
+    /// Number of designs whose projected bytes are currently memoized.
+    pub fn cached_designs(&self) -> usize {
+        self.designs.len()
+    }
+
+    fn retarget(&mut self, doc: DocId) {
+        if self.doc_id != Some(doc) {
+            self.designs.clear();
+            self.doc_id = Some(doc);
+        }
+    }
+}
+
 /// Project `doc` + `assets` onto the directory tree at `dir` (spec 09 §A.2).
 ///
 /// Creates `dir` if needed. Reconciles `fanta.json`, `.gitignore`, and the
@@ -54,13 +105,29 @@ pub struct WriteReport {
 /// left alone). Asset files are content-addressed (the id in the filename
 /// names the bytes), so an asset that already exists on disk is never
 /// rewritten.
+///
+/// Projects from scratch; a caller that saves the same document repeatedly
+/// should use [`write_project_tree_cached`].
 pub fn write_project_tree(
     dir: &Path,
     doc: &Doc,
     assets: &BTreeMap<AssetId, Vec<u8>>,
 ) -> Result<WriteReport> {
+    write_project_tree_cached(dir, doc, assets, &mut ProjectWriteCache::default())
+}
+
+/// [`write_project_tree`] reusing the per-design projection memoized in
+/// `cache` from the previous write of this document. Output and disk
+/// semantics are identical to the uncached call — including rewriting a file
+/// someone edited externally back to the projected bytes.
+pub fn write_project_tree_cached(
+    dir: &Path,
+    doc: &Doc,
+    assets: &BTreeMap<AssetId, Vec<u8>>,
+    cache: &mut ProjectWriteCache,
+) -> Result<WriteReport> {
     fs::create_dir_all(dir)?;
-    let files = project_files(doc)?;
+    let files = project_files_cached(doc, cache)?;
     let asset_files = project_asset_files(assets);
 
     fs::create_dir_all(dir.join(PREVIEWS_DIR))?;
@@ -154,7 +221,7 @@ pub fn write_project_tree(
 /// no-op-or-error on some filesystems); on a case-sensitive filesystem where
 /// the projected name is genuinely occupied the rename fails harmlessly and
 /// the differently-cased dir is pruned as the stale dir it really is.
-fn heal_directory_case(dir: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Result<()> {
+fn heal_directory_case(dir: &Path, files: &ProjectedFiles) -> Result<()> {
     let mut expected: BTreeSet<(&str, &str)> = BTreeSet::new();
     for relative in files.keys() {
         let mut components = relative.components();
@@ -241,18 +308,31 @@ fn remove_symlinks_on_projected_paths<'a>(
     Ok(())
 }
 
+/// The complete in-memory projection of `doc`, computed from scratch.
+#[cfg(test)]
+fn project_files(doc: &Doc) -> Result<ProjectedFiles> {
+    project_files_cached(doc, &mut ProjectWriteCache::default())
+}
+
 /// The complete in-memory projection of `doc`: every non-asset file the tree
 /// should contain, keyed by project-relative path, with the exact bytes the
-/// tree should hold.
-fn project_files(doc: &Doc) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
-    let value = serde_json::to_value(doc)?;
-    let mut files = BTreeMap::new();
+/// tree should hold. Designs whose fingerprint matches `cache` reuse their
+/// previous bytes; everything else is (re)generated. The cache is left
+/// holding exactly the designs this projection contains.
+fn project_files_cached(doc: &Doc, cache: &mut ProjectWriteCache) -> Result<ProjectedFiles> {
+    cache.retarget(doc.id);
+    let mut files = ProjectedFiles::new();
     files.insert(
         PathBuf::from(FANTA_JSON),
-        json_bytes(&serde_json::to_value(ProjectManifest::for_doc(doc))?)?,
+        Arc::new(json_bytes(&serde_json::to_value(
+            ProjectManifest::for_doc(doc),
+        )?)?),
     );
-    files.insert(PathBuf::from(GITIGNORE_NAME), GITIGNORE.as_bytes().to_vec());
-    project_doc_singletons(&mut files, &value)?;
+    files.insert(
+        PathBuf::from(GITIGNORE_NAME),
+        Arc::new(GITIGNORE.as_bytes().to_vec()),
+    );
+    project_doc_singletons(&mut files, doc)?;
     // Name-based reference emission follows the manifest this write stamps:
     // the tree is written at PROJECT_VERSION, and v4 is the layout where
     // `component="Button"` / `"$Collection/Name"` spellings became part of
@@ -263,36 +343,40 @@ fn project_files(doc: &Doc) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
         &doc.variables,
         PROJECT_VERSION >= 4,
     );
-    project_designs(&mut files, doc, &value, &refs)?;
+    project_designs(&mut files, doc, &refs, cache)?;
     Ok(files)
 }
 
 /// The small, mergeable doc-level files under `doc/`. Note what is *absent*:
 /// `active_page`, `selection`, `viewport`, and `history` are presence state
 /// and never reach disk.
-fn project_doc_singletons(files: &mut BTreeMap<PathBuf, Vec<u8>>, value: &Value) -> Result<()> {
+///
+/// Each file holds the field exactly as `Doc`'s own serialization would emit
+/// it, including the `skip_serializing_if` cases, where the whole-document
+/// projection had no key and the writer substituted an empty object — the
+/// bytes must not move when a document gains or loses its first variable.
+fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
     let doc_dir = PathBuf::from(DOC_DIR);
-    let empty = json!({});
-    files.insert(
-        doc_dir.join(METADATA_JSON),
-        json_bytes(value.get("metadata").unwrap_or(&empty))?,
-    );
-    files.insert(
-        doc_dir.join(VARIABLES_JSON),
-        json_bytes(value.get("variables").unwrap_or(&empty))?,
-    );
-    files.insert(
-        doc_dir.join(ACTIVE_MODES_JSON),
-        json_bytes(value.get("active_modes").unwrap_or(&empty))?,
-    );
-    files.insert(
-        doc_dir.join(MOTION_JSON),
-        json_bytes(value.get("motion").unwrap_or(&empty))?,
-    );
-    files.insert(
-        doc_dir.join(FLOW_START_JSON),
-        json_bytes(value.get("flow_start").unwrap_or(&Value::Null))?,
-    );
+    let variables = if doc.variables.is_empty() {
+        json!({})
+    } else {
+        serde_json::to_value(&doc.variables)?
+    };
+    let motion = if doc.motion.is_empty() {
+        json!({})
+    } else {
+        serde_json::to_value(&doc.motion)?
+    };
+    let singletons = [
+        (METADATA_JSON, serde_json::to_value(&doc.metadata)?),
+        (VARIABLES_JSON, variables),
+        (ACTIVE_MODES_JSON, serde_json::to_value(&doc.active_modes)?),
+        (MOTION_JSON, motion),
+        (FLOW_START_JSON, serde_json::to_value(doc.flow_start)?),
+    ];
+    for (name, value) in singletons {
+        files.insert(doc_dir.join(name), Arc::new(json_bytes(&value)?));
+    }
     Ok(())
 }
 
@@ -334,19 +418,11 @@ fn design_slugs<Id: Ord + Copy>(
 /// Page headers, component defs/sets, and one source (or fallback node file)
 /// per design.
 fn project_designs(
-    files: &mut BTreeMap<PathBuf, Vec<u8>>,
+    files: &mut ProjectedFiles,
     doc: &Doc,
-    value: &Value,
     refs: &fanta_fnx::RefTable,
+    cache: &mut ProjectWriteCache,
 ) -> Result<()> {
-    let nodes = value
-        .get("scene")
-        .and_then(|s| s.get("nodes"))
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            FormatError::InvalidProjectTree("doc projection missing scene.nodes".into())
-        })?;
-
     // v3: design directories are named by a slug of the design's name; the
     // ids move into the JSON headers (`page.json` "id", `def.json`).
     let page_slugs: BTreeMap<NodeId, String> = design_slugs(
@@ -378,14 +454,14 @@ fn project_designs(
         })
     };
 
-    // Scene-key (bare ULID) → directory slug for the two kinds of design roots.
-    let mut component_roots: BTreeMap<String, String> = BTreeMap::new();
+    // Design root → directory slug for the two kinds of design roots.
+    let mut component_roots: BTreeMap<NodeId, String> = BTreeMap::new();
     for (cid, def) in &doc.components.defs {
-        component_roots.insert(json_key(&def.root)?, slug_of_component(cid)?.clone());
+        component_roots.insert(def.root, slug_of_component(cid)?.clone());
     }
-    let mut page_dirs: BTreeMap<String, String> = BTreeMap::new();
+    let mut page_dirs: BTreeMap<NodeId, String> = BTreeMap::new();
     for page in &doc.pages {
-        page_dirs.insert(json_key(page)?, slug_of_page(page)?.clone());
+        page_dirs.insert(*page, slug_of_page(page)?.clone());
     }
 
     // pages/<slug>/page.json — id + name + order. The id is the page's
@@ -404,109 +480,242 @@ fn project_designs(
             PathBuf::from(PAGES_DIR)
                 .join(slug_of_page(page)?)
                 .join(PAGE_JSON),
-            json_bytes(&Value::Object(header))?,
+            Arc::new(json_bytes(&Value::Object(header))?),
         );
     }
 
-    // components/<slug>/def.json + components/sets.json. The maps come from the
-    // doc projection so the def JSON is exactly what `Doc` serializes (the def
-    // carries the component's id).
-    let empty = Map::new();
-    let defs = value
-        .get("components")
-        .and_then(|c| c.get("defs"))
-        .and_then(Value::as_object)
-        .unwrap_or(&empty);
-    for (key, def) in defs {
-        let cid: ComponentId = id_from_key(key)?;
+    // components/<slug>/def.json + components/sets.json — each def exactly as
+    // `Doc` serializes it (the def carries the component's id).
+    for (cid, def) in &doc.components.defs {
         files.insert(
             PathBuf::from(COMPONENTS_DIR)
-                .join(slug_of_component(&cid)?)
+                .join(slug_of_component(cid)?)
                 .join(DEF_JSON),
-            json_bytes(def)?,
+            Arc::new(json_bytes(&serde_json::to_value(def)?)?),
         );
     }
-    let sets = value
-        .get("components")
-        .and_then(|c| c.get("sets"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     files.insert(
         PathBuf::from(COMPONENTS_DIR).join(SETS_JSON),
-        json_bytes(&sets)?,
+        Arc::new(json_bytes(&serde_json::to_value(&doc.components.sets)?)?),
     );
 
     // v2: one readable `.fnx` source + an `.ids` sidecar per page / component
     // (was one JSON file per node). Keys are sorted (determinism contract) then
     // grouped by their design; `_loose` orphans stay per-node JSON because they
     // need not form a single-rooted tree.
-    let mut keys: Vec<&String> = nodes.keys().collect();
-    keys.sort();
-    let mut page_nodes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let mut comp_nodes: BTreeMap<String, Vec<Value>> = BTreeMap::new();
-    let mut loose: Vec<&String> = Vec::new();
-    for key in keys {
-        match classify(nodes, key, &component_roots, &page_dirs) {
-            Bucket::Component(cdir) => comp_nodes
-                .entry(cdir)
-                .or_default()
-                .push(nodes[key.as_str()].clone()),
-            Bucket::Page(pdir) => page_nodes
-                .entry(pdir)
-                .or_default()
-                .push(nodes[key.as_str()].clone()),
-            Bucket::Loose => loose.push(key),
+    let mut keyed_nodes: Vec<(String, NodeId)> = Vec::with_capacity(doc.scene.len());
+    for id in scene_node_ids(doc)? {
+        keyed_nodes.push((json_key(&id)?, id));
+    }
+    keyed_nodes.sort();
+    let mut page_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
+    let mut comp_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
+    let mut loose: Vec<NodeId> = Vec::new();
+    for (_, id) in keyed_nodes {
+        match classify(&doc.scene, id, &component_roots, &page_dirs) {
+            Bucket::Component(cdir) => comp_nodes.entry(cdir).or_default().push(id),
+            Bucket::Page(pdir) => page_nodes.entry(pdir).or_default().push(id),
+            Bucket::Loose => loose.push(id),
         }
     }
 
+    let refs_digest = ref_table_digest(doc);
     let page_by_slug: BTreeMap<&String, NodeId> =
         page_slugs.iter().map(|(id, slug)| (slug, *id)).collect();
     let component_by_slug: BTreeMap<&String, ComponentId> = component_slugs
         .iter()
         .map(|(id, slug)| (slug, *id))
         .collect();
+    let mut live_designs: BTreeSet<PathBuf> = BTreeSet::new();
     for (pdir, group) in &page_nodes {
         let name = page_by_slug
             .get(pdir)
             .and_then(|id| doc.scene.get(*id))
             .map(|n| n.name.as_str());
-        project_fnx_design(
+        let design_dir = PathBuf::from(PAGES_DIR).join(pdir);
+        project_design_cached(
             files,
-            &PathBuf::from(PAGES_DIR).join(pdir),
+            doc,
+            cache,
+            &design_dir,
             PAGE_FNX,
             PAGE_IDS,
             group,
             &design_name(name, "Page"),
             refs,
+            &refs_digest,
         )
         .map_err(|e| FormatError::InvalidProjectTree(format!("page {pdir}: {e}")))?;
+        live_designs.insert(design_dir);
     }
     for (cdir, group) in &comp_nodes {
         let name = component_by_slug
             .get(cdir)
             .and_then(|id| doc.components.defs.get(id))
             .map(|d| d.name.as_str());
-        project_fnx_design(
+        let design_dir = PathBuf::from(COMPONENTS_DIR).join(cdir);
+        project_design_cached(
             files,
-            &PathBuf::from(COMPONENTS_DIR).join(cdir),
+            doc,
+            cache,
+            &design_dir,
             MASTER_FNX,
             MASTER_IDS,
             group,
             &design_name(name, "Component"),
             refs,
+            &refs_digest,
         )
         .map_err(|e| FormatError::InvalidProjectTree(format!("component {cdir}: {e}")))?;
+        live_designs.insert(design_dir);
     }
-    for key in loose {
-        let node_id: NodeId = id_from_key(key)?;
+    cache
+        .designs
+        .retain(|design_dir, _| live_designs.contains(design_dir));
+    for id in loose {
+        let node = doc
+            .scene
+            .get(id)
+            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
         files.insert(
             PathBuf::from(PAGES_DIR)
                 .join(LOOSE_DIR)
                 .join(NODES_DIR)
-                .join(format!("{node_id}.json")),
-            json_bytes(&nodes[key.as_str()])?,
+                .join(format!("{id}.json")),
+            Arc::new(json_bytes(&serde_json::to_value(node)?)?),
         );
     }
+    Ok(())
+}
+
+/// Every node id in the scene. The scene exposes no whole-map iterator, so
+/// the ids are gathered by walking down from the roots; a scene whose nodes
+/// are all reachable (the invariant `Scene::validate` enforces on load and
+/// `Scene::insert` on edit) is covered exactly. Should the counts disagree —
+/// a node whose parent was edited out from under it — fall back to the
+/// serialized key set so no node is silently dropped from the tree.
+fn scene_node_ids(doc: &Doc) -> Result<Vec<NodeId>> {
+    let scene = &doc.scene;
+    let mut ids: Vec<NodeId> = Vec::with_capacity(scene.len());
+    for root in scene.roots() {
+        ids.extend(scene.descendants_of(*root));
+    }
+    if ids.len() == scene.len() {
+        return Ok(ids);
+    }
+    tracing::warn!(
+        target: "fanta::format",
+        reachable = ids.len(),
+        total = scene.len(),
+        "scene has nodes unreachable from its roots; projecting from the serialized key set"
+    );
+    let value = serde_json::to_value(scene)?;
+    let nodes = value
+        .get("nodes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| FormatError::InvalidProjectTree("scene projection missing nodes".into()))?;
+    nodes.keys().map(|key| id_from_key(key)).collect()
+}
+
+/// A digest of everything besides the nodes that shapes a design's `.fnx`
+/// text: the name↔id vocabulary the [`fanta_fnx::RefTable`] is built from,
+/// and the layout version that decides whether names are emitted at all.
+/// Mirrors [`crate::project::refs_ctx::build_ref_table`] input for input.
+fn ref_table_digest(doc: &Doc) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECT_VERSION.to_le_bytes());
+    for (id, def) in &doc.components.defs {
+        hasher.update(id.0.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(def.name.as_bytes());
+        hasher.update([0]);
+    }
+    for variable in doc.variables.variables.values() {
+        let Some(collection) = doc.variables.collections.get(&variable.collection) else {
+            continue;
+        };
+        hasher.update(variable.id.0.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(collection.name.as_bytes());
+        hasher.update([b'/']);
+        hasher.update(variable.name.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.finalize().into()
+}
+
+/// Content fingerprint of one design: its kind, display name, the ref-table
+/// digest, and every node's serialization streamed straight into the hash.
+/// Two designs with equal fingerprints project to identical files.
+fn design_fingerprint(
+    doc: &Doc,
+    fnx_name: &str,
+    fn_name: &str,
+    nodes: &[NodeId],
+    refs_digest: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(fnx_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(fn_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(refs_digest);
+    hasher.update((nodes.len() as u64).to_le_bytes());
+    for id in nodes {
+        let node = doc
+            .scene
+            .get(*id)
+            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
+        serde_json::to_writer(&mut hasher, node)?;
+        hasher.update([0]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Project one design, reusing the cached bytes when its fingerprint is
+/// unchanged since the last write and regenerating (and re-memoizing) it
+/// otherwise.
+#[allow(clippy::too_many_arguments)]
+fn project_design_cached(
+    files: &mut ProjectedFiles,
+    doc: &Doc,
+    cache: &mut ProjectWriteCache,
+    design_dir: &Path,
+    fnx_name: &str,
+    ids_name: &str,
+    nodes: &[NodeId],
+    fn_name: &str,
+    refs: &fanta_fnx::RefTable,
+    refs_digest: &[u8; 32],
+) -> Result<()> {
+    let fingerprint = design_fingerprint(doc, fnx_name, fn_name, nodes, refs_digest)?;
+    if let Some(cached) = cache.designs.get(design_dir)
+        && cached.fingerprint == fingerprint
+    {
+        for (relative, bytes) in &cached.files {
+            files.insert(relative.clone(), bytes.clone());
+        }
+        return Ok(());
+    }
+    let mut values: Vec<Value> = Vec::with_capacity(nodes.len());
+    for id in nodes {
+        let node = doc
+            .scene
+            .get(*id)
+            .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
+        values.push(serde_json::to_value(node)?);
+    }
+    let produced = project_fnx_design(design_dir, fnx_name, ids_name, &values, fn_name, refs)?;
+    for (relative, bytes) in &produced {
+        files.insert(relative.clone(), bytes.clone());
+    }
+    cache.designs.insert(
+        design_dir.to_path_buf(),
+        CachedDesign {
+            fingerprint,
+            files: produced,
+        },
+    );
     Ok(())
 }
 
@@ -516,50 +725,51 @@ fn project_designs(
 /// yet), fall back to per-node JSON under `nodes/` — which the reader still
 /// loads — rather than aborting the whole save.
 fn project_fnx_design(
-    files: &mut BTreeMap<PathBuf, Vec<u8>>,
     design_dir: &Path,
     fnx_name: &str,
     ids_name: &str,
     nodes: &[Value],
     fn_name: &str,
     refs: &fanta_fnx::RefTable,
-) -> Result<()> {
+) -> Result<Vec<(PathBuf, Arc<Vec<u8>>)>> {
     match fanta_fnx::encode_subtree_with(nodes, fn_name, refs) {
-        Ok((text, sidecar)) => {
-            files.insert(design_dir.join(fnx_name), text.into_bytes());
-            files.insert(
+        Ok((text, sidecar)) => Ok(vec![
+            (design_dir.join(fnx_name), Arc::new(text.into_bytes())),
+            (
                 design_dir.join(ids_name),
-                json_bytes(&serde_json::to_value(&sidecar)?)?,
-            );
-        }
+                Arc::new(json_bytes(&serde_json::to_value(&sidecar)?)?),
+            ),
+        ]),
         Err(e) => {
             tracing::warn!(
                 target: "fanta::format",
                 dir = %design_dir.display(),
                 "fnx encode failed ({e}); writing per-node JSON fallback"
             );
-            project_nodes_fallback(files, &design_dir.join(NODES_DIR), nodes)?;
+            project_nodes_fallback(&design_dir.join(NODES_DIR), nodes)
         }
     }
-    Ok(())
 }
 
 /// The per-node JSON escape hatch: one `<id>.json` per node, the v1 shape the
 /// reader falls back to when a design has no `.fnx`.
 fn project_nodes_fallback(
-    files: &mut BTreeMap<PathBuf, Vec<u8>>,
     nodes_dir: &Path,
     nodes: &[Value],
-) -> Result<()> {
+) -> Result<Vec<(PathBuf, Arc<Vec<u8>>)>> {
+    let mut produced = Vec::with_capacity(nodes.len());
     for node in nodes {
         let key = node
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| FormatError::InvalidProjectTree("node missing id".into()))?;
         let node_id: NodeId = id_from_key(key)?;
-        files.insert(nodes_dir.join(format!("{node_id}.json")), json_bytes(node)?);
+        produced.push((
+            nodes_dir.join(format!("{node_id}.json")),
+            Arc::new(json_bytes(node)?),
+        ));
     }
-    Ok(())
+    Ok(produced)
 }
 
 /// A cosmetic function name for a `.fnx` file — the design's display name, or a
@@ -571,36 +781,33 @@ fn design_name(name: Option<&str>, fallback: &str) -> String {
         .to_owned()
 }
 
-/// Walk the parent chain from `key` upward. The **nearest ancestor-or-self**
+/// Walk the parent chain from `id` upward. The **nearest ancestor-or-self**
 /// that is a component root wins (so component subtrees nested under a hidden
 /// Components page still file under `components/`); otherwise the chain's top
 /// decides: a page root files under that page, anything else is loose. The hop
 /// cap guards against parent cycles in hand-edited JSON.
 fn classify(
-    nodes: &Map<String, Value>,
-    key: &str,
-    component_roots: &BTreeMap<String, String>,
-    page_dirs: &BTreeMap<String, String>,
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    component_roots: &BTreeMap<NodeId, String>,
+    page_dirs: &BTreeMap<NodeId, String>,
 ) -> Bucket {
-    let mut current = key;
+    let mut current = id;
     let mut hops = 0usize;
     loop {
-        if let Some(cdir) = component_roots.get(current) {
+        if let Some(cdir) = component_roots.get(&current) {
             return Bucket::Component(cdir.clone());
         }
-        let parent = nodes
-            .get(current)
-            .and_then(|n| n.get("parent"))
-            .and_then(Value::as_str);
+        let parent = scene.get(current).and_then(|node| node.parent);
         match parent {
-            Some(p) if hops <= nodes.len() && nodes.contains_key(p) => {
+            Some(p) if hops <= scene.len() && scene.contains(p) => {
                 current = p;
                 hops += 1;
             }
             _ => break,
         }
     }
-    match page_dirs.get(current) {
+    match page_dirs.get(&current) {
         Some(pdir) => Bucket::Page(pdir.clone()),
         None => Bucket::Loose,
     }
@@ -706,7 +913,7 @@ fn design_dir_of(relative: &Path) -> Option<PathBuf> {
 /// resolved is simply left for the trailing prune phase.
 fn find_superseded_design_dirs(
     dir: &Path,
-    files: &BTreeMap<PathBuf, Vec<u8>>,
+    files: &ProjectedFiles,
 ) -> BTreeMap<PathBuf, Vec<PathBuf>> {
     let mut projected_pages: BTreeMap<NodeId, PathBuf> = BTreeMap::new();
     let mut projected_components: BTreeMap<ComponentId, PathBuf> = BTreeMap::new();
@@ -998,9 +1205,7 @@ mod tests {
             json!({"type":"group","id":"AAAAAAAAAAAAAAAAAAAAAAAAAA","parent":null,"index":1.0,"name":"A"}),
             json!({"type":"group","id":"BBBBBBBBBBBBBBBBBBBBBBBBBB","parent":null,"index":2.0,"name":"B"}),
         ];
-        let mut files = BTreeMap::new();
-        project_fnx_design(
-            &mut files,
+        let files: BTreeMap<PathBuf, Arc<Vec<u8>>> = project_fnx_design(
             Path::new("d"),
             "page.fnx",
             "page.ids.json",
@@ -1008,7 +1213,9 @@ mod tests {
             "Multi",
             &fanta_fnx::RefTable::default(),
         )
-        .unwrap();
+        .unwrap()
+        .into_iter()
+        .collect();
         assert!(
             !files.contains_key(Path::new("d/page.fnx")),
             "multi-root bucket must not produce a .fnx"
@@ -1020,5 +1227,193 @@ mod tests {
                 "fell back to nodes/: {key:?}"
             );
         }
+    }
+
+    // ---- incremental projection ---------------------------------------------
+
+    /// Two pages with one child each, a component master, a variable, and a
+    /// motion clip — enough that every `doc/` singleton takes its non-empty
+    /// branch and both design kinds are exercised.
+    fn cache_fixture() -> (Doc, NodeId, NodeId, NodeId) {
+        use fanta_doc::{
+            CanvasNode, ComponentDef, GroupNode, Mode, ModeId, NodeData, Operation, Transform2D,
+            VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
+        };
+        let mut doc = Doc::new();
+        let mut page_a = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page_a.name = "Home".to_owned();
+        let page_a = doc.scene.insert(page_a).unwrap();
+        doc.add_page(page_a);
+        let mut page_b = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page_b.name = "About".to_owned();
+        let page_b = doc.scene.insert(page_b).unwrap();
+        doc.add_page(page_b);
+        let mut child_a = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        child_a.name = "Card".to_owned();
+        child_a.parent = Some(page_a);
+        doc.scene.insert(child_a).unwrap();
+        let mut child_b = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        child_b.name = "Hero".to_owned();
+        child_b.parent = Some(page_b);
+        child_b.transform = Transform2D::translation(10.0, 10.0);
+        let child_b = doc.scene.insert(child_b).unwrap();
+
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.name = "Button".to_owned();
+        let master = doc.scene.insert(master).unwrap();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(ComponentDef {
+                id: ComponentId::new(),
+                root: master,
+                name: "Button".into(),
+                variant_of: None,
+                props: Vec::new(),
+                rev: 0,
+            }),
+        })
+        .unwrap();
+
+        let collection_id = VariableCollectionId::new();
+        let mode_id = ModeId::new();
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".into(),
+                modes: vec![Mode {
+                    id: mode_id,
+                    name: "Light".into(),
+                }],
+                default_mode: mode_id,
+                variable_order: Vec::new(),
+            },
+        );
+        let variable_id = VariableId::new();
+        doc.variables.variables.insert(
+            variable_id,
+            Variable {
+                id: variable_id,
+                collection: collection_id,
+                name: "Spacing".into(),
+                ty: VariableType::Float,
+                values_by_mode: BTreeMap::from([(mode_id, VarValue::Float { value: 8.0 })]),
+                scopes: Vec::new(),
+            },
+        );
+        doc.history = fanta_doc::History::new();
+        (doc, page_a, page_b, child_b)
+    }
+
+    fn legacy_singleton(value: &Value, key: &str, fallback: Value) -> Vec<u8> {
+        json_bytes(value.get(key).unwrap_or(&fallback)).unwrap()
+    }
+
+    #[test]
+    fn singletons_match_the_whole_document_serialization() {
+        // The typed per-field emission must reproduce what slicing the
+        // whole-document `Value` produced, including the `{}` substituted
+        // for a skipped empty registry.
+        for doc in [Doc::new(), cache_fixture().0] {
+            let value = serde_json::to_value(&doc).unwrap();
+            let files = project_files(&doc).unwrap();
+            let expect = |name: &str, key: &str, fallback: Value| {
+                let bytes = files.get(&PathBuf::from(DOC_DIR).join(name)).unwrap();
+                assert_eq!(
+                    bytes.as_slice(),
+                    legacy_singleton(&value, key, fallback).as_slice(),
+                    "{name}"
+                );
+            };
+            expect(METADATA_JSON, "metadata", json!({}));
+            expect(VARIABLES_JSON, "variables", json!({}));
+            expect(ACTIVE_MODES_JSON, "active_modes", json!({}));
+            expect(MOTION_JSON, "motion", json!({}));
+            expect(FLOW_START_JSON, "flow_start", Value::Null);
+        }
+    }
+
+    #[test]
+    fn cached_projection_is_byte_identical_and_shares_untouched_designs() {
+        let (mut doc, _page_a, _page_b, child_b) = cache_fixture();
+        let mut cache = ProjectWriteCache::default();
+        let first = project_files_cached(&doc, &mut cache).unwrap();
+        let cold = project_files(&doc).unwrap();
+        assert_eq!(first, cold);
+        assert_eq!(cache.cached_designs(), 3, "two pages + one component");
+
+        // Unchanged document: every design is served from the cache (same
+        // allocation), and the output is unchanged.
+        let second = project_files_cached(&doc, &mut cache).unwrap();
+        assert_eq!(second, first);
+        for design_file in [
+            "pages/home/page.fnx",
+            "pages/about/page.fnx",
+            "components/button/master.fnx",
+        ] {
+            assert!(
+                Arc::ptr_eq(
+                    &first[Path::new(design_file)],
+                    &second[Path::new(design_file)]
+                ),
+                "{design_file} should be a cache hit"
+            );
+        }
+
+        // One transform on page B re-projects page B only.
+        doc.scene
+            .set_transform(child_b, fanta_doc::Transform2D::translation(99.0, 0.0))
+            .unwrap();
+        let third = project_files_cached(&doc, &mut cache).unwrap();
+        assert_eq!(third, project_files(&doc).unwrap());
+        assert!(Arc::ptr_eq(
+            &second[Path::new("pages/home/page.fnx")],
+            &third[Path::new("pages/home/page.fnx")]
+        ));
+        assert!(Arc::ptr_eq(
+            &second[Path::new("components/button/master.fnx")],
+            &third[Path::new("components/button/master.fnx")]
+        ));
+        assert!(!Arc::ptr_eq(
+            &second[Path::new("pages/about/page.fnx")],
+            &third[Path::new("pages/about/page.fnx")]
+        ));
+        assert_ne!(
+            second[Path::new("pages/about/page.fnx")],
+            third[Path::new("pages/about/page.fnx")]
+        );
+    }
+
+    #[test]
+    fn renaming_a_component_reprojects_every_design_that_names_it() {
+        // The ref table turns `component=<id>` into `component="Name"` in
+        // every design, so a rename must invalidate all of them even though
+        // their nodes did not change.
+        let (mut doc, _, _, _) = cache_fixture();
+        let mut cache = ProjectWriteCache::default();
+        let before = project_files_cached(&doc, &mut cache).unwrap();
+        let cid = *doc.components.defs.keys().next().unwrap();
+        doc.components.defs.get_mut(&cid).unwrap().name = "PrimaryButton".into();
+        let after = project_files_cached(&doc, &mut cache).unwrap();
+        assert_eq!(after, project_files(&doc).unwrap());
+        assert!(!Arc::ptr_eq(
+            &before[Path::new("pages/home/page.fnx")],
+            &after[Path::new("pages/home/page.fnx")]
+        ));
+        assert!(after.contains_key(Path::new("components/primarybutton/master.fnx")));
+        assert!(!after.contains_key(Path::new("components/button/master.fnx")));
+        assert_eq!(cache.cached_designs(), 3, "the stale slug entry is dropped");
+    }
+
+    #[test]
+    fn cache_resets_when_a_different_document_is_written_through_it() {
+        let (doc_a, _, _, _) = cache_fixture();
+        let (doc_b, _, _, _) = cache_fixture();
+        assert_ne!(doc_a.id, doc_b.id);
+        let mut cache = ProjectWriteCache::default();
+        project_files_cached(&doc_a, &mut cache).unwrap();
+        let from_shared_cache = project_files_cached(&doc_b, &mut cache).unwrap();
+        assert_eq!(from_shared_cache, project_files(&doc_b).unwrap());
+        assert_eq!(cache.doc_id, Some(doc_b.id));
+        assert_eq!(cache.cached_designs(), 3);
     }
 }

@@ -106,6 +106,11 @@ pub struct LayersPanelItem {
     pub kind: LayersPanelNodeKind,
     /// Child order is render order in the tree.
     pub children: Vec<Self>,
+    /// Whether the host's node has children even when `children` is empty.
+    /// A host that prunes collapsed subtrees sets this so the row keeps its
+    /// disclosure arrow; expanding it emits `ExpansionChanged`, which is the
+    /// host's cue to supply the children.
+    pub has_children: bool,
     pub visible: bool,
     pub locked: bool,
 }
@@ -122,14 +127,26 @@ impl LayersPanelItem {
             title: title.into(),
             kind,
             children: Vec::new(),
+            has_children: false,
             visible: true,
             locked: false,
         }
     }
 
-    /// Supplies child nodes.
+    /// Supplies child nodes. A non-empty list also marks the node as having
+    /// children; an empty one leaves any earlier `has_children` hint alone.
     pub fn children(mut self, children: Vec<Self>) -> Self {
+        if !children.is_empty() {
+            self.has_children = true;
+        }
         self.children = children;
+        self
+    }
+
+    /// Marks the node as having children the host did not include (see the
+    /// `has_children` field).
+    pub const fn has_children(mut self, has_children: bool) -> Self {
+        self.has_children = has_children;
         self
     }
 

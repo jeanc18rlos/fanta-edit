@@ -6,18 +6,42 @@ use super::{
     OverrideValue, guid_key,
 };
 
-/// Borrow (building + caching on first use) the `guid → def-local-path` map for
-/// the master rooted at `master_root`. Cached per master so the cross-master
-/// walk and repeated instances of the same master don't rebuild it.
-pub(crate) fn master_guid_paths<'c>(
-    doc: &Doc,
-    master_root: NodeId,
-    guid_to_node: &HashMap<String, Option<NodeId>>,
-    cache: &'c mut HashMap<NodeId, HashMap<String, OverridePath>>,
-) -> &'c HashMap<String, OverridePath> {
-    cache
-        .entry(master_root)
-        .or_insert_with(|| build_master_guid_paths(doc, master_root, guid_to_node))
+/// Path-resolution state shared by every instance of one import: the guid of
+/// each mapped node (the inverse of `guid_to_node`, built once) and each
+/// master's `guid → def-local-path` map, built the first time an override
+/// addresses that master. The shared inverse is the point: building it per
+/// master meant scanning the whole `guid_to_node` map once per distinct
+/// master, which is quadratic over a component-heavy file.
+pub(crate) struct MasterPathCache<'a> {
+    node_to_guid: HashMap<NodeId, &'a str>,
+    per_master: HashMap<NodeId, HashMap<String, OverridePath>>,
+}
+
+impl<'a> MasterPathCache<'a> {
+    pub(crate) fn new(guid_to_node: &'a HashMap<String, Option<NodeId>>) -> Self {
+        let node_to_guid = guid_to_node
+            .iter()
+            .filter_map(|(guid, id)| id.map(|id| (id, guid.as_str())))
+            .collect();
+        Self {
+            node_to_guid,
+            per_master: HashMap::new(),
+        }
+    }
+
+    /// Borrow (building + caching on first use) the `guid → def-local-path` map
+    /// for the master rooted at `master_root`. Cached per master so the
+    /// cross-master walk and repeated instances of the same master don't
+    /// rebuild it.
+    pub(crate) fn master_guid_paths(
+        &mut self,
+        doc: &Doc,
+        master_root: NodeId,
+    ) -> &HashMap<String, OverridePath> {
+        self.per_master
+            .entry(master_root)
+            .or_insert_with(|| build_master_guid_paths(doc, master_root, &self.node_to_guid))
+    }
 }
 
 /// Resolve a full Figma `guidPath` (a `KiwiValue` array of guids) into one flat
@@ -41,7 +65,7 @@ pub(crate) fn resolve_full_guid_path(
     guid_to_node: &HashMap<String, Option<NodeId>>,
     guids: &[KiwiValue],
     swap_redirects: &HashMap<String, NodeId>,
-    cache: &mut HashMap<NodeId, HashMap<String, OverridePath>>,
+    cache: &mut MasterPathCache<'_>,
 ) -> Option<OverridePath> {
     if guids.is_empty() {
         return None;
@@ -74,10 +98,10 @@ pub(crate) fn resolve_full_guid_path(
         let (seg, last) = if guid_to_node.get(&guid).copied().flatten() == Some(current_root) {
             (OverridePath::new(), current_root)
         } else {
-            let seg = {
-                let paths = master_guid_paths(doc, current_root, guid_to_node, cache);
-                paths.get(&guid).cloned()?
-            };
+            let seg = cache
+                .master_guid_paths(doc, current_root)
+                .get(&guid)
+                .cloned()?;
             let last = *seg.last()?;
             (seg, last)
         };
@@ -165,31 +189,23 @@ pub(crate) fn master_root_for(doc: &Doc, component: ComponentId) -> Option<NodeI
 /// root's child down to the descendant (root excluded) — exactly the `def_path`
 /// [`fanta_doc::resolve::expand_instance`] records and matches overrides against.
 ///
-/// We invert `guid_to_node` (guid → NodeId) restricted to this master's subtree,
-/// then compute each descendant's def-local path from the scene.
+/// `node_to_guid` is the inverse of the import's `guid_to_node` map (every
+/// mapped node's guid); only this master's subtree is walked.
 pub(crate) fn build_master_guid_paths(
     doc: &Doc,
     master_root: NodeId,
-    guid_to_node: &HashMap<String, Option<NodeId>>,
+    node_to_guid: &HashMap<NodeId, &str>,
 ) -> HashMap<String, OverridePath> {
-    // NodeId → guid for the master subtree (reverse of the relevant slice).
-    let subtree: std::collections::HashSet<NodeId> =
-        doc.scene.descendants_of(master_root).collect();
-    let mut node_to_guid: HashMap<NodeId, String> = HashMap::new();
-    for (g, opt) in guid_to_node {
-        if let Some(id) = opt {
-            if subtree.contains(id) {
-                node_to_guid.insert(*id, g.clone());
-            }
-        }
-    }
     let mut out: HashMap<String, OverridePath> = HashMap::new();
-    for id in &subtree {
-        if *id == master_root {
+    for id in doc.scene.descendants_of(master_root) {
+        if id == master_root {
             continue; // the root addresses the instance itself, not a descendant
         }
-        if let Some(g) = node_to_guid.get(id) {
-            out.insert(g.clone(), def_local_path(&doc.scene, master_root, *id));
+        if let Some(guid) = node_to_guid.get(&id) {
+            out.insert(
+                (*guid).to_owned(),
+                def_local_path(&doc.scene, master_root, id),
+            );
         }
     }
     out

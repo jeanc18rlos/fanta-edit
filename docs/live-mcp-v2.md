@@ -121,15 +121,18 @@ first co-presence surface. Tracked separately.
 
 ## Status
 
-As of `16309b2` (0.1.0-alpha.1). Checked boxes were verified against the tree,
-and the write plane additionally against a running build:
-[`script/smoke-mcp`](../script/smoke-mcp) asserts 18 things about the loop and
-passed **18/18, exit 0** twice at `fe2612c`, the second time after a full quit
-and a cold reload of a 43 MB page. It then passed 18/18 twice more at `16309b2`
-against the release build installed at `/Applications/Fanta.app`, once reusing a
-running instance and once launching it cold. The Unix-socket fallback path passed
-18/18 at `6e14229`, in the rehearsal, and has not been re-run since. Unchecked
-boxes are **not started**, not "in progress".
+As of `16309b2` (0.1.0-alpha.1) plus the AI-alignment work on
+`perf/large-documents-ai-alignment`. Checked boxes marked *verified* were
+checked against a running build at the commits named; boxes marked *ships*
+describe code that compiles and has unit tests but has **not** been driven in
+the app since it landed. Unchecked boxes are **not started**, not "in progress".
+
+Verified earlier: [`script/smoke-mcp`](../script/smoke-mcp) asserts 18 things
+about the loop and passed **18/18, exit 0** twice at `fe2612c`, and twice more
+at `16309b2` against the release build installed at `/Applications/Fanta.app`.
+The Unix-socket fallback path passed 18/18 at `6e14229` and has not been re-run
+since. Nothing behind a mouse click has been driven — see
+[`docs/alpha/REHEARSAL.md`](alpha/REHEARSAL.md).
 
 The transport is a Unix socket, not the TCP + Streamable-HTTP server §1 proposes:
 `fig_viewer::live_mcp` listens on a socket in a per-launch temp dir and
@@ -138,47 +141,55 @@ advertises it in `<data_dir>/fanta_live_mcp.json`, and `fanta --mcp-stdio`
 that gates it is `fanta_live_mcp.enabled`, which defaults to **true** in every
 build, not just dev ones.
 
-What is *not* covered by that evidence: nothing behind a mouse click. The
-in-app agent panel, the welcome page's Connect buttons and every menu path were
-never driven — see [`docs/alpha/REHEARSAL.md`](alpha/REHEARSAL.md).
-
 Naming, because the sections above are a design and not a changelog: the tool
-names proposed in §2 (`design_read`, `design_batch`, `design_screenshot`,
-`fnx_edit`) **do not exist**. The five that ship are `get_editor_state`,
-`batch_get`, `batch_design`, `get_screenshot` and `read_fnx_source`. If you are
-writing a test or a doc, use those.
+names proposed in §2 (`design_read`, `design_batch`, `fnx_edit`) **do not
+exist**. The MCP tools that ship are `get_editor_state`, `batch_get`,
+`batch_design`, `get_screenshot`, `read_fnx_source` and `get_guidelines`; the
+native agent tools are `design_state`, `design_edit`, `design_screenshot` and
+`place_generation`. If you are writing a test or a doc, use those.
 
 - [x] Research pass (7 readers + Figma/Pencil MCP study)
 - [x] Worktree `feat/live-mcp-v2` (sibling checkout so `../fanta-engine-migration` resolves)
-- [x] **Transport + dispatch skeleton** — `crates/fig_viewer/src/live_mcp.rs`,
-      a Unix socket plus a discovery file at
-      `<data_dir>/fanta_live_mcp.json`. On by default
-      (`FantaLiveMcpSettings::enabled` defaults to `true`); `initialize` and
-      `ping` both answer. `fanta --mcp-stdio`
-      (`crates/zed/src/zed/mcp_stdio.rs`) bridges a stdio client onto it and is
-      documented in `--help`.
-- [x] **Read plane on fig_viewer** — `get_editor_state` (project root, pages,
-      active page, each page's source file), `batch_get` (defaults to
-      `depth: 2` when listing; results over 256 KiB are refused with
-      instructions rather than truncated), `get_screenshot`.
-- [x] **`batch_design` write plane** — verified end to end: an external process
-      creates a node, the debounced autosave writes it to `.fnx` about a second
-      later, and it lands as a git diff with nobody at the keyboard.
-- [x] **FNX file tools** — `read_fnx_source`, returning a slice (64 KiB
-      default, 1 MiB ceiling) with `total_lines` / `total_bytes` / `truncated`
-      and a notice naming the next slice's arguments.
-- [ ] Native agent tool registration + thread cards — **not started.** The
-      built-in agent panel has no design tools of its own; nothing in
-      `crates/agent` or `crates/agent_ui` registers them. In-app agent work goes
-      through the same MCP surface or not at all.
-- [ ] Skills (design + media) — **not started.** No `get_guidelines` or
-      `snapshot_layout` equivalent exists in `crates/fig_viewer`.
+- [x] **Transport + dispatch skeleton** (verified) — `crates/fig_viewer/src/live_mcp.rs`,
+      a Unix socket plus a discovery file at `<data_dir>/fanta_live_mcp.json`.
+      On by default; `initialize` and `ping` both answer. `fanta --mcp-stdio`
+      bridges a stdio client onto it and is documented in `--help`.
+- [x] **Read plane on fig_viewer** (verified at `16309b2`; the additions ship
+      unverified) — `get_editor_state` (project root, pages with source files,
+      active page bounds, components, selection bounds, `hints`, and an
+      optional `empty_space: [w, h]` query answered with a free `{x, y}`),
+      `batch_get` (defaults to `depth: 2` when listing; results over 256 KiB
+      are refused with instructions rather than truncated; each node carries
+      kind-specific facts — frame size and layout mode, text font, shape fill,
+      instance component), `get_screenshot`.
+- [x] **`batch_design` write plane** (verified at `16309b2` for
+      `create_node`/`set_props`/`reparent`/`delete`; the rest ships unverified) —
+      one transaction with rollback. Ops: `create_node`, `create_image`,
+      `create_instance`, `set_props`, `set_stroke`, `set_shadow`,
+      `set_text_style`, `set_auto_layout`, `set_index`, `rotate`, `align`,
+      `distribute`, `group`, `frame_selection`, `ungroup`, `duplicate`,
+      `create_component`, `reparent`, `delete`, `select`, `set_viewport`.
+      The vocabulary is `design_surface::DesignOp`, shared by the MCP server
+      and the native tools; each op is implemented as `fanta_doc::Operation`s
+      in `fig_viewer::agent_surface`, with `group`/`ungroup`/`frame_selection`
+      delegating to `fig_viewer::structure`.
+- [x] **FNX file tools** (verified) — `read_fnx_source`, returning a slice
+      (64 KiB default, 1 MiB ceiling) with `total_lines` / `total_bytes` /
+      `truncated` and a notice naming the next slice's arguments.
+- [x] **Native agent tool registration** (ships) — `design_state`,
+      `design_edit`, `design_screenshot`, `place_generation` in `crates/agent`
+      resolve the `design_surface` global per call. The system prompt
+      (`crates/agent/src/templates/system_prompt.hbs`) carries the Fanta
+      identity and a `## Design canvas` section rendered only when
+      `design_edit` is available. Thread cards with post-edit screenshots are
+      **not started**.
+- [x] **Guidelines** (ships) — `design_surface::DESIGN_GUIDELINES`, served by
+      the MCP `get_guidelines` tool and condensed into the system prompt.
+      `snapshot_layout` and a packaged skill are **not started**.
 - [ ] Collab APIs — **not started**, and the collab / livekit / libwebrtc stack
       was dropped from the workspace in `6e14229`.
 
-Five tools ship: `get_editor_state`, `batch_get`, `batch_design`,
-`get_screenshot`, `read_fnx_source`. The 14 metered media-generation tools
-described above are **not** wired into this build: `api.fantaisa.net` appears
-only as the `server_url` default in `assets/settings/default.json` (accounts and
-the managed model provider), and nothing in `crates/` calls a `/mcp` endpoint on
-it.
+The 14 metered media-generation tools described above are **not** wired into
+this build: `api.fantaisa.net` appears only as the `server_url` default in
+`assets/settings/default.json` (accounts and the managed model provider), and
+nothing in `crates/` calls a `/mcp` endpoint on it.

@@ -101,10 +101,10 @@ pub struct FigDocument {
 ///
 /// Each `Blob` is the Kiwi struct `{ bytes: byte[] }` (confirmed against the
 /// real Figma schema: def `Blob`, single array field `bytes` of `byte`), so it
-/// decodes to an object whose `bytes` field is a [`KiwiValue::Array`] of
-/// [`KiwiValue::Byte`]. We flatten each to a `Vec<u8>` so the mapping layer can
-/// index `blobs[commandsBlob]` directly. A blob in an unexpected shape becomes
-/// an empty vec rather than aborting the import (tolerant by design).
+/// decodes to an object whose `bytes` field is a [`KiwiValue::Bytes`]. We copy
+/// each out to a `Vec<u8>` so the mapping layer can index `blobs[commandsBlob]`
+/// directly. A blob in an unexpected shape becomes an empty vec rather than
+/// aborting the import (tolerant by design).
 fn extract_blobs(root: &KiwiValue) -> Vec<Vec<u8>> {
     let Some(arr) = root.get("blobs").and_then(KiwiValue::as_array) else {
         return Vec::new();
@@ -113,29 +113,31 @@ fn extract_blobs(root: &KiwiValue) -> Vec<Vec<u8>> {
 }
 
 /// Flatten one `Blob` value (`{ bytes: byte[] }`, or a bare byte array) to a
-/// `Vec<u8>`.
+/// `Vec<u8>`. The decoder produces the compact [`KiwiValue::Bytes`] form; an
+/// element-wise array (a hand-built value) is flattened item by item.
 fn blob_to_bytes(blob: &KiwiValue) -> Vec<u8> {
     let bytes = match blob {
-        KiwiValue::Array(a) => a,
-        KiwiValue::Object { fields, .. } => {
-            match fields.get("bytes").and_then(KiwiValue::as_array) {
-                Some(a) => a,
-                None => return Vec::new(),
-            }
-        }
-        _ => return Vec::new(),
+        KiwiValue::Object { fields, .. } => match fields.get("bytes") {
+            Some(bytes) => bytes,
+            None => return Vec::new(),
+        },
+        other => other,
     };
-    bytes
-        .iter()
-        .map(|b| match *b {
-            KiwiValue::Byte(x) => x,
-            // Defensive: a `byte` field always decodes to `Byte`, but accept
-            // small uints/ints too so a quirk in a future schema can't panic.
-            KiwiValue::Uint(x) => x as u8,
-            KiwiValue::Int(x) => x as u8,
-            _ => 0,
-        })
-        .collect()
+    match bytes {
+        KiwiValue::Bytes(raw) => raw.clone(),
+        KiwiValue::Array(items) => items
+            .iter()
+            .map(|b| match *b {
+                KiwiValue::Byte(x) => x,
+                // Defensive: a `byte` field always decodes to `Byte`, but accept
+                // small uints/ints too so a quirk in a future schema can't panic.
+                KiwiValue::Uint(x) => x as u8,
+                KiwiValue::Int(x) => x as u8,
+                _ => 0,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The Kiwi message type Figma uses as the document root.

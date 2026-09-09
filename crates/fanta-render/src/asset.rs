@@ -28,10 +28,13 @@
 //! (PNG/JPG decode is owned by the app / `fanta-format`). That keeps this
 //! crate's compile graph small and lets the node-graph path — whose bytes are
 //! already decoded `ImageHandle` RGBA8 — skip a redundant decode entirely.
+//! [`LazyAssetResolver`] keeps that rule too: it owns the *encoded* bytes and
+//! the decoded-pixel budget, but the decode itself is a function the app
+//! injects.
 
 use fanta_doc::AssetId;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Decoded, ready-to-upload image pixels.
 ///
@@ -139,9 +142,203 @@ impl AssetResolver for InMemoryAssetResolver {
     }
 }
 
+/// Default cap on decoded RGBA held by a [`LazyAssetResolver`]: 1.5 GiB.
+/// Above it the least-recently-resolved images are dropped and re-decoded on
+/// their next use.
+pub const DEFAULT_DECODED_BUDGET_BYTES: usize = 1536 * 1024 * 1024;
+
+/// Turns one asset's encoded bytes into straight-alpha RGBA8, or `None` when
+/// the bytes are not a decodable image (the resolver remembers the failure so
+/// a corrupt asset is not re-attempted on every frame). The app supplies this
+/// — see the module docs on why no decoder lives in this crate.
+pub type ImageDecoder = dyn Fn(AssetId, &[u8]) -> Option<DecodedImage> + Send + Sync;
+
+/// An [`AssetResolver`] over a document's encoded assets that decodes each
+/// image the first time something asks for it and keeps the decoded pixels
+/// under a byte budget.
+///
+/// Eagerly decoding every embedded asset at load was the bulk of a large
+/// document's resident memory (a 10 MB `.fig` settled at several GiB of
+/// RGBA), most of it for images on pages the user never opened. Here only
+/// the assets actually drawn — plus whatever the loader [`prewarm`]s — cost
+/// pixels; the encoded bytes stay shared with the save path.
+///
+/// Shared between the render thread and the UI thread (screenshots, export),
+/// so it is `Send + Sync`, and the lock is never held across a decode: a
+/// miss decodes outside the lock and inserts afterwards (a concurrent decode
+/// of the same asset keeps whichever landed first).
+///
+/// [`prewarm`]: Self::prewarm
+pub struct LazyAssetResolver {
+    encoded: Arc<BTreeMap<AssetId, Vec<u8>>>,
+    decoder: Arc<ImageDecoder>,
+    budget_bytes: usize,
+    cache: Mutex<DecodedCache>,
+}
+
+#[derive(Default)]
+struct DecodedCache {
+    entries: HashMap<AssetId, CacheEntry>,
+    /// Recency order: tick → asset. The smallest tick is the least recently
+    /// used entry; every hit re-keys its asset under a fresh tick.
+    recency: BTreeMap<u64, AssetId>,
+    next_tick: u64,
+    /// Bytes held by successfully decoded entries (failures weigh nothing).
+    decoded_bytes: usize,
+    /// Encoded bytes already handed out through [`AssetResolver::resolve_bytes`],
+    /// so a caller asking every frame (the audio waveform painter) gets a
+    /// refcount bump, not a copy of the whole file. Not budgeted: each entry is
+    /// the one copy of an asset the document already holds.
+    shared_bytes: HashMap<AssetId, Arc<Vec<u8>>>,
+}
+
+struct CacheEntry {
+    /// `None` records a decode failure so the asset is not retried per frame.
+    image: Option<DecodedImage>,
+    tick: u64,
+}
+
+impl DecodedCache {
+    fn touch(&mut self, id: AssetId) -> Option<Option<DecodedImage>> {
+        let entry = self.entries.get_mut(&id)?;
+        self.recency.remove(&entry.tick);
+        entry.tick = self.next_tick;
+        self.next_tick += 1;
+        self.recency.insert(entry.tick, id);
+        Some(entry.image.clone())
+    }
+
+    fn insert(&mut self, id: AssetId, image: Option<DecodedImage>, budget_bytes: usize) {
+        if self.entries.contains_key(&id) {
+            return;
+        }
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        self.decoded_bytes += image.as_ref().map_or(0, |image| image.pixels_rgba.len());
+        self.entries.insert(id, CacheEntry { image, tick });
+        self.recency.insert(tick, id);
+        // The entry just inserted is the most recent and is never evicted
+        // here, even if it alone exceeds the budget: an image the renderer
+        // needs right now that can never be cached would otherwise be
+        // re-decoded on every single frame.
+        while self.decoded_bytes > budget_bytes {
+            let Some((&oldest_tick, &oldest)) = self.recency.iter().next() else {
+                break;
+            };
+            if oldest == id {
+                break;
+            }
+            self.recency.remove(&oldest_tick);
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.decoded_bytes -= evicted
+                    .image
+                    .as_ref()
+                    .map_or(0, |image| image.pixels_rgba.len());
+            }
+        }
+    }
+}
+
+impl LazyAssetResolver {
+    /// Resolver over `encoded` with the [`DEFAULT_DECODED_BUDGET_BYTES`] cap.
+    pub fn new(encoded: Arc<BTreeMap<AssetId, Vec<u8>>>, decoder: Arc<ImageDecoder>) -> Self {
+        Self::with_budget(encoded, decoder, DEFAULT_DECODED_BUDGET_BYTES)
+    }
+
+    /// Resolver over `encoded` keeping at most `budget_bytes` of decoded RGBA
+    /// (the most recently used image is always kept, budget or not).
+    pub fn with_budget(
+        encoded: Arc<BTreeMap<AssetId, Vec<u8>>>,
+        decoder: Arc<ImageDecoder>,
+        budget_bytes: usize,
+    ) -> Self {
+        Self {
+            encoded,
+            decoder,
+            budget_bytes,
+            cache: Mutex::new(DecodedCache::default()),
+        }
+    }
+
+    /// Decode `ids` now (skipping ones already decoded or unknown), so the
+    /// first frame that draws them does not pay the decode. Meant for a
+    /// background load task, e.g. with the assets of the page that opens.
+    pub fn prewarm(&self, ids: impl IntoIterator<Item = AssetId>) {
+        for id in ids {
+            let cached = self.lock().entries.contains_key(&id);
+            if cached {
+                continue;
+            }
+            self.decode_and_insert(id);
+        }
+    }
+
+    /// Bytes of decoded RGBA currently held.
+    pub fn decoded_bytes(&self) -> usize {
+        self.lock().decoded_bytes
+    }
+
+    /// The decoded-pixel cap this resolver evicts down to.
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
+    /// Number of encoded assets this resolver knows about.
+    pub fn len(&self) -> usize {
+        self.encoded.len()
+    }
+
+    /// Whether there are no encoded assets at all.
+    pub fn is_empty(&self) -> bool {
+        self.encoded.is_empty()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DecodedCache> {
+        // The cache holds no invariant a panicking holder could break
+        // half-way (each mutation is a single insert/evict step), so a
+        // poisoned lock is still safe to keep using.
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn decode_and_insert(&self, id: AssetId) -> Option<DecodedImage> {
+        let bytes = self.encoded.get(&id)?;
+        let image = (self.decoder)(id, bytes);
+        let mut cache = self.lock();
+        cache.insert(id, image, self.budget_bytes);
+        // Another thread may have raced us to the same asset; serve the
+        // entry that won so both callers hold the same allocation.
+        cache.touch(id).flatten()
+    }
+}
+
+impl AssetResolver for LazyAssetResolver {
+    fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
+        if let Some(cached) = self.lock().touch(id) {
+            return cached;
+        }
+        self.decode_and_insert(id)
+    }
+
+    fn resolve_bytes(&self, id: AssetId) -> Option<Arc<Vec<u8>>> {
+        if let Some(shared) = self.lock().shared_bytes.get(&id) {
+            return Some(Arc::clone(shared));
+        }
+        let bytes = Arc::new(self.encoded.get(&id)?.clone());
+        // The copy happened outside the lock; a racing caller's copy is
+        // equally valid, so whichever landed first is the one kept.
+        let mut cache = self.lock();
+        let shared = cache
+            .shared_bytes
+            .entry(id)
+            .or_insert_with(|| Arc::clone(&bytes));
+        Some(Arc::clone(shared))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn solid(w: u32, h: u32, rgba: [u8; 4]) -> DecodedImage {
         let mut px = Vec::with_capacity((w * h * 4) as usize);
@@ -198,5 +395,133 @@ mod tests {
         let r = InMemoryAssetResolver::new();
         assert!(r.is_empty());
         assert_eq!(r.len(), 0);
+    }
+
+    // ---- LazyAssetResolver -----------------------------------------------
+
+    /// A fake codec: the first byte is the square image's side length, a
+    /// zero-length payload is "corrupt". Counts decodes so tests can tell a
+    /// cache hit from a re-decode.
+    fn counting_decoder(decodes: Arc<AtomicUsize>) -> Arc<ImageDecoder> {
+        Arc::new(move |_id, bytes: &[u8]| {
+            decodes.fetch_add(1, Ordering::SeqCst);
+            let side = u32::from(*bytes.first()?);
+            Some(solid(side, side, [1, 2, 3, 4]))
+        })
+    }
+
+    fn lazy(assets: &[(AssetId, Vec<u8>)], budget: usize) -> (LazyAssetResolver, Arc<AtomicUsize>) {
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let encoded: BTreeMap<AssetId, Vec<u8>> = assets.iter().cloned().collect();
+        let resolver = LazyAssetResolver::with_budget(
+            Arc::new(encoded),
+            counting_decoder(decodes.clone()),
+            budget,
+        );
+        (resolver, decodes)
+    }
+
+    #[test]
+    fn lazy_resolver_decodes_on_first_use_and_then_serves_the_cache() {
+        let id = AssetId::new();
+        let (resolver, decodes) = lazy(&[(id, vec![2])], usize::MAX);
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            0,
+            "nothing decoded at construction"
+        );
+        assert_eq!(resolver.decoded_bytes(), 0);
+
+        let first = resolver.resolve(id).unwrap();
+        let second = resolver.resolve(id).unwrap();
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first.pixels_rgba, &second.pixels_rgba));
+        assert_eq!(resolver.decoded_bytes(), 2 * 2 * 4);
+        assert!(resolver.resolve(AssetId::new()).is_none());
+    }
+
+    #[test]
+    fn lazy_resolver_evicts_least_recently_used_over_budget() {
+        let a = AssetId::from_u128(1);
+        let b = AssetId::from_u128(2);
+        let c = AssetId::from_u128(3);
+        // Each 2x2 image is 16 bytes; the budget fits exactly two.
+        let (resolver, decodes) = lazy(&[(a, vec![2]), (b, vec![2]), (c, vec![2])], 32);
+        resolver.resolve(a);
+        resolver.resolve(b);
+        // Touch `a` so `b` becomes the least recently used.
+        resolver.resolve(a);
+        resolver.resolve(c);
+        assert_eq!(resolver.decoded_bytes(), 32);
+        assert_eq!(decodes.load(Ordering::SeqCst), 3);
+
+        resolver.resolve(a);
+        assert_eq!(decodes.load(Ordering::SeqCst), 3, "a survived eviction");
+        resolver.resolve(b);
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            4,
+            "b was evicted and re-decoded"
+        );
+        assert_eq!(resolver.decoded_bytes(), 32);
+    }
+
+    #[test]
+    fn lazy_resolver_keeps_an_image_larger_than_the_whole_budget() {
+        let big = AssetId::new();
+        let (resolver, decodes) = lazy(&[(big, vec![8])], 16);
+        assert!(resolver.resolve(big).is_some());
+        assert!(resolver.resolve(big).is_some());
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            1,
+            "not re-decoded every frame"
+        );
+        assert_eq!(resolver.decoded_bytes(), 8 * 8 * 4);
+    }
+
+    #[test]
+    fn lazy_resolver_remembers_a_failed_decode() {
+        let corrupt = AssetId::new();
+        let (resolver, decodes) = lazy(&[(corrupt, Vec::new())], usize::MAX);
+        assert!(resolver.resolve(corrupt).is_none());
+        assert!(resolver.resolve(corrupt).is_none());
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.decoded_bytes(), 0);
+    }
+
+    #[test]
+    fn lazy_resolver_prewarms_only_what_is_not_yet_decoded() {
+        let a = AssetId::from_u128(1);
+        let b = AssetId::from_u128(2);
+        let (resolver, decodes) = lazy(&[(a, vec![1]), (b, vec![1])], usize::MAX);
+        resolver.resolve(a);
+        resolver.prewarm([a, b, AssetId::from_u128(99)]);
+        assert_eq!(decodes.load(Ordering::SeqCst), 2);
+        resolver.resolve(b);
+        assert_eq!(decodes.load(Ordering::SeqCst), 2, "prewarmed b is a hit");
+    }
+
+    #[test]
+    fn lazy_resolver_hands_out_encoded_bytes() {
+        let id = AssetId::new();
+        let (resolver, decodes) = lazy(&[(id, vec![3, 9, 9])], usize::MAX);
+        assert_eq!(resolver.resolve_bytes(id).unwrap().as_slice(), &[3, 9, 9]);
+        assert_eq!(decodes.load(Ordering::SeqCst), 0, "bytes never decode");
+        assert_eq!(resolver.len(), 1);
+        assert!(!resolver.is_empty());
+    }
+
+    #[test]
+    fn lazy_resolver_shares_one_allocation_of_the_encoded_bytes() {
+        let id = AssetId::new();
+        let (resolver, _decodes) = lazy(&[(id, vec![3, 9, 9])], usize::MAX);
+        let first = resolver.resolve_bytes(id).unwrap();
+        let second = resolver.resolve_bytes(id).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a repeat request must not copy the asset again"
+        );
+        assert!(resolver.resolve_bytes(AssetId::from_u128(99)).is_none());
     }
 }

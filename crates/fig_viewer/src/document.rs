@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
-use fanta_render::{AssetResolver, DecodedImage, InMemoryAssetResolver, solve_scene_layout};
+use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver, solve_scene_layout};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
     SharedString, Subscription, Task, WeakEntity,
@@ -73,6 +73,12 @@ pub struct FigItem {
     sync_epoch: u64,
     reload_task: Option<Task<()>>,
     _load_task: Option<Task<()>>,
+    /// Per-design projection memo from the last project write, so an
+    /// autosave re-prints only the designs that changed. Taken by the
+    /// in-flight save and handed back when it completes; a save that finds
+    /// it absent starts from an empty one. Dropped whenever the document or
+    /// its project root is replaced.
+    write_cache: Option<fanta_format::ProjectWriteCache>,
     /// Worktree-event subscriptions, one per [`Project`] that opened this
     /// item. The item is shared across windows and each window brings its OWN
     /// `Project` entity, so watching only the first opener's project would
@@ -256,6 +262,12 @@ pub struct FigDocument {
     pub default_page_index: usize,
     pub(crate) solved_pages: HashSet<NodeId>,
     pub asset_resolver: Option<Arc<dyn AssetResolver>>,
+    /// The load-time resolver behind [`asset_resolver`](Self::asset_resolver):
+    /// decodes an embedded image the first time it is drawn and keeps the
+    /// decoded pixels under a byte budget, so opening a document costs the
+    /// encoded bytes, not the RGBA of every image on every page. Kept
+    /// concretely so the loader can prewarm the opening page's images.
+    embedded_assets: Option<Arc<LazyAssetResolver>>,
     /// Original encoded asset bytes, kept for writing the project tree.
     pub raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>,
     /// GPUI-renderable thumbnails for every embedded asset GPUI can decode,
@@ -279,6 +291,36 @@ pub struct FigDocument {
     /// mutation, including variables and motion edits that do not change the
     /// scene graph's own revision.
     render_generation: u64,
+    /// Moves when the variable registry or the active modes may have changed:
+    /// every committed edit, undo, redo, and a variables-panel preview. Drawn
+    /// from a process-wide counter so no two documents ever share a value —
+    /// the canvas memoizes the (expensive) registry hash on it across a
+    /// document swap. Unlike `render_generation` it does NOT move for a drag
+    /// or text-edit preview frame.
+    variables_generation: u64,
+    /// Page roots whose images have been (or are being) decoded ahead of
+    /// their first frame; each page is prewarmed once per document.
+    prewarmed_pages: HashSet<NodeId>,
+}
+
+/// The decode work for one page's images, handed out by
+/// [`FigDocument::take_page_prewarm`] to run off the UI thread.
+pub(crate) struct PagePrewarm {
+    resolver: Arc<LazyAssetResolver>,
+    assets: Vec<AssetId>,
+}
+
+impl PagePrewarm {
+    /// Decode the page's images into the shared resolver. Safe to run on any
+    /// thread; a frame that draws one of them first simply wins the decode.
+    pub(crate) fn run(self) {
+        self.resolver.prewarm(self.assets);
+    }
+}
+
+fn next_variables_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct FigPage {
@@ -312,10 +354,17 @@ impl FigDocument {
             solve_scene_layout(&mut doc.scene, page_root);
             solved_pages.insert(page_root);
         }
-        let resolver = decode_assets(&raw_assets);
-        let asset_resolver =
-            (!resolver.is_empty()).then(|| Arc::new(resolver) as Arc<dyn AssetResolver>);
         let gpui_images = decode_gpui_images(&raw_assets);
+        let raw_assets = Arc::new(raw_assets);
+        let embedded_assets = (!raw_assets.is_empty()).then(|| {
+            Arc::new(LazyAssetResolver::new(
+                raw_assets.clone(),
+                Arc::new(decode_embedded_image),
+            ))
+        });
+        let asset_resolver = embedded_assets
+            .clone()
+            .map(|resolver| resolver as Arc<dyn AssetResolver>);
         let pages = collect_pages(&doc, &visible_page_roots);
         let default_page_index = default_page_root
             .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
@@ -338,16 +387,65 @@ impl FigDocument {
             default_page_index,
             solved_pages,
             asset_resolver,
-            raw_assets: Arc::new(raw_assets),
+            embedded_assets,
+            raw_assets,
             gpui_images,
             agent_asset_overlay: None,
             uses_auto_layout,
             render_generation: 0,
+            variables_generation: next_variables_generation(),
+            prewarmed_pages: HashSet::new(),
         }
+    }
+
+    pub(crate) fn variables_generation(&self) -> u64 {
+        self.variables_generation
+    }
+
+    /// Record that the variable registry or active modes may have changed, so
+    /// the canvas re-hashes them. Called on every committed edit (cheap next
+    /// to the edit) and by variable previews, which are the only transient
+    /// writes that touch the registry.
+    pub(crate) fn mark_variables_changed(&mut self) {
+        self.variables_generation = next_variables_generation();
     }
 
     pub(crate) fn render_generation(&self) -> u64 {
         self.render_generation
+    }
+
+    /// Decode the images the opening page draws, so its first frame does not
+    /// stall on decodes. Runs on the background load thread; every other
+    /// page's images are prewarmed when the page is first activated (see
+    /// [`Self::take_page_prewarm`]).
+    pub(crate) fn prewarm_default_page_assets(&mut self) {
+        let Some(page_root) = self
+            .pages
+            .get(self.default_page_index)
+            .and_then(|page| page.root)
+        else {
+            return;
+        };
+        if let Some(prewarm) = self.take_page_prewarm(page_root) {
+            prewarm.run();
+        }
+    }
+
+    /// The decode work for `page_root`'s images the first time that page is
+    /// activated, or `None` when the page was already prewarmed (or there are
+    /// no embedded assets). Without this, a page switch decodes every image
+    /// the page draws serially inside its first frame on the render thread.
+    /// The caller runs the result on a background thread.
+    pub(crate) fn take_page_prewarm(&mut self, page_root: NodeId) -> Option<PagePrewarm> {
+        let resolver = self.embedded_assets.clone()?;
+        if !self.prewarmed_pages.insert(page_root) {
+            return None;
+        }
+        let assets = page_image_assets(&self.doc, page_root);
+        if assets.is_empty() {
+            return None;
+        }
+        Some(PagePrewarm { resolver, assets })
     }
 
     /// Continue the generation sequence of a document this one replaces.
@@ -591,13 +689,12 @@ impl AssetStores<'_> {
         anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
         let id = AssetId::new();
 
-        // `raw_assets` is shared behind an `Arc` (the Assets panel keys its
-        // cache on pointer identity), so ingesting clones the byte map. Fine
-        // for occasional agent placements; batch imports should get a
-        // shared-bytes representation first.
-        let mut raw = (**self.raw_assets).clone();
-        raw.insert(id, bytes.clone());
-        *self.raw_assets = Arc::new(raw);
+        // `raw_assets` is shared behind an `Arc` with the load-time asset
+        // resolver, so ingesting usually clones the byte map (the resolver
+        // keeps serving the map it was built over; the new image reaches it
+        // through the overlay below). Fine for occasional agent placements;
+        // batch imports should get a shared-bytes representation first.
+        Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
 
         if self.overlay.is_none() {
             *self.overlay = Some(Arc::new(OverlayAssetResolver {
@@ -623,9 +720,7 @@ impl AssetStores<'_> {
     /// rollback path when a batch fails after ingesting.
     pub(crate) fn remove(&mut self, id: AssetId) {
         if self.raw_assets.contains_key(&id) {
-            let mut raw = (**self.raw_assets).clone();
-            raw.remove(&id);
-            *self.raw_assets = Arc::new(raw);
+            Arc::make_mut(self.raw_assets).remove(&id);
         }
         if let Some(overlay) = self.overlay.as_ref() {
             overlay.added.write().unwrap().remove(&id);
@@ -820,6 +915,7 @@ impl project::ProjectItem for FigItem {
                                 register_shared_project_item(key, &cx.entity(), cx);
                             }
                             this.document = FigDocumentState::from_result(document);
+                            this.write_cache = None;
                             if let Some(scope) = this.pending_scope.take()
                                 && let FigDocumentState::Ready(document) = &mut this.document
                             {
@@ -907,6 +1003,7 @@ impl project::ProjectItem for FigItem {
                     sync_epoch: 0,
                     reload_task: None,
                     _load_task: Some(load_task),
+                    write_cache: None,
                     project_subscriptions: vec![(project.downgrade(), project_subscription)],
                 }
             });
@@ -1243,6 +1340,7 @@ impl FigItem {
         );
         self.document = FigDocumentState::Ready(document);
         self.merge_base = Some(disk.doc);
+        self.write_cache = None;
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
@@ -1337,6 +1435,7 @@ impl FigItem {
         );
         self.merge_base = Some(document.doc.clone());
         self.document = FigDocumentState::Ready(document);
+        self.write_cache = None;
         self.dirty = false;
         self.preview_dirty_before = None;
         self.sync_epoch += 1;
@@ -1477,6 +1576,7 @@ impl FigItem {
         let active_page = document.doc.active_page();
         document.resolve_after_edit(active_page);
         document.advance_render_generation();
+        document.mark_variables_changed();
         self.preview_dirty_before = None;
         self.mark_edited(false, cx);
         Ok(())
@@ -1509,6 +1609,7 @@ impl FigItem {
                 let active_page = document.doc.active_page();
                 document.resolve_after_edit(active_page);
                 document.advance_render_generation();
+                document.mark_variables_changed();
                 self.preview_dirty_before = None;
                 self.mark_edited(false, cx);
             }
@@ -1544,6 +1645,7 @@ impl FigItem {
             let active_page = document.doc.active_page();
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
+            document.mark_variables_changed();
             self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
@@ -1571,6 +1673,7 @@ impl FigItem {
             let active_page = document.doc.active_page();
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
+            document.mark_variables_changed();
             self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
@@ -1635,7 +1738,10 @@ impl FigItem {
             return Task::ready(Err(anyhow::anyhow!("the document is still loading")));
         };
 
-        let doc = document.doc.clone();
+        // The write needs the content, not the presence state: the undo
+        // stack's subtree snapshots can outweigh the scene, and cloning them
+        // once per autosave was the save path's memory high-water mark.
+        let doc = document.doc.clone_for_persist();
         let raw_assets = document.raw_assets.clone();
         let existing_root = self.project_root.clone();
         let materializing = existing_root.is_none();
@@ -1666,12 +1772,21 @@ impl FigItem {
         // lands (silently reverting — and on the next save destroying — the
         // content saved here).
         self.reload_task = None;
+        // A save already in flight holds the cache; this one starts cold
+        // rather than waiting, and whichever finishes last keeps its memo.
+        let write_cache = self.write_cache.take().unwrap_or_default();
         cx.spawn(async move |this, cx| {
-            let saved_doc = doc.clone();
-            let result = cx
+            // The persisted clone travels through the write and comes back
+            // to become the merge base — one clone per save, not two.
+            let (result, saved_doc, write_cache) = cx
                 .background_spawn({
                     let target = target.clone();
-                    async move { write_project(&target, &doc, &raw_assets) }
+                    async move {
+                        let mut write_cache = write_cache;
+                        let result =
+                            write_project_cached(&target, &doc, &raw_assets, &mut write_cache);
+                        (result, doc, write_cache)
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1692,6 +1807,12 @@ impl FigItem {
                         SaveKind::Auto => cx.emit(FigItemEvent::Saved),
                     }
                     cx.notify();
+                }
+                // The memo is only worth keeping for the tree it describes; a
+                // failed write leaves it valid too (entries are content
+                // fingerprints, not disk state).
+                if this.project_root.as_deref() == Some(target.as_path()) {
+                    this.write_cache = Some(write_cache);
                 }
             })?;
             result.map(|()| materializing.then_some(target))
@@ -1741,6 +1862,7 @@ pub(crate) fn ready_item_with_root_for_test(
         sync_epoch: 0,
         reload_task: None,
         _load_task: None,
+        write_cache: None,
         project_subscriptions: Vec::new(),
     });
     item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
@@ -1767,9 +1889,26 @@ pub(crate) fn write_project(
     doc: &Doc,
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
 ) -> Result<()> {
+    write_project_cached(
+        root,
+        doc,
+        raw_assets,
+        &mut fanta_format::ProjectWriteCache::default(),
+    )
+}
+
+/// [`write_project`] reusing the per-design projection memoized in `cache`
+/// by the previous write of this document, so a save after a small edit
+/// re-prints only the designs that changed.
+pub(crate) fn write_project_cached(
+    root: &Path,
+    doc: &Doc,
+    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
+    cache: &mut fanta_format::ProjectWriteCache,
+) -> Result<()> {
     fanta_format::scaffold_project_tree(root)
         .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
-    fanta_format::write_project_tree(root, doc, raw_assets)
+    fanta_format::write_project_tree_cached(root, doc, raw_assets, cache)
         .with_context(|| format!("writing Fanta project at {}", root.display()))?;
     git_init_if_needed(root);
     Ok(())
@@ -1964,13 +2103,17 @@ fn load_fig_document(path: &Path) -> Result<FigDocument> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let fig = read_fig(&bytes).context("parsing .fig")?;
     let (doc, _report, assets) = fig_to_doc(&fig).context("mapping .fig to Fanta document")?;
-    Ok(FigDocument::from_doc(doc, assets.into_iter().collect()))
+    let mut document = FigDocument::from_doc(doc, assets.into_iter().collect());
+    document.prewarm_default_page_assets();
+    Ok(document)
 }
 
 fn load_project_document(root: &Path) -> Result<FigDocument> {
     let (doc, assets) = fanta_format::read_project_tree(root)
         .with_context(|| format!("reading Fanta project at {}", root.display()))?;
-    Ok(FigDocument::from_doc(doc, assets))
+    let mut document = FigDocument::from_doc(doc, assets);
+    document.prewarm_default_page_assets();
+    Ok(document)
 }
 
 /// Whether this single node carries an auto layout. O(1) — the incremental
@@ -2099,24 +2242,39 @@ fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bo
     bounds
 }
 
-fn decode_assets(assets: &BTreeMap<AssetId, Vec<u8>>) -> InMemoryAssetResolver {
-    let mut resolver = InMemoryAssetResolver::new();
-    for (asset_id, bytes) in assets {
-        match image::load_from_memory(bytes) {
-            Ok(image) => {
-                let image = image.to_rgba8();
-                let (width, height) = image.dimensions();
-                resolver.insert(
-                    *asset_id,
-                    DecodedImage::new(Arc::new(image.into_raw()), width, height),
-                );
-            }
-            Err(error) => {
-                log::warn!("failed to decode embedded .fig image asset {asset_id}: {error}");
-            }
+/// Decode one embedded asset to the straight-alpha RGBA8 the canvas renderer
+/// draws. Installed in the document's [`LazyAssetResolver`], which calls it
+/// the first time an image is drawn (or prewarmed) and remembers a failure
+/// so a corrupt asset is logged once, not once per frame.
+fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage> {
+    match image::load_from_memory(bytes) {
+        Ok(image) => {
+            let image = image.to_rgba8();
+            let (width, height) = image.dimensions();
+            Some(DecodedImage::new(Arc::new(image.into_raw()), width, height))
+        }
+        Err(error) => {
+            log::warn!("failed to decode embedded .fig image asset {asset_id}: {error}");
+            None
         }
     }
-    resolver
+}
+
+/// The image assets drawn somewhere under `page_root`: every bitmap's asset
+/// and every video's poster frame. Other asset kinds (audio, 3D models, the
+/// videos themselves) are not decoded as images.
+fn page_image_assets(doc: &Doc, page_root: NodeId) -> Vec<AssetId> {
+    let mut assets = Vec::new();
+    for node_id in doc.scene.descendants_of(page_root) {
+        match doc.scene.get(node_id).map(|node| &node.data) {
+            Some(fanta_doc::NodeData::Bitmap(bitmap)) => assets.push(bitmap.asset),
+            Some(fanta_doc::NodeData::Video(video)) => assets.extend(video.poster),
+            _ => {}
+        }
+    }
+    assets.sort();
+    assets.dedup();
+    assets
 }
 
 /// Wrap every embedded asset GPUI can decode as an [`Image`] behind its content
@@ -2128,7 +2286,7 @@ fn decode_gpui_images(assets: &BTreeMap<AssetId, Vec<u8>>) -> HashMap<AssetId, A
         .iter()
         .filter_map(|(asset_id, bytes)| {
             let format = gpui_image_format(image::guess_format(bytes).ok()?)?;
-            // The ENCODED bytes go to GPUI (not `decode_assets`' straight-alpha
+            // The ENCODED bytes go to GPUI (not `decode_embedded_image`'s straight-alpha
             // RGBA8, which the canvas renderer wants): handing over the source
             // bytes lets GPUI decode, swap channels to BGRA, and cache the
             // texture behind the content hash `Image::from_bytes` computes.
@@ -2547,6 +2705,7 @@ mod tests {
             sync_epoch: 0,
             reload_task: None,
             _load_task: None,
+            write_cache: None,
             project_subscriptions: Vec::new(),
         });
         item.update(cx, |item, cx| item.subscribe_to_project(project, cx));

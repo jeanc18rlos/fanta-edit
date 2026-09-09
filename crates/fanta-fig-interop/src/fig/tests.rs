@@ -114,6 +114,61 @@ fn write_then_read_round_trips_the_container() {
 }
 
 #[test]
+fn blob_byte_arrays_decode_compactly_and_flatten_into_the_blob_table() {
+    // `Blob.bytes` is a `byte[]`: the decoder yields one `KiwiValue::Bytes` per
+    // blob instead of a `Byte` per source byte, and `extract_blobs` flattens
+    // either shape (hand-built values still use the element-wise form).
+    let schema = Schema::new(vec![
+        Def::new(
+            "Blob",
+            DefKind::Struct,
+            vec![Field::array("bytes", KiwiType::BYTE, 0)],
+        ),
+        Def::new(
+            "Message",
+            DefKind::Message,
+            vec![Field::array("blobs", KiwiType::user(0), 1)],
+        ),
+    ]);
+    let blob = |bytes: KiwiValue| KiwiValue::Object {
+        type_name: "Blob".into(),
+        fields: [("bytes", bytes)].into_iter().collect(),
+    };
+    let root = KiwiValue::Object {
+        type_name: "Message".into(),
+        fields: [(
+            "blobs",
+            KiwiValue::Array(vec![
+                blob(KiwiValue::Bytes(vec![1, 2, 3])),
+                blob(KiwiValue::Array(vec![KiwiValue::Byte(9)])),
+            ]),
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let blobs = extract_blobs(&root);
+    assert_eq!(blobs, vec![vec![1, 2, 3], vec![9]]);
+    let doc = FigDocument {
+        version: 0,
+        schema,
+        root,
+        root_type_name: "Message".into(),
+        blobs,
+        images: HashMap::new(),
+    };
+
+    let back = read_fig(&write_fig(&doc).unwrap()).unwrap();
+    assert_eq!(back.blobs, doc.blobs);
+    let decoded = back.root.get("blobs").unwrap().as_array().unwrap();
+    assert!(
+        decoded
+            .iter()
+            .all(|b| matches!(b.get("bytes"), Some(KiwiValue::Bytes(_)))),
+        "the decoder always produces the compact byte form"
+    );
+}
+
+#[test]
 fn bad_magic_is_rejected() {
     let mut bytes = write_fig(&figma_like_doc()).unwrap();
     bytes[0] = b'X';

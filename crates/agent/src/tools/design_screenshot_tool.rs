@@ -17,9 +17,10 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// Render a PNG screenshot of the open design canvas so you can see what a
 /// page or node actually looks like.
 ///
-/// Defaults to the active page; pass `node` to render just that node's region,
-/// or `page` for another page. Screenshot after `design_edit` batches to
-/// verify the result visually instead of trusting coordinates.
+/// Defaults to the active page; pass `node` to render just that node's region
+/// (the frame you just built, usually), or `page` for another page. Screenshot
+/// after `design_edit` batches to verify the result visually instead of
+/// trusting coordinates: check alignment, overlap, clipped text, contrast.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignScreenshotToolInput {
     /// Page index to render (defaults to the active page).

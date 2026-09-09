@@ -25,7 +25,7 @@ use crate::node::OverridePath;
 use crate::scene::Scene;
 use crate::value::VarValue;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Every component master and component set in the document.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -58,15 +58,31 @@ impl ComponentLibrary {
     ///
     /// Returns the number of defs whose `rev` changed (mostly for tests).
     pub fn bump_rev_for_node(&mut self, scene: &Scene, node_id: NodeId) -> usize {
+        self.bump_rev_for_nodes(scene, [node_id])
+    }
+
+    /// [`Self::bump_rev_for_node`] for a whole set of touched nodes at once:
+    /// a def whose root contains several of them is bumped once, and the defs
+    /// are scanned a single time rather than once per node. For transient
+    /// previews that write straight into the scene (a drag frame moving many
+    /// nodes) — those bypass `Doc::apply`, which is otherwise the only caller.
+    pub fn bump_rev_for_nodes(
+        &mut self,
+        scene: &Scene,
+        node_ids: impl IntoIterator<Item = NodeId>,
+    ) -> usize {
         if self.defs.is_empty() {
             return 0;
         }
-        // Build the ancestor-or-self set for `node_id`: itself plus every
-        // ancestor. `ancestors_of` does not yield `node_id` itself, so we add it.
-        let mut chain: Vec<NodeId> = Vec::with_capacity(8);
-        chain.push(node_id);
-        for anc in scene.ancestors_of(node_id) {
-            chain.push(anc.id);
+        // The ancestor-or-self set of every touched node. `ancestors_of` does
+        // not yield the node itself, so each is added explicitly.
+        let mut chain: HashSet<NodeId> = HashSet::new();
+        for node_id in node_ids {
+            chain.insert(node_id);
+            chain.extend(scene.ancestors_of(node_id).map(|ancestor| ancestor.id));
+        }
+        if chain.is_empty() {
+            return 0;
         }
         let mut bumped = 0;
         for def in self.defs.values_mut() {
@@ -342,6 +358,15 @@ mod tests {
         // Editing the root itself (ancestor-or-SELF) also bumps it.
         lib.bump_rev_for_node(&scene, root_id);
         assert_eq!(lib.defs[&def_id].rev, 2);
+
+        // A batch of touched nodes bumps each containing master exactly once,
+        // however many of the nodes it holds, and leaves the rest alone.
+        let bumped = lib.bump_rev_for_nodes(&scene, [child_id, root_id]);
+        assert_eq!(bumped, 1);
+        assert_eq!(lib.defs[&def_id].rev, 3);
+        assert_eq!(lib.defs[&other_def_id].rev, 0);
+        assert_eq!(lib.bump_rev_for_nodes(&scene, []), 0);
+        assert_eq!(lib.bump_rev_for_nodes(&scene, [child_id, other_id]), 2);
     }
 
     #[test]

@@ -78,6 +78,9 @@ pub(super) struct LayerNode {
     /// One past the last pre-order index of this node's subtree; the subtree
     /// is exactly `index + 1..subtree_end`.
     pub(super) subtree_end: usize,
+    /// The host's `LayersPanelItem::has_children` hint: the node has children
+    /// the host left out of the tree (a pruned collapsed subtree).
+    pub(super) has_children: bool,
 }
 
 /// The host tree flattened in pre-order (parents before children, siblings in
@@ -108,6 +111,7 @@ impl LayerArena {
             depth,
             parent,
             subtree_end: index + 1,
+            has_children: item.has_children,
         });
         self.index_by_id.insert(item.id.clone(), index);
         for child in &item.children {
@@ -133,10 +137,12 @@ impl LayerArena {
         self.index_by_id.contains_key(id)
     }
 
+    /// Whether the row shows a disclosure arrow: it has children in the
+    /// arena, or the host says it has children it did not include.
     pub(super) fn has_children(&self, index: usize) -> bool {
         self.nodes
             .get(index)
-            .is_some_and(|node| node.subtree_end > index + 1)
+            .is_some_and(|node| node.subtree_end > index + 1 || node.has_children)
     }
 
     /// Whether `index` is `ancestor` itself or lies inside its subtree.

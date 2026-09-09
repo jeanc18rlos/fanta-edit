@@ -313,6 +313,24 @@ impl Doc {
         Ok(())
     }
 
+    /// Discard the open transaction, reverting the ops it has applied so far
+    /// against the whole document — the same [`OpCtx`] as [`Self::apply`], so
+    /// a `DefineComponent` or motion-track op inside the transaction is undone
+    /// too, not just the scene edits (`History::abort` reverts through empty
+    /// registries and would leave those behind). No-op when no transaction is
+    /// open.
+    pub fn abort_transaction(&mut self) -> Result<(), SceneError> {
+        let mut ctx = OpCtx {
+            scene: &mut self.scene,
+            components: &mut self.components,
+            variables: &mut self.variables,
+            active_modes: &mut self.active_modes,
+            motion: &mut self.motion,
+            flow_start: &mut self.flow_start,
+        };
+        self.history.abort_with(&mut ctx)
+    }
+
     /// Install (or clear) the session-journal sink on this doc's history. The
     /// app calls this once it owns the live doc (and after any doc swap) so
     /// every committed edit is recorded; a cloned doc never inherits it.
@@ -392,6 +410,39 @@ impl Doc {
             }
         }
         Ok(adjusted)
+    }
+
+    /// A copy of this document for a persistence path that runs off the
+    /// editing thread (a background project write, a merge base).
+    ///
+    /// Presence state is never persisted by `fanta-format` — its project
+    /// writer emits only `metadata`, `variables`, `active_modes`, `motion`,
+    /// `flow_start`, the component library, the pages, and the scene — so the
+    /// clone drops the two presence fields that carry real weight: `history`
+    /// (whose `DeleteSubtree` snapshots can outweigh the scene itself on a
+    /// long session) and `selection`. The undo stack is likewise cleared by
+    /// any merge that uses this clone as its base, so no reader depends on
+    /// it. `viewport` and `active_page` are a few words each and are kept
+    /// verbatim.
+    pub fn clone_for_persist(&self) -> Self {
+        Self {
+            id: self.id,
+            schema_version: self.schema_version,
+            metadata: self.metadata.clone(),
+            scene: self.scene.clone(),
+            selection: Selection::new(),
+            history: History::new(),
+            viewport: self.viewport,
+            pages: self.pages.clone(),
+            active_page: self.active_page,
+            components: self.components.clone(),
+            variables: self.variables.clone(),
+            active_modes: self.active_modes.clone(),
+            motion: self.motion.clone(),
+            flow_start: self.flow_start,
+            flows: self.flows.clone(),
+            presentation: self.presentation.clone(),
+        }
     }
 
     /// Serialize to the canonical `.fant.json` projection.
@@ -562,6 +613,39 @@ mod tests {
     }
 
     #[test]
+    fn aborting_a_transaction_rolls_back_doc_level_ops_too() {
+        let mut doc = Doc::new();
+        let frame = add_root_group(&mut doc, "Card");
+        let defs_before = doc.components.defs.len();
+
+        doc.history.begin("Batch", &mut doc.scene);
+        let component = crate::id::ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(crate::component::ComponentDef::new(
+                component, frame, "Card",
+            )),
+        })
+        .unwrap();
+        let original = doc.scene.get(frame).unwrap().transform;
+        let moved = original.then(&crate::transform::Transform2D::translation(10.0, 0.0));
+        doc.apply(Operation::SetTransform {
+            id: frame,
+            old: original,
+            new: moved,
+        })
+        .unwrap();
+        assert!(doc.is_component_root(frame));
+        assert_eq!(doc.scene.get(frame).unwrap().transform, moved);
+
+        doc.abort_transaction().unwrap();
+
+        assert_eq!(doc.components.defs.len(), defs_before);
+        assert!(!doc.is_component_root(frame));
+        assert_eq!(doc.scene.get(frame).unwrap().transform, original);
+        assert_eq!(doc.history.undo_depth(), 1, "only the frame's creation remains");
+    }
+
+    #[test]
     fn pages_track_order_active_and_names() {
         let mut d = Doc::new();
         assert!(d.pages().is_empty());
@@ -727,6 +811,50 @@ mod tests {
         assert!(back.scene.contains(id));
         // Rebuilt child index lets us see the root child.
         assert!(back.scene.roots().contains(&id));
+    }
+
+    #[test]
+    fn clone_for_persist_keeps_content_and_drops_history_and_selection() {
+        let mut d = Doc::new();
+        let page = add_root_group(&mut d, "Page 1");
+        d.add_page(page);
+        let child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::BLACK,
+        )));
+        let child_id = child.id;
+        d.apply(Operation::create_node(child)).unwrap();
+        d.selection.replace_with(vec![child_id]);
+        d.viewport.zoom = 2.5;
+        assert!(d.history.can_undo());
+
+        let persisted = d.clone_for_persist();
+        assert_eq!(persisted.id, d.id);
+        assert_eq!(persisted.pages(), d.pages());
+        assert_eq!(persisted.active_page(), d.active_page());
+        assert_eq!(persisted.viewport, d.viewport);
+        assert_eq!(persisted.scene.len(), d.scene.len());
+        assert!(persisted.scene.contains(child_id));
+        assert!(persisted.selection.is_empty());
+        assert!(!persisted.history.can_undo());
+        assert!(!persisted.history.can_redo());
+
+        // Everything the project writer persists serializes identically.
+        let original = serde_json::to_value(&d).unwrap();
+        let clone = serde_json::to_value(&persisted).unwrap();
+        for key in [
+            "metadata",
+            "scene",
+            "pages",
+            "components",
+            "variables",
+            "motion",
+        ] {
+            assert_eq!(original.get(key), clone.get(key), "{key} differs");
+        }
     }
 
     #[test]

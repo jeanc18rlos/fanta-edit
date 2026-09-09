@@ -10,22 +10,31 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
-use design_surface::{DesignNodeType, DesignOp, DesignSurface, NodeQuery, ScreenshotTarget};
+use design_surface::{
+    AlignEdge, CrossAxisAlignment, DesignNodeType, DesignOp, DesignSurface, DistributeAxis,
+    LayerPosition, LayoutDirection, MainAxisAlignment, NamedLayerPosition, NodeQuery,
+    ScreenshotTarget, StrokeAlignment, TextAlignment,
+};
 use fanta_doc::{
-    AssetId, BitmapNode, CanvasNode, Color, Doc, Fill, GroupNode, ImageFitMode, IndexKey, NodeData,
-    NodeFlags, NodeId, Operation, PathData, TextNode, Transform2D, UnitInterval, VectorNode,
-    Viewport,
+    AssetId, AutoLayout, BitmapNode, Bounds, CanvasNode, Color, ComponentId, CounterAlign, Doc,
+    Fill, GroupNode, ImageFitMode, IndexKey, InstanceNode, LayoutMode, NodeData, NodeFlags, NodeId,
+    Operation, PathData, PrimaryAlign, ShadowKind, Stroke, StrokeAlign, TextAlign, TextNode,
+    Transform2D, UnitInterval, VectorNode, Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::clipboard::{create_operations, duplicate_operations};
 use crate::document::{AssetStores, DocChange, FigDocument, FigItem, FigPage, page_bounds};
 use crate::export::render_inputs;
 use crate::properties_ops::{
-    DEFAULT_FILL_COLOR, parse_color, replace_data_operation, resize_operations, set_corner_radius,
+    DEFAULT_FILL_COLOR, create_component_operations, default_shadow, effects_operations,
+    parse_color, replace_data_operation, resize_operations, rotation_operations, set_corner_radius,
+    stroke_list_mut,
 };
+use crate::structure::{frame_selection_operations, group_operations, ungroup_operations};
 
 /// The most recently opened or focused canvas item, shared between the
 /// registered provider and the [`FigView`](crate::FigView) instances that
@@ -70,6 +79,7 @@ impl DesignSurface for FigDesignSurface {
         let document = ready_document(item)?;
         let doc = &document.doc;
         let project_root = item.project_root();
+        let selection: Vec<NodeId> = doc.selection.iter().copied().collect();
         Ok(json!({
             "project": item.title().as_ref(),
             "project_root": project_root.map(|root| root.display().to_string()),
@@ -78,9 +88,39 @@ impl DesignSurface for FigDesignSurface {
             "dirty": item.is_dirty(),
             "total_nodes": doc.scene.len(),
             "pages": pages_json(&document.pages, doc, project_root),
+            "active_page_bounds": bounds_json(content_bounds(doc, doc.active_page())),
             "components": components_json(doc, project_root),
             "selection": selection_ids(doc),
+            "selection_bounds": bounds_json(union_bounds(doc, &selection)),
             "viewport": { "center": doc.viewport.center, "zoom": doc.viewport.zoom },
+            "hints": STATE_HINTS,
+        }))
+    }
+
+    fn find_empty_space(
+        &self,
+        width: f64,
+        height: f64,
+        page: Option<usize>,
+        cx: &mut App,
+    ) -> Result<Value> {
+        if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+            bail!("width and height must be positive");
+        }
+        let item = self.item()?;
+        let item = item.read(cx);
+        let document = ready_document(item)?;
+        let page_index = resolve_page_index(document, page)?;
+        let root = document.pages[page_index]
+            .root
+            .context("the page has no root node")?;
+        let spot = empty_space(&document.doc, root, width, height);
+        Ok(json!({
+            "page": page_index,
+            "x": spot.x,
+            "y": spot.y,
+            "width": width,
+            "height": height,
         }))
     }
 
@@ -317,6 +357,97 @@ fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
     }
 }
 
+/// What every state read tells the model up front, because the mistakes
+/// these prevent (guessed ids, y-up math, unverified results) are the common
+/// ones.
+const STATE_HINTS: [&str; 5] = [
+    "Coordinates are world px with y growing downward; x/y of an op is the node's top-left corner.",
+    "Ids are exact node ids from this state or a page listing; never guess or use layer names.",
+    "Ask for empty_space before creating a new top-level frame so it does not land on existing work.",
+    "Batch related ops into one design_edit/batch_design call with a descriptive label; it is one undo step.",
+    "Verify substantive edits with a screenshot of the changed frame before reporting done.",
+];
+
+fn bounds_json(bounds: Option<Bounds>) -> Value {
+    match bounds {
+        Some(bounds) => json!({
+            "x": bounds.min_x,
+            "y": bounds.min_y,
+            "width": bounds.width(),
+            "height": bounds.height(),
+        }),
+        None => Value::Null,
+    }
+}
+
+/// Union of the world bounds of `ids` (nodes without bounds are skipped).
+fn union_bounds(doc: &Doc, ids: &[NodeId]) -> Option<Bounds> {
+    ids.iter()
+        .filter_map(|id| doc.scene.world_bounds(*id))
+        .filter(Bounds::is_finite)
+        .reduce(|union, bounds| union.union(&bounds))
+}
+
+/// Union of the top-level content of `page` (`None` for an empty page or a
+/// document without pages).
+fn content_bounds(doc: &Doc, page: Option<NodeId>) -> Option<Bounds> {
+    let root = page?;
+    union_bounds(doc, doc.scene.children_of(Some(root)))
+}
+
+/// Gap kept between existing content and a newly placed frame.
+const EMPTY_SPACE_MARGIN: f64 = 100.0;
+
+/// A free top-left for a `width` x `height` box on `page`: the origin on an
+/// empty page, otherwise the first spot to the right of, then below, the
+/// page's content (stepping further out until nothing on the page overlaps).
+fn empty_space(doc: &Doc, page: NodeId, width: f64, height: f64) -> glam::DVec2 {
+    let Some(content) = content_bounds(doc, Some(page)) else {
+        return glam::DVec2::ZERO;
+    };
+    let mut candidates = Vec::new();
+    for step in 1..=8 {
+        let offset = EMPTY_SPACE_MARGIN * f64::from(step);
+        candidates.push(glam::DVec2::new(content.max_x + offset, content.min_y));
+        candidates.push(glam::DVec2::new(content.min_x, content.max_y + offset));
+    }
+    for candidate in &candidates {
+        let rect = Bounds::from_xywh(candidate.x, candidate.y, width, height);
+        if page_area_is_empty(doc, page, rect) {
+            return *candidate;
+        }
+    }
+    // The page's content is wider than eight margins of overlap allows;
+    // fall back to the far right, which the union bounds guarantee is free.
+    glam::DVec2::new(
+        content.max_x + EMPTY_SPACE_MARGIN,
+        content.max_y + EMPTY_SPACE_MARGIN,
+    )
+}
+
+/// Whether nothing on `page` overlaps `rect`. The spatial index answers for
+/// leaves across every page, so hits are filtered to this page's subtree;
+/// empty frames (groups, which the index never reports) are checked against
+/// the page's top-level children directly.
+fn page_area_is_empty(doc: &Doc, page: NodeId, rect: Bounds) -> bool {
+    let on_page = |id: NodeId| {
+        doc.scene
+            .ancestors_of(id)
+            .any(|ancestor| ancestor.id == page)
+    };
+    let leaf_hits = doc
+        .scene
+        .rect_query_where(rect, |id, bounds| bounds.intersects(&rect) && on_page(id));
+    if !leaf_hits.is_empty() {
+        return false;
+    }
+    !doc.scene
+        .children_of(Some(page))
+        .iter()
+        .filter_map(|child| doc.scene.world_bounds(*child))
+        .any(|bounds| bounds.intersects(&rect))
+}
+
 /// Explicit page indices error when out of range; `None` falls back to the
 /// active page like the canvas does.
 fn resolve_page_index(document: &FigDocument, page: Option<usize>) -> Result<usize> {
@@ -351,9 +482,7 @@ fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: boo
     if node.flags.contains(NodeFlags::LOCKED) {
         object.insert("locked".into(), json!(true));
     }
-    if let NodeData::Text(text) = &node.data {
-        object.insert("text".into(), json!(text.content));
-    }
+    summarize_kind(doc, node, &mut object);
     if include_geometry {
         object.insert("world_bounds".into(), world_bounds_json(doc, id));
     }
@@ -375,6 +504,69 @@ fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: boo
         }
     }
     Value::Object(object)
+}
+
+/// Kind-specific facts a model needs to reason about a node without fetching
+/// it in full: a frame's size and layout mode, a text's font and content, a
+/// shape's fill, an instance's component. Only present facts are emitted so
+/// large page listings stay compact.
+fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<String, Value>) {
+    match &node.data {
+        NodeData::Group(group) => {
+            if let Some([width, height]) = group.clip_size {
+                object.insert("size".into(), json!([width, height]));
+            }
+            if let Some(layout) = &group.auto_layout {
+                let mode = match layout.mode {
+                    LayoutMode::Horizontal => "horizontal",
+                    LayoutMode::Vertical => "vertical",
+                };
+                object.insert("auto_layout".into(), json!(mode));
+            }
+            if let Some(color) = group.background.as_ref().and_then(Fill::solid_color) {
+                object.insert("fill".into(), json!(color.to_hex()));
+            }
+        }
+        NodeData::Text(text) => {
+            object.insert("text".into(), json!(text.content));
+            object.insert(
+                "font".into(),
+                json!({
+                    "family": text.style.font_family,
+                    "size": text.style.size_px,
+                    "weight": text.style.weight,
+                }),
+            );
+        }
+        NodeData::Vector(vector) => {
+            if let Some(color) = vector.fills.first().and_then(Fill::solid_color) {
+                object.insert("fill".into(), json!(color.to_hex()));
+            }
+        }
+        NodeData::Boolean(boolean) => {
+            if let Some(color) = boolean.fills.first().and_then(Fill::solid_color) {
+                object.insert("fill".into(), json!(color.to_hex()));
+            }
+        }
+        NodeData::Instance(instance) => {
+            object.insert(
+                "component".into(),
+                json!(
+                    doc.components
+                        .def(instance.component)
+                        .map(|def| def.name.as_str())
+                        .unwrap_or("(missing)")
+                ),
+            );
+        }
+        NodeData::Bitmap(_)
+        | NodeData::Video(_)
+        | NodeData::Audio(_)
+        | NodeData::NodeGraph(_)
+        | NodeData::Model3d(_)
+        | NodeData::AiArtifact(_)
+        | NodeData::Embed(_) => {}
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -459,10 +651,31 @@ struct BatchOutcome {
 
 /// What one applied op affected, for dirty/selection tracking and reporting.
 enum Applied {
-    Content { created: Option<String> },
+    Content {
+        created: Option<String>,
+        /// Extra op-specific facts merged into the op's status entry (e.g.
+        /// the children an `ungroup` freed).
+        detail: Option<Value>,
+    },
     Selection,
     Viewport,
     Nothing,
+}
+
+impl Applied {
+    fn created(id: NodeId) -> Self {
+        Self::Content {
+            created: Some(id.to_string()),
+            detail: None,
+        }
+    }
+
+    fn changed() -> Self {
+        Self::Content {
+            created: None,
+            detail: None,
+        }
+    }
 }
 
 /// Apply the batch inside one history transaction: all content ops commit as
@@ -485,12 +698,20 @@ fn apply_batch(
     doc.history.begin(label, &mut doc.scene);
     for (index, op) in ops.iter().enumerate() {
         match apply_one(doc, assets, &mut ingested_assets, op) {
-            Ok(Applied::Content { created: id }) => {
+            Ok(Applied::Content {
+                created: id,
+                detail,
+            }) => {
                 content_changed = true;
                 let mut status = json!({ "index": index, "status": "ok" });
                 if let Some(id) = id {
                     status["created"] = json!(id);
                     created.push(id);
+                }
+                if let (Some(Value::Object(detail)), Some(status)) =
+                    (detail, status.as_object_mut())
+                {
+                    status.extend(detail);
                 }
                 statuses.push(status);
             }
@@ -523,7 +744,7 @@ fn apply_batch(
             }
         }
         Some((index, mut message)) => {
-            if let Err(abort_error) = doc.history.abort(&mut doc.scene) {
+            if let Err(abort_error) = doc.abort_transaction() {
                 message = format!("{message}; rolling back also failed: {abort_error}");
             }
             for asset in ingested_assets {
@@ -615,9 +836,7 @@ fn apply_one(
                 })
                 .context("recording the image node's metadata")?;
             }
-            Ok(Applied::Content {
-                created: Some(id.to_string()),
-            })
+            Ok(Applied::created(id))
         }
         DesignOp::CreateNode {
             node_type,
@@ -704,9 +923,7 @@ fn apply_one(
             let id = node.id;
             doc.apply(Operation::create_node(node))
                 .context("creating the node")?;
-            Ok(Applied::Content {
-                created: Some(id.to_string()),
-            })
+            Ok(Applied::created(id))
         }
         DesignOp::SetProps {
             id,
@@ -873,10 +1090,494 @@ fn apply_one(
             }
 
             if applied_any {
-                Ok(Applied::Content { created: None })
+                Ok(Applied::changed())
             } else {
                 Ok(Applied::Nothing)
             }
+        }
+        DesignOp::CreateInstance {
+            component,
+            x,
+            y,
+            parent,
+            name,
+        } => {
+            if !(x.is_finite() && y.is_finite()) {
+                bail!("x and y must be finite");
+            }
+            let parent = resolve_container(doc, parent.as_deref())?;
+            let component_id = resolve_component(doc, component)?;
+            let def = doc
+                .components
+                .def(component_id)
+                .with_context(|| format!("component {component} does not exist"))?;
+            if Some(def.root) == parent
+                || parent.is_some_and(|parent| {
+                    doc.scene
+                        .ancestors_of(parent)
+                        .any(|ancestor| ancestor.id == def.root)
+                })
+            {
+                bail!("cannot place an instance of a component inside its own master");
+            }
+            let local_size = master_size(doc, def.root).unwrap_or([100.0, 100.0]);
+            let mut node = CanvasNode::new(NodeData::Instance(InstanceNode {
+                component: component_id,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size,
+            }));
+            node.name = name.clone().unwrap_or_else(|| def.name.clone());
+            let parent_world = parent
+                .and_then(|parent| doc.scene.world_transform(parent))
+                .unwrap_or(Transform2D::IDENTITY);
+            node.parent = parent;
+            node.index = doc.scene.next_child_index(parent);
+            node.transform = Transform2D::translation(*x, *y).then(&parent_world.inverse());
+            let id = node.id;
+            doc.apply(Operation::CreateInstance {
+                node: Box::new(node),
+            })
+            .context("creating the instance")?;
+            Ok(Applied::created(id))
+        }
+        DesignOp::SetStroke {
+            id,
+            color,
+            width,
+            align,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if !matches!(node.data, NodeData::Vector(_) | NodeData::Group(_)) {
+                bail!(
+                    "strokes apply to shapes and frames, not a {} node",
+                    node.data.kind_tag()
+                );
+            }
+            if let Some(width) = width
+                && !(width.is_finite() && *width >= 0.0)
+            {
+                bail!("the stroke width must be non-negative");
+            }
+            let color = color.as_deref().map(parse_fill_color).transpose()?;
+            let align = align.map(|align| match align {
+                StrokeAlignment::Inside => StrokeAlign::Inside,
+                StrokeAlignment::Center => StrokeAlign::Center,
+                StrokeAlignment::Outside => StrokeAlign::Outside,
+            });
+            apply_all(
+                doc,
+                replace_data_operation(doc, id, |data| {
+                    let Some(strokes) = stroke_list_mut(data) else {
+                        return;
+                    };
+                    if *width == Some(0.0) {
+                        strokes.clear();
+                        return;
+                    }
+                    if strokes.is_empty() {
+                        strokes.push(Stroke::solid(
+                            color.unwrap_or(Color::BLACK),
+                            width.unwrap_or(1.0),
+                        ));
+                    }
+                    let Some(stroke) = strokes.first_mut() else {
+                        return;
+                    };
+                    if let Some(color) = color {
+                        stroke.paint.set_solid_color(color);
+                    }
+                    if let Some(width) = width {
+                        stroke.width = *width;
+                    }
+                    if let Some(align) = align {
+                        stroke.align = align;
+                    }
+                }),
+            )
+        }
+        DesignOp::SetShadow {
+            id,
+            color,
+            x,
+            y,
+            blur,
+            spread,
+            remove,
+        } => {
+            let id = parse_node_id(id)?;
+            existing_node(doc, id)?;
+            let color = color.as_deref().map(parse_fill_color).transpose()?;
+            for (label, value) in [("blur", blur), ("spread", spread), ("x", x), ("y", y)] {
+                if let Some(value) = value
+                    && !value.is_finite()
+                {
+                    bail!("the shadow {label} must be finite");
+                }
+            }
+            if let Some(blur) = blur
+                && *blur < 0.0
+            {
+                bail!("the shadow blur must be non-negative");
+            }
+            apply_all(
+                doc,
+                effects_operations(doc, id, |effects| {
+                    if *remove == Some(true) {
+                        effects.retain(|shadow| shadow.kind != ShadowKind::Drop);
+                        return;
+                    }
+                    if !effects.iter().any(|shadow| shadow.kind == ShadowKind::Drop) {
+                        effects.push(default_shadow());
+                    }
+                    let Some(shadow) = effects
+                        .iter_mut()
+                        .find(|shadow| shadow.kind == ShadowKind::Drop)
+                    else {
+                        return;
+                    };
+                    if let Some(color) = color {
+                        shadow.color = color;
+                    }
+                    if let Some(x) = x {
+                        shadow.offset[0] = *x;
+                    }
+                    if let Some(y) = y {
+                        shadow.offset[1] = *y;
+                    }
+                    if let Some(blur) = blur {
+                        shadow.blur = *blur;
+                    }
+                    if let Some(spread) = spread {
+                        shadow.spread = *spread;
+                    }
+                }),
+            )
+        }
+        DesignOp::SetTextStyle {
+            id,
+            font_family,
+            font_weight,
+            font_size,
+            line_height,
+            letter_spacing,
+            align,
+            color,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if !matches!(node.data, NodeData::Text(_)) {
+                bail!("node {id} is not a text node");
+            }
+            if let Some(size) = font_size
+                && !(size.is_finite() && *size > 0.0)
+            {
+                bail!("font_size must be positive");
+            }
+            if let Some(weight) = font_weight
+                && !(100..=1000).contains(weight)
+            {
+                bail!("font_weight must be between 100 and 1000");
+            }
+            if let Some(line_height) = line_height
+                && !(line_height.is_finite() && *line_height > 0.0)
+            {
+                bail!("line_height must be a positive multiple of the font size");
+            }
+            if let Some(spacing) = letter_spacing
+                && !spacing.is_finite()
+            {
+                bail!("letter_spacing must be finite");
+            }
+            let color = color.as_deref().map(parse_fill_color).transpose()?;
+            let align = align.map(|align| match align {
+                TextAlignment::Left => TextAlign::Left,
+                TextAlignment::Center => TextAlign::Center,
+                TextAlignment::Right => TextAlign::Right,
+                TextAlignment::Justify => TextAlign::Justify,
+            });
+            apply_all(
+                doc,
+                replace_data_operation(doc, id, |data| {
+                    let NodeData::Text(text) = data else {
+                        return;
+                    };
+                    // Rich-text runs override the base style, so a whole-node
+                    // change has to land on every run too or it would show on
+                    // none of the styled characters.
+                    let mut styles = vec![&mut text.style];
+                    styles.extend(text.style_runs.iter_mut().map(|run| &mut run.style));
+                    for style in styles {
+                        if let Some(family) = font_family {
+                            style.font_family = family.clone();
+                        }
+                        if let Some(weight) = font_weight {
+                            style.weight = *weight;
+                        }
+                        if let Some(size) = font_size {
+                            style.size_px = *size;
+                        }
+                        if let Some(line_height) = line_height {
+                            style.line_height = *line_height;
+                            style.line_height_auto_percent = None;
+                        }
+                        if let Some(spacing) = letter_spacing {
+                            style.letter_spacing = *spacing;
+                        }
+                        if let Some(color) = color {
+                            style.color = color;
+                        }
+                    }
+                    if let Some(align) = align {
+                        text.align = align;
+                    }
+                }),
+            )
+        }
+        DesignOp::SetAutoLayout {
+            id,
+            direction,
+            gap,
+            padding,
+            align_items,
+            justify,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if !matches!(node.data, NodeData::Group(_)) {
+                bail!(
+                    "auto layout applies to frames and groups, not a {} node",
+                    node.data.kind_tag()
+                );
+            }
+            if let Some(gap) = gap
+                && !(gap.is_finite() && *gap >= 0.0)
+            {
+                bail!("gap must be non-negative");
+            }
+            let padding = padding.as_deref().map(parse_padding).transpose()?;
+            apply_all(
+                doc,
+                replace_data_operation(doc, id, |data| {
+                    let NodeData::Group(group) = data else {
+                        return;
+                    };
+                    let mode = match direction {
+                        LayoutDirection::Horizontal => LayoutMode::Horizontal,
+                        LayoutDirection::Vertical => LayoutMode::Vertical,
+                        LayoutDirection::None => {
+                            group.auto_layout = None;
+                            return;
+                        }
+                    };
+                    let layout = group.auto_layout.get_or_insert_with(AutoLayout::default);
+                    layout.mode = mode;
+                    if let Some(gap) = gap {
+                        layout.spacing = *gap;
+                    }
+                    if let Some(padding) = padding {
+                        layout.padding = padding;
+                    }
+                    if let Some(align_items) = align_items {
+                        layout.counter_align = match align_items {
+                            CrossAxisAlignment::Start => CounterAlign::Start,
+                            CrossAxisAlignment::Center => CounterAlign::Center,
+                            CrossAxisAlignment::End => CounterAlign::End,
+                            CrossAxisAlignment::Stretch => CounterAlign::Stretch,
+                            CrossAxisAlignment::Baseline => CounterAlign::Baseline,
+                        };
+                    }
+                    if let Some(justify) = justify {
+                        layout.primary_align = match justify {
+                            MainAxisAlignment::Start => PrimaryAlign::Start,
+                            MainAxisAlignment::Center => PrimaryAlign::Center,
+                            MainAxisAlignment::End => PrimaryAlign::End,
+                            MainAxisAlignment::SpaceBetween => PrimaryAlign::SpaceBetween,
+                            MainAxisAlignment::SpaceEvenly => PrimaryAlign::SpaceEvenly,
+                        };
+                    }
+                }),
+            )
+        }
+        DesignOp::SetIndex { id, position } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if doc.pages().contains(&id) {
+                bail!("page roots cannot be reordered with set_index");
+            }
+            let Some(new) = layer_position_index(doc, node.parent, id, node.index, *position)?
+            else {
+                return Ok(Applied::Nothing);
+            };
+            doc.apply(Operation::SetIndex {
+                id,
+                old: node.index,
+                new,
+            })?;
+            Ok(Applied::changed())
+        }
+        DesignOp::Rotate { id, degrees } => {
+            let id = parse_node_id(id)?;
+            existing_node(doc, id)?;
+            if !degrees.is_finite() {
+                bail!("degrees must be finite");
+            }
+            if doc.pages().contains(&id) {
+                bail!("page roots cannot be rotated");
+            }
+            apply_all(doc, rotation_operations(doc, id, *degrees))
+        }
+        DesignOp::Align { ids, edge } => {
+            let ids = parse_content_ids(doc, ids)?;
+            let target = match ids.as_slice() {
+                [] => bail!("align needs at least one node id"),
+                [single] => {
+                    let parent = existing_node(doc, *single)?.parent.with_context(|| {
+                        format!("node {single} has no parent frame to align to")
+                    })?;
+                    if doc.pages().contains(&parent) {
+                        bail!(
+                            "aligning a single node needs a parent frame, or two or more ids to align to each other"
+                        );
+                    }
+                    doc.scene
+                        .world_bounds(parent)
+                        .with_context(|| format!("parent {parent} has no bounds"))?
+                }
+                many => union_bounds(doc, many).context("the nodes have no bounds to align")?,
+            };
+            let operations = match edge {
+                AlignEdge::Left => fanta_canvas::align_to_bounds_h(
+                    &doc.scene,
+                    &ids,
+                    target,
+                    fanta_canvas::HAlign::Left,
+                ),
+                AlignEdge::CenterX => fanta_canvas::align_to_bounds_h(
+                    &doc.scene,
+                    &ids,
+                    target,
+                    fanta_canvas::HAlign::Center,
+                ),
+                AlignEdge::Right => fanta_canvas::align_to_bounds_h(
+                    &doc.scene,
+                    &ids,
+                    target,
+                    fanta_canvas::HAlign::Right,
+                ),
+                AlignEdge::Top => fanta_canvas::align_to_bounds_v(
+                    &doc.scene,
+                    &ids,
+                    target,
+                    fanta_canvas::VAlign::Top,
+                ),
+                AlignEdge::CenterY => fanta_canvas::align_to_bounds_v(
+                    &doc.scene,
+                    &ids,
+                    target,
+                    fanta_canvas::VAlign::Middle,
+                ),
+                AlignEdge::Bottom => fanta_canvas::align_to_bounds_v(
+                    &doc.scene,
+                    &ids,
+                    target,
+                    fanta_canvas::VAlign::Bottom,
+                ),
+            };
+            apply_all(doc, operations)
+        }
+        DesignOp::Distribute { ids, axis } => {
+            let ids = parse_content_ids(doc, ids)?;
+            if ids.len() < 3 {
+                bail!("distribute needs at least three node ids");
+            }
+            let axis = match axis {
+                DistributeAxis::Horizontal => fanta_canvas::Axis::X,
+                DistributeAxis::Vertical => fanta_canvas::Axis::Y,
+            };
+            apply_all(doc, fanta_canvas::distribute(&doc.scene, &ids, axis))
+        }
+        DesignOp::Group { ids, name } => {
+            let ids = parse_content_ids(doc, ids)?;
+            let grouped = group_operations(doc, &ids, name.as_deref())?;
+            for operation in grouped.operations {
+                doc.apply(operation)?;
+            }
+            Ok(Applied::created(grouped.group))
+        }
+        DesignOp::FrameSelection { ids, name } => {
+            let ids = parse_content_ids(doc, ids)?;
+            let framed = frame_selection_operations(doc, &ids, name.as_deref())?;
+            for operation in framed.operations {
+                doc.apply(operation)?;
+            }
+            Ok(Applied::created(framed.group))
+        }
+        DesignOp::Ungroup { id } => {
+            let id = parse_node_id(id)?;
+            existing_node(doc, id)?;
+            let ungrouped = ungroup_operations(doc, id)?;
+            for operation in ungrouped.operations {
+                doc.apply(operation)?;
+            }
+            let surviving: Vec<NodeId> = doc
+                .selection
+                .iter()
+                .copied()
+                .filter(|selected| *selected != id)
+                .collect();
+            doc.selection.replace_with(surviving);
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({
+                    "children": ungrouped
+                        .children
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                })),
+            })
+        }
+        DesignOp::Duplicate { id, dx, dy } => {
+            let id = parse_node_id(id)?;
+            existing_node(doc, id)?;
+            let pasted = duplicate_operations(doc, &[id], (dx.unwrap_or(0.0), dy.unwrap_or(0.0)))?;
+            let copy = pasted
+                .roots
+                .first()
+                .copied()
+                .context("duplicating produced no copy")?;
+            for operation in create_operations(&pasted) {
+                doc.apply(operation)?;
+            }
+            Ok(Applied::created(copy))
+        }
+        DesignOp::CreateComponent { id } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if doc.pages().contains(&id) {
+                bail!("a page cannot become a component");
+            }
+            let operations = create_component_operations(doc, id);
+            let Some(Operation::DefineComponent { def }) = operations.first() else {
+                if !matches!(node.data, NodeData::Group(_)) {
+                    bail!(
+                        "only frames and groups can become components, not a {} node",
+                        node.data.kind_tag()
+                    );
+                }
+                bail!("node {id} is already a component master");
+            };
+            let component = def.id;
+            for operation in operations {
+                doc.apply(operation)?;
+            }
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({ "component": component.to_string() })),
+            })
         }
         DesignOp::Reparent { id, parent, index } => {
             let id = parse_node_id(id)?;
@@ -923,7 +1624,7 @@ fn apply_one(
                     new: new_local,
                 })?;
             }
-            Ok(Applied::Content { created: None })
+            Ok(Applied::changed())
         }
         DesignOp::Delete { id } => {
             let id = parse_node_id(id)?;
@@ -947,7 +1648,7 @@ fn apply_one(
                 .filter(|selected| !deleted.contains(selected))
                 .collect();
             doc.selection.replace_with(surviving);
-            Ok(Applied::Content { created: None })
+            Ok(Applied::changed())
         }
         DesignOp::Select { ids } => {
             let mut parsed = Vec::with_capacity(ids.len());
@@ -1035,6 +1736,175 @@ fn sibling_index(
         bail!("the insertion gap at position {position} is exhausted; reorder the siblings first");
     }
     Ok(IndexKey::between(left, right))
+}
+
+/// The node for `id`, cloned so the borrow does not outlive later mutation.
+fn existing_node(doc: &Doc, id: NodeId) -> Result<CanvasNode> {
+    doc.scene
+        .get(id)
+        .cloned()
+        .with_context(|| format!("node {id} does not exist"))
+}
+
+/// Apply a helper's operation list inside the running transaction; an empty
+/// list means the request changed nothing.
+fn apply_all(doc: &mut Doc, operations: Vec<Operation>) -> Result<Applied> {
+    if operations.is_empty() {
+        return Ok(Applied::Nothing);
+    }
+    for operation in operations {
+        doc.apply(operation)?;
+    }
+    Ok(Applied::changed())
+}
+
+/// Parse a list of ids that must all name existing, non-page content nodes.
+fn parse_content_ids(doc: &Doc, raw_ids: &[String]) -> Result<Vec<NodeId>> {
+    let mut ids = Vec::with_capacity(raw_ids.len());
+    for raw in raw_ids {
+        let id = parse_node_id(raw)?;
+        if !doc.scene.contains(id) {
+            bail!("node {raw} does not exist");
+        }
+        if doc.pages().contains(&id) {
+            bail!("{raw} is a page root, not a content node");
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// `[all]`, `[vertical, horizontal]` or `[top, right, bottom, left]` into the
+/// layout's `[top, right, bottom, left]`.
+fn parse_padding(values: &[f64]) -> Result<[f64; 4]> {
+    if values
+        .iter()
+        .any(|value| !(value.is_finite() && *value >= 0.0))
+    {
+        bail!("padding values must be non-negative");
+    }
+    match values {
+        [all] => Ok([*all; 4]),
+        [vertical, horizontal] => Ok([*vertical, *horizontal, *vertical, *horizontal]),
+        [top, right, bottom, left] => Ok([*top, *right, *bottom, *left]),
+        _ => bail!(
+            "padding takes 1, 2 or 4 values ([all], [vertical, horizontal] or [top, right, bottom, left]), not {}",
+            values.len()
+        ),
+    }
+}
+
+/// A component by id, or by name when exactly one component carries it.
+fn resolve_component(doc: &Doc, reference: &str) -> Result<ComponentId> {
+    if let Ok(id) = reference.parse::<ComponentId>()
+        && doc.components.def(id).is_some()
+    {
+        return Ok(id);
+    }
+    let mut matches = doc
+        .components
+        .defs
+        .values()
+        .filter(|def| def.name == reference)
+        .map(|def| def.id);
+    let first = matches
+        .next()
+        .with_context(|| format!("no component is named or identified by `{reference}`"))?;
+    if matches.next().is_some() {
+        bail!("several components are named `{reference}`; use the component id");
+    }
+    Ok(first)
+}
+
+/// The size a new instance takes: the master's frame box, or its content
+/// bounds for a plain group.
+fn master_size(doc: &Doc, root: NodeId) -> Option<[f64; 2]> {
+    let node = doc.scene.get(root)?;
+    if let NodeData::Group(group) = &node.data
+        && let Some(size) = group.clip_size.or(group.local_size)
+    {
+        return Some(size);
+    }
+    let bounds = doc.scene.local_bounds(root)?;
+    Some([bounds.width(), bounds.height()])
+}
+
+/// The new z-slot for `set_index`, or `None` when the node is already there.
+fn layer_position_index(
+    doc: &Doc,
+    parent: Option<NodeId>,
+    id: NodeId,
+    current: IndexKey,
+    position: LayerPosition,
+) -> Result<Option<IndexKey>> {
+    let siblings: Vec<IndexKey> = doc
+        .scene
+        .children_of(parent)
+        .iter()
+        .filter(|sibling| **sibling != id)
+        .filter_map(|sibling| doc.scene.get(*sibling))
+        .map(|sibling| sibling.index)
+        .collect();
+    let above = siblings.iter().copied().filter(|index| *index > current);
+    let below = siblings.iter().copied().filter(|index| *index < current);
+    let new = match position {
+        LayerPosition::Named(NamedLayerPosition::Front) => match siblings.last() {
+            Some(top) if *top > current => IndexKey::after(*top),
+            _ => return Ok(None),
+        },
+        LayerPosition::Named(NamedLayerPosition::Back) => match siblings.first() {
+            Some(bottom) if *bottom < current => IndexKey::before(*bottom),
+            _ => return Ok(None),
+        },
+        LayerPosition::Named(NamedLayerPosition::Forward) => {
+            let mut above = above;
+            let Some(next) = above.next() else {
+                return Ok(None);
+            };
+            match above.next() {
+                Some(after_next) => {
+                    if IndexKey::near_precision_limit(next, after_next) {
+                        bail!(
+                            "the z-order gap above {id} is exhausted; reorder the siblings first"
+                        );
+                    }
+                    IndexKey::between(next, after_next)
+                }
+                None => IndexKey::after(next),
+            }
+        }
+        LayerPosition::Named(NamedLayerPosition::Backward) => {
+            let mut below: Vec<IndexKey> = below.collect();
+            let Some(previous) = below.pop() else {
+                return Ok(None);
+            };
+            match below.pop() {
+                Some(before_previous) => {
+                    if IndexKey::near_precision_limit(before_previous, previous) {
+                        bail!(
+                            "the z-order gap below {id} is exhausted; reorder the siblings first"
+                        );
+                    }
+                    IndexKey::between(before_previous, previous)
+                }
+                None => IndexKey::before(previous),
+            }
+        }
+        LayerPosition::Absolute { index } => {
+            let current_position = siblings
+                .iter()
+                .filter(|sibling| **sibling < current)
+                .count();
+            let already_on_top = index >= siblings.len() && current_position == siblings.len();
+            if index == current_position || already_on_top {
+                return Ok(None);
+            }
+            sibling_index(doc, parent, id, Some(index))?
+        }
+    };
+    Ok(Some(new))
 }
 
 /// Cap on a `create_image` payload after base64 decoding. Generous for any
@@ -1442,5 +2312,509 @@ mod tests {
         assert!(!doc.scene.contains(frame));
         assert!(!doc.scene.contains(ellipse));
         assert!(doc.selection.iter().next().is_none());
+    }
+    fn create_rect(doc: &mut Doc, x: f64, y: f64, width: f64, height: f64) -> NodeId {
+        let outcome = run_batch(
+            doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "rectangle",
+                 "x": x, "y": y, "width": width, "height": height},
+            ])),
+            "Create",
+        );
+        assert_eq!(outcome.value["applied"], json!(true), "{}", outcome.value);
+        created_id(&outcome, 0)
+    }
+
+    fn assert_applied(outcome: &BatchOutcome) {
+        assert_eq!(outcome.value["applied"], json!(true), "{}", outcome.value);
+    }
+
+    #[test]
+    fn empty_space_is_the_origin_on_an_empty_page_and_beside_content_otherwise() {
+        let (mut doc, page_id) = doc_with_page();
+        assert_eq!(empty_space(&doc, page_id, 100.0, 50.0), glam::DVec2::ZERO);
+
+        create_rect(&mut doc, 10.0, 20.0, 200.0, 100.0);
+        let spot = empty_space(&doc, page_id, 100.0, 50.0);
+        assert_eq!((spot.x, spot.y), (210.0 + EMPTY_SPACE_MARGIN, 20.0));
+        assert!(page_area_is_empty(
+            &doc,
+            page_id,
+            Bounds::from_xywh(spot.x, spot.y, 100.0, 50.0)
+        ));
+        assert!(!page_area_is_empty(
+            &doc,
+            page_id,
+            Bounds::from_xywh(0.0, 0.0, 50.0, 50.0)
+        ));
+    }
+
+    #[test]
+    fn empty_space_never_overlaps_existing_top_level_content() {
+        let (mut doc, page_id) = doc_with_page();
+        create_rect(&mut doc, 0.0, 0.0, 100.0, 100.0);
+        // An empty frame is invisible to the leaf index but still occupies
+        // the page; the spot must clear it too.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 100.0 + EMPTY_SPACE_MARGIN, "y": 0.0, "width": 300.0, "height": 100.0},
+            ])),
+            "Frame",
+        );
+        assert_applied(&outcome);
+        let spot = empty_space(&doc, page_id, 50.0, 50.0);
+        let rect = Bounds::from_xywh(spot.x, spot.y, 50.0, 50.0);
+        assert!(page_area_is_empty(&doc, page_id, rect));
+        for child in doc.scene.children_of(Some(page_id)) {
+            let bounds = doc.scene.world_bounds(*child).unwrap();
+            assert!(!bounds.intersects(&rect), "{rect:?} overlaps {bounds:?}");
+        }
+    }
+
+    #[test]
+    fn state_style_ops_write_stroke_shadow_and_text_style() {
+        let (mut doc, _) = doc_with_page();
+        let rect = create_rect(&mut doc, 0.0, 0.0, 40.0, 40.0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "text", "text": "Hi",
+                 "x": 0.0, "y": 0.0, "width": 80.0, "height": 20.0},
+            ])),
+            "Text",
+        );
+        let text = created_id(&outcome, 0);
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_stroke", "id": rect.to_string(), "color": "#112233", "width": 3.0,
+                 "align": "inside"},
+                {"op": "set_shadow", "id": rect.to_string(), "color": "#00000080", "y": 6.0,
+                 "blur": 12.0},
+                {"op": "set_text_style", "id": text.to_string(), "font_family": "Inter",
+                 "font_weight": 600, "font_size": 24.0, "line_height": 1.2,
+                 "letter_spacing": -0.5, "align": "center", "color": "#FF0000"},
+            ])),
+            "Style",
+        );
+        assert_applied(&outcome);
+        let NodeData::Vector(vector) = &doc.scene.get(rect).unwrap().data else {
+            panic!("expected a vector");
+        };
+        assert_eq!(vector.strokes.len(), 1);
+        assert_eq!(vector.strokes[0].width, 3.0);
+        assert_eq!(vector.strokes[0].align, StrokeAlign::Inside);
+        assert_eq!(
+            vector.strokes[0].paint.solid_color(),
+            parse_color("#112233")
+        );
+        let effects = &doc.scene.get(rect).unwrap().effects;
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].offset, [0.0, 6.0]);
+        assert_eq!(effects[0].blur, 12.0);
+        let NodeData::Text(text_node) = &doc.scene.get(text).unwrap().data else {
+            panic!("expected text");
+        };
+        assert_eq!(text_node.style.font_family, "Inter");
+        assert_eq!(text_node.style.weight, 600);
+        assert_eq!(text_node.style.size_px, 24.0);
+        assert_eq!(text_node.style.line_height, 1.2);
+        assert_eq!(text_node.style.letter_spacing, -0.5);
+        assert_eq!(text_node.align, TextAlign::Center);
+        assert_eq!(text_node.style.color, parse_color("#FF0000").unwrap());
+
+        // Width 0 removes the stroke; remove drops the shadow.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_stroke", "id": rect.to_string(), "width": 0.0},
+                {"op": "set_shadow", "id": rect.to_string(), "remove": true},
+            ])),
+            "Clear",
+        );
+        assert_applied(&outcome);
+        let NodeData::Vector(vector) = &doc.scene.get(rect).unwrap().data else {
+            panic!("expected a vector");
+        };
+        assert!(vector.strokes.is_empty());
+        assert!(doc.scene.get(rect).unwrap().effects.is_empty());
+
+        // Strokes on text are refused with the op index named by the batch.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "set_stroke", "id": text.to_string(), "width": 1.0}])),
+            "Bad stroke",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        assert_eq!(outcome.value["ops"][0]["status"], json!("failed"));
+    }
+
+    #[test]
+    fn set_auto_layout_configures_and_clears_the_frame_layout() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 0.0, "y": 0.0, "width": 300.0, "height": 100.0},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_auto_layout", "id": frame.to_string(), "direction": "vertical",
+                 "gap": 8.0, "padding": [16.0, 24.0], "align_items": "stretch",
+                 "justify": "space_between"},
+            ])),
+            "Layout",
+        );
+        assert_applied(&outcome);
+        let NodeData::Group(group) = &doc.scene.get(frame).unwrap().data else {
+            panic!("expected a frame");
+        };
+        let layout = group.auto_layout.expect("auto layout on");
+        assert_eq!(layout.mode, LayoutMode::Vertical);
+        assert_eq!(layout.spacing, 8.0);
+        assert_eq!(layout.padding, [16.0, 24.0, 16.0, 24.0]);
+        assert_eq!(layout.counter_align, CounterAlign::Stretch);
+        assert_eq!(layout.primary_align, PrimaryAlign::SpaceBetween);
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_auto_layout", "id": frame.to_string(), "direction": "none"},
+            ])),
+            "Layout off",
+        );
+        assert_applied(&outcome);
+        let NodeData::Group(group) = &doc.scene.get(frame).unwrap().data else {
+            panic!("expected a frame");
+        };
+        assert!(group.auto_layout.is_none());
+
+        assert!(parse_padding(&[1.0, 2.0, 3.0]).is_err());
+        assert_eq!(parse_padding(&[4.0]).unwrap(), [4.0; 4]);
+        assert_eq!(
+            parse_padding(&[1.0, 2.0, 3.0, 4.0]).unwrap(),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn set_index_moves_a_node_through_its_siblings() {
+        let (mut doc, page_id) = doc_with_page();
+        let bottom = create_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
+        let middle = create_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
+        let top = create_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
+        let order = |doc: &Doc| doc.scene.children_of(Some(page_id)).to_vec();
+        assert_eq!(order(&doc), vec![bottom, middle, top]);
+
+        let run = |doc: &mut Doc, id: NodeId, position: Value| {
+            let outcome = run_batch(
+                doc,
+                &ops(json!([{"op": "set_index", "id": id.to_string(), "position": position}])),
+                "Reorder",
+            );
+            assert_applied(&outcome);
+        };
+        run(&mut doc, bottom, json!("front"));
+        assert_eq!(order(&doc), vec![middle, top, bottom]);
+        run(&mut doc, bottom, json!("backward"));
+        assert_eq!(order(&doc), vec![middle, bottom, top]);
+        run(&mut doc, middle, json!("forward"));
+        assert_eq!(order(&doc), vec![bottom, middle, top]);
+        run(&mut doc, top, json!("back"));
+        assert_eq!(order(&doc), vec![top, bottom, middle]);
+        run(&mut doc, top, json!({"index": 1}));
+        assert_eq!(order(&doc), vec![bottom, top, middle]);
+        // Already at the front: no change, still a successful op.
+        run(&mut doc, middle, json!("front"));
+        assert_eq!(order(&doc), vec![bottom, top, middle]);
+    }
+
+    #[test]
+    fn align_and_distribute_move_nodes_in_world_space() {
+        let (mut doc, _) = doc_with_page();
+        let first = create_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
+        let second = create_rect(&mut doc, 100.0, 50.0, 10.0, 10.0);
+        let third = create_rect(&mut doc, 130.0, 90.0, 10.0, 10.0);
+        let ids = [first, second, third]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "align", "ids": ids, "edge": "top"},
+                {"op": "distribute", "ids": ids, "axis": "horizontal"},
+            ])),
+            "Tidy",
+        );
+        assert_applied(&outcome);
+        for id in [first, second, third] {
+            assert_eq!(doc.scene.world_bounds(id).unwrap().min_y, 0.0);
+        }
+        assert_eq!(doc.scene.world_bounds(second).unwrap().min_x, 65.0);
+
+        // A single node aligns to its parent frame.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 200.0, "y": 200.0, "width": 100.0, "height": 100.0},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "reparent", "id": first.to_string(), "parent": frame.to_string()},
+                {"op": "align", "ids": [first.to_string()], "edge": "center_x"},
+                {"op": "align", "ids": [first.to_string()], "edge": "bottom"},
+            ])),
+            "Center in frame",
+        );
+        assert_applied(&outcome);
+        let bounds = doc.scene.world_bounds(first).unwrap();
+        assert_eq!((bounds.min_x, bounds.max_y), (245.0, 300.0));
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "distribute", "ids": [second.to_string()], "axis": "vertical"}])),
+            "Too few",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+    }
+
+    #[test]
+    fn rotate_sets_an_absolute_angle_about_the_centre() {
+        let (mut doc, _) = doc_with_page();
+        let rect = create_rect(&mut doc, 0.0, 0.0, 40.0, 20.0);
+        let before = doc.scene.world_bounds(rect).unwrap().center();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "rotate", "id": rect.to_string(), "degrees": 90.0}])),
+            "Rotate",
+        );
+        assert_applied(&outcome);
+        let after = doc.scene.world_bounds(rect).unwrap();
+        assert!((after.center() - before).length() < 1e-9);
+        assert!((after.width() - 20.0).abs() < 1e-9 && (after.height() - 40.0).abs() < 1e-9);
+        let angle = fanta_canvas::transform_angle(&doc.scene.world_transform(rect).unwrap());
+        assert!((angle - 90.0_f64.to_radians()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duplicate_returns_the_copy_and_offsets_it() {
+        let (mut doc, page_id) = doc_with_page();
+        let rect = create_rect(&mut doc, 10.0, 10.0, 40.0, 20.0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "duplicate", "id": rect.to_string(), "dx": 50.0, "dy": 0.0}])),
+            "Duplicate",
+        );
+        assert_applied(&outcome);
+        let copy = created_id(&outcome, 0);
+        assert_ne!(copy, rect);
+        let bounds = doc.scene.world_bounds(copy).unwrap();
+        assert_eq!((bounds.min_x, bounds.min_y), (60.0, 10.0));
+        assert_eq!(doc.scene.children_of(Some(page_id)), &[rect, copy]);
+        assert_eq!(doc.history.undo_depth(), 2);
+    }
+
+    #[test]
+    fn a_failed_batch_rolls_back_a_component_definition() {
+        let (mut doc, _page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Button",
+                 "x": 0.0, "y": 0.0, "width": 120.0, "height": 40.0},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0);
+        let defs_before = doc.components.defs.len();
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_component", "id": frame.to_string()},
+                {"op": "delete", "id": NodeId::new().to_string()},
+            ])),
+            "Componentize then fail",
+        );
+        assert_eq!(outcome.value["applied"], Value::Bool(false));
+        assert_eq!(
+            doc.components.defs.len(),
+            defs_before,
+            "the definition applied before the failure must roll back with the batch"
+        );
+        assert!(!doc.is_component_root(frame));
+    }
+
+    #[test]
+    fn create_component_then_create_instance_by_name_and_id() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Button",
+                 "x": 0.0, "y": 0.0, "width": 120.0, "height": 40.0},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "create_component", "id": frame.to_string()}])),
+            "Componentize",
+        );
+        assert_applied(&outcome);
+        let component = outcome.value["ops"][0]["component"]
+            .as_str()
+            .expect("the component id is reported")
+            .to_string();
+        assert!(doc.is_component_root(frame));
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_instance", "component": "Button", "x": 200.0, "y": 300.0},
+                {"op": "create_instance", "component": component, "x": 400.0, "y": 300.0,
+                 "name": "Second"},
+            ])),
+            "Instances",
+        );
+        assert_applied(&outcome);
+        let instance = created_id(&outcome, 0);
+        let node = doc.scene.get(instance).unwrap();
+        assert_eq!(node.parent, Some(page_id));
+        assert_eq!(node.name, "Button");
+        let NodeData::Instance(instance_node) = &node.data else {
+            panic!("expected an instance");
+        };
+        assert_eq!(instance_node.local_size, [120.0, 40.0]);
+        let bounds = doc.scene.world_bounds(instance).unwrap();
+        assert_eq!((bounds.min_x, bounds.min_y), (200.0, 300.0));
+        assert_eq!(
+            doc.scene.get(created_id(&outcome, 1)).unwrap().name,
+            "Second"
+        );
+
+        // Instances cannot nest inside their own master.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_instance", "component": "Button", "x": 0.0, "y": 0.0,
+                 "parent": frame.to_string()},
+            ])),
+            "Recursive",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        // A second master named the same makes the name ambiguous.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Button",
+                 "x": 0.0, "y": 500.0, "width": 10.0, "height": 10.0},
+            ])),
+            "Frame",
+        );
+        let other = created_id(&outcome, 0);
+        run_batch(
+            &mut doc,
+            &ops(json!([{"op": "create_component", "id": other.to_string()}])),
+            "Componentize",
+        );
+        assert!(resolve_component(&doc, "Button").is_err());
+    }
+
+    #[test]
+    fn group_ungroup_and_frame_selection_report_their_structure() {
+        let (mut doc, page_id) = doc_with_page();
+        let first = create_rect(&mut doc, 10.0, 10.0, 20.0, 20.0);
+        let second = create_rect(&mut doc, 50.0, 30.0, 20.0, 20.0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "group", "ids": [first.to_string(), second.to_string()], "name": "Pair"},
+            ])),
+            "Group",
+        );
+        assert_applied(&outcome);
+        let group = created_id(&outcome, 0);
+        assert_eq!(doc.scene.get(group).unwrap().name, "Pair");
+        assert_eq!(doc.scene.get(first).unwrap().parent, Some(group));
+        let bounds = doc.scene.world_bounds(first).unwrap();
+        assert_eq!((bounds.min_x, bounds.min_y), (10.0, 10.0));
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "ungroup", "id": group.to_string()}])),
+            "Ungroup",
+        );
+        assert_applied(&outcome);
+        let children = outcome.value["ops"][0]["children"]
+            .as_array()
+            .expect("freed children are reported");
+        assert_eq!(children.len(), 2);
+        assert!(!doc.scene.contains(group));
+        assert_eq!(doc.scene.get(second).unwrap().parent, Some(page_id));
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "frame_selection", "ids": [first.to_string(), second.to_string()]},
+            ])),
+            "Frame",
+        );
+        assert_applied(&outcome);
+        let frame = created_id(&outcome, 0);
+        let NodeData::Group(group_node) = &doc.scene.get(frame).unwrap().data else {
+            panic!("expected a frame");
+        };
+        assert_eq!(group_node.clip_size, Some([60.0, 40.0]));
+        assert!(group_node.background.is_none());
+    }
+
+    #[test]
+    fn node_summary_carries_kind_specific_facts() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Card",
+                 "x": 0.0, "y": 0.0, "width": 200.0, "height": 100.0, "fill": "#FAFAFA"},
+                {"op": "create_node", "node_type": "text", "text": "Title",
+                 "x": 8.0, "y": 8.0, "width": 100.0, "height": 20.0},
+                {"op": "create_node", "node_type": "rectangle",
+                 "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0, "fill": "#123456"},
+            ])),
+            "Create",
+        );
+        let frame = created_id(&outcome, 0);
+        run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_auto_layout", "id": frame.to_string(), "direction": "horizontal"},
+            ])),
+            "Layout",
+        );
+        let summary = node_summary(&doc, page_id, None, false);
+        let children = summary["children"].as_array().unwrap();
+        assert_eq!(children[0]["size"], json!([200.0, 100.0]));
+        assert_eq!(children[0]["auto_layout"], json!("horizontal"));
+        assert_eq!(children[0]["fill"], json!("#FAFAFA"));
+        assert_eq!(children[1]["text"], json!("Title"));
+        assert_eq!(children[1]["font"]["size"], json!(16.0));
+        assert_eq!(children[2]["fill"], json!("#123456"));
     }
 }

@@ -36,7 +36,8 @@ use workspace::{
 use crate::document::{DocChange, FigDocument, FigPage, page_bounds};
 use crate::panel_settings::FantaDesignPanelSettings;
 use crate::view::{
-    CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, PasteSelection,
+    CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, FrameSelection,
+    GroupSelection, PasteSelection, UngroupSelection,
 };
 
 actions!(
@@ -367,8 +368,14 @@ pub struct FantaDesignPanel {
     width: Option<Pixels>,
     /// Host-controlled expansion of the layer tree, echoed into the gpui
     /// panel on every refresh (the panel's own expansion interactions come
-    /// back as `ExpansionChanged` and land here).
+    /// back as `ExpansionChanged` and land here). Mutated only through
+    /// `set_node_expanded` / `clear_expanded_nodes`, which keep
+    /// `expansion_generation` honest.
     expanded_nodes: HashSet<NodeId>,
+    /// Bumped whenever `expanded_nodes` changes. The layer tree read model
+    /// holds only the children of expanded containers, so it is memoized on
+    /// this counter alongside the document's render generation.
+    expansion_generation: u64,
     collapsed_sections: HashSet<Section>,
     // Cached section state, rebuilt on document events (never in render — see
     // `render_sections`).
@@ -524,6 +531,7 @@ impl FantaDesignPanel {
             active_view: None,
             width: None,
             expanded_nodes: HashSet::new(),
+            expansion_generation: 0,
             collapsed_sections: HashSet::new(),
             pages_cache: Vec::new(),
             #[cfg(feature = "fanta-gpui-ui")]
@@ -594,7 +602,7 @@ impl FantaDesignPanel {
                         },
                     ));
                     self.active_view = Some(view.downgrade());
-                    self.expanded_nodes.clear();
+                    self.clear_expanded_nodes();
                     self.last_reveal_anchor = None;
                     self.pending_reveal = None;
                     // Another document may reuse a (root, generation) key —
@@ -617,6 +625,28 @@ impl FantaDesignPanel {
             }
         }
         cx.notify();
+    }
+
+    /// Expands or collapses one layer-tree node. A no-op change (already in
+    /// that state) leaves `expansion_generation` alone so the memoized tree
+    /// survives the reveal echoes that re-expand an already open chain.
+    fn set_node_expanded(&mut self, id: NodeId, expanded: bool) {
+        let changed = if expanded {
+            self.expanded_nodes.insert(id)
+        } else {
+            self.expanded_nodes.remove(&id)
+        };
+        if changed {
+            self.expansion_generation = self.expansion_generation.wrapping_add(1);
+        }
+    }
+
+    fn clear_expanded_nodes(&mut self) {
+        if self.expanded_nodes.is_empty() {
+            return;
+        }
+        self.expanded_nodes.clear();
+        self.expansion_generation = self.expansion_generation.wrapping_add(1);
     }
 
     fn active_view(&self, _cx: &App) -> Option<Entity<FigView>> {
@@ -834,7 +864,7 @@ impl FantaDesignPanel {
                 doc.history.begin("Move layer", &mut doc.scene);
                 for operation in operations {
                     if let Err(error) = doc.apply(operation) {
-                        let rollback = doc.history.abort(&mut doc.scene);
+                        let rollback = doc.abort_transaction();
                         let error = match rollback {
                             Ok(()) => anyhow::anyhow!("reparenting layer: {error}"),
                             Err(rollback_error) => anyhow::anyhow!(
@@ -852,7 +882,7 @@ impl FantaDesignPanel {
         match result {
             Ok(true) => {
                 if placement == LayerDropPlacement::Inside {
-                    self.expanded_nodes.insert(target);
+                    self.set_node_expanded(target, true);
                 }
                 self.rebuild_caches(cx);
                 cx.notify();
@@ -1260,8 +1290,14 @@ impl FantaDesignPanel {
         if anchor != self.last_reveal_anchor {
             self.last_reveal_anchor = anchor;
             if let Some(anchor) = anchor {
-                for ancestor in doc.scene.ancestors_of(anchor) {
-                    self.expanded_nodes.insert(ancestor.id);
+                // The page root is never a row, so expanding it would only
+                // invalidate the memoized tree for nothing.
+                for ancestor in doc
+                    .scene
+                    .ancestors_of(anchor)
+                    .filter(|ancestor| Some(ancestor.id) != page_root)
+                {
+                    self.set_node_expanded(ancestor.id, true);
                 }
                 self.pending_reveal = Some(anchor);
             }
@@ -1728,6 +1764,21 @@ impl Render for FantaDesignPanel {
             .on_action(cx.listener(|this, _: &DuplicateSelection, _, cx| {
                 if let Some(view) = this.active_view(cx) {
                     view.update(cx, |view, cx| view.duplicate_selected_nodes(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GroupSelection, window, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.group_nodes(None, window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &UngroupSelection, window, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.ungroup_nodes(None, window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FrameSelection, window, cx| {
+                if let Some(view) = this.active_view(cx) {
+                    view.update(cx, |view, cx| view.frame_nodes(None, window, cx));
                 }
             }))
             .size_full()
@@ -2682,19 +2733,38 @@ mod gpui_layers_tests {
         assert!(row_bounds(&mut harness, leaves[299]).is_none());
     }
 
+    fn tree_key(harness: &Harness) -> Option<crate::gpui_adapters::layers::LayersTreeKey> {
+        harness.panel.read_with(&harness.cx, |panel, _| {
+            panel.gpui_layers.as_ref().unwrap().tree_key
+        })
+    }
+
+    fn shown_rows(harness: &Harness) -> Vec<SharedString> {
+        harness
+            .layers
+            .read_with(&harness.cx, |layers, _| layers.visible_row_ids())
+    }
+
+    fn disclosure_bounds(harness: &mut Harness, id: NodeId) -> Option<gpui::Bounds<Pixels>> {
+        let selector: &'static str = Box::leak(format!("layers-expand-{id}").into_boxed_str());
+        harness.cx.debug_bounds(selector)
+    }
+
     #[gpui::test]
     async fn selection_changes_do_not_rebuild_the_layer_tree(cx: &mut TestAppContext) {
         let mut harness = setup(cx, 20).await;
         let leaves = harness.fixture.leaves.clone();
-        let key_before = harness.panel.read_with(&harness.cx, |panel, _| {
-            panel.gpui_layers.as_ref().unwrap().tree_key
-        });
-        assert!(key_before.is_some());
+        let key_mounted = tree_key(&harness);
+        assert!(key_mounted.is_some());
+        // The first reveal opens the frame, which the pruned tree must be
+        // rebuilt for; after that the chain is open and selection alone
+        // never rebuilds.
         select_on_canvas(&mut harness, leaves[0]);
+        let key_before = tree_key(&harness);
+        assert_ne!(key_mounted, key_before, "revealing a pruned leaf rebuilds");
         select_on_canvas(&mut harness, leaves[1]);
-        let key_after = harness.panel.read_with(&harness.cx, |panel, _| {
-            panel.gpui_layers.as_ref().unwrap().tree_key
-        });
+        select_on_canvas(&mut harness, leaves[2]);
+        let key_after = tree_key(&harness);
         assert_eq!(
             key_before, key_after,
             "selection is echoed without a rebuild"
@@ -2706,10 +2776,78 @@ mod gpui_layers_tests {
             panel.rename_node_to(leaf, "Renamed".into(), cx);
         });
         harness.cx.run_until_parked();
-        let key_edited = harness.panel.read_with(&harness.cx, |panel, _| {
-            panel.gpui_layers.as_ref().unwrap().tree_key
-        });
+        let key_edited = tree_key(&harness);
         assert_ne!(key_before, key_edited);
+    }
+
+    #[gpui::test]
+    async fn expanding_a_row_supplies_its_children_and_collapsing_prunes_them(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 5).await;
+        let frame = harness.fixture.frame;
+        let master = harness.fixture.master;
+        let instance = harness.fixture.instance;
+        let leaves = harness.fixture.leaves.clone();
+
+        // Collapsed on mount: the tree holds the page's top level only, yet
+        // the frame keeps its disclosure arrow from the children hint, and
+        // the childless master does not get one.
+        assert_eq!(
+            shown_rows(&harness),
+            vec![row_id(instance), row_id(master), row_id(frame)]
+        );
+        assert!(disclosure_bounds(&mut harness, frame).is_some());
+        assert!(disclosure_bounds(&mut harness, master).is_none());
+        assert!(row_bounds(&mut harness, leaves[0]).is_none());
+        let key_collapsed = tree_key(&harness);
+
+        // The panel's expansion intent makes the host rebuild with the
+        // frame's children (topmost first) — no document edit involved.
+        emit(
+            &mut harness,
+            LayersPanelAction::ExpansionChanged {
+                node_id: row_id(frame),
+                expanded: true,
+            },
+        );
+        let key_expanded = tree_key(&harness);
+        assert_ne!(key_collapsed, key_expanded);
+        let mut expected = vec![row_id(instance), row_id(master), row_id(frame)];
+        expected.extend(leaves.iter().rev().map(|leaf| row_id(*leaf)));
+        assert_eq!(shown_rows(&harness), expected);
+        assert!(row_bounds(&mut harness, leaves[4]).is_some());
+
+        // Re-echoing the same expansion (a reveal of a leaf whose chain is
+        // already open) does not rebuild.
+        select_on_canvas(&mut harness, leaves[2]);
+        assert_eq!(tree_key(&harness), key_expanded);
+
+        // Collapsing prunes the subtree from the tree again.
+        emit(
+            &mut harness,
+            LayersPanelAction::ExpansionChanged {
+                node_id: row_id(frame),
+                expanded: false,
+            },
+        );
+        assert_ne!(tree_key(&harness), key_expanded);
+        assert_eq!(
+            shown_rows(&harness),
+            vec![row_id(instance), row_id(master), row_id(frame)]
+        );
+        assert!(disclosure_bounds(&mut harness, frame).is_some());
+        let key_pruned = tree_key(&harness);
+
+        // Collapse-all over an already collapsed tree changes nothing, so
+        // the memoized tree survives.
+        emit(&mut harness, LayersPanelAction::CollapseAllRequested);
+        assert_eq!(tree_key(&harness), key_pruned);
+        assert!(
+            harness
+                .panel
+                .read_with(&harness.cx, |panel, _| panel.expanded_nodes.is_empty())
+        );
     }
 
     #[gpui::test]
@@ -3309,7 +3447,7 @@ impl FantaDesignPanel {
                 doc.history.begin(label, &mut doc.scene);
                 for operation in operations {
                     if let Err(error) = doc.apply(operation) {
-                        let rollback = doc.history.abort(&mut doc.scene);
+                        let rollback = doc.abort_transaction();
                         let error = match rollback {
                             Ok(()) => anyhow::anyhow!("{label}: {error}"),
                             Err(rollback_error) => {
@@ -3426,10 +3564,12 @@ impl FantaDesignPanel {
     }
 
     /// Echo the layer tree, selection, and expansion into the panel, then
-    /// scroll a pending reveal into view. The tree read model is memoized on
-    /// (page root, render generation): selection changes — every canvas
-    /// click — reach the panel as two id-list setters, never as a rebuild of
-    /// a 30k-item tree.
+    /// scroll a pending reveal into view. The tree read model holds only the
+    /// children of expanded containers and is memoized on
+    /// [`LayersTreeKey`](crate::gpui_adapters::layers::LayersTreeKey):
+    /// selection changes — every canvas click — reach the panel as two
+    /// id-list setters, never as a rebuild, and a rebuild (an edit, or an
+    /// expansion toggle) costs the shown rows, not the 30k-node page.
     fn refresh_gpui_layers(&mut self, cx: &mut App) {
         let refresh_started = std::time::Instant::now();
         let Some(view) = self.active_view(cx) else {
@@ -3445,12 +3585,16 @@ impl FantaDesignPanel {
         };
         let doc = &document.doc;
         let page_root = Self::layers_page_root(view, document);
-        let tree_key = (page_root, document.render_generation());
+        let tree_key = crate::gpui_adapters::layers::LayersTreeKey {
+            page_root,
+            render_generation: document.render_generation(),
+            expansion_generation: self.expansion_generation,
+        };
         let tree = (self
             .gpui_layers
             .as_ref()
             .is_some_and(|adapter| adapter.tree_key != Some(tree_key)))
-        .then(|| crate::gpui_adapters::layers::layers_tree(doc, page_root));
+        .then(|| crate::gpui_adapters::layers::layers_tree(doc, page_root, &self.expanded_nodes));
         let selected: Vec<SharedString> = doc
             .selection
             .iter()
@@ -3508,15 +3652,14 @@ impl FantaDesignPanel {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                if *expanded {
-                    self.expanded_nodes.insert(id);
-                } else {
-                    self.expanded_nodes.remove(&id);
-                }
+                // The panel already shows the toggle; the refresh supplies
+                // (or prunes) the subtree the tree read model left out.
+                self.set_node_expanded(id, *expanded);
+                self.refresh_gpui_layers(cx);
                 cx.notify();
             }
             LayersPanelAction::CollapseAllRequested => {
-                self.expanded_nodes.clear();
+                self.clear_expanded_nodes();
                 self.refresh_gpui_layers(cx);
                 cx.notify();
             }
@@ -3620,6 +3763,25 @@ impl FantaDesignPanel {
                 });
                 if let Some(master) = master {
                     self.focus_component(master, cx);
+                }
+            }
+            // The view decides whether the clicked row stands in for the
+            // selection (it is part of it) or is the sole target.
+            LayersPanelContextAction::GroupSelection => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.group_nodes(Some(id), window, cx));
+                }
+            }
+            LayersPanelContextAction::FrameSelection => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.frame_nodes(Some(id), window, cx));
+                }
+            }
+            // Removing a frame is ungrouping it: the frame dissolves and its
+            // children keep their place, exactly what shift-cmd-G does.
+            LayersPanelContextAction::Ungroup | LayersPanelContextAction::RemoveFrame => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.ungroup_nodes(Some(id), window, cx));
                 }
             }
             other => crate::view::notify_unavailable(other.label(), window, cx),

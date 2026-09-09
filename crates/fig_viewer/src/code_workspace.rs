@@ -661,7 +661,10 @@ fn opening_tags(source: &str) -> Vec<OpeningTag> {
             }
         }
         let (end, name) = scan_tag(source, name_end);
-        tags.push(OpeningTag { offset: index, name });
+        tags.push(OpeningTag {
+            offset: index,
+            name,
+        });
         index = end;
     }
     tags
@@ -776,16 +779,12 @@ impl Render for FantaCodeWorkspace {
                     .child(self.render_selector(cx))
                     .children(self.render_path(cx))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(
-                                Label::new(status)
-                                    .size(LabelSize::Small)
-                                    .color(status_color)
-                                    .single_line(),
-                            ),
+                        div().flex_1().min_w_0().overflow_hidden().child(
+                            Label::new(status)
+                                .size(LabelSize::Small)
+                                .color(status_color)
+                                .single_line(),
+                        ),
                     ),
             )
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))

@@ -104,6 +104,7 @@ fn format_value(value: Option<&KiwiValue>) -> String {
     match value {
         KiwiValue::Bool(value) => value.to_string(),
         KiwiValue::Byte(value) => value.to_string(),
+        KiwiValue::Bytes(bytes) => format!("<{} bytes>", bytes.len()),
         KiwiValue::Int(value) => value.to_string(),
         KiwiValue::Uint(value) => value.to_string(),
         KiwiValue::Float(value) => format!("{value:.3}"),

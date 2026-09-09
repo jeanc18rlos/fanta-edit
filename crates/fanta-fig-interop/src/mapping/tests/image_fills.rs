@@ -70,6 +70,37 @@ fn rect_with_paints(paints: Vec<KiwiValue>) -> KiwiValue {
 }
 
 #[test]
+fn compact_byte_hash_reads_like_the_element_wise_form() {
+    // The decoder produces `KiwiValue::Bytes` for `byte[]` fields; hand-built
+    // values use an `Array` of `Byte`s. Both must key the same asset.
+    let hash_bytes: Vec<u8> = (1u8..=20).collect();
+    let element_wise = image_paint(&hash_bytes, "FILL");
+    let mut compact = image_paint(&hash_bytes, "FILL");
+    compact
+        .get_mut("image")
+        .unwrap()
+        .set_field("hash", KiwiValue::Bytes(hash_bytes.clone()));
+
+    let expected_hex = hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        image_hash_hex(&compact).as_deref(),
+        Some(expected_hex.as_str())
+    );
+    assert_eq!(image_hash_hex(&compact), image_hash_hex(&element_wise));
+    assert_eq!(read_paint(&compact), read_paint(&element_wise));
+
+    // An empty hash still mints no asset.
+    compact
+        .get_mut("image")
+        .unwrap()
+        .set_field("hash", KiwiValue::Bytes(Vec::new()));
+    assert!(image_hash_hex(&compact).is_none());
+}
+
+#[test]
 fn image_paint_maps_to_fill_image_with_stable_asset_id() {
     // The 20-byte sha1 the paint references; hex is the ZIP key.
     let hash_bytes: Vec<u8> = (1u8..=20).collect();

@@ -28,9 +28,12 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// `get_generation` reports an asset URL. The image is ingested as a project
 /// asset (persisted under `assets/images/` when the project is saved), so the
 /// design stays self-contained. `x`/`y` are world (canvas) coordinates of the
-/// placed image's top-left corner; omit `width`/`height` to keep the image's
-/// natural pixel size (give one and the other follows the aspect ratio).
-/// Verify placement with `design_screenshot`.
+/// placed image's top-left corner (y grows down); omit `width`/`height` to
+/// keep the image's natural pixel size (give one and the other follows the
+/// aspect ratio). Ask `design_state` for `empty_space` first when placing on
+/// the page rather than inside a frame, then verify placement with
+/// `design_screenshot`. This is the equivalent of a `create_image` op in
+/// `design_edit` with the download done for you.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct PlaceGenerationToolInput {
     /// URL of the finished generation's image file.

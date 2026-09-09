@@ -3,12 +3,14 @@
 //! and the `Item` integration that gives fanta projects text-editor-style
 //! dirty tracking and save.
 
-use anyhow::Result;
+use std::collections::HashSet;
+
+use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp, Easing,
+    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp, Doc, Easing,
     Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, MotionTarget,
-    MotionTransform, NodeId, Operation, ResolvedVarValue, Transaction, Viewport,
+    MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue, Transaction, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -43,7 +45,7 @@ use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
 use crate::document::{
-    DocChange, FigDocument, FigItem, FigItemEvent, FigScope, SaveKind, ScopeRequester,
+    AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigScope, SaveKind, ScopeRequester,
 };
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
@@ -102,6 +104,12 @@ actions!(
         PasteSelection,
         /// Duplicate the selected canvas subtrees.
         DuplicateSelection,
+        /// Group the selected layers.
+        GroupSelection,
+        /// Ungroup the selected groups and frames.
+        UngroupSelection,
+        /// Wrap the selected layers in a frame.
+        FrameSelection,
         /// Present the authored prototype from its configured starting frame.
         PlayPrototype,
         /// Leave prototype presentation and return to the editor.
@@ -2627,6 +2635,131 @@ impl FigView {
         self.duplicate_selected_nodes(cx);
     }
 
+    fn group_selection(&mut self, _: &GroupSelection, window: &mut Window, cx: &mut Context<Self>) {
+        self.group_nodes(None, window, cx);
+    }
+
+    fn ungroup_selection(
+        &mut self,
+        _: &UngroupSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ungroup_nodes(None, window, cx);
+    }
+
+    fn frame_selection(&mut self, _: &FrameSelection, window: &mut Window, cx: &mut Context<Self>) {
+        self.frame_nodes(None, window, cx);
+    }
+
+    /// Wrap the structure targets (see [`Self::structure_targets`]) in a new
+    /// group and select it.
+    pub(crate) fn group_nodes(
+        &mut self,
+        clicked: Option<NodeId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_structure_edit(
+            "Group",
+            move |doc| {
+                let targets = structure_targets(doc, clicked);
+                let grouped = crate::structure::group_operations(doc, &targets, None)?;
+                Ok((grouped.operations, vec![grouped.group]))
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Wrap the structure targets in a new clipping frame and select it.
+    pub(crate) fn frame_nodes(
+        &mut self,
+        clicked: Option<NodeId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_structure_edit(
+            "Frame selection",
+            move |doc| {
+                let targets = structure_targets(doc, clicked);
+                let grouped = crate::structure::frame_selection_operations(doc, &targets, None)?;
+                Ok((grouped.operations, vec![grouped.group]))
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Dissolve every group or frame among the structure targets and select
+    /// the freed children. Targets nested in another target are skipped, as
+    /// their parent's ungroup already moves them.
+    pub(crate) fn ungroup_nodes(
+        &mut self,
+        clicked: Option<NodeId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_structure_edit(
+            "Ungroup",
+            move |doc| {
+                let targets = structure_targets(doc, clicked);
+                let groups = ungroupable_targets(doc, &targets);
+                if groups.is_empty() {
+                    anyhow::bail!("select a group or frame to ungroup");
+                }
+                let mut operations = Vec::new();
+                let mut children = Vec::new();
+                for group in groups {
+                    let ungrouped = crate::structure::ungroup_operations(doc, group)?;
+                    operations.extend(ungrouped.operations);
+                    children.extend(ungrouped.children);
+                }
+                Ok((operations, children))
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Run one structural transaction built from the current document and
+    /// select `select` afterwards. A refusal (a page in the selection, no
+    /// group to ungroup) is shown as a canvas notice: the command came from a
+    /// visible control, so silence would read as a broken button.
+    fn apply_structure_edit(
+        &mut self,
+        label: &str,
+        build: impl FnOnce(&Doc) -> Result<(Vec<Operation>, Vec<NodeId>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let result = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (operations, select) = match build(&document.doc) {
+                    Ok(built) => built,
+                    Err(error) => return (Err(error), DocChange::None),
+                };
+                match apply_canvas_transaction(&mut document.doc, label, operations) {
+                    Ok(true) => {
+                        document.doc.selection.replace_with(select);
+                        (Ok(()), DocChange::Content)
+                    }
+                    Ok(false) => (Ok(()), DocChange::None),
+                    Err(error) => (Err(error), DocChange::None),
+                }
+            })
+            .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
+        });
+        if let Err(error) = result {
+            log::warn!("{label} on the canvas selection failed: {error:#}");
+            show_canvas_notice(format!("{label}: {error:#}"), window, cx);
+        }
+    }
+
     /// Select every top-level node of the page the canvas is showing.
     ///
     /// A document with no active page renders all of its roots, and
@@ -2702,21 +2835,131 @@ impl FigView {
         }
     }
 
+    /// Paste in priority order: a canvas payload copied from this app, then
+    /// image bytes from another app, then image files copied in a file
+    /// manager. Text without a canvas payload is not pastable on the canvas.
     pub(crate) fn paste_selected_nodes(&mut self, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
             return;
         }
-        let payload = cx.read_from_clipboard().and_then(|clipboard| {
-            clipboard.entries.into_iter().find_map(|entry| match entry {
-                ClipboardEntry::String(string) => string.metadata_json::<CanvasClipboard>(),
-                ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_) => None,
-            })
-        });
-        let Some(payload) = payload else {
+        let Some(clipboard) = cx.read_from_clipboard() else {
             return;
         };
+        let payload = clipboard.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::String(string) => string.metadata_json::<CanvasClipboard>(),
+            ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_) => None,
+        });
+        if let Some(payload) = payload {
+            self.finish_document_edits(cx);
+            self.insert_clipboard_payload(&payload, "Paste", 16.0, ClipboardPlacement::Paste, cx);
+            return;
+        }
+
+        let images = clipboard
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image.bytes().to_vec()),
+                ClipboardEntry::String(_) | ClipboardEntry::ExternalPaths(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !images.is_empty() {
+            self.finish_document_edits(cx);
+            self.place_pasted_images(images, cx);
+            return;
+        }
+
+        let paths = clipboard
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
+                ClipboardEntry::String(_) | ClipboardEntry::Image(_) => None,
+            })
+            .flatten()
+            .filter(|path| is_pastable_image_path(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return;
+        }
         self.finish_document_edits(cx);
-        self.insert_clipboard_payload(&payload, "Paste", 16.0, ClipboardPlacement::Paste, cx);
+        let read = cx.background_spawn(async move {
+            paths
+                .into_iter()
+                .map(|path| {
+                    std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+                })
+                .collect::<Vec<Result<Vec<u8>>>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let files = read.await;
+            this.update(cx, |this, cx| {
+                let mut images = Vec::new();
+                for file in files {
+                    match file {
+                        Ok(bytes) => images.push(bytes),
+                        Err(error) => {
+                            log::warn!("pasting an image file failed: {error:#}");
+                            show_canvas_notice_deferred(
+                                format!("Pasting an image file failed: {error:#}"),
+                                cx,
+                            );
+                        }
+                    }
+                }
+                if !images.is_empty() {
+                    this.place_pasted_images(images, cx);
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Ingest each image as a project asset and place it as a bitmap layer
+    /// centred on the viewport, one "Paste image" transaction per image so
+    /// a corrupt file in the middle of a batch does not undo its neighbours.
+    fn place_pasted_images(&mut self, images: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        let viewport = self.viewport.unwrap_or(Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        });
+        let visible = self
+            .container_bounds
+            .map(bounds_size)
+            .map(|(width, height)| [width / viewport.zoom, height / viewport.zoom])
+            .unwrap_or([1024.0, 768.0]);
+
+        let mut placed = Vec::new();
+        for (position, bytes) in images.into_iter().enumerate() {
+            let offset = position as f64 * 16.0;
+            let result = self.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let (doc, mut assets) = document.doc_and_assets();
+                    match paste_image(doc, &mut assets, bytes, viewport.center, visible, offset) {
+                        Ok(id) => (Ok(id), DocChange::Content),
+                        Err(error) => (Err(error), DocChange::None),
+                    }
+                })
+                .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
+            });
+            match result {
+                Ok(id) => placed.push(id),
+                Err(error) => {
+                    log::warn!("pasting an image failed: {error:#}");
+                    show_canvas_notice_deferred(format!("Pasting an image failed: {error:#}"), cx);
+                }
+            }
+        }
+        if placed.is_empty() {
+            return;
+        }
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with(placed);
+                ((), DocChange::Selection)
+            });
+        });
     }
 
     pub(crate) fn duplicate_selected_nodes(&mut self, cx: &mut Context<Self>) {
@@ -3067,17 +3310,23 @@ impl FigView {
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
-        let root = self
+        let (root, prewarm) = self
             .item
             .update(cx, |item, cx| {
                 item.with_document(cx, |document| {
                     document.ensure_page_solved(index);
                     let root = document.pages.get(index).and_then(|page| page.root);
                     document.doc.set_active_page(root);
-                    (root, DocChange::Selection)
+                    let prewarm = root.and_then(|root| document.take_page_prewarm(root));
+                    ((root, prewarm), DocChange::Selection)
                 })
             })
-            .flatten();
+            .unwrap_or((None, None));
+        if let Some(prewarm) = prewarm {
+            // Decoding the page's images here would stall the frame that
+            // shows it; the render thread picks up whatever has landed.
+            cx.background_spawn(async move { prewarm.run() }).detach();
+        }
         self.selected_page_index = Some(index);
         self.selected_page_root = root;
         // Focus re-assertion must follow in-tab navigation: this tab now
@@ -4122,6 +4371,9 @@ impl Render for FigView {
             .on_action(cx.listener(Self::cut_selection))
             .on_action(cx.listener(Self::paste_selection))
             .on_action(cx.listener(Self::duplicate_selection))
+            .on_action(cx.listener(Self::group_selection))
+            .on_action(cx.listener(Self::ungroup_selection))
+            .on_action(cx.listener(Self::frame_selection))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::zoom_to_selection_action))
             // The application Edit menu dispatches `editor::actions::*`, which
@@ -4443,6 +4695,107 @@ fn single_selection(doc: &fanta_doc::Doc) -> Option<NodeId> {
     let mut selection = doc.selection.iter().copied();
     let node = selection.next()?;
     selection.next().is_none().then_some(node)
+}
+
+/// The layers a structural command (group, frame, ungroup) acts on: the
+/// selection, unless the command came from a layer row that is not part of
+/// it, in which case only that row's node. Switching pages keeps the
+/// selection, so layers left behind on another page are dropped here — a
+/// group built from them would land out of view, or pull them onto this page.
+fn structure_targets(doc: &Doc, clicked: Option<NodeId>) -> Vec<NodeId> {
+    let candidates = match clicked {
+        Some(clicked) if !doc.selection.contains(clicked) => vec![clicked],
+        _ => doc.selection.as_slice().to_vec(),
+    };
+    candidates
+        .into_iter()
+        .filter(|id| crate::clipboard::node_is_on_active_page(doc, *id))
+        .collect()
+}
+
+/// The structure targets ungrouping dissolves: groups and frames, skipping
+/// page roots, component masters (Figma leaves those intact), and targets
+/// nested in another target, whose parent's ungroup already moves them.
+fn ungroupable_targets(doc: &Doc, targets: &[NodeId]) -> Vec<NodeId> {
+    let requested = targets.iter().copied().collect::<HashSet<_>>();
+    targets
+        .iter()
+        .copied()
+        .filter(|id| {
+            matches!(
+                doc.scene.get(*id).map(|node| &node.data),
+                Some(NodeData::Group(_))
+            ) && !doc.pages().contains(id)
+                && !doc.is_component_root(*id)
+                && !doc
+                    .scene
+                    .ancestors_of(*id)
+                    .any(|ancestor| requested.contains(&ancestor.id))
+        })
+        .collect()
+}
+
+fn is_pastable_image_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif"
+            )
+        })
+}
+
+/// Ingest `bytes` as an asset and create its bitmap layer on the active page,
+/// centred on `center` (world) at natural size, shrunk to fit 80% of the
+/// `visible` world-space viewport when larger. The asset is dropped again
+/// when the node cannot be created so a failed paste leaves no orphan bytes.
+fn paste_image(
+    doc: &mut Doc,
+    assets: &mut AssetStores<'_>,
+    bytes: Vec<u8>,
+    center: [f64; 2],
+    visible: [f64; 2],
+    offset: f64,
+) -> Result<NodeId> {
+    let (asset, natural_size) = assets.add_image(bytes)?;
+    let natural = [
+        f64::from(natural_size[0].max(1)),
+        f64::from(natural_size[1].max(1)),
+    ];
+    let mut fit = 1.0_f64;
+    for axis in 0..2 {
+        if visible[axis].is_finite() && visible[axis] > 0.0 {
+            fit = fit.min(visible[axis] * 0.8 / natural[axis]);
+        }
+    }
+    let size = [natural[0] * fit, natural[1] * fit];
+    let x = center[0] - size[0] * 0.5 + offset;
+    let y = center[1] - size[1] * 0.5 + offset;
+    let node = match crate::structure::image_layer_node(
+        doc,
+        asset,
+        natural_size,
+        size,
+        None,
+        x,
+        y,
+        None,
+    ) {
+        Ok(node) => node,
+        Err(error) => {
+            assets.remove(asset);
+            return Err(error);
+        }
+    };
+    let id = node.id;
+    match apply_canvas_transaction(doc, "Paste image", vec![Operation::create_node(node)]) {
+        Ok(_) => Ok(id),
+        Err(error) => {
+            assets.remove(asset);
+            Err(error)
+        }
+    }
 }
 
 fn motion_property(property: TimelineProperty) -> MotionProperty {
@@ -5669,6 +6022,52 @@ mod tests {
         (doc, page_one, page_two)
     }
 
+    fn group_under(doc: &mut fanta_doc::Doc, parent: NodeId) -> NodeId {
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        group.parent = Some(parent);
+        let id = group.id;
+        doc.apply(Operation::create_node(group))
+            .expect("create group");
+        id
+    }
+
+    #[test]
+    fn structure_commands_ignore_layers_left_on_another_page() {
+        let (mut doc, page_one, page_two) = doc_with_two_pages();
+        let on_page_one = group_under(&mut doc, page_one);
+        doc.selection.replace_with(vec![on_page_one]);
+        assert_eq!(structure_targets(&doc, None), vec![on_page_one]);
+
+        doc.set_active_page(Some(page_two));
+        assert!(
+            structure_targets(&doc, None).is_empty(),
+            "a selection left on page one is not grouped from page two"
+        );
+        assert!(structure_targets(&doc, Some(on_page_one)).is_empty());
+
+        let on_page_two = group_under(&mut doc, page_two);
+        doc.selection.replace_with(vec![on_page_one, on_page_two]);
+        assert_eq!(
+            structure_targets(&doc, None),
+            vec![on_page_two],
+            "a selection spanning pages keeps only this page's layers"
+        );
+    }
+
+    #[test]
+    fn ungrouping_skips_component_masters_and_page_roots() {
+        let (mut doc, page_one, _page_two) = doc_with_two_pages();
+        let plain = group_under(&mut doc, page_one);
+        let master = group_under(&mut doc, page_one);
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Card"),
+        );
+        assert_eq!(ungroupable_targets(&doc, &[plain, master]), vec![plain]);
+        assert!(ungroupable_targets(&doc, &[master, page_one]).is_empty());
+    }
+
     /// The headline new-tab walk: tab A shows page 1 zoomed and still reports
     /// `is_focused` when the scoped open of `pages/<p2>/page.fnx` re-targets
     /// the shared document (focus listeners only run at the next draw, so the
@@ -6872,7 +7271,13 @@ impl FigView {
                 ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
                 ToolbarCommand::Export => self.export_from_toolbar(window, cx),
-                other => notify_unavailable(other.label(), window, cx),
+                ToolbarCommand::Group => self.group_selection(&GroupSelection, window, cx),
+                ToolbarCommand::Ungroup => self.ungroup_selection(&UngroupSelection, window, cx),
+                ToolbarCommand::FrameSelection => self.frame_selection(&FrameSelection, window, cx),
+                other => match toolbar_agent_prompt_template(*other) {
+                    Some(template) => self.route_toolbar_agent_prompt(template, window, cx),
+                    None => notify_unavailable(other.label(), window, cx),
+                },
             },
             ToolbarAction::ControlChangeRequested { control, value, .. } => {
                 self.handle_toolbar_control_change(*control, value, window, cx);
@@ -6881,7 +7286,7 @@ impl FigView {
                 self.handle_toolbar_secondary_control(*control, window, cx);
             }
             ToolbarAction::AiPromptSubmitted { prompt } => {
-                self.route_toolbar_agent_prompt(prompt, window, cx);
+                self.route_toolbar_agent_prompt(prompt.as_ref(), window, cx);
             }
             ToolbarAction::AgentAttachmentRequested => {
                 notify_unavailable("Attaching a file to the Agent from the toolbar", window, cx)
@@ -6924,7 +7329,7 @@ impl FigView {
     #[cfg(feature = "fanta-gpui-ui")]
     fn route_toolbar_agent_prompt(
         &mut self,
-        prompt: &SharedString,
+        prompt: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -6957,8 +7362,10 @@ impl FigView {
         }
     }
 
-    /// The one-line "what the user is looking at" header prefixed onto a
-    /// toolbar Agent prompt.
+    /// The "what the user is looking at" header prefixed onto a toolbar
+    /// Agent prompt: the page, the selection, and the first selected layers
+    /// with their exact ids so the agent can act without a discovery round
+    /// trip.
     #[cfg(feature = "fanta-gpui-ui")]
     fn agent_prompt_context(&self, cx: &App) -> String {
         let Some(document) = self.item.read(cx).document() else {
@@ -6968,11 +7375,51 @@ impl FigView {
             .page(self.selected_page_index)
             .map(|page| page.name.to_string())
             .unwrap_or_else(|| "Untitled".to_string());
-        match document.doc.selection.len() {
+        let doc = &document.doc;
+        let mut context = match doc.selection.len() {
             0 => format!("Fanta canvas — page \"{page}\", nothing selected."),
             1 => format!("Fanta canvas — page \"{page}\", 1 layer selected."),
             count => format!("Fanta canvas — page \"{page}\", {count} layers selected."),
+        };
+        let listed = doc
+            .selection
+            .iter()
+            .filter_map(|id| doc.scene.get(*id))
+            .take(AGENT_PROMPT_CONTEXT_LAYERS);
+        for node in listed {
+            let geometry = doc
+                .scene
+                .world_bounds(node.id)
+                .filter(|bounds| bounds.is_finite())
+                .map(|bounds| {
+                    format!(
+                        ", {:.0}x{:.0} at {:.0},{:.0}",
+                        bounds.width(),
+                        bounds.height(),
+                        bounds.min_x,
+                        bounds.min_y
+                    )
+                })
+                .unwrap_or_default();
+            context.push_str(&format!(
+                "\n- {} ({}, id {}{geometry})",
+                node.name,
+                node.data.kind_tag(),
+                node.id
+            ));
         }
+        let remaining = doc
+            .selection
+            .len()
+            .saturating_sub(AGENT_PROMPT_CONTEXT_LAYERS);
+        if remaining > 0 {
+            context.push_str(&format!("\n- …and {remaining} more"));
+        }
+        context.push_str(
+            "\nThe ids above are exact node ids. The canvas tools are design_state (read), \
+             design_edit (change) and design_screenshot (verify).",
+        );
+        context
     }
 
     /// §12 contract: an accepted control value is applied to host state and
@@ -7082,6 +7529,43 @@ impl FigView {
 /// One id shared by every canvas notice, so a second click replaces the
 /// standing message instead of stacking a queue of them.
 const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
+
+/// How many selected layers a toolbar Agent prompt lists by id.
+#[cfg(feature = "fanta-gpui-ui")]
+const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
+
+/// The draft prompt a toolbar AI command opens in the Agent Panel for the
+/// user to complete and review. Media commands stay `None`: there is no image
+/// backend to hand them to, so they are declined by name instead.
+#[cfg(feature = "fanta-gpui-ui")]
+fn toolbar_agent_prompt_template(
+    command: fanta_gpui::toolbar::ToolbarCommand,
+) -> Option<&'static str> {
+    use fanta_gpui::toolbar::ToolbarCommand;
+    match command {
+        ToolbarCommand::GenerateDesign => Some(
+            "Design <describe the screen> as a new frame on this page, using auto layout, \
+             a consistent type scale and the page's existing colours; verify with \
+             design_screenshot.",
+        ),
+        ToolbarCommand::ReplaceContent => Some(
+            "Replace the placeholder content in the selection with realistic content for \
+             <describe the product>.",
+        ),
+        ToolbarCommand::RewriteText => {
+            Some("Rewrite the text of the selected text layers to: <describe the tone or goal>")
+        }
+        ToolbarCommand::TranslateText => {
+            Some("Translate the selected text layers to <language>, keeping the layout intact.")
+        }
+        ToolbarCommand::RenameLayers => Some(
+            "Rename the selected layers with clear, descriptive names based on their content \
+             and role (use design_state to read them, then design_edit set_props name changes \
+             in one batch).",
+        ),
+        _ => None,
+    }
+}
 
 /// Show `message` in this window's workspace notification surface.
 ///

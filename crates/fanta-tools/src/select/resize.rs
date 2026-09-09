@@ -279,7 +279,7 @@ impl SelectTool {
                 old: child.original,
                 new: child.normalized,
             }) {
-                let rollback = ctx.doc.history.abort(&mut ctx.doc.scene);
+                let rollback = ctx.doc.abort_transaction();
                 tracing::warn!(
                     target: "fanta-tools.select",
                     "materializing legacy group bounds failed: {error}; rollback: {rollback:?}"
@@ -316,7 +316,7 @@ impl SelectTool {
                     ctx.doc
                         .apply_constraints_for_parent_resize(state.node_id, old_size, new_size)
                 {
-                    let rollback = ctx.doc.history.abort(&mut ctx.doc.scene);
+                    let rollback = ctx.doc.abort_transaction();
                     tracing::warn!(
                         target: "fanta-tools.select",
                         "apply_constraints after resize failed: {error}; rollback: {rollback:?}"

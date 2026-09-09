@@ -1,8 +1,10 @@
 //! LayersPanel adapter: builds the layer tree read model for the active
 //! page and maps the panel's intents onto the existing selection / flag /
-//! rename / drop paths. The panel is virtualized, so the read model is built
-//! for whole pages (30k+ nodes) and memoized by the host on (page root,
-//! render generation) — see `FantaDesignPanel::refresh_gpui_layers`.
+//! rename / drop paths. The read model carries only the rows the panel can
+//! show — the page's top level plus the children of expanded containers —
+//! so an edit on a 30k-node page costs O(expanded rows), not O(page). The
+//! host memoizes it on [`LayersTreeKey`] — see
+//! `FantaDesignPanel::refresh_gpui_layers`.
 
 use std::collections::HashSet;
 
@@ -16,10 +18,22 @@ use crate::design_panel::LayerDropPlacement;
 
 pub(crate) struct LayersAdapter {
     pub panel: Entity<LayersPanel>,
-    /// The (page root, render generation) the panel's tree was last built
-    /// from; `None` forces a rebuild on the next refresh.
-    pub tree_key: Option<(Option<NodeId>, u64)>,
+    /// What the panel's tree was last built from; `None` forces a rebuild on
+    /// the next refresh.
+    pub tree_key: Option<LayersTreeKey>,
     pub _subscription: Subscription,
+}
+
+/// Everything `layers_tree` reads that can change its output. The host
+/// rebuilds the panel's tree only when this differs from the last build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LayersTreeKey {
+    pub page_root: Option<NodeId>,
+    pub render_generation: u64,
+    /// The host's expansion counter: the tree only holds the children of
+    /// expanded containers, so a change in the expanded set changes the tree
+    /// even when the document did not.
+    pub expansion_generation: u64,
 }
 
 /// The engine facts the kind mapping needs beyond a node's own data.
@@ -116,14 +130,24 @@ fn is_two_point_open_path(path: &PathData) -> bool {
 /// without page roots, whose scene roots are the layers — the same fallback
 /// the canvas paints. Children appear in the same visual order as Figma's
 /// panel: topmost paint order first, i.e. the scene's child order reversed.
-pub(crate) fn layers_tree(doc: &Doc, page_root: Option<NodeId>) -> Vec<LayersPanelItem> {
+///
+/// Only the children of `expanded` containers are built; a collapsed
+/// container is a single item flagged `has_children`, so the panel still
+/// draws its disclosure arrow and asks the host (`ExpansionChanged`) for the
+/// subtree when it is opened.
+pub(crate) fn layers_tree(
+    doc: &Doc,
+    page_root: Option<NodeId>,
+    expanded: &HashSet<NodeId>,
+) -> Vec<LayersPanelItem> {
     let context = KindContext::from_doc(doc);
-    build_children(doc, page_root, &context)
+    build_children(doc, page_root, expanded, &context)
 }
 
 fn build_children(
     doc: &Doc,
     parent: Option<NodeId>,
+    expanded: &HashSet<NodeId>,
     context: &KindContext,
 ) -> Vec<LayersPanelItem> {
     let children = match parent {
@@ -136,11 +160,18 @@ fn build_children(
         .filter_map(|child| {
             let node = doc.scene.get(*child)?;
             let kind = layers_kind(*child, node, context);
+            let has_children = !doc.scene.children_of(Some(*child)).is_empty();
+            let children = if has_children && expanded.contains(child) {
+                build_children(doc, Some(*child), expanded, context)
+            } else {
+                Vec::new()
+            };
             Some(LayersPanelItem {
                 id: SharedString::from(child.to_string()),
                 title: SharedString::from(node.name.clone()),
                 kind,
-                children: build_children(doc, Some(*child), context),
+                children,
+                has_children,
                 visible: !node.flags.contains(fanta_doc::NodeFlags::HIDDEN),
                 locked: node.flags.contains(fanta_doc::NodeFlags::LOCKED),
             })
@@ -205,7 +236,7 @@ mod tests {
         top.name = "Top".into();
         let top = insert(&mut doc, top, Some(page));
 
-        let tree = layers_tree(&doc, Some(page));
+        let tree = layers_tree(&doc, Some(page), &HashSet::new());
         assert_eq!(
             tree.iter()
                 .map(|item| item.title.as_ref())
@@ -214,12 +245,66 @@ mod tests {
         );
         assert_eq!(node_id(&tree[0].id), Some(top));
         assert_eq!(node_id(&tree[1].id), Some(bottom));
+        assert!(tree.iter().all(|item| !item.has_children));
 
-        // No page root: the scene roots are the layers.
-        let rootless = layers_tree(&doc, None);
+        // No page root: the scene roots are the layers. The page is a
+        // collapsed container until it is expanded.
+        let rootless = layers_tree(&doc, None, &HashSet::new());
         assert_eq!(rootless.len(), 1);
         assert_eq!(node_id(&rootless[0].id), Some(page));
+        assert!(rootless[0].has_children);
+        assert!(rootless[0].children.is_empty());
+        let rootless = layers_tree(&doc, None, &HashSet::from([page]));
         assert_eq!(rootless[0].children.len(), 2);
+    }
+
+    #[test]
+    fn children_are_built_only_for_expanded_containers() {
+        let mut doc = Doc::new();
+        let page = insert(&mut doc, group(), None);
+        let mut frame = group();
+        frame.name = "Frame".into();
+        let frame = insert(&mut doc, frame, Some(page));
+        let mut inner = group();
+        inner.name = "Inner".into();
+        let inner = insert(&mut doc, inner, Some(frame));
+        let mut leaf = rect();
+        leaf.name = "Leaf".into();
+        let leaf = insert(&mut doc, leaf, Some(inner));
+        let mut empty = group();
+        empty.name = "Empty".into();
+        let empty = insert(&mut doc, empty, Some(page));
+
+        // Nothing expanded: the page's top level only, containers flagged.
+        let tree = layers_tree(&doc, Some(page), &HashSet::new());
+        assert_eq!(
+            tree.iter()
+                .map(|item| (item.title.as_ref(), item.has_children, item.children.len()))
+                .collect::<Vec<_>>(),
+            vec![("Empty", false, 0), ("Frame", true, 0)]
+        );
+        assert_eq!(node_id(&tree[1].id), Some(frame));
+        assert_eq!(node_id(&tree[0].id), Some(empty));
+
+        // Expanding the frame builds its children, but not the collapsed
+        // inner group's.
+        let tree = layers_tree(&doc, Some(page), &HashSet::from([frame]));
+        let frame_item = &tree[1];
+        assert_eq!(frame_item.children.len(), 1);
+        let inner_item = &frame_item.children[0];
+        assert_eq!(node_id(&inner_item.id), Some(inner));
+        assert!(inner_item.has_children);
+        assert!(inner_item.children.is_empty());
+
+        // An expanded node under a collapsed ancestor stays pruned with it.
+        let tree = layers_tree(&doc, Some(page), &HashSet::from([inner]));
+        assert!(tree[1].children.is_empty());
+
+        // Expanding the whole chain reaches the leaf.
+        let tree = layers_tree(&doc, Some(page), &HashSet::from([frame, inner]));
+        let leaf_item = &tree[1].children[0].children[0];
+        assert_eq!(node_id(&leaf_item.id), Some(leaf));
+        assert!(!leaf_item.has_children);
     }
 
     #[test]

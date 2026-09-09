@@ -17,7 +17,6 @@ use anyhow::{Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
-use client::zed_urls;
 use collections::{HashMap, HashSet, IndexMap};
 use editor::scroll::Autoscroll;
 use editor::{
@@ -1386,11 +1385,7 @@ impl ConversationView {
                 })
             });
 
-        let agent_display_name = self
-            .agent_server_store
-            .read(cx)
-            .agent_display_name(&agent_id.clone())
-            .unwrap_or_else(|| agent_id.0.clone());
+        let agent_display_name = agent_display_name(self.agent_server_store.read(cx), &agent_id);
 
         let agent_icon = self.agent.logo();
         let agent_icon_from_external_svg = self
@@ -1833,11 +1828,10 @@ impl ConversationView {
                     let has_slash_completions =
                         !available_commands.is_empty() || !available_skills.is_empty();
 
-                    let agent_display_name = self
-                        .agent_server_store
-                        .read(cx)
-                        .agent_display_name(&self.agent.agent_id())
-                        .unwrap_or_else(|| self.agent.agent_id().0.to_string().into());
+                    let agent_display_name = agent_display_name(
+                        self.agent_server_store.read(cx),
+                        &self.agent.agent_id(),
+                    );
 
                     let new_placeholder =
                         placeholder_text(agent_display_name.as_ref(), has_slash_completions);
@@ -2248,11 +2242,8 @@ impl ConversationView {
     ) -> impl IntoElement {
         let auth_methods = connection.auth_methods();
 
-        let agent_display_name = self
-            .agent_server_store
-            .read(cx)
-            .agent_display_name(&self.agent.agent_id())
-            .unwrap_or_else(|| self.agent.agent_id().0);
+        let agent_display_name =
+            agent_display_name(self.agent_server_store.read(cx), &self.agent.agent_id());
 
         let show_fallback_description =
             auth_methods.len() > 1 && description.is_none() && pending_auth_method.is_none();
@@ -3278,20 +3269,72 @@ fn native_available_skills(
         .collect()
 }
 
-fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
-    if agent_name == agent::ZED_AGENT_ID.as_ref() {
-        // The persisted id predates the rebrand; display the Fanta name.
-        format!(
-            "Message the {}, @ to include context, / for commands",
-            crate::Agent::NativeAgent.label()
-        )
-    } else if has_commands {
-        format!(
-            "Message {} — @ to include context, / for commands",
-            agent_name
-        )
+/// The name shown for an agent wherever the UI addresses it: the display name
+/// the agent registry has for it, else its id. The built-in agent is the
+/// exception: its id is persisted in thread metadata and predates the rebrand,
+/// so it must never be shown raw.
+fn agent_display_name(agent_server_store: &AgentServerStore, agent_id: &AgentId) -> SharedString {
+    agent_server_store
+        .agent_display_name(agent_id)
+        .unwrap_or_else(|| fallback_agent_display_name(agent_id))
+}
+
+fn fallback_agent_display_name(agent_id: &AgentId) -> SharedString {
+    if agent_id == &*agent::ZED_AGENT_ID {
+        Agent::NativeAgent.label()
     } else {
-        format!("Message {} — @ to include context", agent_name)
+        agent_id.0.clone()
+    }
+}
+
+fn placeholder_text(agent_name: &str, has_commands: bool) -> String {
+    if agent_name == Agent::NativeAgent.label().as_ref() {
+        // The built-in agent is addressed with an article; external agents go
+        // by their own name.
+        format!("Message the {agent_name}, @ to include context, / for commands")
+    } else if has_commands {
+        format!("Message {agent_name} — @ to include context, / for commands")
+    } else {
+        format!("Message {agent_name} — @ to include context")
+    }
+}
+
+#[cfg(test)]
+mod agent_display_name_tests {
+    use super::*;
+
+    #[test]
+    fn built_in_agent_id_is_never_shown_raw() {
+        assert_eq!(
+            fallback_agent_display_name(&agent::ZED_AGENT_ID),
+            Agent::NativeAgent.label()
+        );
+        assert_ne!(
+            fallback_agent_display_name(&agent::ZED_AGENT_ID).as_ref(),
+            agent::ZED_AGENT_ID.as_ref()
+        );
+    }
+
+    #[test]
+    fn external_agent_falls_back_to_its_id() {
+        let agent_id = AgentId::new("Codex CLI");
+        assert_eq!(fallback_agent_display_name(&agent_id), agent_id.0);
+    }
+
+    #[test]
+    fn placeholder_addresses_built_in_agent_with_article() {
+        assert_eq!(
+            placeholder_text(Agent::NativeAgent.label().as_ref(), true),
+            "Message the Fanta Agent, @ to include context, / for commands"
+        );
+        assert_eq!(
+            placeholder_text("Codex CLI", true),
+            "Message Codex CLI — @ to include context, / for commands"
+        );
+        assert_eq!(
+            placeholder_text("Codex CLI", false),
+            "Message Codex CLI — @ to include context"
+        );
     }
 }
 

@@ -1231,13 +1231,18 @@ pub(crate) fn restore_snapshot(doc: &mut Doc, snapshot: &NodeSnapshot) {
         node.data = (*snapshot.data).clone();
         node.effects = snapshot.effects.clone();
         node.blurs = snapshot.blurs.clone();
+        doc.components.bump_rev_for_node(&doc.scene, snapshot.id);
     }
 }
 
 /// Write an operation's `new` value straight into the scene WITHOUT history —
 /// the preview twin of `Doc::apply`, so a scrub frame shows exactly what the
-/// commit will produce.
+/// commit will produce. Like `apply`, it bumps the revision of any component
+/// master containing the node, so instances re-expand for the preview.
 pub(crate) fn apply_preview_operation(doc: &mut Doc, operation: &Operation) {
+    if let Some(target) = operation.primary_target() {
+        doc.components.bump_rev_for_node(&doc.scene, target);
+    }
     match operation {
         Operation::SetTransform { id, new, .. } => {
             if let Some(node) = doc.scene.get_mut(*id) {
@@ -2034,6 +2039,45 @@ mod tests {
                 .all(|operation| !matches!(operation, Operation::ReplaceData { .. })),
             "vector outlines should remain normally distortable"
         );
+    }
+
+    #[test]
+    fn preview_writes_inside_a_master_bump_its_revision() {
+        let mut doc = Doc::new();
+        let master = CanvasNode::new(NodeData::Group(frame_group()));
+        let master_id = master.id;
+        doc.scene.insert(master).expect("inserting the master");
+        let mut child = CanvasNode::new(NodeData::Text(text_node()));
+        child.parent = Some(master_id);
+        let child_id = child.id;
+        doc.scene.insert(child).expect("inserting the master's text");
+        let component = fanta_doc::ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, master_id, "Card"));
+        let rev = |doc: &Doc| doc.components.defs[&component].rev;
+
+        let node = doc.scene.get(child_id).expect("the text node");
+        let snapshot = NodeSnapshot {
+            id: child_id,
+            transform: node.transform,
+            opacity: node.opacity,
+            data: Box::new(node.data.clone()),
+            effects: node.effects.clone(),
+            blurs: node.blurs.clone(),
+        };
+
+        let before = rev(&doc);
+        for operation in field_operations(&doc, &InspectorField::Width(child_id), "72") {
+            apply_preview_operation(&mut doc, &operation);
+        }
+        let previewed = rev(&doc);
+        assert!(
+            previewed > before,
+            "a scrub frame inside a master must re-key its instances"
+        );
+        restore_snapshot(&mut doc, &snapshot);
+        assert!(rev(&doc) > previewed, "so must restoring the baseline");
     }
 
     #[test]

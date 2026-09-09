@@ -514,7 +514,10 @@ impl FantaVariablesWorkspace {
             item.with_document(cx, |document| {
                 let result = preview_variable_value(&mut document.doc, cell, value);
                 let change = match result {
-                    Ok(true) => DocChange::ContentPreview,
+                    Ok(true) => {
+                        document.mark_variables_changed();
+                        DocChange::ContentPreview
+                    }
                     Ok(false) | Err(_) => DocChange::None,
                 };
                 (result, change)
@@ -548,6 +551,9 @@ impl FantaVariablesWorkspace {
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let changed = restore_variable_value(&mut document.doc, cell, baseline);
+                if changed {
+                    document.mark_variables_changed();
+                }
                 let change = if changed && notify {
                     DocChange::ContentPreview
                 } else {

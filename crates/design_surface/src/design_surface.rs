@@ -23,9 +23,107 @@ pub enum DesignNodeType {
     Text,
 }
 
+/// Where a stroke sits relative to the shape's geometric edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StrokeAlignment {
+    Inside,
+    Center,
+    Outside,
+}
+
+/// Horizontal text alignment within the text box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAlignment {
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+/// The flow direction of an auto-layout frame; `none` turns auto layout off
+/// and leaves the children where the last solve put them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutDirection {
+    Horizontal,
+    Vertical,
+    None,
+}
+
+/// Cross-axis alignment of auto-layout children (CSS `align-items`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossAxisAlignment {
+    Start,
+    Center,
+    End,
+    /// Children stretch to the frame's cross-axis size.
+    Stretch,
+    Baseline,
+}
+
+/// Main-axis distribution of auto-layout children (CSS `justify-content`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MainAxisAlignment {
+    Start,
+    Center,
+    End,
+    SpaceBetween,
+    SpaceEvenly,
+}
+
+/// A relative z-order move within the node's current parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NamedLayerPosition {
+    /// Topmost among its siblings (painted last).
+    Front,
+    /// Bottommost among its siblings (painted first).
+    Back,
+    /// One step up.
+    Forward,
+    /// One step down.
+    Backward,
+}
+
+/// Where `set_index` puts a node among its siblings: a named relative move
+/// (`"front"`, `"back"`, `"forward"`, `"backward"`) or an absolute slot
+/// (`{"index": n}`, 0 = bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum LayerPosition {
+    Named(NamedLayerPosition),
+    Absolute { index: usize },
+}
+
+/// The edge or centre line `align` snaps nodes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignEdge {
+    Left,
+    CenterX,
+    Right,
+    Top,
+    CenterY,
+    Bottom,
+}
+
+/// The axis `distribute` spaces nodes along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributeAxis {
+    Horizontal,
+    Vertical,
+}
+
 /// One edit to the open design document. A batch of ops is applied in order
 /// as a single undoable transaction: if any op fails, the whole batch rolls
-/// back.
+/// back. Every `x`/`y` is a world (canvas) coordinate, y grows downward, and
+/// every `id` is an exact node id from `design_state` / `batch_get` (never a
+/// layer name).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DesignOp {
@@ -82,12 +180,30 @@ pub enum DesignOp {
         #[serde(default)]
         meta: Option<serde_json::Value>,
     },
+    /// Place an instance of an existing component. The instance takes the
+    /// master's size and follows later edits to the master.
+    CreateInstance {
+        /// The component: its id, or its name when exactly one component has
+        /// that name (`design_state` lists both).
+        component: String,
+        /// World x of the instance's top-left corner.
+        x: f64,
+        /// World y of the instance's top-left corner.
+        y: f64,
+        /// Id of the parent frame/group. Omit to place on the active page.
+        #[serde(default)]
+        parent: Option<String>,
+        /// Layer name. Omit to use the component's name.
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Update properties of an existing node. Only the provided fields change.
     SetProps {
         id: String,
         #[serde(default)]
         name: Option<String>,
-        /// New world x of the node's origin (rotation/scale preserved).
+        /// New world x of the node's bounding-box origin (rotation/scale
+        /// preserved).
         #[serde(default)]
         x: Option<f64>,
         #[serde(default)]
@@ -99,7 +215,8 @@ pub enum DesignOp {
         /// Node opacity in `0.0..=1.0`.
         #[serde(default)]
         opacity: Option<f32>,
-        /// Solid fill hex color; replaces the first fill (glyph color for text).
+        /// Solid fill hex color; replaces the first fill (glyph color for text,
+        /// background for frames).
         #[serde(default)]
         fill: Option<String>,
         /// Uniform corner radius (rectangles and frames).
@@ -113,6 +230,142 @@ pub enum DesignOp {
         #[serde(default)]
         locked: Option<bool>,
     },
+    /// Set the single outline stroke of a shape or frame. Creates the stroke
+    /// when the node has none (defaulting to 1px black); `width: 0` removes it.
+    SetStroke {
+        id: String,
+        /// Stroke color as `#RRGGBB` or `#RRGGBBAA`.
+        #[serde(default)]
+        color: Option<String>,
+        /// Stroke width in px; `0` removes the stroke.
+        #[serde(default)]
+        width: Option<f64>,
+        /// Where the stroke sits relative to the edge (default `center`).
+        #[serde(default)]
+        align: Option<StrokeAlignment>,
+    },
+    /// Set (or remove) the node's drop shadow. Edits the first drop shadow in
+    /// place, or adds one; `remove: true` deletes every drop shadow.
+    SetShadow {
+        id: String,
+        /// Shadow color as `#RRGGBB` or `#RRGGBBAA` (default `#00000040`).
+        #[serde(default)]
+        color: Option<String>,
+        /// Horizontal offset in px (default 0).
+        #[serde(default)]
+        x: Option<f64>,
+        /// Vertical offset in px, positive = down (default 2).
+        #[serde(default)]
+        y: Option<f64>,
+        /// Blur radius in px (default 4).
+        #[serde(default)]
+        blur: Option<f64>,
+        /// Spread in px (default 0).
+        #[serde(default)]
+        spread: Option<f64>,
+        /// Remove all drop shadows instead of setting one.
+        #[serde(default)]
+        remove: Option<bool>,
+    },
+    /// Change the typography of a text node. Only the provided fields change;
+    /// they apply to the whole text (rich-text runs included).
+    SetTextStyle {
+        id: String,
+        /// Font family name, e.g. `"Inter"`.
+        #[serde(default)]
+        font_family: Option<String>,
+        /// OpenType weight 100–900 (400 regular, 500 medium, 600 semibold,
+        /// 700 bold).
+        #[serde(default)]
+        font_weight: Option<u16>,
+        /// Font size in px.
+        #[serde(default)]
+        font_size: Option<f64>,
+        /// Line height as a multiple of the font size (1.0 = single; UI text
+        /// is usually 1.2–1.5).
+        #[serde(default)]
+        line_height: Option<f64>,
+        /// Extra letter spacing in px (negative tightens).
+        #[serde(default)]
+        letter_spacing: Option<f64>,
+        /// Horizontal alignment within the text box.
+        #[serde(default)]
+        align: Option<TextAlignment>,
+        /// Glyph color as `#RRGGBB` or `#RRGGBBAA`.
+        #[serde(default)]
+        color: Option<String>,
+    },
+    /// Turn a frame or group into an auto-layout (flex) container, change its
+    /// layout rules, or (`direction: "none"`) turn auto layout off. Children
+    /// are positioned by the layout solver; do not also set their `x`/`y`.
+    SetAutoLayout {
+        id: String,
+        direction: LayoutDirection,
+        /// Gap between children along the flow direction, in px.
+        #[serde(default)]
+        gap: Option<f64>,
+        /// Padding in px: `[all]`, `[vertical, horizontal]`, or
+        /// `[top, right, bottom, left]`.
+        #[serde(default)]
+        padding: Option<Vec<f64>>,
+        /// Cross-axis alignment of the children.
+        #[serde(default)]
+        align_items: Option<CrossAxisAlignment>,
+        /// Main-axis distribution of the children.
+        #[serde(default)]
+        justify: Option<MainAxisAlignment>,
+    },
+    /// Change a node's z-order among its current siblings.
+    SetIndex { id: String, position: LayerPosition },
+    /// Rotate a node to an absolute angle in degrees about the centre of its
+    /// own box (positive = clockwise on the y-down canvas; 0 = upright).
+    Rotate { id: String, degrees: f64 },
+    /// Align nodes to an edge or centre line of their combined bounds (two or
+    /// more ids), or a single node to its parent frame's bounds.
+    Align { ids: Vec<String>, edge: AlignEdge },
+    /// Space three or more nodes evenly along one axis, keeping the outermost
+    /// two where they are.
+    Distribute {
+        ids: Vec<String>,
+        axis: DistributeAxis,
+    },
+    /// Wrap nodes in a new plain group (no clipping, no background). The group
+    /// is created where the topmost member lives; members from other parents
+    /// move into it keeping their world position. Returns the group id as
+    /// `created`.
+    Group {
+        ids: Vec<String>,
+        /// Group name (default "Group").
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Wrap nodes in a new frame sized to their combined bounds (Figma "Frame
+    /// selection"): a clipping container without a background. Returns the
+    /// frame id as `created`.
+    FrameSelection {
+        ids: Vec<String>,
+        /// Frame name (default "Frame").
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Dissolve a group or frame: its children move to its parent at the same
+    /// z-slot, keeping their world positions, and the empty container is
+    /// deleted. Reports the freed child ids as `children`.
+    Ungroup { id: String },
+    /// Deep-copy a node (and its subtree) next to the original, one slot above
+    /// it, shifted by `dx`/`dy` world units (default 0). Returns the copy's id
+    /// as `created`.
+    Duplicate {
+        id: String,
+        #[serde(default)]
+        dx: Option<f64>,
+        #[serde(default)]
+        dy: Option<f64>,
+    },
+    /// Promote a frame or group into a component master (it stays in place on
+    /// the canvas, like Figma's "Create component"). Reports the new
+    /// `component` id; place copies with `create_instance`.
+    CreateComponent { id: String },
     /// Move a node under a new parent, preserving its world position.
     Reparent {
         id: String,
@@ -135,6 +388,13 @@ pub enum DesignOp {
         zoom: Option<f64>,
     },
 }
+
+/// Cap on one serialized JSON state result, shared by every surface that hands
+/// node listings to a model (the native `design_state` tool and the MCP
+/// `batch_get`). A model cannot use megabytes of JSON, and a client that drops
+/// the response leaves the agent with nothing at all — so a query whose answer
+/// is this big is refused with instructions for narrowing it, never cut.
+pub const MAX_JSON_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Which nodes `DesignSurface::get_nodes` returns.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -188,7 +448,96 @@ pub trait DesignSurface: 'static {
 
     /// List the project's FNX source files, or return one file's text.
     fn read_source(&self, path: Option<String>, cx: &mut App) -> Result<serde_json::Value>;
+
+    /// A free `{x, y}` top-left for a `width` x `height` box on a page
+    /// (default the active page): to the right of, or below, everything the
+    /// page already holds, with a margin.
+    fn find_empty_space(
+        &self,
+        width: f64,
+        height: f64,
+        page: Option<usize>,
+        cx: &mut App,
+    ) -> Result<serde_json::Value>;
 }
+
+/// Design guidelines for agents driving the canvas — served by the MCP
+/// `get_guidelines` tool and condensed into the built-in agent's system
+/// prompt. Kept next to the op vocabulary so the two stay in step.
+pub const DESIGN_GUIDELINES: &str = r#"# Designing in Fanta
+
+Fanta is an agent-native design tool: the design is `.fnx` source files and a
+live canvas at once. These guidelines apply whether you drive the canvas
+(`design_edit` / `batch_design`) or edit `.fnx` files directly.
+
+## Coordinates and geometry
+- World coordinates, in px, y grows DOWN. `x`/`y` of an op is the node's
+  top-left corner; a node's reported `world_bounds` uses the same origin.
+- Sizes are the node's own box; frames clip to `clip_size`, groups do not.
+- Ids are exact 26-character node ids from the state tools. Never guess an id
+  or address a node by name.
+- Before creating a new top-level frame, ask for `empty_space` (state tool)
+  and place it there; do not stack new work on top of existing frames.
+
+## Structure
+- Frame = container with a size, clipping, a background, optional auto layout.
+  Group = a bare wrapper for moving things together. Screens, cards, list rows
+  and buttons are frames; loose decoration is grouped.
+- Prefer auto layout for any UI. Set `set_auto_layout` on the container, then
+  create children inside it with a size and any `x`/`y` (the container's own
+  `x`/`y` is fine); the layout solver repositions them. Use `gap` and
+  `padding` in 4/8 px steps (4, 8, 12, 16, 24, 32, 48, 64).
+- Nest frames for hierarchy (screen > section > row > control). Keep depth
+  under about six levels.
+- Name layers by role in Title Case: "Header", "Primary Button", "Card /
+  Title". Never leave "Rectangle 12" behind in finished work.
+- Repeated elements are components: build one instance right, `create_component`
+  it, then `create_instance` the rest. Reference an existing component by its
+  id (or unique name) from `design_state` `components`.
+
+## Visual language
+- Type scale (px): 12 caption, 14 body-small, 16 body, 20 heading-3, 24
+  heading-2, 32 heading-1, 48 display. Line height 1.2 for headings, 1.4–1.5
+  for body. Weights: 400 body, 500/600 labels, 700 headings.
+- Contrast: body text at least 4.5:1 against its background. Muted text is
+  a lighter tint of the text color, not a lighter opacity.
+- Corner radius: 4–8 px controls, 12–16 px cards, 999 px pills.
+- Shadows are subtle: `#00000014` to `#00000033`, y 2–8, blur 8–24.
+- One accent color; neutrals do the rest. Use `#RRGGBBAA` for tints.
+- Text boxes: make them wide enough for the content at the font size (about
+  0.55 x size per character for Latin text) and 1.4 x size tall per line.
+
+## Working method
+1. Read state first (`design_state` / `get_editor_state`), then the page tree
+   with `depth` 1–2; fetch nodes by id for detail.
+2. Batch related ops into ONE call with a descriptive `label` ("Add login
+   card"); the batch is one undo step and rolls back entirely on failure.
+   Use the `created` ids the result returns for follow-up ops.
+3. Verify with a screenshot (`design_screenshot` / `get_screenshot`) of the
+   frame you changed before reporting done. Fix what you see, then re-check.
+4. Keep the selection meaningful: `select` what you just built so the user
+   sees it.
+
+## Two editing lanes
+- Canvas ops (above): precise, immediate, undoable; the right lane for
+  building and adjusting.
+- `.fnx` files: each page is `pages/<slug>/page.fnx`, each component master
+  `components/<slug>/master.fnx` (paths are in the state's `pages[].source`
+  and `components[].source`). Edit the file with normal file tools for bulk
+  textual changes (renaming many layers, retyping colors, restructuring a
+  whole page); the open canvas hot-reloads about 300 ms after save. Keep the
+  JSX well-formed.
+- Never touch `*.ids.json` sidecars, `fanta.json`, `previews/` or `exports/`.
+- Do not mix lanes on the same nodes in one step: finish canvas edits (they
+  autosave) before editing the file, and vice versa.
+
+## Don'ts
+- Don't set `x`/`y` on children of an auto-layout frame; change the layout.
+- Don't scale text or images by editing `width`/`height` to fake a style
+  change; use `set_text_style` or replace the image.
+- Don't delete or rewrite what you have not read; page trees are large, and
+  `child_count` means there is more below.
+"#;
 
 #[derive(Default)]
 struct DesignSurfaceRegistry {

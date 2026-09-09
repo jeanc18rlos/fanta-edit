@@ -7,9 +7,9 @@ use super::{
     Arc, BlendMode, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey,
     InstanceNode, NodeData, NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur,
     begin_effects_layer, draw_inner_shadows, draw_unresolved_outline, effects_layer_bounds,
-    hash_overrides, opacity_folds_into_paint, paint_child_sequence, paint_node_content,
-    paint_node_foreground, resolve_overlay, shadow_expanded_local_bounds, to_sk_matrix,
-    visible_effects, with_shaped_layout,
+    opacity_folds_into_paint, paint_child_sequence, paint_node_content, paint_node_foreground,
+    resolve_overlay, shadow_expanded_local_bounds, to_sk_matrix, visible_effects,
+    with_shaped_layout,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,14 +94,21 @@ pub(crate) fn expand_instance_memoized(
         inst,
         &expansion_context,
     );
+    // Only a live-scene instance has a stamp to memoize its override hash on;
+    // a nested transient clone (fresh id, not in the scene) hashes directly.
+    let stamp = ctx
+        .scene
+        .contains(instance_id)
+        .then(|| ctx.scene.node_stamp(instance_id));
     let key = InstanceCacheKey {
         instance: instance_id,
         rev,
-        override_hash: hash_overrides(inst),
+        override_hash: ctx.instance_cache.override_hash(instance_id, stamp, inst),
         mode_generation: ctx.inputs.mode_generation,
+        mode_pins: hash_mode_pins(ctx.scene, mode_anchor),
     };
-    if let Some(cached) = ctx.instance_cache.entries.get(&key) {
-        return Arc::clone(cached);
+    if let Some(cached) = ctx.instance_cache.lookup(&key) {
+        return cached;
     }
     let mut expanded = fanta_doc::expand_instance_with_context(
         ctx.scene,
@@ -119,10 +126,33 @@ pub(crate) fn expand_instance_memoized(
         fanta_doc::solve_expanded(&mut expanded, &mut measure_text_node);
     }
     let expanded = Arc::new(expanded);
-    ctx.instance_cache
-        .entries
-        .insert(key, Arc::clone(&expanded));
+    ctx.instance_cache.insert(key, Arc::clone(&expanded));
     expanded
+}
+
+/// Hash of every frame mode pin (`GroupNode::explicit_modes`) on `anchor` and
+/// its ancestor chain, nearest first. The instance's effective mode — which
+/// [`expand_instance_memoized`] bakes into the cached expansion through
+/// alias-backed component properties — is decided by the nearest pin, so the
+/// ordered sequence of pins is exactly what the expansion depends on beyond
+/// the variables and doc-level modes. O(depth), no allocation.
+fn hash_mode_pins(scene: &Scene, anchor: NodeId) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut visit = |node: &CanvasNode| {
+        if let NodeData::Group(group) = &node.data
+            && !group.explicit_modes.is_empty()
+        {
+            group.explicit_modes.hash(&mut hasher);
+        }
+    };
+    if let Some(node) = scene.get(anchor) {
+        visit(node);
+    }
+    for ancestor in scene.ancestors_of(anchor) {
+        visit(ancestor);
+    }
+    hasher.finish()
 }
 
 /// Measure a text node's glyph box with the real `fanta-text` shaper, for the
@@ -158,14 +188,15 @@ pub fn measure_text_node(t: &fanta_doc::TextNode) -> (f64, f64) {
 /// Auto-width labels are measured with the real `fanta-text` shaper — through
 /// the same shared shaped-text cache the renderer paints from, so this measure
 /// pass PRE-WARMS those runs for the first render (see [`measure_text_node`]).
-/// Mutates node transforms/sizes, then invalidates the scene's world-bounds
-/// cache so culling, hit-testing, and `world_bounds` observe the new geometry.
+/// Every node it writes goes through `Scene::get_mut`, which drops the derived
+/// caches and logs a precise per-node change — so culling, hit-testing, and
+/// `world_bounds` observe the new geometry, and a render-thread copy of the
+/// scene can still be patched past the solve instead of re-copied wholesale.
 ///
 /// Call ONCE after import (and after edits that change auto-layout inputs) — it
 /// is `O(n)` over the page subtree, not a per-frame cost.
 pub fn solve_scene_layout(scene: &mut Scene, page: NodeId) {
     fanta_doc::solve_auto_layout(scene, page, &mut measure_text_node);
-    scene.invalidate_world_cache();
 }
 
 /// The local AABB of a transient (expanded-instance) node's subtree, mirroring
@@ -385,7 +416,100 @@ pub(crate) fn render_expanded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fanta_doc::{Color, GroupNode, Transform2D, VectorNode};
+    use fanta_doc::{AutoLayout, Color, GroupNode, Transform2D, VectorNode};
+
+    #[test]
+    fn solving_scene_layout_keeps_the_scene_patchable() {
+        let mut scene = Scene::new();
+        let frame = scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode {
+                auto_layout: Some(AutoLayout::default()),
+                local_size: Some([100.0, 40.0]),
+                ..GroupNode::default()
+            })))
+            .unwrap();
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            30.0,
+            20.0,
+            Color::WHITE,
+        )));
+        child.parent = Some(frame);
+        child.transform = Transform2D::translation(50.0, 50.0);
+        let child = scene.insert(child).unwrap();
+
+        let before = scene.revision();
+        solve_scene_layout(&mut scene, frame);
+        let delta = scene
+            .changes_since(before)
+            .expect("a layout solve must log its writes precisely, never as Unknown");
+        assert!(
+            delta.nodes.contains(&child) || delta.transforms.contains(&child),
+            "the solver's write to the child is in the delta: {delta:?}"
+        );
+    }
+
+    #[test]
+    fn mode_pin_hash_follows_the_ancestor_chain_pins() {
+        let mut scene = Scene::new();
+        let outer = scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+            .unwrap();
+        let mut inner = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        inner.parent = Some(outer);
+        let inner = scene.insert(inner).unwrap();
+        let mut leaf = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            Color::WHITE,
+        )));
+        leaf.parent = Some(inner);
+        let leaf = scene.insert(leaf).unwrap();
+        let sibling = scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+            .unwrap();
+
+        let unpinned = hash_mode_pins(&scene, leaf);
+        assert_eq!(
+            unpinned,
+            hash_mode_pins(&scene, sibling),
+            "no pins anywhere"
+        );
+
+        let collection = fanta_doc::VariableCollectionId::new();
+        let dark = fanta_doc::ModeId::new();
+        if let Some(NodeData::Group(group)) = scene.get_mut(outer).map(|node| &mut node.data) {
+            group.explicit_modes.insert(collection, dark);
+        }
+        let pinned_above = hash_mode_pins(&scene, leaf);
+        assert_ne!(
+            unpinned, pinned_above,
+            "a pin on an ancestor changes the hash"
+        );
+        assert_eq!(
+            unpinned,
+            hash_mode_pins(&scene, sibling),
+            "a pin elsewhere leaves unrelated chains alone"
+        );
+        assert_eq!(
+            pinned_above,
+            hash_mode_pins(&scene, leaf),
+            "stable across calls"
+        );
+
+        let light = fanta_doc::ModeId::new();
+        if let Some(NodeData::Group(group)) = scene.get_mut(inner).map(|node| &mut node.data) {
+            group.explicit_modes.insert(collection, light);
+        }
+        assert_ne!(
+            pinned_above,
+            hash_mode_pins(&scene, leaf),
+            "a nearer pin changes the hash"
+        );
+    }
 
     #[test]
     fn expanded_non_clipping_group_bounds_union_box_and_overflow_children() {

@@ -70,9 +70,11 @@ args = ["--mcp-stdio"]
 
 Both strings are what the welcome page's **Copy command** and **Copy Codex
 config** buttons put on your clipboard. When a client connects, the Fanta window
-toasts *"Agent connected: &lt;client&gt;"*. The server exposes five tools
-against the focused design: `get_editor_state`, `batch_get`, `batch_design`,
-`get_screenshot` and `read_fnx_source`.
+toasts *"Agent connected: &lt;client&gt;"*. The server exposes six tools
+against the focused design: `get_editor_state`, `get_guidelines`, `batch_get`,
+`batch_design`, `get_screenshot` and `read_fnx_source`. `batch_design` speaks
+the `design_surface::DesignOp` vocabulary — create, style, auto-layout, align,
+distribute, group, duplicate, componentise — as one undo step per call.
 
 Then ask for something — *"add a 200x100 blue rectangle called Hero to this
 page"*. The agent's edit lands on the canvas, autosaves to the project folder
@@ -110,8 +112,11 @@ no longer linked.
    Opening a `.fig` writes a Fanta project folder beside it on open, and
    `git init`s it; that folder, not the original `.fig`, is what your edits go
    to. Large files take a while — a 9.6 MB `.fig` took 30-40 s to reach a
-   rendered canvas on a debug build.
+   rendered canvas on a debug build of the previous release; the import path
+   has since been reworked and not re-timed.
 2. Draw. Edits autosave about a second after you stop — no `cmd-s` needed.
+   `cmd-g` groups the selection, `cmd-alt-g` wraps it in a frame,
+   `cmd-shift-g` ungroups; pasting an image from another app places it.
 3. **File > Review Changes** shows the diff your edits made; **File > Commit…**
    commits them.
 4. Open the **Code** tab to read the `.fnx` behind what you are looking at. It
@@ -128,11 +133,12 @@ meet first:
 
 - Parts of the toolbar and inspector are visible but not wired up. They say so
   when clicked rather than failing silently.
-- There is no Group or Ungroup.
 - Grid auto-layout, three blend modes, and most effect kinds beyond shadows and
   blurs do nothing.
-- Copy and paste works within one document only; pasting an image or a file from
-  another app does nothing.
+- Canvas copy and paste works within one document only. Pasting an image works;
+  pasting any other kind of file still does nothing.
+- Group, Ungroup, Frame selection, image paste and the new agent operations
+  have only been exercised by unit tests, not in a running build.
 - Opening a folder that is *not* a design project raises an inherited
   Restricted Mode dialog that Escape will not dismiss. A design project Fanta
   scaffolded is trusted automatically; one you received as a zip or a copied
@@ -147,9 +153,12 @@ meet first:
 
 There is no public issue tracker for the alpha yet — report back through
 whoever gave you the build. Logs live in `~/Library/Logs/Fanta/`, and attaching
-`Fanta.log` makes almost every report easier to act on. Two ERROR lines in there
-are known and cosmetic (`language not found` from the agent composer, and the
-Metal renderer's `scene too large … retrying`); anything else is worth sending.
+`Fanta.log` makes almost every report easier to act on. One ERROR line in there
+is known and cosmetic — the Metal renderer's `scene too large … retrying`. The
+`language not found` line older builds logged once per launch should be gone
+(the agent composer now only asks for a Markdown grammar when one is
+registered); if you still see it, or anything else at ERROR level, it is worth
+sending.
 
 If the app crashed, the shipped binary is stripped, so a backtrace is bare
 addresses. `script/bundle-mac` writes `fanta.dwarf` next to the binary it built;

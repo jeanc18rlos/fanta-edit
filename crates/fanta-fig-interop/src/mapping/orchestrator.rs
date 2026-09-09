@@ -14,6 +14,7 @@ use super::{
     read_paint, read_paint_color_bindings, read_pending_variable, read_prop_defs_raw,
     read_set_modes, resolve_style_references, tally_fidelity,
 };
+use std::collections::HashSet;
 
 /// Map a parsed `.fig` document into a Fantaisa [`Doc`].
 ///
@@ -35,13 +36,12 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     // separate NodeChanges (each carrying a `styleType` of FILL/TEXT/EFFECT and a
     // paint/text/effect payload); a *consuming* node carries only a
     // `styleIdFor{Fill,StrokeFill,Text,Effect}` ref and an EMPTY paint array. We
-    // own-clone the changes and inline each style's payload into its consumers
-    // (and into every `symbolData.symbolOverrides[]` entry), so the downstream
-    // readers see real paints/text instead of an empty array. Mirrors op2's
-    // `resolveStyleReferences` (figma-node-mapper.ts:25-90).
-    let mut owned_changes: Vec<KiwiValue> = raw_node_changes.to_vec();
-    let style_report = resolve_style_references(&mut owned_changes);
-    let node_changes: &[KiwiValue] = &owned_changes;
+    // inline each style's payload into a copy of each consumer (and into every
+    // `symbolData.symbolOverrides[]` entry), so the downstream readers see real
+    // paints/text instead of an empty array; changes with no style ref stay
+    // borrowed from `fig`. Mirrors op2's `resolveStyleReferences`
+    // (figma-node-mapper.ts:25-90).
+    let (node_changes, style_report) = resolve_style_references(raw_node_changes);
 
     let mut doc = Doc::new();
     let mut report = MapReport {
@@ -80,7 +80,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     let mut presentation: Option<fanta_doc::PresentationConfig> = None;
 
     // ---- pass 1: create nodes ----
-    for change in node_changes {
+    for change in node_changes.iter().map(|change| -> &KiwiValue { change }) {
         let guid = match change.get("guid").and_then(guid_key) {
             Some(g) => g,
             None => {
@@ -186,7 +186,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
 
         match build_node(type_name, change, &fig.blobs) {
             NodeBuild::Node {
-                node,
+                mut node,
                 is_page,
                 geometry_decoded,
             } => {
@@ -194,6 +194,14 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
                 if node.constraints.is_some() {
                     report.constraints_imported += 1;
                 }
+                // Every node lands at the root for now (pass 2 detaches and
+                // re-attaches all of them). The root bucket is a Vec sorted by
+                // (index, id); with every node at `IndexKey::FIRST` the order
+                // falls to the id, so each insert memmoves past every
+                // same-millisecond ULID already present — a cost that grows
+                // with how fast ids are minted. A key above every sibling
+                // keeps the insert an append.
+                node.index = doc.scene.next_root_index();
                 doc.scene
                     .insert(*node)
                     .map_err(|e| FigError::Mapping(e.to_string()))?;
@@ -436,7 +444,10 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     // the `.fig` ZIP, so the app can install a resolver. Done after the scene is
     // assembled by re-reading the source paints (the `AssetId` is a pure function
     // of the image hash, so this reproduces exactly the ids `read_paint` minted).
-    let assets = collect_image_assets(node_changes, &fig.images);
+    let assets = collect_image_assets(
+        node_changes.iter().map(|change| -> &KiwiValue { change }),
+        &fig.images,
+    );
     report.image_assets_extracted = assets.len();
 
     Ok((doc, report, assets))
@@ -546,30 +557,20 @@ fn relocate_masters(
     report: &mut MapReport,
     page: NodeId,
     page_ids: &[NodeId],
-    pending_components: &[PendingComponent],
+    pending_components: &[PendingComponent<'_>],
     pending_sets: &[PendingSet],
 ) -> FigResult<()> {
+    let page_set: HashSet<NodeId> = page_ids.iter().copied().collect();
+    let master_roots: HashSet<NodeId> = pending_sets
+        .iter()
+        .map(|ps| ps.root)
+        .chain(pending_components.iter().map(|pc| pc.root))
+        .collect();
     for ps in pending_sets {
-        relocate_master(
-            doc,
-            report,
-            ps.root,
-            page,
-            page_ids,
-            pending_components,
-            pending_sets,
-        )?;
+        relocate_master(doc, report, ps.root, page, &page_set, &master_roots)?;
     }
     for pc in pending_components {
-        relocate_master(
-            doc,
-            report,
-            pc.root,
-            page,
-            page_ids,
-            pending_components,
-            pending_sets,
-        )?;
+        relocate_master(doc, report, pc.root, page, &page_set, &master_roots)?;
     }
     Ok(())
 }
@@ -582,9 +583,8 @@ fn relocate_master(
     report: &mut MapReport,
     root: NodeId,
     page: NodeId,
-    page_ids: &[NodeId],
-    pending_components: &[PendingComponent],
-    pending_sets: &[PendingSet],
+    page_set: &HashSet<NodeId>,
+    master_roots: &HashSet<NodeId>,
 ) -> FigResult<()> {
     let scene = &mut doc.scene;
     // Don't relocate a node already living under the Components page (e.g. a
@@ -593,14 +593,7 @@ fn relocate_master(
     if scene.get(root).is_none() || is_under_components {
         return Ok(());
     }
-    if !is_library_master(
-        root,
-        page,
-        page_ids,
-        pending_components,
-        pending_sets,
-        scene,
-    ) {
+    if !is_library_master(root, page, page_set, master_roots, scene) {
         // Embedded in design content — leave it in place so it renders where the
         // designer put it (Figma fidelity).
         report.masters_kept_in_place += 1;
@@ -615,12 +608,12 @@ fn relocate_master(
 
 /// Whether a master `root` is detached library data (relocate to the Components
 /// page) rather than visible Figma-canvas content (render in place).
+/// `master_roots` is every component master and set root.
 fn is_library_master(
     root: NodeId,
     page: NodeId,
-    page_ids: &[NodeId],
-    pending_components: &[PendingComponent],
-    pending_sets: &[PendingSet],
+    page_set: &HashSet<NodeId>,
+    master_roots: &HashSet<NodeId>,
     scene: &fanta_doc::scene::Scene,
 ) -> bool {
     // The master's immediate scene parent. `None` means it is a detached root,
@@ -633,21 +626,23 @@ fn is_library_master(
     if parent == page {
         return true;
     }
-    if page_ids.contains(&parent) {
+    if page_set.contains(&parent) {
         return false;
     }
-    pending_components.iter().any(|pc| pc.root == parent)
-        || pending_sets.iter().any(|ps| ps.root == parent)
+    master_roots.contains(&parent)
 }
 
 /// The side-table material collected during pass 1, resolved and applied after
 /// the scene is assembled. Grouping these keeps `fig_to_doc`'s pass-1 loop and
-/// the collection helpers from threading a dozen separate `&mut` locals.
+/// the collection helpers from threading a dozen separate `&mut` locals. Raw
+/// Kiwi material is borrowed from the (style-resolved) node changes for the
+/// import's lifetime `'a` rather than cloned: an instance's `derivedSymbolData`
+/// alone is a large share of a real file's bytes.
 #[derive(Default)]
-struct Pending {
+struct Pending<'a> {
     /// Component master definitions: (symbol guid, master root NodeId, name,
     /// prop defs).
-    components: Vec<PendingComponent>,
+    components: Vec<PendingComponent<'a>>,
     /// Component sets: state-group SYMBOL / COMPONENT_SET roots.
     sets: Vec<PendingSet>,
     /// Instances: (instance NodeId, symbol guid string) to wire the component ref
@@ -658,9 +653,9 @@ struct Pending {
     /// Variables (from VARIABLE).
     variables: Vec<PendingVariable>,
     /// Per-node prototype reactions.
-    reactions: Vec<(NodeId, Vec<KiwiValue>)>,
+    reactions: Vec<(NodeId, &'a [KiwiValue])>,
     /// Per-node variable bindings (the consumption map).
-    bindings: Vec<(NodeId, KiwiValue)>,
+    bindings: Vec<(NodeId, &'a KiwiValue)>,
     /// Per-node paint-level color bindings.
     paint_bindings: Vec<(NodeId, Vec<(BoundProp, VariableId)>)>,
     /// Per-frame variable-mode pins (`explicitVariableModes`): (node id,
@@ -670,7 +665,7 @@ struct Pending {
     /// Instance overrides: the raw `symbolData.symbolOverrides` array and the
     /// top-level `componentPropAssignments` array per instance, applied in pass 4
     /// once the master subtree + guid→NodeId map are settled.
-    instance_overrides: Vec<PendingInstanceOverrides>,
+    instance_overrides: Vec<PendingInstanceOverrides<'a>>,
     /// Every node's `componentPropRefs` — which prop-def guid drives which
     /// property of that node — keyed by the node's own guid string. Lets pass 4
     /// resolve an instance's `componentPropAssignments[defID → value]` to the
@@ -725,13 +720,13 @@ fn tally_recovered_geometry(
 
 /// Collect the type-specific side-table material for a recognized node
 /// (component master/set, instance overrides, variable collection/variable).
-fn collect_typed_side_tables(
-    pending: &mut Pending,
+fn collect_typed_side_tables<'a>(
+    pending: &mut Pending<'a>,
     report: &mut MapReport,
     type_name: &str,
     guid: &str,
     id: NodeId,
-    change: &KiwiValue,
+    change: &'a KiwiValue,
 ) {
     match type_name {
         "SYMBOL" => {
@@ -798,12 +793,12 @@ fn collect_typed_side_tables(
 /// Collect an INSTANCE's pending side-table material: the symbol ref + its raw
 /// override material (symbolOverrides, componentPropAssignments, derivedSymbolData,
 /// own surface fills) for pass 4.
-fn collect_instance_side_tables(
-    pending: &mut Pending,
+fn collect_instance_side_tables<'a>(
+    pending: &mut Pending<'a>,
     report: &mut MapReport,
     _guid: &str,
     id: NodeId,
-    change: &KiwiValue,
+    change: &'a KiwiValue,
 ) {
     report.instances += 1;
     let Some(sym) = change
@@ -819,13 +814,11 @@ fn collect_instance_side_tables(
         .get("symbolData")
         .and_then(|sd| sd.get("symbolOverrides"))
         .and_then(KiwiValue::as_array)
-        .map(<[KiwiValue]>::to_vec)
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     let prop_assignments = change
         .get("componentPropAssignments")
         .and_then(KiwiValue::as_array)
-        .map(<[KiwiValue]>::to_vec)
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     // Figma's baked per-descendant render data: the `derivedSymbolData`
     // NodeChange[] (field 125). Each entry carries the RESOLVED transform/size/
     // geometry/text for one descendant of this instance's expanded subtree —
@@ -834,8 +827,7 @@ fn collect_instance_side_tables(
     let derived_symbol_data = change
         .get("derivedSymbolData")
         .and_then(KiwiValue::as_array)
-        .map(<[KiwiValue]>::to_vec)
-        .unwrap_or_default();
+        .unwrap_or(&[]);
     // The instance's OWN (style-resolved) surface fills/strokes. The style pre-pass
     // already inlined a `styleIdForFill` ref into `fillPaints` (so a dark
     // `_Header` carries its resolved `#1D1D1D` here, not the light master's white).
@@ -865,19 +857,24 @@ pub(crate) fn has_stroke_fields(change: &KiwiValue) -> bool {
 /// Collect the per-node side-table material that applies regardless of type:
 /// prototype interactions, variable bindings, paint-color bindings, explicit
 /// variable-mode pins, and component-prop refs/defs.
-fn collect_per_node_side_tables(pending: &mut Pending, guid: &str, id: NodeId, change: &KiwiValue) {
+fn collect_per_node_side_tables<'a>(
+    pending: &mut Pending<'a>,
+    guid: &str,
+    id: NodeId,
+    change: &'a KiwiValue,
+) {
     // Per-node prototype interactions.
     if let Some(arr) = change
         .get("prototypeInteractions")
         .and_then(KiwiValue::as_array)
     {
         if !arr.is_empty() {
-            pending.reactions.push((id, arr.to_vec()));
+            pending.reactions.push((id, arr));
         }
     }
     // Per-node variable bindings (the consumption map).
     if let Some(map) = change.get("variableConsumptionMap") {
-        pending.bindings.push((id, map.clone()));
+        pending.bindings.push((id, map));
     }
     let paint_bindings = read_paint_color_bindings(change);
     if !paint_bindings.is_empty() {
@@ -916,8 +913,8 @@ fn collect_per_node_side_tables(pending: &mut Pending, guid: &str, id: NodeId, c
 /// referenced hash absent from `images` (a thumbnail-only ref, or a stripped
 /// export) is skipped: the paint still resolved to a `Fill::Image`, and the
 /// renderer falls back to its placeholder for the unbacked asset.
-pub(crate) fn collect_image_assets(
-    node_changes: &[KiwiValue],
+pub(crate) fn collect_image_assets<'a>(
+    node_changes: impl IntoIterator<Item = &'a KiwiValue>,
     images: &HashMap<String, Vec<u8>>,
 ) -> HashMap<AssetId, Vec<u8>> {
     let mut assets = HashMap::new();
@@ -999,7 +996,7 @@ pub(crate) const COMPONENTS_PAGE_NAME: &str = "Components";
 // Pending side-table records
 // =============================================================================
 
-pub(crate) struct PendingComponent {
+pub(crate) struct PendingComponent<'a> {
     pub(crate) guid: String,
     pub(crate) root: NodeId,
     pub(crate) name: String,
@@ -1009,7 +1006,7 @@ pub(crate) struct PendingComponent {
     /// Parsed into [`ComponentDef::props`] so instances can apply DEFAULTS for
     /// props they don't explicitly assign, and so variant selection has a schema.
     /// Empty for a hand-built component or a master with no exposed props.
-    pub(crate) prop_defs: Vec<KiwiValue>,
+    pub(crate) prop_defs: &'a [KiwiValue],
 }
 
 pub(crate) struct PendingSet {
@@ -1052,17 +1049,17 @@ pub(crate) struct PendingVariable {
 ///   component-property values). Each carries a `defID` (prop-def guid) and a
 ///   `value.textValue` — resolved against the master descendants that bind that
 ///   prop-def via their `componentPropRefs`.
-pub(crate) struct PendingInstanceOverrides {
+pub(crate) struct PendingInstanceOverrides<'a> {
     pub(crate) instance: NodeId,
-    pub(crate) symbol_overrides: Vec<KiwiValue>,
-    pub(crate) prop_assignments: Vec<KiwiValue>,
+    pub(crate) symbol_overrides: &'a [KiwiValue],
+    pub(crate) prop_assignments: &'a [KiwiValue],
     /// The instance's `derivedSymbolData` (Kiwi field 125): a `NodeChange[]` of
     /// Figma's baked, fully-resolved per-descendant render data — each entry's
     /// `guidPath` addresses one master descendant and carries its resolved
     /// `size`/`transform`/`fillGeometry`/`strokeGeometry`/`strokeWeight`/
     /// `derivedTextData` for *this* placement. Resolved to typed
     /// [`fanta_doc::node::DerivedOverride`]s in pass 4.
-    pub(crate) derived_symbol_data: Vec<KiwiValue>,
+    pub(crate) derived_symbol_data: &'a [KiwiValue],
     /// The instance node's OWN surface fills, read from its (style-resolved)
     /// `fillPaints`. Figma resolves a per-placement surface color onto the
     /// instance itself — for a dark-theme card `_Header` this is `#1D1D1D`,

@@ -1,6 +1,7 @@
 //! Shared-style references, backgroundPaints fallback, visibility.
 
 use super::*;
+use std::borrow::Cow;
 
 // =============================================================================
 // Shared-style references + backgroundPaints fallback + visibility (this work)
@@ -44,6 +45,191 @@ fn text_style_def(sid: u32, lid: u32, r: f32, g: f32, b: f32) -> KiwiValue {
             ),
         ],
     )
+}
+
+#[test]
+fn style_pre_pass_copies_only_the_changes_it_rewrites() {
+    // The pre-pass hands back a copy-on-write view: a change with no
+    // `styleIdFor*` ref anywhere the resolvers look stays borrowed from the
+    // source, and only the consumers (including those whose ref sits on a
+    // symbolOverrides entry or a rich-text run entry) are cloned + rewritten.
+    let dark = solid_paint(26.0 / 255.0, 26.0 / 255.0, 26.0 / 255.0, 1.0);
+    let changes = vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 0)),
+                ("type", KiwiValue::Enum("DOCUMENT".into())),
+            ],
+        ),
+        fill_style_def(10, 5, 26.0 / 255.0, 26.0 / 255.0, 26.0 / 255.0),
+        // A direct consumer.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("fillPaints", KiwiValue::Array(vec![])),
+                ("styleIdForFill", style_ref(10, 5)),
+            ],
+        ),
+        // No ref anywhere: must come back untouched and unowned.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 3)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                (
+                    "fillPaints",
+                    KiwiValue::Array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                ),
+            ],
+        ),
+        // The ref lives on a symbolOverrides entry only.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 4)),
+                ("type", KiwiValue::Enum("INSTANCE".into())),
+                (
+                    "symbolData",
+                    o(
+                        "SymbolData",
+                        vec![
+                            ("symbolID", guid(0, 20)),
+                            (
+                                "symbolOverrides",
+                                KiwiValue::Array(vec![o(
+                                    "NodeChange",
+                                    vec![
+                                        ("guidPath", guid_path(0, 21)),
+                                        ("styleIdForFill", style_ref(10, 5)),
+                                    ],
+                                )]),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        ),
+        // The ref lives on a rich-text run entry only.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 5)),
+                ("type", KiwiValue::Enum("TEXT".into())),
+                (
+                    "textData",
+                    o(
+                        "TextData",
+                        vec![
+                            ("characters", KiwiValue::String("ab".to_owned())),
+                            (
+                                "styleOverrideTable",
+                                KiwiValue::Array(vec![o(
+                                    "NodeChange",
+                                    vec![
+                                        ("styleID", KiwiValue::Uint(1)),
+                                        ("styleIdForFill", style_ref(10, 5)),
+                                    ],
+                                )]),
+                            ),
+                        ],
+                    ),
+                ),
+            ],
+        ),
+        // A ref to a guid that is NOT a style def: still counted (and copied),
+        // exactly as the resolvers behaved on an owned slice.
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 6)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("styleIdForFill", style_ref(99, 99)),
+            ],
+        ),
+    ];
+
+    let (resolved, report) = resolve_style_references(&changes);
+    assert_eq!(resolved.len(), changes.len());
+    let owned: Vec<bool> = resolved
+        .iter()
+        .map(|change| matches!(change, Cow::Owned(_)))
+        .collect();
+    assert_eq!(
+        owned,
+        vec![false, false, true, false, true, true, true],
+        "only ref-carrying changes are copied"
+    );
+    for (resolved, original) in resolved.iter().zip(&changes) {
+        if let Cow::Borrowed(borrowed) = resolved {
+            assert!(std::ptr::eq(*borrowed, original));
+        }
+    }
+    // The direct consumer got the style's paints; the untouched rect is equal.
+    assert_eq!(
+        resolved[2].get("fillPaints"),
+        Some(&KiwiValue::Array(vec![dark.clone()]))
+    );
+    assert_eq!(*resolved[3], changes[3]);
+    // The override entry and the run entry were rewritten in place.
+    let override_entry = &resolved[4]
+        .get("symbolData")
+        .and_then(|sd| sd.get("symbolOverrides"))
+        .and_then(KiwiValue::as_array)
+        .unwrap()[0];
+    assert_eq!(
+        override_entry.get("fillPaints"),
+        Some(&KiwiValue::Array(vec![dark.clone()]))
+    );
+    let run_entry = &resolved[5]
+        .get("textData")
+        .and_then(|td| td.get("styleOverrideTable"))
+        .and_then(KiwiValue::as_array)
+        .unwrap()[0];
+    assert_eq!(
+        run_entry.get("fillPaints"),
+        Some(&KiwiValue::Array(vec![dark]))
+    );
+    // The unresolvable ref is counted as an empty-fill ref, never resolved.
+    assert!(resolved[6].get("fillPaints").is_none());
+    assert_eq!(report.style_def_count, 1);
+    assert_eq!(
+        report.ref_empty_fill, 4,
+        "direct consumer + override entry + run entry + dangling ref"
+    );
+    assert_eq!(report.resolved_fill, 3);
+}
+
+#[test]
+fn style_pre_pass_without_style_defs_borrows_everything() {
+    let changes = vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 0)),
+                ("type", KiwiValue::Enum("DOCUMENT".into())),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("styleIdForFill", style_ref(10, 5)),
+            ],
+        ),
+    ];
+    let (resolved, report) = resolve_style_references(&changes);
+    assert!(
+        resolved
+            .iter()
+            .all(|change| matches!(change, Cow::Borrowed(_))),
+        "no style defs ⇒ nothing to inline ⇒ no copies"
+    );
+    assert_eq!(report.style_def_count, 0);
+    assert_eq!(report.ref_empty_fill, 0);
 }
 
 #[test]

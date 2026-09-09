@@ -23,6 +23,7 @@ mod instance_overrides_root_duality;
 mod instance_overrides_routing;
 mod instance_overrides_schema;
 mod instance_overrides_variant_placeholder;
+mod large_documents;
 mod motion;
 mod prototype;
 mod shared_style;

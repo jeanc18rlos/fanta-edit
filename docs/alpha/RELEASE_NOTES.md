@@ -13,10 +13,16 @@ Fanta writes a project folder — `fanta.json`, a `pages/` tree of `.fnx` source
 the folder changes; `git diff` shows you what you did. An agent editing the same
 folder is doing exactly what your cursor does.
 
-Every feature sentence below was re-checked against this tree at commit
-`16309b2`, by grepping for the thing it claims. Where something was measured,
+Every feature sentence below was re-checked against the working tree of
+`perf/large-documents-ai-alignment` — the uncommitted work on top of
+`16309b2` — by grepping for the thing it claims. Where something was measured,
 the number is the measurement and the command that produced it, and the commit
-it was taken at. Where nothing was run, [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and
+it was taken at; every measurement in this document was taken at `16309b2` or
+earlier, and **no binary has been built from this tree**. The tree changed the
+autosave write path, image decoding, drag rendering, the layers tree and the
+`.fig` import pipeline, so the memory and timing figures describe code this
+tree replaced; [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) says so entry by entry.
+Where nothing was run, [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and
 [`REHEARSAL.md`](REHEARSAL.md) say so instead — and `REHEARSAL.md`'s "could not
 verify" rows are not restated here as features.
 
@@ -82,15 +88,22 @@ args = ["--mcp-stdio"]
 
 **What to expect when it works.** The client's handshake completes, and the
 Fanta window raises a toast reading *"Agent connected: &lt;client name&gt;"*.
-`tools/list` returns five tools, scoped to whichever design is focused:
+`tools/list` returns six tools, scoped to whichever design is focused
+(`server.add_tool(…)` in `crates/fig_viewer/src/live_mcp.rs`):
 
 | Tool | What it does |
 |---|---|
-| `get_editor_state` | project root, pages, which page is active, and each page's source file |
+| `get_editor_state` | project root, pages, which page is active, each page's source file, the selection and its bounds; pass `empty_space: [w, h]` to also get a free spot for a new frame |
+| `get_guidelines` | Fanta's design guidelines for agents (`design_surface::DESIGN_GUIDELINES`); read once per session |
 | `batch_get` | reads nodes; with no `ids` it lists the active page's tree at `depth: 2` |
-| `batch_design` | applies a list of design operations to the canvas |
+| `batch_design` | applies a list of design operations to the canvas as one undo step — the `design_surface::DesignOp` vocabulary, from `create_node` to `group`, `align` and `create_component` |
 | `get_screenshot` | renders the open page (or a node) to PNG |
 | `read_fnx_source` | returns a slice of a `.fnx` file — 64 KiB by default, 1 MiB ceiling |
+
+`get_guidelines` and most of the `batch_design` vocabulary landed on this
+branch and have only been exercised by unit tests; the five tools the release
+build was smoke-tested with were the other five, and `script/smoke-mcp` drives
+exactly one op, `create_node`.
 
 **What to expect when it does not.** With the app closed, the bridge prints one
 line and exits 2 rather than pretending to be connected:
@@ -110,7 +123,7 @@ while a prototype is playing and while a keyframe is being dragged
 frame of a drag.
 
 A new project is `git init`-ed the first time it is written
-(`git_init_if_needed`, `crates/fig_viewer/src/document.rs:1787`) unless it
+(`git_init_if_needed`, `crates/fig_viewer/src/document.rs`) unless it
 already sits inside a repository, in which case its changes show up in the
 repository you already have. That call shells out to `git` on `PATH`, and a
 failure is logged and swallowed so that a save never fails because version
@@ -143,6 +156,17 @@ save path. Both `fanta-fnx` and `fanta-format` now enable serde_json's
 `float_roundtrip` feature, and `fanta.json` no longer carries a per-save
 timestamp, which took it out of the diff entirely.
 
+The write behind that diff changed on this branch and the diff has not been
+re-taken. `FigItem::save` now persists `Doc::clone_for_persist()` — the
+document without its undo history and selection, which were never written —
+through `fanta_format::write_project_tree_cached`, which fingerprints each
+page and component and reuses last save's bytes for any design that did not
+change (`ProjectWriteCache`, `crates/fanta-format/src/project/write.rs`). The
+crate's contract, and its tests (`tests/write_cache.rs`), is that the bytes are
+identical to a cold write and that the same write-if-changed and prune steps
+still run, so the three-file diff above is what the code says you should still
+get; nobody has run `git status` after a save from this tree.
+
 Editing `.fnx` in your own editor works in the other direction: the canvas
 reloads and names the file that changed — *"&lt;file&gt; changed on disk —
 canvas updated"*, or *"… merged into your unsaved canvas edits"* if you had
@@ -161,6 +185,32 @@ render it, and watch it reach git. Everything else below is a source reading.
   gradients, shadows and blurs (four effect kinds only), components and
   instances, and variables with modes (`variable_binding.rs`,
   `mode_overrides.rs`).
+- **Group, Frame selection and Ungroup** — `cmd-g`, `cmd-alt-g` and
+  `cmd-shift-g` (`assets/keymaps/default-macos.json`), the toolbar's commands
+  of the same names and the layers context menu, all built by
+  `crates/fig_viewer/src/structure.rs` as one undo step each. Members keep
+  their world position; a page, a component master or (for ungroup) an
+  instance is refused with a canvas notice. New on this branch; unit-tested,
+  never pressed.
+- **Pasting an image** from another app, or a `png`/`jpg`/`jpeg`/`webp`/`gif`/
+  `bmp`/`tiff`/`tif` file from Finder, places it as a bitmap layer centred on the
+  viewport and adds it to the project's assets (`paste_selected_nodes` and
+  `paste_image`, `crates/fig_viewer/src/view.rs`). Other file types are still
+  ignored. New on this branch; source reading.
+- **Toolbar AI commands** (*Generate a design*, *Replace content*, *Rewrite
+  text*, *Translate text*, *Rename layers*) and the toolbar's AI box open a
+  draft in the Agent Panel, prefixed with the page and selection, that you
+  still have to send (`route_toolbar_agent_prompt`, `view.rs`). *Remove
+  background* and *Generate an image* say they are unavailable.
+- **Large-document paths reworked**, all as source readings: the render
+  thread receives per-node patches for a drag instead of a scene copy
+  (`ScenePatch`, `crates/fig_viewer/src/canvas.rs`), the layers panel builds
+  only the rows it can show (`gpui_adapters/layers.rs::layers_tree`), images
+  decode on first draw under a 1.5 GiB cap (`fanta_render::asset::LazyAssetResolver`),
+  selections over 512 layers draw one outline (`SELECTION_OUTLINE_CAP`), and
+  the `.fig` importer no longer decodes `byte[]` fields one value per byte or
+  deep-clones the change tree to resolve shared styles
+  (`crates/fanta-fig-interop`). None of it has been timed in the app.
 - **Prototype flows and presentation**, motion clips with a timeline, and pinned
   comments. These are compiled in but were **not exercised** in the alpha smoke
   run at all; treat them as unverified.
@@ -219,8 +269,11 @@ repository just now, with the command that produced it.
 
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) is the honest list and it is not short.
 The headlines: parts of the toolbar and inspector are visible but not wired up
-and say so when clicked; there is no Group or Ungroup; cross-document and image
-paste do not work; and the first launch goes through macOS Gatekeeper. A design
+and say so when clicked; cross-document paste does not work; nothing on this
+branch — Group/Ungroup, image paste, the new agent ops, the reworked save and
+render paths — has been driven in a running build; the memory and timing
+figures are from the previous build; and the first launch goes through macOS
+Gatekeeper. A design
 project Fanta scaffolded opens without the Restricted Mode prompt; a folder that
 is *not* a design project — and a design project whose copied `.git` carries
 anything this build does not recognise as inert — still raises it, and that
@@ -250,6 +303,12 @@ one thing that build cannot prove about itself is Gatekeeper: it was never
 downloaded through a browser, so it carries no quarantine attribute and the
 "Apple could not verify" dialog above has still never been seen. Row G of
 [`SMOKE.md`](SMOKE.md) is the only way to settle that.
+
+**Nothing on `perf/large-documents-ai-alignment` has been driven.** The smoke
+script has not been re-run against a build of this tree; if it were, its
+`tools/list` assertion would still pass — it checks that the five names in
+`REQUIRED_TOOLS` are present, not that there are five (`script/smoke-mcp`) —
+and its one `batch_design` op, `create_node`, is unchanged.
 
 The CLI checks below were re-run against that release binary, not carried over.
 

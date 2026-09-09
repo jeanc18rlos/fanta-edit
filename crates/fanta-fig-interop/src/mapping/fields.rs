@@ -7,6 +7,7 @@ use super::{
     ImageFitMode, KiwiValue, ParametricShape, PathData, Shadow, ShadowKind, Transform2D,
     VectorNode, build_stroke, stable_hash_u128,
 };
+use std::borrow::Cow;
 
 /// Resolve a Figma `Number { value, units }` to an absolute pixel amount.
 pub(crate) fn read_number_px(number: Option<&KiwiValue>, font_px: f64) -> Option<f64> {
@@ -306,6 +307,11 @@ pub(crate) fn style_ref_guid(change: &KiwiValue, field: &str) -> Option<String> 
         .and_then(guid_key)
 }
 
+/// The shared-style definitions of a document, keyed by guid string. Borrows
+/// the ORIGINAL (unresolved) changes: a style def that itself carries a style
+/// ref is never chased, matching op2.
+pub(crate) type StyleMap<'a> = HashMap<String, &'a KiwiValue>;
+
 /// **Shared-style reference resolution** — mirrors op2's `resolveStyleReferences`
 /// (figma-node-mapper.ts:25-90).
 ///
@@ -320,27 +326,37 @@ pub(crate) fn style_ref_guid(change: &KiwiValue, field: &str) -> Option<String> 
 /// (`read_fills`, `build_stroke`, `read_effects`, `build_text`) transparently see
 /// real values. Rich text runs have their own mini `NodeChange`s in
 /// `textData.styleOverrideTable`, so we resolve those nested refs too.
-pub(crate) fn resolve_style_references(changes: &mut [KiwiValue]) -> StyleResolveReport {
+///
+/// Returns the changes as a copy-on-write view over `changes`: a change that
+/// carries no `styleIdFor*` ref anywhere the resolvers look is handed back
+/// borrowed, and only the consumers are cloned and rewritten. The resolvers
+/// never mutate (or count) a change without such a ref, so the borrowed
+/// entries are exactly the ones they would have left untouched — and the
+/// document is no longer deep-copied wholesale for the handful of styled nodes.
+pub(crate) fn resolve_style_references(
+    changes: &[KiwiValue],
+) -> (Vec<Cow<'_, KiwiValue>>, StyleResolveReport) {
     let mut report = StyleResolveReport::default();
 
-    // 1) Build the style map (guid string → cloned style def). We clone the few
-    //    style defs up-front so we can keep borrowing them while mutating each
-    //    consumer in the same slice.
-    let mut style_map: HashMap<String, KiwiValue> = HashMap::new();
-    for nc in changes.iter() {
+    let mut style_map: StyleMap<'_> = HashMap::new();
+    for nc in changes {
         if nc.get("styleType").is_some() {
             report.style_def_count += 1;
             if let Some(guid) = nc.get("guid").and_then(guid_key) {
-                style_map.insert(guid, nc.clone());
+                style_map.insert(guid, nc);
             }
         }
     }
+    let mut resolved: Vec<Cow<'_, KiwiValue>> = changes.iter().map(Cow::Borrowed).collect();
     if style_map.is_empty() {
-        return report;
+        return (resolved, report);
     }
 
-    // 2) Resolve every node + every override entry against the map.
-    for nc in changes.iter_mut() {
+    for slot in &mut resolved {
+        if !change_carries_style_ref(slot) {
+            continue;
+        }
+        let nc = slot.to_mut();
         resolve_style_on(nc, &style_map, &mut report);
 
         // Override entries (figma-node-mapper.ts:82-89): dark-theme instances
@@ -367,7 +383,47 @@ pub(crate) fn resolve_style_references(changes: &mut [KiwiValue]) -> StyleResolv
         }
     }
 
-    report
+    (resolved, report)
+}
+
+/// The `styleIdFor*` fields the resolvers act on. Every resolver returns
+/// before touching or counting anything unless its ref field is present, so
+/// "carries one of these" is the exact precondition for a change needing an
+/// owned copy.
+const STYLE_REF_FIELDS: [&str; 4] = [
+    "styleIdForFill",
+    "styleIdForStrokeFill",
+    "styleIdForText",
+    "styleIdForEffect",
+];
+
+/// Whether `resolve_style_references` would rewrite `nc`: a style ref on the
+/// change itself, on one of its rich-text run entries, or on one of its
+/// `symbolData.symbolOverrides[]` entries (including THEIR run entries). Mirrors
+/// the exact shape the resolvers walk.
+pub(crate) fn change_carries_style_ref(nc: &KiwiValue) -> bool {
+    if consumer_carries_style_ref(nc) {
+        return true;
+    }
+    nc.get("symbolData")
+        .and_then(|sd| sd.get("symbolOverrides"))
+        .and_then(KiwiValue::as_array)
+        .is_some_and(|overrides| overrides.iter().any(consumer_carries_style_ref))
+}
+
+/// The per-consumer half of [`change_carries_style_ref`]: what
+/// [`resolve_style_on`] / [`resolve_style_on_symbol_override`] look at for one
+/// node or override entry — its own ref fields plus its run tables.
+fn consumer_carries_style_ref(nc: &KiwiValue) -> bool {
+    if STYLE_REF_FIELDS.iter().any(|field| nc.get(field).is_some()) {
+        return true;
+    }
+    ["textData", "derivedTextData"].iter().any(|field| {
+        nc.get(field)
+            .and_then(|td| td.get("styleOverrideTable"))
+            .and_then(KiwiValue::as_array)
+            .is_some_and(|table| table.iter().any(consumer_carries_style_ref))
+    })
 }
 
 /// Inline any referenced style's payload into a single consumer (`nc`), only for
@@ -375,7 +431,7 @@ pub(crate) fn resolve_style_references(changes: &mut [KiwiValue]) -> StyleResolv
 /// the fill-resolution coverage.
 pub(crate) fn resolve_style_on(
     nc: &mut KiwiValue,
-    style_map: &HashMap<String, KiwiValue>,
+    style_map: &StyleMap<'_>,
     report: &mut StyleResolveReport,
 ) {
     resolve_fill_style(nc, style_map, report);
@@ -387,7 +443,7 @@ pub(crate) fn resolve_style_on(
 
 pub(crate) fn resolve_style_on_symbol_override(
     nc: &mut KiwiValue,
-    style_map: &HashMap<String, KiwiValue>,
+    style_map: &StyleMap<'_>,
     report: &mut StyleResolveReport,
 ) {
     resolve_fill_style(nc, style_map, report);
@@ -412,7 +468,7 @@ pub(crate) fn resolve_style_on_symbol_override(
 /// the overwrite is a no-op there — the fix stays per-page correct.)
 fn resolve_fill_style(
     nc: &mut KiwiValue,
-    style_map: &HashMap<String, KiwiValue>,
+    style_map: &StyleMap<'_>,
     report: &mut StyleResolveReport,
 ) {
     let Some(guid) = style_ref_guid(nc, "styleIdForFill") else {
@@ -438,7 +494,7 @@ fn resolve_fill_style(
 /// ---- STROKE FILL ----  (the style's `fillPaints` becomes the stroke paint)
 /// Same unconditional-overwrite semantics as FILL (op2 lines 51-54): the
 /// referenced stroke style's paints win over the node's own `strokePaints`.
-fn resolve_stroke_fill_style(nc: &mut KiwiValue, style_map: &HashMap<String, KiwiValue>) {
+fn resolve_stroke_fill_style(nc: &mut KiwiValue, style_map: &StyleMap<'_>) {
     let Some(guid) = style_ref_guid(nc, "styleIdForStrokeFill") else {
         return;
     };
@@ -453,15 +509,11 @@ fn resolve_stroke_fill_style(nc: &mut KiwiValue, style_map: &HashMap<String, Kiw
 }
 
 /// ---- TEXT ----  font fields + the text color (style's fillPaints)
-fn resolve_text_style(
-    nc: &mut KiwiValue,
-    style_map: &HashMap<String, KiwiValue>,
-    copy_style_fills: bool,
-) {
+fn resolve_text_style(nc: &mut KiwiValue, style_map: &StyleMap<'_>, copy_style_fills: bool) {
     let Some(guid) = style_ref_guid(nc, "styleIdForText") else {
         return;
     };
-    let Some(style) = style_map.get(&guid).cloned() else {
+    let Some(&style) = style_map.get(&guid) else {
         return;
     };
     for field in [
@@ -482,7 +534,7 @@ fn resolve_text_style(
     // A TEXT style may also carry the glyph color via its own fillPaints. Symbol
     // override entries are different: Spectrum uses `styleIdForText` there to
     // swap typography while leaving the descendant's authored/theme fill intact.
-    if copy_style_fills && !has_nonempty_fills(nc) && has_nonempty_fills(&style) {
+    if copy_style_fills && !has_nonempty_fills(nc) && has_nonempty_fills(style) {
         if let Some(paints) = style.get("fillPaints") {
             nc.set_field("fillPaints", paints.clone());
         }
@@ -490,7 +542,7 @@ fn resolve_text_style(
 }
 
 /// ---- EFFECT ----
-fn resolve_effect_style(nc: &mut KiwiValue, style_map: &HashMap<String, KiwiValue>) {
+fn resolve_effect_style(nc: &mut KiwiValue, style_map: &StyleMap<'_>) {
     if has_nonempty_array(nc, "effects") {
         return;
     }
@@ -514,7 +566,7 @@ fn resolve_effect_style(nc: &mut KiwiValue, style_map: &HashMap<String, KiwiValu
 /// range imports with the right font metadata but the wrong glyph color.
 fn resolve_rich_text_run_styles(
     nc: &mut KiwiValue,
-    style_map: &HashMap<String, KiwiValue>,
+    style_map: &StyleMap<'_>,
     report: &mut StyleResolveReport,
 ) {
     for field in ["textData", "derivedTextData"] {
@@ -703,23 +755,21 @@ pub(crate) fn image_hash_hex(paint: &KiwiValue) -> Option<String> {
     let bytes = paint
         .get("image")
         .and_then(|img| img.get("hash"))
-        .and_then(KiwiValue::as_array)?;
+        .and_then(KiwiValue::as_bytes)?;
     if bytes.is_empty() {
         return None;
     }
     let mut hex = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let v = match *b {
-            KiwiValue::Byte(x) => x,
-            KiwiValue::Uint(x) => x as u8,
-            KiwiValue::Int(x) => x as u8,
-            _ => return None,
-        };
-        use std::fmt::Write;
-        let _ = write!(hex, "{v:02x}");
+    for byte in bytes.iter() {
+        hex.push(HEX_DIGITS[usize::from(byte >> 4)]);
+        hex.push(HEX_DIGITS[usize::from(byte & 0x0f)]);
     }
     Some(hex)
 }
+
+const HEX_DIGITS: [char; 16] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+];
 
 /// Deterministic [`AssetId`] for an image hash hex string. Stable across runs
 /// and across re-imports (it's a pure function of the hash), so two paints that

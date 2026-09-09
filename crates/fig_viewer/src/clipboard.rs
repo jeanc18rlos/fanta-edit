@@ -45,7 +45,12 @@ pub(crate) struct PastedNodes {
 
 impl CanvasClipboard {
     pub(crate) fn capture(doc: &Doc) -> Option<Self> {
-        let mut roots = editable_selection_roots(doc);
+        Self::capture_roots(doc, editable_selection_roots(doc))
+    }
+
+    /// Capture the subtrees under `roots` (already reduced to top-level
+    /// members: no root may be a descendant of another).
+    fn capture_roots(doc: &Doc, mut roots: Vec<NodeId>) -> Option<Self> {
         roots.sort_by(|left, right| {
             let left = doc.scene.get(*left);
             let right = doc.scene.get(*right);
@@ -120,6 +125,15 @@ impl CanvasClipboard {
         &self,
         doc: &Doc,
         offset: f64,
+        placement: ClipboardPlacement,
+    ) -> Result<PastedNodes> {
+        self.instantiate_offset(doc, (offset, offset), placement)
+    }
+
+    fn instantiate_offset(
+        &self,
+        doc: &Doc,
+        offset: (f64, f64),
         placement: ClipboardPlacement,
     ) -> Result<PastedNodes> {
         if self.version != CLIPBOARD_VERSION {
@@ -211,7 +225,7 @@ impl CanvasClipboard {
                 node.transform = source_world.then(&parent_world.inverse());
                 node.transform = node
                     .transform
-                    .then(&Transform2D::translation(offset, offset));
+                    .then(&Transform2D::translation(offset.0, offset.1));
                 node.index = destination_index;
                 pasted_roots.push(node.id);
             } else {
@@ -282,7 +296,7 @@ fn compatible_parent(doc: &Doc, id: NodeId) -> bool {
     node_is_on_active_page(doc, id) && doc.scene.get(id).is_some_and(CanvasNode::can_have_children)
 }
 
-fn node_is_on_active_page(doc: &Doc, id: NodeId) -> bool {
+pub(crate) fn node_is_on_active_page(doc: &Doc, id: NodeId) -> bool {
     let Some(page) = doc.active_page() else {
         return true;
     };
@@ -340,6 +354,40 @@ fn duplicate_root_indices(doc: &Doc, roots: &[ClipboardRoot]) -> Result<HashMap<
         }
     }
     Ok(result)
+}
+
+/// Deep-copy the subtrees under `roots` (ids nested under another root are
+/// dropped, page roots are refused), each copy landing one z-slot above its
+/// source, shifted by `offset` world units. The returned [`PastedNodes`] is
+/// turned into ops with [`create_operations`]; `roots` names the copies.
+pub(crate) fn duplicate_operations(
+    doc: &Doc,
+    roots: &[NodeId],
+    offset: (f64, f64),
+) -> Result<PastedNodes> {
+    if !(offset.0.is_finite() && offset.1.is_finite()) {
+        bail!("the duplicate offset must be finite");
+    }
+    let requested = roots.iter().copied().collect::<HashSet<_>>();
+    let mut top_level = Vec::with_capacity(roots.len());
+    for id in roots {
+        if !doc.scene.contains(*id) {
+            bail!("node {id} does not exist");
+        }
+        if doc.pages().contains(id) {
+            bail!("refusing to duplicate a page root");
+        }
+        let nested = doc
+            .scene
+            .ancestors_of(*id)
+            .any(|ancestor| requested.contains(&ancestor.id));
+        if !nested && !top_level.contains(id) {
+            top_level.push(*id);
+        }
+    }
+    let clipboard =
+        CanvasClipboard::capture_roots(doc, top_level).context("nothing to duplicate")?;
+    clipboard.instantiate_offset(doc, offset, ClipboardPlacement::Duplicate)
 }
 
 pub(crate) fn delete_operations(doc: &Doc) -> Vec<Operation> {
@@ -403,8 +451,7 @@ pub(crate) fn apply_transaction(
     doc.history.begin(label, &mut doc.scene);
     for operation in operations {
         if let Err(error) = doc.apply(operation) {
-            doc.history
-                .abort(&mut doc.scene)
+            doc.abort_transaction()
                 .context("rolling back the canvas edit")?;
             return Err(error).context("applying the canvas edit");
         }
@@ -704,6 +751,31 @@ mod tests {
                 .values()
                 .any(|track| track.target.node == remapped_target)
         );
+    }
+
+    #[test]
+    fn duplicate_operations_copies_explicit_roots_with_an_offset() {
+        let (mut doc, frame_id, first_id, _) = subtree_doc();
+        let pasted = duplicate_operations(&doc, &[frame_id, first_id], (10.0, 5.0))
+            .expect("duplicate the frame");
+        assert_eq!(pasted.roots.len(), 1, "the nested child is not a root");
+        let copy = pasted.roots[0];
+        assert!(apply_transaction(&mut doc, "Duplicate", create_operations(&pasted)).unwrap());
+        let source = doc.scene.world_bounds(frame_id).unwrap();
+        let duplicate = doc.scene.world_bounds(copy).unwrap();
+        assert_eq!(duplicate.min_x - source.min_x, 10.0);
+        assert_eq!(duplicate.min_y - source.min_y, 5.0);
+        assert_eq!(doc.scene.children_of(Some(copy)).len(), 2);
+        assert!(doc.scene.get(frame_id).unwrap().index < doc.scene.get(copy).unwrap().index);
+    }
+
+    #[test]
+    fn duplicate_operations_refuses_page_roots_and_missing_nodes() {
+        let (doc, _, _, _) = subtree_doc();
+        let page = doc.active_page().unwrap();
+        assert!(duplicate_operations(&doc, &[page], (0.0, 0.0)).is_err());
+        assert!(duplicate_operations(&doc, &[NodeId::new()], (0.0, 0.0)).is_err());
+        assert!(duplicate_operations(&doc, &[], (0.0, 0.0)).is_err());
     }
 
     #[test]

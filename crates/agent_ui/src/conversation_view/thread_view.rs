@@ -1850,8 +1850,7 @@ impl ThreadView {
                 ThreadError::PaymentRequired => (
                     "payment_required",
                     None,
-                    "You reached your free usage limit. Upgrade to Fanta Pro for more prompts."
-                        .into(),
+                    "You reached your free usage limit.".into(),
                 ),
                 ThreadError::Refusal => {
                     let model_or_agent_name = self.current_model_name(cx);
@@ -10722,8 +10721,7 @@ impl ThreadView {
     }
 
     fn render_payment_required_error(&self, cx: &mut Context<Self>) -> Callout {
-        const ERROR_MESSAGE: &str =
-            "You reached your free usage limit. Upgrade to Fanta Pro for more prompts.";
+        const ERROR_MESSAGE: &str = "You reached your free usage limit.";
 
         Callout::new()
             .severity(Severity::Error)
@@ -10733,7 +10731,6 @@ impl ThreadView {
             .actions_slot(
                 h_flex()
                     .gap_0p5()
-                    .child(self.upgrade_button(cx))
                     .child(self.create_copy_button(ERROR_MESSAGE)),
             )
             .dismiss_action(self.dismiss_error_button(cx))
@@ -10897,18 +10894,6 @@ impl ThreadView {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.clear_thread_error(cx);
                 window.dispatch_action(NewThread.boxed_clone(), cx);
-            }))
-    }
-
-    fn upgrade_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("upgrade", "Upgrade")
-            .label_size(LabelSize::Small)
-            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-            .on_click(cx.listener({
-                move |this, _, _, cx| {
-                    this.clear_thread_error(cx);
-                    cx.open_url(&zed_urls::upgrade_to_zed_pro_url(cx));
-                }
             }))
     }
 

@@ -15,7 +15,59 @@ use crate::spatial::SpatialIndex;
 use crate::transform::{Bounds, Transform2D};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+
+// =============================================================================
+// Change log
+// =============================================================================
+
+/// One recorded mutation, paired in [`Scene::change_log`] with the revision
+/// the scene held right after it. See [`Scene::changes_since`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneChange {
+    /// Only the node's local transform changed ([`Scene::set_transform`]).
+    Transform(NodeId),
+    /// The node's own data may have changed in any way except its parent and
+    /// z-index ([`Scene::get_mut`], [`Scene::patch_node`]).
+    Node(NodeId),
+    /// Nodes were inserted, removed, reparented, reordered, or the child index
+    /// was rebuilt — a copy cannot be brought up to date node by node.
+    Structural,
+    /// An edit through a `&mut Scene` the graph did not see, reported after the
+    /// fact via [`Scene::invalidate_world_cache`].
+    Unknown,
+}
+
+/// The deduplicated set of nodes a copy of the scene has to refresh to match
+/// the original — the result of [`Scene::changes_since`]. Both lists are sorted
+/// and disjoint: a node whose data may have changed is listed in `nodes` only,
+/// since re-copying the node carries its transform along.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SceneDelta {
+    /// Nodes whose only change since the queried revision is their local
+    /// transform.
+    pub transforms: Vec<NodeId>,
+    /// Nodes whose data may have changed since the queried revision.
+    pub nodes: Vec<NodeId>,
+}
+
+impl SceneDelta {
+    pub fn is_empty(&self) -> bool {
+        self.transforms.is_empty() && self.nodes.is_empty()
+    }
+}
+
+/// How many mutations [`Scene::change_log`] remembers. A consumer further
+/// behind than this cannot be served a delta and re-copies the scene. Sized so
+/// a drag of a few hundred nodes on a page whose render spans several input
+/// frames still fits between two renders (entries are 24 bytes; the deque only
+/// grows as far as it is used).
+pub const SCENE_CHANGE_LOG_CAP: usize = 16_384;
+
+/// The most nodes a [`SceneDelta`] may name. Beyond this a node-by-node patch
+/// is no longer cheaper than a fresh copy, so [`Scene::changes_since`] gives
+/// up instead.
+pub const SCENE_DELTA_MAX_NODES: usize = 2048;
 
 // =============================================================================
 // Scene
@@ -55,15 +107,21 @@ pub struct Scene {
     /// A cached world transform for `id` is the product of `id`'s local
     /// transform and every ancestor's local transform. It goes stale if any of
     /// those transforms change, or if `id`'s ancestor chain changes (reparent /
-    /// reorder that moves `id` under a different subtree). Rather than track
-    /// fine-grained dependencies, every method that *could* invalidate an entry
-    /// clears the **whole** cache via [`Scene::invalidate_world_cache`]:
+    /// reorder that moves `id` under a different subtree). Every method that
+    /// *could* invalidate an entry clears the **whole** cache
+    /// ([`Scene::clear_derived_caches`]):
     ///
     /// - [`Scene::insert`], [`Scene::remove`] — add/drop nodes and subtrees.
     /// - [`Scene::set_parent`], [`Scene::set_index`] — change ancestor chains.
     /// - [`Scene::rebuild_child_index`] — wholesale index rebuild after load.
     /// - [`Scene::get_mut`] — opaque `&mut CanvasNode`; the caller may write
     ///   `transform`, so we must assume any transform changed.
+    ///
+    /// except the two edits whose reach is known exactly, which drop only the
+    /// entries they can stale: [`Scene::set_transform`] (the node and its
+    /// descendants) and [`Scene::patch_node`] (the same, with the hierarchy
+    /// verified unchanged). A drag on a 30k-node page therefore recomputes the
+    /// moved subtree, not the document.
     ///
     /// Clearing is O(n) in the cache size but happens only on mutation, not on
     /// the per-node read hot path. A cleared cache is always correct: the next
@@ -89,13 +147,15 @@ pub struct Scene {
     ///
     /// ## Invalidation contract
     ///
-    /// Shares [`Scene::invalidate_world_cache`] with `world_cache`: any geometry
+    /// Shares [`Scene::clear_derived_caches`] with `world_cache`: any geometry
     /// or structure change (transform write via `get_mut`, insert/remove,
     /// reparent/reorder, index rebuild) clears it wholesale. A group's bounds
     /// depend on its descendants' local transforms and geometry, so a descendant
     /// edit must invalidate every ancestor's cached union — wholesale clearing
-    /// covers that conservatively. `#[serde(skip)]` so clone/deserialize start
-    /// empty and can never resurrect a stale entry.
+    /// covers that conservatively, and [`Scene::set_transform`] /
+    /// [`Scene::patch_node`] drop exactly the edited node's ancestor chain (plus
+    /// the node itself for a data edit). `#[serde(skip)]` so clone/deserialize
+    /// start empty and can never resurrect a stale entry.
     #[serde(skip)]
     pub(crate) local_bounds_cache: RefCell<IdHashMap<NodeId, Option<Bounds>>>,
     /// Lazily-built spatial acceleration structure over world AABBs, used to
@@ -118,9 +178,9 @@ pub struct Scene {
     /// empty and never resurrect a stale index. See [`crate::spatial`].
     #[serde(skip)]
     pub(crate) spatial_index: RefCell<Option<SpatialIndex>>,
-    /// Monotonic content revision: bumped by [`Scene::invalidate_world_cache`]
-    /// — the single funnel every structural/geometry mutation already goes
-    /// through. Equal revisions GUARANTEE the render-relevant scene state is
+    /// Monotonic content revision: bumped by [`Scene::record_change`] — the
+    /// single funnel every structural/geometry mutation goes through, which
+    /// also logs what changed. Equal revisions GUARANTEE the render-relevant scene state is
     /// unchanged (the converse doesn't hold: a bump may be conservative).
     /// The memoization primitive for retained-surface blits and per-frame
     /// chrome scans (perf-findings-2026-06.md item 1). `Cell` because reads
@@ -164,6 +224,16 @@ pub struct Scene {
     /// the serde `default`) — so equal ids GUARANTEE the same live instance.
     #[serde(skip, default = "mint_scene_instance_id")]
     pub(crate) instance_id: u64,
+    /// The last [`SCENE_CHANGE_LOG_CAP`] mutations, oldest first, each paired
+    /// with the [`Scene::revision`] the scene held right after it. Every
+    /// revision bump goes through [`Scene::record_change`] and appends exactly
+    /// one entry, so consecutive entries carry consecutive revisions — which is
+    /// what lets [`Scene::changes_since`] prove it saw every mutation between a
+    /// copy's revision and now. `RefCell` for the same reason as the caches:
+    /// [`Scene::invalidate_world_cache`] takes `&self`. Skipped by serde and
+    /// started empty by `Clone`: a copy's history is not the original's.
+    #[serde(skip)]
+    pub(crate) change_log: RefCell<VecDeque<(u64, SceneChange)>>,
 }
 
 /// Next process-unique geometry stamp — see [`Scene::node_stamp`]. Starts at
@@ -196,6 +266,7 @@ impl Default for Scene {
             spatial_index: RefCell::new(None),
             revision: std::cell::Cell::new(0),
             instance_id: mint_scene_instance_id(),
+            change_log: RefCell::new(VecDeque::new()),
         }
     }
 }
@@ -205,6 +276,10 @@ impl Clone for Scene {
     /// is a distinct instance whose revision counter diverges independently
     /// from the original's, so sharing the id would let the two alias
     /// `(NodeId, revision)` memo keys with different content.
+    ///
+    /// The spatial index is not copied either: it is a derived structure the
+    /// clone rebuilds lazily on its first hit-test, and copying it made every
+    /// render-thread snapshot pay for an index the render never queries.
     fn clone(&self) -> Self {
         Self {
             nodes: self.nodes.clone(),
@@ -214,9 +289,10 @@ impl Clone for Scene {
             removal_revision: self.removal_revision.clone(),
             world_cache: self.world_cache.clone(),
             local_bounds_cache: self.local_bounds_cache.clone(),
-            spatial_index: self.spatial_index.clone(),
+            spatial_index: RefCell::new(None),
             revision: self.revision.clone(),
             instance_id: mint_scene_instance_id(),
+            change_log: RefCell::new(VecDeque::new()),
         }
     }
 }
@@ -262,11 +338,39 @@ impl Scene {
         // transform cache. A node's cached world transform is the product of
         // its and its ancestors' locals, so a mutated `transform` here would
         // also invalidate every descendant — clearing wholesale covers that.
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Node(id));
         if self.nodes.contains_key(&id) {
             self.touch_stamp(id);
         }
         self.nodes.get_mut(&id)
+    }
+
+    /// Replace `id`'s node with `node` — a copy's way of taking over an edit
+    /// the original made through [`Scene::get_mut`] — and set its geometry
+    /// stamp to `stamp` (the original's, so renderer caches keyed on stamps
+    /// agree across the two scenes). The node's `parent` and `index` must match
+    /// the stored node's: those are structural and go through
+    /// [`Scene::set_parent`] / [`Scene::set_index`]; a mismatch is refused
+    /// without touching the scene.
+    ///
+    /// Invalidation is targeted rather than wholesale: with the hierarchy
+    /// unchanged, only `id` and its descendants can have a different world
+    /// transform, and only `id` and its ancestors a different local-bounds
+    /// union.
+    pub fn patch_node(&mut self, node: CanvasNode, stamp: u64) -> Result<(), SceneError> {
+        let id = node.id;
+        let existing = self.nodes.get(&id).ok_or(SceneError::NotFound(id))?;
+        if existing.parent != node.parent || existing.index != node.index {
+            return Err(SceneError::InvariantViolated(format!(
+                "patch_node {id}: parent or z-index differs from the stored node"
+            )));
+        }
+        self.nodes.insert(id, node);
+        self.invalidate_node_edit(id);
+        self.record_change(SceneChange::Node(id));
+        self.node_stamps.insert(id, stamp);
+        Ok(())
     }
 
     pub fn contains(&self, id: NodeId) -> bool {
@@ -295,7 +399,8 @@ impl Scene {
         let index = node.index;
         self.nodes.insert(id, node);
         self.child_index_insert(parent_key, id, index);
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
         self.touch_stamp(id);
         if let Some(parent) = parent_key {
             self.touch_stamp(parent);
@@ -321,7 +426,8 @@ impl Scene {
                 }
             }
         }
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
         self.removal_revision.set(next_geometry_stamp());
         if let Some(parent) = root_removed.as_ref().and_then(|node| node.parent)
             && self.nodes.contains_key(&parent)
@@ -373,7 +479,8 @@ impl Scene {
         self.child_index_insert(new_parent, id, new_index);
         // Reparenting changes `id`'s (and its subtree's) ancestor chain, so
         // every world transform under it could change.
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
         self.touch_stamp(id);
         for parent in [old_parent, new_parent].into_iter().flatten() {
             if self.nodes.contains_key(&parent) {
@@ -396,7 +503,8 @@ impl Scene {
         // Z-order does not affect world transforms, but `set_index` shares the
         // mutator contract; clearing keeps the invalidation surface uniform and
         // future-proof (e.g. if index ever feeds into layout).
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
         self.touch_stamp(id);
         if let Some(parent) = parent
             && self.nodes.contains_key(&parent)
@@ -609,7 +717,8 @@ impl Scene {
                 node.index = IndexKey::FIRST;
             }
         }
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
         self.stamp_floor.set(next_geometry_stamp());
     }
 
@@ -637,7 +746,8 @@ impl Scene {
         // The index rebuild follows a bulk mutation (typically a deserialize);
         // the world cache is already empty after `#[serde(skip)]`, but clear
         // defensively so this method is safe to call at any point.
-        self.invalidate_world_cache();
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Structural);
         self.stamp_floor.set(next_geometry_stamp());
     }
 
@@ -682,22 +792,23 @@ impl Scene {
         self.removal_revision.get()
     }
 
-    /// Transform-only write with cache-precision: bumps the revision and
-    /// clears world caches like every mutator, but skips the geometry stamp
-    /// unless a boolean ancestor bakes this node's transform into a cached
-    /// fold. Local vector geometry does not depend on the transform, so a
-    /// plain drag through this method leaves every renderer path cache entry
-    /// valid.
+    /// Transform-only write with cache-precision: bumps the revision like
+    /// every mutator, but invalidates only what a local-transform change can
+    /// stale — the world transforms of `id` and its descendants, the
+    /// local-bounds unions of its ancestors, and the spatial index — so a drag
+    /// on a huge page recomputes the moved subtree, not the whole document.
+    /// It also skips the geometry stamp unless a boolean ancestor bakes this
+    /// node's transform into a cached fold. Local vector geometry does not
+    /// depend on the transform, so a plain drag through this method leaves
+    /// every renderer path cache entry valid.
     pub fn set_transform(&mut self, id: NodeId, transform: Transform2D) -> Result<(), SceneError> {
-        if !self.nodes.contains_key(&id) {
-            return Err(SceneError::NotFound(id));
-        }
         let in_boolean = self
             .ancestors_of(id)
             .any(|ancestor| matches!(ancestor.data, crate::node::NodeData::Boolean(_)));
-        let node = self.nodes.get_mut(&id).expect("just checked");
+        let node = self.nodes.get_mut(&id).ok_or(SceneError::NotFound(id))?;
         node.transform = transform;
-        self.invalidate_world_cache();
+        self.invalidate_transform_edit(id);
+        self.record_change(SceneChange::Transform(id));
         if in_boolean {
             self.touch_stamp(id);
             // The fold lives on the boolean ancestor; stamping the moved
@@ -713,6 +824,86 @@ impl Scene {
             }
         }
         Ok(())
+    }
+
+    // ---- change log ----------------------------------------------------------
+
+    /// Bump the revision and log `change` against it. The ONLY place the
+    /// revision moves, so the log's revision sequence has no gaps — see the
+    /// field docs on [`Scene::change_log`].
+    pub(crate) fn record_change(&self, change: SceneChange) {
+        let revision = self.revision.get().wrapping_add(1);
+        self.revision.set(revision);
+        let mut log = self.change_log.borrow_mut();
+        log.push_back((revision, change));
+        while log.len() > SCENE_CHANGE_LOG_CAP {
+            log.pop_front();
+        }
+    }
+
+    /// What a copy of this scene taken at `revision` must refresh to match it
+    /// now, or `None` when that cannot be answered node by node and the copy
+    /// has to be re-taken: the copy is older than the log window, some
+    /// mutation since was structural or untracked, more than
+    /// [`SCENE_DELTA_MAX_NODES`] nodes were touched, or a touched node no
+    /// longer exists. A copy at the current revision needs nothing
+    /// (`Some(empty)`).
+    ///
+    /// Only meaningful for a copy of THIS instance (compare
+    /// [`Scene::instance_id`] first): revisions of different instances are
+    /// unrelated counters.
+    pub fn changes_since(&self, revision: u64) -> Option<SceneDelta> {
+        if revision == self.revision.get() {
+            return Some(SceneDelta::default());
+        }
+        let log = self.change_log.borrow();
+        let mut oldest_seen: Option<u64> = None;
+        let mut transforms: Vec<NodeId> = Vec::new();
+        let mut nodes: Vec<NodeId> = Vec::new();
+        for &(revision_after, change) in log.iter().rev() {
+            if revision_after <= revision {
+                break;
+            }
+            oldest_seen = Some(revision_after);
+            match change {
+                SceneChange::Transform(id) => transforms.push(id),
+                SceneChange::Node(id) => nodes.push(id),
+                SceneChange::Structural | SceneChange::Unknown => return None,
+            }
+            if transforms.len() + nodes.len() > SCENE_DELTA_MAX_NODES {
+                // Deduplicate before giving up: a drag logs the same ids frame
+                // after frame, and only distinct nodes cost the consumer.
+                transforms.sort_unstable();
+                transforms.dedup();
+                nodes.sort_unstable();
+                nodes.dedup();
+                if transforms.len() + nodes.len() > SCENE_DELTA_MAX_NODES {
+                    return None;
+                }
+            }
+        }
+        // Contiguity: the oldest entry we consumed must be the very first
+        // mutation after `revision`, otherwise the log window starts later
+        // than the copy and some mutation went unseen.
+        if oldest_seen != Some(revision.wrapping_add(1)) {
+            return None;
+        }
+        nodes.sort_unstable();
+        nodes.dedup();
+        transforms.sort_unstable();
+        transforms.dedup();
+        transforms.retain(|id| nodes.binary_search(id).is_err());
+        if transforms.len() + nodes.len() > SCENE_DELTA_MAX_NODES {
+            return None;
+        }
+        if transforms
+            .iter()
+            .chain(nodes.iter())
+            .any(|id| !self.nodes.contains_key(id))
+        {
+            return None;
+        }
+        Some(SceneDelta { transforms, nodes })
     }
 }
 

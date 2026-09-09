@@ -29,7 +29,7 @@ pub struct OpenRecentProject {
 actions!(
     zed,
     [
-        /// Show the Zed welcome screen
+        /// Show the Fanta welcome screen
         ShowWelcome
     ]
 );

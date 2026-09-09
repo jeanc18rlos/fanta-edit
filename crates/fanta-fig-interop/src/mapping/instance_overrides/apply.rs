@@ -2,30 +2,35 @@
 //! assignments, derivedSymbolData, nested-instance routing, and swaps.
 
 use super::{
-    BoundProp, ComponentId, ComponentMaps, Doc, HashMap, KiwiValue, MapReport, NodeData, NodeId,
-    Override, OverridePath, OverrideValue, PendingInstanceOverrides, PropRefKind, VarValue,
-    apply_text_style_fields, blend_mode, build_content_and_style_runs, build_stroke,
+    BoundProp, ComponentId, ComponentMaps, Doc, HashMap, KiwiValue, MapReport, MasterPathCache,
+    NodeData, NodeId, Override, OverridePath, OverrideValue, PendingInstanceOverrides, PropRefKind,
+    VarValue, apply_text_style_fields, blend_mode, build_content_and_style_runs, build_stroke,
     build_swap_redirects, corner_radii, corner_smoothing, guid_key, has_stroke_fields,
-    master_guid_paths, master_root_for, prop_assignment_text, read_blurs, read_derived_override,
-    read_effects, read_fills, read_size, read_transform, resolve_full_guid_path, text_case_of,
-    text_override,
+    master_root_for, prop_assignment_text, read_blurs, read_derived_override, read_effects,
+    read_fills, read_size, read_transform, resolve_full_guid_path, text_case_of, text_override,
 };
+use fanta_doc::id::ComponentPropId;
 use fanta_doc::{Fill, Stroke};
 use std::collections::HashSet;
 
 /// The master node's own fills and strokes at `node_id`, for detecting a
 /// redundant override (see the drop in [`apply_symbol_overrides`]). A group's
 /// single background counts as its fill.
-fn master_paints(doc: &Doc, node_id: NodeId) -> (Vec<Fill>, Vec<Stroke>) {
+fn master_paints(doc: &Doc, node_id: NodeId) -> (&[Fill], &[Stroke]) {
     match doc.scene.get(node_id).map(|node| &node.data) {
-        Some(NodeData::Vector(v)) => (v.fills.to_vec(), v.strokes.to_vec()),
-        Some(NodeData::Group(g)) => (
-            g.background.clone().into_iter().collect(),
-            g.strokes.to_vec(),
-        ),
-        _ => (Vec::new(), Vec::new()),
+        Some(NodeData::Vector(v)) => (v.fills.as_slice(), v.strokes.as_slice()),
+        Some(NodeData::Group(g)) => (g.background.as_slice(), g.strokes.as_slice()),
+        _ => (&[], &[]),
     }
 }
+
+/// The serialized master nodes the snapshot-vs-authored rule compares override
+/// fields against, keyed by master target. One override pass reads the same
+/// few hundred master nodes tens of thousands of times (once per override
+/// entry that carries a generic field), and nothing in the pass writes the
+/// compared keys: `commit_instance_overrides` only sets an instance's
+/// `overrides` / `derived`, so a serialization stays valid for the whole pass.
+type MasterJsonCache = HashMap<NodeId, Option<serde_json::Value>>;
 
 /// Resolve each instance's override material to typed [`Override`]s addressed by
 /// def-local path, and push them onto the [`InstanceNode`] so
@@ -96,7 +101,7 @@ fn master_paints(doc: &Doc, node_id: NodeId) -> (Vec<Fill>, Vec<Stroke>) {
 pub(crate) fn apply_instance_overrides(
     doc: &mut Doc,
     report: &mut MapReport,
-    pending: &[PendingInstanceOverrides],
+    pending: &[PendingInstanceOverrides<'_>],
     node_prop_refs: &HashMap<String, Vec<(String, PropRefKind)>>,
     guid_to_node: &HashMap<String, Option<NodeId>>,
     maps: &ComponentMaps,
@@ -107,7 +112,18 @@ pub(crate) fn apply_instance_overrides(
     // Per-master `guid → def-local-path` cache, keyed by master root NodeId, so
     // the cross-master path walk (and repeated instances of the same master)
     // don't rebuild the same small map. A component master is dozens of nodes.
-    let mut path_cache: HashMap<NodeId, HashMap<String, OverridePath>> = HashMap::new();
+    let mut path_cache = MasterPathCache::new(guid_to_node);
+    let mut master_json_cache: MasterJsonCache = HashMap::new();
+    // Each component's exposed props (prop-def guid + prop id), so the defaults
+    // pass reads one component's props rather than every prop in the file for
+    // every instance.
+    let mut props_by_component: HashMap<ComponentId, Vec<(&str, ComponentPropId)>> = HashMap::new();
+    for (guid, (component, prop)) in prop_guid_to_id {
+        props_by_component
+            .entry(*component)
+            .or_default()
+            .push((guid.as_str(), *prop));
+    }
 
     for po in pending {
         // The instance must still exist (not dropped as virtual content).
@@ -160,6 +176,7 @@ pub(crate) fn apply_instance_overrides(
             &swap_redirects,
             &derived_paths,
             &mut path_cache,
+            &mut master_json_cache,
             &mut overrides,
         );
         apply_own_surface_fill(doc, po, master_root, &mut overrides);
@@ -169,7 +186,6 @@ pub(crate) fn apply_instance_overrides(
             report,
             po,
             master_root,
-            guid_to_node,
             node_prop_refs,
             symbol_guid_to_component,
             &mut path_cache,
@@ -181,9 +197,10 @@ pub(crate) fn apply_instance_overrides(
             po,
             component,
             master_root,
-            guid_to_node,
             node_prop_refs,
-            prop_guid_to_id,
+            props_by_component
+                .get(&component)
+                .map_or(&[][..], Vec::as_slice),
             &mut path_cache,
             &mut overrides,
         );
@@ -223,16 +240,17 @@ fn instance_component(doc: &Doc, id: NodeId) -> Option<ComponentId> {
 fn apply_symbol_overrides(
     doc: &Doc,
     report: &mut MapReport,
-    po: &PendingInstanceOverrides,
+    po: &PendingInstanceOverrides<'_>,
     master_root: NodeId,
     guid_to_node: &HashMap<String, Option<NodeId>>,
     symbol_guid_to_component: &HashMap<String, ComponentId>,
     swap_redirects: &HashMap<String, NodeId>,
     derived_paths: &HashSet<String>,
-    path_cache: &mut HashMap<NodeId, HashMap<String, OverridePath>>,
+    path_cache: &mut MasterPathCache<'_>,
+    master_json_cache: &mut MasterJsonCache,
     overrides: &mut Vec<Override>,
 ) {
-    for ov in &po.symbol_overrides {
+    for ov in po.symbol_overrides {
         let guids = ov
             .get("guidPath")
             .and_then(|p| p.get("guids"))
@@ -305,7 +323,7 @@ fn apply_symbol_overrides(
             Vec::new()
         };
         // Keep the fill override only when it actually differs from the master.
-        if !ov_fills.is_empty() && ov_fills != master_fills {
+        if !ov_fills.is_empty() && ov_fills.as_slice() != master_fills {
             overrides.push(Override {
                 target_path: path.clone(),
                 target_prop: BoundProp::FillColor { index: 0 },
@@ -316,7 +334,7 @@ fn apply_symbol_overrides(
         }
         if has_stroke_fields(ov) {
             let ov_strokes = build_stroke(ov);
-            if ov_strokes != master_strokes {
+            if ov_strokes.as_slice() != master_strokes {
                 overrides.push(Override {
                     target_path: path.clone(),
                     target_prop: BoundProp::StrokeColor { index: 0 },
@@ -346,6 +364,7 @@ fn apply_symbol_overrides(
             master_target,
             &path,
             derived_covers_path,
+            master_json_cache,
             overrides,
         );
     }
@@ -391,6 +410,7 @@ fn derived_guid_path_keys(derived: &[KiwiValue]) -> HashSet<String> {
 /// the instance against master edits. Each candidate is compared against the
 /// master's serialized form and dropped (counted) when equal; the Field
 /// override is emitted only when at least one key survives.
+#[allow(clippy::too_many_arguments)]
 fn push_field_override(
     doc: &Doc,
     report: &mut MapReport,
@@ -398,6 +418,7 @@ fn push_field_override(
     master_target: NodeId,
     path: &OverridePath,
     derived_covers_path: bool,
+    master_json_cache: &mut MasterJsonCache,
     overrides: &mut Vec<Override>,
 ) {
     let mut fields = serde_json::Map::new();
@@ -411,10 +432,11 @@ fn push_field_override(
         return;
     }
 
-    let master_json = doc
-        .scene
-        .get(master_target)
-        .and_then(|node| serde_json::to_value(node).ok());
+    let master_json = master_json_cache.entry(master_target).or_insert_with(|| {
+        doc.scene
+            .get(master_target)
+            .and_then(|node| serde_json::to_value(node).ok())
+    });
     let mut kept = serde_json::Map::new();
     for (key, value) in fields {
         if master_restates(master_json.as_ref(), &key, &value) {
@@ -684,7 +706,7 @@ fn tally_path_len(report: &mut MapReport, path_len: usize) {
 /// white its master carries, so the override is a visual no-op there.
 fn apply_own_surface_fill(
     doc: &Doc,
-    po: &PendingInstanceOverrides,
+    po: &PendingInstanceOverrides<'_>,
     master_root: NodeId,
     overrides: &mut Vec<Override>,
 ) {
@@ -717,7 +739,7 @@ fn apply_own_surface_fill(
 
 fn apply_own_surface_strokes(
     doc: &Doc,
-    po: &PendingInstanceOverrides,
+    po: &PendingInstanceOverrides<'_>,
     master_root: NodeId,
     overrides: &mut Vec<Override>,
 ) {
@@ -752,16 +774,15 @@ fn apply_own_surface_strokes(
 fn apply_prop_assignments(
     doc: &Doc,
     report: &mut MapReport,
-    po: &PendingInstanceOverrides,
+    po: &PendingInstanceOverrides<'_>,
     master_root: NodeId,
-    guid_to_node: &HashMap<String, Option<NodeId>>,
     node_prop_refs: &HashMap<String, Vec<(String, PropRefKind)>>,
     symbol_guid_to_component: &HashMap<String, ComponentId>,
-    path_cache: &mut HashMap<NodeId, HashMap<String, OverridePath>>,
+    path_cache: &mut MasterPathCache<'_>,
     overrides: &mut Vec<Override>,
 ) {
-    let direct_paths = master_guid_paths(doc, master_root, guid_to_node, path_cache);
-    for cpa in &po.prop_assignments {
+    let direct_paths = path_cache.master_guid_paths(doc, master_root);
+    for cpa in po.prop_assignments {
         let Some(def_guid) = cpa.get("defID").and_then(guid_key) else {
             continue;
         };
@@ -842,21 +863,24 @@ fn push_assignment_override(
 
 /// Mechanism 2b — component-property DEFAULTS for props the instance left unset.
 /// When an instance leaves an exposed prop unset, Figma resolves the descendant
-/// binding to the prop default from `componentPropDefs`.
+/// binding to the prop default from `componentPropDefs`. `component_props` is
+/// this component's `(prop-def guid, prop id)` list.
 #[allow(clippy::too_many_arguments)]
 fn apply_prop_defaults(
     doc: &Doc,
     report: &mut MapReport,
-    po: &PendingInstanceOverrides,
+    po: &PendingInstanceOverrides<'_>,
     component: ComponentId,
     master_root: NodeId,
-    guid_to_node: &HashMap<String, Option<NodeId>>,
     node_prop_refs: &HashMap<String, Vec<(String, PropRefKind)>>,
-    prop_guid_to_id: &HashMap<String, (ComponentId, fanta_doc::ComponentPropId)>,
-    path_cache: &mut HashMap<NodeId, HashMap<String, OverridePath>>,
+    component_props: &[(&str, ComponentPropId)],
+    path_cache: &mut MasterPathCache<'_>,
     overrides: &mut Vec<Override>,
 ) {
-    let assigned_prop_guids: std::collections::HashSet<String> = po
+    if component_props.is_empty() {
+        return;
+    }
+    let assigned_prop_guids: HashSet<String> = po
         .prop_assignments
         .iter()
         .filter_map(|cpa| cpa.get("defID").and_then(guid_key))
@@ -865,12 +889,12 @@ fn apply_prop_defaults(
     let mut prop_def_defaults: HashMap<String, (fanta_doc::ComponentPropKind, VarValue)> =
         HashMap::new();
     if let Some(def) = doc.components.def(component) {
-        for (guid, (cid, pid)) in prop_guid_to_id {
-            if *cid != component || assigned_prop_guids.contains(guid) {
+        for (guid, pid) in component_props {
+            if assigned_prop_guids.contains(*guid) {
                 continue;
             }
             if let Some(p) = def.props.iter().find(|p| p.id == *pid) {
-                prop_def_defaults.insert(guid.clone(), (p.kind.clone(), p.default.clone()));
+                prop_def_defaults.insert((*guid).to_owned(), (p.kind.clone(), p.default.clone()));
             }
         }
     }
@@ -878,7 +902,7 @@ fn apply_prop_defaults(
         return;
     }
 
-    let direct_paths = master_guid_paths(doc, master_root, guid_to_node, path_cache);
+    let direct_paths = path_cache.master_guid_paths(doc, master_root);
     for (target_guid, path) in direct_paths {
         let Some(refs) = node_prop_refs.get(target_guid) else {
             continue;
@@ -933,15 +957,15 @@ fn push_default_override(
 fn apply_derived_overrides(
     doc: &Doc,
     report: &mut MapReport,
-    po: &PendingInstanceOverrides,
+    po: &PendingInstanceOverrides<'_>,
     master_root: NodeId,
     guid_to_node: &HashMap<String, Option<NodeId>>,
     swap_redirects: &HashMap<String, NodeId>,
-    path_cache: &mut HashMap<NodeId, HashMap<String, OverridePath>>,
+    path_cache: &mut MasterPathCache<'_>,
     blobs: &[Vec<u8>],
 ) -> Vec<fanta_doc::node::DerivedOverride> {
     let mut derived: Vec<fanta_doc::node::DerivedOverride> = Vec::new();
-    for d in &po.derived_symbol_data {
+    for d in po.derived_symbol_data {
         let guids = d
             .get("guidPath")
             .and_then(|p| p.get("guids"))
@@ -1004,7 +1028,11 @@ fn commit_instance_overrides(
 /// mergeSymbolProps surface tally (op2 `mergeSymbolProps` / op1 sync): count
 /// instances whose resolved master root carries a background fill — i.e. the
 /// instances whose inherited surface `expand_instance` now paints at their box.
-fn tally_merged_surfaces(doc: &Doc, report: &mut MapReport, pending: &[PendingInstanceOverrides]) {
+fn tally_merged_surfaces(
+    doc: &Doc,
+    report: &mut MapReport,
+    pending: &[PendingInstanceOverrides<'_>],
+) {
     for po in pending {
         let Some(component) = instance_component(doc, po.instance) else {
             continue;

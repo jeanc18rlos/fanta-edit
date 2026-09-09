@@ -11,7 +11,7 @@ use super::{
 pub(crate) fn apply_bindings(
     doc: &mut Doc,
     report: &mut MapReport,
-    pending: &[(NodeId, KiwiValue)],
+    pending: &[(NodeId, &KiwiValue)],
     _pending_variables: &[PendingVariable],
 ) {
     for (node_id, map) in pending {

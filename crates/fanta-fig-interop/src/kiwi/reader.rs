@@ -37,6 +37,16 @@ impl<'a> ByteReader<'a> {
         Ok(b)
     }
 
+    /// Borrow the next `len` bytes verbatim and advance past them. This is how
+    /// a `byte[]` field is read: one bounds check for the whole run instead of
+    /// one per element.
+    pub fn read_bytes(&mut self, len: usize) -> FigResult<&'a [u8]> {
+        let end = self.index.checked_add(len).ok_or(FigError::Truncated)?;
+        let bytes = self.data.get(self.index..end).ok_or(FigError::Truncated)?;
+        self.index = end;
+        Ok(bytes)
+    }
+
     pub fn read_bool(&mut self) -> FigResult<bool> {
         match self.read_byte()? {
             0 => Ok(false),

@@ -237,6 +237,13 @@ impl SelectTool {
             ));
             let _ = ctx.doc.scene.set_transform(id, new);
         }
+        // `set_transform` bypasses `Doc::apply`, so the master revision that
+        // keys memoized instance expansions is bumped here; otherwise instances
+        // of a master whose child is being dragged lag the whole gesture.
+        ctx.doc.components.bump_rev_for_nodes(
+            &ctx.doc.scene,
+            sel.moving.iter().map(|&(id, _)| id),
+        );
 
         let mut response = ToolResponse::cursor(CursorHint::Move);
         for o in Self::snap_overlays(&snap_result) {
@@ -292,5 +299,9 @@ impl SelectTool {
         for &(id, old) in sel.moving.iter() {
             let _ = ctx.doc.scene.set_transform(id, old);
         }
+        ctx.doc.components.bump_rev_for_nodes(
+            &ctx.doc.scene,
+            sel.moving.iter().map(|&(id, _)| id),
+        );
     }
 }

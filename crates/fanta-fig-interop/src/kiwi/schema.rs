@@ -321,6 +321,10 @@ impl Schema {
     pub fn skip_field(&self, r: &mut ByteReader, field: &Field) -> FigResult<()> {
         if field.is_array {
             let len = r.read_var_uint()?;
+            if field.ty == KiwiType::BYTE {
+                r.read_bytes(len as usize)?;
+                return Ok(());
+            }
             for _ in 0..len {
                 self.skip_type(r, field.ty)?;
             }

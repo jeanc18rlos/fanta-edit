@@ -29,4 +29,7 @@ mod geometry;
 mod graph;
 
 pub use error::SceneError;
-pub use graph::{Ancestors, Descendants, Scene};
+pub use graph::{
+    Ancestors, Descendants, SCENE_CHANGE_LOG_CAP, SCENE_DELTA_MAX_NODES, Scene, SceneChange,
+    SceneDelta,
+};

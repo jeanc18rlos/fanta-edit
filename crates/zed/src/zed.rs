@@ -535,7 +535,10 @@ fn git_config_is_entirely_inert(config: &str) -> bool {
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        if let Some(header) = line.strip_prefix('[').and_then(|line| line.strip_suffix(']')) {
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
             // `[remote "origin"]` names a subsection we do not need to look at;
             // the section alone decides which keys are meaningful.
             section = header
@@ -581,8 +584,10 @@ fn git_setting_is_inert(section: &str, key: &str, value: &str) -> bool {
         // An `ext::` remote runs the rest of the URL as a command on fetch, which
         // is the whole reason git gates it behind `protocol.ext.allow`.
         "remote" => {
-            matches!(key, "url" | "pushurl" | "fetch" | "push" | "tagopt" | "prune")
-                && !value.to_ascii_lowercase().starts_with("ext::")
+            matches!(
+                key,
+                "url" | "pushurl" | "fetch" | "push" | "tagopt" | "prune"
+            ) && !value.to_ascii_lowercase().starts_with("ext::")
         }
         "branch" => matches!(key, "remote" | "merge" | "rebase" | "description"),
         "pull" => matches!(key, "rebase" | "ff"),
@@ -616,7 +621,9 @@ fn trust_worktree_if_design_project(
     let is_design = if is_single_file {
         // A design file on its own is data: opening one configures nothing.
         matches!(
-            abs_path.extension().and_then(|extension| extension.to_str()),
+            abs_path
+                .extension()
+                .and_then(|extension| extension.to_str()),
             Some("fig" | "fnx")
         )
     } else {
@@ -2664,11 +2671,7 @@ mod trust_tests {
     use std::path::{Path, PathBuf};
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "fanta-trust-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir = std::env::temp_dir().join(format!("fanta-trust-{}-{}", std::process::id(), name));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).expect("scratch dir");
         dir

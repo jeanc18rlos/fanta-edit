@@ -24,12 +24,12 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) fn populate_instance_prop_values(
     doc: &mut Doc,
     report: &mut MapReport,
-    pending: &[PendingInstanceOverrides],
+    pending: &[PendingInstanceOverrides<'_>],
     prop_guid_to_id: &HashMap<String, (ComponentId, ComponentPropId)>,
 ) {
     for po in pending {
         let mut values: BTreeMap<ComponentPropId, VarValue> = BTreeMap::new();
-        for cpa in &po.prop_assignments {
+        for cpa in po.prop_assignments {
             let Some(def_guid) = cpa.get("defID").and_then(guid_key) else {
                 continue;
             };

@@ -185,27 +185,39 @@ impl History {
     /// Discard the open transaction, reverting any ops it has already applied
     /// to `scene`. Used when a tool cancels mid-drag (Esc).
     ///
-    /// Stays `&mut Scene` (a marker signature tools/app already call). An open
-    /// transaction only ever holds scene-only ops (a drag's `SetTransform`), so
-    /// reverting them through an [`OpCtx`] with empty doc-level registries is
-    /// safe — those ops never touch components/variables/modes/flow-start.
+    /// Stays `&mut Scene` (a marker signature tools already call) and is only
+    /// correct for a transaction of scene-only ops (a drag's `SetTransform`):
+    /// the doc-level registries it reverts through are empty throwaways, so a
+    /// `DefineComponent` or `SetAnimationTrack` in the transaction would be
+    /// left applied. A transaction that may hold such ops must be aborted
+    /// through `Doc::abort_transaction`, which supplies the real registries.
     pub fn abort(&mut self, scene: &mut Scene) -> Result<(), SceneError> {
+        let mut components = crate::component::ComponentLibrary::new();
+        let mut variables = crate::variables::VariableRegistry::new();
+        let mut active_modes = std::collections::BTreeMap::new();
+        let mut motion = crate::motion::MotionLibrary::new();
+        let mut flow_start = None;
+        let mut ctx = OpCtx {
+            scene,
+            components: &mut components,
+            variables: &mut variables,
+            active_modes: &mut active_modes,
+            motion: &mut motion,
+            flow_start: &mut flow_start,
+        };
+        self.abort_with(&mut ctx)
+    }
+
+    /// Discard the open transaction, reverting every op it has applied through
+    /// `ctx` — the whole document, so doc-level ops (component definitions,
+    /// motion tracks, variables) roll back along with the scene edits. Master
+    /// revisions are bumped for the reverted ops as `undo` does. No-op without
+    /// an open transaction.
+    pub fn abort_with(&mut self, ctx: &mut OpCtx) -> Result<(), SceneError> {
         if let Some(mut tx) = self.open.take() {
-            let mut components = crate::component::ComponentLibrary::new();
-            let mut variables = crate::variables::VariableRegistry::new();
-            let mut active_modes = std::collections::BTreeMap::new();
-            let mut motion = crate::motion::MotionLibrary::new();
-            let mut flow_start = None;
-            let mut ctx = OpCtx {
-                scene,
-                components: &mut components,
-                variables: &mut variables,
-                active_modes: &mut active_modes,
-                motion: &mut motion,
-                flow_start: &mut flow_start,
-            };
             while let Some(op) = tx.ops.pop() {
-                op.revert(&mut ctx)?;
+                op.revert(ctx)?;
+                ctx.bump_revs(&op);
             }
         }
         Ok(())

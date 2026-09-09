@@ -32,7 +32,7 @@ pub mod path;
 pub mod raster;
 pub mod transform;
 
-pub use asset::{AssetResolver, DecodedImage, InMemoryAssetResolver};
+pub use asset::{AssetResolver, DecodedImage, InMemoryAssetResolver, LazyAssetResolver};
 pub use bounds::visual_world_bounds;
 pub use color::{to_sk_color, to_sk_color4f};
 pub use image::{

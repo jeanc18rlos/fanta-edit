@@ -34,6 +34,12 @@ impl ByteWriter {
         self.data.push(value);
     }
 
+    /// Append `bytes` verbatim — the element payload of a `byte[]` field (the
+    /// caller writes the length prefix).
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+    }
+
     pub fn write_bool(&mut self, value: bool) {
         self.data.push(value as u8);
     }

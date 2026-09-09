@@ -4,7 +4,7 @@
 
 use crate::id::NodeId;
 use crate::node::{NodeData, NodeFlags};
-use crate::scene::graph::Scene;
+use crate::scene::graph::{Scene, SceneChange};
 use crate::spatial::SpatialIndex;
 use crate::transform::{Bounds, Transform2D};
 use glam::DVec2;
@@ -55,24 +55,80 @@ impl Scene {
         Some(world)
     }
 
-    /// Drop every memoized world transform *and* local-bounds entry. Called by
-    /// every mutator that can change a node's transform, geometry, or place in
-    /// the hierarchy — see the invalidation contracts on the cache fields. Both
-    /// share one signal because a single transform/structure edit can stale
-    /// entries in either. Cheap relative to the edit itself, and only ever runs
-    /// off the read hot path.
+    /// Drop every memoized world transform *and* local-bounds entry, bump the
+    /// revision, and log the edit as [`SceneChange::Unknown`] — the graph did
+    /// not see what changed, so no copy can be patched past it.
     ///
     /// `pub` so callers that mutate node transforms *directly* through a
     /// `&mut Scene` (e.g. the auto-layout solver) can restore cache consistency
-    /// after the edit.
+    /// after the edit. The graph's own mutators do not go through here: they
+    /// know what they changed and log it precisely.
     pub fn invalidate_world_cache(&self) {
+        self.clear_derived_caches();
+        self.record_change(SceneChange::Unknown);
+    }
+
+    /// Wholesale clear of the derived caches, without touching the revision.
+    /// Structural mutators call this because a hierarchy change can stale an
+    /// entry anywhere; the two share one signal since a single edit can stale
+    /// entries in either cache. Cheap relative to the edit itself, and only
+    /// ever runs off the read hot path.
+    pub(crate) fn clear_derived_caches(&self) {
         self.world_cache.borrow_mut().clear();
         self.local_bounds_cache.borrow_mut().clear();
         // The spatial index is derived from world AABBs + paint order, so any
         // edit that stales those caches stales the index too (see its field
         // docs). Drop it; the next spatial query rebuilds lazily.
         *self.spatial_index.borrow_mut() = None;
-        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    /// Targeted invalidation after `id`'s LOCAL TRANSFORM changed and nothing
+    /// else did. A world transform composes the locals of a node and its
+    /// ancestors, so exactly `id` and its descendants can differ; a local
+    /// bounds union folds each child's bounds through the child's transform,
+    /// so exactly `id`'s ancestors can differ (`id`'s own local bounds are in
+    /// its own space and do not move with it). The spatial index snapshots
+    /// world AABBs and is rebuilt lazily.
+    pub(crate) fn invalidate_transform_edit(&self, id: NodeId) {
+        self.drop_world_cache_subtree(id);
+        {
+            let mut local_bounds = self.local_bounds_cache.borrow_mut();
+            if !local_bounds.is_empty() {
+                for ancestor in self.ancestors_of(id) {
+                    local_bounds.remove(&ancestor.id);
+                }
+            }
+        }
+        *self.spatial_index.borrow_mut() = None;
+    }
+
+    /// Targeted invalidation after `id`'s node was replaced wholesale with its
+    /// parent and z-index unchanged ([`Scene::patch_node`]). Like a transform
+    /// edit plus the node's own local bounds, which its data determines.
+    pub(crate) fn invalidate_node_edit(&self, id: NodeId) {
+        self.drop_world_cache_subtree(id);
+        {
+            let mut local_bounds = self.local_bounds_cache.borrow_mut();
+            if !local_bounds.is_empty() {
+                local_bounds.remove(&id);
+                for ancestor in self.ancestors_of(id) {
+                    local_bounds.remove(&ancestor.id);
+                }
+            }
+        }
+        *self.spatial_index.borrow_mut() = None;
+    }
+
+    fn drop_world_cache_subtree(&self, id: NodeId) {
+        let mut world = self.world_cache.borrow_mut();
+        if world.is_empty() {
+            return;
+        }
+        // `descendants_of` reads only the node map and child index, never a
+        // `RefCell`, so holding the cache borrow across the walk is fine.
+        for descendant in self.descendants_of(id) {
+            world.remove(&descendant);
+        }
     }
 
     /// The scene's content revision — see the field docs: equal values mean

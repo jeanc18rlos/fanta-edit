@@ -127,7 +127,7 @@ pub(crate) use effects::{
 pub(crate) use instance::render_instance;
 pub(crate) use layer_cache::{LayerCache, LayerEpoch};
 pub(crate) use renderer::{
-    BooleanCache, CachedVectorPaths, InstanceCache, InstanceCacheKey, PathCache, hash_overrides,
+    BooleanCache, CachedVectorPaths, InstanceCache, InstanceCacheKey, PathCache,
 };
 pub(crate) use text::{draw_text_node, with_shaped_layout};
 pub(crate) use vector::{
@@ -146,6 +146,8 @@ pub(crate) use effects::{
     SIGMA_SCREEN_MAX, SIGMA_SCREEN_MIN, VisibleEffects, capped_render_sigma,
     shadow_expanded_world_bounds,
 };
+#[cfg(test)]
+pub(crate) use renderer::hash_overrides;
 #[cfg(test)]
 pub(crate) use text::{clear_layout_cache, layout_cache_len};
 

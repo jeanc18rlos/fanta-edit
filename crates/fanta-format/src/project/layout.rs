@@ -115,7 +115,8 @@ on the canvas save back to these same files. So working here as a text agent
 If Fanta is running with this project open you also have a more direct route: a
 live MCP server that reads and edits the focused canvas. Jump to *Driving the
 open canvas over MCP* below — prefer it when the app is up, and fall back to
-editing the files by hand when it is not.
+editing the files by hand when it is not. Either way, call `get_guidelines`
+(or read the condensed rules the built-in agent carries) before designing.
 
 ## Directory layout
 
@@ -290,39 +291,82 @@ canvas that is focused right now**. It is on by default; it is turned off with
   is rewritten on every launch and is *not* deleted on quit, so anything reading
   it directly must check that `pid` is still alive before trusting `socket`.
 
-### The five tools
+### The six tools
 
-**`get_editor_state`** — takes no arguments. Returns the project name and
-`project_root`, every page (`index`, `name`, root node id, node count, and which
-one is `active`), the current `selection` ids, the `viewport`, `total_nodes`,
-and whether the canvas `is_editable` and is `dirty`. Call it first: the page
-indices and node ids it returns are what every other tool takes.
+**`get_editor_state`** — `{ empty_space?, page? }`, both optional. Returns the
+project name and `project_root`, every page (`index`, `name`, root node id,
+node count, `source` path, and which one is `active`), `active_page_bounds`,
+the `components` (id, name, root, source), the current `selection` ids and
+`selection_bounds`, the `viewport`, `total_nodes`, whether the canvas
+`is_editable` and is `dirty`, and a short `hints` list. Pass
+`empty_space: [width, height]` to also get `empty_space: {page, x, y, width,
+height}` — a free top-left for a new frame of that size, to the right of or
+below the page's content. Call it first: the page indices and node ids it
+returns are what every other tool takes.
+
+**`get_guidelines`** — takes no arguments. Returns Fanta's design guidelines
+for agents (coordinates, frames vs groups, auto layout, spacing and type
+scales, naming, components, the working method, and when to edit `.fnx`
+instead). Read it once per session before designing.
 
 **`batch_get`** — `{ ids?, page?, depth?, include_geometry? }`. With `ids`,
 returns those nodes in full detail. Without them it lists one page's tree in
 compact form, where `page` is a page *index* (default: the active page), `depth`
-limits how many levels of children come back, and `include_geometry: true` adds
-world-space bounding boxes.
+limits how many levels of children come back (default 2; a cut-off node reports
+`child_count`), and `include_geometry: true` adds world-space bounding boxes.
+Each listed node carries its id, kind and name plus kind-specific facts: a
+frame's `size` and `auto_layout` mode, a text's `text` and `font`, a shape's
+first solid `fill`, an instance's `component` name.
 
 **`batch_design`** — `{ ops, label? }`. Applies `ops` in order as **one undo
 step**, named by `label` (default `"MCP edit"`). If any op fails the whole batch
-rolls back and the error names the op that failed. Each op is an object tagged
-by `"op"`:
+rolls back and the error names the op that failed; created ids come back in
+`created`. Every `x`/`y` is a world coordinate (px, y down) of a node's
+top-left corner, and every `id` is an exact node id. Each op is an object
+tagged by `"op"`:
 
 - `create_node` — `node_type` (`"frame"`, `"rectangle"`, `"ellipse"` or
-  `"text"`), `x`, `y`, `width`, `height` (all required; `x`/`y` are the world
-  coordinates of the top-left corner), plus optional `parent` (a frame id; omit
-  to place on the active page), `name`, `fill` (`"#RRGGBB"` or `"#RRGGBBAA"`;
-  the glyph color for text), `text` and `font_size`.
+  `"text"`), `x`, `y`, `width`, `height` (all required), plus optional `parent`
+  (a frame id; omit to place on the active page), `name`, `fill` (`"#RRGGBB"`
+  or `"#RRGGBBAA"`; the glyph color for text), `text` and `font_size`.
 - `create_image` — `source` (a `data:image/…;base64,…` URI or raw base64 of
   encoded PNG/JPEG/WebP/GIF bytes; `http(s)` URLs are *not* fetched), `x`, `y`,
   plus optional `parent`, `name`, `width`/`height` (give one and the other
   scales to preserve aspect; give neither for the natural pixel size) and `meta`
   (JSON stored in the node's metadata, e.g. generation provenance). The bytes
   become a project asset under `assets/images/` on the next save.
+- `create_instance` — `component` (a component id, or its name when unique),
+  `x`, `y`, optional `parent` and `name`. The instance takes the master's size.
 - `set_props` — `id` plus only the fields you are changing: `name`, `x`, `y`,
   `width`, `height`, `opacity` (0.0–1.0), `fill`, `corner_radius`, `text`,
   `hidden`, `locked`.
+- `set_stroke` — `id`, optional `color`, `width` (`0` removes the stroke) and
+  `align` (`"inside"`, `"center"`, `"outside"`). Creates the stroke if absent.
+- `set_shadow` — `id`, optional `color`, `x`, `y`, `blur`, `spread`; edits or
+  adds the drop shadow. `remove: true` deletes every drop shadow.
+- `set_text_style` — `id` plus optional `font_family`, `font_weight`
+  (100–900), `font_size`, `line_height` (multiple of the size),
+  `letter_spacing`, `align` (`left|center|right|justify`), `color`.
+- `set_auto_layout` — `id`, `direction` (`"horizontal"`, `"vertical"` or
+  `"none"` to turn it off), optional `gap`, `padding` (`[all]`,
+  `[vertical, horizontal]` or `[top, right, bottom, left]`), `align_items`
+  (`start|center|end|stretch|baseline`) and `justify`
+  (`start|center|end|space_between|space_evenly`).
+- `set_index` — `id`, `position`: `"front"`, `"back"`, `"forward"`,
+  `"backward"` or `{"index": n}` (0 = bottom) among the current siblings.
+- `rotate` — `id`, `degrees`: absolute angle about the node's centre.
+- `align` — `ids`, `edge` (`left|center_x|right|top|center_y|bottom`): aligns
+  two or more nodes to their combined bounds, or one node to its parent frame.
+- `distribute` — `ids` (three or more), `axis` (`"horizontal"` or
+  `"vertical"`): equal gaps, outer nodes fixed.
+- `group` / `frame_selection` — `ids`, optional `name`: wrap the nodes in a new
+  group (no clipping) or a new frame sized to their bounds; the new id is in
+  `created`. `ungroup` — `id`: dissolves a group/frame and reports the freed
+  `children`.
+- `duplicate` — `id`, optional `dx`/`dy`: deep-copies the node one slot above
+  the original; the copy's id is in `created`.
+- `create_component` — `id` of a frame or group: makes it a component master
+  in place and reports the `component` id.
 - `reparent` — `id`, optional `parent` (omit to move to the active page root)
   and optional `index` among the new siblings (0 = bottom; omit to append on
   top). The node keeps its world position.
@@ -330,22 +374,29 @@ by `"op"`:
 - `select` — `ids`, replacing the editor selection.
 - `set_viewport` — optional `center` (`[x, y]`) and `zoom`.
 
-Strokes, gradients, shadows, auto-layout, fonts and components are **not**
-`batch_design` properties. For those, read the page's `.fnx`, edit the file with
-your normal file tools, and let the canvas reload — that edit is also a reviewable
-git diff, which a `batch_design` call is not until the editor saves.
+Gradients, variables and per-run rich text are **not** `batch_design` ops yet.
+For those, read the page's `.fnx`, edit the file with your normal file tools,
+and let the canvas reload — that edit is also a reviewable git diff, which a
+`batch_design` call is not until the editor saves.
 
 **`get_screenshot`** — `{ page?, node?, max_dimension? }`, all optional. Renders
 a PNG of the active page, of another page by index, or of a single node's region,
 capped so the longer side is at most `max_dimension` pixels (default 1024). Use
 it to check your own work before telling the user it is done.
 
-**`read_fnx_source`** — `{ path? }`. Omit `path` for the project `root` and the
-list of its source files; pass a project-relative path (for example
-`pages/<page-slug>/page.fnx`) for that file's text. Paths that escape the project
+**`read_fnx_source`** — `{ path?, offset?, limit?, max_bytes? }`. Omit `path`
+for the project `root` and the list of its source files; pass a project-relative
+path (for example `pages/<page-slug>/page.fnx`) for that file's text, returned
+in slices (64 KiB by default) with `total_lines`, `total_bytes`, `truncated` and
+a notice naming the next slice's arguments. Paths that escape the project
 root are rejected. This tool only reads — write with your own file tools. On a
 document that has never been saved it fails with *the document has no on-disk
 Fanta project yet; save the canvas once to materialize one*.
+
+The built-in Fanta agent uses the same surface through its native tools
+`design_state` (= `get_editor_state` + `batch_get`, with `empty_space`),
+`design_edit` (= `batch_design`), `design_screenshot` (= `get_screenshot`) and
+`place_generation` (download an image URL and place it as a `create_image`).
 
 ### When no canvas is open
 

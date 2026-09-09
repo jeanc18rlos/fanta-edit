@@ -898,3 +898,481 @@ fn instance_id_is_unique_across_new_default_clone_and_deserialize() {
     );
     assert_ne!(deserialized.instance_id(), 0);
 }
+
+// ---- targeted invalidation + change log ----------------------------------
+
+/// A tree deep enough to have ancestors, descendants, siblings and unrelated
+/// roots around one "moved" node:
+///
+/// ```text
+/// root_a (group)          root_b (group)
+/// ├── mid (group)         └── b_leaf
+/// │   ├── inner (group)   ← the node the tests move / patch
+/// │   │   ├── inner_leaf_0
+/// │   │   └── inner_leaf_1
+/// │   └── mid_leaf
+/// └── sibling_leaf
+/// ```
+struct DeepScene {
+    scene: Scene,
+    root_a: NodeId,
+    mid: NodeId,
+    inner: NodeId,
+    inner_leaves: Vec<NodeId>,
+    mid_leaf: NodeId,
+    sibling_leaf: NodeId,
+    root_b: NodeId,
+    b_leaf: NodeId,
+}
+
+impl DeepScene {
+    fn build() -> Self {
+        let mut scene = Scene::new();
+        let mut add = |mut node: CanvasNode, parent: Option<NodeId>, x: f64, y: f64| {
+            node.parent = parent;
+            node.transform = Transform2D::translation(x, y);
+            node.index = scene.next_child_index(parent);
+            let id = node.id;
+            scene.insert(node).unwrap();
+            id
+        };
+        let root_a = add(group_node(), None, 10.0, 20.0);
+        let mid = add(group_node(), Some(root_a), 5.0, 5.0);
+        let inner = add(group_node(), Some(mid), 1.0, 2.0);
+        let inner_leaves = vec![
+            add(rect_node(0.0, 0.0, 10.0, 10.0), Some(inner), 0.0, 0.0),
+            add(rect_node(0.0, 0.0, 10.0, 10.0), Some(inner), 30.0, 0.0),
+        ];
+        let mid_leaf = add(rect_node(0.0, 0.0, 8.0, 8.0), Some(mid), 100.0, 0.0);
+        let sibling_leaf = add(rect_node(0.0, 0.0, 6.0, 6.0), Some(root_a), 0.0, 100.0);
+        let root_b = add(group_node(), None, 500.0, 500.0);
+        let b_leaf = add(rect_node(0.0, 0.0, 20.0, 20.0), Some(root_b), 3.0, 3.0);
+        Self {
+            scene,
+            root_a,
+            mid,
+            inner,
+            inner_leaves,
+            mid_leaf,
+            sibling_leaf,
+            root_b,
+            b_leaf,
+        }
+    }
+
+    fn all_ids(&self) -> Vec<NodeId> {
+        let mut ids = vec![
+            self.root_a,
+            self.mid,
+            self.inner,
+            self.mid_leaf,
+            self.sibling_leaf,
+            self.root_b,
+            self.b_leaf,
+        ];
+        ids.extend(self.inner_leaves.iter().copied());
+        ids
+    }
+
+    /// Fill every cache entry the render/hit-test paths would.
+    fn warm(&self) {
+        for id in self.all_ids() {
+            self.scene.world_transform(id);
+            self.scene.world_bounds(id);
+        }
+        self.scene.hit_test(DVec2::new(-1e9, -1e9));
+    }
+}
+
+/// A copy of `scene` with every derived cache dropped — the uncached fold the
+/// warm scene is checked against.
+fn cold_oracle(scene: &Scene) -> Scene {
+    let fresh = scene.clone();
+    fresh.clear_derived_caches();
+    fresh
+}
+
+fn assert_geometry_matches_cold_fold(scene: &Scene, ids: &[NodeId]) {
+    let oracle = cold_oracle(scene);
+    for &id in ids {
+        assert_eq!(
+            scene.world_transform(id),
+            oracle.world_transform(id),
+            "world_transform of {id} diverged from the uncached fold"
+        );
+        assert_eq!(
+            scene.world_bounds(id),
+            oracle.world_bounds(id),
+            "world_bounds of {id} diverged from the uncached walk"
+        );
+        assert_eq!(
+            scene.local_bounds(id),
+            oracle.local_bounds(id),
+            "local_bounds of {id} diverged from the uncached walk"
+        );
+    }
+}
+
+#[test]
+fn set_transform_on_a_deep_subtree_matches_a_fresh_fold_everywhere() {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(-40.0, 75.0))
+        .unwrap();
+    assert_geometry_matches_cold_fold(&deep.scene, &deep.all_ids());
+    // The moved node really moved: its leaf follows the new local transform.
+    let leaf = deep.scene.world_bounds(deep.inner_leaves[0]).unwrap();
+    assert!((leaf.min_x - (10.0 + 5.0 - 40.0)).abs() < 1e-9);
+    assert!((leaf.min_y - (20.0 + 5.0 + 75.0)).abs() < 1e-9);
+    // Hit-testing through the rebuilt index agrees with brute force at the
+    // new and old positions.
+    for probe in [leaf.center(), DVec2::new(16.0 + 5.0, 27.0 + 5.0)] {
+        assert_eq!(deep.scene.hit_test(probe), deep.scene.hit_test_brute(probe));
+    }
+}
+
+#[test]
+fn set_transform_of_a_root_and_of_a_leaf_match_a_fresh_fold() {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    deep.scene
+        .set_transform(deep.root_a, Transform2D::translation(0.0, 0.0))
+        .unwrap();
+    assert_geometry_matches_cold_fold(&deep.scene, &deep.all_ids());
+    deep.warm();
+    deep.scene
+        .set_transform(deep.inner_leaves[1], Transform2D::translation(-30.0, 60.0))
+        .unwrap();
+    assert_geometry_matches_cold_fold(&deep.scene, &deep.all_ids());
+}
+
+#[test]
+fn set_transform_keeps_unrelated_cache_entries_and_drops_the_affected_ones() {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(-40.0, 75.0))
+        .unwrap();
+
+    let world = deep.scene.world_cache.borrow();
+    let local = deep.scene.local_bounds_cache.borrow();
+    // World transforms: the moved node and its descendants are gone…
+    for id in std::iter::once(deep.inner).chain(deep.inner_leaves.iter().copied()) {
+        assert!(
+            !world.contains_key(&id),
+            "stale world transform kept for {id}"
+        );
+    }
+    // …while ancestors, siblings and the other root keep theirs.
+    for id in [
+        deep.root_a,
+        deep.mid,
+        deep.mid_leaf,
+        deep.sibling_leaf,
+        deep.root_b,
+        deep.b_leaf,
+    ] {
+        assert!(
+            world.contains_key(&id),
+            "unrelated world transform dropped for {id}"
+        );
+    }
+    // Local bounds: the ancestors' unions are gone, the node's own bounds and
+    // everything else survive.
+    for id in [deep.mid, deep.root_a] {
+        assert!(
+            !local.contains_key(&id),
+            "stale local bounds kept for ancestor {id}"
+        );
+    }
+    for id in std::iter::once(deep.inner)
+        .chain(deep.inner_leaves.iter().copied())
+        .chain([deep.mid_leaf, deep.sibling_leaf, deep.root_b, deep.b_leaf])
+    {
+        assert!(
+            local.contains_key(&id),
+            "unrelated local bounds dropped for {id}"
+        );
+    }
+    assert!(
+        deep.scene.spatial_index.borrow().is_none(),
+        "the spatial index snapshots world AABBs and must be rebuilt lazily"
+    );
+}
+
+#[test]
+fn clone_starts_without_a_spatial_index() {
+    let deep = DeepScene::build();
+    deep.warm();
+    assert!(deep.scene.spatial_index.borrow().is_some());
+    let cloned = deep.scene.clone();
+    assert!(cloned.spatial_index.borrow().is_none());
+    // And still answers hit-tests identically once it rebuilds.
+    let probe = deep.scene.world_bounds(deep.b_leaf).unwrap().center();
+    assert_eq!(cloned.hit_test(probe), deep.scene.hit_test(probe));
+}
+
+#[test]
+fn changes_since_the_current_revision_is_empty() {
+    let deep = DeepScene::build();
+    let delta = deep.scene.changes_since(deep.scene.revision()).unwrap();
+    assert!(delta.is_empty());
+}
+
+#[test]
+fn changes_since_reports_a_contiguous_deduplicated_transform_run() {
+    let mut deep = DeepScene::build();
+    let start = deep.scene.revision();
+    for frame in 0..5 {
+        deep.scene
+            .set_transform(deep.inner, Transform2D::translation(frame as f64, 0.0))
+            .unwrap();
+        deep.scene
+            .set_transform(deep.b_leaf, Transform2D::translation(0.0, frame as f64))
+            .unwrap();
+    }
+    let delta = deep.scene.changes_since(start).unwrap();
+    let mut expected = vec![deep.inner, deep.b_leaf];
+    expected.sort_unstable();
+    assert_eq!(delta.transforms, expected);
+    assert!(delta.nodes.is_empty());
+    // A copy that caught up half-way sees only the later frames' nodes.
+    let mid_revision = start + 3;
+    let later = deep.scene.changes_since(mid_revision).unwrap();
+    assert_eq!(later.transforms, expected);
+}
+
+#[test]
+fn changes_since_folds_a_transform_into_a_node_change() {
+    let mut deep = DeepScene::build();
+    let start = deep.scene.revision();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(1.0, 1.0))
+        .unwrap();
+    deep.scene.get_mut(deep.inner).unwrap().name = "renamed".into();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(2.0, 2.0))
+        .unwrap();
+    deep.scene
+        .set_transform(deep.mid_leaf, Transform2D::translation(2.0, 2.0))
+        .unwrap();
+    let delta = deep.scene.changes_since(start).unwrap();
+    assert_eq!(delta.nodes, vec![deep.inner]);
+    assert_eq!(delta.transforms, vec![deep.mid_leaf]);
+}
+
+#[test]
+fn changes_since_gives_up_on_structural_and_unknown_edits() {
+    let mut deep = DeepScene::build();
+    let start = deep.scene.revision();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(1.0, 1.0))
+        .unwrap();
+    deep.scene.invalidate_world_cache();
+    assert!(
+        deep.scene.changes_since(start).is_none(),
+        "an untracked edit poisons every delta spanning it"
+    );
+    // Once past it, deltas resume.
+    let after_unknown = deep.scene.revision();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(3.0, 3.0))
+        .unwrap();
+    assert_eq!(
+        deep.scene.changes_since(after_unknown).unwrap().transforms,
+        vec![deep.inner]
+    );
+
+    let before_insert = deep.scene.revision();
+    let mut extra = rect_node(0.0, 0.0, 1.0, 1.0);
+    extra.parent = Some(deep.root_b);
+    deep.scene.insert(extra).unwrap();
+    assert!(deep.scene.changes_since(before_insert).is_none());
+
+    let before_reparent = deep.scene.revision();
+    deep.scene
+        .set_parent(deep.mid_leaf, Some(deep.root_b), IndexKey::FIRST)
+        .unwrap();
+    assert!(deep.scene.changes_since(before_reparent).is_none());
+
+    let before_reorder = deep.scene.revision();
+    deep.scene
+        .set_index(deep.sibling_leaf, IndexKey::from_raw(99.0))
+        .unwrap();
+    assert!(deep.scene.changes_since(before_reorder).is_none());
+
+    let before_remove = deep.scene.revision();
+    deep.scene.remove(deep.b_leaf).unwrap();
+    assert!(deep.scene.changes_since(before_remove).is_none());
+
+    let before_rebuild = deep.scene.revision();
+    deep.scene.rebuild_child_index();
+    assert!(deep.scene.changes_since(before_rebuild).is_none());
+}
+
+#[test]
+fn changes_since_gives_up_when_a_touched_node_is_missing() {
+    let mut deep = DeepScene::build();
+    let start = deep.scene.revision();
+    assert!(deep.scene.get_mut(NodeId::new()).is_none());
+    assert_ne!(deep.scene.revision(), start, "get_mut bumps even on a miss");
+    assert!(deep.scene.changes_since(start).is_none());
+}
+
+#[test]
+fn changes_since_gives_up_past_the_log_window() {
+    let mut deep = DeepScene::build();
+    let start = deep.scene.revision();
+    for frame in 0..=SCENE_CHANGE_LOG_CAP {
+        deep.scene
+            .set_transform(deep.inner, Transform2D::translation(frame as f64, 0.0))
+            .unwrap();
+    }
+    assert!(deep.scene.changes_since(start).is_none());
+    // The newest CAP entries are still served.
+    let inside_window = deep.scene.revision() - (SCENE_CHANGE_LOG_CAP as u64);
+    assert_eq!(
+        deep.scene.changes_since(inside_window).unwrap().transforms,
+        vec![deep.inner]
+    );
+    let just_outside = inside_window - 1;
+    assert!(deep.scene.changes_since(just_outside).is_none());
+}
+
+#[test]
+fn changes_since_gives_up_beyond_the_node_cap() {
+    let mut scene = Scene::new();
+    let ids: Vec<NodeId> = (0..=SCENE_DELTA_MAX_NODES)
+        .map(|_| {
+            let node = rect_node(0.0, 0.0, 1.0, 1.0);
+            let id = node.id;
+            scene.insert(node).unwrap();
+            id
+        })
+        .collect();
+    let start = scene.revision();
+    for &id in &ids[..SCENE_DELTA_MAX_NODES] {
+        scene
+            .set_transform(id, Transform2D::translation(1.0, 0.0))
+            .unwrap();
+    }
+    assert_eq!(
+        scene.changes_since(start).unwrap().transforms.len(),
+        SCENE_DELTA_MAX_NODES,
+        "exactly the cap is still a delta"
+    );
+    scene
+        .set_transform(
+            ids[SCENE_DELTA_MAX_NODES],
+            Transform2D::translation(1.0, 0.0),
+        )
+        .unwrap();
+    assert!(scene.changes_since(start).is_none());
+}
+
+#[test]
+fn patch_node_brings_a_clone_into_parity_with_the_original() {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    let mut copy = deep.scene.clone();
+    // Warm the copy too, so stale entries would show if invalidation missed.
+    for id in deep.all_ids() {
+        copy.world_bounds(id);
+    }
+    copy.hit_test(DVec2::ZERO);
+
+    let copy_revision = copy.revision();
+    {
+        let inner = deep.scene.get_mut(deep.inner).unwrap();
+        inner.transform = Transform2D::translation(-40.0, 75.0);
+        inner.name = "moved".into();
+    }
+    {
+        let leaf = deep.scene.get_mut(deep.b_leaf).unwrap();
+        leaf.data = rect_node(0.0, 0.0, 200.0, 200.0).data;
+        leaf.flags |= crate::node::NodeFlags::HIDDEN;
+    }
+    deep.scene
+        .set_transform(deep.mid_leaf, Transform2D::translation(7.0, 7.0))
+        .unwrap();
+
+    let delta = deep.scene.changes_since(copy_revision).unwrap();
+    for id in delta.transforms {
+        let transform = deep.scene.get(id).unwrap().transform;
+        copy.set_transform(id, transform).unwrap();
+    }
+    for id in delta.nodes {
+        let node = deep.scene.get(id).unwrap().clone();
+        copy.patch_node(node, deep.scene.node_stamp(id)).unwrap();
+    }
+
+    for id in deep.all_ids() {
+        assert_eq!(copy.get(id), deep.scene.get(id), "node {id} differs");
+        assert_eq!(copy.world_transform(id), deep.scene.world_transform(id));
+        assert_eq!(copy.world_bounds(id), deep.scene.world_bounds(id));
+        assert_eq!(
+            copy.node_stamp(id),
+            deep.scene.node_stamp(id),
+            "stamp of {id}"
+        );
+    }
+    assert_geometry_matches_cold_fold(&copy, &deep.all_ids());
+    for id in deep.all_ids() {
+        if let Some(bounds) = deep.scene.world_bounds(id) {
+            let probe = bounds.center();
+            assert_eq!(copy.hit_test(probe), deep.scene.hit_test(probe));
+            assert_eq!(copy.hit_test(probe), copy.hit_test_brute(probe));
+        }
+    }
+    copy.validate().unwrap();
+}
+
+#[test]
+fn patch_node_refuses_a_hierarchy_change_and_a_missing_node() {
+    let mut deep = DeepScene::build();
+    let mut reparented = deep.scene.get(deep.mid_leaf).unwrap().clone();
+    reparented.parent = Some(deep.root_b);
+    assert!(matches!(
+        deep.scene.patch_node(reparented, 1),
+        Err(SceneError::InvariantViolated(_))
+    ));
+    let mut reordered = deep.scene.get(deep.mid_leaf).unwrap().clone();
+    reordered.index = IndexKey::from_raw(1234.0);
+    assert!(matches!(
+        deep.scene.patch_node(reordered, 1),
+        Err(SceneError::InvariantViolated(_))
+    ));
+    assert!(matches!(
+        deep.scene.patch_node(rect_node(0.0, 0.0, 1.0, 1.0), 1),
+        Err(SceneError::NotFound(_))
+    ));
+    deep.scene.validate().unwrap();
+}
+
+#[test]
+fn patch_node_logs_a_node_change_and_targets_its_invalidation() {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    let start = deep.scene.revision();
+    let mut replacement = deep.scene.get(deep.inner).unwrap().clone();
+    replacement.transform = Transform2D::translation(9.0, 9.0);
+    deep.scene.patch_node(replacement, 77).unwrap();
+    assert_eq!(deep.scene.node_stamp(deep.inner), 77);
+    assert_eq!(
+        deep.scene.changes_since(start).unwrap().nodes,
+        vec![deep.inner]
+    );
+    {
+        let world = deep.scene.world_cache.borrow();
+        let local = deep.scene.local_bounds_cache.borrow();
+        assert!(!world.contains_key(&deep.inner));
+        assert!(!world.contains_key(&deep.inner_leaves[0]));
+        assert!(world.contains_key(&deep.sibling_leaf));
+        assert!(!local.contains_key(&deep.inner));
+        assert!(!local.contains_key(&deep.mid));
+        assert!(local.contains_key(&deep.inner_leaves[0]));
+        assert!(local.contains_key(&deep.b_leaf));
+    }
+    assert_geometry_matches_cold_fold(&deep.scene, &deep.all_ids());
+}

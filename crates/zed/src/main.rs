@@ -1443,11 +1443,15 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
         "copilot",
         "debug_panel",
         "debugger",
+        // `dev: open url prompt`, the inspector and the hang/crash triggers.
+        "dev",
         "dev_container",
         "diagnostics",
         "edit_prediction",
         "encoding",
         "extensions",
+        // Zed's bug-report form and support address.
+        "feedback",
         "file_finder",
         "git_panel",
         "journal",
@@ -1462,6 +1466,7 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
         "outline_panel",
         "project_panel",
         "projects",
+        "remote_debug",
         "repl",
         "settings_editor",
         "snippets",
@@ -1508,6 +1513,19 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             TypeId::of::<zed_actions::OpenProjectSettings>(),
             TypeId::of::<workspace::OpenTerminal>(),
             TypeId::of::<workspace::OpenInTerminal>(),
+            // Developer-only switches in the `zed` namespace.
+            TypeId::of::<zed::DebugElements>(),
+            TypeId::of::<zed::ResetDatabase>(),
+            TypeId::of::<zed::TestPanic>(),
+            TypeId::of::<zed::TestCrash>(),
+            TypeId::of::<zed_actions::OpenTelemetryLog>(),
+            TypeId::of::<zed_actions::OpenPerformanceProfiler>(),
+            TypeId::of::<zed_actions::ShowUpdateNotification>(),
+            // These open Zed's own account, server or extension surfaces.
+            TypeId::of::<zed_actions::OpenAccountSettings>(),
+            TypeId::of::<zed_actions::OpenServerSettings>(),
+            TypeId::of::<zed_actions::OpenZedUrl>(),
+            TypeId::of::<zed_actions::Extensions>(),
         ]);
     });
 }

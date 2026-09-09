@@ -32,6 +32,7 @@ mod properties_render;
 mod properties_snapshot;
 mod prototype_panel;
 mod prototype_player;
+mod structure;
 mod text_edit;
 #[cfg(feature = "fanta-gpui-ui")]
 mod theme_bridge;

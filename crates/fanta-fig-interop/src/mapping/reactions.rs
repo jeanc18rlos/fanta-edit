@@ -31,7 +31,7 @@ fn stable_hash_u128(s: &str) -> u128 {
 pub(crate) fn apply_reactions(
     doc: &mut Doc,
     report: &mut MapReport,
-    pending: &[(NodeId, Vec<KiwiValue>)],
+    pending: &[(NodeId, &[KiwiValue])],
     guid_to_node: &HashMap<String, Option<NodeId>>,
     component_maps: &ComponentMaps,
 ) {
@@ -41,7 +41,7 @@ pub(crate) fn apply_reactions(
             continue;
         }
         let mut reactions: Vec<Reaction> = Vec::new();
-        for interaction in interactions {
+        for interaction in interactions.iter() {
             if matches!(interaction.get("isDeleted"), Some(KiwiValue::Bool(true))) {
                 continue;
             }

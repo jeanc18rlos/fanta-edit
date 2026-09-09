@@ -80,7 +80,7 @@ pub use source_edit::{
     ProjectSourceEdit, apply_project_source_edit, apply_project_source_edit_with_diagnostics,
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
-pub use write::{WriteReport, write_project_tree};
+pub use write::{ProjectWriteCache, WriteReport, write_project_tree, write_project_tree_cached};
 
 #[cfg(test)]
 mod tests {

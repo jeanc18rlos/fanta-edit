@@ -233,13 +233,40 @@ impl<'a> RenderInputs<'a> {
 /// Invalidation is automatic: editing a master bumps its `ComponentDef.rev`
 /// (see `ComponentLibrary::bump_rev_for_node`), which changes the key; changing
 /// the instance's own overrides changes the override-hash; a mode switch bumps
-/// `mode_generation`. Stale entries are simply never looked up again; the cache
-/// is bounded only by distinct live keys, and `clear_instance_cache` drops it
-/// wholesale (e.g. on document switch).
+/// `mode_generation`, and a frame mode pin above the instance changes the
+/// pin-hash. Entries are keyed by instance id and hold one expansion each, so a
+/// key change REPLACES the instance's entry instead of leaving the old one
+/// behind. Entries no instance looked up for [`INSTANCE_CACHE_IDLE_FRAMES`]
+/// frames are dropped (that is how the fresh-id clones of nested instances,
+/// orphaned when their outer expansion re-expands, get freed), and
+/// `clear_instance_cache` drops it wholesale (e.g. on document switch).
 #[derive(Default)]
 pub(crate) struct InstanceCache {
-    pub(crate) entries: IdHashMap<InstanceCacheKey, Arc<Vec<ExpandedNode>>>,
+    pub(crate) entries: IdHashMap<NodeId, InstanceCacheEntry>,
+    /// [`hash_overrides`] memoized per live-scene instance as
+    /// `(node stamp, hash)`: the hash inputs (`component`, `overrides`,
+    /// `prop_values`, `derived`) live on the scene node, whose stamp moves on
+    /// every data edit, so an unchanged stamp guarantees an unchanged hash and
+    /// a steady-state frame serializes nothing. Purged of removed ids when the
+    /// scene's removal revision moves.
+    override_hashes: IdHashMap<NodeId, (u64, u64)>,
+    removal_seen: u64,
+    /// Frame serial for idle eviction.
+    frame: u64,
 }
+
+/// One instance's memoized expansion and the key it was built under.
+pub(crate) struct InstanceCacheEntry {
+    pub(crate) key: InstanceCacheKey,
+    pub(crate) expanded: Arc<Vec<ExpandedNode>>,
+    last_used: u64,
+}
+
+/// Frames an entry may go without a lookup before it is dropped. Long enough
+/// that an instance scrolled off-screen and back within a few seconds keeps
+/// its expansion; short enough that orphaned nested-clone entries do not pile
+/// up over an editing session.
+pub(crate) const INSTANCE_CACHE_IDLE_FRAMES: u64 = 240;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct InstanceCacheKey {
@@ -247,32 +274,88 @@ pub(crate) struct InstanceCacheKey {
     pub(crate) rev: u64,
     pub(crate) override_hash: u64,
     pub(crate) mode_generation: u64,
+    /// Hash of the frame mode pins on the instance's ancestor chain (see
+    /// `hash_mode_pins`): alias-backed component properties are resolved in
+    /// the instance's effective mode INTO the cached expansion, and a pin on
+    /// an enclosing frame changes that mode without touching the variables,
+    /// the modes, or the instance node itself.
+    pub(crate) mode_pins: u64,
 }
 
 impl InstanceCache {
     fn clear(&mut self) {
         self.entries.clear();
+        self.override_hashes.clear();
     }
 
     fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Drop entries from older `mode_generation`s. The generation advances on
-    /// every content edit (including each pointer-move of a drag), and stale
-    /// entries were never looked up again but also never freed — a long edit
-    /// session leaked one full expansion tree per instance per edit, which is
-    /// exactly the "gets slower over time" decay. Live entries are bounded by
-    /// the instances actually rendered this generation, so the retain is
-    /// cheap; skip it entirely when nothing is stale.
-    fn evict_stale(&mut self, mode_generation: u64) {
-        if self
-            .entries
-            .keys()
-            .any(|key| key.mode_generation != mode_generation)
+    /// The memoized expansion for `key`'s instance, if it was built under
+    /// exactly this key.
+    pub(crate) fn lookup(&mut self, key: &InstanceCacheKey) -> Option<Arc<Vec<ExpandedNode>>> {
+        let entry = self.entries.get_mut(&key.instance)?;
+        if entry.key != *key {
+            return None;
+        }
+        entry.last_used = self.frame;
+        Some(Arc::clone(&entry.expanded))
+    }
+
+    pub(crate) fn insert(&mut self, key: InstanceCacheKey, expanded: Arc<Vec<ExpandedNode>>) {
+        self.entries.insert(
+            key.instance,
+            InstanceCacheEntry {
+                key,
+                expanded,
+                last_used: self.frame,
+            },
+        );
+    }
+
+    /// [`hash_overrides`] for `instance`, served from the stamp memo when
+    /// `stamp` is `Some` (a live-scene node) and computed directly for a
+    /// transient clone, whose fresh id would only ever pin a one-off entry.
+    pub(crate) fn override_hash(
+        &mut self,
+        instance_id: NodeId,
+        stamp: Option<u64>,
+        instance: &InstanceNode,
+    ) -> u64 {
+        let Some(stamp) = stamp else {
+            return hash_overrides(instance);
+        };
+        if let Some(&(memo_stamp, hash)) = self.override_hashes.get(&instance_id)
+            && memo_stamp == stamp
         {
-            self.entries
-                .retain(|key, _| key.mode_generation == mode_generation);
+            return hash;
+        }
+        let hash = hash_overrides(instance);
+        self.override_hashes.insert(instance_id, (stamp, hash));
+        hash
+    }
+
+    /// Per-frame bookkeeping: advance the idle clock, drop entries from older
+    /// `mode_generation`s and entries idle for [`INSTANCE_CACHE_IDLE_FRAMES`],
+    /// and purge the override-hash memo of removed nodes (gated on the scene's
+    /// removal revision so steady frames never scan it).
+    fn begin_frame(&mut self, scene: &Scene, mode_generation: u64) {
+        self.frame = self.frame.wrapping_add(1);
+        let frame = self.frame;
+        if self.entries.values().any(|entry| {
+            entry.key.mode_generation != mode_generation
+                || frame.wrapping_sub(entry.last_used) > INSTANCE_CACHE_IDLE_FRAMES
+        }) {
+            self.entries.retain(|_, entry| {
+                entry.key.mode_generation == mode_generation
+                    && frame.wrapping_sub(entry.last_used) <= INSTANCE_CACHE_IDLE_FRAMES
+            });
+        }
+        let removal = scene.removal_revision();
+        if self.removal_seen != removal {
+            self.override_hashes.retain(|id, _| scene.contains(*id));
+            self.removal_seen = removal;
         }
     }
 }
@@ -372,13 +455,16 @@ impl PathCache {
     }
 }
 
-/// Hash an instance's overrides into one `u64` for the memo key. The overrides
-/// `Vec<Override>` is not `Hash` (it carries `f64`s via `OverrideValue::Field`
-/// JSON and `Fills`), so we route it through its serde JSON projection — stable
-/// for a given override set and cheap relative to a full subtree clone. A hash
-/// collision would at worst serve a wrong-but-same-shape expansion; the input
-/// space (overrides on one instance between two edits) makes that negligible,
-/// and any real edit also bumps `rev` or `mode_generation`.
+/// Hash every field of an instance that expansion reads — `component`,
+/// `overrides`, `prop_values`, `derived` and `local_size` — into one `u64` for
+/// the memo key. The overrides `Vec<Override>` is not `Hash` (it carries
+/// `f64`s via `OverrideValue::Field` JSON and `Fills`), so we route it through
+/// its serde JSON projection — stable for a given override set and cheap
+/// relative to a full subtree clone. A hash collision would at worst serve a
+/// wrong-but-same-shape expansion; the input space (overrides on one instance
+/// between two edits) makes that negligible.
+/// Three serializations per call, so the renderer memoizes it per live
+/// instance behind the node's geometry stamp ([`InstanceCache::override_hash`]).
 pub(crate) fn hash_overrides(instance: &InstanceNode) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // `component` participates so a swap (which `expand` keys off) re-expands
@@ -397,6 +483,11 @@ pub(crate) fn hash_overrides(instance: &InstanceNode) -> u64 {
     // would not invalidate the memo and the stale baked layout would persist.
     if let Ok(json) = serde_json::to_string(&instance.derived) {
         json.hash(&mut hasher);
+    }
+    // `pin_expansion_root_box` bakes the instance's own box into the expanded
+    // root, so a resize with no other change must miss the memo too.
+    for extent in instance.local_size {
+        extent.to_bits().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -881,7 +972,8 @@ impl RasterRenderer {
             return metrics;
         }
         self.sync_scene_instance(scene);
-        self.instance_cache.evict_stale(inputs.mode_generation);
+        self.instance_cache
+            .begin_frame(scene, inputs.mode_generation);
         self.boolean_cache.purge_removed(scene);
         self.path_cache.purge_removed(scene);
         let background = self.background;
@@ -973,7 +1065,8 @@ impl RasterRenderer {
         let mut metrics = RenderMetrics::default();
 
         self.sync_scene_instance(scene);
-        self.instance_cache.evict_stale(inputs.mode_generation);
+        self.instance_cache
+            .begin_frame(scene, inputs.mode_generation);
         self.boolean_cache.purge_removed(scene);
         self.path_cache.purge_removed(scene);
         let background = self.background;
@@ -1496,5 +1589,145 @@ fn page_background_color(
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod instance_cache_tests {
+    use super::*;
+    use fanta_doc::{ComponentId, InstanceNode, Override, OverrideValue};
+
+    fn instance(component: ComponentId) -> InstanceNode {
+        InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [10.0, 10.0],
+        }
+    }
+
+    fn key(instance: NodeId, override_hash: u64, mode_generation: u64) -> InstanceCacheKey {
+        InstanceCacheKey {
+            instance,
+            rev: 1,
+            override_hash,
+            mode_generation,
+            mode_pins: 0,
+        }
+    }
+
+    #[test]
+    fn override_hash_is_served_from_the_stamp_memo_until_the_stamp_moves() {
+        let mut cache = InstanceCache::default();
+        let id = NodeId::new();
+        let plain = instance(ComponentId::new());
+        let mut hidden = plain.clone();
+        hidden.overrides.push(Override {
+            target_path: Default::default(),
+            target_prop: fanta_doc::BoundProp::Visible,
+            value: OverrideValue::SwapInstance {
+                component: ComponentId::new(),
+            },
+        });
+        assert_eq!(
+            cache.override_hash(id, Some(1), &plain),
+            hash_overrides(&plain)
+        );
+        // Same stamp: the memo answers, whatever the node now says — the
+        // contract is that a data edit always moves the stamp.
+        assert_eq!(
+            cache.override_hash(id, Some(1), &hidden),
+            hash_overrides(&plain)
+        );
+        assert_eq!(
+            cache.override_hash(id, Some(2), &hidden),
+            hash_overrides(&hidden)
+        );
+        // A transient clone (no stamp) is always hashed directly.
+        assert_eq!(
+            cache.override_hash(id, None, &plain),
+            hash_overrides(&plain)
+        );
+    }
+
+    #[test]
+    fn the_override_hash_covers_the_instance_box() {
+        let plain = instance(ComponentId::new());
+        let mut resized = plain.clone();
+        resized.local_size = [20.0, 10.0];
+        assert_ne!(
+            hash_overrides(&plain),
+            hash_overrides(&resized),
+            "an instance resize alone must re-key its expansion"
+        );
+        assert_eq!(hash_overrides(&plain), hash_overrides(&plain.clone()));
+    }
+
+    #[test]
+    fn a_changed_key_replaces_the_instances_entry_instead_of_leaking() {
+        let mut cache = InstanceCache::default();
+        let id = NodeId::new();
+        cache.insert(key(id, 1, 0), Arc::new(Vec::new()));
+        assert!(cache.lookup(&key(id, 1, 0)).is_some());
+        assert!(
+            cache.lookup(&key(id, 2, 0)).is_none(),
+            "a new override hash misses"
+        );
+        cache.insert(key(id, 2, 0), Arc::new(Vec::new()));
+        assert_eq!(cache.len(), 1, "one entry per instance");
+        assert!(cache.lookup(&key(id, 1, 0)).is_none());
+        assert!(cache.lookup(&key(id, 2, 0)).is_some());
+    }
+
+    #[test]
+    fn entries_from_another_mode_generation_or_idle_too_long_are_evicted() {
+        let scene = Scene::new();
+        let mut cache = InstanceCache::default();
+        let live = NodeId::new();
+        let stale_mode = NodeId::new();
+        cache.begin_frame(&scene, 7);
+        cache.insert(key(live, 1, 7), Arc::new(Vec::new()));
+        cache.insert(key(stale_mode, 1, 6), Arc::new(Vec::new()));
+        cache.begin_frame(&scene, 7);
+        assert!(cache.lookup(&key(stale_mode, 1, 6)).is_none());
+        assert!(cache.lookup(&key(live, 1, 7)).is_some());
+
+        let idle = NodeId::new();
+        cache.insert(key(idle, 1, 7), Arc::new(Vec::new()));
+        for _ in 0..INSTANCE_CACHE_IDLE_FRAMES {
+            cache.begin_frame(&scene, 7);
+            // `live` is looked up every frame and must survive.
+            assert!(cache.lookup(&key(live, 1, 7)).is_some());
+        }
+        // Probe the map directly: a lookup would count as a use.
+        assert!(cache.entries.contains_key(&idle), "still inside the window");
+        cache.begin_frame(&scene, 7);
+        assert!(
+            !cache.entries.contains_key(&idle),
+            "one frame past the window"
+        );
+        assert!(cache.lookup(&key(live, 1, 7)).is_some());
+    }
+
+    #[test]
+    fn override_hash_memo_is_purged_of_removed_nodes_when_the_scene_says_so() {
+        let mut scene = Scene::new();
+        let node =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Instance(instance(ComponentId::new())));
+        let id = node.id;
+        scene.insert(node).unwrap();
+        let mut cache = InstanceCache::default();
+        cache.begin_frame(&scene, 0);
+        let Some(fanta_doc::NodeData::Instance(inst)) = scene.get(id).map(|node| &node.data) else {
+            panic!("instance node");
+        };
+        cache.override_hash(id, Some(scene.node_stamp(id)), inst);
+        assert_eq!(cache.override_hashes.len(), 1);
+        cache.begin_frame(&scene, 0);
+        assert_eq!(cache.override_hashes.len(), 1, "no removal, no scan");
+        scene.remove(id).unwrap();
+        cache.begin_frame(&scene, 0);
+        assert!(cache.override_hashes.is_empty());
     }
 }

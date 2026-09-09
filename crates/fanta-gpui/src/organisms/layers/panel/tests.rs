@@ -198,6 +198,34 @@ fn arena_answers_subtree_membership_from_preorder_indices() {
 }
 
 #[test]
+fn arena_honours_the_host_children_hint_for_pruned_containers() {
+    let items = vec![
+        LayersPanelItem::new("pruned", "Pruned frame", LayersPanelNodeKind::Frame)
+            .has_children(true),
+        LayersPanelItem::new("leaf", "Leaf", LayersPanelNodeKind::Rectangle),
+    ];
+    let arena = LayerArena::from_items(&items);
+    assert_eq!(arena.len(), 2);
+    assert!(arena.has_children(0));
+    assert!(!arena.has_children(1));
+
+    // With nothing pruned to skip, the pruned container is one row whether
+    // or not it counts as expanded.
+    let expanded: HashSet<SharedString> = ["pruned".into()].into_iter().collect();
+    assert_eq!(arena.visible_indices(&expanded), vec![0, 1]);
+    assert_eq!(arena.visible_indices(&HashSet::new()), vec![0, 1]);
+
+    // `children(...)` marks a populated node without an explicit hint.
+    let populated =
+        LayersPanelItem::new("frame", "Frame", LayersPanelNodeKind::Frame).children(vec![
+            LayersPanelItem::new("child", "Child", LayersPanelNodeKind::Text),
+        ]);
+    assert!(populated.has_children);
+    let leaf = LayersPanelItem::new("leaf", "Leaf", LayersPanelNodeKind::Text);
+    assert!(!leaf.has_children);
+}
+
+#[test]
 fn every_supported_node_kind_has_safe_common_context_actions() {
     use LayersPanelNodeKind as Kind;
     let kinds = [
@@ -456,6 +484,71 @@ fn expansion_and_collapse_all_update_presentation_and_emit_intents(cx: &mut Test
     assert_eq!(
         actions.borrow().last(),
         Some(&LayersPanelAction::CollapseAllRequested)
+    );
+}
+
+#[gpui::test]
+fn pruned_container_keeps_its_disclosure_and_expanding_asks_the_host(cx: &mut TestAppContext) {
+    let (host, actions, cx): Mounted<'_, LayersPanel, LayersPanelAction> =
+        mount_component(cx, |window, cx| {
+            LayersPanel::new(
+                "pruned-layers",
+                vec![
+                    LayersPanelItem::new("pruned", "Pruned frame", LayersPanelNodeKind::Frame)
+                        .has_children(true),
+                    LayersPanelItem::new("leaf", "Leaf", LayersPanelNodeKind::Rectangle),
+                ],
+                window,
+                cx,
+            )
+        });
+    let panel = panel(&host, cx);
+
+    // The host left the frame's children out, yet the row still discloses.
+    assert!(bounds(cx, "layers-expand-pruned").size.width > px(0.));
+    assert!(cx.debug_bounds("layers-expand-leaf").is_none());
+    assert_eq!(
+        read_panel(&panel, cx, |panel| panel.visible_row_ids()),
+        vec![SharedString::from("pruned"), SharedString::from("leaf")]
+    );
+
+    click(cx, "layers-expand-pruned", Modifiers::none());
+    assert_eq!(
+        actions.borrow().last(),
+        Some(&LayersPanelAction::ExpansionChanged {
+            node_id: "pruned".into(),
+            expanded: true,
+        })
+    );
+    assert!(read_panel(&panel, cx, |panel| panel
+        .expanded_node_ids
+        .contains(&SharedString::from("pruned"))));
+
+    // The host answers the intent with the children; the expansion the panel
+    // already recorded shows them without a further echo.
+    panel.update(cx, |panel, cx| {
+        panel.set_nodes(
+            vec![
+                LayersPanelItem::new("pruned", "Pruned frame", LayersPanelNodeKind::Frame)
+                    .children(vec![LayersPanelItem::new(
+                        "child",
+                        "Child",
+                        LayersPanelNodeKind::Text,
+                    )]),
+                LayersPanelItem::new("leaf", "Leaf", LayersPanelNodeKind::Rectangle),
+            ],
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(bounds(cx, "layers-row-child").size.height > px(0.));
+    assert_eq!(
+        read_panel(&panel, cx, |panel| panel.visible_row_ids()),
+        vec![
+            SharedString::from("pruned"),
+            SharedString::from("child"),
+            SharedString::from("leaf"),
+        ]
     );
 }
 

@@ -23,7 +23,7 @@ use context_server::types::{
     ServerCapabilities, ToolAnnotations, ToolsCapabilities, VERSION_2024_11_05, VERSION_2025_03_26,
     VERSION_2025_06_18, requests,
 };
-use design_surface::{DesignOp, NodeQuery, ScreenshotTarget};
+use design_surface::{DesignOp, MAX_JSON_RESPONSE_BYTES, NodeQuery, ScreenshotTarget};
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Task};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -92,6 +92,7 @@ fn apply_setting(cx: &mut App) {
             server.add_tool(BatchDesignTool);
             server.add_tool(GetScreenshotTool);
             server.add_tool(ReadFnxSourceTool);
+            server.add_tool(GetGuidelinesTool);
             server.handle_request::<requests::Initialize>(|params, cx| {
                 let client_name = params.client_info.name;
                 // The handler only holds `&App`, and the connecting agent is
@@ -264,11 +265,6 @@ fn text_response(value: serde_json::Value) -> ToolResponse<()> {
     }
 }
 
-/// Cap on one serialized JSON tool result. Whatever an MCP client can carry,
-/// a model cannot use megabytes of JSON, and a client that drops the response
-/// leaves the agent with nothing at all — so a query whose answer is this big
-/// is refused with instructions for narrowing it, never silently cut.
-const MAX_JSON_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Like [`text_response`], but refuses a result too large to be carried or
 /// read. `narrowing_hint` must tell the model how to ask a smaller question.
@@ -316,10 +312,21 @@ fn read_only() -> ToolAnnotations {
 // ---- get_editor_state --------------------------------------------------------
 
 /// Overview of the open Fanta design document: project name and root, pages
-/// (index, name, root id, node counts), the active page, current selection,
-/// viewport, and whether the canvas is editable right now.
+/// (index, name, root id, node counts, `.fnx` source path), the active page
+/// and its content bounds, components, current selection and its bounds,
+/// viewport, whether the canvas is editable right now, and short `hints`.
+/// Pass `empty_space: [width, height]` to also get a free `{x, y}` on the
+/// page for a new top-level frame of that size.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
-struct GetEditorStateArgs {}
+struct GetEditorStateArgs {
+    /// `[width, height]` of a box to find room for; the result then carries
+    /// `empty_space: {page, x, y, width, height}`.
+    #[serde(default)]
+    empty_space: Option<[f64; 2]>,
+    /// Page index `empty_space` searches (defaults to the active page).
+    #[serde(default)]
+    page: Option<usize>,
+}
 
 #[derive(Clone)]
 struct GetEditorStateTool;
@@ -334,9 +341,52 @@ impl McpServerTool for GetEditorStateTool {
         read_only()
     }
 
-    async fn run(&self, _input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
-        let value = with_surface(cx, |surface, cx| surface.state(cx))?;
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let args = input.0;
+        let value = with_surface(cx, move |surface, cx| {
+            let mut state = surface.state(cx)?;
+            if let Some([width, height]) = args.empty_space {
+                let spot = surface.find_empty_space(width, height, args.page, cx)?;
+                if let Some(state) = state.as_object_mut() {
+                    state.insert("empty_space".into(), spot);
+                }
+            }
+            Ok(state)
+        })?;
         Ok(text_response(value))
+    }
+}
+
+// ---- get_guidelines ----------------------------------------------------------
+
+/// Fanta's design guidelines for agents: coordinate system, frames vs groups,
+/// auto layout, spacing and type scales, naming, components, the working
+/// method (read state, batch ops with a label, screenshot to verify), and when
+/// to edit `.fnx` source instead of the canvas. Read once per session before
+/// designing.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+struct GetGuidelinesArgs {}
+
+#[derive(Clone)]
+struct GetGuidelinesTool;
+
+impl McpServerTool for GetGuidelinesTool {
+    type Input = OrDefault<GetGuidelinesArgs>;
+    type Output = ();
+
+    const NAME: &'static str = "get_guidelines";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(&self, _input: Self::Input, _cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        Ok(ToolResponse {
+            content: vec![context_server::types::ToolResponseContent::Text {
+                text: design_surface::DESIGN_GUIDELINES.to_string(),
+            }],
+            structured_content: (),
+        })
     }
 }
 
@@ -403,12 +453,18 @@ impl McpServerTool for BatchGetTool {
 // ---- batch_design ------------------------------------------------------------
 
 /// Apply a batch of design ops to the open canvas as ONE undoable
-/// transaction: create_node (frame/rectangle/ellipse/text), create_image
-/// (base64 source), set_props, reparent, delete, select, set_viewport. If any
-/// op fails the whole batch rolls back and the result names the failing op.
-/// Strokes, gradients, shadows, auto-layout, fonts and components are not
-/// batch_design properties: read the page .fnx with read_fnx_source, edit the
-/// file, and the canvas reloads (the change is a git diff).
+/// transaction. Ops: create_node (frame/rectangle/ellipse/text), create_image
+/// (base64 source), create_instance (of a component, by id or unique name),
+/// set_props (name/position/size/opacity/fill/corner_radius/text/hidden/
+/// locked), set_stroke, set_shadow, set_text_style, set_auto_layout,
+/// set_index (z-order), rotate, align, distribute, group, frame_selection,
+/// ungroup, duplicate, create_component, reparent, delete, select,
+/// set_viewport. Coordinates are world px, y down, x/y = top-left; ids are
+/// exact node ids. If any op fails the whole batch rolls back and the result
+/// names the failing op; created ids come back in `created`. Gradients,
+/// variables and per-run rich text are not ops yet: for those, read the page
+/// .fnx with read_fnx_source, edit the file, and the canvas reloads (the change
+/// is a git diff).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct BatchDesignArgs {
     /// The ops to apply, in order.
@@ -776,7 +832,9 @@ mod tests {
         assert_eq!(slice.text, "x".repeat(50));
         assert_eq!(slice.partial_line, Some(1));
         assert_eq!(slice.next_offset, Some(2));
-        let notice = slice.notice("page.fnx").expect("a cut line must be reported");
+        let notice = slice
+            .notice("page.fnx")
+            .expect("a cut line must be reported");
         assert!(notice.contains("cut mid-line"));
         assert!(notice.contains("max_bytes"));
     }
@@ -795,7 +853,9 @@ mod tests {
         assert!(slice.text.is_empty());
         assert_eq!(slice.next_offset, None);
         assert!(slice.truncated());
-        let notice = slice.notice("page.fnx").expect("an empty slice must be reported");
+        let notice = slice
+            .notice("page.fnx")
+            .expect("an empty slice must be reported");
         assert!(notice.contains("NOTHING WAS RETURNED"));
         assert!(notice.contains("line 9"));
     }

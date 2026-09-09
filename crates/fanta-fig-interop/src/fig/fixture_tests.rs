@@ -790,3 +790,52 @@ fn real_fig_truncations_error_cleanly() {
         );
     }
 }
+
+/// Opt-in import-timing diagnostic against a real Figma export: how long the
+/// container read + Kiwi decode and the scene mapping each take, with the
+/// sizes that drive them. Run with:
+///   FANTA_FIG_FIXTURE=/path/to/file.fig \
+///     cargo test -p fanta-fig-interop import_timing -- --ignored --nocapture
+#[test]
+#[ignore = "requires FANTA_FIG_FIXTURE pointing at a real .fig"]
+fn import_timing_diagnostic() {
+    let Ok(path) = std::env::var("FANTA_FIG_FIXTURE") else {
+        eprintln!("FANTA_FIG_FIXTURE not set; skipping");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("read fixture");
+
+    let started = std::time::Instant::now();
+    let doc = read_fig(&bytes).expect("real .fig must parse");
+    let read_elapsed = started.elapsed();
+    let node_changes = doc
+        .root
+        .get("nodeChanges")
+        .and_then(KiwiValue::as_array)
+        .map_or(0, <[KiwiValue]>::len);
+    let blob_bytes: usize = doc.blobs.iter().map(Vec::len).sum();
+
+    let started = std::time::Instant::now();
+    let (mapped, report, assets) = crate::mapping::fig_to_doc(&doc).expect("map to doc");
+    let map_elapsed = started.elapsed();
+
+    eprintln!(
+        "import timing for {path}: {} bytes on disk, {node_changes} node changes, \
+         {} blobs ({blob_bytes} bytes), {} images",
+        bytes.len(),
+        doc.blobs.len(),
+        doc.images.len(),
+    );
+    eprintln!("  read_fig   {read_elapsed:?}");
+    eprintln!(
+        "  fig_to_doc {map_elapsed:?} -> {} scene nodes ({} mapped, {} skipped, \
+         {} instance children dropped), {} instances, {} components, {} assets",
+        mapped.scene.len(),
+        report.mapped,
+        report.skipped(),
+        report.instance_children_dropped,
+        report.instances,
+        report.components,
+        assets.len(),
+    );
+}
