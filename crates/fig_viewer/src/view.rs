@@ -2175,19 +2175,13 @@ impl FigView {
         {
             edit.session.dragging = false;
         }
-        // Primary releases are normally handled by the window-level listener
-        // the canvas installs while a drag is live — but that listener only
-        // exists after the paint FOLLOWING the press. A fast click can
-        // release before that paint, which would strand `primary_pressed`
-        // and turn every later hover move into a drag. Both paths funnel
-        // through `handle_window_mouse_up`, which no-ops once the flag is
-        // cleared, so a release never dispatches twice.
+        // The canvas and window listeners share an idempotent release path:
+        // whichever runs first ends the gesture, so it never dispatches twice.
         self.handle_window_mouse_up(event, cx);
     }
 
-    /// Window-level fallback installed by the canvas while a primary drag is
-    /// in flight: element listeners stop firing once the cursor leaves the
-    /// canvas, which would strand the tool mid-gesture.
+    /// Element listeners stop firing once the cursor leaves the canvas, so
+    /// the window listener must also be able to end an active gesture.
     pub(crate) fn handle_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if event.button != MouseButton::Left {
             return;
@@ -2235,10 +2229,8 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Self-heal the gesture flag. The window-level release listener only
-        // exists while a TOOL drag is live, so a release outside the canvas
-        // during a text-selection or comment gesture is never delivered; a
-        // hover move with no button held proves the pointer came up.
+        // A hover with no button held also recovers a release missed while
+        // the window was inactive.
         if event.pressed_button.is_none() {
             self.canvas_pointer_down = false;
         }
@@ -2613,10 +2605,17 @@ impl FigView {
     fn delete_selection(
         &mut self,
         _: &DeleteSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.delete_selected_nodes(cx);
+        if matches!(self.tools.kind(), ToolKind::NodeEdit | ToolKind::PathSelect) {
+            if self.is_editable(cx) {
+                self.finish_document_edits(cx);
+                self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
+            }
+        } else {
+            self.delete_selected_nodes(cx);
+        }
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {

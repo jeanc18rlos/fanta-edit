@@ -1809,7 +1809,6 @@ impl IntoElement for CanvasElement {
 /// gestures currently in flight.
 pub(crate) struct DragListeners {
     panning: bool,
-    primary_drag: bool,
 }
 
 impl Element for CanvasElement {
@@ -1857,10 +1856,7 @@ impl Element for CanvasElement {
             self.view.update(cx, |this, _| {
                 this.set_container_bounds(bounds);
             });
-            return Some(DragListeners {
-                panning: false,
-                primary_drag: false,
-            });
+            return Some(DragListeners { panning: false });
         }
         let logical_size = bounds_size(bounds);
         let (viewport, drag_listeners) = {
@@ -1899,7 +1895,6 @@ impl Element for CanvasElement {
                 viewport,
                 DragListeners {
                     panning: view.is_panning(),
-                    primary_drag: view.primary_pressed(),
                 },
             )
         };
@@ -1963,31 +1958,30 @@ impl Element for CanvasElement {
             });
         }
 
-        // While a primary drag is live, window-level listeners own the
-        // move/release stream: element listeners stop firing once the cursor
-        // leaves the canvas, which would strand the tool mid-gesture.
-        if listeners.primary_drag {
-            let view = self.view.downgrade();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && let Some(view) = view.upgrade()
-                {
-                    view.update(cx, |this, cx| {
-                        this.handle_window_mouse_move(event, cx);
-                    });
-                }
-            });
-            let view = self.view.downgrade();
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && let Some(view) = view.upgrade()
-                {
-                    view.update(cx, |this, cx| {
-                        this.handle_window_mouse_up(event, cx);
-                    });
-                }
-            });
-        }
+        // A press, move and release can arrive before the next paint. Install
+        // these ahead of the press and consult live gesture state, including
+        // when the pointer has left the canvas.
+        let view = self.view.downgrade();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble
+                && let Some(view) = view.upgrade()
+                && view.read(cx).primary_pressed()
+            {
+                view.update(cx, |this, cx| {
+                    this.handle_window_mouse_move(event, cx);
+                });
+            }
+        });
+        let view = self.view.downgrade();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble
+                && let Some(view) = view.upgrade()
+            {
+                view.update(cx, |this, cx| {
+                    this.handle_window_mouse_up(event, cx);
+                });
+            }
+        });
 
         let scale_factor = window.scale_factor();
         // The GPU frame is rendered with a margin beyond the element so
