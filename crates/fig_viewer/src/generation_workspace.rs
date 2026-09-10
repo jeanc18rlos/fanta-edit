@@ -29,6 +29,9 @@ const MAX_VECTOR_SVG_BYTES: usize = 128 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
 const PREVIEW_SIZE: u32 = 1200;
 const HISTORY_LIMIT: usize = 12;
+// Generation submissions can run for 120 seconds before returning a job.
+const API_TIMEOUT: Duration = Duration::from_secs(125);
+const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 actions!(
     fanta,
@@ -490,7 +493,8 @@ impl GenerationWorkspace {
         let request_id = uuid::Uuid::new_v4();
         self.catalog_request = Some(request_id);
         self.catalog_task = Some(cx.spawn(async move |this, cx| {
-            let result = fetch_catalog(&client, &base_url, Some(&account)).await;
+            let result =
+                fetch_catalog(&client, &base_url, Some(&account), cx.background_executor()).await;
             this.update(cx, |this, cx| {
                 if this.catalog_request != Some(request_id) {
                     return;
@@ -732,13 +736,7 @@ impl GenerationWorkspace {
         self.error = None;
         self.status = "Creating vector artwork…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
-            let request = api_json(&client, &base_url, Method::POST, "/v1/messages", Some(request), None, account.as_deref());
-            let deadline = cx.background_executor().timer(Duration::from_secs(125));
-            futures::pin_mut!(request, deadline);
-            let response = match futures::future::select(request, deadline).await {
-                futures::future::Either::Left((result, _)) => result,
-                futures::future::Either::Right(_) => Err(anyhow!("The vector request timed out.")),
-            };
+            let response = api_json(&client, &base_url, Method::POST, "/v1/messages", Some(request), None, account.as_deref(), cx.background_executor()).await;
             let result = response.and_then(|response| parse_vector_message(&response));
             this.update(cx, |this, cx| {
                 this.task = None;
@@ -800,6 +798,7 @@ impl GenerationWorkspace {
                 Some(request),
                 Some(&key),
                 account.as_deref(),
+                cx.background_executor(),
             )
             .await
             .and_then(|value| {
@@ -877,6 +876,7 @@ impl GenerationWorkspace {
                 None,
                 None,
                 account.as_deref(),
+                cx.background_executor(),
             )
             .await
             .and_then(|value| {
@@ -953,6 +953,7 @@ impl GenerationWorkspace {
                 None,
                 None,
                 account.as_deref(),
+                cx.background_executor(),
             )
             .await
             .and_then(|value| {
@@ -1052,7 +1053,8 @@ impl GenerationWorkspace {
         let client = self.client.clone();
         self.preview_task = Some(cx.spawn(async move |this, cx| {
             let result = async {
-                let bytes = media_bytes(&client, &output.location).await?;
+                let bytes =
+                    media_bytes(&client, &output.location, cx.background_executor()).await?;
                 cx.background_spawn(async move { make_preview(&bytes, &output.mime) })
                     .await
             }
@@ -1119,7 +1121,16 @@ impl GenerationWorkspace {
                     this.status = "Uploading source image…".into();
                     cx.notify();
                 })?;
-                let asset = upload_image(&client, &base_url, bytes, &name, mime, &preview).await?;
+                let asset = upload_image(
+                    &client,
+                    &base_url,
+                    bytes,
+                    &name,
+                    mime,
+                    &preview,
+                    cx.background_executor(),
+                )
+                .await?;
                 Ok(Some(SourceImage {
                     reference: json!({"asset_id": asset}),
                     name,
@@ -1193,6 +1204,7 @@ impl GenerationWorkspace {
                     "Canvas reference.png",
                     "image/png",
                     &preview,
+                    cx.background_executor(),
                 )
                 .await?;
                 Ok::<_, anyhow::Error>(SourceImage {
@@ -1263,7 +1275,8 @@ impl GenerationWorkspace {
             let base_url = self.base_url.clone();
             self.task = Some(cx.spawn(async move |this, cx| {
                 let result = async {
-                    let bytes = media_bytes(&client, &output.location).await?;
+                    let bytes =
+                        media_bytes(&client, &output.location, cx.background_executor()).await?;
                     let asset = upload_image(
                         &client,
                         &base_url,
@@ -1271,6 +1284,7 @@ impl GenerationWorkspace {
                         "Generated source",
                         &output.mime,
                         &preview,
+                        cx.background_executor(),
                     )
                     .await?;
                     Ok::<_, anyhow::Error>(SourceImage {
@@ -1329,15 +1343,15 @@ impl GenerationWorkspace {
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
                 let location = if let Some(id) = source.reference["asset_id"].as_str() {
-                    let asset = api_json(&client, &base_url, Method::GET, &format!("/v1/assets/{id}"), None, None, account.as_deref()).await?;
+                    let asset = api_json(&client, &base_url, Method::GET, &format!("/v1/assets/{id}"), None, None, account.as_deref(), cx.background_executor()).await?;
                     MediaLocation::Url(asset["url"].as_str().context("The source image is no longer available.")?.to_owned())
                 } else if let Some(id) = source.reference["generation_id"].as_str() {
-                    let generation = api_json(&client, &base_url, Method::GET, &format!("/v1/generations/{id}"), None, None, account.as_deref()).await?;
+                    let generation = api_json(&client, &base_url, Method::GET, &format!("/v1/generations/{id}"), None, None, account.as_deref(), cx.background_executor()).await?;
                     let outputs: Vec<Value> = serde_json::from_value(generation["output"].clone())?;
                     normalize_outputs(&outputs)?.into_iter().next().context("The original image is unavailable.")?.location
                 } else { bail!("The original source image is unavailable."); };
-                let image = media_bytes(&client, &location).await?;
-                let mask = media_bytes(&client, &output.location).await?;
+                let image = media_bytes(&client, &location, cx.background_executor()).await?;
+                let mask = media_bytes(&client, &output.location, cx.background_executor()).await?;
                 cx.background_spawn(async move { cutout_image(&image, &mask) }).await
             }.await;
             this.update(cx, |this, cx| {
@@ -1381,7 +1395,8 @@ impl GenerationWorkspace {
                 let Some(path) = path.await?? else {
                     return Ok(false);
                 };
-                let bytes = media_bytes(&client, &output.location).await?;
+                let bytes =
+                    media_bytes(&client, &output.location, cx.background_executor()).await?;
                 cx.background_spawn(async move {
                     std::fs::write(path, bytes).context("The result could not be saved")
                 })
@@ -1392,7 +1407,10 @@ impl GenerationWorkspace {
             this.update(cx, |this, cx| {
                 this.task = None;
                 match result {
-                    Ok(true) => this.status = "Result saved.".into(),
+                    Ok(true) => {
+                        this.error = None;
+                        this.status = "Result saved.".into();
+                    }
                     Ok(false) => {}
                     Err(error) => this.fail(error, cx),
                 }
@@ -1413,7 +1431,8 @@ impl GenerationWorkspace {
         let client = self.client.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
-                let bytes = media_bytes(&client, &output.location).await?;
+                let bytes =
+                    media_bytes(&client, &output.location, cx.background_executor()).await?;
                 cx.background_spawn(async move {
                     generation_media::mp4_metadata(&bytes)?;
                     let file = tempfile::Builder::new()
@@ -1430,6 +1449,7 @@ impl GenerationWorkspace {
                 this.task = None;
                 match result {
                     Ok(file) => {
+                        this.error = None;
                         cx.open_with_system(&file);
                         this.playback_file = Some(file);
                         this.status = "Opened in your video player.".into();
@@ -1462,7 +1482,7 @@ impl GenerationWorkspace {
         let run = self.active_run.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
-                let bytes = media_bytes(&client, &output.location).await?;
+                let bytes = media_bytes(&client, &output.location, cx.background_executor()).await?;
                 let media = cx.background_spawn(async move {
                     if output.mime == "image/svg+xml" {
                         Ok::<_, anyhow::Error>(PreparedPlacement::Vector(generation_media::parse_svg(&bytes)?))
@@ -1509,7 +1529,7 @@ impl GenerationWorkspace {
             }.await;
             this.update(cx, |this, cx| {
                 this.task = None;
-                match result { Ok(()) => this.status = "Added to your design. Save the design to keep it.".into(), Err(error) => this.fail(error, cx) }
+                match result { Ok(()) => { this.error = None; this.status = "Added to your design. Save the design to keep it.".into(); }, Err(error) => this.fail(error, cx) }
                 cx.notify();
             }).log_err();
         }));
@@ -2171,6 +2191,7 @@ async fn fetch_catalog(
     client: &Arc<Client>,
     base_url: &str,
     expected_account: Option<&str>,
+    executor: &gpui::BackgroundExecutor,
 ) -> Result<Vec<GenerationModel>> {
     let value = api_json(
         client,
@@ -2180,6 +2201,7 @@ async fn fetch_catalog(
         None,
         None,
         expected_account,
+        executor,
     )
     .await?;
     serde_json::from_value(value["models"].clone()).context("The model catalog could not be read")
@@ -2193,6 +2215,7 @@ async fn api_json(
     body: Option<Value>,
     idempotency_key: Option<&str>,
     expected_account: Option<&str>,
+    executor: &gpui::BackgroundExecutor,
 ) -> Result<Value> {
     let mut request = Request::builder()
         .method(method)
@@ -2213,18 +2236,28 @@ async fn api_json(
     } else {
         AsyncBody::empty()
     };
-    let response = client
-        .http_client()
-        .send(request.body(body)?)
-        .await
-        .context("Could not reach Fanta. Check your connection and try again.")?;
-    let status = response.status();
+    let request = request.body(body)?;
     let limit = if path == "/v1/messages" {
         MAX_VECTOR_RESPONSE_BYTES
     } else {
         MAX_JSON_BYTES
     };
-    let bytes = bounded_body(response.into_body(), limit).await?;
+    let (status, bytes) = network_deadline(
+        executor,
+        API_TIMEOUT,
+        "The Fanta request timed out. Check your connection and try again.",
+        async {
+            let response = client
+                .http_client()
+                .send(request)
+                .await
+                .context("Could not reach Fanta. Check your connection and try again.")?;
+            let status = response.status();
+            let bytes = bounded_body(response.into_body(), limit).await?;
+            Ok((status, bytes))
+        },
+    )
+    .await?;
     ensure!(
         client.account_access_token().as_deref() == expected_account,
         "Your Fanta account changed. Start a new experiment."
@@ -2272,23 +2305,49 @@ async fn bounded_body(body: AsyncBody, limit: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn media_bytes(client: &Arc<Client>, location: &MediaLocation) -> Result<Arc<[u8]>> {
+async fn network_deadline<T>(
+    executor: &gpui::BackgroundExecutor,
+    timeout: Duration,
+    message: &'static str,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let deadline = executor.timer(timeout);
+    futures::pin_mut!(operation, deadline);
+    match futures::future::select(operation, deadline).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(_) => Err(anyhow!(message)),
+    }
+}
+
+async fn media_bytes(
+    client: &Arc<Client>,
+    location: &MediaLocation,
+    executor: &gpui::BackgroundExecutor,
+) -> Result<Arc<[u8]>> {
     match location {
         MediaLocation::Inline(bytes) => Ok(bytes.clone()),
         MediaLocation::Url(url) => {
             let url = url::Url::parse(url)?;
             ensure!(url.scheme() == "https", "The result URL must use HTTPS.");
-            let response = client
-                .http_client()
-                .get(url.as_str(), AsyncBody::empty(), true)
-                .await?;
-            ensure!(
-                response.status().is_success(),
-                "This result link expired. Select the experiment again to refresh it."
-            );
-            Ok(bounded_body(response.into_body(), MAX_MEDIA_BYTES)
-                .await?
-                .into())
+            network_deadline(
+                executor,
+                MEDIA_TRANSFER_TIMEOUT,
+                "The result download timed out. Try again, or select the experiment to refresh its link.",
+                async {
+                    let response = client
+                        .http_client()
+                        .get(url.as_str(), AsyncBody::empty(), true)
+                        .await?;
+                    ensure!(
+                        response.status().is_success(),
+                        "This result link expired. Select the experiment again to refresh it."
+                    );
+                    Ok(bounded_body(response.into_body(), MAX_MEDIA_BYTES)
+                        .await?
+                        .into())
+                },
+            )
+            .await
         }
     }
 }
@@ -2300,6 +2359,7 @@ async fn upload_image(
     name: &str,
     mime: &str,
     preview: &Preview,
+    executor: &gpui::BackgroundExecutor,
 ) -> Result<String> {
     let account = client.account_access_token();
     let hash = format!("{:x}", Sha256::digest(&bytes));
@@ -2314,6 +2374,7 @@ async fn upload_image(
         })),
         None,
         account.as_deref(),
+        executor,
     )
     .await?;
     if value["reused"].as_bool() == Some(true) {
@@ -2338,11 +2399,21 @@ async fn upload_image(
         .uri(url)
         .header("Content-Type", mime)
         .body(AsyncBody::from(bytes))?;
-    let response = client.http_client().send(request).await?;
-    ensure!(
-        response.status().is_success(),
-        "The image upload failed. Choose the image again to retry."
-    );
+    network_deadline(
+        executor,
+        MEDIA_TRANSFER_TIMEOUT,
+        "The image upload timed out. Choose the image again to retry.",
+        async {
+            let response = client.http_client().send(request).await?;
+            ensure!(
+                response.status().is_success(),
+                "The image upload failed. Choose the image again to retry."
+            );
+            bounded_body(response.into_body(), MAX_JSON_BYTES).await?;
+            Ok(())
+        },
+    )
+    .await?;
     api_json(
         client,
         base_url,
@@ -2351,6 +2422,7 @@ async fn upload_image(
         Some(json!({})),
         None,
         account.as_deref(),
+        executor,
     )
     .await?;
     Ok(id.to_owned())
@@ -2696,6 +2768,14 @@ mod tests {
             panic!("Rendering a signed-out workspace must not submit requests")
         });
         let client = catalog_client(cx, http);
+        visual_workspace_with_client(mode, client, cx)
+    }
+
+    fn visual_workspace_with_client(
+        mode: GenerationMode,
+        client: Arc<Client>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<GenerationWorkspace>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -2885,6 +2965,7 @@ mod tests {
             &client,
             "https://api.fantaisa.net",
             client.account_access_token().as_deref(),
+            &cx.executor(),
         )
         .await
         .expect("authenticated model catalog");
@@ -2902,7 +2983,7 @@ mod tests {
             panic!("A signed-out catalog must not make an unauthorized network request")
         });
         let client = catalog_client(cx, http);
-        let error = fetch_catalog(&client, "https://api.fantaisa.net", None)
+        let error = fetch_catalog(&client, "https://api.fantaisa.net", None, &cx.executor())
             .await
             .err()
             .expect("sign-in required");
@@ -2931,13 +3012,322 @@ mod tests {
         let client = catalog_client(cx, http);
         sign_in_catalog_client(&client, cx).await;
         let account = client.account_access_token();
-        let request = fetch_catalog(&client, "https://api.fantaisa.net", account.as_deref());
+        let executor = cx.executor();
+        let request = fetch_catalog(
+            &client,
+            "https://api.fantaisa.net",
+            account.as_deref(),
+            &executor,
+        );
         futures::pin_mut!(request);
         assert!(futures::poll!(&mut request).is_pending());
         client.sign_out(&cx.to_async()).await;
         response_sender.send(()).expect("release response");
         let error = request.await.err().expect("discard old account response");
         assert!(error.to_string().contains("account changed"));
+    }
+
+    struct PendingBody;
+
+    impl futures::AsyncRead for PendingBody {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buffer: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    async fn stalled_response(stall_body: bool) -> Result<http_client::Response<AsyncBody>> {
+        if stall_body {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(AsyncBody::from_reader(
+                    futures::io::Cursor::new(b"partial response".to_vec()).chain(PendingBody),
+                ))?)
+        } else {
+            futures::future::pending().await
+        }
+    }
+
+    async fn assert_submission_timeout_recovers(stall_body: bool, cx: &mut gpui::TestAppContext) {
+        let submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let submissions = submissions.clone();
+            move |request| {
+                let submissions = submissions.clone();
+                async move {
+                    if request.uri().path() == "/v1/models" {
+                        return Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(r#"{"models":[]}"#.into())?);
+                    }
+                    assert_eq!(request.method(), Method::POST);
+                    assert_eq!(request.uri().path(), "/v1/generations");
+                    let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                    let body: Value = serde_json::from_slice(
+                        &bounded_body(request.into_body(), MAX_JSON_BYTES).await?,
+                    )?;
+                    let first_submission = {
+                        let mut submissions = submissions.lock().expect("submission log");
+                        submissions.push((key, body));
+                        submissions.len() == 1
+                    };
+                    if first_submission {
+                        return stalled_response(stall_body).await;
+                    }
+                    Ok(http_client::Response::builder().status(200).body(
+                        json!({
+                            "id":"accepted-before-timeout", "status":"succeeded",
+                            "output":[{"url":"https://media.example/result.mp4", "mime":"video/mp4"}],
+                            "billed_credits":1,
+                        })
+                        .to_string()
+                        .into(),
+                    )?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, cx);
+        let request = json!({"model":"fanta-video-1", "prompt":"A sunrise"});
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "original-submission-key".into(),
+                    request: request.clone(),
+                    model: "fanta-video-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account: account.clone(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(API_TIMEOUT - Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.task.is_some()));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        let retry = view.read_with(cx, |view, _| {
+            assert!(view.task.is_none(), "the timeout must unlock recovery");
+            assert!(
+                view.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("timed out"))
+            );
+            assert!(view.history.is_empty());
+            view.unresolved_submission
+                .clone()
+                .expect("retain the uncertain submission")
+        });
+        assert_eq!(retry.key, "original-submission-key");
+        assert_eq!(retry.request, request);
+        assert_eq!(retry.account, account);
+        view.update(cx, |view, cx| view.submit(retry, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.unresolved_submission.is_none());
+            assert!(view.error.is_none());
+            assert_eq!(view.history.len(), 1);
+            assert_eq!(view.outputs.len(), 1);
+            assert_eq!(
+                view.active_run.as_ref().and_then(RunSummary::generation_id),
+                Some("accepted-before-timeout")
+            );
+        });
+        let submissions = submissions.lock().expect("submission log");
+        assert_eq!(submissions.len(), 2);
+        assert_eq!(
+            submissions[0], submissions[1],
+            "retry must preserve the key and body"
+        );
+    }
+
+    #[gpui::test]
+    async fn generation_submission_header_timeout_preserves_same_key_retry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_submission_timeout_recovers(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_submission_body_timeout_preserves_same_key_retry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_submission_timeout_recovers(true, cx).await;
+    }
+
+    async fn assert_download_timeout_preserves_result(
+        stall_body: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let downloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let downloads = downloads.clone();
+            move |request| {
+                let downloads = downloads.clone();
+                async move {
+                    if request.uri().path() == "/v1/models" {
+                        return Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(r#"{"models":[]}"#.into())?);
+                    }
+                    assert_eq!(request.uri().path(), "/result.mp4");
+                    assert!(request.headers().get("Authorization").is_none());
+                    if downloads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return stalled_response(stall_body).await;
+                    }
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body("saved media bytes".into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, cx);
+        let directory = tempfile::tempdir().expect("output directory");
+        let path = directory.path().join("result.mp4");
+        std::fs::write(&path, "existing output").expect("existing output file");
+        view.update(cx, |view, cx| {
+            let run = RunSummary {
+                result: RunResult::Generation {
+                    id: "download-job".into(),
+                },
+                model: "fanta-video-1".into(),
+                prompt: "A sunrise".into(),
+                source: None,
+            };
+            view.active_run = Some(run.clone());
+            view.history = vec![run];
+            view.outputs = vec![MediaOutput {
+                label: "Video".into(),
+                mime: "video/mp4".into(),
+                location: MediaLocation::Url("https://media.example/result.mp4".into()),
+                mask: false,
+            }];
+            view.save_output(cx);
+        });
+        assert!(cx.did_prompt_for_new_path());
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        cx.run_until_parked();
+        cx.executor().advance_clock(MEDIA_TRANSFER_TIMEOUT);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(
+                view.error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("download timed out"))
+            );
+            assert_eq!(
+                view.active_run.as_ref().and_then(RunSummary::generation_id),
+                Some("download-job")
+            );
+            assert_eq!(view.history.len(), 1);
+            assert_eq!(view.outputs.len(), 1);
+        });
+        assert_eq!(
+            std::fs::read(&path).expect("untouched file"),
+            b"existing output"
+        );
+        view.update(cx, |view, cx| view.save_output(cx));
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(path).expect("saved file"),
+            b"saved media bytes"
+        );
+        assert_eq!(downloads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(view.read_with(cx, |view, _| view.task.is_none()
+            && view.error.is_none()
+            && view.status == "Result saved."));
+    }
+
+    #[gpui::test]
+    async fn generation_download_header_timeout_preserves_save_retry(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_download_timeout_preserves_result(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_download_body_timeout_preserves_save_retry(cx: &mut gpui::TestAppContext) {
+        assert_download_timeout_preserves_result(true, cx).await;
+    }
+
+    async fn assert_upload_timeout_does_not_complete(
+        stall_body: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            move |request| {
+                requests
+                    .lock()
+                    .expect("request log")
+                    .push(request.uri().path().to_owned());
+                async move {
+                    match request.uri().path() {
+                        "/v1/assets/uploads" => Ok(http_client::Response::builder().status(200).body(
+                            r#"{"asset_id":"pending-upload","upload_url":"https://media.example/upload"}"#.into(),
+                        )?),
+                        "/upload" => {
+                            assert_eq!(request.method(), Method::PUT);
+                            assert!(request.headers().get("Authorization").is_none());
+                            stalled_response(stall_body).await
+                        }
+                        path => panic!("An unconfirmed upload must not be completed: {path}"),
+                    }
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("source image");
+        let preview = make_preview(png.get_ref(), "image/png").expect("preview");
+        let executor = cx.executor();
+        let upload = upload_image(
+            &client,
+            "https://api.fantaisa.net",
+            png.into_inner(),
+            "source.png",
+            "image/png",
+            &preview,
+            &executor,
+        );
+        futures::pin_mut!(upload);
+        assert!(futures::poll!(&mut upload).is_pending());
+        executor.advance_clock(MEDIA_TRANSFER_TIMEOUT);
+        let error = upload.await.err().expect("stalled upload must time out");
+        assert!(error.to_string().contains("upload timed out"));
+        assert_eq!(
+            *requests.lock().expect("request log"),
+            ["/v1/assets/uploads", "/upload"]
+        );
+    }
+
+    #[gpui::test]
+    async fn generation_upload_header_timeout_does_not_complete_asset(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_upload_timeout_does_not_complete(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_upload_body_timeout_does_not_complete_asset(cx: &mut gpui::TestAppContext) {
+        assert_upload_timeout_does_not_complete(true, cx).await;
     }
 
     fn model(kind: &str) -> GenerationModel {
