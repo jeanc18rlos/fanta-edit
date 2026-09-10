@@ -124,6 +124,36 @@ pub fn open_external_prompt_for_review(
     Ok(())
 }
 
+/// Reveals the Agent Panel's current draft and opens its existing Add Context
+/// menu. The toolbar can hand control to the Agent composer without creating a
+/// second attachment store or sending anything on the user's behalf.
+pub fn open_agent_add_context_menu(
+    workspace: Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    if workspace.read(cx).root_paths(cx).is_empty() {
+        return Err(anyhow::anyhow!(
+            "the Agent Panel needs an open project before it can attach context"
+        ));
+    }
+    let panel = workspace
+        .read(cx)
+        .panel::<AgentPanel>(cx)
+        .ok_or_else(|| anyhow::anyhow!("the Agent Panel is not available in this workspace"))?;
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.reveal_panel::<AgentPanel>(window, cx);
+    });
+    panel.update(cx, |panel, cx| {
+        panel.activate_draft_and_open_add_context_menu(window, cx)
+    })?;
+    workspace.update(cx, |workspace, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    Ok(())
+}
+
 pub(crate) fn resolve_agent_image(
     dest_url: &str,
     worktree_roots: &[PathBuf],

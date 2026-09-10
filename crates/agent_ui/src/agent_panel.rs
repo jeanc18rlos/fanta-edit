@@ -73,7 +73,7 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Anchor, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem,
-    Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
+    Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, Pixels,
     PlatformDisplay, Subscription, Task, TaskExt, WeakEntity, WindowHandle, prelude::*,
     pulsating_between,
 };
@@ -1177,6 +1177,7 @@ pub struct AgentPanel {
     _base_view_observation: Option<Subscription>,
     _draft_editor_observation: Option<Subscription>,
     _active_draft_reclaim_observation: Option<Subscription>,
+    _pending_add_context_menu_subscription: Option<Subscription>,
     _thread_metadata_store_subscription: Subscription,
     last_context_source: Option<AgentContextSource>,
 
@@ -1570,6 +1571,7 @@ impl AgentPanel {
             _base_view_observation: None,
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
+            _pending_add_context_menu_subscription: None,
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
@@ -2957,6 +2959,99 @@ impl AgentPanel {
         );
     }
 
+    pub(crate) fn activate_draft_and_open_add_context_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self._pending_add_context_menu_subscription = None;
+        self.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        let conversation_view = self
+            .active_conversation_view()
+            .cloned()
+            .ok_or_else(|| anyhow!("the Agent draft could not be created"))?;
+
+        if self.schedule_open_add_context_menu(&conversation_view, window, cx) {
+            return Ok(());
+        }
+
+        self._pending_add_context_menu_subscription = Some(cx.subscribe_in(
+            &conversation_view,
+            window,
+            move |this, conversation_view, _event: &RootThreadUpdated, window, cx| {
+                let is_still_active = this.is_active
+                    && this
+                        .active_conversation_view()
+                        .is_some_and(|active| active.entity_id() == conversation_view.entity_id());
+                if !is_still_active {
+                    this._pending_add_context_menu_subscription = None;
+                    return;
+                }
+                if this.schedule_open_add_context_menu(&conversation_view, window, cx) {
+                    this._pending_add_context_menu_subscription = None;
+                }
+            },
+        ));
+
+        Ok(())
+    }
+
+    fn schedule_open_add_context_menu(
+        &self,
+        conversation_view: &Entity<ConversationView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(thread_view) = conversation_view.read(cx).root_thread_view() else {
+            return false;
+        };
+        let panel = cx.weak_entity();
+        let conversation_view_id = conversation_view.entity_id();
+        // Next-frame callbacks run before that frame is drawn. Waiting twice
+        // lets the newly revealed ThreadView initialize its popover handle.
+        window.on_next_frame(move |window, _cx| {
+            window.on_next_frame(move |window, cx| {
+                Self::show_add_context_menu_if_current(
+                    &panel,
+                    conversation_view_id,
+                    &thread_view,
+                    window,
+                    cx,
+                );
+            });
+        });
+        true
+    }
+
+    fn show_add_context_menu_if_current(
+        panel: &WeakEntity<Self>,
+        conversation_view_id: EntityId,
+        thread_view: &Entity<ThreadView>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let is_still_active = panel
+            .read_with(cx, |panel, _cx| {
+                panel.is_active
+                    && panel
+                        .active_conversation_view()
+                        .is_some_and(|active| active.entity_id() == conversation_view_id)
+            })
+            .unwrap_or(false);
+        if !is_still_active {
+            return;
+        }
+
+        let thread_view = thread_view.read(cx);
+        if thread_view.add_context_menu_handle.is_deployed() {
+            return;
+        }
+        let focus_handle = thread_view.focus_handle(cx);
+        let menu_handle = thread_view.add_context_menu_handle.clone();
+        focus_handle.focus(window, cx);
+        menu_handle.show(window, cx);
+    }
+
     fn ensure_draft(
         &mut self,
         source: AgentThreadSource,
@@ -4209,6 +4304,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self._pending_add_context_menu_subscription = None;
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -4999,6 +5095,8 @@ impl Panel for AgentPanel {
         self.is_active = active;
         if active {
             self.ensure_thread_initialized(window, cx);
+        } else {
+            self._pending_add_context_menu_subscription = None;
         }
     }
 
@@ -12848,6 +12946,124 @@ mod tests {
                 assert!(thread_view.thread.read(cx).entries().is_empty());
             });
         });
+    }
+
+    #[gpui::test]
+    async fn test_attachment_route_reveals_a_draft_and_opens_add_context_menu(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+
+        cx.update(|window, cx| {
+            crate::open_agent_add_context_menu(workspace.clone(), window, cx)
+                .expect("attachment context should route to the registered panel");
+        });
+        cx.run_until_parked();
+        let draft_thread_id = panel.read_with(&cx, |panel, cx| {
+            panel
+                .active_thread_id(cx)
+                .expect("attachment route should activate a draft")
+        });
+        let (conversation_view_id, thread_view) = panel.read_with(&cx, |panel, cx| {
+            let conversation_view = panel
+                .active_conversation_view()
+                .expect("attachment route should activate a conversation");
+            let thread_view = conversation_view
+                .read(cx)
+                .root_thread_view()
+                .expect("attachment route should initialize the draft thread");
+            (conversation_view.entity_id(), thread_view)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            AgentPanel::show_add_context_menu_if_current(
+                &panel.downgrade(),
+                conversation_view_id,
+                &thread_view,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel._pending_add_context_menu_subscription.is_none());
+            assert_eq!(panel.active_thread_id(cx), Some(draft_thread_id));
+            let thread_view = panel
+                .active_thread_view(cx)
+                .expect("attachment route should activate a draft");
+            thread_view.read_with(cx, |thread_view, cx| {
+                assert!(thread_view.add_context_menu_handle.is_deployed());
+                assert!(thread_view.message_editor.read(cx).text(cx).is_empty());
+                assert!(thread_view.thread.read(cx).entries().is_empty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pending_attachment_menu_does_not_open_after_agent_panel_closes(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+
+        cx.update(|window, cx| {
+            crate::open_agent_add_context_menu(workspace.clone(), window, cx)
+                .expect("attachment context should route to the registered panel");
+        });
+        cx.run_until_parked();
+        let (conversation_view, thread_view) = panel.read_with(&cx, |panel, cx| {
+            let conversation_view = panel
+                .active_conversation_view()
+                .cloned()
+                .expect("attachment route should activate a conversation");
+            let thread_view = conversation_view
+                .read(cx)
+                .root_thread_view()
+                .expect("attachment route should initialize the draft thread");
+            (conversation_view, thread_view)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.close_panel::<AgentPanel>(window, cx);
+            });
+        });
+        let focus_after_close = cx.update(|window, cx| window.focused(cx));
+
+        conversation_view.update(&mut cx, |_, cx| cx.emit(RootThreadUpdated));
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            AgentPanel::show_add_context_menu_if_current(
+                &panel.downgrade(),
+                conversation_view.entity_id(),
+                &thread_view,
+                window,
+                cx,
+            );
+        });
+
+        assert!(!cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+        assert!(panel.read_with(&cx, |panel, _| {
+            !panel.is_active && panel._pending_add_context_menu_subscription.is_none()
+        }));
+        assert!(!thread_view.read_with(&cx, |thread_view, _| {
+            thread_view.add_context_menu_handle.is_deployed()
+        }));
+        assert_eq!(
+            cx.update(|window, cx| window.focused(cx)),
+            focus_after_close
+        );
     }
 
     /// Reproduces the retained-thread reset race:

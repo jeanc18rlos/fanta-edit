@@ -9401,7 +9401,7 @@ impl FigView {
                 self.route_toolbar_agent_prompt(prompt.as_ref(), window, cx);
             }
             ToolbarAction::AgentAttachmentRequested => {
-                notify_unavailable("Attaching a file to the Agent from the toolbar", window, cx)
+                self.open_toolbar_agent_attachment(window, cx)
             }
             ToolbarAction::AgentVoiceInputRequested => {
                 notify_unavailable("Voice input", window, cx)
@@ -9467,6 +9467,30 @@ impl FigView {
             log::error!("routing the toolbar Agent prompt failed: {error:#}");
             show_canvas_notice(
                 format!("The Agent prompt could not be opened: {error:#}"),
+                window,
+                cx,
+            );
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn open_toolbar_agent_attachment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = window
+            .root::<MultiWorkspace>()
+            .flatten()
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone());
+        let Some(workspace) = workspace else {
+            show_canvas_notice(
+                "This window has no workspace for the Agent Panel.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+        if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
+            log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
+            show_canvas_notice(
+                format!("The Agent attachment workflow could not be opened: {error:#}"),
                 window,
                 cx,
             );
