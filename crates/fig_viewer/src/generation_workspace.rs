@@ -1,4 +1,4 @@
-use std::{io::Cursor, path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::Cell, io::Cursor, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -464,6 +464,14 @@ struct GenerationWorkspace {
     selected_output: usize,
     preview: Option<Preview>,
     prepared_video: Option<Arc<generation_media::PreparedVideo>>,
+    #[cfg(target_os = "macos")]
+    playback: Option<Entity<crate::video_playback::VideoPlaybackView>>,
+    #[cfg(all(test, target_os = "macos"))]
+    playback_factory: Option<
+        Box<dyn Fn(Arc<[u8]>, &mut App) -> Entity<crate::video_playback::VideoPlaybackView>>,
+    >,
+    playback_active: bool,
+    playback_removed: Cell<bool>,
     preview_request: Option<uuid::Uuid>,
     history: Vec<RunSummary>,
     active_run: Option<RunSummary>,
@@ -595,6 +603,12 @@ impl GenerationWorkspace {
             selected_output: 0,
             preview: None,
             prepared_video: None,
+            #[cfg(target_os = "macos")]
+            playback: None,
+            #[cfg(all(test, target_os = "macos"))]
+            playback_factory: None,
+            playback_active: true,
+            playback_removed: Cell::new(false),
             preview_request: None,
             history: Vec::new(),
             active_run: None,
@@ -629,6 +643,7 @@ impl GenerationWorkspace {
         self.task = None;
         self.preview_task = None;
         self.prepared_video = None;
+        self.clear_playback(cx);
         self.preview_request = None;
         self.unresolved_submission = None;
         self.recovered_submissions.clear();
@@ -983,6 +998,7 @@ impl GenerationWorkspace {
         self.preview = None;
         self.preview_task = None;
         self.prepared_video = None;
+        self.clear_playback(cx);
         self.preview_request = None;
         self.active_run = None;
         self.error = None;
@@ -1131,6 +1147,7 @@ impl GenerationWorkspace {
                         this.preview = None;
                         this.preview_task = None;
                         this.prepared_video = None;
+                        this.clear_playback(cx);
                         this.preview_request = None;
                         this.accept_response(&response, cx);
                         true
@@ -1313,6 +1330,7 @@ impl GenerationWorkspace {
         self.preview = None;
         self.preview_task = None;
         self.prepared_video = None;
+        self.clear_playback(cx);
         self.preview_request = None;
         self.pending = false;
         self.active_run = Some(run.clone());
@@ -1447,10 +1465,51 @@ impl GenerationWorkspace {
         cx.notify();
     }
 
+    fn restore_video_playback(&mut self, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.clear_playback(_cx);
+            let Some(video) = self.prepared_video.as_ref() else {
+                return;
+            };
+            let bytes = video.bytes.clone();
+            #[cfg(test)]
+            let injected = self
+                .playback_factory
+                .as_ref()
+                .map(|factory| factory(bytes.clone(), _cx));
+            #[cfg(not(test))]
+            let injected: Option<Entity<crate::video_playback::VideoPlaybackView>> = None;
+            let playback = injected.unwrap_or_else(|| {
+                _cx.new(|cx| crate::video_playback::VideoPlaybackView::new(bytes, PREVIEW_SIZE, cx))
+            });
+            playback.update(_cx, |playback, cx| {
+                playback.set_active(self.playback_active, cx)
+            });
+            self.playback = Some(playback);
+        }
+    }
+
+    fn clear_playback(&mut self, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if let Some(playback) = self.playback.take() {
+            playback.update(_cx, |playback, cx| playback.close(cx));
+        }
+    }
+
+    fn set_playback_active(&mut self, active: bool, _cx: &mut Context<Self>) {
+        self.playback_active = active;
+        #[cfg(target_os = "macos")]
+        if let Some(playback) = self.playback.as_ref() {
+            playback.update(_cx, |playback, cx| playback.set_active(active, cx));
+        }
+    }
+
     fn load_preview(&mut self, cx: &mut Context<Self>) {
         self.preview = None;
         self.preview_task = None;
         self.prepared_video = None;
+        self.clear_playback(cx);
         self.preview_request = None;
         let Some(output) = self.outputs.get(self.selected_output).cloned() else {
             return;
@@ -1495,7 +1554,7 @@ impl GenerationWorkspace {
                     this.sync_account(cx);
                     return;
                 }
-                if this.preview_request != Some(request) {
+                if this.preview_request != Some(request) || this.playback_removed.get() {
                     return;
                 }
                 this.preview_task = None;
@@ -1504,6 +1563,7 @@ impl GenerationWorkspace {
                     Ok((preview, video)) => {
                         this.preview = preview;
                         this.prepared_video = video;
+                        this.restore_video_playback(cx);
                     }
                     Err(error) => {
                         this.error = Some(
@@ -1876,6 +1936,7 @@ impl GenerationWorkspace {
         }));
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn play_output(&mut self, cx: &mut Context<Self>) {
         self.sync_account(cx);
         if self.task.is_some() {
@@ -2298,6 +2359,12 @@ impl GenerationWorkspace {
             output.mime.starts_with("image/") && output.mime != "image/svg+xml" && !output.mask
         });
         let is_mask = output.as_ref().is_some_and(|output| output.mask);
+        #[cfg(target_os = "macos")]
+        let inline_playback = self.playback.clone();
+        #[cfg(not(target_os = "macos"))]
+        let has_inline_playback = false;
+        #[cfg(target_os = "macos")]
+        let has_inline_playback = inline_playback.is_some();
         v_flex()
             .flex_1()
             .min_w(px(280.))
@@ -2333,14 +2400,21 @@ impl GenerationWorkspace {
                     .items_center()
                     .justify_center()
                     .overflow_hidden()
-                    .when_some(self.preview.clone(), |element, preview| {
+                    .when_some(self.preview.clone().filter(|_| !has_inline_playback), |element, preview| {
                         element.child(
                             img(preview.image)
                                 .size_full()
                                 .object_fit(ObjectFit::Contain),
                         )
                     })
-                    .when(self.preview.is_none(), |element| {
+                    .map(|element| {
+                        #[cfg(target_os = "macos")]
+                        let element = element.when_some(inline_playback, |element, playback| {
+                            element.child(div().size_full().p_2().child(playback))
+                        });
+                        element
+                    })
+                    .when(self.preview.is_none() && !has_inline_playback, |element| {
                         element.child(
                             Label::new(if self.preview_task.is_some() {
                                 "Loading preview…"
@@ -2380,9 +2454,13 @@ impl GenerationWorkspace {
                                     .disabled(self.task.is_some())
                                     .on_click(cx.listener(|this, _, _, cx| this.save_output(cx))),
                             )
-                            .when(output.as_ref().is_some_and(|output| output.mime.starts_with("video/")), |element| element.child(
-                                Button::new("play-generation", "Play video").disabled(self.task.is_some())
-                                    .on_click(cx.listener(|this, _, _, cx| this.play_output(cx)))))
+                            .map(|element| {
+                                #[cfg(not(target_os = "macos"))]
+                                let element = element.when(output.as_ref().is_some_and(|output| output.mime.starts_with("video/")), |element| element.child(
+                                    Button::new("play-generation", "Play video").disabled(self.task.is_some())
+                                        .on_click(cx.listener(|this, _, _, cx| this.play_output(cx)))));
+                                element
+                            })
                             .when(is_mask, |element| element.child(
                                 Button::new("remove-generated-background", "Remove background").disabled(self.task.is_some())
                                     .on_click(cx.listener(|this, _, _, cx| this.remove_background(cx)))))
@@ -2442,6 +2520,7 @@ impl GenerationWorkspace {
 impl Render for GenerationWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_account(cx);
+        self.set_playback_active(true, cx);
         let signed_in = self.client.account_access_token().is_some();
         let is_design = self.mode == GenerationMode::Design;
         let prompt_vectors =
@@ -2570,6 +2649,24 @@ impl Focusable for GenerationWorkspace {
 }
 impl Item for GenerationWorkspace {
     type Event = ItemEvent;
+    fn added_to_workspace(&mut self, _: &mut Workspace, _: &mut Window, _cx: &mut Context<Self>) {
+        if self.playback_removed.replace(false) {
+            self.restore_video_playback(_cx);
+        }
+    }
+    fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_playback_active(false, cx);
+    }
+    fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_playback_active(false, cx);
+    }
+    fn on_removed(&self, _cx: &mut Context<Self>) {
+        self.playback_removed.set(true);
+        #[cfg(target_os = "macos")]
+        if let Some(playback) = self.playback.as_ref() {
+            playback.update(_cx, |playback, cx| playback.close(cx));
+        }
+    }
     fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
         let label = if self.mode == GenerationMode::Vector {
             self.vector_operation.label()
@@ -4688,6 +4785,196 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         assert_submission_timeout_recovers(true, cx).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn generation_inline_video_result_change_and_removal_close_retained_player(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = visual_workspace(GenerationMode::Video, cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        for remove_item in [false, true] {
+            let player = view.update(cx, |view, cx| {
+                let player = crate::video_playback::fake_playback(cx);
+                view.playback = Some(player.clone());
+                cx.notify();
+                player
+            });
+            cx.run_until_parked();
+            let revision = player.read_with(cx, |player, _| player.frame_revision());
+            assert!(player.read_with(cx, |player, _| player.frame().is_some()));
+            view.update(cx, |view, cx| {
+                if remove_item {
+                    Item::on_removed(view, cx);
+                } else {
+                    view.outputs.clear();
+                    view.load_preview(cx);
+                }
+            });
+            cx.run_until_parked();
+            player.read_with(cx, |player, _| {
+                assert!(
+                    player.frame().is_none(),
+                    "an old rendered entity must release video pixels immediately"
+                );
+                assert!(player.frame_revision() > revision);
+                assert_eq!(
+                    player.status().state,
+                    media::video::VideoPlaybackState::Paused
+                );
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn generation_inline_video_readded_tab_recreates_player_from_cached_bytes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = visual_workspace(GenerationMode::Video, cx);
+        let project = project::Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let workspace =
+            cx.update(|window, cx| cx.new(|cx| Workspace::test_new(project, window, cx)));
+        let expected: Arc<[u8]> = Arc::from(&b"already downloaded video bytes"[..]);
+        let creations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let original_item_id = view.entity_id();
+        view.update(cx, |view, cx| {
+            view.prepared_video = Some(Arc::new(generation_media::PreparedVideo {
+                bytes: expected.clone(),
+                metadata: generation_media::VideoMetadata {
+                    width: 320,
+                    height: 180,
+                    duration_us: 10_000_000,
+                },
+                poster: None,
+            }));
+            let expected = expected.clone();
+            let creations = creations.clone();
+            view.playback_factory = Some(Box::new(move |bytes, cx| {
+                assert!(
+                    Arc::ptr_eq(&bytes, &expected),
+                    "reuse the exact cached bytes without downloading"
+                );
+                creations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::video_playback::fake_playback(cx)
+            }));
+            view.restore_video_playback(cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let original = view.read_with(cx, |view, _| view.playback.clone().expect("first player"));
+        assert!(original.read_with(cx, |player, _| player.frame().is_some()));
+        view.update_in(cx, |view, window, cx| {
+            Item::deactivated(view, window, cx);
+            Item::on_removed(view, cx);
+        });
+        assert!(original.read_with(cx, |player, _| player.frame().is_none()));
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                view.update(cx, |view, cx| {
+                    Item::added_to_workspace(view, workspace, window, cx);
+                    cx.notify();
+                });
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(view.entity_id(), original_item_id);
+        assert_eq!(creations.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let replacement = view.read_with(cx, |view, _| {
+            view.playback.clone().expect("replacement player")
+        });
+        assert_ne!(replacement.entity_id(), original.entity_id());
+        replacement.update_in(cx, |player, window, cx| {
+            player.play(cx);
+            player.tick(window, cx);
+        });
+        assert_eq!(
+            replacement.read_with(cx, |player, _| player.status().state),
+            media::video::VideoPlaybackState::Playing
+        );
+        assert!(replacement.read_with(cx, |player, _| player.frame().is_some()));
+        assert!(Arc::ptr_eq(
+            &view.read_with(cx, |view, _| view
+                .prepared_video
+                .as_ref()
+                .expect("cache")
+                .bytes
+                .clone()),
+            &expected
+        ));
+        view.update(cx, |view, cx| view.clear_playback(cx));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn generation_inline_video_signout_closes_retained_player(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|request| async move {
+            let body = match request.uri().path() {
+                "/v1/models" => json!({"models":[]}),
+                "/v1/me" => recovery_account_fixture(),
+                route => panic!("inline player must not download again: {route}"),
+            };
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(body.to_string().into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client.clone(), cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let player = view.update(cx, |view, cx| {
+            let player = crate::video_playback::fake_playback(cx);
+            view.playback = Some(player.clone());
+            cx.notify();
+            player
+        });
+        cx.run_until_parked();
+        assert!(player.read_with(cx, |player, _| player.frame().is_some()));
+        client.sign_out(&cx.to_async()).await;
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.playback.is_none()));
+        assert!(player.read_with(cx, |player, _| player.frame().is_none()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn generation_inline_video_tab_and_workspace_deactivation_pause(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Video, cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let player = view.update(cx, |view, cx| {
+            let player = crate::video_playback::fake_playback(cx);
+            view.playback = Some(player.clone());
+            cx.notify();
+            player
+        });
+        cx.run_until_parked();
+        for workspace in [false, true] {
+            view.update(cx, |view, cx| view.set_playback_active(true, cx));
+            player.update_in(cx, |player, window, cx| {
+                player.play(cx);
+                player.tick(window, cx);
+            });
+            assert_eq!(
+                player.read_with(cx, |player, _| player.status().state),
+                media::video::VideoPlaybackState::Playing
+            );
+            view.update_in(cx, |view, window, cx| {
+                if workspace {
+                    Item::workspace_deactivated(view, window, cx);
+                } else {
+                    Item::deactivated(view, window, cx);
+                }
+            });
+            assert_eq!(
+                player.read_with(cx, |player, _| player.status().state),
+                media::video::VideoPlaybackState::Paused
+            );
+        }
+        view.update(cx, |view, cx| view.clear_playback(cx));
     }
 
     #[gpui::test]

@@ -126,13 +126,15 @@ pub struct SvgRenderOutput {
 /// playhead + played/remaining split today, with the video progress bar (and,
 /// later, the 3D orbit angle) riding the same channel. Absent for headless /
 /// golden renders, so those are unaffected.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MediaPlayback {
     /// Playback position in `0.0..=1.0`.
     pub progress: f32,
     /// The video frame to show at this position (a filmstrip asset id), or
     /// `None` for audio / a paused video (which shows its poster).
     pub frame: Option<fanta_doc::AssetId>,
+    /// Borrowed GPU textures must remain alive until this frame finishes rendering.
+    pub decoded_frame: Option<skia_safe::Image>,
 }
 
 pub struct RenderInputs<'a> {

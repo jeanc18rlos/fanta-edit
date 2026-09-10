@@ -49,8 +49,8 @@ jobs:
       - name: Test canvas editing tools
         run: cargo test --locked -p fanta-tools --lib
 
-      - name: Test imported and edited vector clipping
-        run: cargo test --locked -p fanta-render --lib viewport
+      - name: Test canvas rendering, clipping, effects and live video
+        run: cargo test --locked -p fanta-render --lib
 
       - name: Test Git sync without a system installation
         run: cargo test --locked -p git --lib bundled_git_

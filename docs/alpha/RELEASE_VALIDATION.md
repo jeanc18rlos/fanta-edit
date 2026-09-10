@@ -6,12 +6,32 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 
 | Area | Current status |
 | --- | --- |
-| Backend and AI | Existing production runtime is deployed; default Sonnet streaming, credit metering, catalog access and key revocation passed. Reviewed video URL fix `0d3753a` passes 449 backend/78 worker tests but is not deployed. Final native sign-in/persistence and production media remain unverified. |
+| Backend and AI | Video URL fix `0d3753a` is live, with 449 backend/78 worker tests and candidate/production public checks passed. Earlier Sonnet streaming, credit metering, catalog access and key revocation passed. Matching-R2 video worker rollout, final native sign-in/persistence and real production media remain unverified. |
 | Customer payments | Not enabled. Resolve product/pricing/currency/credit allowances, configure Polar, and verify checkout and subscription lifecycle before charging customers. |
 | Editor | Creation/editing, Save As, reopening, Git commit/push, Scale, curve viewport and Undo/Redo checks have native evidence. Local durable recovery passed two full restarts, with exact SVG/image bytes and no automatic generation or status requests. Hosted-installer verification remains open. Text on Path is unfinished. |
 | Leads | PostHog US access recovered. The live waitlist stores contacts and attribution correctly. Exclude the synthetic QA signup; no outreach or conversion improvement is claimed. |
 | Distribution | Both checks at published recovery head `02a32f6` passed by 06:09 UTC; its installer was pending behind the running `12ad6d3` installer. The earlier `eca2b86` installer passed with notarization skipped. Apple notarization and clean-Mac validation remain open. |
-| Housekeeping | Latest check: only user app 21997/helper 22010, zero Cargo/zombies, 60.88 GiB free; the idle video QA app and fixture are closed. Daily 04:00 Europe/Madrid checks clean Cargo on idle Sundays, below 40 GiB, or after a deferred request becomes safe. Earlier cleanup recovered about 49.24 GiB. |
+| Housekeeping | Latest check at 08:32 UTC: only user app 21997/helper 22010, zero Cargo/zombies, 56.52 GiB free; the idle video QA app and fixture are closed. Daily 04:00 Europe/Madrid checks clean Cargo on idle Sundays, below 40 GiB, or after a deferred request becomes safe. Earlier cleanup recovered about 49.24 GiB. |
+
+## Backend video URL deployment — September 10
+
+At **08:13:26 UTC**, `api.fantaisa.net` resolved to deployment
+`dpl_CVnuDoWotpCv8v7SG3UyXrbzwvhQ`, exact source
+`0d3753aa70f152b62cd3963045f53da8ec74cdbb`. It replaced
+`dpl_12FMtF55tpV1pJnyr93nx4pPz6BS` (`830f702`). The tracked-only candidate
+was READY before promotion; nine public candidate checks and three generation/
+workflow authentication-boundary checks passed. The nine public checks passed
+again on the production domain at **08:13:40 UTC**.
+
+The health response was `ok` with an empty family list. This verifies the
+public service contract, not live GPU capacity. Source verification passed
+449 backend tests, 78 CPU worker tests, type checking and
+[backend CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34450548076).
+No migration, seed, pricing, environment or secret change was required, and
+these checks made no inference or payment requests. Older URL-only worker
+responses remain compatible. Fresh video links still require the matching-R2
+`videogen` worker rollout; historical URL-only results are not repaired.
+Evidence: `/tmp/fanta-release-qa-20260909/video-url-validation/production/DEPLOYMENT.md`.
 
 ## GitHub and local checks
 
@@ -1281,13 +1301,12 @@ closed. Counters recorded one sign-in callback, zero profile/catalog reads,
 and zero generation POSTs, status reads or media deliveries. Consequently,
 **native poster visuals, video Save/Play/Place and video-project save/reopen
 remain unverified for this build**. The separate native playback engine was
-subsequently validated as described below; it is not yet connected to the
-generation controls or canvas.
+subsequently validated as described below; controls/canvas work followed later.
 
-Backend video URL fix `0d3753a` is reviewed and passes **449 backend tests in
-44 files**, **78 CPU-only worker tests**, and type checking, but is **not
-deployed**. Its renewal behavior requires both backend and `videogen` rollout
-with matching R2 configuration. Historical URL-only results remain unchanged;
+At that earlier checkpoint, backend video URL fix `0d3753a` had passed
+**449 backend tests in 44 files**, **78 CPU-only worker tests**, and type
+checking. It has since been deployed and publicly verified as recorded above.
+Its renewal behavior still requires the `videogen` rollout with matching R2. Historical URL-only results remain unchanged;
 results first completed without backend R2 receive no later library-asset
 backfill. These tests do not prove live GPU/storage execution.
 
@@ -1328,19 +1347,80 @@ Boolean compilation error was also corrected; both failure logs are retained.
 
 Root and independent ownership/ABI reviews found no blocking issue. License,
 Rust formatting, diff and workflow syntax checks passed. GitHub checks include
-both native suites. This engine is not yet connected to the generation controls
-or canvas: inline UI, seeking controls, canvas composition, audible playback,
-sustained resource measurements and final app/installer checks remain pending.
+both native suites. At that checkpoint the engine was not yet connected to
+generation controls or the canvas. The integration and subsequent CI finding
+are recorded below; audible playback, sustained resource measurements and
+final app/installer checks remain pending.
 No production media request or payment was made. Evidence:
 `/tmp/fanta-release-qa-20260909/video-playback-validation/verification.json`.
+
+## Inline video controls and canvas rendering — September 10
+
+Generated video previews now use a shared native player with Play/Pause,
+seeking, time and mute controls. A selected full-length, normal-speed video
+layer uses those controls and draws decoded frames through the existing scene
+renderer. Clipping, transforms, layer order and effects remain in that path;
+existing volatile-video behavior preserves caching for unrelated static layers.
+Unsupported authored trim/speed settings show an explicit message.
+
+The GPU path retains the input pixel buffer, CoreVideo texture and borrowed
+Skia image through the synchronous flush. The CPU fallback copies validated
+padded BGRA rows into owned pixels. Frame/session keys change rendered pixels
+without copying or editing the document every frame. Replacing the selection,
+source or document closes the old player. Tab/window inactivity pauses it;
+removal releases it even if the prior rendered entity is retained. Moving a
+tab recreates playback rather than reusing a permanently closed player.
+Generation previews reuse their already downloaded bytes and preserve the
+account/result guards. Preparation/loading/seek deadlines remain finite.
+
+All **626 editor tests passed** on the combined source. **15 playback-control
+GPUI cases** and **two canvas-lifecycle GPUI cases** passed **20 scheduler
+iterations each**. The renderer suite passed **254 tests, one ignored**, with
+new pixel tests for live frames under transformed clips, foreground layers
+and effects. The padded-buffer test verifies owned pixels after the original
+buffer is released. A local project with three exact MP4 fixtures passed
+parser/save/reopen and a zero-write second save; it has not yet been opened
+in the rebuilt native app. These local checks include the protected user-staged
+changes; the isolated source awaits fresh GitHub checks.
+
+The first combined compilation needed an explicit mouse-event type. The next
+suite exposed a fixture-only cleanup assertion: GPUI queues destruction until
+an App update flushes it, while an idle scheduler pump alone need not do so.
+The correction drops the last handle within that update and preserves the
+exact release-count assertion; fixture assertions no longer poison held
+mutexes. The source project fixture also initially assumed a sized page root;
+its corrected expectation follows the existing unsized/unclipped page invariant,
+while preserving the nested clipping assertions. All initial logs remain.
+
+GitHub [PR checks at `a984699`](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34451427646)
+failed when a rapid seek exposed a 2.7-second frame after a 1.5-second target;
+the sibling push check passed. Eleven local runs of the expanded native cases
+did not reproduce that intermittent native failure. The correction queries
+the explicit latest seek target until its first frame, uses item time while
+paused, and retains host-time synchronization during ordinary playback.
+A future frame beyond the target is not published. Two deterministic tests
+cover the stale-clock choice and publication guard without assuming a fixed
+frame duration. Earlier presentation timestamps can be valid long samples;
+this is not a general variable-frame-rate corruption detector.
+
+The media library passes **nine tests**; all **six real native playback cases**
+passed **ten consecutive runs** after the correction. The app and CLI compile
+check passed. A new slow-frame control initially assumed the encoded sample's
+starting timestamp; AVVideoComposition legitimately returned the requested
+display timestamp instead. That test now verifies the known containing sample
+interval, no future frame, and the same expected pixels. Existing rapid-seek
+assertions were not relaxed. Fresh GitHub verification remains pending.
+Native app visuals, audible playback, sustained decoder/GPU memory measurements,
+production generation and the final signed/notarized installer remain open.
+Evidence: `/tmp/fanta-release-qa-20260909/inline-video-validation/`.
 
 ## Remaining release requirements
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
-| Backend and AI Gateway | Runtime `830f702` is live as `dpl_12FMtF55tpV1pJnyr93nx4pPz6BS`, with 438 tests in 44 files, 60 focused tests, type checking and source CI (`34441329043`) passing. Migration `0019_generation_request_hash` was applied at 05:45:37 UTC and independently verified at 05:49:25 UTC (exact 19→20 history and nullable text column, no seed or customer-row reads). Nine candidate and nine live public checks passed without inference; direct alias verification confirms `api.fantaisa.net` serves this deployment. Atomic submission/body binding now joins the earlier terminal completion/billing, account selection, access/revocation and mock-model guards. The 06:09:09 UTC production API rejection check passed device sign-in, two 400/unreserved responses, unchanged 387 credits and key revocation followed by 401; it used no inference or native app. Earlier unauthenticated chat returned 401 and billing preflight returned 204. Browser-confirmed device API sign-in, catalogs, default Sonnet streaming, one-credit debit and key revocation passed previously in production. Repeat through the final native installer; Keychain persistence and native account-error handling remain unverified. |
+| Backend and AI Gateway | Runtime `0d3753a` is live as `dpl_CVnuDoWotpCv8v7SG3UyXrbzwvhQ`; its candidate/live checks and remaining worker limits are recorded above. Earlier runtime `830f702` passed 438 tests in 44 files, 60 focused tests, type checking and source CI (`34441329043`) passing. Migration `0019_generation_request_hash` was applied at 05:45:37 UTC and independently verified at 05:49:25 UTC (exact 19→20 history and nullable text column, no seed or customer-row reads). Nine candidate and nine live public checks passed without inference; direct alias verification confirms `api.fantaisa.net` serves this deployment. Atomic submission/body binding now joins the earlier terminal completion/billing, account selection, access/revocation and mock-model guards. The 06:09:09 UTC production API rejection check passed device sign-in, two 400/unreserved responses, unchanged 387 credits and key revocation followed by 401; it used no inference or native app. Earlier unauthenticated chat returned 401 and billing preflight returned 204. Browser-confirmed device API sign-in, catalogs, default Sonnet streaming, one-credit debit and key revocation passed previously in production. Repeat through the final native installer; Keychain persistence and native account-error handling remain unverified. |
 | Charge customers | The billing page still displays an explicit checkout-not-configured notice and no purchase or manage buttons. The latest API/dashboard check shows Pro/Owner and 387 credits after two one-credit AI verification requests. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
-| Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. The durable-recovery implementation described above passes all 596 viewer tests and persists generation state across reopening. Its `be2b282` native build passed in 4m46s, and both hosted checks at `02a32f6` passed. Local native full-restart QA passed at 06:20:39 UTC: no automatic generation/status/Messages requests, GET-only accepted-job recovery, exact uncertain-request replay and exact SVG/PNG bytes. The hosted installer and production GPU/Keychain remain unverified. The earlier `12ad6d3` has only tab-lifetime recovery. Runtime `110868d` adds video posters and account-safe result completion; the six native decoder tests and 606 editor tests pass as described above. Its 7m11s native build passed, but sign-in stalled in Keychain before poster Save/Play/Place/reopen checks; native app/installer QA remains pending. That build uses the system player. The separate native playback engine passes seven library and five real playback cases; generation-control/canvas integration and planned video editing remain unfinished. |
+| Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. The durable-recovery implementation described above passes all 596 viewer tests and persists generation state across reopening. Its `be2b282` native build passed in 4m46s, and both hosted checks at `02a32f6` passed. Local native full-restart QA passed at 06:20:39 UTC: no automatic generation/status/Messages requests, GET-only accepted-job recovery, exact uncertain-request replay and exact SVG/PNG bytes. The hosted installer and production GPU/Keychain remain unverified. The earlier `12ad6d3` has only tab-lifetime recovery. Runtime `110868d` adds video posters and account-safe result completion; the six native decoder tests and 606 editor tests pass as described above. Its 7m11s native build passed, but sign-in stalled in Keychain before poster Save/Play/Place/reopen checks; native app/installer QA remains pending. That build uses the system player. The subsequent inline generation controls and selected-video canvas rendering pass the automated checks above. Native UI/installer validation, audible playback, sustained resource measurements and planned video editing remain unfinished. |
 | Additional canvas tools | Path Selection, proportional Scale, and the K shortcut are implemented. The combined `ca56b0a` native candidate passed fast input, anchor editing, Scale/strokes, Undo/Redo, and save/reopen, but exposed viewport clipping. The `dcf27d6` viewport revision passed 337 document tests with one ignored, 280 tools, 6 viewport renders, and 24 toolbar adapters; both viewport GPUI pixel/reopen cases passed 20 iterations each. Its native build passed in 6m42s; viewport overflow, save/reopen, and K passed. Undo exposed stale editing handles. The `849685f` read-only overlay correction now passes 280 tools, 26 toolbar adapters, and both new GPUI cases across 20 iterations each. Its 4m36s build passed native immediate Undo/Redo handle alignment and save/reopen. Both `9ff7a77` hosted checks pass; exact-installer verification remains pending. Text on Path remains a placeholder. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
 | Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. The later `5d3826d` native build passed page rename/Code path, move/Undo/Redo, K and explicit Save/reopen with all 15 saved-file hashes unchanged. Hosted checks through published `12ad6d3` pass, including the save batch; exact-installer verification remains pending. |

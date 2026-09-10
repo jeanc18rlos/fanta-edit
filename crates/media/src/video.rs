@@ -378,6 +378,7 @@ pub struct VideoPlayback {
     prepared: PreparedVideoPlayback,
     seek_completion: Arc<Mutex<Option<bool>>>,
     pending_seek: Option<u64>,
+    awaiting_seek_frame: Option<u64>,
     seeking: bool,
     requested_play: bool,
     _thread_confined: PhantomData<Rc<()>>,
@@ -466,6 +467,7 @@ impl VideoPlayback {
                 prepared,
                 seek_completion: Arc::new(Mutex::new(None)),
                 pending_seek: None,
+                awaiting_seek_frame: None,
                 seeking: false,
                 requested_play: false,
                 _thread_confined: PhantomData,
@@ -572,7 +574,7 @@ impl VideoPlayback {
             host_time.is_finite() && host_time >= 0.,
             "The video display timestamp is invalid."
         );
-        self.status()?;
+        let status = self.status()?;
         if self.seeking {
             return Ok(VideoFrameUpdate::Unchanged);
         }
@@ -581,7 +583,11 @@ impl VideoPlayback {
                 .output
                 .as_ref()
                 .context("The video player was closed.")?;
-            let requested: NativeTime = msg_send![**output, itemTimeForHostTime:host_time];
+            let requested = playback_frame_request_time(
+                self.awaiting_seek_frame,
+                status,
+                || msg_send![**output, itemTimeForHostTime:host_time],
+            );
             if requested.flags & 1 == 0 {
                 return Ok(VideoFrameUpdate::Unchanged);
             }
@@ -606,6 +612,9 @@ impl VideoPlayback {
                 presentation_time_us <= self.prepared.info.duration_us,
                 "The video player returned an invalid frame time."
             );
+            if !accept_seek_frame(&mut self.awaiting_seek_frame, presentation_time_us) {
+                return Ok(VideoFrameUpdate::Unchanged);
+            }
             Ok(VideoFrameUpdate::Frame(VideoPlaybackFrame {
                 buffer,
                 presentation_time_us,
@@ -662,6 +671,7 @@ impl VideoPlayback {
                 let _: () = msg_send![player, seekToTime:time toleranceBefore:NativeTime::ZERO toleranceAfter:NativeTime::ZERO completionHandler:&*callback];
                 Ok::<_, anyhow::Error>(())
             })?;
+            self.awaiting_seek_frame = Some(target);
             self.seeking = true;
         } else if completed && self.requested_play {
             autoreleasepool(|| unsafe {
@@ -671,6 +681,41 @@ impl VideoPlayback {
         }
         Ok(())
     }
+}
+
+fn playback_frame_request_time(
+    seek_target: Option<u64>,
+    status: VideoPlaybackStatus,
+    host_time: impl FnOnce() -> NativeTime,
+) -> NativeTime {
+    // Seek completion can precede the output's host-time mapping update. Keep
+    // querying the requested item time until its first frame arrives; a paused
+    // player likewise has no advancing display clock to synchronize against.
+    let explicit_time = seek_target.or_else(|| {
+        (status.state != VideoPlaybackState::Playing).then_some(status.current_time_us)
+    });
+    match explicit_time {
+        Some(time_us) => NativeTime {
+            value: time_us as i64,
+            timescale: 1_000_000,
+            flags: 1,
+            epoch: 0,
+        },
+        None => host_time(),
+    }
+}
+
+fn accept_seek_frame(seek_target: &mut Option<u64>, presentation_time_us: u64) -> bool {
+    if let Some(target) = *seek_target
+        && presentation_time_us > target.saturating_add(1)
+    {
+        // A future frame cannot display at the requested position. Keep waiting
+        // under the caller's seek deadline. Older PTS may belong to a valid long
+        // VFR sample, so nominal FPS must not be used as a lower-bound tolerance.
+        return false;
+    }
+    *seek_target = None;
+    true
 }
 
 impl Drop for VideoPlayback {
@@ -1220,6 +1265,86 @@ mod tests {
     const ROTATE_270: &[u8] = include_bytes!("../test_fixtures/quadrants-rotate-270.mp4");
     const MIRRORED: &[u8] = include_bytes!("../test_fixtures/quadrants-mirrored.mp4");
     const CORRUPT: &[u8] = include_bytes!("../test_fixtures/quadrants-corrupt.mp4");
+
+    #[test]
+    fn video_playback_seek_queries_item_time_before_obsolete_host_mapping() -> Result<()> {
+        let host_queries = std::cell::Cell::new(0);
+        let host_time = || {
+            host_queries.set(host_queries.get() + 1);
+            NativeTime {
+                value: 2_700_000,
+                timescale: 1_000_000,
+                flags: 1,
+                epoch: 0,
+            }
+        };
+        let mut status = VideoPlaybackStatus {
+            state: VideoPlaybackState::Playing,
+            current_time_us: 1_510_000,
+            duration_us: 3_000_000,
+        };
+        let mut seek_target = Some(1_500_000);
+        let requested = playback_frame_request_time(seek_target, status, &host_time);
+        assert_eq!(time_us(requested)?, 1_500_000);
+        assert_eq!(
+            host_queries.get(),
+            0,
+            "seek must not query the obsolete host clock"
+        );
+        assert!(!accept_seek_frame(&mut seek_target, 2_700_000));
+        assert_eq!(
+            seek_target,
+            Some(1_500_000),
+            "obsolete output must not finish the seek frame wait"
+        );
+        assert_eq!(
+            time_us(playback_frame_request_time(seek_target, status, &host_time))?,
+            1_500_000
+        );
+        assert!(accept_seek_frame(&mut seek_target, 1_500_000));
+        assert_eq!(seek_target, None);
+        assert_eq!(
+            time_us(playback_frame_request_time(seek_target, status, &host_time))?,
+            2_700_000
+        );
+        assert_eq!(
+            host_queries.get(),
+            1,
+            "ordinary playback uses the display clock"
+        );
+        status.state = VideoPlaybackState::Paused;
+        status.current_time_us = 1_520_000;
+        assert_eq!(
+            time_us(playback_frame_request_time(seek_target, status, &host_time))?,
+            1_520_000
+        );
+        assert_eq!(
+            host_queries.get(),
+            1,
+            "paused output uses the settled item clock"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_playback_seek_frame_gate_preserves_variable_sample_timing() {
+        let mut seek_target = Some(200_000);
+        assert!(!accept_seek_frame(&mut seek_target, 2_700_000));
+        assert!(!accept_seek_frame(&mut seek_target, 1_300_000));
+        assert_eq!(seek_target, Some(200_000));
+        assert!(accept_seek_frame(&mut seek_target, 200_000));
+        assert_eq!(seek_target, None);
+        // A four-FPS or variable-duration source sample can begin much earlier
+        // than a seek within that sample. Rejecting it at 40 ms would hang.
+        seek_target = Some(249_999);
+        assert!(accept_seek_frame(&mut seek_target, 0));
+        assert_eq!(seek_target, None);
+        seek_target = Some(33_333);
+        assert!(accept_seek_frame(&mut seek_target, 33_334));
+        seek_target = Some(33_333);
+        assert!(!accept_seek_frame(&mut seek_target, 33_335));
+        assert_eq!(seek_target, Some(33_333));
+    }
 
     #[test]
     fn video_playback_geometry_rejects_unbounded_or_nonorthogonal_sources() -> Result<()> {

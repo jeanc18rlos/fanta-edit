@@ -18,6 +18,8 @@ mod export;
 mod generation_journal;
 mod generation_workspace;
 mod generation_media;
+#[cfg(target_os = "macos")]
+mod video_playback;
 #[cfg(feature = "fanta-gpui-ui")]
 mod gpui_adapters;
 mod inspector_components;

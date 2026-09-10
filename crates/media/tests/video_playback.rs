@@ -216,11 +216,17 @@ mod native {
             || Ok(player.status()?.state == VideoPlaybackState::Paused),
             "latest seek",
         )?;
+        let settled = player.status()?;
+        ensure!(
+            settled.current_time_us.abs_diff(200_000) < 40_000,
+            "Latest seek did not settle at its target: {settled:?}"
+        );
         let frame = frame(&mut player)?;
         ensure!(
             frame.presentation_time_us.abs_diff(200_000) < 40_000,
-            "Obsolete seek won: {}",
-            frame.presentation_time_us
+            "Obsolete seek won: {} after player settled at {}",
+            frame.presentation_time_us,
+            settled.current_time_us
         );
         near(colors(&frame)?[0], [255, 0, 0])?;
         player.play()?;
@@ -235,6 +241,71 @@ mod native {
             time.abs_diff(1_500_000) < 40_000,
             "Pause lost seek position"
         );
+        Ok(())
+    }
+
+    fn queued_obsolete_frames_never_escape_a_completed_seek() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        for (obsolete, intermediate, latest, expected) in [
+            (2_700_000, 1_300_000, 200_000, [255, 0, 0]),
+            (200_000, 2_700_000, 1_500_000, [0, 255, 255]),
+            (1_500_000, 200_000, 2_500_000, [255, 0, 255]),
+            (2_500_000, 1_500_000, 0, [255, 0, 0]),
+        ] {
+            player.seek(obsolete)?;
+            wait(
+                || Ok(player.status()?.state == VideoPlaybackState::Paused),
+                "obsolete seek completed without consuming its output",
+            )?;
+            let old_time = player.status()?.current_time_us;
+            ensure!(
+                old_time.abs_diff(obsolete) < 40_000,
+                "Obsolete-position precondition failed: {old_time} vs {obsolete}"
+            );
+            // Allow native output delivery while leaving its old frame unread.
+            // The next seek must not expose it as its first completed frame.
+            tick();
+            player.seek(intermediate)?;
+            player.seek(latest)?;
+            wait(
+                || Ok(player.status()?.state == VideoPlaybackState::Paused),
+                "coalesced latest seek after unread output",
+            )?;
+            let settled = player.status()?;
+            ensure!(
+                settled.current_time_us.abs_diff(latest) < 40_000,
+                "Coalesced seek clock lost latest target {latest}: {settled:?}"
+            );
+            let first = frame(&mut player)?;
+            ensure!(
+                first.presentation_time_us.abs_diff(latest) < 40_000,
+                "First published frame {} is obsolete after {obsolete} -> {intermediate} -> {latest}; player settled at {}",
+                first.presentation_time_us,
+                settled.current_time_us
+            );
+            near(colors(&first)?[0], expected)?;
+        }
+        let mut player = self::player(QUADRANTS, 128)?;
+        for (target, sample_start, sample_end, expected) in [
+            (125_000, 0, 250_000, [255, 0, 0]),
+            (875_000, 750_000, 1_000_000, [0, 255, 255]),
+        ] {
+            player.seek(target)?;
+            wait(
+                || Ok(player.status()?.state == VideoPlaybackState::Paused),
+                "seek inside a low-frame-rate sample",
+            )?;
+            let first = frame(&mut player)?;
+            // The compositor may retime a source sample to the requested display
+            // position. Its pixels must still belong to the containing sample.
+            ensure!(
+                (sample_start..sample_end).contains(&first.presentation_time_us)
+                    && first.presentation_time_us <= target + 1,
+                "Seek returned display PTS {} outside sample [{sample_start}, {sample_end}) or after target {target}",
+                first.presentation_time_us
+            );
+            near(colors(&first)?[0], expected)?;
+        }
         Ok(())
     }
 
@@ -336,6 +407,10 @@ mod native {
             (
                 "rapid_seek_keeps_only_the_latest_target",
                 rapid_seek_keeps_only_the_latest_target,
+            ),
+            (
+                "queued_obsolete_frames_never_escape_a_completed_seek",
+                queued_obsolete_frames_never_escape_a_completed_seek,
             ),
             (
                 "playback_preserves_oriented_bounded_pixels",

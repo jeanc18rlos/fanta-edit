@@ -31,10 +31,13 @@ See the video-poster section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
 
 ## Latest video validation — September 10
 
-Backend video URL fix `0d3753a` was reviewed and passes **449 backend tests
-across 44 files**, **78 CPU-only worker tests**, and type checking. It is **not
-deployed**. URL renewal requires the backend and `videogen` worker with
-matching R2 configuration; historical URL-only results remain unchanged.
+Backend video URL fix `0d3753a` is **deployed** to `api.fantaisa.net` as
+`dpl_CVnuDoWotpCv8v7SG3UyXrbzwvhQ`. Its **449 backend tests across 44 files**,
+**78 CPU-only worker tests**, type checking and source CI passed. Nine public
+candidate checks, three authorization-boundary checks and nine live checks
+passed before/after promotion. Health reports `ok` with no listed GPU families;
+this is not proof of active workers. URL renewal still requires the `videogen`
+worker rollout with matching R2; historical URL-only results remain unchanged.
 
 The local poster app built successfully in **7m11s**, from runtime `110868d`
 plus protected user-staged changes, and passed strict ad-hoc signature checks.
@@ -43,14 +46,19 @@ Keychain. Automation could not interact with SecurityAgent, so manual user
 approval was requested. The idle QA app and helper subsequently quit normally,
 and the fixture stopped. No native poster visual, video Save/Play/Place or
 video-project save/reopen result was obtained. A separate native playback
-engine now passes seven library tests and five real playback cases, including
-corrupt-first-frame rejection and cleanup. Its generation controls and canvas
-integration remain unfinished; the app still uses the system player.
+engine initially passed seven library tests and five real playback cases.
+Inline generation controls and selected-video canvas rendering now pass all
+626 editor tests, with the control/lifecycle cases passing 20 scheduler
+iterations each. GitHub exposed an intermittent rapid-seek frame error; the
+correction queries explicit item time after a seek and adds deterministic
+regressions. Nine media library tests and six real playback cases pass; the
+native cases passed ten consecutive runs. App/CLI compile checks pass. Native UI, final installer,
+audible playback and sustained resource validation remain open.
 Evidence: `/tmp/fanta-release-qa-20260909/video-preview-validation/native/`
 (`native-build.json` and `verification.json`).
 
-The subsequent housekeeping check found only user app **21997** and helper
-**22010**, zero Cargo/zombie processes and **60.88 GiB free**. Daily **04:00
+The latest housekeeping check at **08:32 UTC** found only user app **21997**
+and helper **22010**, zero Cargo/zombie processes and **56.52 GiB free**. Daily **04:00
 Europe/Madrid** housekeeping remains scheduled, with Cargo cleanup on Sundays
 when idle, below 40 GiB free, or when a deferred cleanup becomes safe. Active
 work is preserved; the video fixture's port 47843 is closed.
