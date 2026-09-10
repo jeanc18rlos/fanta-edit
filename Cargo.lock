@@ -4643,6 +4643,7 @@ dependencies = [
  "base64 0.22.1",
  "client",
  "context_server",
+ "db",
  "core-foundation 0.10.0",
  "core-video",
  "design_surface",

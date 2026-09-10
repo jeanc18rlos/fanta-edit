@@ -20,7 +20,14 @@ use ui_input::InputField;
 use util::ResultExt as _;
 use workspace::{Item, MultiWorkspace, Workspace, item::ItemEvent};
 
-use crate::{FigItem, FigView, agent_surface, generation_media};
+use crate::{
+    FigItem, FigView, agent_surface,
+    generation_journal::{
+        GenerationJournal, JournalRecord, JournalScope, JournalSnapshot, SavedRunResult,
+        SavedSource, SavedSubmission, normalize_endpoint,
+    },
+    generation_media,
+};
 
 const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 32 * 1024 * 1024;
@@ -70,6 +77,13 @@ impl GenerationMode {
             Self::Design => "Design",
             Self::Masks => "Masks",
         }
+    }
+
+    fn from_label(label: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.label() == label)
+            .context("The saved experiment uses an unsupported tool.")
     }
 
     fn accepts(self, model: &GenerationModel) -> bool {
@@ -189,6 +203,27 @@ impl GenerationResponse {
     }
 }
 
+fn parse_generation_response(value: Value) -> Result<GenerationResponse> {
+    let response: GenerationResponse = serde_json::from_value(value)?;
+    ensure!(
+        !response.id.is_empty()
+            && response.id.len() <= 256
+            && response
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "The server returned an invalid generation ID."
+    );
+    ensure!(
+        matches!(
+            response.status.as_str(),
+            "queued" | "warming" | "processing" | "succeeded" | "failed" | "canceled"
+        ),
+        "The server returned an unknown generation status. Check the saved request again."
+    );
+    Ok(response)
+}
+
 #[derive(Clone)]
 struct MediaOutput {
     label: String,
@@ -274,11 +309,118 @@ struct Submission {
     prompt: String,
     source: Option<SourceImage>,
     account: Option<Arc<str>>,
+    mode: GenerationMode,
+}
+
+impl Submission {
+    fn saved(&self) -> Result<SavedSubmission> {
+        let source = self
+            .source
+            .as_ref()
+            .map(|source| {
+                ensure!(
+                    source.preview.image.format == ImageFormat::Png,
+                    "The source preview cannot be saved for recovery. Choose the image again."
+                );
+                anyhow::Ok(SavedSource {
+                    reference: source.reference.clone(),
+                    name: source.name.clone(),
+                    preview_png: STANDARD.encode(&source.preview.image.bytes),
+                    width: source.preview.width,
+                    height: source.preview.height,
+                })
+            })
+            .transpose()?;
+        Ok(SavedSubmission {
+            key: self.key.clone(),
+            request: self.request.clone(),
+            model: self.model.clone(),
+            prompt: self.prompt.clone(),
+            source,
+            mode: self.mode.label().into(),
+        })
+    }
+}
+
+fn restore_source(source: &SavedSource) -> Result<SourceImage> {
+    ensure!(
+        source.width > 0
+            && source.height > 0
+            && u64::from(source.width) * u64::from(source.height) <= MAX_IMAGE_PIXELS,
+        "The saved source dimensions are invalid."
+    );
+    ensure!(
+        source.preview_png.len() <= 12 * 1024 * 1024,
+        "The saved source preview is too large."
+    );
+    let bytes = STANDARD
+        .decode(&source.preview_png)
+        .context("The saved source preview is unreadable.")?;
+    let mut preview = make_preview(&bytes, "image/png")?;
+    preview.width = source.width;
+    preview.height = source.height;
+    Ok(SourceImage {
+        reference: source.reference.clone(),
+        name: source.name.clone(),
+        preview,
+    })
+}
+
+fn run_from_record(record: &JournalRecord) -> Result<RunSummary> {
+    let result = match record
+        .result
+        .as_ref()
+        .context("The saved experiment has no result.")?
+    {
+        SavedRunResult::Generation { id, .. } => RunResult::Generation { id: id.clone() },
+        SavedRunResult::VectorMessage { message_id, svg } => {
+            ensure!(
+                svg.len() <= MAX_VECTOR_SVG_BYTES,
+                "The saved vector artwork is too large."
+            );
+            RunResult::VectorMessage {
+                message_id: message_id.clone(),
+                svg: svg.as_bytes().into(),
+            }
+        }
+    };
+    Ok(RunSummary {
+        result,
+        model: record.model.clone(),
+        prompt: record.prompt.clone(),
+        source: record.source.as_ref().map(restore_source).transpose()?,
+    })
+}
+
+fn restore_journal(
+    snapshot: JournalSnapshot,
+    account: Arc<str>,
+) -> Result<(Vec<Submission>, Vec<RunSummary>)> {
+    let mut submissions = Vec::new();
+    let mut history = Vec::new();
+    for record in snapshot.records {
+        let mode = GenerationMode::from_label(&record.mode)?;
+        if record.result.is_some() {
+            history.push(run_from_record(&record)?);
+        } else {
+            submissions.push(Submission {
+                source: record.source.as_ref().map(restore_source).transpose()?,
+                request: record.request.context("The saved request is missing.")?,
+                key: record.key,
+                model: record.model,
+                prompt: record.prompt,
+                mode,
+                account: Some(account.clone()),
+            });
+        }
+    }
+    Ok((submissions, history))
 }
 
 #[derive(Debug)]
 struct ApiRejected {
     status: u16,
+    unreserved: bool,
     message: String,
 }
 impl std::fmt::Display for ApiRejected {
@@ -325,6 +467,8 @@ struct GenerationWorkspace {
     pending: bool,
     playback_file: Option<tempfile::TempPath>,
     unresolved_submission: Option<Submission>,
+    recovered_submissions: Vec<Submission>,
+    journal: Option<GenerationJournal>,
     _account_task: Task<()>,
     account: Option<Arc<str>>,
     status: SharedString,
@@ -452,6 +596,8 @@ impl GenerationWorkspace {
             pending: false,
             playback_file: None,
             unresolved_submission: None,
+            recovered_submissions: Vec::new(),
+            journal: None,
             _account_task: account_task,
             account: client.account_access_token(),
             status: "Choose a model and describe your idea.".into(),
@@ -478,6 +624,8 @@ impl GenerationWorkspace {
         self.task = None;
         self.preview_task = None;
         self.unresolved_submission = None;
+        self.recovered_submissions.clear();
+        self.journal = None;
         self.source = None;
         self.mask = None;
         self.points.clear();
@@ -506,16 +654,57 @@ impl GenerationWorkspace {
             cx.notify();
             return;
         };
-        if self.catalog_task.is_some() {
+        if self.catalog_task.is_some() || self.task.is_some() {
             return;
         }
+        match normalize_endpoint(&self.base_url) {
+            Ok(base_url) => self.base_url = base_url,
+            Err(error) => {
+                self.fail(error, cx);
+                return;
+            }
+        }
+        self.journal = None;
         let client = self.client.clone();
         let base_url = self.base_url.clone();
+        let store = db::kvp::KeyValueStore::global(cx);
         let request_id = uuid::Uuid::new_v4();
         self.catalog_request = Some(request_id);
         self.catalog_task = Some(cx.spawn(async move |this, cx| {
-            let result =
-                fetch_catalog(&client, &base_url, Some(&account), cx.background_executor()).await;
+            let result = async {
+                let (models, profile) = futures::try_join!(
+                    fetch_catalog(&client, &base_url, Some(&account), cx.background_executor()),
+                    api_json(
+                        &client,
+                        &base_url,
+                        Method::GET,
+                        "/v1/me",
+                        None,
+                        None,
+                        Some(&account),
+                        cx.background_executor()
+                    ),
+                )?;
+                let scope = JournalScope::new(
+                    &base_url,
+                    profile["user"]["id"]
+                        .as_str()
+                        .context("Your account identity is unavailable.")?,
+                    profile["org"]["id"]
+                        .as_str()
+                        .context("Your account organization is unavailable.")?,
+                )?;
+                let journal = GenerationJournal::new(store, scope)?;
+                let snapshot = journal.load().await?;
+                let restored = cx
+                    .background_spawn({
+                        let account = account.clone();
+                        async move { restore_journal(snapshot, account) }
+                    })
+                    .await?;
+                anyhow::Ok((models, journal, restored))
+            }
+            .await;
             this.update(cx, |this, cx| {
                 if this.catalog_request != Some(request_id) {
                     return;
@@ -527,8 +716,10 @@ impl GenerationWorkspace {
                 this.catalog_task = None;
                 this.catalog_request = None;
                 match result {
-                    Ok(models) => {
+                    Ok((models, journal, (submissions, history))) => {
                         this.models = models;
+                        this.journal = Some(journal);
+                        this.restore_history(submissions, history);
                         this.choose_default_model();
                         this.error = None;
                     }
@@ -538,6 +729,21 @@ impl GenerationWorkspace {
             })
             .log_err();
         }));
+    }
+
+    fn restore_history(&mut self, mut submissions: Vec<Submission>, history: Vec<RunSummary>) {
+        self.unresolved_submission = if submissions.is_empty() {
+            None
+        } else {
+            Some(submissions.remove(0))
+        };
+        self.recovered_submissions = submissions;
+        self.history = history;
+        if self.unresolved_submission.is_some() {
+            self.status =
+                "An earlier request needs confirmation. Retry the saved request to check it."
+                    .into();
+        }
     }
 
     fn accepts_model(&self, model: &GenerationModel) -> bool {
@@ -722,6 +928,7 @@ impl GenerationWorkspace {
                 model: self.selected_model.clone().unwrap_or_default(),
                 source: self.source.clone(),
                 account: self.client.account_access_token(),
+                mode: self.mode,
             },
             cx,
         );
@@ -731,6 +938,13 @@ impl GenerationWorkspace {
         if self.task.is_some() {
             return;
         }
+        let Some(journal) = self.journal.clone() else {
+            self.fail(
+                anyhow!("Account recovery is not ready. Refresh models before generating."),
+                cx,
+            );
+            return;
+        };
         let Some(model) = self.model().cloned() else {
             self.fail(
                 anyhow!("No vector creation model is available. Refresh the model list."),
@@ -749,6 +963,14 @@ impl GenerationWorkspace {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let account = client.account_access_token();
+        let saved = SavedSubmission {
+            key: uuid::Uuid::new_v4().to_string(),
+            request: request.clone(),
+            model: model.id.clone(),
+            prompt: prompt.clone(),
+            source: None,
+            mode: GenerationMode::Vector.label().into(),
+        };
         self.pending = false;
         self.outputs.clear();
         self.preview = None;
@@ -759,6 +981,15 @@ impl GenerationWorkspace {
         self.task = Some(cx.spawn(async move |this, cx| {
             let response = api_json(&client, &base_url, Method::POST, "/v1/messages", Some(request), None, account.as_deref(), cx.background_executor()).await;
             let result = response.and_then(|response| parse_vector_message(&response));
+            let recovery_error = match &result {
+                Ok((message_id, svg)) => match std::str::from_utf8(svg) {
+                    Ok(svg) => journal.record_completed(saved, SavedRunResult::VectorMessage {
+                        message_id: message_id.clone(), svg: svg.to_owned(),
+                    }).await.err(),
+                    Err(error) => Some(error.into()),
+                },
+                Err(_) => None,
+            };
             this.update(cx, |this, cx| {
                 this.task = None;
                 if this.client.account_access_token() != account { this.sync_account(cx); return; }
@@ -770,10 +1001,18 @@ impl GenerationWorkspace {
                         };
                         this.active_run = Some(run.clone());
                         this.history.insert(0, run);
-                        this.history.truncate(HISTORY_LIMIT);
+                        let mut vectors = 0;
+                        this.history.retain(|run| match run.result {
+                            RunResult::VectorMessage { .. } => {
+                                vectors += 1;
+                                vectors <= HISTORY_LIMIT
+                            }
+                            RunResult::Generation { .. } => true,
+                        });
                         this.outputs = vec![vector_output(svg)];
                         this.selected_output = 0;
                         this.status = "Vector artwork is ready. AI usage is billed to your Fanta credits.".into();
+                        this.error = recovery_error.map(|error| format!("Your artwork is ready, but recovery could not be saved: {error}. Save the artwork before closing this tab.").into());
                         this.load_preview(cx);
                     }
                     Err(error) => {
@@ -792,10 +1031,36 @@ impl GenerationWorkspace {
     }
 
     fn submit(&mut self, submission: Submission, cx: &mut Context<Self>) {
+        self.sync_account(cx);
         if self.task.is_some() {
             return;
         }
-        let retrying = self.unresolved_submission.is_some();
+        let Some(journal) = self.journal.clone() else {
+            self.fail(
+                anyhow!("Account recovery is not ready. Refresh models before generating."),
+                cx,
+            );
+            return;
+        };
+        if submission.account.is_none() || submission.account != self.client.account_access_token()
+        {
+            self.fail(
+                anyhow!("Your account changed. Open the saved request for the current account."),
+                cx,
+            );
+            return;
+        }
+        let saved = match submission.saved() {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.fail(error, cx);
+                return;
+            }
+        };
+        let retrying = self
+            .unresolved_submission
+            .as_ref()
+            .is_some_and(|previous| previous.key == submission.key);
         self.unresolved_submission = Some(submission.clone());
         let Submission {
             key,
@@ -804,77 +1069,95 @@ impl GenerationWorkspace {
             prompt,
             source,
             account,
+            ..
         } = submission;
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         self.pending = false;
         self.error = None;
-        self.status = "Sending your request…".into();
+        self.status = "Saving your request for recovery…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result = api_json(
-                &client,
-                &base_url,
-                Method::POST,
-                "/v1/generations",
-                Some(request),
-                Some(&key),
-                account.as_deref(),
-                cx.background_executor(),
-            )
-            .await
-            .and_then(|value| {
-                serde_json::from_value::<GenerationResponse>(value).map_err(Into::into)
-            });
+            let result = async {
+                let previous = journal.prepare(saved).await?;
+                let value = match previous.result {
+                    Some(SavedRunResult::Generation { id, .. }) => {
+                        let value = api_json(&client, &base_url, Method::GET,
+                            &format!("/v1/generations/{id}"), None, None,
+                            account.as_deref(), cx.background_executor()).await?;
+                        ensure!(value["id"].as_str() == Some(id.as_str()),
+                            "The status response did not match the saved generation.");
+                        value
+                    }
+                    Some(SavedRunResult::VectorMessage { .. }) => {
+                        bail!("This experiment already has artwork. Open it from Recent experiments.")
+                    }
+                    None => api_json(&client, &base_url, Method::POST,
+                        "/v1/generations", Some(request), Some(&key),
+                        account.as_deref(), cx.background_executor()).await?,
+                };
+                let response = parse_generation_response(value)?;
+                journal.accept(&key, SavedRunResult::Generation { id: response.id.clone(), finished: !response.pending() }).await
+                    .with_context(|| format!("Generation {} was accepted, but its recovery record could not be saved. Retry the same request", response.id))?;
+                let snapshot = journal.load().await?;
+                let restored = cx.background_spawn({
+                    let account = account.clone().context("Sign in to restore your experiments.")?;
+                    async move { restore_journal(snapshot, account) }
+                }).await?;
+                anyhow::Ok((response, restored))
+            }.await;
             match result {
-                Ok(response) => {
+                Ok((response, (submissions, history))) => {
                     let run = RunSummary {
-                        result: RunResult::Generation {
-                            id: response.id.clone(),
-                        },
-                        model,
-                        prompt,
-                        source,
+                        result: RunResult::Generation { id: response.id.clone() },
+                        model, prompt, source,
                     };
-                    this.update(cx, |this, cx| {
-                        this.unresolved_submission = None;
-                        this.active_run = Some(run.clone());
-                        this.history.insert(0, run);
-                        this.history.truncate(HISTORY_LIMIT);
+                    let applied = this.update(cx, |this, cx| {
+                        if this.client.account_access_token() != account {
+                            this.sync_account(cx);
+                            return false;
+                        }
+                        this.restore_history(submissions, history);
+                        this.active_run = Some(run);
                         this.outputs.clear();
                         this.preview = None;
                         this.preview_task = None;
                         this.accept_response(&response, cx);
-                    })
-                    .log_err();
-                    if response.pending() {
-                        Self::poll(
-                            this.clone(),
-                            client,
-                            base_url,
-                            response.id,
-                            account.clone(),
-                            cx,
-                        )
-                        .await;
+                        true
+                    }).log_err().unwrap_or(false);
+                    if applied && response.pending() {
+                        Self::poll(this.clone(), client, base_url, response.id, account.clone(), journal.clone(), cx).await;
                     }
                 }
-                Err(error) => {
+                Err(mut error) => {
+                    let mut discarded = false;
+                    if error.downcast_ref::<ApiRejected>().is_some_and(|error| {
+                        error.unreserved && error.status < 500 && error.status != 409 && !retrying
+                    }) {
+                        match journal.reject(&key).await {
+                            Ok(()) => discarded = true,
+                            Err(persistence_error) => {
+                                error = anyhow!("{error}. The saved request could not be updated: {persistence_error}");
+                            }
+                        }
+                    }
                     this.update(cx, |this, cx| {
-                        if error.downcast_ref::<ApiRejected>().is_some_and(|error| {
-                            error.status < 500 && error.status != 409 && !retrying
-                        }) {
-                            this.unresolved_submission = None;
+                        if this.client.account_access_token() != account {
+                            this.sync_account(cx);
+                            return;
+                        }
+                        if discarded {
+                            this.unresolved_submission = if this.recovered_submissions.is_empty() {
+                                None
+                            } else { Some(this.recovered_submissions.remove(0)) };
                         }
                         this.fail(error, cx);
-                    })
-                    .log_err();
+                    }).log_err();
                 }
             }
             this.update(cx, |this, cx| {
                 this.task = None;
                 cx.notify();
-            })
-            .log_err();
+            }).log_err();
         }));
         cx.notify();
     }
@@ -885,6 +1168,7 @@ impl GenerationWorkspace {
         base_url: String,
         id: String,
         account: Option<Arc<str>>,
+        journal: GenerationJournal,
         cx: &mut gpui::AsyncApp,
     ) {
         for _ in 0..300 {
@@ -900,16 +1184,36 @@ impl GenerationWorkspace {
                 cx.background_executor(),
             )
             .await
-            .and_then(|value| {
-                serde_json::from_value::<GenerationResponse>(value).map_err(Into::into)
+            .and_then(parse_generation_response)
+            .and_then(|response| {
+                ensure!(
+                    response.id == id,
+                    "The status response did not match the saved generation."
+                );
+                Ok(response)
             });
             match result {
                 Ok(response) => {
                     let pending = response.pending();
-                    if this
-                        .update(cx, |this, cx| this.accept_response(&response, cx))
-                        .is_err()
-                    {
+                    let persistence_error = if pending {
+                        None
+                    } else {
+                        journal.mark_finished(&id).await.err()
+                    };
+                    let applied = this
+                        .update(cx, |this, cx| {
+                            if this.client.account_access_token() != account {
+                                this.sync_account(cx);
+                                return false;
+                            }
+                            this.accept_response(&response, cx);
+                            if let Some(error) = persistence_error {
+                                this.error = Some(format!("The result is available, but its saved status could not be updated: {error}. Check status again to finish recovery.").into());
+                            }
+                            true
+                        })
+                        .log_err().unwrap_or(false);
+                    if !applied {
                         return;
                     }
                     if !pending {
@@ -918,6 +1222,10 @@ impl GenerationWorkspace {
                 }
                 Err(error) => {
                     this.update(cx, |this, cx| {
+                        if this.client.account_access_token() != account {
+                            this.sync_account(cx);
+                            return;
+                        }
                         this.error = Some(
                             format!(
                                 "Status check failed: {error}. Use Check status to resume this job."
@@ -932,6 +1240,10 @@ impl GenerationWorkspace {
             }
         }
         this.update(cx, |this, cx| {
+            if this.client.account_access_token() != account {
+                this.sync_account(cx);
+                return;
+            }
             this.status = "This job is still running. Check its status again in a moment.".into();
             cx.notify();
         })
@@ -943,6 +1255,46 @@ impl GenerationWorkspace {
         if self.task.is_some() {
             return;
         }
+        let Some(journal) = self
+            .journal
+            .clone()
+            .filter(|_| self.client.account_access_token().is_some())
+        else {
+            self.fail(
+                anyhow!(
+                    "Account recovery is not ready. Refresh models before opening this experiment."
+                ),
+                cx,
+            );
+            return;
+        };
+        let Some(run) = self
+            .history
+            .iter()
+            .find(|saved| match (&saved.result, &run.result) {
+                (RunResult::Generation { id: saved }, RunResult::Generation { id: requested }) => {
+                    saved == requested
+                }
+                (
+                    RunResult::VectorMessage {
+                        message_id: saved_id,
+                        svg: saved_svg,
+                    },
+                    RunResult::VectorMessage {
+                        message_id: requested_id,
+                        svg: requested_svg,
+                    },
+                ) => saved_id == requested_id && saved_svg == requested_svg,
+                _ => false,
+            })
+            .cloned()
+        else {
+            self.fail(
+                anyhow!("This experiment is no longer in the current account's saved history."),
+                cx,
+            );
+            return;
+        };
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         let account = self.client.account_access_token();
@@ -955,7 +1307,7 @@ impl GenerationWorkspace {
             self.outputs = vec![vector_output(svg.clone())];
             self.selected_output = 0;
             self.error = None;
-            self.status = "Vector artwork restored from this tab's history.".into();
+            self.status = "Vector artwork restored from your saved experiments.".into();
             self.load_preview(cx);
             cx.notify();
             return;
@@ -977,27 +1329,47 @@ impl GenerationWorkspace {
                 cx.background_executor(),
             )
             .await
-            .and_then(|value| {
-                serde_json::from_value::<GenerationResponse>(value).map_err(Into::into)
+            .and_then(parse_generation_response)
+            .and_then(|response| {
+                ensure!(response.id == generation_id, "The status response did not match the saved generation.");
+                Ok(response)
             });
             match result {
                 Ok(response) => {
-                    this.update(cx, |this, cx| this.accept_response(&response, cx))
-                        .log_err();
-                    if response.pending() {
+                    let persistence_error = if response.pending() { None } else { journal.mark_finished(&generation_id).await.err() };
+                    let applied = this.update(cx, |this, cx| {
+                        if this.client.account_access_token() != account {
+                            this.sync_account(cx);
+                            return false;
+                        }
+                        this.accept_response(&response, cx);
+                        if let Some(error) = persistence_error {
+                            this.error = Some(format!("The result is available, but its saved status could not be updated: {error}. Check status again to finish recovery.").into());
+                        }
+                        true
+                    })
+                        .log_err().unwrap_or(false);
+                    if applied && response.pending() {
                         Self::poll(
                             this.clone(),
                             client,
                             base_url,
                             response.id,
                             account.clone(),
+                            journal.clone(),
                             cx,
                         )
                         .await;
                     }
                 }
                 Err(error) => {
-                    this.update(cx, |this, cx| this.fail(error, cx)).log_err();
+                    this.update(cx, |this, cx| {
+                        if this.client.account_access_token() != account {
+                            this.sync_account(cx);
+                            return;
+                        }
+                        this.fail(error, cx);
+                    }).log_err();
                 }
             }
             this.update(cx, |this, cx| {
@@ -2023,7 +2395,7 @@ impl Render for GenerationWorkspace {
                         .child(Label::new(if prompt_vectors { "Describe artwork to create editable vectors with Fanta AI." } else { "Upload an image or capture the canvas to turn it into vectors." }).color(Color::Muted)))
                     .when(!is_design, |element| element
                         .child(Label::new("Model").color(Color::Muted)).child(model_dropdown)
-                        .child(Button::new("refresh-generation-models", "Refresh models").disabled(self.catalog_task.is_some())
+                        .child(Button::new("refresh-generation-models", "Refresh models").disabled(self.catalog_task.is_some() || self.task.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_catalog(cx)))))
                     .child(Label::new(if self.mode == GenerationMode::Masks { "What to select (optional)" } else if trace_vectors { "Guidance (optional)" } else { "Your idea" }).color(Color::Muted))
                     // Auto-height editors need a definite width; InputField's
@@ -2059,14 +2431,27 @@ impl Render for GenerationWorkspace {
                     .when_some(price.filter(|_| !is_design && !prompt_vectors), |element, price| element.child(Label::new(price).size(LabelSize::Small).color(Color::Muted)))
                     .child(div().debug_selector(|| "generation-submit".into()).child(Button::new("submit-generation", if is_design { "Prepare design brief" } else if self.mode == GenerationMode::Masks { "Generate masks" } else if prompt_vectors { "Create vectors" } else if trace_vectors { "Trace image" } else { "Generate" })
                         .style(ButtonStyle::Filled).full_width()
-                        .disabled(self.task.is_some() || !signed_in || (!is_design && (self.model().is_none() || self.unresolved_submission.is_some())))
+                        .disabled(self.task.is_some() || !signed_in || (!is_design && (self.journal.is_none() || self.model().is_none() || self.unresolved_submission.is_some())))
                         .on_click(cx.listener(|this, _, window, cx| this.generate(window, cx)))))
                     .when(self.unresolved_submission.is_some() && self.task.is_none(), |element| element
                         .child(Label::new("The previous submission was not confirmed. Retry it with the same request to avoid a duplicate charge.").color(Color::Muted))
-                        .child(Button::new("retry-generation-submission", "Retry same request")
+                        .child(Button::new("retry-generation-submission", "Retry same request").disabled(self.journal.is_none())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(submission) = this.unresolved_submission.clone() { this.submit(submission, cx); }
-                            }))))
+                            })))
+                        .children(self.recovered_submissions.iter().enumerate().map(|(index, submission)| {
+                            Button::new(("retry-saved-generation", index), format!("Recover {} · {}", submission.mode.label(), submission.prompt.chars().take(48).collect::<String>()))
+                                .disabled(self.journal.is_none())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if index < this.recovered_submissions.len() {
+                                        let submission = this.recovered_submissions.remove(index);
+                                        if let Some(previous) = this.unresolved_submission.replace(submission.clone()) {
+                                            this.recovered_submissions.push(previous);
+                                        }
+                                        this.submit(submission, cx);
+                                    }
+                                }))
+                        })))
                     .when(self.task.is_some() && self.pending, |element| element
                         .child(Button::new("pause-generation-poll", "Stop waiting")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -2236,6 +2621,7 @@ async fn api_json(
     expected_account: Option<&str>,
     executor: &gpui::BackgroundExecutor,
 ) -> Result<Value> {
+    let generation_submission = method == Method::POST && path == "/v1/generations";
     let mut request = Request::builder()
         .method(method)
         .uri(format!("{base_url}{path}"))
@@ -2261,7 +2647,7 @@ async fn api_json(
     } else {
         MAX_JSON_BYTES
     };
-    let (status, bytes) = network_deadline(
+    let (status, unreserved, bytes) = network_deadline(
         executor,
         API_TIMEOUT,
         "The Fanta request timed out. Check your connection and try again.",
@@ -2272,8 +2658,13 @@ async fn api_json(
                 .await
                 .context("Could not reach Fanta. Check your connection and try again.")?;
             let status = response.status();
+            let unreserved = generation_submission
+                && response
+                    .headers()
+                    .get("x-fanta-generation-unreserved")
+                    .is_some_and(|value| value == "true");
             let bytes = bounded_body(response.into_body(), limit).await?;
-            Ok((status, bytes))
+            Ok((status, unreserved, bytes))
         },
     )
     .await?;
@@ -2295,6 +2686,7 @@ async fn api_json(
         };
         return Err(ApiRejected {
             status: status.as_u16(),
+            unreserved,
             message,
         }
         .into());
@@ -2788,6 +3180,39 @@ fn preview_point(
 mod tests {
     use super::*;
 
+    struct RecoveryTestDirectory {
+        _directory: tempfile::TempDir,
+    }
+    impl gpui::Global for RecoveryTestDirectory {}
+
+    fn initialize_recovery_database(cx: &mut App) {
+        if cx.has_global::<db::AppDatabase>() {
+            return;
+        }
+        let directory = tempfile::tempdir().expect("recovery database directory");
+        let path = directory.path().join("recovery.sqlite");
+        let connection = gpui::block_on(
+            db::sqlez::thread_safe_connection::ThreadSafeConnection::builder::<db::AppMigrator>(
+                path.to_str().expect("test database path"),
+                true,
+            )
+            .with_write_queue_constructor(db::sqlez::thread_safe_connection::locking_queue())
+            .build(),
+        )
+        .expect("persistent recovery database");
+        cx.set_global(db::AppDatabase(connection));
+        cx.set_global(RecoveryTestDirectory {
+            _directory: directory,
+        });
+    }
+
+    fn recovery_account_fixture() -> Value {
+        json!({
+            "user": {"id": "93f29737-8b7f-41b5-9b53-ef6df21d76ce"},
+            "org": {"id": "c6c984b9-d716-4ef3-88a3-b599a9824748"},
+        })
+    }
+
     fn visual_workspace(
         mode: GenerationMode,
         cx: &mut gpui::TestAppContext,
@@ -2805,6 +3230,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) -> (Entity<GenerationWorkspace>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
+            initialize_recovery_database(cx);
             assets::Assets.load_test_fonts(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
@@ -3112,6 +3538,7 @@ mod tests {
                 async move {
                     let response = match (request.method(), request.uri().path()) {
                         (&Method::GET, "/v1/models") => json!({"models":[]}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
                         (&Method::POST, "/v1/generations") => {
                             requests.lock().expect("request log").push("submission");
                             if pending {
@@ -3145,6 +3572,7 @@ mod tests {
                     prompt: "A sunrise".into(),
                     source: None,
                     account,
+                    mode: GenerationMode::Image,
                 },
                 cx,
             )
@@ -3191,6 +3619,779 @@ mod tests {
 
     struct PendingBody;
 
+    async fn assert_generation_recovery_after_tab_close(
+        accepted: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let submissions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let submissions = submissions.clone();
+            move |request| {
+                let submissions = submissions.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": []}),
+                        (&Method::GET, "/v1/me") => json!({
+                            "user": {"id": "93f29737-8b7f-41b5-9b53-ef6df21d76ce"},
+                            "org": {"id": "c6c984b9-d716-4ef3-88a3-b599a9824748"},
+                        }),
+                        (&Method::POST, "/v1/generations") => {
+                            let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                            let body: Value = serde_json::from_slice(
+                                &bounded_body(request.into_body(), MAX_JSON_BYTES).await?,
+                            )?;
+                            submissions
+                                .lock()
+                                .expect("submission log")
+                                .push((key, body));
+                            if !accepted {
+                                return stalled_response(false).await;
+                            }
+                            json!({"id": "accepted-before-close", "status": "processing"})
+                        }
+                        route => panic!("Restoring history must not start or poll jobs: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client.clone(), cx);
+        let request = json!({"model": "fanta-video-1", "prompt": "A sunrise"});
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "recover-after-close".into(),
+                    request: request.clone(),
+                    model: "fanta-video-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account: account.clone(),
+                    mode: GenerationMode::Video,
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        if accepted {
+            assert!(view.read_with(cx, |view, _| view.pending && view.history.len() == 1));
+        } else {
+            cx.executor().advance_clock(API_TIMEOUT);
+            cx.run_until_parked();
+            assert!(view.read_with(cx, |view, _| {
+                view.task.is_none() && view.unresolved_submission.is_some()
+            }));
+        }
+        let previous = view.downgrade();
+        let mut reopened_context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        reopened_context.run_until_parked();
+        assert!(
+            previous.upgrade().is_none(),
+            "the original tab must be released"
+        );
+        let (reopened, cx) =
+            visual_workspace_with_client(GenerationMode::Video, client, &mut reopened_context);
+        reopened.read_with(cx, |view, _| {
+            assert!(
+                view.task.is_none(),
+                "restore must require an explicit action"
+            );
+            if accepted {
+                assert_eq!(
+                    view.history.first().and_then(RunSummary::generation_id),
+                    Some("accepted-before-close"),
+                    "accepted jobs must remain available after closing their tab",
+                );
+            } else {
+                let restored = view
+                    .unresolved_submission
+                    .as_ref()
+                    .expect("unconfirmed requests must survive their tab");
+                assert_eq!(restored.key, "recover-after-close");
+                assert_eq!(restored.request, request);
+                assert_eq!(restored.account, account);
+            }
+        });
+        assert_eq!(submissions.lock().expect("submission log").len(), 1);
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_reopens_unconfirmed_submission_after_tab_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_recovery_after_tab_close(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_reopens_accepted_job_after_tab_close(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_recovery_after_tab_close(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_storage_failure_prevents_submission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let submissions = submissions.clone();
+            move |request| {
+                let submissions = submissions.clone();
+                async move {
+                    let value = match request.uri().path() {
+                        "/v1/models" => json!({"models": []}),
+                        "/v1/me" => recovery_account_fixture(),
+                        _ => {
+                            submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            bail!("A request must not be sent without a saved recovery record")
+                        }
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(value.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, cx);
+        let database = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+        database
+            .write(|connection| {
+                connection
+                    .exec(
+                        "CREATE TRIGGER fail_generation_recovery BEFORE INSERT ON scoped_kv_store
+             BEGIN SELECT RAISE(FAIL,'disk write failed'); END;",
+                    )
+                    .and_then(|mut statement| statement())
+            })
+            .await
+            .expect("install storage failure");
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "must-save-first".into(),
+                    request: json!({"model":"fanta-video-1", "prompt":"A sunrise"}),
+                    model: "fanta-video-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Video,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(
+                view.error.is_some(),
+                "storage errors must reach the interface"
+            );
+            assert!(view.history.is_empty());
+        });
+        assert_eq!(submissions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_uses_verified_identity_across_key_rotation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let submissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let submissions = submissions.clone();
+            move |request| {
+                let submissions = submissions.clone();
+                async move {
+                    let value = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": []}),
+                        (&Method::GET, "/v1/me") => {
+                            let mut profile = recovery_account_fixture();
+                            if request
+                                .headers()
+                                .get("Authorization")
+                                .and_then(|header| header.to_str().ok())
+                                == Some("Bearer fnt_live_other_test")
+                            {
+                                profile["user"]["id"] =
+                                    json!("d8e366fe-2f4d-4d4a-a516-3179b5c9b707");
+                            }
+                            profile
+                        }
+                        (&Method::POST, "/v1/generations") => {
+                            submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            json!({"id":"original-account-job", "status":"processing"})
+                        }
+                        route => panic!("Restoring an account must not submit or poll: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(value.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client.clone(), cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "original-account-request".into(),
+                    request: json!({"model":"fanta-video-1", "prompt":"A sunrise"}),
+                    model: "fanta-video-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Video,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.history.len() == 1));
+        let mut context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        context.run_until_parked();
+        for (token, expected_history) in [("fnt_live_other_test", 0), ("fnt_live_rotated_test", 1)]
+        {
+            client.sign_out(&context.to_async()).await;
+            client.override_authenticate(move |_| {
+                Task::ready(Ok(client::Credentials {
+                    // Deliberately keep the legacy numeric ID unchanged: only /v1/me can isolate this account.
+                    user_id: 1,
+                    access_token: token.into(),
+                }))
+            });
+            client
+                .sign_in(false, &context.to_async())
+                .await
+                .expect("sign in with replacement key");
+            let (view, cx) =
+                visual_workspace_with_client(GenerationMode::Video, client.clone(), &mut context);
+            view.read_with(cx, |view, _| {
+                assert!(view.error.is_none());
+                assert_eq!(view.history.len(), expected_history);
+                if expected_history == 1 {
+                    assert_eq!(
+                        view.history.first().and_then(RunSummary::generation_id),
+                        Some("original-account-job")
+                    );
+                }
+            });
+            cx.update(|window, _| window.remove_window());
+            drop(view);
+            cx.run_until_parked();
+        }
+        assert_eq!(submissions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    async fn assert_generation_http_400_recovery(
+        unreserved: bool,
+        rejected_retry: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            move |request| {
+                let requests = requests.clone();
+                async move {
+                    let value = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": []}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                            let body: Value = serde_json::from_slice(
+                                &bounded_body(request.into_body(), MAX_JSON_BYTES).await?,
+                            )?;
+                            let attempt = {
+                                let mut requests = requests.lock().expect("request log");
+                                requests.push((key, body));
+                                requests.len()
+                            };
+                            if attempt == 1 || (rejected_retry && attempt == 2) {
+                                let mut response = http_client::Response::builder().status(400);
+                                if unreserved || attempt == 2 {
+                                    response =
+                                        response.header("x-fanta-generation-unreserved", "true");
+                                }
+                                return Ok(response.body(json!({"error": {"type": "invalid_request_error", "message": "Source is unavailable"}}).to_string().into())?);
+                            }
+                            json!({"id":"reserved-before-error", "status":"failed", "output":[], "error":"Source is unavailable", "idempotent_replay":true})
+                        }
+                        route => panic!("Unexpected recovery request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(value.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client.clone(), cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "recover-reserved-error".into(),
+                    request: json!({"model":"fanta-video-1", "prompt":"A sunrise"}),
+                    model: "fanta-video-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Video,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_some());
+            assert_eq!(
+                view.unresolved_submission.is_some(),
+                !unreserved,
+                "only an explicit unreserved response can discard the recovery key"
+            );
+        });
+        let mut context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        context.run_until_parked();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, &mut context);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.unresolved_submission.is_some()),
+            !unreserved
+        );
+        if !unreserved {
+            let submission = view.read_with(cx, |view, _| {
+                view.unresolved_submission
+                    .clone()
+                    .expect("saved failed response")
+            });
+            view.update(cx, |view, cx| view.submit(submission.clone(), cx));
+            cx.run_until_parked();
+            if rejected_retry {
+                assert!(
+                    view.read_with(cx, |view, _| view.unresolved_submission.is_some()),
+                    "a rejected retry cannot disprove acceptance of an earlier attempt"
+                );
+                view.update(cx, |view, cx| view.submit(submission, cx));
+                cx.run_until_parked();
+            }
+            view.read_with(cx, |view, _| {
+                assert!(view.unresolved_submission.is_none());
+                assert_eq!(
+                    view.history.first().and_then(RunSummary::generation_id),
+                    Some("reserved-before-error")
+                );
+            });
+        }
+        let requests = requests.lock().expect("request log");
+        assert_eq!(
+            requests.len(),
+            if unreserved {
+                1
+            } else if rejected_retry {
+                3
+            } else {
+                2
+            }
+        );
+        if !unreserved {
+            assert_eq!(
+                requests.first(),
+                requests.get(1),
+                "recovery must reuse the exact body and key"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_http_400_keeps_unknown_reservation_after_reopen(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_http_400_recovery(false, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_http_400_clears_only_explicit_unreserved_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_http_400_recovery(true, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_http_400_unreserved_retry_keeps_earlier_uncertainty(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_http_400_recovery(false, true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_accept_write_failure_reopens_exact_mask_request(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let journal_slot = Arc::new(std::sync::Mutex::new(None::<GenerationJournal>));
+        let http = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            let journal_slot = journal_slot.clone();
+            move |request| {
+                let requests = requests.clone();
+                let journal_slot = journal_slot.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": []}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                            let body: Value = serde_json::from_slice(
+                                &bounded_body(request.into_body(), MAX_JSON_BYTES).await?,
+                            )?;
+                            let journal = journal_slot
+                                .lock()
+                                .expect("journal slot")
+                                .clone()
+                                .expect("initialized journal");
+                            let snapshot = journal.load().await?;
+                            let record = snapshot.records.first().expect("saved before POST");
+                            assert_eq!(record.key, key);
+                            assert_eq!(record.request.as_ref(), Some(&body));
+                            assert!(record.result.is_none());
+                            requests
+                                .lock()
+                                .expect("request log")
+                                .push(("POST", Some((key, body))));
+                            json!({"id":"server-job-42", "status":"succeeded", "output":[{"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"2\"><rect width=\"4\" height=\"2\" fill=\"blue\"/></svg>"}]})
+                        }
+                        (&Method::GET, "/v1/generations/server-job-42") => {
+                            requests.lock().expect("request log").push(("GET", None));
+                            json!({"id":"server-job-42", "status":"succeeded", "output":[{"svg":"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"2\"><rect width=\"4\" height=\"2\" fill=\"blue\"/></svg>"}]})
+                        }
+                        route => panic!("Unexpected recovery request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client.clone(), cx);
+        *journal_slot.lock().expect("journal slot") =
+            view.read_with(cx, |view, _| view.journal.clone());
+        let database = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+        database
+            .write(|connection| {
+                connection.exec(
+                    "CREATE TRIGGER fail_accepted_recovery BEFORE INSERT ON scoped_kv_store
+                WHEN instr(NEW.value, 'server-job-42') > 0
+                BEGIN SELECT RAISE(FAIL,'accepted record write failed'); END;",
+                )?()
+            })
+            .await
+            .expect("install acceptance failure");
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(4, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("source PNG");
+        let png = png.into_inner();
+        let mut preview = make_preview(&png, "image/png").expect("source preview");
+        preview.width = 400;
+        preview.height = 200;
+        let source = SourceImage {
+            reference: json!({"url":"https://media.example/original.png"}),
+            name: "Original mask source".into(),
+            preview,
+        };
+        let submission = Submission {
+            key: "recover-accepted-write".into(),
+            request: json!({"model":"fanta-image-1", "prompt":"Replace the sky", "seed":"9007199254740993",
+                "input":{"operation":"inpaint", "image":source.reference.clone(),
+                    "points":[{"x":123,"y":45,"positive":true}], "mask":{"data_url":"data:image/png;base64,AA=="}}}),
+            model: "fanta-image-1".into(),
+            prompt: "Replace the sky".into(),
+            source: Some(source),
+            account,
+            mode: GenerationMode::Image,
+        };
+        let expected = submission.saved().expect("saved source");
+        view.update(cx, |view, cx| view.submit(submission.clone(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(
+                view.error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("server-job-42"))
+            );
+            assert!(view.unresolved_submission.is_some());
+            assert!(view.history.is_empty());
+        });
+        let previous = view.downgrade();
+        let mut context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        context.run_until_parked();
+        assert!(previous.upgrade().is_none());
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, &mut context);
+        let recovered = view.read_with(cx, |view, _| {
+            view.unresolved_submission
+                .clone()
+                .expect("saved unresolved request")
+        });
+        assert_eq!(recovered.saved().expect("restored source"), expected);
+        assert_eq!(
+            requests.lock().expect("request log").len(),
+            1,
+            "reopen cannot submit automatically"
+        );
+        database
+            .write(|connection| connection.exec("DROP TRIGGER fail_accepted_recovery")?())
+            .await
+            .expect("restore storage");
+        view.update(cx, |view, cx| view.submit(recovered, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.error.is_none(),
+                "recovered job error: {:?}",
+                view.error
+            );
+            assert!(view.unresolved_submission.is_none());
+            let run = view.history.first().expect("accepted history");
+            assert_eq!(run.generation_id(), Some("server-job-42"));
+            let source = run.source.as_ref().expect("accepted source");
+            assert_eq!((source.preview.width, source.preview.height), (400, 200));
+        });
+        view.update(cx, |view, cx| view.submit(submission, cx));
+        cx.run_until_parked();
+        let requests = requests.lock().expect("request log");
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests.first(),
+            requests.get(1),
+            "recovery must reuse exact request bytes and key"
+        );
+        assert_eq!(
+            requests.get(2).map(|request| request.0),
+            Some("GET"),
+            "a stale accepted submission must fetch its saved job instead of starting another request"
+        );
+    }
+
+    async fn assert_generation_recovery_completed_vector(
+        stale_after_sign_out: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><path d="M2 2L30 2L16 22Z" fill="#22c55e"/></svg>"##;
+        let messages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let messages = messages.clone();
+            move |request| {
+                let messages = messages.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models": [{
+                            "id": "claude-sonnet-5", "kind": "chat", "max_output_tokens": 4096
+                        }]}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/messages") => {
+                            assert!(request.headers().get("Idempotency-Key").is_none());
+                            let body: Value = serde_json::from_slice(
+                                &bounded_body(request.into_body(), MAX_JSON_BYTES).await?,
+                            )?;
+                            assert_eq!(body["model"], "claude-sonnet-5");
+                            assert_eq!(body["messages"][0]["content"], "a green triangle");
+                            assert_eq!(
+                                messages.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                                0,
+                                "restoring artwork must not repeat a metered Messages request"
+                            );
+                            json!({
+                                "id": "msg_completed_recovery",
+                                "stop_reason": "end_turn",
+                                "content": [{"type": "text", "text": SVG}]
+                            })
+                        }
+                        route => panic!(
+                            "Vector restore/save must not create or poll a generation: {route:?}"
+                        ),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Vector, client.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.journal.is_some(),
+                "verified account recovery must be ready"
+            );
+            assert_eq!(view.selected_model.as_deref(), Some("claude-sonnet-5"));
+            let prompt = view.prompt.clone();
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_text("a green triangle", window, cx)
+            });
+            view.generate(window, cx);
+        });
+        cx.run_until_parked();
+        let run = view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(
+                view.error.is_none(),
+                "unexpected vector error: {:?}",
+                view.error
+            );
+            assert!(view.preview.is_some());
+            assert!(view.unresolved_submission.is_none());
+            assert_eq!(view.history.len(), 1);
+            let run = view
+                .history
+                .first()
+                .expect("completed vector history")
+                .clone();
+            assert!(run.generation_id().is_none());
+            assert_eq!(run.provenance()["message_id"], "msg_completed_recovery");
+            run
+        });
+        let journal = view.read_with(cx, |view, _| view.journal.clone().expect("account journal"));
+        let saved = journal.load().await.expect("durable completed vector");
+        let record = saved.records.first().expect("one persisted vector");
+        assert_eq!(saved.records.len(), 1);
+        assert!(
+            record.request.is_none(),
+            "Messages has no safe submission replay"
+        );
+        assert!(matches!(
+            &record.result,
+            Some(SavedRunResult::VectorMessage { message_id, svg })
+                if message_id.as_deref() == Some("msg_completed_recovery") && svg == SVG
+        ));
+
+        if stale_after_sign_out {
+            client.sign_out(&cx.to_async()).await;
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.history.is_empty());
+                assert!(view.journal.is_none());
+                assert!(view.outputs.is_empty());
+            });
+            view.update(cx, |view, cx| view.check_status(run, cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.active_run.is_none(),
+                    "a stale history callback must not restore the old account's run"
+                );
+                assert!(
+                    view.outputs.is_empty(),
+                    "signed-out history must not reveal old SVG bytes"
+                );
+                assert!(view.preview.is_none());
+                assert!(view.preview_task.is_none());
+                assert!(view.task.is_none());
+                assert!(view.history.is_empty());
+                assert!(view.journal.is_none());
+            });
+        } else {
+            let previous = view.downgrade();
+            let mut reopened_context = cx.cx.clone();
+            cx.update(|window, _| window.remove_window());
+            drop(view);
+            reopened_context.run_until_parked();
+            assert!(
+                previous.upgrade().is_none(),
+                "release the original vector tab"
+            );
+            let (reopened, cx) =
+                visual_workspace_with_client(GenerationMode::Vector, client, &mut reopened_context);
+            let restored = reopened.read_with(cx, |view, _| {
+                assert!(view.task.is_none());
+                assert!(view.error.is_none());
+                assert!(view.unresolved_submission.is_none());
+                assert!(
+                    view.outputs.is_empty(),
+                    "restore waits for an explicit history selection"
+                );
+                assert_eq!(view.history.len(), 1);
+                view.history
+                    .first()
+                    .expect("reopened vector history")
+                    .clone()
+            });
+            reopened.update(cx, |view, cx| view.check_status(restored, cx));
+            cx.run_until_parked();
+            reopened.read_with(cx, |view, _| {
+                assert!(view.error.is_none());
+                assert!(view.preview.is_some());
+                assert!(view.task.is_none());
+                assert_eq!(view.outputs.len(), 1);
+                let output = view.outputs.first().expect("restored SVG output");
+                assert_eq!(output.mime, "image/svg+xml");
+                let MediaLocation::Inline(bytes) = &output.location else {
+                    panic!("completed Messages artwork must restore its received bytes locally")
+                };
+                assert_eq!(bytes.as_ref(), SVG.as_bytes());
+                assert!(
+                    view.active_run
+                        .as_ref()
+                        .expect("restored run")
+                        .generation_id()
+                        .is_none()
+                );
+            });
+            let directory = tempfile::tempdir().expect("restored vector output directory");
+            let path = directory.path().join("restored.svg");
+            reopened.update(cx, |view, cx| view.save_output(cx));
+            assert!(cx.did_prompt_for_new_path());
+            cx.simulate_new_path_selection(|_| Some(path.clone()));
+            cx.run_until_parked();
+            assert_eq!(
+                std::fs::read(path).expect("saved restored SVG"),
+                SVG.as_bytes()
+            );
+            reopened.read_with(cx, |view, _| {
+                assert!(view.task.is_none());
+                assert!(view.error.is_none());
+                assert_eq!(view.status, "Result saved.");
+            });
+        }
+        assert_eq!(messages.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_completed_vector_reopens_and_saves_without_resubmission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_recovery_completed_vector(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_recovery_stale_vector_selection_after_sign_out_stays_cleared(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_generation_recovery_completed_vector(true, cx).await;
+    }
+
     impl futures::AsyncRead for PendingBody {
         fn poll_read(
             self: std::pin::Pin<&mut Self>,
@@ -3220,6 +4421,11 @@ mod tests {
             move |request| {
                 let submissions = submissions.clone();
                 async move {
+                    if request.uri().path() == "/v1/me" {
+                        return Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(recovery_account_fixture().to_string().into())?);
+                    }
                     if request.uri().path() == "/v1/models" {
                         return Ok(http_client::Response::builder()
                             .status(200)
@@ -3266,6 +4472,7 @@ mod tests {
                     prompt: "A sunrise".into(),
                     source: None,
                     account: account.clone(),
+                    mode: GenerationMode::Video,
                 },
                 cx,
             );
@@ -3338,6 +4545,11 @@ mod tests {
             move |request| {
                 let downloads = downloads.clone();
                 async move {
+                    if request.uri().path() == "/v1/me" {
+                        return Ok(http_client::Response::builder()
+                            .status(200)
+                            .body(recovery_account_fixture().to_string().into())?);
+                    }
                     if request.uri().path() == "/v1/models" {
                         return Ok(http_client::Response::builder()
                             .status(200)
