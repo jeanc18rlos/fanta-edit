@@ -73,6 +73,9 @@ pub fn bundled_support_directory(binary: &Path) -> Option<PathBuf> {
     None
 }
 
+// This is the low-level constructor behind `GitBinary::build_command`; the
+// repository layer adds the mandatory security arguments before execution.
+#[allow(clippy::disallowed_methods)]
 pub fn command(binary: &Path) -> Command {
     let mut command = new_command(binary);
     if let Some(support) = bundled_support_directory(binary) {

@@ -1602,15 +1602,19 @@ impl GenerationWorkspace {
             };
             let bytes = video.bytes.clone();
             #[cfg(test)]
-            let injected = self
+            let playback = self
                 .playback_factory
                 .as_ref()
-                .map(|factory| factory(bytes.clone(), _cx));
+                .map(|factory| factory(bytes.clone(), _cx))
+                .unwrap_or_else(|| {
+                    _cx.new(|cx| {
+                        crate::video_playback::VideoPlaybackView::new(bytes, PREVIEW_SIZE, cx)
+                    })
+                });
             #[cfg(not(test))]
-            let injected: Option<Entity<crate::video_playback::VideoPlaybackView>> = None;
-            let playback = injected.unwrap_or_else(|| {
+            let playback = {
                 _cx.new(|cx| crate::video_playback::VideoPlaybackView::new(bytes, PREVIEW_SIZE, cx))
-            });
+            };
             playback.update(_cx, |playback, cx| {
                 playback.set_active(self.playback_active, cx)
             });

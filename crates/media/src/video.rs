@@ -1384,6 +1384,9 @@ struct NativeRect {
     size: NativeSize,
 }
 
+// Both frameworks export symbols used by this native block; Clippy otherwise
+// treats their shared `kind = "framework"` argument as a duplicate attribute.
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "AVFoundation", kind = "framework")]
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {

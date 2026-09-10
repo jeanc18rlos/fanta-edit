@@ -4179,7 +4179,7 @@ mod tests {
         next_progress.progress = 0.5;
         let mut replacement_session = frame.clone();
         replacement_session.session_revision += 1;
-        let mut other_node = frame.clone();
+        let mut other_node = frame;
         other_node.node_id = NodeId::from_u128(98);
         for next in [
             Some(next_pixels),

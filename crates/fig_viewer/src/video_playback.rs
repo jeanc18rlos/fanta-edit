@@ -555,7 +555,7 @@ impl VideoPlaybackView {
                                     });
                                 }
                             });
-                            let view = weak.clone();
+                            let view = weak;
                             window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                                 if phase == DispatchPhase::Bubble
                                     && event.button == MouseButton::Left

@@ -262,7 +262,7 @@ fn append_svg_group(
         );
         node.transform = transform.then(&parent_transform.inverse());
         node.parent = Some(parent);
-        node.index = index.clone();
+        node.index = index;
         index = IndexKey::after(index);
         let id = node.id;
         nodes.push(node);
