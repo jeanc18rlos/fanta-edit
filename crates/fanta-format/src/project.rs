@@ -91,8 +91,9 @@ mod tests {
         AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, CanvasNode,
         ComponentDef, ComponentId, Doc, Easing, GroupNode, History, Interpolation, Keyframe,
         KeyframeId, Mode, ModeId, MotionProperty, MotionTarget, NodeData, NodeId, ResolvedVarValue,
-        Selection, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
-        VariableType, Viewport,
+        Selection, TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide, TextPathStart,
+        VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
+        Viewport,
     };
     use serde_json::Value;
     use std::collections::{BTreeMap, BTreeSet};
@@ -495,6 +496,69 @@ mod tests {
         assert_eq!(persisted(&doc2), persisted(&f.doc));
         assert_eq!(assets2, assets);
         assert_eq!(doc2.pages(), f.doc.pages(), "page order survives");
+    }
+
+    #[test]
+    fn text_path_round_trips_through_canonical_page_source() {
+        let mut doc = Doc::new();
+        let page = {
+            let node = group(None, "Page 1");
+            let id = node.id;
+            doc.scene.insert(node).unwrap();
+            id
+        };
+        doc.add_page(page);
+
+        let mut baseline = fanta_doc::PathData::new();
+        baseline
+            .move_to(0.0, 10.0)
+            .cubic_to(20.0, -5.0, 40.0, 25.0, 60.0, 10.0)
+            .line_to(80.0, 10.0);
+        let mut text_path = TextPathNode::new(baseline, "Persistent curve");
+        text_path.style.font_family = "Test Sans".to_owned();
+        text_path.style.size_px = 21.0;
+        text_path.style_runs.push(fanta_doc::TextStyleRun {
+            start: 0,
+            end: 10,
+            style: fanta_doc::TextStyle {
+                weight: 700,
+                color: fanta_doc::Color::rgb(0x12, 0x34, 0x56),
+                ..fanta_doc::TextStyle::default()
+            },
+        });
+        text_path.start = TextPathStart::new(1, 0.5).expect("valid start");
+        text_path.alignment = TextPathAlignment::End;
+        text_path.direction = TextPathDirection::Reverse;
+        text_path.side = TextPathSide::Flipped;
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path.clone()));
+        node.parent = Some(page);
+        node.name = "Curved label".to_owned();
+        let id = node.id;
+        doc.scene.insert(node).unwrap();
+
+        let dir = tempdir().unwrap();
+        write_project_tree(dir.path(), &doc, &BTreeMap::new()).unwrap();
+
+        let page_dir = dir.path().join("pages/page-1");
+        let source = fs::read_to_string(page_dir.join("page.fnx")).unwrap();
+        assert!(
+            source.contains("<TextPath "),
+            "TextPath tag missing:\n{source}"
+        );
+        assert!(
+            source.contains("path="),
+            "owned baseline missing:\n{source}"
+        );
+        assert!(
+            !page_dir.join("nodes").exists(),
+            "TextPath must not fall back to legacy per-node JSON"
+        );
+
+        let (restored, _) = read_project_tree(dir.path()).unwrap();
+        let restored = restored.scene.get(id).expect("TextPath restored");
+        assert_eq!(restored.name, "Curved label");
+        assert_eq!(restored.parent, Some(page));
+        assert_eq!(restored.data, NodeData::TextPath(text_path));
     }
 
     #[test]
@@ -1246,8 +1310,8 @@ mod tests {
             "got {err:?}"
         );
 
-        // Older doc schema → migrated up before deserialization (the v1→v2
-        // step is idempotent on already-v2 node shapes).
+        // Older doc schema → migrated through each adjacent step before
+        // deserialization (v1→v2 is idempotent on already-v2 node shapes).
         let mut v: Value = serde_json::from_str(&manifest_text).unwrap();
         v["schema_version"] = Value::from(1);
         fs::write(&manifest_path, v.to_string()).unwrap();

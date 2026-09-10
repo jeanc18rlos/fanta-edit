@@ -18,12 +18,13 @@ use std::collections::BTreeMap;
 /// Current canonical JSON schema version. Bump when the on-disk shape changes;
 /// `fanta-format` owns the migration table.
 ///
-/// v2 (this version) made `PathData` an object `{ segments, fill_rule? }` (was a
+/// v2 made `PathData` an object `{ segments, fill_rule? }` (was a
 /// bare array) and added components/variables/prototyping — all of which are
 /// `#[serde(default)]`, so the only non-defaultable change driving the bump is
-/// the `PathData` shape. Motion is likewise additive/defaultable and does not
-/// require another bump. See `fanta-format::migrate` for the v1→v2 step.
-pub const SCHEMA_VERSION: u32 = 2;
+/// the `PathData` shape. v3 adds the first-class `text_path` node tag. Existing
+/// v2 documents need no structural rewrite, but the bump lets older readers
+/// reject documents containing the new enum variant cleanly.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One Fantaisa document — the root of everything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -464,9 +465,19 @@ impl Doc {
         let from = value
             .get("schema_version")
             .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+            .unwrap_or(1);
+        if from > u64::from(SCHEMA_VERSION) {
+            return Err(DocLoadError::UnsupportedSchema {
+                found: from,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let from = u32::try_from(from).map_err(|_| DocLoadError::UnsupportedSchema {
+            found: from,
+            supported: SCHEMA_VERSION,
+        })?;
         if from < SCHEMA_VERSION {
-            migrate_doc_json(&mut value, from);
+            migrate_doc_json(&mut value, from)?;
         }
         let mut doc: Doc = serde_json::from_value(value)?;
         doc.scene.rebuild_child_index();
@@ -485,17 +496,44 @@ impl Doc {
 ///   vector node's array `path` — including paths embedded in persisted history
 ///   op snapshots (`DeleteSubtree`, `ReplaceData`), which a node-tree-only walk
 ///   would miss. Idempotent (an object `path` passes through).
-pub fn migrate_doc_json(value: &mut serde_json::Value, from_version: u32) {
-    if from_version < 2 {
+/// - **v2 → v3**: no structural rewrite. v3 reserves the `text_path` enum tag,
+///   so stamping the version provides an explicit forward-compatibility gate.
+pub fn migrate_doc_json(
+    value: &mut serde_json::Value,
+    from_version: u32,
+) -> Result<(), DocMigrationError> {
+    migrate_doc_json_to(value, from_version, SCHEMA_VERSION)
+}
+
+/// Apply migrations up to an explicit supported target version.
+///
+/// `fanta-format` uses this for its adjacent-step migration table, while the
+/// raw JSON loader always targets [`SCHEMA_VERSION`] through
+/// [`migrate_doc_json`]. Invalid bounds are reported without changing `value`.
+pub fn migrate_doc_json_to(
+    value: &mut serde_json::Value,
+    from_version: u32,
+    to_version: u32,
+) -> Result<(), DocMigrationError> {
+    if to_version > SCHEMA_VERSION {
+        return Err(DocMigrationError::UnsupportedTarget {
+            target: to_version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if from_version > to_version {
+        return Err(DocMigrationError::Backward {
+            from: from_version,
+            to: to_version,
+        });
+    }
+    if from_version < 2 && to_version >= 2 {
         migrate_v1_to_v2(value);
     }
-    // Stamp the current version so the deserialized doc reports v2.
     if let serde_json::Value::Object(map) = value {
-        map.insert(
-            "schema_version".into(),
-            serde_json::Value::from(SCHEMA_VERSION),
-        );
+        map.insert("schema_version".into(), serde_json::Value::from(to_version));
     }
+    Ok(())
 }
 
 /// Recursively wrap any vector node's bare-array `path` into `{ "segments": [...] }`.
@@ -577,8 +615,20 @@ impl Default for Viewport {
 pub enum DocLoadError {
     #[error("invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("document schema {found} is newer than supported schema {supported}")]
+    UnsupportedSchema { found: u64, supported: u32 },
+    #[error("document schema migration failed: {0}")]
+    Migration(#[from] DocMigrationError),
     #[error("scene failed validation: {0}")]
     InvalidScene(SceneError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DocMigrationError {
+    #[error("cannot migrate backward from schema {from} to schema {to}")]
+    Backward { from: u32, to: u32 },
+    #[error("migration target {target} is newer than supported schema {supported}")]
+    UnsupportedTarget { target: u32, supported: u32 },
 }
 
 fn unix_seconds_now() -> i64 {
@@ -601,6 +651,69 @@ mod tests {
         let back = Doc::from_json_str(&s).unwrap();
         assert_eq!(back.id, d.id);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_v2_doc_loads_as_v3_without_structural_rewrite() {
+        let current = serde_json::to_value(Doc::new()).expect("current doc serializes");
+        let mut old = current.clone();
+        old["schema_version"] = serde_json::Value::from(2);
+
+        let loaded = Doc::from_json_str(&old.to_string()).expect("v2 doc migrates");
+        let mut loaded = serde_json::to_value(loaded).expect("migrated doc serializes");
+        loaded["schema_version"] = serde_json::Value::from(2);
+
+        assert_eq!(loaded, old, "v2 to v3 only stamps the schema version");
+    }
+
+    #[test]
+    fn raw_json_loader_rejects_a_future_schema() {
+        let mut value = serde_json::to_value(Doc::new()).expect("doc serializes");
+        value["schema_version"] = serde_json::Value::from(SCHEMA_VERSION + 1);
+
+        let error = Doc::from_json_str(&value.to_string()).expect_err("future schema rejected");
+        assert!(matches!(
+            error,
+            DocLoadError::UnsupportedSchema {
+                found,
+                supported
+            } if found == u64::from(SCHEMA_VERSION + 1) && supported == SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
+    fn raw_json_loader_rejects_schema_versions_larger_than_u32() {
+        let mut value = serde_json::to_value(Doc::new()).expect("doc serializes");
+        value["schema_version"] = serde_json::Value::from(u64::MAX);
+
+        let error = Doc::from_json_str(&value.to_string()).expect_err("huge schema rejected");
+        assert!(matches!(
+            error,
+            DocLoadError::UnsupportedSchema {
+                found: u64::MAX,
+                supported: SCHEMA_VERSION
+            }
+        ));
+    }
+
+    #[test]
+    fn migration_rejects_invalid_bounds_without_mutating_input() {
+        let original = serde_json::json!({"schema_version": 2, "opaque": [1, 2, 3]});
+        for (from, to, expected) in [
+            (
+                2,
+                SCHEMA_VERSION + 1,
+                DocMigrationError::UnsupportedTarget {
+                    target: SCHEMA_VERSION + 1,
+                    supported: SCHEMA_VERSION,
+                },
+            ),
+            (3, 2, DocMigrationError::Backward { from: 3, to: 2 }),
+        ] {
+            let mut value = original.clone();
+            assert_eq!(migrate_doc_json_to(&mut value, from, to), Err(expected));
+            assert_eq!(value, original);
+        }
     }
 
     /// Insert a root-level group named `name` and return its id.

@@ -123,7 +123,7 @@ fn printed_source_looks_like_react() {
     let tree = tree_from_nodes(&nodes).unwrap();
     let text = print_doc("Card", &tree.root);
     assert!(text.starts_with(
-        "/** @jsxRuntime classic */\n/** @jsx fnxElement */\nimport { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, Vector, Video } from \"../../fnx\";\n"
+        "/** @jsxRuntime classic */\n/** @jsx fnxElement */\nimport { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, TextPath, Vector, Video } from \"../../fnx\";\n"
     ));
     assert!(text.contains("export default function Card()"));
     assert!(text.contains("<Frame"));
@@ -894,6 +894,7 @@ fn every_nodedata_variant_has_a_tag() {
             Group(_) => "group",
             Vector(_) => "vector",
             Text(_) => "text",
+            TextPath(_) => "text_path",
             Bitmap(_) => "bitmap",
             Video(_) => "video",
             Audio(_) => "audio",
@@ -910,6 +911,7 @@ fn every_nodedata_variant_has_a_tag() {
         "group",
         "vector",
         "text",
+        "text_path",
         "bitmap",
         "video",
         "audio",
@@ -930,6 +932,7 @@ fn tag_type_bijection_covers_all_variants() {
         "group",
         "vector",
         "text",
+        "text_path",
         "bitmap",
         "video",
         "audio",
@@ -961,7 +964,9 @@ fn string_attr_with_special_chars_round_trips() {
 #[test]
 fn real_doc_node_projection_round_trips() {
     use fanta_doc::{
-        CanvasNode, Color, Doc, GroupNode, NodeData, Operation, Stroke, TextNode, VectorNode,
+        CanvasNode, Color, Doc, GroupNode, NodeData, Operation, PathData, Stroke, TextNode,
+        TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide, TextPathStart,
+        VectorNode,
     };
 
     let mut doc = Doc::new();
@@ -989,6 +994,17 @@ fn real_doc_node_projection_round_trips() {
     text.parent = Some(root_id);
     doc.apply(Operation::create_node(text)).unwrap();
 
+    let mut baseline = PathData::new();
+    baseline.move_to(2.0, 3.0).quad_to(20.0, -4.0, 38.0, 3.0);
+    let mut text_path = TextPathNode::new(baseline, "Around the bend");
+    text_path.start = TextPathStart::new(0, 0.25).expect("valid start");
+    text_path.alignment = TextPathAlignment::Center;
+    text_path.direction = TextPathDirection::Reverse;
+    text_path.side = TextPathSide::Flipped;
+    let mut text_path = CanvasNode::new(NodeData::TextPath(text_path));
+    text_path.parent = Some(root_id);
+    doc.apply(Operation::create_node(text_path)).unwrap();
+
     // Pull the per-node Values exactly as write_project_tree does.
     let doc_val = serde_json::to_value(&doc).unwrap();
     let nodes: Vec<Value> = doc_val["scene"]["nodes"]
@@ -997,7 +1013,7 @@ fn real_doc_node_projection_round_trips() {
         .values()
         .cloned()
         .collect();
-    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes.len(), 4);
 
     let back = round_trip(&nodes);
     assert_same_nodes(&nodes, &back);
@@ -1686,27 +1702,30 @@ fn path_edit_on_authored_rect_falls_back_to_canonical_vector() {
     assert!(patched.contains("<Frame name=\"Card\">"));
 }
 
-/// A legacy generated file whose import line byte-equals a previous printer's
-/// output upgrades to the current import (which names the sugar tags), so a
-/// hand-added `<Rect>` in an old file is not a TypeScript error.
+/// Legacy generated imports upgrade one generation at a time, keeping newly
+/// persisted tags available to TypeScript tooling without duplicating imports.
 #[test]
 fn canonicalizer_upgrades_the_legacy_import_line_in_place() {
-    let legacy_import = "import { AiArtifact, Audio, Boolean, Embed, Frame, Image, Instance, Model3D, NodeGraph, Text, Vector, Video } from \"../../fnx\";";
-    let legacy_source = format!(
-        "{}\n{}\n{legacy_import}\n// @generated fanta source\nexport default () => <Frame name=\"Card\" />;\n",
-        crate::canonicalize::JSX_RUNTIME_PRAGMA,
-        crate::canonicalize::JSX_FACTORY_PRAGMA,
-    );
+    for legacy_import in [
+        "import { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, Vector, Video } from \"../../fnx\";",
+        "import { AiArtifact, Audio, Boolean, Embed, Frame, Image, Instance, Model3D, NodeGraph, Text, Vector, Video } from \"../../fnx\";",
+    ] {
+        let legacy_source = format!(
+            "{}\n{}\n{legacy_import}\n// @generated fanta source\nexport default () => <Frame name=\"Card\" />;\n",
+            crate::canonicalize::JSX_RUNTIME_PRAGMA,
+            crate::canonicalize::JSX_FACTORY_PRAGMA,
+        );
 
-    let upgraded =
-        canonicalize_legacy_source(&legacy_source).expect("legacy import line should upgrade");
-    assert!(upgraded.contains(crate::canonicalize::FNX_TAG_IMPORT));
-    assert!(
-        !upgraded.contains(legacy_import),
-        "old import replaced, not duplicated:\n{upgraded}"
-    );
-    assert_eq!(upgraded.matches("from \"../../fnx\"").count(), 1);
-    assert_eq!(canonicalize_legacy_source(&upgraded), None, "idempotent");
+        let upgraded =
+            canonicalize_legacy_source(&legacy_source).expect("legacy import line should upgrade");
+        assert!(upgraded.contains(crate::canonicalize::FNX_TAG_IMPORT));
+        assert!(
+            !upgraded.contains(legacy_import),
+            "old import replaced, not duplicated:\n{upgraded}"
+        );
+        assert_eq!(upgraded.matches("from \"../../fnx\"").count(), 1);
+        assert_eq!(canonicalize_legacy_source(&upgraded), None, "idempotent");
+    }
 }
 
 #[test]

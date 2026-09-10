@@ -12,7 +12,8 @@
 
 use super::{
     AutoLayout, CanvasNode, Constraints, GroupNode, LayoutChild, MaskType, NodeData, Reaction,
-    ScrollBehavior, ScrollDirection, TextNode, TextStyle, TextStyleRun, VectorNode,
+    ScrollBehavior, ScrollDirection, TextNode, TextPathAlignment, TextPathDirection, TextPathNode,
+    TextPathSide, TextPathStart, TextStyle, TextStyleRun, VectorNode,
 };
 use crate::binding::BoundProp;
 use crate::color::Color;
@@ -136,10 +137,25 @@ fn maximal_variants() -> Vec<NodeData> {
     text.paragraph_spacing = 4.0;
     text.paragraph_indent = 2.0;
 
+    let mut text_path = TextPathNode::new(
+        crate::path::PathData::rect(0.0, 0.0, 10.0, 10.0),
+        "path text",
+    );
+    text_path.style_runs.push(TextStyleRun {
+        start: 0,
+        end: 4,
+        style: TextStyle::default(),
+    });
+    text_path.start = TextPathStart::DEFAULT.with_segment(2);
+    text_path.alignment = TextPathAlignment::End;
+    text_path.direction = TextPathDirection::Reverse;
+    text_path.side = TextPathSide::Flipped;
+
     vec![
         NodeData::Group(group),
         NodeData::Vector(vector),
         NodeData::Text(text),
+        NodeData::TextPath(text_path),
     ]
 }
 
@@ -173,6 +189,19 @@ mod tests {
         let text = known_fields("text").expect("text tag known");
         for key in ["content", "style", "style_runs", "truncate", "max_lines"] {
             assert!(text.contains(key), "text table missing `{key}`");
+        }
+        let text_path = known_fields("text_path").expect("text_path tag known");
+        for key in [
+            "path",
+            "content",
+            "style",
+            "style_runs",
+            "start",
+            "alignment",
+            "direction",
+            "side",
+        ] {
+            assert!(text_path.contains(key), "text_path table missing `{key}`");
         }
         // Typos are NOT known.
         assert!(!group.contains("colour"));
