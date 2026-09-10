@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use fanta_doc::{
     BlendMode, Blur, BlurKind, BoundProp, Color as FantaColor, ComponentId, Doc, Fill, Gradient,
-    LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, Shadow,
-    ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, Transform2D,
+    GradientStop, LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape,
+    Shadow, ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, Transform2D,
     VAlign as TextVAlign, VarValue,
 };
 use fanta_gpui::design::{
@@ -29,17 +29,17 @@ use fanta_gpui::design::{
     DesignComponentReference, DesignComponentRole, DesignCornerCapabilities, DesignEffect,
     DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop,
     DesignLayout, DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
-    DesignPageBackground, DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintProperty,
-    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
-    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
-    DesignPanelEditPhase, DesignPanelInspectionContext, DesignPanelMultipleSelection,
-    DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout,
-    DesignPanelPermissions, DesignPanelProperty, DesignPanelPropertyValueState, DesignPanelSection,
-    DesignPanelTarget, DesignPanelValue, DesignSizingMode, DesignStroke, DesignStrokeAlign,
-    DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeJoin,
-    DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
-    DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment,
-    DesignTransformOperation, DesignTypography,
+    DesignPageBackground, DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintPayload,
+    DesignPaintProperty, DesignPaintTransform, DesignPaintValue, DesignPanel, DesignPanelAction,
+    DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap,
+    DesignPanelCollection, DesignPanelEditPhase, DesignPanelInspectionContext,
+    DesignPanelMultipleSelection, DesignPanelNode, DesignPanelNodeCapabilities,
+    DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelPermissions, DesignPanelProperty,
+    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelTarget, DesignPanelValue,
+    DesignSizingMode, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
+    DesignStrokeDashes, DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights,
+    DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
+    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 
@@ -55,8 +55,10 @@ use crate::properties_ops::{
 };
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
-    CornerRadiusValue, InspectorField, NodeSection, NodeSnapshot, PaintSnapshot, PropValueSnapshot,
-    TypographySnapshot, master_roots, multi_section, node_section, page_section,
+    CornerRadiusValue, HiddenPaintAlpha, InspectorField, NodeSection, NodeSnapshot, PaintKey,
+    PaintSnapshot, PropValueSnapshot, TypographySnapshot, master_roots, multi_section,
+    node_section, opaque_paint_alpha, page_section, paint_alpha, paint_alpha_is_visible,
+    set_paint_alpha, zeroed_paint_alpha,
 };
 use crate::view::FigView;
 
@@ -830,7 +832,8 @@ fn aggregate_selection(
     (node, states)
 }
 
-/// Bound-state projection for the whole-node `BoundProp`s the panel displays.
+/// Host-authored property states that cannot be inferred from the reusable
+/// panel model alone.
 fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
     let Some(node) = doc.scene.get(id) else {
         return Vec::new();
@@ -867,6 +870,15 @@ fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
             ),
         ));
     }
+    for index in 0..node.effects.len() {
+        states.push((
+            DesignPanelProperty::EffectShadowBlendMode(index),
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::BlendMode(
+                DesignBlendMode::Normal,
+            ))
+            .read_only_with_reason("Shadow blend modes are not supported by this document format"),
+        ));
+    }
     states
 }
 
@@ -894,6 +906,7 @@ pub(crate) struct DesignAdapter {
     pub panel: Entity<DesignPanel>,
     pub(crate) last_echo: Option<DesignEchoKey>,
     pub(crate) session: Option<DesignEditSession>,
+    hidden_paint_alpha: HashMap<PaintKey, HiddenPaintAlpha>,
     _subscription: Subscription,
 }
 
@@ -912,6 +925,7 @@ impl DesignAdapter {
             panel,
             last_echo: None,
             session: None,
+            hidden_paint_alpha: HashMap::new(),
             _subscription: subscription,
         }
     }
@@ -1760,21 +1774,26 @@ impl FigView {
             DesignPanelCollection::Stroke => true,
             _ => return,
         };
-        let value = match (&edit.property, &edit.value) {
-            (DesignPaintProperty::Color, DesignPaintValue::Color(color)) => {
-                PaintEditValue::Color(fanta_color(*color))
+        if let (DesignPaintProperty::Visible, DesignPaintValue::Bool(visible)) =
+            (&edit.property, &edit.value)
+        {
+            self.handle_design_paint_visibility(id, is_stroke, index, *visible, phase, window, cx);
+            return;
+        }
+        let Some(value) = paint_edit_value(edit) else {
+            log::debug!(
+                "fig design adapter: unavailable paint edit {:?}",
+                edit.property
+            );
+            if phase == DesignPanelEditPhase::Commit {
+                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
             }
-            (DesignPaintProperty::Opacity, DesignPaintValue::Number(percent)) => {
-                PaintEditValue::Opacity(f64::from(*percent))
-            }
-            _ => {
-                log::debug!(
-                    "fig design adapter: unhandled paint edit {:?}",
-                    edit.property
-                );
-                return;
-            }
+            return;
         };
+        let replaces_payload = matches!(
+            &value,
+            PaintEditValue::SolidPayload(_) | PaintEditValue::GradientPayload(_)
+        );
         // Route through the shared phased machinery by synthesizing the
         // property key: paint edits reuse a whole-node snapshot, so Begin /
         // Preview / Cancel behave exactly like ordinary property gestures.
@@ -1838,6 +1857,9 @@ impl FigView {
                 if session.is_some() {
                     item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
                 }
+                if committed && replaces_payload {
+                    self.forget_hidden_paint_alpha(id, is_stroke);
+                }
             }
             DesignPanelEditPhase::Cancel => {
                 self.handle_design_phased_edit(
@@ -1849,6 +1871,77 @@ impl FigView {
                     cx,
                 );
             }
+        }
+    }
+
+    fn handle_design_paint_visibility(
+        &mut self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        visible: bool,
+        phase: DesignPanelEditPhase,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if phase != DesignPanelEditPhase::Commit {
+            return;
+        }
+        self.finish_document_edits_for_external_change(cx);
+        let key = PaintKey {
+            id,
+            index,
+            is_stroke,
+        };
+        let remembered = self
+            .gpui_design
+            .as_ref()
+            .and_then(|adapter| adapter.hidden_paint_alpha.get(&key))
+            .cloned();
+        let item = self.item().clone();
+        let plan = {
+            let item = item.read(cx);
+            if !item.is_editable() {
+                return;
+            }
+            item.document().and_then(|document| {
+                paint_visibility_operations(
+                    &document.doc,
+                    id,
+                    is_stroke,
+                    index,
+                    visible,
+                    remembered.as_ref(),
+                )
+            })
+        };
+        let Some(plan) = plan else {
+            log::debug!("fig design adapter: unavailable paint visibility edit");
+            crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            return;
+        };
+        if !self.design_apply_ops(plan.operations, cx) {
+            return;
+        }
+        let Some(adapter) = self.gpui_design.as_mut() else {
+            return;
+        };
+        match plan.memory_update {
+            PaintVisibilityMemoryUpdate::Preserve => {}
+            PaintVisibilityMemoryUpdate::Store(alpha) => {
+                adapter.hidden_paint_alpha.insert(key, alpha);
+            }
+            PaintVisibilityMemoryUpdate::Remove => {
+                adapter.hidden_paint_alpha.remove(&key);
+            }
+        }
+    }
+
+    fn forget_hidden_paint_alpha(&mut self, id: NodeId, is_stroke: bool) {
+        if let Some(adapter) = self.gpui_design.as_mut() {
+            adapter
+                .hidden_paint_alpha
+                .retain(|key, _| key.id != id || key.is_stroke != is_stroke);
         }
     }
 
@@ -1897,8 +1990,10 @@ impl FigView {
         } else {
             self.finish_document_edits_for_external_change(cx);
         }
+        let mut unhandled = false;
         let ops = self.design_ops(cx, |doc| {
             effect_edit_operations(doc, id, reference, property, value).unwrap_or_else(|| {
+                unhandled = true;
                 log::debug!("fig design adapter: unhandled effect edit {property:?}");
                 Vec::new()
             })
@@ -1906,6 +2001,9 @@ impl FigView {
         let committed = self.design_apply_ops(ops, cx);
         if session.is_some() {
             item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
+        }
+        if unhandled {
+            crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
         }
     }
 
@@ -2095,6 +2193,71 @@ fn flip_operations(doc: &Doc, ids: &[NodeId], horizontal: bool) -> Vec<Operation
 enum PaintEditValue {
     Color(FantaColor),
     Opacity(f64),
+    BlendMode(BlendMode),
+    SolidPayload(FantaColor),
+    GradientPayload(Gradient),
+}
+
+fn paint_edit_value(edit: &fanta_gpui::design::DesignPaintEdit) -> Option<PaintEditValue> {
+    match (&edit.property, &edit.value) {
+        (DesignPaintProperty::Color, DesignPaintValue::Color(color)) => {
+            Some(PaintEditValue::Color(fanta_color(*color)))
+        }
+        (DesignPaintProperty::Opacity, DesignPaintValue::Number(percent))
+            if percent.is_finite() =>
+        {
+            Some(PaintEditValue::Opacity(f64::from(*percent)))
+        }
+        (DesignPaintProperty::BlendMode, DesignPaintValue::BlendMode(mode)) => {
+            engine_blend_mode(*mode).map(PaintEditValue::BlendMode)
+        }
+        (DesignPaintProperty::Payload, DesignPaintValue::Payload(payload)) => match payload {
+            DesignPaintPayload::Solid(solid) if solid.binding.is_none() => {
+                Some(PaintEditValue::SolidPayload(fanta_color(solid.color)))
+            }
+            DesignPaintPayload::Gradient(gradient)
+                if gradient.transform == DesignPaintTransform::IDENTITY
+                    && gradient.stops.len() >= 2
+                    && gradient.stops.iter().all(|stop| {
+                        stop.binding.is_none()
+                            && stop.position.is_finite()
+                            && (0.0..=1.0).contains(&stop.position)
+                    }) =>
+            {
+                let stops = gradient
+                    .stops
+                    .iter()
+                    .map(|stop| GradientStop {
+                        position: stop.position,
+                        color: fanta_color(stop.color),
+                    })
+                    .collect();
+                let linear = Gradient::Linear {
+                    start: [0.5, 0.0],
+                    end: [0.5, 1.0],
+                    stops,
+                };
+                let kind = match gradient.kind {
+                    DesignPaintKind::LinearGradient => GradientKind::Linear,
+                    DesignPaintKind::RadialGradient => GradientKind::Radial,
+                    DesignPaintKind::AngularGradient => GradientKind::Angular,
+                    DesignPaintKind::DiamondGradient => GradientKind::Diamond,
+                    _ => return None,
+                };
+                Some(PaintEditValue::GradientPayload(
+                    crate::color_picker::convert_gradient_kind(&linear, kind),
+                ))
+            }
+            DesignPaintPayload::Pattern(_)
+            | DesignPaintPayload::Image(_)
+            | DesignPaintPayload::Video(_)
+            | DesignPaintPayload::Shader(_)
+            | DesignPaintPayload::Unsupported(_)
+            | DesignPaintPayload::Solid(_)
+            | DesignPaintPayload::Gradient(_) => None,
+        },
+        _ => None,
+    }
 }
 
 fn paint_edit_operations(
@@ -2129,7 +2292,77 @@ fn paint_edit_operations(
             },
             &format_number(*percent),
         ),
+        PaintEditValue::BlendMode(blend_mode) => replace_data_operation(doc, id, |data| {
+            if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
+                match paint {
+                    Fill::Solid { blend, .. }
+                    | Fill::Gradient { blend, .. }
+                    | Fill::Image { blend, .. } => *blend = *blend_mode,
+                }
+            }
+        }),
+        PaintEditValue::SolidPayload(color) => {
+            solid_paint_color_operations(doc, id, is_stroke, index, *color)
+        }
+        PaintEditValue::GradientPayload(gradient) => replace_data_operation(doc, id, |data| {
+            crate::properties_ops::set_paint_gradient(data, index, is_stroke, gradient.clone());
+        }),
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum PaintVisibilityMemoryUpdate {
+    Preserve,
+    Store(HiddenPaintAlpha),
+    Remove,
+}
+
+struct PaintVisibilityPlan {
+    operations: Vec<Operation>,
+    memory_update: PaintVisibilityMemoryUpdate,
+}
+
+fn paint_visibility_operations(
+    doc: &Doc,
+    id: NodeId,
+    is_stroke: bool,
+    index: usize,
+    visible: bool,
+    remembered: Option<&HiddenPaintAlpha>,
+) -> Option<PaintVisibilityPlan> {
+    let node = doc.scene.get(id)?;
+    let mut data = node.data.clone();
+    let paint = crate::properties_ops::paint_slot_mut(&mut data, index, is_stroke)?;
+    let current = paint_alpha(paint);
+    if paint_alpha_is_visible(&current) == visible {
+        return Some(PaintVisibilityPlan {
+            operations: Vec::new(),
+            memory_update: PaintVisibilityMemoryUpdate::Preserve,
+        });
+    }
+    let (target, memory_update) = if visible {
+        let target = remembered
+            .filter(|remembered| {
+                std::mem::discriminant(*remembered) == std::mem::discriminant(&current)
+            })
+            .cloned()
+            .unwrap_or_else(|| opaque_paint_alpha(&current));
+        (target, PaintVisibilityMemoryUpdate::Remove)
+    } else {
+        (
+            zeroed_paint_alpha(paint),
+            PaintVisibilityMemoryUpdate::Store(current),
+        )
+    };
+    let operations = replace_data_operation(doc, id, |data| {
+        if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
+            set_paint_alpha(paint, &target);
+        }
+    });
+    Some(PaintVisibilityPlan {
+        operations,
+        memory_update,
+    })
 }
 
 fn solid_paint_color_operations(
@@ -2416,7 +2649,7 @@ fn property_operations(
                 new: node.flags ^ NodeFlags::HIDDEN,
             }])
         }
-        (P::BlendMode, V::BlendMode(mode)) => Some(blend_mode_operations(doc, id, *mode)),
+        (P::BlendMode, V::BlendMode(mode)) => blend_mode_operations(doc, id, *mode),
         (P::ClipContent, V::Bool(enabled)) => {
             Some(set_clip_content_meta_operation(doc, id, *enabled))
         }
@@ -2705,10 +2938,8 @@ fn property_operations(
 
 /// Pass through clears `ISOLATED_BLEND`; Normal sets it; every concrete
 /// engine mode writes `SetBlendMode`. Two writes batch into one transaction.
-fn blend_mode_operations(doc: &Doc, id: NodeId, mode: DesignBlendMode) -> Vec<Operation> {
-    let Some(node) = doc.scene.get(id) else {
-        return Vec::new();
-    };
+fn blend_mode_operations(doc: &Doc, id: NodeId, mode: DesignBlendMode) -> Option<Vec<Operation>> {
+    let node = doc.scene.get(id)?;
     let mut operations = Vec::new();
     match mode {
         DesignBlendMode::PassThrough => {
@@ -2744,10 +2975,7 @@ fn blend_mode_operations(doc: &Doc, id: NodeId, mode: DesignBlendMode) -> Vec<Op
             }
         }
         other => {
-            let Some(target) = engine_blend_mode(other) else {
-                log::debug!("fig design adapter: unsupported blend mode {other:?}");
-                return Vec::new();
-            };
+            let target = engine_blend_mode(other)?;
             if node.blend_mode != target {
                 operations.push(Operation::SetBlendMode {
                     id,
@@ -2757,7 +2985,7 @@ fn blend_mode_operations(doc: &Doc, id: NodeId, mode: DesignBlendMode) -> Vec<Op
             }
         }
     }
-    operations
+    Some(operations)
 }
 
 fn set_independent_corners(data: &mut NodeData, independent: bool) {
@@ -2985,6 +3213,202 @@ mod tests {
         assert!(
             (rotated - 90.0).abs() < 0.01,
             "a square at 0° turns to 90°, got {rotated}"
+        );
+    }
+
+    fn apply_operations(doc: &mut Doc, operations: Vec<Operation>) {
+        for operation in operations {
+            doc.apply(operation).expect("apply inspector operation");
+        }
+    }
+
+    fn paint_at(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Fill {
+        let mut data = doc.scene.get(id).expect("node exists").data.clone();
+        crate::properties_ops::paint_slot_mut(&mut data, index, is_stroke)
+            .cloned()
+            .expect("paint exists")
+    }
+
+    #[test]
+    fn paint_visibility_mutates_fills_and_strokes_and_restores_their_alpha() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let node = doc.scene.get_mut(rect).expect("rect exists");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("test rect should be a vector");
+        };
+        vector.strokes.push(fanta_doc::Stroke::solid(
+            FantaColor::rgba(0x10, 0x20, 0x30, 0x80),
+            2.0,
+        ));
+
+        for is_stroke in [false, true] {
+            let original = paint_alpha(&paint_at(&doc, rect, is_stroke, 0));
+            let PaintVisibilityPlan {
+                operations,
+                memory_update,
+            } = paint_visibility_operations(&doc, rect, is_stroke, 0, false, None)
+                .expect("paint visibility is wired");
+            assert_eq!(
+                memory_update,
+                PaintVisibilityMemoryUpdate::Store(original.clone())
+            );
+            assert_eq!(operations.len(), 1, "hiding writes the paint once");
+            apply_operations(&mut doc, operations);
+            assert!(!crate::properties_snapshot::paint_is_visible(&paint_at(
+                &doc, rect, is_stroke, 0
+            )));
+
+            let PaintVisibilityPlan {
+                operations,
+                memory_update,
+            } = paint_visibility_operations(&doc, rect, is_stroke, 0, true, Some(&original))
+                .expect("paint visibility is wired");
+            assert_eq!(memory_update, PaintVisibilityMemoryUpdate::Remove);
+            assert_eq!(operations.len(), 1, "showing writes the paint once");
+            apply_operations(&mut doc, operations);
+            assert_eq!(
+                paint_alpha(&paint_at(&doc, rect, is_stroke, 0)),
+                original,
+                "showing restores the pre-hide alpha"
+            );
+        }
+    }
+
+    #[test]
+    fn paint_payload_and_blend_edits_mutate_supported_engine_paints() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let gradient = DesignPaint::gradient(
+            DesignPaintKind::LinearGradient,
+            vec![
+                DesignGradientStop::new(0.0, DesignColor::rgb(0x11, 0x22, 0x33)),
+                DesignGradientStop::new(1.0, DesignColor::rgba(0x44, 0x55, 0x66, 0x40)),
+            ],
+        );
+        let payload_edit = fanta_gpui::design::DesignPaintEdit {
+            property: DesignPaintProperty::Payload,
+            value: DesignPaintValue::Payload(gradient.payload),
+        };
+        let payload_value = paint_edit_value(&payload_edit).expect("gradient payload is supported");
+        let operations = paint_edit_operations(&doc, rect, false, 0, &payload_value);
+        apply_operations(&mut doc, operations);
+        assert!(matches!(
+            paint_at(&doc, rect, false, 0),
+            Fill::Gradient { .. }
+        ));
+
+        let blend_edit = fanta_gpui::design::DesignPaintEdit {
+            property: DesignPaintProperty::BlendMode,
+            value: DesignPaintValue::BlendMode(DesignBlendMode::Multiply),
+        };
+        let blend_value = paint_edit_value(&blend_edit).expect("paint blend is supported");
+        let operations = paint_edit_operations(&doc, rect, false, 0, &blend_value);
+        apply_operations(&mut doc, operations);
+        assert!(matches!(
+            paint_at(&doc, rect, false, 0),
+            Fill::Gradient {
+                blend: BlendMode::Multiply,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unsupported_paint_payloads_and_blends_are_declined_explicitly() {
+        let unsupported_paints = [
+            DesignPaint::pattern("pattern-node"),
+            DesignPaint::image(fanta_gpui::design::DesignPaintSource::default()),
+            DesignPaint::video(fanta_gpui::design::DesignPaintSource::default()),
+            DesignPaint::shader("shader-id", "Shader"),
+        ];
+        for paint in unsupported_paints {
+            let edit = fanta_gpui::design::DesignPaintEdit {
+                property: DesignPaintProperty::Payload,
+                value: DesignPaintValue::Payload(paint.payload),
+            };
+            assert!(
+                paint_edit_value(&edit).is_none(),
+                "the host must route an unsupported payload to its unavailable notice"
+            );
+        }
+        for mode in [
+            DesignBlendMode::PassThrough,
+            DesignBlendMode::LinearBurn,
+            DesignBlendMode::LinearDodge,
+        ] {
+            let edit = fanta_gpui::design::DesignPaintEdit {
+                property: DesignPaintProperty::BlendMode,
+                value: DesignPaintValue::BlendMode(mode),
+            };
+            assert!(
+                paint_edit_value(&edit).is_none(),
+                "an unmappable paint blend must route to the unavailable notice"
+            );
+        }
+    }
+
+    #[test]
+    fn node_blend_declines_linear_modes_but_preserves_pass_through() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        for mode in [DesignBlendMode::LinearBurn, DesignBlendMode::LinearDodge] {
+            assert!(
+                property_operations(
+                    &doc,
+                    rect,
+                    DesignPanelProperty::BlendMode,
+                    &DesignPanelValue::BlendMode(mode),
+                )
+                .is_none(),
+                "an unmappable visible choice must route to the unavailable notice"
+            );
+        }
+
+        let node = doc.scene.get_mut(rect).expect("rect exists");
+        node.flags.insert(NodeFlags::ISOLATED_BLEND);
+        node.blend_mode = BlendMode::Multiply;
+        let operations = property_operations(
+            &doc,
+            rect,
+            DesignPanelProperty::BlendMode,
+            &DesignPanelValue::BlendMode(DesignBlendMode::PassThrough),
+        )
+        .expect("Pass through is supported");
+        assert_eq!(operations.len(), 2);
+        apply_operations(&mut doc, operations);
+        let node = doc.scene.get(rect).expect("rect exists");
+        assert!(!node.flags.contains(NodeFlags::ISOLATED_BLEND));
+        assert_eq!(node.blend_mode, BlendMode::Normal);
+    }
+
+    #[test]
+    fn shadow_blend_is_host_disabled_when_the_document_has_no_representation() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.scene
+            .get_mut(rect)
+            .expect("rect exists")
+            .effects
+            .push(default_shadow());
+        let states = bound_states(&doc, rect);
+        let state = states
+            .iter()
+            .find_map(|(property, state)| {
+                (*property == DesignPanelProperty::EffectShadowBlendMode(0)).then_some(state)
+            })
+            .expect("the host supplies a shadow blend state");
+        assert!(state.is_read_only(), "the visible control must be disabled");
+        assert!(matches!(
+            state.resolved(),
+            Some(DesignPanelValue::BlendMode(DesignBlendMode::Normal))
+        ));
+        assert!(
+            effect_edit_operations(
+                &doc,
+                rect,
+                EffectRef::Shadow(0),
+                DesignPanelProperty::EffectShadowBlendMode(0),
+                &DesignPanelValue::BlendMode(DesignBlendMode::Multiply),
+            )
+            .is_none(),
+            "a stale direct action must be reported as unavailable"
         );
     }
 
