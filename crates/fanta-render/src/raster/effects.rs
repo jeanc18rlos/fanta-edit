@@ -1094,7 +1094,7 @@ pub(crate) fn node_silhouette_path(
             })
         }
         NodeData::Text(text) => text_node_outline(text).map(|path| to_sk_fill_path(&path)),
-        NodeData::TextPath(text_path) => text_path_outline(text_path),
+        NodeData::TextPath(text_path) => text_path_outline(text_path).into_exact(),
         NodeData::Boolean(boolean) => fold_operands(scene, scene_id?, boolean.op),
         NodeData::Group(g) => frame_box_bounds(g, scene_id, scene).map(|b| {
             rounded_rect_path(

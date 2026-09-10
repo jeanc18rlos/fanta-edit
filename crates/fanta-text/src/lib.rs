@@ -63,6 +63,7 @@ pub use font_resolver::{
     bundled_family_names, bundled_preview_bytes, prewarm_font_downloads,
 };
 pub use layout::{
-    LayoutEngine, LayoutOptions, LineMetrics, ShapedGlyph, ShapedGlyphRun, TextLayout,
+    LayoutEngine, LayoutOptions, LineMetrics, ShapedGlyph, ShapedGlyphError, ShapedGlyphRun,
+    ShapedTextCluster, TextLayout,
 };
 pub use style::{FontWeight, TextStyle};

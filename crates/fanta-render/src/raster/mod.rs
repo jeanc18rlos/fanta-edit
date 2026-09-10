@@ -111,6 +111,13 @@ pub use text::{
     text_caret_rect, text_first_baseline, text_hit_test, text_line_height, text_node_outline,
     text_selection_rects,
 };
+pub use text_path::{
+    TextPathAffinity, TextPathCaretSegment, TextPathPosition, TextPathSelectionQuad,
+    TextPathVisualDirection, text_path_caret_segment, text_path_caret_segment_at,
+    text_path_contains_point, text_path_hit_test, text_path_hit_test_position,
+    text_path_selection_quads, text_path_visual_bounds, text_path_visual_line_edge,
+    text_path_visual_neighbor, text_path_visual_selection_edge,
+};
 pub use vector::vector_outline_sk_path; // track svg-prod
 
 // Crate-internal items shared across the submodules (and exercised by the

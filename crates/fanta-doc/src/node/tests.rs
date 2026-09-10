@@ -249,6 +249,22 @@ fn text_path_defaults_are_omitted_and_restore_canonically() {
 }
 
 #[test]
+fn text_path_local_bounds_conservatively_include_shaped_ink_band() {
+    let mut path = crate::PathData::new();
+    path.move_to(0.0, 0.0).line_to(100.0, 0.0);
+    let mut text_path = TextPathNode::new(path, "Baseline");
+    text_path.style.size_px = 20.0;
+
+    let bounds = NodeData::TextPath(text_path)
+        .local_bounds()
+        .expect("text path bounds");
+    assert_eq!(bounds.min_x, -80.0);
+    assert_eq!(bounds.max_x, 180.0);
+    assert_eq!(bounds.min_y, -80.0);
+    assert_eq!(bounds.max_y, 80.0);
+}
+
+#[test]
 fn replacing_vector_with_text_path_keeps_identity_and_undo_redo() {
     let mut doc = Doc::new();
     let vector = VectorNode {

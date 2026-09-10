@@ -608,9 +608,36 @@ impl NodeData {
                 .or(g.local_size)
                 .map(|[w, h]| Bounds::from_xywh(0.0, 0.0, w, h)),
             Self::Vector(v) => v.path.rough_bounds(),
-            // Phase-one bounds are the owned baseline only. Exact glyph bounds
-            // depend on shaping and belong to the renderer integration.
-            Self::TextPath(text_path) => text_path.path.rough_bounds(),
+            // The scene index cannot shape glyphs, but it must not exclude
+            // painted text before the renderer can perform an exact hit test.
+            // Font bounds can extend outside the em, so use a deliberately
+            // conservative band around the baseline here; renderer-facing
+            // selection/export bounds replace this with exact shaped ink.
+            Self::TextPath(text_path) => {
+                let bounds = text_path.path.rough_bounds()?;
+                let em = std::iter::once(&text_path.style)
+                    .chain(text_path.style_runs.iter().map(|run| &run.style))
+                    .filter_map(|style| {
+                        if !style.size_px.is_finite() || style.size_px <= 0.0 {
+                            return None;
+                        }
+                        let spacing = if style.letter_spacing.is_finite() {
+                            style.letter_spacing.abs()
+                        } else {
+                            0.0
+                        };
+                        Some(style.size_px + spacing)
+                    })
+                    .fold(0.0, f64::max);
+                let padding = (em * 4.0).max(1.0);
+                let expanded = Bounds {
+                    min_x: bounds.min_x - padding,
+                    min_y: bounds.min_y - padding,
+                    max_x: bounds.max_x + padding,
+                    max_y: bounds.max_y + padding,
+                };
+                expanded.is_finite().then_some(expanded).or(Some(bounds))
+            }
             data => data
                 .local_size()
                 .map(|[w, h]| Bounds::from_xywh(0.0, 0.0, w, h)),

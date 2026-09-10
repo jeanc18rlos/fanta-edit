@@ -112,13 +112,14 @@ fn text_path_visual_bounds_include_glyphs_decorations_and_effect_reach() {
 }
 
 #[test]
-fn unclipped_group_culling_uses_exact_text_path_descendant_bounds() {
+fn unclipped_group_culling_keeps_text_path_descendant_ink() {
     let mut path = PathData::new();
     path.move_to(-20.0, 80.0).line_to(100.0, 80.0);
     let mut text_path = TextPathNode::new(path, "H");
     text_path.style.size_px = 64.0;
     text_path.style.color = Color::rgb(20, 40, 220);
 
+    let exact = text_path_bounds(&text_path).expect("shaped glyph bounds");
     let mut doc = Doc::new();
     let outer = CanvasNode::new(NodeData::Group(GroupNode::default()));
     let outer_id = outer.id;
@@ -134,8 +135,11 @@ fn unclipped_group_culling_uses_exact_text_path_descendant_bounds() {
     let authored = doc
         .scene
         .local_bounds(outer_id)
-        .expect("baseline bounds are cached");
-    assert!(authored.min_y > 52.0);
+        .expect("conservative text-path bounds are cached");
+    assert!(authored.min_x <= exact.min_x);
+    assert!(authored.min_y <= exact.min_y);
+    assert!(authored.max_x >= exact.max_x);
+    assert!(authored.max_y >= exact.max_y);
 
     let mut renderer = RasterRenderer::new(100, 100).unwrap();
     renderer.render(&doc.scene, &doc.viewport);

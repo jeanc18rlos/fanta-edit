@@ -4491,6 +4491,8 @@ dependencies = [
  "skia-safe",
  "smallvec",
  "thiserror 2.0.17",
+ "tracing",
+ "unicode-segmentation",
 ]
 
 [[package]]
