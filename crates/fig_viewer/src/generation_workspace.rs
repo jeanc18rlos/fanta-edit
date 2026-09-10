@@ -154,12 +154,33 @@ struct GenerationResponse {
     output: Vec<Value>,
     #[serde(default)]
     model: Option<String>,
-    #[serde(default)]
-    seed: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_generation_seed")]
+    seed: Option<String>,
     #[serde(default)]
     billed_credits: Option<f64>,
     #[serde(default)]
     error: Option<Value>,
+}
+
+fn deserialize_generation_seed<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Seed {
+        Text(String),
+        Number(u64),
+    }
+
+    Ok(
+        Option::<Seed>::deserialize(deserializer)?.map(|seed| match seed {
+            Seed::Text(seed) => seed,
+            Seed::Number(seed) => seed.to_string(),
+        }),
+    )
 }
 
 impl GenerationResponse {
@@ -1008,7 +1029,7 @@ impl GenerationWorkspace {
                     if let Some(credits) = response.billed_credits {
                         status.push_str(&format!(" · {credits:.2} credits"));
                     }
-                    if let Some(seed) = response.seed {
+                    if let Some(seed) = &response.seed {
                         status.push_str(&format!(" · Seed {seed}"));
                     }
                     self.status = status.into();
@@ -2473,10 +2494,18 @@ fn build_request(
             input["text"] = json!(prompt.trim());
         }
         if !points.is_empty() {
+            ensure!(
+                points
+                    .iter()
+                    .all(|point| [point.x, point.y].into_iter().all(|coordinate| {
+                        coordinate.is_finite() && (0.0..=u32::MAX as f64).contains(&coordinate)
+                    })),
+                "Mask points must be valid source image coordinates."
+            );
             input["points"] = json!(
                 points
                     .iter()
-                    .map(|point| json!({"x":point.x,"y":point.y,"positive":point.positive}))
+                    .map(|point| json!({"x":point.x.floor() as u32,"y":point.y.floor() as u32,"positive":point.positive}))
                     .collect::<Vec<_>>()
             );
         }
@@ -2738,7 +2767,8 @@ fn image_point(
     let scale = (box_width / width as f32).min(box_height / height as f32);
     let x = (x - (box_width - width as f32 * scale) / 2.) / scale;
     let y = (y - (box_height - height as f32 * scale) / 2.) / scale;
-    (x >= 0. && y >= 0. && x < width as f32 && y < height as f32).then_some((x as f64, y as f64))
+    (x >= 0. && y >= 0. && x < width as f32 && y < height as f32)
+        .then_some((x.floor() as f64, y.floor() as f64))
 }
 
 fn preview_point(
@@ -2863,6 +2893,17 @@ mod tests {
         view.read_with(cx, |view, _| {
             let point = view.points.first().expect("click should add a point");
             assert!((point.x - 256.).abs() < 1. && (point.y - 256.).abs() < 1.);
+        });
+        cx.simulate_click(
+            bounds.center() + gpui::point(px(0.5), px(0.25)),
+            gpui::Modifiers::none(),
+        );
+        view.read_with(cx, |view, _| {
+            let point = view
+                .points
+                .last()
+                .expect("off-grid click should add a point");
+            assert_eq!((point.x, point.y), (257., 256.));
         });
     }
 
@@ -3027,6 +3068,129 @@ mod tests {
         assert!(error.to_string().contains("account changed"));
     }
 
+    #[test]
+    fn generation_response_seed_preserves_backend_text_and_numeric_compatibility() {
+        for (seed, expected) in [
+            (None, None),
+            (Some(Value::Null), None),
+            (Some(json!(42)), Some("42")),
+            (Some(json!(u64::MAX)), Some("18446744073709551615")),
+            (Some(json!("9007199254740993")), Some("9007199254740993")),
+            (
+                Some(json!("184467440737095516160001")),
+                Some("184467440737095516160001"),
+            ),
+            (Some(json!("00042")), Some("00042")),
+        ] {
+            let mut value = json!({"id":"seed-contract", "status":"succeeded", "output":[]});
+            if let Some(seed) = seed {
+                value["seed"] = seed;
+            }
+            let response: GenerationResponse = serde_json::from_value(value).expect("backend seed");
+            assert_eq!(
+                response.seed.as_ref().map(ToString::to_string).as_deref(),
+                expected
+            );
+        }
+    }
+
+    async fn assert_string_seed_generation_completes(pending: bool, cx: &mut gpui::TestAppContext) {
+        let seed = "184467440737095516160001";
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("generated image");
+        let completed = json!({
+            "id":"seed-contract", "status":"succeeded", "model":"fanta-image-1",
+            "seed":seed, "billed_credits":1,
+            "output":[{"data_url":format!("data:image/png;base64,{}", STANDARD.encode(png.into_inner()))}],
+        });
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let http = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            move |request| {
+                let completed = completed.clone();
+                let requests = requests.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models":[]}),
+                        (&Method::POST, "/v1/generations") => {
+                            requests.lock().expect("request log").push("submission");
+                            if pending {
+                                json!({"id":"seed-contract", "status":"processing"})
+                            } else {
+                                completed
+                            }
+                        }
+                        (&Method::GET, "/v1/generations/seed-contract") => {
+                            requests.lock().expect("request log").push("poll");
+                            completed
+                        }
+                        route => panic!("Unexpected generation request: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client, cx);
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "seed-contract".into(),
+                    request: json!({"model":"fanta-image-1", "prompt":"A sunrise"}),
+                    model: "fanta-image-1".into(),
+                    prompt: "A sunrise".into(),
+                    source: None,
+                    account,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        if pending {
+            assert!(view.read_with(cx, |view, _| view.pending && view.task.is_some()));
+            cx.executor().advance_clock(Duration::from_secs(2));
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_none());
+            assert!(!view.pending);
+            assert!(view.unresolved_submission.is_none());
+            assert_eq!(view.outputs.len(), 1);
+            assert_eq!(view.history.len(), 1);
+            assert!(view.preview.is_some());
+            assert!(
+                view.status.contains(seed),
+                "preserve the backend seed exactly: {}",
+                view.status
+            );
+        });
+        let expected = if pending {
+            vec!["submission", "poll"]
+        } else {
+            vec!["submission"]
+        };
+        assert_eq!(*requests.lock().expect("request log"), expected);
+    }
+
+    #[gpui::test]
+    async fn generation_completed_submission_accepts_backend_string_seed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_string_seed_generation_completes(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_poll_accepts_backend_string_seed(cx: &mut gpui::TestAppContext) {
+        assert_string_seed_generation_completes(true, cx).await;
+    }
+
     struct PendingBody;
 
     impl futures::AsyncRead for PendingBody {
@@ -3082,6 +3246,7 @@ mod tests {
                             "id":"accepted-before-timeout", "status":"succeeded",
                             "output":[{"url":"https://media.example/result.mp4", "mime":"video/mp4"}],
                             "billed_credits":1,
+                            "seed":"9007199254740993", "idempotent_replay":true,
                         })
                         .to_string()
                         .into(),
@@ -3137,6 +3302,7 @@ mod tests {
             assert!(view.error.is_none());
             assert_eq!(view.history.len(), 1);
             assert_eq!(view.outputs.len(), 1);
+            assert!(view.status.contains("Seed 9007199254740993"));
             assert_eq!(
                 view.active_run.as_ref().and_then(RunSummary::generation_id),
                 Some("accepted-before-timeout")
@@ -3477,7 +3643,7 @@ mod tests {
         .expect("valid segmentation");
         assert_eq!(
             request["input"],
-            json!({"source":{"asset_id":"source"},"text":"person","points":[{"x":120.,"y":80.,"positive":false}]})
+            json!({"source":{"asset_id":"source"},"text":"person","points":[{"x":120,"y":80,"positive":false}]})
         );
         assert!(request.get("prompt").is_none());
     }
@@ -3636,6 +3802,74 @@ mod tests {
             .to_rgba8();
         assert_eq!(image.get_pixel(0, 0).0, [200, 100, 50, 128]);
         assert_eq!(image.get_pixel(1, 0).0, [200, 100, 50, 0]);
+    }
+
+    #[test]
+    fn generation_mask_points_use_integer_source_pixels() {
+        let (x, y) = image_point(100.5, 100.25, 200., 200., 512, 512).expect("off-grid click");
+        assert_eq!((x, y), (257., 256.));
+        let (last_x, last_y) =
+            image_point(199.99, 199.99, 200., 200., 512, 512).expect("last pixel");
+        assert_eq!((last_x, last_y), (511., 511.));
+        assert_eq!(image_point(-0.01, 100., 200., 200., 512, 512), None);
+        assert_eq!(image_point(100., -0.01, 200., 200., 512, 512), None);
+        assert_eq!(image_point(200., 100., 200., 200., 512, 512), None);
+        assert_eq!(image_point(100., 200., 200., 200., 512, 512), None);
+        let request = build_request(
+            &model("segment"),
+            "person",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            Some(json!({"asset_id":"source"})),
+            None,
+            &[
+                MaskPoint {
+                    x,
+                    y,
+                    positive: false,
+                },
+                MaskPoint {
+                    x: last_x,
+                    y: last_y,
+                    positive: true,
+                },
+            ],
+        )
+        .expect("source pixel request");
+        assert_eq!(request["input"]["points"][0]["x"].as_u64(), Some(257));
+        assert_eq!(request["input"]["points"][0]["y"].as_u64(), Some(256));
+        assert_eq!(request["input"]["points"][0]["positive"], false);
+        assert_eq!(request["input"]["points"][1]["x"].as_u64(), Some(511));
+        assert_eq!(request["input"]["points"][1]["y"].as_u64(), Some(511));
+        assert_eq!(request["input"]["points"][1]["positive"], true);
+        for coordinate in [-1., f64::NAN, f64::INFINITY] {
+            assert!(
+                build_request(
+                    &model("segment"),
+                    "person",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    Some(json!({"asset_id":"source"})),
+                    None,
+                    &[MaskPoint {
+                        x: coordinate,
+                        y: 0.,
+                        positive: true
+                    }],
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
