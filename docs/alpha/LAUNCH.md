@@ -19,6 +19,15 @@ Updated on 2026-09-10. First release target: Apple Silicon Mac.
 - Backend analytics now flush within the request lifetime, as required for
   [PostHog in serverless environments](https://posthog.com/docs/libraries/node#short-lived-processes-like-serverless-environments).
 
+Video preview runtime `110868d` passes six real native decoder tests and all
+606 editor tests. Generated MP4 results now have first-frame posters, oriented
+canvas placement, cached Save/Play bytes and account-change guards. Negative
+prompts follow the selected model's capabilities while preserving the draft.
+Seven timing cases passed 20 iterations each. Full native app and installer QA
+for this source is pending; playback still uses the system player, and inline
+video playback/editing plus production GPU verification remain unfinished.
+See the video-poster section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
+
 ## Required before accepting payment
 
 Production Vercel has the AI Gateway, database, and Clerk settings. The
