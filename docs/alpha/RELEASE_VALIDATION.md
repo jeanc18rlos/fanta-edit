@@ -8,10 +8,16 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | --- | --- |
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
-| Editor and video | Both complete `00abf93` hosted checks pass. Trim and its right-edge replay correction pass 649 editor tests, 11 media library tests and 11 native playback cases. Native trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing pass. The final QA app closed normally and all 21 saved files remain exact. |
+| Editor and video | Both `17de5eb` hosted checks pass. The current candidate through `5184d4b` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its compact toolbar, command registration, Export feedback, Design draft contract, and inspector paint changes still need exact-candidate native verification. Earlier trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing passed natively; the QA app closed normally and all 21 saved files remain exact. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
-| Distribution | The a9f320d installer passed with notarization skipped; the 00abf93 installer is building. A notarized installer, clean-Mac validation and automatic updates remain open. |
+| Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
+
+The hosted installer was downloaded after completion. Its published SHA-256,
+image CRC, embedded `17de5eb` revision, strict ad-hoc signature, arm64 app/CLI,
+and bundled Git 2.53.0 passed non-launch inspection. The image was detached
+normally and the user's existing Fanta processes remained unchanged. Evidence:
+`/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
 
 ## Latest trim, database and native checkpoint
 
@@ -33,7 +39,10 @@ showed Pause at 0.319 seconds, followed by Play at the 0.800-second end.
 The included cyan scene, clipping and foreground overlap remained visible.
 A normal Save and quit preserved all 21 fixture files exactly. The QA app
 exited with code zero. This local binary includes preserved user changes and
-is not a notarized installer. Hosted follow-up checks remain pending. Evidence
+is not a notarized installer. Both hosted follow-up checks pass; its exact
+hosted installer also passed packaging, bundle/checksum verification, artifact
+upload, and crash-symbol upload at 13:52 UTC. Notarization was skipped, and the
+artifact has not been used for the clean-install pass. Evidence
 is in `video-trim-validation/end-scrub`, including `native-verification.json`
 and the four hashed screenshots.
 

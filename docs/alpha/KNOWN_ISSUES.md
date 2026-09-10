@@ -1,13 +1,10 @@
 # Known issues, Fanta 0.1.0-alpha.1
 
-Written from the code and from the alpha rehearsal, not from wishful thinking.
-Every entry is something a tester can hit on purpose. Where a claim comes from
-reading source rather than from running the app, it says so. Re-checked entry by
-entry against the working tree of `perf/large-documents-ai-alignment` — the
-uncommitted work on top of `16309b2` — by grepping for the thing each one
-claims; entries that work closed have been deleted or rewritten rather than left
-standing, and entries that only a human at the keyboard could confirm are
-labelled as source readings.
+Written from the code, the alpha rehearsal, and the focused validation record;
+not from wishful thinking. Every entry is something a tester can hit on purpose.
+Where a claim comes from reading source rather than from running the app, it
+says so. Reconciled against desktop commit `17de5eb`; the release-facing status
+matrix is [`CAPABILITY_INVENTORY.md`](CAPABILITY_INVENTORY.md).
 
 **A release binary has now been built from this tree and driven.** On
 2026-09-09, `cargo build --release -p zed` produced `target/release/fanta`,
@@ -32,13 +29,12 @@ built afterwards and driven to check it; that pagination result is the only
 measurement here taken against the later binary, and it says so where it
 appears.
 
-**Nothing was clicked.** No mouse, no menu, no toolbar button, no keyboard
-shortcut, no canvas drag, no layers-panel interaction, no image paste, no DMG
-and no Gatekeeper path. Everything reachable only by a pointer or a key press is
-still a source reading and says so, including the drag path (`ScenePatch`,
-`crates/fig_viewer/src/canvas.rs`), which unit tests and whatever the MCP edits
-happened to trigger are the only things that have exercised it — no human has
-dragged a node in this build.
+**The full manual smoke pass has not been completed against one artifact.**
+Focused native fixtures have clicked through Scale and Path Select behavior,
+generation workspaces, durable generation recovery, and other bounded flows.
+Menus, the complete toolbar, image paste, the DMG/Gatekeeper path, and several
+other pointer-only surfaces still need the exact-artifact pass. The evidence and
+its limits are in [`RELEASE_VALIDATION.md`](RELEASE_VALIDATION.md).
 
 [`REHEARSAL.md`](REHEARSAL.md) is the committed record of what was and was not
 actually driven. Nothing here claims more than that record supports.
@@ -108,47 +104,30 @@ actually driven. Nothing here claims more than that record supports.
 
 ## Canvas and tools
 
-- **Unwired faces stay visible and tell you so when clicked.** The toolbar and
-  the layers/pages panels come from the vendored `fanta-gpui` crate, which
-  exposes no host-side API to hide or disable a control — the comment above the
-  `tool_kind` match in `view.rs::handle_toolbar_action` records this
-  ("the vendored toolbar has no host-side API to hide a tool"). Hiding them would
-  have meant patching a vendored crate on the eve of the alpha, so that was
-  **deliberately deferred**; instead
-  the host declines the action and raises a notice reading
-  *"&lt;control&gt; is not available in the Fanta alpha yet."*
-  (`view.rs::notify_unavailable`). You will meet it on the **Scale**, **Path
-  Selection** and **Text-on-Path** tools (they have a tool object but no
-  behaviour, so arming them would silently swallow every drag), on **Dev mode**,
-  on the toolbar's **file-attach** and **voice** buttons, on **Remove
-  background** and **Generate an image** in the toolbar's AI menu (there is no
-  image backend to hand them to — `toolbar_agent_prompt_template` in `view.rs`
-  returns `None` for both), on **auto-keyframe recording**, on **"mark ready
-  for dev"**, on **time-anchored comments**, on **page duplication** and **page
-  links** (`design_panel.rs`, `PagesPanelAction::DuplicateRequested` /
-  `CopyLinkRequested`), and on a number of inspector controls.
-- **The other five toolbar AI commands open a draft in the Agent Panel; they do
-  not run anything themselves.** *Generate a design*, *Replace content*,
-  *Rewrite text*, *Translate text* and *Rename layers* each put a prompt
-  template into a fresh Agent Panel draft — with blanks such as
-  `<describe the screen>` you are meant to fill in — and so does anything typed
-  into the toolbar's own AI box (`toolbar_agent_prompt_template` and
-  `route_toolbar_agent_prompt`, `view.rs`). The draft is prefixed with the page
-  name, the selection count and up to eight selected layers as
-  `- <name> (<kind>, id <node id>, <w>x<h> at <x>,<y>)` (`agent_prompt_context`),
-  and nothing is sent until you press send: `agent_ui::open_external_prompt_for_review`
-  demands the manual send so a toolbar button cannot bypass the panel's review
-  boundary. Without a working agent configuration (see Agents) you get a draft
-  you cannot send anywhere. Source reading — no toolbar button has been clicked
-  in a build of this tree.
-- **Group, Frame selection and Ungroup now exist, and nobody has pressed the
-  keys yet.** `cmd-g`, `cmd-alt-g` and `cmd-shift-g` are bound to
+- **Roadmap faces stay visible and decline explicitly.** Text-on-path, direct
+  Image/Video placement, Arrow, Annotation, Measure, Dev mode/tools, toolbar
+  file attachment and voice, auto-keyframe recording, time-anchored comments,
+  page duplication, and page links are not implemented. Their handlers raise
+  *"&lt;control&gt; is not available in the Fanta alpha yet."* or an equally
+  specific notice. Scale and Path Select are implemented and have focused
+  native history/reopen evidence; Image, Video, Vector, Masks, and Remove
+  Background open their dedicated generation workspaces.
+- **Ask AI and text-oriented commands prepare Agent drafts, not automatic
+  edits.** A typed Ask AI prompt and the Replace Content, Rewrite Text,
+  Translate Text, and Rename Layers templates open a fresh Agent Panel draft
+  with page and selection context. Nothing is sent until the user reviews and
+  submits it. Generate Design opens the Design workspace, whose explicit
+  “Prepare unsent Agent brief” action uses the registered `design_state`,
+  `design_edit`, and `design_screenshot` tools without requiring a generation
+  account. It remains a draft handoff rather than the agreed end-to-end design
+  generation, progress, review, acceptance, and Undo workflow.
+- **Group, Frame selection and Ungroup are wired and registered.** `cmd-g`,
+  `cmd-alt-g` and `cmd-shift-g` are bound to
   `fig_viewer::GroupSelection` / `FrameSelection` / `UngroupSelection` in both
   the `FigViewer && !Editor` and `FantaDesignPanel && !Editor` contexts
-  (`assets/keymaps/default-macos.json`), the toolbar's *Group selection* /
-  *Ungroup selection* / *Frame selection* commands route to the same handlers
-  (`view.rs::handle_toolbar_action`, `ToolbarCommand::Group` and friends), and so
-  do the layers context menu's entries (`design_panel.rs::handle_layers_context_action`,
+  (`assets/keymaps/default-macos.json`). Their Actions-palette entries route to
+  the same handlers, as do the layers context menu entries
+  (`design_panel.rs::handle_layers_context_action`,
   which acts on the selection when the clicked row is part of it and on that
   row alone otherwise — `view.rs::structure_targets`). The builders live in
   `crates/fig_viewer/src/structure.rs`. What to expect, from reading them:
@@ -164,17 +143,23 @@ actually driven. Nothing here claims more than that record supports.
   (*"an instance cannot be ungrouped; detach it first"*), a component master
   (*"… detach or delete the component instead"*), or something that is not a
   group (*"select a group or frame to ungroup"*). Unit-tested in
-  `structure.rs`. The keys have still not been pressed, but the same builders
-  were reached over MCP on 2026-09-09: `batch_design`'s `group` and `ungroup`
-  ops both succeeded on both test documents. `frame_selection` was not among
-  the ops driven.
-- Grid auto layout is offered in the inspector and the engine ignores it: the
-  adapter logs a line and returns no operations at all
-  (`gpui_adapters/design.rs::layout_mode_operations`). Horizontal and vertical
-  auto layout work.
-- Pass Through, Linear Burn and Linear Dodge are listed as blend modes and do
-  nothing; the engine has no equivalent, so the adapter emits no operation
-  (`gpui_adapters/design.rs`). The other blend modes map straight through.
+  `structure.rs`. Exact palette search/action tests now cover all three structure
+  commands and the four text-AI commands. The same builders were reached over
+  MCP on 2026-09-09:
+  `batch_design`'s `group` and `ungroup` ops succeeded on both test documents;
+  `frame_selection` was not among the operations driven.
+- Grid auto layout is removed from the default inspector; horizontal and
+  vertical auto layout work.
+- **Inspector paint edits now mutate undoably or decline explicitly in the
+  current candidate.** Fill and stroke visibility, supported solid payloads,
+  finite unbound gradients with an identity transform, and per-paint blend-mode
+  changes produce document edits. Pattern, Image, Video, and Shader payloads,
+  bound paint payloads, and unsupported or nonidentity-transform gradients
+  raise the existing unavailable notice. These changes have automated coverage;
+  exact-artifact native verification remains open.
+- Pass Through works. Linear Burn and Linear Dodge are explicitly unavailable
+  because they cannot map to engine blend modes. Shadow blend is read-only
+  because the document model has no representation for it.
 - Effects are limited to drop shadow, inner shadow, layer blur and background
   blur. Every other effect kind is reported as unsupported in the inspector.
 - **Select more than 512 layers and the per-layer outlines disappear.** Above
@@ -270,14 +255,26 @@ actually driven. Nothing here claims more than that record supports.
   thereafter. (A viewport that genuinely crops the shape has no `<Rect>`
   spelling and still prints as a canonical `<Vector>`; that is correct, not a
   regression.)
-- Export runs in the inspector and needs a project root, so the project has to
-  have been written at least once. Files land in `<project>/exports/`
-  (`export.rs:260`), in PNG, JPG, SVG or PDF (`ExportFormat`). The toolbar's
-  Export command is **not** a second flow: it forces the inspector sidebar open
-  and defers to the same `export_selection`
-  (`view.rs::export_from_toolbar`), because every failure it can hit — unsaved
-  project, unexportable bounds — is reported as inspector feedback and would
-  otherwise look like a click that did nothing.
+- **Export's engine and toolbar feedback work, but preset configuration is not
+  visible in the default inspector.** Export needs a written project and can
+  produce PNG, JPG, SVG, or PDF under `<project>/exports/`. Toolbar Export calls
+  that same engine, preserves the current sidebar state, and mirrors running,
+  success, and failure messages to the canvas. The default GPUI inspector still
+  removes the legacy Export section, so users cannot configure the existing
+  1×/2×/4× presets or formats from the shipped surface. Automated success and
+  unsaved-canvas cases pass; exact-artifact native verification remains open.
+- **The document-backed timeline is ahead of its toolbar.** Motion mode can
+  create/select/rename clips, change duration, add property tracks and
+  keyframes from the timeline-wide `+ Keyframe` menu, move/delete keyframes,
+  edit interpolation/easing, apply entrance presets, play, loop, scrub, and
+  zoom. The contextual Animation Style chooser currently changes only toolbar
+  state; its Keyframe chip is guidance rather than the real property chooser.
+  The duplicate primary Motion flyout still declines Motion Select, Play
+  Preview, Add Keyframe, and Animation Style even where contextual/runtime
+  equivalents work. Auto-keyframe, motion paths, and time comments have no
+  document implementation yet. Production uses `fig_viewer::TimelineShell`;
+  the reusable `fanta-gpui` timeline tests exercise the pseudo editor, not the
+  shipped timeline.
 - The Code tab is read-only by design. Edit `.fnx` in your own editor and the
   canvas follows the file. Note that with autosave on, `page.fnx`'s mtime moves
   about a second after any canvas edit — **an unchanged mtime is no longer a

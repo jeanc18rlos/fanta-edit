@@ -9,16 +9,14 @@ Start from a clean profile:
 rm -rf ~/Library/Application\ Support/Fanta ~/Library/Logs/Fanta
 ```
 
-[`REHEARSAL.md`](REHEARSAL.md) is the record of a dry run of this checklist. It
-is the reference for what has and has not been exercised before: most rows below
-are marked *NOT VERIFIED* there because neither rehearsal could drive anything
-behind a mouse click. Rows 0, 5 (the external-edit half), 7 and 8 are the only
-rows that have ever passed end to end, and rows 0 and 5 are the two a machine
-can prove on its own. Row 0 passed **18 of 18, exit 0** against a release build
-of `perf/large-documents-ai-alignment` on 2026-09-09, and the timing note at the
-foot of this page has been run for the first time; everything else is still
-waiting on a human, so treat an unexpected result as a finding rather than as
-your own mistake.
+[`REHEARSAL.md`](REHEARSAL.md) records the original dry run of this checklist;
+[`RELEASE_VALIDATION.md`](RELEASE_VALIDATION.md) records the later focused
+native and automated checks. Row 0 passed **18 of 18, exit 0** against a release
+build on 2026-09-09. Subsequent native fixtures exercised Scale, Path Select,
+generation workspaces, recovery across restarts, and other bounded flows, but
+this entire pointer-driven checklist has not yet passed against one release
+artifact. Do not promote a focused fixture result into a claim that its whole
+row passed.
 
 Rows marked **new** were added after the rehearsal — from its wave-2 list, and
 from the Gatekeeper dance it never exercised because it ran an unbundled debug
@@ -40,7 +38,7 @@ binary. Nobody has run any of them.
 | 5 | Wait ~2 s after the last canvas edit without pressing anything, then `git -C <project> status --short`. Then edit `page.fnx` in another editor and save. | **The edit is already on disk** — autosave writes about a second after you stop, so `page.fnx` is modified with no `cmd-s`. Expect three modified files for a one-node change: `pages/…/page.fnx`, `pages/…/page.ids.json`, `doc/metadata.json`. Do **not** assert an unchanged mtime anywhere in this row; autosave moves it. The external edit then updates both canvas and Code pane, and raises a *"&lt;file&gt; changed on disk — canvas updated"* notice. |
 | 5a | Open the Code tab | Source renders highlighted; the tab shows its file path; selecting a node on the canvas moves the Code tab to that node's source; typing does nothing (read-only by design). `~/Library/Application Support/Fanta/languages/` gains no new entries. |
 | 5b | **new** File > Review Changes, then File > Commit… | Review Changes opens the project diff on the design folder itself and shows the `page.fnx` / `page.ids.json` / `doc/metadata.json` changes row 5 just made; Commit… opens the commit flow on the same folder. Both are wired in `crates/zed/src/zed/app_menus.rs` (`git_ui::project_diff::Diff`, `git::Commit`). If Review Changes shows nothing, check the project actually has a `.git` — see the Xcode Command Line Tools entry in KNOWN_ISSUES.md. |
-| 6 | Click every visible toolbar tool. Submit a prompt in the toolbar's AI box. Inspector > Export PNG. | Tools either draw or raise *"&lt;control&gt; is not available in the Fanta alpha yet."* — never a click that does nothing. Expect that notice on Scale, Path Selection, Text-on-Path, Dev mode, file-attach, voice, and on Group/Ungroup. The AI box opens an agent draft; the PNG lands in `<project>/exports/`. |
+| 6 | Click every visible toolbar tool and command. Exercise Scale and Path Select. Submit a prompt through **Ask AI**. Open each media-AI workspace. Run Export from Actions. | Move/drawing tools act; Scale and Path Select visibly transform/edit a selection; roadmap controls such as Text-on-path, Dev mode/tools, file attachment and voice raise *"&lt;control&gt; is not available in the Fanta alpha yet."* — never a silent click. Ask AI opens an unsent Agent draft with page/selection context. Image, Video, Vector and Masks commands open their matching workspace. Group/Ungroup/Frame and the four text-AI commands are registered and automatically verified. Export writes the default preset to `<project>/exports/`, preserves sidebar state, and shows running plus success or failure feedback on the canvas. **Remaining limitation:** preset/format configuration is still hidden with the legacy inspector section; verify the default toolbar flow natively in this row. |
 | 7 | Quit and relaunch | `Smoke/` is back in the rail and the canvas reopens on the same page, with any external edits still present. |
 | 8 | File > Open... `~/Desktop/basic.fig`; then File > Open... the `Smoke` folder | The `.fig` renders and materialises `basic/` beside itself, git-initialised; the folder opens straight onto the canvas. Neither raises the Restricted Mode dialog. |
 | 8a | File > Open... a folder that is **not** a design project (any plain git checkout) | The inherited *"Unrecognized Project"* / Restricted Mode dialog **does** appear, and cannot be dismissed with Escape. This is expected — see KNOWN_ISSUES.md. Confirm the design projects in row 8 did not raise it. |

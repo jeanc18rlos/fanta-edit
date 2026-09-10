@@ -21,13 +21,27 @@ Updated on 2026-09-10. First release target: Apple Silicon Mac.
 
 ## Latest release checkpoint — September 10
 
-Both complete hosted checks for desktop `00abf93` pass. Its combined native
-build passed 639 editor tests; a second save and a save after full restart
-preserved all 20 project files, including three original MP4s. Native video
-orientation, clipping and toolbar placement were checked. The earlier hosted
-consecutive-seek failure is corrected and its original timestamp/pixel guards
-pass. The a9f320d installer passed packaging and upload with notarization skipped;
-the 00abf93 installer is building. Notarization and clean-Mac validation remain open.
+The current desktop candidate through `5184d4b` adds the compact centered
+canvas toolbar, restrained shared popup styling, explicit Ask AI action,
+responsive zoom tiers, registered structure/text-AI commands, visible toolbar
+Export feedback, an honest unsent Design AI brief contract, and undoable
+inspector paint edits with explicit unsupported states. It passes all 646
+viewer tests, all 591 shared GPUI tests plus three architecture tests, all 11
+media-library and 11 native-playback cases, and release-mode Clippy for
+`fig_viewer`/`fanta-gpui`. Exact native interaction and persistence checks for
+this candidate are the next gate.
+
+Desktop `17de5eb` now has successful push and pull-request checks. Its local
+candidate passes the 649 editor, 11 media-library and 11 native-playback cases
+described below. Its exact hosted Apple Silicon installer completed successfully
+at 13:52 UTC: build/package, bundle and checksum verification, installer upload,
+and crash-symbol upload passed. Notarization and draft-release publication were
+skipped because this push build has no distribution credentials. It is a test
+artifact, not a customer release; download/launch, notarization, Gatekeeper, and
+clean-Mac validation remain open. The downloaded artifact's checksum, embedded
+revision, strict ad-hoc signature, arm64 binaries, and bundled Git were verified
+without launching it; retained evidence is
+`/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
 
 Selected normal-speed video now has Start/End inputs and Apply/Cancel. Trimming
 prepares a new poster before one undoable range/poster edit, preserving the
@@ -48,7 +62,9 @@ failed against the published trim runtime, then passed with all 649 editor,
 follow-up native build passed in 7m21s. Dragging to 0.800 seconds, clicking
 Play once, and observing 0.319 then 0.800 seconds verified restart and stop.
 The included cyan scene remained visible, all 21 saved files stayed exact,
-and the QA app closed normally. Hosted checks for this follow-up remain pending.
+and the QA app closed normally. Both hosted checks for this follow-up pass. Its
+exact hosted installer also passed packaging and artifact upload at 13:52 UTC;
+it was not notarized or launched as a clean-install artifact.
 
 Backend `9510f61` passes all four CI jobs: 537 backend tests, 153 CPU worker
 tests, 17 real PostgreSQL cases and the container build. It includes guarded
