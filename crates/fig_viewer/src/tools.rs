@@ -136,7 +136,7 @@ impl ToolKind {
     }
 
     /// Placeholder tools that appear in the toolbar but have no behavior yet
-    /// (Scale, direct path-selection, text-on-path).
+    /// (Scale and text-on-path).
     ///
     /// The legacy native tool pill renders these with a "soon" hint. The
     /// default fanta-gpui toolbar has no host-side API to hide or disable a
@@ -144,7 +144,7 @@ impl ToolKind {
     /// says so in a notice instead — arming a tool that swallows every drag
     /// reads as a frozen canvas.
     pub fn is_stub(self) -> bool {
-        matches!(self, Self::Scale | Self::PathSelect | Self::TextPath)
+        matches!(self, Self::Scale | Self::TextPath)
     }
 
     fn build(self) -> Box<dyn Tool> {
@@ -257,7 +257,7 @@ impl ToolShell {
             Some(CursorHint::Move) | Some(CursorHint::Default) => CursorStyle::Arrow,
             None => match self.kind {
                 ToolKind::Hand => CursorStyle::OpenHand,
-                ToolKind::Select => CursorStyle::Arrow,
+                ToolKind::Select | ToolKind::PathSelect => CursorStyle::Arrow,
                 ToolKind::Text => CursorStyle::IBeam,
                 _ => CursorStyle::Crosshair,
             },

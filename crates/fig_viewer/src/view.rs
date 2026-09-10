@@ -160,7 +160,7 @@ actions!(
         ActivateSliceTool,
         /// Activate the scale tool (placeholder).
         ActivateScaleTool,
-        /// Activate the direct path-selection tool (placeholder).
+        /// Activate direct selection of vector anchors and segments.
         ActivatePathSelectTool,
         /// Activate the text-on-path tool (placeholder).
         ActivateTextPathTool,
@@ -7706,7 +7706,7 @@ impl FigView {
             } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    // Scale, path-selection and text-on-path have a canvas
+                    // Scale and text-on-path have a canvas
                     // tool object but no behavior, so activating them would
                     // arm a face that silently swallows every drag. The
                     // vendored toolbar has no host-side API to hide a tool

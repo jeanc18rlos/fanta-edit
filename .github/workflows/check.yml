@@ -46,6 +46,9 @@ jobs:
       - name: Test document snapshots and file compatibility
         run: cargo test --locked -p fanta-doc -p fanta-format
 
+      - name: Test canvas editing tools
+        run: cargo test --locked -p fanta-tools --lib
+
       - name: Test Git sync without a system installation
         run: cargo test --locked -p git --lib bundled_git_
 
@@ -89,7 +92,8 @@ jobs:
           cargo test --locked -p sidebar --lib test_selection_
           cargo test --locked -p sidebar --lib test_confirm_on_historical_thread_preserves_historical_timestamp_and_order
 
-      - name: Test canvas toolbar text entry
+      - name: Test canvas toolbar interactions
         run: |
           cargo test --locked -p fanta-gpui --lib organisms::toolbar::component::interaction_tests
           cargo test --locked -p fig_viewer --lib toolbar_actions_query_keeps_text_input_with_canvas_keybindings
+          cargo test --locked -p fig_viewer --lib path_selection_toolbar_drag_edits_segment_endpoints_and_undoes

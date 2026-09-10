@@ -658,6 +658,122 @@ mod echo_tests {
     }
 
     #[gpui::test]
+    async fn path_selection_toolbar_drag_edits_segment_endpoints_and_undoes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = test_doc();
+        let mut original = fanta_doc::PathData::new();
+        original
+            .move_to(0., 0.)
+            .line_to(100., 0.)
+            .line_to(100., 100.);
+        let mut vector = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: original.clone(),
+            fills: Default::default(),
+            strokes: [fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 2.)]
+                .into_iter()
+                .collect(),
+            corner_radius: None,
+            corner_radii: None,
+            corner_smoothing: 0.,
+            local_size: None,
+            parametric: None,
+        }));
+        vector.parent = doc.active_page();
+        vector.transform = Transform2D::translation(-100., 100.);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create editable path");
+        doc.selection.clear();
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Path-selection.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::PathSelect,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::PathSelect
+        );
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [-50., 150.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center() + point(px(0.), px(-50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let edited = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.contains(vector_id));
+            assert_eq!(doc.history.undo_depth(), 1);
+            let path = &doc
+                .scene
+                .get(vector_id)
+                .expect("vector")
+                .data
+                .as_vector()
+                .expect("path")
+                .path;
+            let mut expected = fanta_doc::PathData::new();
+            expected
+                .move_to(20., 30.)
+                .line_to(120., 30.)
+                .line_to(100., 100.);
+            assert_eq!(path, &expected);
+            path.clone()
+        });
+        for (command, expected) in [
+            (ToolbarCommand::Undo, original),
+            (ToolbarCommand::Redo, edited),
+        ] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let actual = &item
+                    .doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path;
+                assert_eq!(actual, &expected);
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn toolbar_actions_query_keeps_text_input_with_canvas_keybindings(
         cx: &mut TestAppContext,
     ) {

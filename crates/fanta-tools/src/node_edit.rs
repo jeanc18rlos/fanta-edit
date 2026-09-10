@@ -31,7 +31,7 @@ use crate::node_math::{
     self, AnchorId, AnchorInfo, HandleSide, closest_point_on_path, enumerate_anchors,
 };
 use crate::tool::{CursorHint, Tool, ToolOverlay, ToolResponse, bounds_from_corners};
-use fanta_doc::{NodeData, NodeId, Operation, PathData, Transform2D};
+use fanta_doc::{NodeData, NodeFlags, NodeId, Operation, PathData, Transform2D};
 use glam::DVec2;
 use std::collections::BTreeSet;
 
@@ -81,6 +81,7 @@ enum Phase {
 
 /// The node-edit (direct selection) tool state machine.
 pub struct NodeEditTool {
+    select_segments: bool,
     /// The vector node whose path is being edited.
     target: Option<NodeId>,
     /// Selected anchors of the target's path.
@@ -99,10 +100,18 @@ impl Default for NodeEditTool {
 impl NodeEditTool {
     pub fn new() -> Self {
         Self {
+            select_segments: false,
             target: None,
             selected: BTreeSet::new(),
             phase: Phase::Idle,
             insert_hover: None,
+        }
+    }
+
+    pub(crate) fn for_path_selection() -> Self {
+        Self {
+            select_segments: true,
+            ..Self::new()
         }
     }
 
@@ -131,6 +140,16 @@ impl Tool for NodeEditTool {
     }
 
     fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {
+        if self.select_segments
+            && self.target.is_some_and(|id| {
+                !eligible_selection_target(ctx, id) || !ctx.doc.selection.contains(id)
+            })
+        {
+            self.abort_drag(ctx);
+            self.target = None;
+            self.selected.clear();
+            self.insert_hover = None;
+        }
         // The shell swaps tools without calling `activate`, so the edit
         // target is (re-)derived lazily from the doc selection — this is what
         // makes "double-click a vector with Select" land here already armed.
@@ -166,22 +185,137 @@ fn is_vector(ctx: &ToolContext, id: NodeId) -> bool {
         .is_some_and(|n| n.data.as_vector().is_some())
 }
 
+fn eligible_selection_target(ctx: &ToolContext, id: NodeId) -> bool {
+    let scene = &ctx.doc.scene;
+    let Some(node) = scene.get(id) else {
+        return false;
+    };
+    if node.data.as_vector().is_none()
+        || node.flags.intersects(NodeFlags::LOCKED | NodeFlags::HIDDEN)
+        || scene.ancestors_of(id).any(|ancestor| {
+            ancestor
+                .flags
+                .intersects(NodeFlags::LOCKED | NodeFlags::HIDDEN)
+                || matches!(ancestor.data, NodeData::Boolean(_))
+        })
+        || ctx.scope().is_some_and(|root| {
+            id != root && !scene.ancestors_of(id).any(|ancestor| ancestor.id == root)
+        })
+    {
+        return false;
+    }
+    scene.world_transform(id).is_some_and(|transform| {
+        transform.0.is_finite() && transform.0.matrix2.determinant().abs() > f64::EPSILON
+    })
+}
+
 impl NodeEditTool {
     // -- target / geometry helpers --------------------------------------------
+
+    fn retarget_selection(&mut self, ctx: &mut ToolContext, screen: DVec2) {
+        if !matches!(self.phase, Phase::Idle) {
+            self.abort_drag(ctx);
+        }
+        if let Some(path) = self.target_path(ctx) {
+            let world = self.target_world(ctx);
+            let anchors = enumerate_anchors(&path);
+            // Visible controls can extend outside the object's bounds and overlap other objects.
+            if self.anchor_at(ctx, &anchors, &world, screen).is_some()
+                || self.handle_at(ctx, &anchors, &world, screen).is_some()
+                || self.segment_at(ctx, &path, &world, screen).is_some()
+            {
+                return;
+            }
+        }
+        let world = ctx.screen_to_world(screen);
+        let radius = DVec2::splat(SEGMENT_HIT_PX);
+        let hit_bounds = fanta_doc::Bounds::from_min_max(
+            ctx.screen_to_world(screen - radius),
+            ctx.screen_to_world(screen + radius),
+        );
+        // Query the full screen-space tolerance before refining geometry, so thin
+        // paths and paths behind another vector's empty bounds remain reachable.
+        let candidates = ctx.doc.scene.rect_query_where(hit_bounds, |id, bounds| {
+            bounds.intersects(&hit_bounds)
+                && eligible_selection_target(ctx, id)
+                && ctx.doc.scene.ancestors_of(id).all(|ancestor| {
+                    let NodeData::Group(group) = &ancestor.data else {
+                        return true;
+                    };
+                    let Some([width, height]) = group.clip_size else {
+                        return true;
+                    };
+                    if ancestor
+                        .meta
+                        .get("clip_content")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(false)
+                    {
+                        return true;
+                    }
+                    ctx.doc
+                        .scene
+                        .world_transform(ancestor.id)
+                        .is_some_and(|transform| {
+                            if !transform.is_finite()
+                                || transform.0.matrix2.determinant().abs() <= f64::EPSILON
+                            {
+                                return false;
+                            }
+                            let local = transform.inverse().transform_point(world);
+                            local.x >= 0. && local.y >= 0. && local.x <= width && local.y <= height
+                        })
+                })
+        });
+        let previous_target = self.target;
+        for id in candidates.into_iter().rev() {
+            self.target = Some(id);
+            let on_path = self.target_path(ctx).is_some_and(|path| {
+                let world = self.target_world(ctx);
+                self.anchor_at(ctx, &enumerate_anchors(&path), &world, screen)
+                    .is_some()
+                    || self.segment_at(ctx, &path, &world, screen).is_some()
+                    || self.in_filled_path(ctx, screen)
+            });
+            if on_path {
+                if previous_target != self.target {
+                    self.selected.clear();
+                }
+                ctx.doc.selection.select_only(id);
+                return;
+            }
+        }
+        self.target = previous_target;
+    }
+
+    fn in_filled_path(&self, ctx: &ToolContext, screen: DVec2) -> bool {
+        self.target
+            .and_then(|id| ctx.doc.scene.get(id))
+            .and_then(|node| node.data.as_vector())
+            .is_some_and(|vector| {
+                !vector.fills.is_empty()
+                    && fanta_canvas::point_in_path(
+                        &vector.path,
+                        self.screen_to_local(ctx, &self.target_world(ctx), screen),
+                    )
+            })
+    }
 
     /// Keep `target` pointed at a live vector node: when it is unset (or its
     /// node vanished / changed kind), adopt the first selected vector from the
     /// doc. Dropping the target also drops the per-path anchor selection.
     fn ensure_target(&mut self, ctx: &ToolContext) {
-        if self.target.is_some_and(|id| is_vector(ctx, id)) {
+        let eligible = |id| {
+            if self.select_segments {
+                eligible_selection_target(ctx, id)
+            } else {
+                is_vector(ctx, id)
+            }
+        };
+        if self.target.is_some_and(eligible) {
             return;
         }
-        self.target = ctx
-            .doc
-            .selection
-            .iter()
-            .copied()
-            .find(|&id| is_vector(ctx, id));
+        self.target = ctx.doc.selection.iter().copied().find(|&id| eligible(id));
         self.selected.clear();
     }
 
@@ -248,6 +382,9 @@ impl NodeEditTool {
         old_data.path = old_path;
         let mut new_data = vec_now.clone();
         new_data.path = new_path;
+        if self.select_segments {
+            new_data.parametric = None;
+        }
         // Restore the pre-gesture data so `apply` re-establishes the final
         // value through history, recording a clean old→new pair.
         if let Some(n) = ctx.doc.scene.get_mut(id) {
@@ -274,6 +411,9 @@ impl NodeEditTool {
         let old_data = v.clone();
         let mut new_data = v.clone();
         new_data.path = new_path;
+        if self.select_segments {
+            new_data.parametric = None;
+        }
         if let Err(e) = ctx.doc.apply(Operation::ReplaceData {
             id,
             old: Box::new(NodeData::Vector(old_data)),
@@ -407,6 +547,21 @@ impl NodeEditTool {
         world_t: &Transform2D,
         screen: DVec2,
     ) -> Option<(usize, f64, DVec2)> {
+        if self.select_segments {
+            // Local-space proximity is distorted by non-uniform scale and skew.
+            let mut screen_path = path.clone();
+            screen_path.map_points_mut(|point| {
+                self.local_to_screen(ctx, world_t, DVec2::from(point))
+                    .to_array()
+            });
+            let hit = closest_point_on_path(&screen_path, screen)?;
+            return (hit.dist <= SEGMENT_HIT_PX)
+                .then(|| {
+                    node_math::eval_segment(path, hit.seg_index, hit.t)
+                        .map(|point| (hit.seg_index, hit.t, point))
+                })
+                .flatten();
+        }
         let local = self.screen_to_local(ctx, world_t, screen);
         let hit = closest_point_on_path(path, local)?;
         let on_screen = self.local_to_screen(ctx, world_t, hit.pos);
@@ -486,8 +641,13 @@ impl NodeEditTool {
         count: u8,
     ) -> ToolResponse {
         self.insert_hover = None;
+        if self.select_segments {
+            self.retarget_selection(ctx, screen);
+        }
         // No target yet: adopt the vector under the cursor.
-        if self.target.is_none() || !self.target.is_some_and(|id| is_vector(ctx, id)) {
+        if !self.select_segments
+            && (self.target.is_none() || !self.target.is_some_and(|id| is_vector(ctx, id)))
+        {
             let world = ctx.screen_to_world(screen);
             let hit = fanta_canvas::hit_test(
                 &ctx.doc.scene,
@@ -558,6 +718,29 @@ impl NodeEditTool {
 
         // 3) Segment within 6 px: insert an anchor at the split point.
         if let Some((seg_index, t, _)) = self.segment_at(ctx, &path, &world_t, screen) {
+            if self.select_segments {
+                if let Some(anchors) = node_math::segment_anchors(&path, seg_index) {
+                    let shift = modifiers.contains(ModifierKeys::SHIFT);
+                    if shift && anchors.iter().all(|anchor| self.selected.contains(anchor)) {
+                        for anchor in anchors {
+                            self.selected.remove(&anchor);
+                        }
+                        self.phase = Phase::Idle;
+                    } else {
+                        if !shift && !anchors.iter().all(|anchor| self.selected.contains(anchor)) {
+                            self.selected.clear();
+                        }
+                        self.selected.extend(anchors);
+                        self.phase = Phase::PressedAnchor {
+                            screen_press: screen,
+                            old_path: path,
+                            moving: self.selected.iter().copied().collect(),
+                        };
+                    }
+                    return self.overlay_response(ctx, CursorHint::Move);
+                }
+                return self.overlay_response(ctx, CursorHint::Default);
+            }
             if let Some((new_path, point)) = node_math::insert_at(&path, seg_index, t) {
                 self.apply_path_edit(ctx, new_path.clone());
                 // Select the freshly inserted anchor (nearest to the split point).
@@ -572,6 +755,16 @@ impl NodeEditTool {
                 self.phase = Phase::Idle;
                 return self.overlay_response(ctx, CursorHint::Default);
             }
+        }
+
+        if self.select_segments && self.in_filled_path(ctx, screen) {
+            self.selected.extend(anchors.iter().map(|anchor| anchor.id));
+            self.phase = Phase::PressedAnchor {
+                screen_press: screen,
+                old_path: path,
+                moving: self.selected.iter().copied().collect(),
+            };
+            return self.overlay_response(ctx, CursorHint::Move);
         }
 
         // 4) Empty space: marquee over anchors.
@@ -605,8 +798,12 @@ impl NodeEditTool {
                     } else if let Some((_, _, local)) =
                         self.segment_at(ctx, &path, &world_t, screen)
                     {
-                        self.insert_hover = Some(world_t.transform_point(local));
-                        cursor = CursorHint::Crosshair;
+                        if self.select_segments {
+                            cursor = CursorHint::Move;
+                        } else {
+                            self.insert_hover = Some(world_t.transform_point(local));
+                            cursor = CursorHint::Crosshair;
+                        }
                     }
                 }
                 self.overlay_response(ctx, cursor)

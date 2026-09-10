@@ -65,6 +65,58 @@ fn rect_bounds_are_tight() {
 }
 
 #[test]
+fn rough_bounds_contains_quadratic_and_cubic_curve_bodies() {
+    for cubic in [false, true] {
+        let mut path = PathData::new();
+        path.move_to(0., 0.);
+        if cubic {
+            path.cubic_to(-40., 120., 140., -80., 100., 0.);
+        } else {
+            path.quad_to(50., 80., 100., 0.);
+        }
+        let bounds = path.rough_bounds().expect("curve bounds");
+        assert_eq!(
+            bounds,
+            if cubic {
+                crate::Bounds::from_xywh(-40., -80., 180., 200.)
+            } else {
+                crate::Bounds::from_xywh(0., 0., 100., 80.)
+            }
+        );
+        for sample in 0..=32 {
+            let t = sample as f64 / 32.;
+            let u = 1. - t;
+            let point = if cubic {
+                glam::DVec2::new(-40., 120.) * (3. * u * u * t)
+                    + glam::DVec2::new(140., -80.) * (3. * u * t * t)
+                    + glam::DVec2::new(100., 0.) * (t * t * t)
+            } else {
+                glam::DVec2::new(50., 80.) * (2. * u * t) + glam::DVec2::new(100., 0.) * (t * t)
+            };
+            assert!(bounds.contains_point(point), "curve body {point:?}");
+        }
+    }
+}
+
+#[test]
+fn rough_bounds_filters_non_finite_curve_controls() {
+    let mut path = PathData::new();
+    path.move_to(f64::NAN, 0.)
+        .quad_to(10., 20., 30., f64::INFINITY)
+        .cubic_to(f64::NEG_INFINITY, 10., -5., -8., 0., 0.);
+    assert_eq!(
+        path.rough_bounds(),
+        Some(crate::Bounds::from_xywh(-5., -8., 15., 28.))
+    );
+    let mut invalid = PathData::new();
+    invalid
+        .move_to(f64::NAN, 0.)
+        .quad_to(f64::NAN, 0., 0., f64::INFINITY)
+        .cubic_to(f64::INFINITY, 0., 0., f64::NEG_INFINITY, f64::NAN, 0.);
+    assert!(invalid.rough_bounds().is_none());
+}
+
+#[test]
 fn rough_bounds_ignores_non_finite_points() {
     let mut p = PathData::new();
     p.move_to(f64::NAN, 0.0)

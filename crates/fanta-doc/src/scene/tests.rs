@@ -24,6 +24,67 @@ fn group_node() -> CanvasNode {
 }
 
 #[test]
+fn curve_body_hits_survive_parent_transforms_and_spatial_index_refresh() {
+    for cubic in [false, true] {
+        let mut scene = Scene::new();
+        let mut parent = group_node();
+        parent.transform = Transform2D::rotation(0.3).then(&Transform2D::translation(200., 100.));
+        let parent_id = parent.id;
+        scene.insert(parent).expect("parent");
+        let mut path = crate::PathData::new();
+        path.move_to(0., 0.);
+        let midpoint = if cubic {
+            path.cubic_to(0., 60., 100., 60., 100., 0.);
+            DVec2::new(50., 45.)
+        } else {
+            path.quad_to(50., 80., 100., 0.);
+            DVec2::new(50., 40.)
+        };
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            ..Default::default()
+        }));
+        node.parent = Some(parent_id);
+        node.transform = Transform2D::scale_xy(2., 0.5);
+        let id = node.id;
+        scene.insert(node).expect("curve");
+        let old_point = scene
+            .world_transform(id)
+            .expect("transform")
+            .transform_point(midpoint);
+        for moved in [false, true] {
+            if moved {
+                scene.get_mut(id).expect("curve").transform =
+                    Transform2D::scale_xy(2., 0.5).then(&Transform2D::translation(300., 200.));
+                assert_eq!(scene.hit_test(old_point), None);
+            }
+            let world = scene
+                .world_transform(id)
+                .expect("transform")
+                .transform_point(midpoint);
+            assert!(
+                scene
+                    .world_bounds(id)
+                    .expect("curve bounds")
+                    .contains_point(world)
+            );
+            assert!(
+                scene
+                    .world_bounds(parent_id)
+                    .expect("parent bounds")
+                    .contains_point(world)
+            );
+            assert_eq!(scene.hit_test(world), Some(id));
+            let probe = Bounds::from_min_max(world - DVec2::splat(1.), world + DVec2::splat(1.));
+            assert_eq!(
+                scene.rect_query_where(probe, |_, bounds| bounds.intersects(&probe)),
+                vec![id]
+            );
+        }
+    }
+}
+
+#[test]
 fn insert_and_get() {
     let mut scene = Scene::new();
     let n = rect_node(0.0, 0.0, 10.0, 10.0);
