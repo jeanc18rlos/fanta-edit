@@ -10,10 +10,24 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Customer payments | Not enabled. Resolve product/pricing/currency/credit allowances, configure Polar, and verify checkout and subscription lifecycle before charging customers. |
 | Editor | Creation/editing, Save As, reopening, Git commit/push, Scale, and curve viewport checks have native evidence. The Undo/Redo handle-refresh correction passes automated and native checks, including save/reopen. Text on Path is unfinished. |
 | Leads | PostHog US access recovered. The live waitlist stores contacts and attribution correctly. Exclude the synthetic QA signup; no outreach or conversion improvement is claimed. |
-| Distribution | GitHub checks and earlier test installers pass. Checks through `9ff7a77` pass; its exact installer and hosted checks for the later save/media batch remain pending; Apple notarization and clean-Mac validation remain open. |
+| Distribution | Both checks at published `12ad6d3` passed; its exact installer was building at 05:26 UTC. The earlier `eca2b86` installer passed with notarization skipped. Apple notarization and clean-Mac validation remain open. |
 | Housekeeping | Retired QA apps closed; about 49.24 GiB recovered from the retired build target. Daily 04:00 Europe/Madrid checks and Sunday Cargo cleanup are scheduled, with cleanup deferred during active work. |
 
 ## GitHub and local checks
+
+At **05:26 UTC on September 10**, both checks for published desktop head
+`12ad6d3219c857090a264997d968cb951e3c1be5` had passed:
+[push check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34438558490)
+finished at 05:20:34 UTC and
+[PR check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34438560024)
+finished at 05:20:22 UTC. These include the save/media fixes and full viewer CI.
+The [exact installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34438558598)
+was still building and packaging; that step started at 04:59:26 UTC.
+The earlier [eca2b86 installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427356619)
+completed successfully at 04:57:38 UTC, including bundle checks, checksums and
+artifact upload. Its notarization step was skipped. The queued `9ff7a77`
+installer was superseded by the later push; no active build was canceled.
+The earlier checks below remain historical evidence.
 
 Desktop push and pull request CI passed at `5181599` and `b0523fe`; the latter
 runs are [34384719415](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34384719415)
@@ -50,7 +64,7 @@ the Save As/font, generation recovery/contract, and sidebar-selection correction
 [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34423713177).
 Its [installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34423710706)
 completed successfully. The [eca2b86 installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427356619)
-was still in progress at that check. Both hosted checks at `eca2b86` passed:
+was still in progress at that earlier check and has since passed as recorded above. Both hosted checks at `eca2b86` passed:
 [pull-request check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427359223) and
 [push check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427356711).
 Subsequent commits `ee8e14d` (fast canvas input and anchor deletion), `af4cb0f`
@@ -63,11 +77,10 @@ viewport and K checks passed at `dcf27d6`; Undo exposed stale editing handles.
 The `849685f` correction passes automated checks and its 4m36s build passed
 native Undo/Redo handle alignment and save/reopen. The matching `9ff7a77`
 [installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34434784877)
-was pending at the last prepublication check. A later push may supersede
-queued installer revisions; running builds are preserved. Later local commits
-`48171ea` (atomic files), `5d3826d` (Save),
-and `0edf122` (full viewer CI) are included in this publication batch; hosted checks
-and installer validation remain pending.
+was pending at that prepublication check and was later superseded by `12ad6d3`.
+Commits `48171ea` (atomic files), `5d3826d` (Save), and `0edf122` (full viewer CI)
+are published in `12ad6d3`, whose two hosted checks passed. Its exact-installer
+validation remains pending.
 Running installers have not been canceled or restarted.
 
 The preceding local native build used `ca56b0a` and passed in **4m41s**.
@@ -103,8 +116,8 @@ and zero zombies, with 87.27 GiB free. The retired disk-image mounts were unmoun
 downloaded images and untouched app copies remain available.
 
 Backend runtime `42a4885` is deployed as
-`dpl_5484e7wjBBFjX7W2DguXBw5cHay6`; the companion PR's documentation head is
-`abc3d17`. All **408 TypeScript tests in 43 files**, type checking, and
+`dpl_5484e7wjBBFjX7W2DguXBw5cHay6`; its preceding documentation head was
+`abc3d17` (the new submission source is `830f702`, described below). All **408 TypeScript tests in 43 files**, type checking, and
 [GitHub CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34436154574)
 passed. All jobs also passed on documentation head `abc3d17` in
 [CI run 34436789383](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34436789383).
@@ -135,7 +148,7 @@ Local validation results:
 | `cargo test --locked --offline -p fanta-render --lib viewport` | Final viewport revision: 6 passed, including canvas/export bounds and authored-viewport behavior |
 | `cargo test --locked --offline -p fanta-format` | Atomic-write source `48171ea`: 187 passed, including integration tests and doctests; 2 ignored |
 | Focused Rust formatting and `git diff --check` | Passed |
-| `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; `ca56b0a` adds full Sidebar and native toolbar adapter suites alongside the existing document, format, and editing-tool checks. Hosted checks through `9ff7a77` pass. The later `0edf122` full-viewer consolidation passes actionlint and is included in this batch; hosted execution remains pending. |
+| `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; `ca56b0a` adds full Sidebar and native toolbar adapter suites alongside the existing document, format, and editing-tool checks. Hosted checks through `12ad6d3` pass, including the `0edf122` full-viewer consolidation; actionlint also passed. |
 | `cargo build --locked --release -p zed --bin fanta` | Preceding viewport build: 6m42s at `dcf27d6`; positive/negative viewport overflow, geometry Undo/Redo, save/reopen, and K passed. Undo exposed a stale editing-handle overlay, corrected in `849685f` with passing automated checks. Overlay build: 4m36s at `849685f`; native Undo/Redo immediately aligns handles with restored geometry, and save/reopen preserves the complete curve and exact saved-source hash. The prior 4m41s `ca56b0a` build passed fast input, anchors and Scale/strokes. Earlier 5m45s Save As/font build passed the lifecycle checks below. Latest completed build: 280.96s at `5d3826d`; native page rename/Code path, move/Undo/Redo, K, explicit Save/reopen and all 15 saved-file hashes passed. |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
 | Document suite | Save source `5d3826d`: 45 passed, retaining Save As, hidden-page rendering, bundled Git, watcher, cancellation, and entity-release checks. All 9 ordinary-Save regressions passed 20 scheduler iterations each. CodeWorkspace: 14 passed, with all 3 new cases passing 20 iterations each. The full viewer suite passed all 577 tests; both corrected autosave fixtures passed 20 iterations each. Native save/reopen smoke also passed on the 280.96-second build; forced failure coverage is automated, and exact-installer validation remains pending. |
@@ -194,10 +207,10 @@ failures, with the unchanged-editor control passing. Its correction passed all
 The earlier broader run passed 575 tests but exposed two autosave fixtures
 missing theme initialization. After the fixture-only correction, the full
 viewer suite passed **577 tests with no failures** (16.07 seconds of test
-time); both affected cases passed 20 iterations each. Local CI commit `0edf122` runs the full viewer suite once in place of five
-overlapping filters; actionlint passed. It is included in this publication batch.
-**Pending:** hosted execution and exact-installer validation for the new
-save/media/CI batch.
+time); both affected cases passed 20 iterations each. CI commit `0edf122` runs
+the full viewer suite once in place of five overlapping filters; actionlint
+passed. The save/media/CI batch is published in `12ad6d3`, and both hosted
+checks passed by 05:26 UTC. **Pending:** exact-installer validation.
 
 The `5d3826d` native release build completed in **280.96 seconds**. Page rename
 updated the Code source path; rectangle movement and Undo/Redo ended at
@@ -1094,8 +1107,59 @@ found only the user's retained Fanta app and its helper, no Cargo/rustc or
 zombie processes, and about 88.5 GiB free. Evidence, source guards, and saved
 fixtures are under
 `/tmp/fanta-release-qa-20260909/path-overlay-history-validation/native/`.
-Both `9ff7a77` hosted checks now pass for this editing batch; its exact
-installer remains pending. These checks are not customer-release signoff.
+Both `9ff7a77` checks passed for this editing batch. The later published
+`12ad6d3` also passed both checks; its exact installer was still building at
+05:26 UTC. These checks are not customer-release signoff.
+
+## Durable generation recovery — September 10
+
+**Local automated validation passed; hosted and native recovery checks remain
+pending.** This work is separate from the green `12ad6d3` checks and the deployed
+backend. Desktop source `be2b282` persists a local recovery journal scoped to
+the normalized API endpoint and the authenticated `/v1/me` user and organization
+IDs. It stores a generation's submitted body and idempotency key before its
+POST, preserves uncertain submissions and accepted IDs across reopening, and
+uses the same body/key only on explicit Retry. Reopening does not issue an
+automatic paid POST; known jobs recover through authenticated status reads.
+
+Per scope, storage is capped at **32 unfinished generations**, including at
+most **8 unconfirmed submissions**, plus **12 completed records** and **64 MiB**
+of serialized journal data. Unfinished work is retained when completed history
+is pruned. Vector history stores completed SVG results only; it does not
+recover uncertain `/v1/messages` requests or replay Messages calls.
+
+Companion backend source `830f702` is published in its draft PR and passed
+**438 tests in 44 files**,
+**60 focused tests**, and type checking. It binds the request digest, client
+key and generation in one transaction, compares the submitted JSON before
+caps, rejects non-finite numbers, and rechecks accepted keys before preflight
+rejection. Only a confirmed-unreserved first attempt can be discarded using
+the explicit response marker; an earlier uncertain attempt remains recoverable.
+The marker does not lock out another concurrent submission. Historical null
+hashes remain unverified, and reservation does not guarantee provider dispatch
+recovery. Migration `0019_generation_request_hash` and production deployment
+remain pending; [source CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34441329043)
+was running at publication. Production remains on `42a4885`.
+
+The complete desktop viewer suite passed **596 tests** in **21.51 seconds**.
+Initial tab-close tests reproduced two failures, the unmarked-400 baseline
+reproduced one failure with a passing explicit-unreserved control, and the
+stale signed-out SVG baseline reproduced one failure. All now pass. Additional
+coverage proves a persistent write happens before POST, local acceptance-save
+failure preserves the exact mask/source/seed request across closing, retry
+reuses its body/key, an already-accepted request uses GET, completed SVG reopens
+and saves exact bytes without another metered call, and account-key rotation
+preserves only the matching verified identity's history. Nine journal tests
+cover persistent SQLite reopening, concurrent writes, rollback, corruption,
+size limits and preserving unfinished jobs. The acceptance-failure fixture
+initially returned an empty successful output and correctly displayed a media
+error; its output fixture was corrected without changing runtime behavior.
+All ten new recovery cases passed 20 scheduler iterations each (200 executions,
+34.03 seconds). Focused formatting, diff checks, and root/independent peer
+review passed. No native app,
+production inference, payment or migration was performed for this batch.
+Evidence is under `/tmp/fanta-release-qa-20260909/generation-journal-validation/`
+and `/tmp/fanta-release-qa-20260909/generation-submission-validation/`.
 
 ## Remaining release requirements
 
@@ -1103,10 +1167,10 @@ installer remains pending. These checks are not customer-release signoff.
 | --- | --- |
 | Backend and AI Gateway | Runtime `42a4885` is deployed as `dpl_5484e7wjBBFjX7W2DguXBw5cHay6`, with 408 tests in 43 files, type checking and CI passing; PR documentation head `abc3d17` also passed all CI jobs (`34436789383`). Concurrent generation completion and billing are atomic. Nine candidate and nine live public checks passed, with no new paid calls or migration. Earlier account selection, access/revocation and mock-model guards remain included; the additive migration stays verified. Earlier unauthenticated chat returned 401 and billing preflight returned 204. Browser-confirmed device API sign-in, catalogs, default Sonnet streaming, one-credit debit and key revocation passed previously in production. Repeat through the final native installer; Keychain persistence and native account-error handling remain unverified. |
 | Charge customers | The billing page still displays an explicit checkout-not-configured notice and no purchase or manage buttons. The latest API/dashboard check shows Pro/Owner and 387 credits after two one-credit AI verification requests. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
-| Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
+| Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. The durable-recovery implementation described above passes all 596 viewer tests and persists generation state across reopening; hosted and native recovery validation remain pending. The earlier `12ad6d3` has only tab-lifetime recovery. Video playback uses the system player and canvas cards have no poster yet. |
 | Additional canvas tools | Path Selection, proportional Scale, and the K shortcut are implemented. The combined `ca56b0a` native candidate passed fast input, anchor editing, Scale/strokes, Undo/Redo, and save/reopen, but exposed viewport clipping. The `dcf27d6` viewport revision passed 337 document tests with one ignored, 280 tools, 6 viewport renders, and 24 toolbar adapters; both viewport GPUI pixel/reopen cases passed 20 iterations each. Its native build passed in 6m42s; viewport overflow, save/reopen, and K passed. Undo exposed stale editing handles. The `849685f` read-only overlay correction now passes 280 tools, 26 toolbar adapters, and both new GPUI cases across 20 iterations each. Its 4m36s build passed native immediate Undo/Redo handle alignment and save/reopen. Both `9ff7a77` hosted checks pass; exact-installer verification remains pending. Text on Path remains a placeholder. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. The later `5d3826d` native build passed page rename/Code path, move/Undo/Redo, K and explicit Save/reopen with all 15 saved-file hashes unchanged. Hosted checks through `9ff7a77` pass; the newer save batch and exact-installer verification remain pending. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. The later `5d3826d` native build passed page rename/Code path, move/Undo/Redo, K and explicit Save/reopen with all 15 saved-file hashes unchanged. Hosted checks through published `12ad6d3` pass, including the save batch; exact-installer verification remains pending. |
 | Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans. The previously observed descriptor-array scanner signature is absent after the later font correction; its final native snapshot still flags 314 blocks / 19,936 bytes across 20 roots. Other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | Landing head `4e6c9c9` is live as `dpl_7SD2uTp6M2W37XABjH7qm2ynSGnU`; both hosted checks passed. All 15 offline tests, type checks, lint, and the production build passed. The live form rejected an overlong address, disabled edits while submitting, and confirmed the exact test address. Its stored contact and canonical `waitlist_joined` event were retrieved in US PostHog project 410640 with matching submission ID and campaign attribution. Basic signup-to-stored-contact verification passed using one reserved-domain QA address. Exclude that record from customer counts; no conversion improvement or completed outreach campaign is established. |
