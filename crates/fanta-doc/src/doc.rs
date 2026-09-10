@@ -655,8 +655,7 @@ mod tests {
 
     #[test]
     fn schema_v2_doc_loads_as_v3_without_structural_rewrite() {
-        let current = serde_json::to_value(Doc::new()).expect("current doc serializes");
-        let mut old = current.clone();
+        let mut old = serde_json::to_value(Doc::new()).expect("current doc serializes");
         old["schema_version"] = serde_json::Value::from(2);
 
         let loaded = Doc::from_json_str(&old.to_string()).expect("v2 doc migrates");
