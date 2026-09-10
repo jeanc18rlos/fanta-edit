@@ -1,12 +1,12 @@
 //! Node-edit tool — the direct-selection ("white arrow") tool for vector
 //! paths: select, move, and reshape individual anchors and Bézier handles.
 //!
-//! ## Gestures (each commits as ONE undo step via `ReplaceData`)
+//! ## Gestures (each commits as ONE undo step)
 //!
 //! - **Click an anchor** selects it (Shift toggles membership). **Drag**
 //!   moves every selected anchor, controls riding along; the drag previews by
-//!   writing the path directly into the scene and commits a single
-//!   `ReplaceData { old, new }` on release.
+//!   writing the path directly into the scene and commits the path and clipping
+//!   state on release.
 //! - **Drag a handle** rotates/extends that control point. While the anchor
 //!   is smooth the opposite handle mirrors the angle (length preserved); the
 //!   **Alt** drag breaks the pair into a corner.
@@ -44,6 +44,13 @@ const SEGMENT_HIT_PX: f64 = 6.0;
 /// Screen-px a press must travel before a click becomes a drag.
 const DRAG_THRESHOLD_PX: f64 = 3.0;
 
+#[derive(Debug)]
+struct PathEditSnapshot {
+    path: PathData,
+    local_size: Option<[f64; 2]>,
+    unclipped: bool,
+}
+
 /// In-flight gesture state.
 #[derive(Debug)]
 enum Phase {
@@ -51,22 +58,22 @@ enum Phase {
     /// Primary down on an anchor; not yet decided click vs drag.
     PressedAnchor {
         screen_press: DVec2,
-        /// Path snapshot at press — the `ReplaceData.old` for the whole drag.
-        old_path: PathData,
+        original: PathEditSnapshot,
         /// Anchors that will move (the selection at press time).
         moving: Vec<AnchorId>,
     },
     /// Anchor drag past the threshold — live preview, single commit on release.
     DraggingAnchor {
         screen_press: DVec2,
-        old_path: PathData,
+        original: PathEditSnapshot,
         moving: Vec<AnchorId>,
     },
     /// Handle drag — live preview, single commit on release.
     DraggingHandle {
+        screen_press: DVec2,
         anchor: AnchorId,
         side: HandleSide,
-        old_path: PathData,
+        original: PathEditSnapshot,
         /// Whether the anchor was smooth at press (mirror unless Alt).
         smooth_at_press: bool,
         moved: bool,
@@ -325,6 +332,16 @@ impl NodeEditTool {
         Some(ctx.doc.scene.get(id)?.data.as_vector()?.path.clone())
     }
 
+    fn target_snapshot(&self, ctx: &ToolContext) -> Option<PathEditSnapshot> {
+        let node = ctx.doc.scene.get(self.target?)?;
+        let vector = node.data.as_vector()?;
+        Some(PathEditSnapshot {
+            path: vector.path.clone(),
+            local_size: vector.local_size,
+            unclipped: node.flags.contains(NodeFlags::UNCLIPPED_VECTOR),
+        })
+    }
+
     /// World transform of the target node (identity if unresolvable).
     fn target_world(&self, ctx: &ToolContext) -> Transform2D {
         self.target
@@ -344,91 +361,96 @@ impl NodeEditTool {
             .transform_point(ctx.screen_to_world(screen))
     }
 
-    /// Write `path` straight into the target's vector node — the transient
-    /// per-frame preview (no history). The single `ReplaceData` committed on
-    /// release upholds the undo invariant, mirroring the select tool's move.
-    fn write_path_direct(&self, ctx: &mut ToolContext, path: PathData) {
-        let Some(id) = self.target else {
+    fn write_path_direct(
+        &self,
+        ctx: &mut ToolContext,
+        path: PathData,
+        original: &PathEditSnapshot,
+    ) {
+        let Some(node) = self.target.and_then(|id| ctx.doc.scene.get_mut(id)) else {
             return;
         };
-        if let Some(v) = ctx
-            .doc
-            .scene
-            .get_mut(id)
-            .and_then(|n| n.data.as_vector_mut())
-        {
-            v.path = path;
-        }
+        let Some(vector) = node.data.as_vector_mut() else {
+            return;
+        };
+        let changed = path != original.path;
+        // Authored viewport boxes no longer describe edited geometry, including
+        // negative coordinates and strokes. Persist the opt-out so load-time
+        // legacy backfill cannot recreate a clip around the edited path.
+        vector.local_size = if changed { None } else { original.local_size };
+        node.flags
+            .set(NodeFlags::UNCLIPPED_VECTOR, changed || original.unclipped);
+        vector.path = path;
     }
 
-    /// Commit the target's current (previewed) path as ONE undo step: restore
-    /// `old`, then apply `ReplaceData { old, new }` through the history
-    /// chokepoint. No-op when the path didn't actually change.
-    fn commit_path(&self, ctx: &mut ToolContext, old_path: PathData) {
+    fn commit_path(&self, ctx: &mut ToolContext, original: PathEditSnapshot) {
         let Some(id) = self.target else {
             return;
         };
-        let Some(v) = ctx.doc.scene.get(id).and_then(|n| n.data.as_vector()) else {
+        let Some(node) = ctx.doc.scene.get(id) else {
             return;
         };
-        let new_path = v.path.clone();
-        if new_path == old_path {
+        let Some(vector) = node.data.as_vector() else {
+            return;
+        };
+        if vector.path == original.path {
             return;
         }
-        let Some(vec_now) = ctx.doc.scene.get(id).and_then(|n| n.data.as_vector()) else {
-            return;
-        };
-        let mut old_data = vec_now.clone();
-        old_data.path = old_path;
-        let mut new_data = vec_now.clone();
-        new_data.path = new_path;
+        let mut old_data = vector.clone();
+        old_data.path = original.path;
+        old_data.local_size = original.local_size;
+        let mut new_data = vector.clone();
         if self.select_segments {
             new_data.parametric = None;
         }
-        // Restore the pre-gesture data so `apply` re-establishes the final
-        // value through history, recording a clean old→new pair.
-        if let Some(n) = ctx.doc.scene.get_mut(id) {
-            n.data = NodeData::Vector(old_data.clone());
+        let new_flags = node.flags;
+        let mut old_flags = new_flags;
+        old_flags.set(NodeFlags::UNCLIPPED_VECTOR, original.unclipped);
+        if let Some(node) = ctx.doc.scene.get_mut(id) {
+            node.data = NodeData::Vector(old_data.clone());
+            node.flags
+                .set(NodeFlags::UNCLIPPED_VECTOR, original.unclipped);
         }
-        if let Err(e) = ctx.doc.apply(Operation::ReplaceData {
+        let mut operations = vec![Operation::ReplaceData {
             id,
             old: Box::new(NodeData::Vector(old_data)),
             new: Box::new(NodeData::Vector(new_data)),
-        }) {
-            tracing::warn!(target: "fanta-tools.node_edit", "path commit failed: {e}");
+        }];
+        if new_flags != old_flags {
+            operations.push(Operation::SetFlags {
+                id,
+                old: old_flags,
+                new: new_flags,
+            });
         }
+        ctx.doc.history.begin("Edit path", &mut ctx.doc.scene);
+        for operation in operations {
+            if let Err(error) = ctx.doc.apply(operation) {
+                if let Err(rollback) = ctx.doc.abort_transaction() {
+                    tracing::error!(target: "fanta-tools.node_edit", "path rollback failed: {rollback}");
+                }
+                tracing::warn!(target: "fanta-tools.node_edit", "path commit failed: {error}");
+                return;
+            }
+        }
+        ctx.doc.history.commit(&mut ctx.doc.scene);
     }
 
-    /// Apply an already-computed path edit as one immediate undo step (used by
-    /// the click-gestures: toggle smooth, insert, delete).
     fn apply_path_edit(&self, ctx: &mut ToolContext, new_path: PathData) {
-        let Some(id) = self.target else {
+        let Some(original) = self.target_snapshot(ctx) else {
             return;
         };
-        let Some(v) = ctx.doc.scene.get(id).and_then(|n| n.data.as_vector()) else {
+        if new_path == original.path {
             return;
-        };
-        let old_data = v.clone();
-        let mut new_data = v.clone();
-        new_data.path = new_path;
-        if self.select_segments {
-            new_data.parametric = None;
         }
-        if let Err(e) = ctx.doc.apply(Operation::ReplaceData {
-            id,
-            old: Box::new(NodeData::Vector(old_data)),
-            new: Box::new(NodeData::Vector(new_data)),
-        }) {
-            tracing::warn!(target: "fanta-tools.node_edit", "path edit failed: {e}");
-        }
+        self.write_path_direct(ctx, new_path, &original);
+        self.commit_path(ctx, original);
     }
 
-    /// Abort any in-flight drag by restoring the press-time path directly
-    /// (the preview never touched history, so a direct restore is exact).
     fn abort_drag(&mut self, ctx: &mut ToolContext) {
         match std::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::DraggingAnchor { old_path, .. } | Phase::DraggingHandle { old_path, .. } => {
-                self.write_path_direct(ctx, old_path);
+            Phase::DraggingAnchor { original, .. } | Phase::DraggingHandle { original, .. } => {
+                self.write_path_direct(ctx, original.path.clone(), &original);
             }
             _ => {}
         }
@@ -664,9 +686,10 @@ impl NodeEditTool {
                 return ToolResponse::cursor(CursorHint::Default);
             }
         }
-        let Some(path) = self.target_path(ctx) else {
+        let Some(original) = self.target_snapshot(ctx) else {
             return ToolResponse::cursor(CursorHint::Default);
         };
+        let path = &original.path;
         let world_t = self.target_world(ctx);
         let anchors = enumerate_anchors(&path);
 
@@ -697,7 +720,7 @@ impl NodeEditTool {
             }
             self.phase = Phase::PressedAnchor {
                 screen_press: screen,
-                old_path: path,
+                original,
                 moving: self.selected.iter().copied().collect(),
             };
             return self.overlay_response(ctx, CursorHint::Move);
@@ -707,9 +730,10 @@ impl NodeEditTool {
         if let Some((id, side)) = self.handle_at(ctx, &anchors, &world_t, screen) {
             let smooth = node_math::anchor_is_smooth(&path, id);
             self.phase = Phase::DraggingHandle {
+                screen_press: screen,
                 anchor: id,
                 side,
-                old_path: path,
+                original,
                 smooth_at_press: smooth,
                 moved: false,
             };
@@ -733,7 +757,7 @@ impl NodeEditTool {
                         self.selected.extend(anchors);
                         self.phase = Phase::PressedAnchor {
                             screen_press: screen,
-                            old_path: path,
+                            original,
                             moving: self.selected.iter().copied().collect(),
                         };
                     }
@@ -761,7 +785,7 @@ impl NodeEditTool {
             self.selected.extend(anchors.iter().map(|anchor| anchor.id));
             self.phase = Phase::PressedAnchor {
                 screen_press: screen,
-                old_path: path,
+                original,
                 moving: self.selected.iter().copied().collect(),
             };
             return self.overlay_response(ctx, CursorHint::Move);
@@ -810,40 +834,41 @@ impl NodeEditTool {
             }
             Phase::PressedAnchor {
                 screen_press,
-                old_path,
+                original,
                 moving,
             } => {
                 if (screen - screen_press).length() < DRAG_THRESHOLD_PX {
                     self.phase = Phase::PressedAnchor {
                         screen_press,
-                        old_path,
+                        original,
                         moving,
                     };
                     return self.overlay_response(ctx, CursorHint::Move);
                 }
                 self.phase = Phase::DraggingAnchor {
                     screen_press,
-                    old_path,
+                    original,
                     moving,
                 };
                 self.update_anchor_drag(ctx, screen)
             }
             Phase::DraggingAnchor {
                 screen_press,
-                old_path,
+                original,
                 moving,
             } => {
                 self.phase = Phase::DraggingAnchor {
                     screen_press,
-                    old_path,
+                    original,
                     moving,
                 };
                 self.update_anchor_drag(ctx, screen)
             }
             Phase::DraggingHandle {
+                screen_press,
                 anchor,
                 side,
-                old_path,
+                original,
                 smooth_at_press,
                 ..
             } => {
@@ -852,15 +877,25 @@ impl NodeEditTool {
                 // Mirror while the anchor was smooth at press; Alt breaks the
                 // pair into a corner (checked live so Alt can engage mid-drag).
                 let mirror = smooth_at_press && !modifiers.contains(ModifierKeys::ALT);
-                if let Some(new_path) =
-                    node_math::set_handle(&old_path, anchor, side, local, mirror)
+                let original_control = enumerate_anchors(&original.path)
+                    .into_iter()
+                    .find(|candidate| candidate.id == anchor)
+                    .and_then(|candidate| match side {
+                        HandleSide::In => candidate.ctrl_in,
+                        HandleSide::Out => candidate.ctrl_out,
+                    });
+                if screen == screen_press || original_control == Some(local) {
+                    self.write_path_direct(ctx, original.path.clone(), &original);
+                } else if let Some(new_path) =
+                    node_math::set_handle(&original.path, anchor, side, local, mirror)
                 {
-                    self.write_path_direct(ctx, new_path);
+                    self.write_path_direct(ctx, new_path, &original);
                 }
                 self.phase = Phase::DraggingHandle {
+                    screen_press,
                     anchor,
                     side,
-                    old_path,
+                    original,
                     smooth_at_press,
                     moved: true,
                 };
@@ -890,7 +925,7 @@ impl NodeEditTool {
     fn update_anchor_drag(&mut self, ctx: &mut ToolContext, screen: DVec2) -> ToolResponse {
         let Phase::DraggingAnchor {
             screen_press,
-            old_path,
+            original,
             moving,
         } = &self.phase
         else {
@@ -901,8 +936,12 @@ impl NodeEditTool {
         let press_local = inv.transform_point(ctx.screen_to_world(*screen_press));
         let cur_local = inv.transform_point(ctx.screen_to_world(screen));
         let delta = cur_local - press_local;
-        let mut path = old_path.clone();
-        let snapshot = enumerate_anchors(old_path);
+        if delta == DVec2::ZERO {
+            self.write_path_direct(ctx, original.path.clone(), original);
+            return self.overlay_response(ctx, CursorHint::Move);
+        }
+        let mut path = original.path.clone();
+        let snapshot = enumerate_anchors(&original.path);
         for id in moving {
             let Some(orig) = snapshot.iter().find(|a| a.id == *id) else {
                 continue;
@@ -911,7 +950,7 @@ impl NodeEditTool {
                 path = next;
             }
         }
-        self.write_path_direct(ctx, path);
+        self.write_path_direct(ctx, path, original);
         self.overlay_response(ctx, CursorHint::Move)
     }
 
@@ -922,15 +961,15 @@ impl NodeEditTool {
                 // Click without drag — selection already applied at press.
                 self.overlay_response(ctx, CursorHint::Default)
             }
-            Phase::DraggingAnchor { old_path, .. } => {
-                self.commit_path(ctx, old_path);
+            Phase::DraggingAnchor { original, .. } => {
+                self.commit_path(ctx, original);
                 self.overlay_response(ctx, CursorHint::Default)
             }
             Phase::DraggingHandle {
-                old_path, moved, ..
+                original, moved, ..
             } => {
                 if moved {
-                    self.commit_path(ctx, old_path);
+                    self.commit_path(ctx, original);
                 }
                 self.overlay_response(ctx, CursorHint::Default)
             }
@@ -1437,5 +1476,323 @@ mod tests {
             2,
             "guard refuses to drop below 2 anchors on an open path"
         );
+    }
+    fn viewport_curve_fixture() -> (Doc, NodeId, NodeData) {
+        let mut doc = Doc::new();
+        let mut path = PathData::new();
+        path.move_to(0., 160.).quad_to(100., 0., 200., 160.);
+        let vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            local_size: Some([200., 160.]),
+            strokes: [fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 4.)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }));
+        let original = vector.data.clone();
+        let id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create clipped curve");
+        doc.selection.select_only(id);
+        doc.history = Default::default();
+        (doc, id, original)
+    }
+
+    fn viewport_edit_tool(select_segments: bool) -> NodeEditTool {
+        if select_segments {
+            NodeEditTool::for_path_selection()
+        } else {
+            NodeEditTool::new()
+        }
+    }
+
+    #[test]
+    fn path_edit_viewport_detaches_during_drag_and_undo_restores_it() {
+        for select_segments in [false, true] {
+            for delta in [DVec2::splat(40.), DVec2::splat(-40.)] {
+                let (mut doc, id, original) = viewport_curve_fixture();
+                let mut viewport = Viewport::default();
+                let mut ctx = ToolContext::new(
+                    &mut doc,
+                    &mut viewport,
+                    SnapEngine::default(),
+                    DVec2::new(800., 600.),
+                );
+                let mut tool = viewport_edit_tool(select_segments);
+                tool.activate(&mut ctx);
+                let start = DVec2::new(0., 160.);
+                let end = start + delta;
+                tool.handle_event(&mut ctx, press(w2s(start.to_array())));
+                tool.handle_event(&mut ctx, mv(w2s(end.to_array())));
+                let vector = ctx
+                    .doc
+                    .scene
+                    .get(id)
+                    .expect("curve")
+                    .data
+                    .as_vector()
+                    .expect("vector");
+                assert_eq!(
+                    vector.local_size, None,
+                    "an edited path must escape its old viewport during preview"
+                );
+                let anchors = node_math::enumerate_anchors(&vector.path);
+                assert_eq!(anchors.first().expect("moved anchor").pos, end);
+                assert_eq!(ctx.doc.history.undo_depth(), 0);
+                tool.handle_event(&mut ctx, release(w2s(end.to_array())));
+                let edited = ctx.doc.scene.get(id).expect("curve").data.clone();
+                assert_eq!(edited.as_vector().expect("vector").local_size, None);
+                assert_eq!(
+                    ctx.doc.scene.get(id).expect("curve").transform,
+                    Transform2D::IDENTITY
+                );
+                assert_eq!(ctx.doc.history.undo_depth(), 1);
+                assert!(ctx.doc.undo().expect("undo path edit"));
+                assert_eq!(ctx.doc.scene.get(id).expect("curve").data, original);
+                assert!(ctx.doc.redo().expect("redo path edit"));
+                assert_eq!(ctx.doc.scene.get(id).expect("curve").data, edited);
+            }
+        }
+    }
+
+    #[test]
+    fn path_edit_viewport_click_and_subthreshold_move_preserve_import() {
+        for select_segments in [false, true] {
+            let (mut doc, id, original) = viewport_curve_fixture();
+            let original_meta = serde_json::json!({"clip_content": true, "import_note": "keep"});
+            doc.scene.get_mut(id).expect("curve").meta = original_meta.clone();
+            let mut viewport = Viewport::default();
+            let mut ctx = ToolContext::new(
+                &mut doc,
+                &mut viewport,
+                SnapEngine::default(),
+                DVec2::new(800., 600.),
+            );
+            let mut tool = viewport_edit_tool(select_segments);
+            tool.activate(&mut ctx);
+            for end in [[0., 160.], [1., 161.]] {
+                tool.handle_event(&mut ctx, press(w2s([0., 160.])));
+                tool.handle_event(&mut ctx, mv(w2s(end)));
+                tool.handle_event(&mut ctx, release(w2s(end)));
+                assert_eq!(ctx.doc.scene.get(id).expect("curve").data, original);
+                assert_eq!(ctx.doc.scene.get(id).expect("curve").meta, original_meta);
+                assert_eq!(ctx.doc.history.undo_depth(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn path_edit_viewport_cancel_switch_and_return_restore_import_exactly() {
+        for select_segments in [false, true] {
+            for drag_handle in [false, true] {
+                for (ending, original_meta) in [
+                    (
+                        "escape",
+                        serde_json::json!({"clip_content": true, "import_note": "keep"}),
+                    ),
+                    (
+                        "deactivate",
+                        serde_json::json!({"clip_content": false, "nested": {"value": 7}}),
+                    ),
+                    ("return", serde_json::json!(["opaque", 42])),
+                ] {
+                    let (mut doc, id, original) = viewport_curve_fixture();
+                    doc.scene.get_mut(id).expect("curve").meta = original_meta.clone();
+                    let mut viewport = Viewport::default();
+                    let mut ctx = ToolContext::new(
+                        &mut doc,
+                        &mut viewport,
+                        SnapEngine::default(),
+                        DVec2::new(800., 600.),
+                    );
+                    let mut tool = viewport_edit_tool(select_segments);
+                    tool.activate(&mut ctx);
+                    let start = if drag_handle {
+                        tool.handle_event(&mut ctx, press(w2s([0., 160.])));
+                        tool.handle_event(&mut ctx, release(w2s([0., 160.])));
+                        node_math::enumerate_anchors(&node_path(ctx.doc, id))
+                            .first()
+                            .expect("first anchor")
+                            .ctrl_out
+                            .expect("quadratic handle")
+                            .to_array()
+                    } else {
+                        [0., 160.]
+                    };
+                    tool.handle_event(&mut ctx, press(w2s(start)));
+                    tool.handle_event(&mut ctx, mv(w2s([-40., 200.])));
+                    assert_eq!(
+                        ctx.doc
+                            .scene
+                            .get(id)
+                            .expect("curve")
+                            .data
+                            .as_vector()
+                            .expect("vector")
+                            .local_size,
+                        None
+                    );
+                    ctx.doc
+                        .scene
+                        .get_mut(id)
+                        .expect("curve")
+                        .flags
+                        .insert(NodeFlags::EXCLUDE_FROM_AI);
+                    match ending {
+                        "escape" => {
+                            tool.handle_event(&mut ctx, key(LogicalKey::Escape));
+                        }
+                        "deactivate" => tool.deactivate(&mut ctx),
+                        "return" => {
+                            tool.handle_event(&mut ctx, mv(w2s(start)));
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_eq!(
+                        ctx.doc.scene.get(id).expect("curve").data,
+                        original,
+                        "{ending} must restore both authored quadratic and viewport"
+                    );
+                    assert_eq!(ctx.doc.scene.get(id).expect("curve").meta, original_meta);
+                    assert_eq!(
+                        ctx.doc.scene.get(id).expect("curve").flags,
+                        NodeFlags::EXCLUDE_FROM_AI
+                    );
+                    let end = if ending == "return" {
+                        start
+                    } else {
+                        [-40., 200.]
+                    };
+                    tool.handle_event(&mut ctx, release(w2s(end)));
+                    assert_eq!(ctx.doc.scene.get(id).expect("curve").data, original);
+                    assert_eq!(ctx.doc.scene.get(id).expect("curve").meta, original_meta);
+                    assert_eq!(
+                        ctx.doc.scene.get(id).expect("curve").flags,
+                        NodeFlags::EXCLUDE_FROM_AI
+                    );
+                    assert_eq!(ctx.doc.history.undo_depth(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_edit_viewport_handle_drag_and_immediate_delete_are_undoable() {
+        for select_segments in [false, true] {
+            let (mut doc, id, original) = viewport_curve_fixture();
+            let mut viewport = Viewport::default();
+            let mut ctx = ToolContext::new(
+                &mut doc,
+                &mut viewport,
+                SnapEngine::default(),
+                DVec2::new(800., 600.),
+            );
+            let mut tool = viewport_edit_tool(select_segments);
+            tool.activate(&mut ctx);
+            tool.handle_event(&mut ctx, press(w2s([0., 160.])));
+            tool.handle_event(&mut ctx, release(w2s([0., 160.])));
+            let anchors = node_math::enumerate_anchors(&node_path(ctx.doc, id));
+            let handle = anchors
+                .first()
+                .expect("anchor")
+                .ctrl_out
+                .expect("quadratic control handle");
+            tool.handle_event(&mut ctx, press(w2s(handle.to_array())));
+            tool.handle_event(&mut ctx, mv(w2s([-40., -40.])));
+            assert_eq!(
+                ctx.doc
+                    .scene
+                    .get(id)
+                    .expect("curve")
+                    .data
+                    .as_vector()
+                    .expect("vector")
+                    .local_size,
+                None
+            );
+            tool.handle_event(&mut ctx, release(w2s([-40., -40.])));
+            assert_eq!(ctx.doc.history.undo_depth(), 1);
+            assert!(ctx.doc.undo().expect("undo handle"));
+            assert_eq!(ctx.doc.scene.get(id).expect("curve").data, original);
+
+            let id = add_polyline(ctx.doc);
+            ctx.doc
+                .scene
+                .get_mut(id)
+                .expect("polyline")
+                .data
+                .as_vector_mut()
+                .expect("vector")
+                .local_size = Some([100., 100.]);
+            ctx.doc.selection.select_only(id);
+            let original = ctx.doc.scene.get(id).expect("polyline").data.clone();
+            ctx.doc.history = Default::default();
+            let mut tool = viewport_edit_tool(select_segments);
+            tool.activate(&mut ctx);
+            tool.handle_event(&mut ctx, press(w2s([100., 0.])));
+            tool.handle_event(&mut ctx, release(w2s([100., 0.])));
+            tool.handle_event(&mut ctx, key(LogicalKey::Delete));
+            let vector = ctx
+                .doc
+                .scene
+                .get(id)
+                .expect("polyline")
+                .data
+                .as_vector()
+                .expect("vector");
+            assert_eq!(node_math::enumerate_anchors(&vector.path).len(), 2);
+            assert_eq!(vector.local_size, None);
+            assert_eq!(ctx.doc.history.undo_depth(), 1);
+            assert!(ctx.doc.undo().expect("undo anchor delete"));
+            assert_eq!(ctx.doc.scene.get(id).expect("polyline").data, original);
+        }
+    }
+    #[test]
+    fn path_edit_viewport_metadata_and_backfill_intent_share_one_undo_step() {
+        for select_segments in [false, true] {
+            for original_meta in [
+                serde_json::json!({"clip_content": true, "import_note": "keep", "nested": {"value": 7}}),
+                serde_json::json!(["opaque", 42]),
+                serde_json::json!("opaque extension"),
+                serde_json::Value::Null,
+            ] {
+                let (mut doc, id, _) = viewport_curve_fixture();
+                let node = doc.scene.get_mut(id).expect("curve");
+                node.meta = original_meta.clone();
+                node.flags.insert(NodeFlags::EXCLUDE_FROM_AI);
+                let original = node.clone();
+                let mut viewport = Viewport::default();
+                let mut ctx = ToolContext::new(
+                    &mut doc,
+                    &mut viewport,
+                    SnapEngine::default(),
+                    DVec2::new(800., 600.),
+                );
+                let mut tool = viewport_edit_tool(select_segments);
+                tool.activate(&mut ctx);
+                tool.handle_event(&mut ctx, press(w2s([0., 160.])));
+                tool.handle_event(&mut ctx, mv(w2s([40., 200.])));
+                let preview = ctx.doc.scene.get(id).expect("curve");
+                assert_eq!(preview.meta, original_meta);
+                assert_eq!(preview.flags, original.flags | NodeFlags::UNCLIPPED_VECTOR);
+                tool.handle_event(&mut ctx, release(w2s([40., 200.])));
+                assert_eq!(ctx.doc.history.undo_depth(), 1);
+                fanta_doc::backfill_vector_viewports(&mut ctx.doc.scene);
+                let edited = ctx.doc.scene.get(id).expect("curve");
+                assert_eq!(edited.data.as_vector().expect("vector").local_size, None);
+                assert_eq!(edited.meta, original_meta);
+                assert_eq!(edited.flags, original.flags | NodeFlags::UNCLIPPED_VECTOR);
+                assert!(ctx.doc.undo().expect("undo path and viewport intent"));
+                let restored = ctx.doc.scene.get(id).expect("curve");
+                assert_eq!(restored.data, original.data);
+                assert_eq!(restored.meta, original.meta);
+                assert_eq!(restored.flags, original.flags);
+                assert!(ctx.doc.redo().expect("redo path and viewport intent"));
+                let edited = ctx.doc.scene.get(id).expect("curve");
+                assert_eq!(edited.data.as_vector().expect("vector").local_size, None);
+                assert_eq!(edited.meta, original_meta);
+                assert_eq!(edited.flags, original.flags | NodeFlags::UNCLIPPED_VECTOR);
+            }
+        }
     }
 }

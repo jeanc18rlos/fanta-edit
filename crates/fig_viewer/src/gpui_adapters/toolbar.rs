@@ -912,6 +912,237 @@ mod echo_tests {
         });
     }
 
+    async fn assert_path_edit_viewport_pixels(cx: &mut TestAppContext, delta: f32) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut path = fanta_doc::PathData::new();
+        path.move_to(0., 160.).quad_to(100., 0., 200., 160.);
+        let mut curve = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path,
+            local_size: Some([200., 160.]),
+            strokes: [fanta_doc::Stroke::solid(
+                fanta_doc::Color::rgb(46, 125, 255),
+                6.,
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        curve.meta = if delta > 0. {
+            serde_json::json!(["opaque", 42])
+        } else {
+            serde_json::json!("opaque extension")
+        };
+        curve.parent = Some(page_id);
+        curve.transform = Transform2D::translation(60., 60.);
+        let curve_id = curve.id;
+        let original = curve.clone();
+        doc.apply(Operation::create_node(curve))
+            .expect("create imported curve");
+        doc.selection.select_only(curve_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Path-viewport.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::PathSelect,
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [160., 140.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center();
+        let end = start + point(px(delta), px(delta));
+        let mut renderer = fanta_render::RasterRenderer::new(400, 400).expect("CPU renderer");
+        // At t=0.1, the shifted curve is outside the old viewport: below it for
+        // +40 and left of it for -40. A geometry-only assertion misses this clip.
+        let samples = if delta > 0. {
+            [(120_usize, 231_usize), (298, 260)]
+        } else {
+            [(40, 151), (218, 180)]
+        };
+        let assert_pixel = |item: &Entity<crate::document::FigItem>,
+                            cx: &VisualTestContext,
+                            renderer: &mut fanta_render::RasterRenderer,
+                            painted: bool| {
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                renderer.render_page(
+                    &doc.scene,
+                    &Viewport {
+                        center: [200., 200.],
+                        zoom: 1.,
+                    },
+                    doc.active_page(),
+                );
+                let pixels = renderer.copy_rgba();
+                for sample in samples {
+                    let offset = (sample.1 * 400 + sample.0) * 4;
+                    let pixel = pixels.get(offset..offset + 4).expect("sample pixel");
+                    let blue = pixel[0] < 100
+                        && pixel[1] > 80
+                        && pixel[1] < 180
+                        && pixel[2] > 220
+                        && pixel[3] > 200;
+                    assert_eq!(
+                        blue, painted,
+                        "curve pixel at {sample:?}, delta {delta}: {pixel:?}"
+                    );
+                }
+            });
+        };
+        assert_pixel(&item, cx, &mut renderer, false);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        assert_pixel(&item, cx, &mut renderer, true);
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        assert_pixel(&item, cx, &mut renderer, true);
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let curve = doc.scene.get(curve_id).expect("curve");
+            assert_eq!(curve.transform, original.transform);
+            assert_eq!(curve.meta, original.meta);
+            assert_eq!(
+                curve.flags,
+                original.flags | fanta_doc::NodeFlags::UNCLIPPED_VECTOR
+            );
+            assert_eq!(curve.data.as_vector().expect("vector").local_size, None);
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+        for (command, painted) in [(ToolbarCommand::Undo, false), (ToolbarCommand::Redo, true)] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            assert_pixel(&item, cx, &mut renderer, painted);
+            if !painted {
+                item.read_with(cx, |item, _| {
+                    let node = item
+                        .doc()
+                        .expect("document")
+                        .scene
+                        .get(curve_id)
+                        .expect("restored curve");
+                    assert_eq!(node.data, original.data);
+                    assert_eq!(node.meta, original.meta);
+                    assert_eq!(node.flags, original.flags);
+                    assert_eq!(node.transform, original.transform);
+                });
+            }
+        }
+
+        let saved_doc = item.read_with(cx, |item, _| item.doc().expect("saved doc").clone());
+        let saved_curve = saved_doc.scene.get(curve_id).expect("saved curve").clone();
+        let temporary = tempfile::tempdir().expect("temporary project");
+        crate::document::write_project(temporary.path(), &saved_doc, &Default::default())
+            .expect("write edited FNX project");
+        let (reopened_doc, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("read edited FNX project");
+        assert!(assets.is_empty());
+        let reopened_item = crate::document::ready_item_for_test(
+            &project,
+            temporary.path().join("page.fnx"),
+            reopened_doc,
+            cx,
+        );
+        reopened_item.read_with(cx, |item, _| {
+            let node = item
+                .doc()
+                .expect("reopened document")
+                .scene
+                .get(curve_id)
+                .expect("reopened curve");
+            assert_eq!(
+                node.data.as_vector().expect("vector").local_size,
+                None,
+                "FigDocument load must not backfill an explicitly edited viewport"
+            );
+            assert_eq!(node.data, saved_curve.data);
+            assert_eq!(node.meta, original.meta);
+            assert_eq!(node.meta, saved_curve.meta);
+            assert_eq!(node.flags, saved_curve.flags);
+            assert!(node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR));
+            assert_eq!(node.transform, saved_curve.transform);
+        });
+        assert_pixel(&reopened_item, cx, &mut renderer, true);
+    }
+
+    #[gpui::test]
+    async fn path_edit_viewport_positive_segment_drag_renders_outside_old_clip(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_viewport_pixels(cx, 40.).await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_viewport_negative_segment_drag_renders_outside_old_clip(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_viewport_pixels(cx, -40.).await;
+    }
+
+    #[test]
+    fn path_edit_viewport_explicit_flag_overrides_a_remaining_box() {
+        let mut doc = Doc::new();
+        let mut node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: fanta_doc::PathData::rect(0., 0., 20., 20.),
+            local_size: Some([20., 20.]),
+            strokes: [fanta_doc::Stroke::solid(
+                fanta_doc::Color::rgb(0, 0, 255),
+                16.,
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        node.flags.insert(fanta_doc::NodeFlags::UNCLIPPED_VECTOR);
+        doc.apply(Operation::create_node(node))
+            .expect("create flagged SVG viewport");
+        let mut renderer = fanta_render::RasterRenderer::new(64, 64).expect("CPU renderer");
+        renderer.render(&doc.scene, &doc.viewport);
+        let pixels = renderer.copy_rgba();
+        let offset = (42 * 64 + 56) * 4;
+        let pixel = pixels
+            .get(offset..offset + 4)
+            .expect("stroke outside viewport");
+        assert!(
+            pixel[2] > 200 && pixel[3] > 200,
+            "explicit flag must override its remaining viewport: {pixel:?}"
+        );
+    }
+
     struct CanvasGestureFixture {
         view: Entity<FigView>,
         item: Entity<crate::document::FigItem>,

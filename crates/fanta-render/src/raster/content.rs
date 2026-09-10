@@ -87,7 +87,11 @@ pub(crate) fn paint_node_content(
             // spills past it — chiefly a stroke thickened beyond the box — is
             // cropped instead of growing the shape. The canvas already carries the
             // node's transform, so `[0,0,w,h]` is the box in local coordinates.
-            let viewport = v.local_size;
+            let viewport = if node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR) {
+                None
+            } else {
+                v.local_size
+            };
             if let Some([w, h]) = viewport {
                 canvas.save();
                 canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);

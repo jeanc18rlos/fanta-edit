@@ -357,6 +357,9 @@ bitflags! {
         /// Excluded from automatic AI context (when an agent gets "everything
         /// on canvas," this node is omitted). Useful for sensitive layers.
         const EXCLUDE_FROM_AI = 1 << 3;
+        /// Edited vector paths may extend beyond an imported viewport. This
+        /// overrides `local_size` clipping and prevents legacy viewport backfill.
+        const UNCLIPPED_VECTOR = 1 << 4;
     }
 }
 
