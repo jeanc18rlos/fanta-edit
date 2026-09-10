@@ -34,6 +34,9 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Duplicate,
     ToolbarCommand::Delete,
     ToolbarCommand::SelectAll,
+    ToolbarCommand::Group,
+    ToolbarCommand::Ungroup,
+    ToolbarCommand::FrameSelection,
     ToolbarCommand::ZoomToFit,
     ToolbarCommand::ZoomToSelection,
     ToolbarCommand::Export,
@@ -45,6 +48,10 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::GenerateVector,
     ToolbarCommand::GenerateDesign,
     ToolbarCommand::GenerateMasks,
+    ToolbarCommand::ReplaceContent,
+    ToolbarCommand::RewriteText,
+    ToolbarCommand::TranslateText,
+    ToolbarCommand::RenameLayers,
     ToolbarCommand::RemoveBackground,
 ];
 
@@ -547,6 +554,35 @@ mod tests {
         assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::ZoomToFit));
         assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::ZoomToSelection));
         assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::SelectAll));
+    }
+
+    #[test]
+    fn implemented_commands_are_unique_and_include_existing_structure_and_text_ai_actions() {
+        let unique: std::collections::HashSet<_> = IMPLEMENTED_COMMANDS.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            IMPLEMENTED_COMMANDS.len(),
+            "the host command registry must not contain duplicate actions"
+        );
+
+        for command in [
+            ToolbarCommand::Group,
+            ToolbarCommand::Ungroup,
+            ToolbarCommand::FrameSelection,
+            ToolbarCommand::ReplaceContent,
+            ToolbarCommand::RewriteText,
+            ToolbarCommand::TranslateText,
+            ToolbarCommand::RenameLayers,
+        ] {
+            assert_eq!(
+                IMPLEMENTED_COMMANDS
+                    .iter()
+                    .filter(|registered| **registered == command)
+                    .count(),
+                1,
+                "{command:?} must be advertised exactly once"
+            );
+        }
     }
 
     /// The style catalog mirrors motion_panel.rs's entrance presets (minus
@@ -1811,6 +1847,89 @@ mod echo_tests {
                 assert_ne!(item.item_id(), view.entity_id());
             });
         }
+    }
+
+    #[gpui::test]
+    async fn structure_and_text_ai_commands_are_searchable_and_emit_their_host_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let (_view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let invoked = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let invoked = invoked.clone();
+            cx.subscribe(&toolbar, move |_, action: &ToolbarAction, _| {
+                if let ToolbarAction::CommandInvoked { command } = action {
+                    invoked.borrow_mut().push(*command);
+                }
+            })
+        });
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        cx.run_until_parked();
+
+        let commands = [
+            (
+                "group selection",
+                "toolbar-command-group-selection",
+                ToolbarCommand::Group,
+            ),
+            (
+                "ungroup selection",
+                "toolbar-command-ungroup-selection",
+                ToolbarCommand::Ungroup,
+            ),
+            (
+                "frame selection",
+                "toolbar-command-frame-selection",
+                ToolbarCommand::FrameSelection,
+            ),
+            (
+                "replace content",
+                "toolbar-command-replace-content",
+                ToolbarCommand::ReplaceContent,
+            ),
+            (
+                "rewrite text",
+                "toolbar-command-rewrite-text",
+                ToolbarCommand::RewriteText,
+            ),
+            (
+                "translate text",
+                "toolbar-command-translate-text",
+                ToolbarCommand::TranslateText,
+            ),
+            (
+                "rename layers",
+                "toolbar-command-rename-layers",
+                ToolbarCommand::RenameLayers,
+            ),
+        ];
+        for (query, selector, command) in commands {
+            let trigger = cx
+                .debug_bounds("toolbar-tool-actions")
+                .expect("Actions trigger");
+            cx.simulate_click(trigger.center(), Modifiers::none());
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+
+            let result = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("'{query}' must expose {command:?}"));
+            cx.simulate_click(result.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(
+                invoked.borrow().last().copied(),
+                Some(command),
+                "'{query}' must emit its implemented host action"
+            );
+        }
+
+        assert_eq!(
+            invoked.borrow().as_slice(),
+            commands.map(|(_, _, command)| command).as_slice(),
+            "each newly exposed command must emit once in registry order"
+        );
     }
 
     #[gpui::test]
