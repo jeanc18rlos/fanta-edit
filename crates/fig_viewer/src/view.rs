@@ -1142,8 +1142,13 @@ impl FigView {
             TimelineEvent::AddKeyframe(property) => {
                 let view = cx.weak_entity();
                 cx.defer(move |cx| {
-                    view.update(cx, |view, cx| view.add_motion_keyframe(property, cx))
-                        .log_err();
+                    if let Err(error) = view
+                        .update(cx, |view, cx| view.add_motion_keyframe(property, cx))
+                        .and_then(|result| result)
+                    {
+                        log::error!("adding motion keyframe failed: {error:#}");
+                        show_canvas_notice_deferred(format!("Could not add keyframe: {error}"), cx);
+                    }
                 });
             }
             TimelineEvent::KeyframeSelectionChanged(_) => {}
@@ -1606,13 +1611,21 @@ impl FigView {
         self.sync_motion_timeline(cx);
     }
 
-    fn add_motion_keyframe(&mut self, property: TimelineProperty, cx: &mut Context<Self>) {
+    fn add_motion_keyframe(
+        &mut self,
+        property: TimelineProperty,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.finish_document_edits(cx);
         if !self.is_editable(cx) {
-            return;
+            anyhow::bail!("the canvas is not editable while another edit is active");
         }
-        let Some(clip_id) = self.active_motion_clip else {
-            return;
-        };
+        if self.item.read(cx).content_preview_active() {
+            anyhow::bail!("finish or cancel the active canvas preview before adding a keyframe");
+        }
+        let clip_id = self
+            .active_motion_clip
+            .context("create an animation before adding a keyframe")?;
         let playhead_ms = self
             .timeline_shell
             .read(cx)
@@ -1620,74 +1633,88 @@ impl FigView {
             .max(0)
             .div_euclid(1_000)
             .min(i64::from(u32::MAX)) as u32;
-        self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                let Some(node_id) = single_selection(&document.doc) else {
-                    return ((), DocChange::None);
-                };
-                let Some(node) = motion_source_node(&document.doc, node_id) else {
-                    return ((), DocChange::None);
-                };
-                let motion_property = motion_property(property);
-                let Some(value) = motion_value(&node, motion_property) else {
-                    return ((), DocChange::None);
-                };
-                let target = MotionTarget::new(node_id, motion_property);
-                let Some(clip) = document.doc.motion.clip(clip_id) else {
-                    return ((), DocChange::None);
-                };
-                let time_ms = playhead_ms.min(clip.duration_ms);
-                let mut transaction = Transaction::new("Add Keyframe");
-                let track_id = if let Some(track) = clip.track_for_target(target) {
-                    track.id
-                } else {
-                    let track_id = AnimationTrackId::new();
-                    transaction.push(Operation::SetAnimationTrack {
+        let preview_owner = cx.entity_id();
+        let result = self.item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let result: Result<()> = (|| {
+                    let node_id = single_selection(&document.doc)
+                        .context("select one layer before adding a keyframe")?;
+                    let node = motion_source_node(&document.doc, node_id)
+                        .context("the selected layer cannot be animated")?;
+                    let motion_property = motion_property(property);
+                    let value = motion_value(&node, motion_property).with_context(|| {
+                        format!(
+                            "{} is not available for the selected layer",
+                            property.label()
+                        )
+                    })?;
+                    let target = MotionTarget::new(node_id, motion_property);
+                    let clip = document
+                        .doc
+                        .motion
+                        .clip(clip_id)
+                        .context("the active animation no longer exists")?;
+                    let time_ms = playhead_ms.min(clip.duration_ms);
+                    let mut transaction = Transaction::new("Add Keyframe");
+                    let track_id = if let Some(track) = clip.track_for_target(target) {
+                        track.id
+                    } else {
+                        let track_id = AnimationTrackId::new();
+                        transaction.push(Operation::SetAnimationTrack {
+                            clip: clip_id,
+                            track: track_id,
+                            old: None,
+                            new: Some(Box::new(AnimationTrack::new(track_id, target))),
+                        });
+                        track_id
+                    };
+                    let existing = clip
+                        .tracks
+                        .get(&track_id)
+                        .and_then(|track| {
+                            track
+                                .keyframes
+                                .values()
+                                .find(|keyframe| keyframe.time_ms == time_ms)
+                        })
+                        .cloned();
+                    let keyframe_id = existing
+                        .as_ref()
+                        .map(|keyframe| keyframe.id)
+                        .unwrap_or_else(KeyframeId::new);
+                    transaction.push(Operation::SetKeyframe {
                         clip: clip_id,
                         track: track_id,
-                        old: None,
-                        new: Some(Box::new(AnimationTrack::new(track_id, target))),
+                        target,
+                        keyframe: keyframe_id,
+                        old: existing,
+                        new: Some(Keyframe {
+                            id: keyframe_id,
+                            time_ms,
+                            value,
+                            interpolation: Interpolation::Linear,
+                            easing: Easing::EaseInOut,
+                        }),
                     });
-                    track_id
+                    document
+                        .doc
+                        .apply_transaction(transaction)
+                        .context("applying the keyframe transaction")?;
+                    Ok(())
+                })();
+                let change = if result.is_ok() {
+                    DocChange::Content
+                } else {
+                    DocChange::None
                 };
-                let existing = clip
-                    .tracks
-                    .get(&track_id)
-                    .and_then(|track| {
-                        track
-                            .keyframes
-                            .values()
-                            .find(|keyframe| keyframe.time_ms == time_ms)
-                    })
-                    .cloned();
-                let keyframe_id = existing
-                    .as_ref()
-                    .map(|keyframe| keyframe.id)
-                    .unwrap_or_else(KeyframeId::new);
-                transaction.push(Operation::SetKeyframe {
-                    clip: clip_id,
-                    track: track_id,
-                    target,
-                    keyframe: keyframe_id,
-                    old: existing,
-                    new: Some(Keyframe {
-                        id: keyframe_id,
-                        time_ms,
-                        value,
-                        interpolation: Interpolation::Linear,
-                        easing: Easing::EaseInOut,
-                    }),
-                });
-                match document.doc.apply_transaction(transaction) {
-                    Ok(()) => ((), DocChange::Content),
-                    Err(error) => {
-                        log::error!("adding motion keyframe failed: {error:#}");
-                        ((), DocChange::None)
-                    }
-                }
-            });
+                (result, change)
+            })
         });
+        result.context(
+            "finish the current Save As operation or canvas preview before adding a keyframe",
+        )??;
         self.sync_motion_timeline(cx);
+        Ok(())
     }
 
     fn sync_motion_timeline(&mut self, cx: &mut Context<Self>) {
@@ -8482,6 +8509,13 @@ mod tests {
         )));
         node.transform = fanta_doc::Transform2D::translation(12.0, 34.0);
 
+        for property in TimelineProperty::ALL {
+            assert_eq!(
+                motion_property_label(motion_property(*property)),
+                property.label()
+            );
+        }
+
         assert_eq!(
             motion_value(&node, MotionProperty::PositionX),
             Some(ResolvedVarValue::Float { value: 12.0 })
@@ -10683,6 +10717,31 @@ impl FigView {
                     .update(cx, |timeline, cx| timeline.set_loop_playback(*looping, cx));
                 cx.notify();
             }
+            (
+                ToolbarSecondaryControl::MotionAddKeyframe,
+                ToolbarControlValue::Choice(property_label),
+            ) => {
+                let Some(property) = TimelineProperty::from_label(property_label.as_ref()) else {
+                    show_canvas_notice(
+                        "Choose a keyframe property from the toolbar menu.".to_string(),
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                match self.add_motion_keyframe(property, cx) {
+                    Ok(()) => show_canvas_notice(
+                        format!("{} keyframe added.", property.label()),
+                        window,
+                        cx,
+                    ),
+                    Err(error) => show_canvas_notice(
+                        format!("Could not add {} keyframe: {error}", property.label()),
+                        window,
+                        cx,
+                    ),
+                }
+            }
             (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
                 let active_clip = self.active_motion_clip;
                 let result = self.motion_sidebar.update(cx, |panel, cx| {
@@ -10729,13 +10788,8 @@ impl FigView {
         use fanta_gpui::toolbar::ToolbarSecondaryControl;
         match control {
             ToolbarSecondaryControl::MotionAddKeyframe => {
-                // `add_motion_keyframe` needs a `TimelineProperty`; the chip
-                // carries none, and inventing one would author a keyframe the
-                // user did not ask for. The timeline's per-track controls own
-                // that flow.
                 show_canvas_notice(
-                    "Add keyframe needs a track: use the timeline's per-track controls."
-                        .to_string(),
+                    "Choose a keyframe property from the toolbar menu.".to_string(),
                     window,
                     cx,
                 );

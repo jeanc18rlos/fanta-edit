@@ -10,6 +10,7 @@ use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window}
 use gpui_component::IconName;
 
 use crate::editor_session::EditorMode;
+use crate::timeline::TimelineProperty;
 use crate::tools::ToolKind;
 use crate::view::FigView;
 
@@ -65,6 +66,13 @@ pub(crate) fn motion_animation_styles() -> Vec<SharedString> {
     crate::motion_panel::TOOLBAR_ANIMATION_STYLE_PRESETS
         .iter()
         .map(|(label, _)| SharedString::from(*label))
+        .collect()
+}
+
+pub(crate) fn motion_keyframe_properties() -> Vec<SharedString> {
+    TimelineProperty::ALL
+        .iter()
+        .map(|property| SharedString::from(property.label()))
         .collect()
 }
 
@@ -321,6 +329,7 @@ impl ToolbarAdapter {
             // instead of inventing a duration.
             duration_ms: options.duration_ms.unwrap_or(0),
             animation_style: self.animation_style.clone(),
+            available_keyframe_properties: motion_keyframe_properties(),
             available_animation_styles: motion_animation_styles(),
         };
         if self.last_pushed_motion.as_ref() != Some(&motion) {
@@ -1944,6 +1953,10 @@ mod echo_tests {
             assert!(!motion.playing);
             assert!(!motion.looping);
             assert!(!motion.auto_keyframe);
+            assert_eq!(
+                motion.available_keyframe_properties,
+                motion_keyframe_properties()
+            );
             assert_eq!(motion.available_animation_styles, motion_animation_styles());
             assert_eq!(motion.animation_style, "Slide in");
             // No active clip yet: a zero-length transport, not an invented one.
@@ -2004,6 +2017,107 @@ mod echo_tests {
             baseline + 1,
             "one change, one push"
         );
+    }
+
+    #[gpui::test]
+    async fn keyframe_choice_creates_one_undoable_property_track(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+                value: ToolbarControlValue::Choice("Opacity".into()),
+            });
+        });
+        cx.run_until_parked();
+
+        let before_invalid = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            let track = clip
+                .track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .expect("opacity track");
+            assert_eq!(track.keyframes.len(), 1);
+            let keyframe = track.keyframes.values().next().expect("opacity keyframe");
+            assert_eq!(keyframe.time_ms, 0);
+            assert_eq!(keyframe.value, ResolvedVarValue::Float { value: 1.0 });
+            assert_eq!(doc.history.undo_depth(), 1);
+            doc.motion.clone()
+        });
+
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+                value: ToolbarControlValue::Choice("Width".into()),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.motion, before_invalid);
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+
+        assert!(item.update(cx, |item, cx| item.undo(cx).expect("undo keyframe")));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            assert!(
+                clip.track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .is_none()
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+
+        let sibling_owner = toolbar.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(sibling_owner, cx, |_| {
+                ((), crate::document::DocChange::ContentPreview)
+            })
+            .expect("sibling preview starts");
+        });
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+                value: ToolbarControlValue::Choice("Opacity".into()),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            assert!(
+                clip.track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .is_none()
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+        });
+        item.update(cx, |item, cx| {
+            assert!(item.finish_content_preview(sibling_owner, false, cx));
+        });
     }
 
     #[gpui::test]

@@ -707,11 +707,11 @@ impl EditorToolbar {
                 self.motion_options.auto_keyframe,
                 cx,
             ))
-            .child(self.render_secondary_button(
+            .child(self.render_editor_chip(
                 "motion-keyframe",
                 "Keyframe",
                 ToolbarSecondaryControl::MotionAddKeyframe,
-                false,
+                window,
                 cx,
             ))
             .child(self.render_editor_chip(

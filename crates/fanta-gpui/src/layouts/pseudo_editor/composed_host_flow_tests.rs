@@ -109,7 +109,7 @@ impl WorkflowHost {
                     host.toolbar_mode = *mode;
                     host.toolbar_tool = match mode {
                         ToolbarMode::Design => ToolbarTool::Move,
-                        ToolbarMode::Motion => ToolbarTool::MotionSelect,
+                        ToolbarMode::Motion => ToolbarTool::Move,
                         ToolbarMode::Dev => ToolbarTool::Inspect,
                     };
                     toolbar.update(cx, |toolbar, cx| {
@@ -203,7 +203,7 @@ fn composed_host_routes_intents_and_echoes_state_across_components(cx: &mut Test
             let host = host.read(app);
             (host.toolbar_mode, host.toolbar_tool)
         }),
-        (ToolbarMode::Motion, ToolbarTool::MotionSelect),
+        (ToolbarMode::Motion, ToolbarTool::Move),
     );
     assert_eq!(
         cx.read(|app| {
@@ -216,7 +216,7 @@ fn composed_host_routes_intents_and_echoes_state_across_components(cx: &mut Test
         }),
         (
             ToolbarMode::Motion,
-            ToolbarTool::MotionSelect,
+            ToolbarTool::Move,
             DesignPanelWorkspaceMode::Design,
         ),
     );

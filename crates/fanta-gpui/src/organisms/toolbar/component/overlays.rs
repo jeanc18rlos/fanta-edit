@@ -723,6 +723,7 @@ impl EditorToolbar {
     /// Debug-selector prefix for one secondary chip's anchored editor.
     fn editor_selector_prefix(control: ToolbarSecondaryControl) -> &'static str {
         match control {
+            ToolbarSecondaryControl::MotionAddKeyframe => "toolbar-motion-keyframe",
             ToolbarSecondaryControl::MotionAnimationStyle => "toolbar-motion-style",
             _ => "toolbar-option",
         }

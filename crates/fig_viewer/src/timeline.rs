@@ -135,6 +135,37 @@ pub enum TimelineProperty {
     FillColor,
 }
 
+impl TimelineProperty {
+    pub const ALL: &'static [Self] = &[
+        Self::PositionX,
+        Self::PositionY,
+        Self::Rotation,
+        Self::ScaleX,
+        Self::ScaleY,
+        Self::Opacity,
+        Self::FillColor,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PositionX => "Position X",
+            Self::PositionY => "Position Y",
+            Self::Rotation => "Rotation",
+            Self::ScaleX => "Scale X",
+            Self::ScaleY => "Scale Y",
+            Self::Opacity => "Opacity",
+            Self::FillColor => "Fill color",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|property| property.label() == label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TimelineKeyframeDrag {
     keyframe: TimelineKeyframeSelection,
@@ -1694,15 +1725,8 @@ impl TimelineShell {
 
         let timeline = cx.weak_entity();
         let keyframe_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            for (property, label) in [
-                (TimelineProperty::PositionX, "Position X"),
-                (TimelineProperty::PositionY, "Position Y"),
-                (TimelineProperty::Rotation, "Rotation"),
-                (TimelineProperty::ScaleX, "Scale X"),
-                (TimelineProperty::ScaleY, "Scale Y"),
-                (TimelineProperty::Opacity, "Opacity"),
-                (TimelineProperty::FillColor, "Fill color"),
-            ] {
+            for property in TimelineProperty::ALL.iter().copied() {
+                let label = property.label();
                 let timeline = timeline.clone();
                 menu.push_item(ContextMenuEntry::new(label).handler(move |_, cx| {
                     timeline
@@ -2242,6 +2266,18 @@ mod tests {
         assert_eq!(playhead_for_x(-20.0, 0.0, 100.0, 4_000_000), 0);
         assert_eq!(playhead_for_x(120.0, 0.0, 100.0, 4_000_000), 4_000_000);
         assert_eq!(playhead_for_x(50.0, 0.0, 0.0, 4_000_000), 0);
+    }
+
+    #[test]
+    fn timeline_property_labels_round_trip() {
+        assert_eq!(TimelineProperty::ALL.len(), 7);
+        for property in TimelineProperty::ALL {
+            assert_eq!(
+                TimelineProperty::from_label(property.label()),
+                Some(*property)
+            );
+        }
+        assert_eq!(TimelineProperty::from_label("Width"), None);
     }
 
     #[test]

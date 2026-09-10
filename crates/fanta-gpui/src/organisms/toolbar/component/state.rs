@@ -454,6 +454,9 @@ impl EditorToolbar {
     /// controls without one.
     pub(super) fn choice_candidates(&self, control: ToolbarSecondaryControl) -> &[SharedString] {
         match control {
+            ToolbarSecondaryControl::MotionAddKeyframe => {
+                &self.motion_options.available_keyframe_properties
+            }
             ToolbarSecondaryControl::MotionAnimationStyle => {
                 &self.motion_options.available_animation_styles
             }

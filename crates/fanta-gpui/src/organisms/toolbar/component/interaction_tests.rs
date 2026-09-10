@@ -1189,6 +1189,57 @@ fn motion_style_chip_offers_host_candidates(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn motion_keyframe_chip_offers_host_candidates(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_mode(ToolbarMode::Motion, cx);
+            toolbar.set_motion_options(
+                MotionToolbarOptions {
+                    available_keyframe_properties: vec!["Rotation".into(), "Opacity".into()],
+                    ..MotionToolbarOptions::default()
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let chip = cx
+        .debug_bounds("toolbar-secondary-motion-keyframe")
+        .expect("keyframe chip should render");
+    cx.simulate_click(chip.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("toolbar-motion-keyframe-editor").is_some(),
+        "the keyframe chip should open a property menu"
+    );
+
+    actions.borrow_mut().clear();
+    let candidate = cx
+        .debug_bounds("toolbar-motion-keyframe-option-opacity")
+        .expect("host-supplied property should render");
+    cx.simulate_click(candidate.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[ToolbarAction::ControlChangeRequested {
+            mode: ToolbarMode::Motion,
+            control: ToolbarSecondaryControl::MotionAddKeyframe,
+            value: ToolbarControlValue::Choice("Opacity".into()),
+        }]
+    );
+    assert!(
+        cx.debug_bounds("toolbar-motion-keyframe-editor").is_none(),
+        "choosing a property should close the editor"
+    );
+}
+
+#[gpui::test]
 fn motion_style_editor_arrows_move_the_highlight_and_enter_commits(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     cx.simulate_resize(size(px(900.), px(700.)));
