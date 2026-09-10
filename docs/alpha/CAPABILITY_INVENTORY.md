@@ -2,7 +2,7 @@
 
 This is the release-facing inventory for desktop commit `17de5eb`, the exact
 first-milestone candidate `9d92b30` built on top of it, and source-only
-candidate `8fe0316` identified below. It separates
+candidate `895b6b7` identified below. It separates
 implemented behavior from test evidence and production readiness so a source
 implementation is not mistaken for a shipped, verified capability.
 
@@ -25,11 +25,11 @@ notarization were used.
 |---|---:|---:|---:|---:|---|
 | Canvas selection and drawing | Yes | Yes | Partial | N/A | Move, Hand, Scale, Path Select, Node Edit, shapes, Pen, Pencil, Frame, Section, Slice, Text, Comment, and the source-only Text on Path work are wired. Text on Path conservatively converts one eligible selected vector in place, enters inline editing, and uses cluster-derived curved caret, hit, selection, and visual-bounds geometry. Scale and Path Select have native history/reopen evidence; Text on Path has no native or final-artifact evidence. |
 | Toolbar chrome and editing commands | Yes | Yes | Partial | N/A | Resources, Actions, zoom, panel toggles, undo/redo, clipboard, duplicate/delete/select-all, Group, Ungroup, Frame Selection, Present, Design/Motion, and AI routes are wired. The exact `9d92b30` native pass verified centered Design and Motion layouts, responsive zoom collapse, panel-toggle recentering, flyout event isolation, explicit Ask AI, and searchable structure/text-AI Actions. The remaining editing-command and menu matrix still needs the final artifact pass. |
-| Roadmap toolbar controls | Partial | Yes | Unknown | N/A | Text on Path is implemented only in source candidate `8fe0316`. Arrow, direct Image/Video placement, Annotation, Measure, Dev mode/tools, auto-keyframe, motion path, and time comments still report that they are unavailable. They are not release claims. |
+| Roadmap toolbar controls | Partial | Yes | Unknown | N/A | Text on Path and contextual Motion keyframing are implemented only in source candidate `895b6b7`. Arrow, direct Image/Video placement, Annotation, Measure, Dev mode/tools, auto-keyframe, and time comments still report that they are unavailable; Motion Path is hidden and unimplemented. They are not release claims. |
 | Application menus | Yes | Partial | Unknown | N/A | Fanta, File, Edit, View, Window, and Help are declared and routed in source. The packaged-installer menu pass is outstanding. |
-| Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. The source-only TextPath inspector projects its exact kind/name; font family, Regular/Italic style, weight, size, line height, pixel letter spacing, start/center/end alignment, and underline/strikethrough; side/orientation; and validated API-debug start segment/position controls. Its synthetic glyph Fill permits RGB and opacity edits only; paint add, style, visibility, remove, and reorder actions are gated. Direction is preserved and rendered but has no typed UI action, and disabled non-applicable typography controls remain visible. The coherent candidate source gate passed, including all 706 viewer tests. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Text on Path and the remaining paint/blend matrix still need final-artifact native coverage. |
+| Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. The source-only TextPath inspector projects its exact kind/name; font family, Regular/Italic style, weight, size, line height, pixel letter spacing, start/center/end alignment, and underline/strikethrough; side/orientation; and validated API-debug start segment/position controls. Its synthetic glyph Fill permits RGB and opacity edits only; paint add, style, visibility, remove, and reorder actions are gated. Direction is preserved and rendered but has no typed UI action, and disabled non-applicable typography controls remain visible. The coherent candidate source gate passed, including all 708 viewer tests. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Text on Path and the remaining paint/blend matrix still need final-artifact native coverage. |
 | Prototype mode | Yes | Yes | Unknown | N/A | Triggers, navigation/overlay/scroll actions, variables/components, transitions, flows, and presentation runtime are implemented. |
-| Motion mode and timeline | Partial | Yes | Unknown | N/A | The production `TimelineShell` supports clip creation/selection/rename/duration, property-track keyframes, move/delete, interpolation/easing, entrance presets, playback, looping, scrub, and zoom. The contextual toolbar's Animation Style now applies an undoable entrance preset and synchronizes the timeline. Add Keyframe still requires the timeline's per-track controls, and the duplicate primary Motion flyout contradicts the working contextual controls. Auto-keyframe, motion paths, and time comments remain unavailable. |
+| Motion mode and timeline | Partial | Yes | Unknown | N/A | The production `TimelineShell` supports clip creation/selection/rename/duration, property-track keyframes, move/delete, interpolation/easing, entrance presets, playback, looping, scrub, and zoom. The contextual toolbar's Keyframe chooser shares the timeline's seven-property catalog and adds or replaces one keyframe at the playhead in a single undoable transaction; Animation Style applies an undoable entrance preset and synchronizes the timeline. The contradictory primary Motion flyout is removed. Auto-keyframe, motion paths, and time comments remain unavailable. |
 | Comments | Yes | Yes | Unknown | N/A | Pins, threads, replies, resolve/delete, mentions, attachments, and skill routing are implemented. |
 | Variables workspace | Yes | Yes | Unknown | N/A | Collections, variables, modes, values, scopes, binding, preview, and undo are implemented. Typography-variable editing is read-only. |
 | Code workspace | Yes | Yes | Unknown | N/A | FNX and JSON follow the current selection and source. Both panes are intentionally read-only. |
@@ -53,11 +53,10 @@ change state, produce output, or give an explicit unavailable message.
    hides its Export section. Toolbar export now relays progress and results to
    the canvas, but preset configuration remains outside the visible product
    surface.
-2. The production timeline can author keyframes and entrance presets, and the
-   contextual Animation Style control now authors an undoable preset and syncs
-   the timeline. Add Keyframe still does not open the real property menu, and
-   the duplicate primary Motion flyout declines actions that work in the
-   contextual row.
+2. The production timeline and contextual toolbar can author keyframes and
+   entrance presets without the former duplicate primary flyout. Auto-keyframe
+   and time comments remain visible but explicitly unavailable; Motion Path is
+   hidden and has no document implementation.
 3. Text on Path direction is serialized and honored by rendering, but it is not
    exposed by the typed inspector UI. Caret positions inside one shaping
    cluster that contains multiple graphemes use equal subdivisions rather than
@@ -104,11 +103,11 @@ restores and reprojects the document before persistence resumes. Direction
 remains unexposed, and this inspector work has not been exercised in a native
 build.
 
-The coherent source-only gate passed all 706 `fig_viewer` tests; 116
+The coherent source-only gate passed all 708 `fig_viewer` tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21
 focused `fanta-render` TextPath tests; five focused `fanta-doc` TextPath tests;
-297 `fanta-tools` tests (290 unit, six end-to-end, and one ink oracle); and 596
-`fanta-gpui` checks (593 unit and three architecture), with one doctest ignored.
+297 `fanta-tools` tests (290 unit, six end-to-end, and one ink oracle); and 597
+`fanta-gpui` checks (594 unit and three architecture), with one doctest ignored.
 The package-scoped `./script/clippy` gate is also green for `fanta-text`,
 `fanta-render`, `fanta-doc`, `fanta-tools`, `fanta-gpui`, `fig_viewer`,
 `acp_thread`, `agent`, and `agent_ui`. Focused Agent evidence includes two
@@ -147,11 +146,13 @@ not be assumed safe.
 
 ## Intentionally gated behavior
 
-These controls already decline explicitly or are deliberately read-only. They
-should stay out of release claims, but they are not silent-handler bugs:
+These controls already decline explicitly, are deliberately read-only, or stay
+hidden because their document behavior does not exist. They should stay out of
+release claims, but they are not silent-handler bugs:
 
 - Dev mode/tools, direct media placement tools, Annotation, Measure,
-  auto-keyframe, motion path, and time-anchored comments.
+  auto-keyframe, and time-anchored comments decline explicitly. Motion Path is
+  hidden and unimplemented.
 - Text on Path conversion of rounded, clipped, degenerate, hidden/locked, or
   ambiguously/unsupported-painted vectors; those cases decline without changing
   the document. Direction editing, exact glyph-internal carets within one
@@ -190,8 +191,9 @@ Before release sign-off:
    read-only.
 2. Expose Export preset configuration in the default product surface and
    native-verify both success and failure feedback.
-3. Connect toolbar Add Keyframe to the existing production timeline operations,
-   then remove or unify the contradictory primary flyout.
+3. Native-verify the contextual seven-property Keyframe chooser, its single-step
+   Undo behavior and rejected requests that author no keyframe, and the absence
+   of the contradictory primary Motion flyout.
 4. Native-verify Text on Path create/edit/Undo/Redo/save/reopen/export behavior,
    including multi-grapheme clusters, glyphless intervals, inspector preview
    cancellation/persistence barriers, and explicit rejection paths. Add a typed

@@ -9,7 +9,7 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
 | Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity and driven natively: compact Design/Motion layouts, responsive centering, toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export passed. Earlier trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing also passed natively. This is not the final signed/notarized artifact. |
-| Current source-only editor work | Candidate `8fe0316` implements Text on Path creation/editing/render geometry, its bounded Design-inspector surface and preview-persistence boundary, and an active-root-scoped canvas-selection attachment to an unsent Agent draft. The coherent source gate passes 706 viewer tests, the focused text/render/document/tools/GPUI and Agent checks recorded below, and package-scoped Clippy for all affected packages. No native build, hosted artifact, deployment, billing configuration, or customer release validates this combined slice. Dev mode and Voice input remain unavailable. |
+| Current source-only editor work | Candidate `895b6b7` implements Text on Path creation/editing/render geometry, its bounded Design-inspector surface and preview-persistence boundary, an active-root-scoped canvas-selection attachment to an unsent Agent draft, and contextual seven-property Motion keyframing without the duplicate primary flyout. The coherent source gate passes 708 viewer tests, the focused text/render/document/tools/GPUI and Agent checks recorded below, and package-scoped Clippy for all affected packages. No native build, hosted artifact, deployment, billing configuration, or customer release validates this combined slice. Dev mode, auto-keyframe, Motion Path, time comments, and Voice input remain unavailable. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
@@ -61,9 +61,9 @@ closed after the pass and the prior untouched
 `github-d0bc2d7/untouched/Fanta.app` was restarted with its original profile.
 Do not run two stable-channel Fanta QA binaries in parallel.
 
-## Current source-only Text on Path and canvas context — September 10
+## Current source-only Text on Path, canvas context, and Motion keyframing — September 10
 
-Source-only candidate `8fe0316` replaces the former Text on Path
+Source-only candidate `895b6b734e11253c3320918f60492cd1f0758a41` replaces the former Text on Path
 placeholder with a conservative command: exactly one visible, unlocked vector
 is replaced in place, preserving its node identity and wrapper metadata, then
 opened for inline editing. The command accepts an unpainted path or one normal
@@ -119,14 +119,24 @@ permission handling, transcription, and cancellation are not part of this
 slice, and Dev mode's inspect, measure, annotation, and readiness controls
 remain unavailable.
 
+The contextual Motion Keyframe chip now opens the same Position X/Y, Rotation,
+Scale X/Y, Opacity, and Fill color catalog as the production timeline. Choosing
+a property samples the selected layer's resolved value and adds or replaces its
+keyframe at the current playhead in one undoable transaction. Exact label
+parsing rejects forged choices, and a content preview owned elsewhere blocks the
+operation without changing motion state or history. The former duplicate
+primary Motion flyout is absent; Move remains the primary selection face.
+Auto-keyframe, Motion Path, and time comments remain unimplemented. This source
+behavior has automated evidence only and still needs native-artifact validation.
+
 The coherent candidate source gate passed:
 
-- all 706 `fig_viewer` tests;
+- all 708 `fig_viewer` tests;
 - 116 `fanta-text` unit tests and one doctest, with one network test ignored;
 - 21 focused `fanta-render` TextPath tests and five focused `fanta-doc`
   TextPath tests;
 - 297 `fanta-tools` tests: 290 unit, six end-to-end, and one ink oracle;
-- 596 `fanta-gpui` checks: 593 unit and three architecture, with one doctest
+- 597 `fanta-gpui` checks: 594 unit and three architecture, with one doctest
   ignored;
 - two Agent canvas-selection request-framing checks; three attachment, one
   external-context, and nine queue-filter Agent UI checks; 49 `acp_thread`

@@ -37,7 +37,7 @@ ad-hoc local QA shell is not a distribution candidate. Evidence is retained at
 The remaining paint/blend matrix, native Export failure, and final
 signed/notarized artifact are still gates.
 
-Source-only candidate `8fe0316` implements conservative
+Source-only candidate `895b6b7` implements conservative
 Text on Path conversion, inline curved-text editing, and renderer-backed
 selection geometry. Visual bidirectional navigation is implemented. Caret
 positions inside one shaping cluster containing multiple graphemes remain equal
@@ -58,12 +58,20 @@ The toolbar attachment captures only selections wholly inside the active page
 or component root. Its immutable review-before-send resource carries exact node
 ids plus stable document/path/project/root/scope identity, bounds descriptive
 strings, and is capped at 64 nodes and 128 KiB; mixed-root or off-root selections
-are rejected and rapid requests queue without sending automatically. The
-coherent candidate source gate passed all 706 viewer tests; 116
+are rejected and rapid requests queue without sending automatically.
+
+The contextual Motion Keyframe control now shares the production timeline's
+seven-property catalog and adds or replaces one keyframe at the playhead as one
+undoable transaction. Rejected requests do not author a keyframe, and a foreign
+content preview remains intact. The duplicate primary Motion flyout is removed.
+Auto-keyframe, Motion Path, and time comments remain unimplemented, and this
+Motion change has no native-artifact evidence.
+
+The coherent candidate source gate passed all 708 viewer tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21
 focused renderer TextPath tests; five focused document TextPath tests; 297
-tools tests (290 unit, six end-to-end, and one ink oracle); and 596 GPUI checks
-(593 unit and three architecture), with one doctest ignored. Focused Agent
+tools tests (290 unit, six end-to-end, and one ink oracle); and 597 GPUI checks
+(594 unit and three architecture), with one doctest ignored. Focused Agent
 coverage passed two canvas-selection request-framing checks; three attachment,
 one external-context, and nine queue-filter Agent UI checks; 49 mention checks;
 and one canvas-selection URI round trip. The package-scoped `./script/clippy`

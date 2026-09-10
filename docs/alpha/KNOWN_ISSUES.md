@@ -108,14 +108,17 @@ actually driven. Nothing here claims more than that record supports.
 
 ## Canvas and tools
 
-- **Roadmap faces stay visible and decline explicitly.** Text-on-path, direct
-  Image/Video placement, Arrow, Annotation, Measure, Dev mode/tools, toolbar
-  file attachment and voice, auto-keyframe recording, time-anchored comments,
-  page duplication, and page links are not implemented. Their handlers raise
-  *"&lt;control&gt; is not available in the Fanta alpha yet."* or an equally
-  specific notice. Scale and Path Select are implemented and have focused
-  native history/reopen evidence; Image, Video, Vector, Masks, and Remove
-  Background open their dedicated generation workspaces.
+- **Unfinished roadmap faces either decline explicitly or stay hidden.** Direct
+  Image/Video placement, Arrow, Annotation, Measure, Dev mode/tools, arbitrary
+  toolbar file attachment and voice, auto-keyframe recording, time-anchored
+  comments, page duplication, and page links are not implemented. Their visible
+  handlers raise *"&lt;control&gt; is not available in the Fanta alpha yet."* or an
+  equally specific notice. Motion Path is hidden and unimplemented. Text on
+  Path and the bounded canvas-selection attachment are implemented only in the
+  current source candidate and have no native-artifact evidence. Scale and Path
+  Select are implemented and have focused native history/reopen evidence;
+  Image, Video, Vector, Masks, and Remove Background open their dedicated
+  generation workspaces.
 - **Ask AI and text-oriented commands prepare Agent drafts, not automatic
   edits.** A typed Ask AI prompt and the Replace Content, Rewrite Text,
   Translate Text, and Rename Layers templates open a fresh Agent Panel draft
@@ -271,18 +274,18 @@ actually driven. Nothing here claims more than that record supports.
   unsaved-canvas cases pass. Exact `9d92b30` native QA exercised the success
   route and wrote a valid 418×354 `Shape@2x.png`; native failure feedback is
   still open.
-- **The document-backed timeline is ahead of its toolbar.** Motion mode can
-  create/select/rename clips, change duration, add property tracks and
-  keyframes from the timeline-wide `+ Keyframe` menu, move/delete keyframes,
-  edit interpolation/easing, apply entrance presets, play, loop, scrub, and
-  zoom. The contextual Animation Style chooser currently changes only toolbar
-  state; its Keyframe chip is guidance rather than the real property chooser.
-  The duplicate primary Motion flyout still declines Motion Select, Play
-  Preview, Add Keyframe, and Animation Style even where contextual/runtime
-  equivalents work. Auto-keyframe, motion paths, and time comments have no
-  document implementation yet. Production uses `fig_viewer::TimelineShell`;
-  the reusable `fanta-gpui` timeline tests exercise the pseudo editor, not the
-  shipped timeline.
+- **Auto-keyframe, motion paths, and time comments remain unfinished.** Motion
+  mode can create/select/rename clips, change duration, add property tracks and
+  keyframes, move/delete keyframes, edit interpolation/easing, apply entrance
+  presets, play, loop, scrub, and zoom. The timeline-wide and contextual
+  Keyframe menus now share the same seven-property catalog; a contextual choice
+  adds or replaces one keyframe at the playhead in one undoable transaction.
+  Animation Style applies an undoable preset and synchronizes the timeline, and
+  the contradictory primary Motion flyout is removed. Auto-keyframe and time
+  comments still decline explicitly; Motion Path is hidden and has no document
+  implementation. Production uses `fig_viewer::TimelineShell`; the reusable
+  `fanta-gpui` timeline tests exercise the pseudo editor, not the shipped
+  timeline. None of the new contextual keyframing has native-artifact evidence.
 - The Code tab is read-only by design. Edit `.fnx` in your own editor and the
   canvas follows the file. Note that with autosave on, `page.fnx`'s mtime moves
   about a second after any canvas edit — **an unchanged mtime is no longer a
