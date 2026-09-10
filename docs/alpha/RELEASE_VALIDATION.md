@@ -4,6 +4,15 @@
 and the remaining work for the Apple Silicon alpha. Configuration and launch
 instructions are in [LAUNCH.md](LAUNCH.md).
 
+| Area | Current status |
+| --- | --- |
+| Backend and AI | Deployed. Real default Sonnet streaming, credit metering, catalog access, and key revocation passed. Final native sign-in/persistence and production media remain unverified. |
+| Customer payments | Not enabled. Resolve product/pricing/currency/credit allowances, configure Polar, and verify checkout and subscription lifecycle before charging customers. |
+| Editor | Creation/editing, Save As, reopening, Git commit/push, Scale, and curve viewport checks have native evidence. The Undo/Redo handle-refresh correction passes automated and native checks, including save/reopen. Text on Path is unfinished. |
+| Leads | PostHog US access recovered. The live waitlist stores contacts and attribution correctly. Exclude the synthetic QA signup; no outreach or conversion improvement is claimed. |
+| Distribution | GitHub checks and earlier test installers pass. The latest editing batch still needs hosted checks and its exact installer; Apple notarization and clean-Mac validation remain open. |
+| Housekeeping | Retired QA apps closed; about 49.24 GiB recovered from the retired build target. Daily 04:00 Europe/Madrid checks and Sunday Cargo cleanup are scheduled, with cleanup deferred during active work. |
+
 ## GitHub and local checks
 
 Desktop push and pull request CI passed at `5181599` and `b0523fe`; the latter
@@ -40,14 +49,34 @@ the Save As/font, generation recovery/contract, and sidebar-selection correction
 [push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34423710801) and
 [pull-request checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34423713177).
 Its [installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34423710706)
-is building. The subsequent Path Selection changes still need hosted checks and
-a matching installer. Running installers have not been canceled or restarted.
-The last local native build passed in
-**5m45s**, and Save As passed copy/adoption, original-file preservation,
-autosave recovery, and rejection without opening the destination tab. The
-font correction at `8ab306a` has completed local allocation review below.
-Hosted checks through `20d7108` pass. Path Selection still needs hosted checks,
-and exact installer validation remains pending.
+completed successfully. The [eca2b86 installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427356619)
+is in progress. Both hosted checks at `eca2b86` passed:
+[pull-request check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427359223) and
+[push check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34427356711).
+Subsequent commits `ee8e14d` (fast canvas input and anchor deletion), `af4cb0f`
+(Scale), `ca56b0a` (Sidebar fixtures and full-suite CI coverage), `16533e6`
+(K shortcut), `dcf27d6` (viewport correction), and `849685f` (history-overlay
+refresh) have the local results below. Hosted checks for this batch remain pending. Native
+viewport and K checks passed at `dcf27d6`; Undo exposed stale editing handles.
+The `849685f` correction passes automated checks and its 4m36s build passed
+native Undo/Redo handle alignment and save/reopen. Hosted checks and a matching
+installer remain pending.
+Running installers have not been canceled or restarted.
+
+The preceding local native build used `ca56b0a` and passed in **4m41s**.
+Fast input, anchor editing, Scale with proportional strokes, Undo/Redo, and
+save/reopen passed. It exposed clipping after point edits, as recorded below.
+The `dcf27d6` build passed in **6m42s**, followed by native overflow in both
+directions, geometry Undo/Redo, save/reopen, and K checks. A stale editing-handle
+overlay after Undo led to the `849685f` correction. Its automated checks pass;
+the 4m36s build passed native Undo/Redo handle alignment and save/reopen. The
+earlier **4m39s** candidate passed curve
+rendering/acquisition and authored-curve save but exposed the fast-drag and
+anchor-delete defects that the combined candidate subsequently verified.
+The preceding **5m45s** build passed Save As copy/adoption, original-file
+preservation, autosave recovery, and rejection without opening the destination
+tab. The font correction at `8ab306a` has completed local allocation review
+below. Exact installer validation remains pending.
 No signed/notarized installer is validated.
 An earlier native release build passed in **5m30s**, including the page-switch
 inspector correction. Candidate app `dev.fanta.CandidateQA` (PID 93583)
@@ -87,26 +116,29 @@ Local validation results:
 
 | Check | Result |
 | --- | --- |
-| `cargo test --locked --offline -p fanta-doc --lib` | 336 passed; 1 explicit benchmark ignored, including conservative curve bounds |
-| `cargo test --locked --offline -p fanta-tools --lib` | 258 passed, including 16 Path Selection regressions and existing node-edit tools |
+| `cargo test --locked --offline -p fanta-doc --lib` | Final viewport revision: 337 passed; 1 explicit benchmark ignored, including conservative curve bounds and persisted unclipped-vector state |
+| `cargo test --locked --offline -p fanta-tools --lib` | Final overlay revision `849685f`: 280 passed, retaining the 17 Scale cases, 16 Path Selection cases, and viewport/metadata-preservation node-edit regressions |
+| `cargo test --locked --offline -p fanta-render --lib viewport` | Final viewport revision: 6 passed, including canvas/export bounds and authored-viewport behavior |
 | `cargo test --locked --offline -p fanta-format` | 181 passed, including integration tests and doctests; 2 ignored |
 | Focused Rust formatting and `git diff --check` | Passed |
-| `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; now includes `cargo test --locked -p fanta-doc -p fanta-format` |
-| `cargo build --locked --release -p zed --bin fanta` | Final Save As/font build passed in 5m45s; native copy/adoption, data protection, rejection without destination-tab activation, autosave recovery, and reopen passed |
+| `.github/workflows/check.yml` with actionlint 1.7.12 | Passed; `ca56b0a` adds full Sidebar and native toolbar adapter suites alongside the existing document, format, and editing-tool checks. Hosted execution of the expanded workflow is pending. |
+| `cargo build --locked --release -p zed --bin fanta` | Preceding viewport build: 6m42s at `dcf27d6`; positive/negative viewport overflow, geometry Undo/Redo, save/reopen, and K passed. Undo exposed a stale editing-handle overlay, corrected in `849685f` with passing automated checks. Latest build: 4m36s at `849685f`; native Undo/Redo immediately aligns handles with restored geometry, and save/reopen preserves the complete curve and exact saved-source hash. The prior 4m41s `ca56b0a` build passed fast input, anchors and Scale/strokes. Earlier 5m45s Save As/font build passed the lifecycle checks below. |
 | Browser sign-in callback recovery | 2 passed; valid encrypted callbacks, invalid callback rejection, 10-minute deadline, retry and cancellation |
 | Document suite | 36 passed, including Save As regressions; hidden active-page recovery with background/shape pixel assertions, bundled Git resolution, long-save watcher suppression, overlapping/failed/canceled saves, and entity release |
 | Production language registration | 4 passed, including named Git Commit lookup and COMMIT_EDITMSG file recognition without a parser or language server |
 | Bundled Git transport | 2 Rust regressions passed, including clone/push/fetch/pull without system Git and with a bad inherited `GIT_EXEC_PATH`; replay against actual Dugite passed with clean repository integrity checks |
 | Inspector integration suite | 34 passed; real page switching clears off-page selection, preserves selection on the current page, updates the inspector, and leaves the old shape unchanged |
 | Native toolbar interaction suite | 32 passed, including pointer focus, popup dismissal, input editing, and keyboard navigation |
-| Native toolbar adapter suite | 15 passed, including Path Selection drag/undo/redo and the shipped canvas keymap; typing and clicking in search preserve the query, Escape restores shortcuts |
+| Native toolbar adapter suite | Final overlay revision `849685f`: 26 passed, including exact NodeEdit/Path Selection overlays after keyboard and toolbar Undo/Redo without pointer input, plus the earlier drag/delete, Scale, viewport, and search/keymap checks. Both new overlay cases passed 20 scheduler iterations each. The five fast-drag/delete, Scale, and two viewport GPUI regressions also passed 20 each; the ordinary raster pixel guard passed once. |
 | Native generation/media suite | 37 passed, including backend string-seed submission/poll/replay responses, integer segmentation clicks, toolbar activation, catalog authorization, prompt-to-SVG, and scrollable inpainting controls |
-| Sidebar suite with ownership, startup, and selection fixes | 137 passed, 6 existing failures. Three new selection regressions and the previously failing historical-thread selection test pass. The initial baseline was 128 passes and 8 failures; the suite is not fully green. |
+| Sidebar suite with ownership, startup, and selection fixes | Final run: 143 passed, 0 failed in 22.96s. All six corrected fixtures passed 20 scheduler iterations each. Database-fixture isolation and setup corrections retain the behavioral assertions; this batch adds no Sidebar runtime change. Earlier 137-pass/6-failure and 128-pass/8-failure baselines remain below. |
 
-The local CI workflow includes the focused sidebar ownership regressions.
-Six baseline failures remain; their exclusion from the focused check is not
-evidence that they are fixed. The current CI also runs selection-remapping
-regressions and the historical-thread activation check.
+Commit `ca56b0a` adds full Sidebar and native toolbar suites to CI; actionlint
+passed. The final local Sidebar run passed all 143 tests. Repeated archive,
+terminal, and unarchive fixture failures came from shared database metadata;
+isolation corrections retain the original behavioral assertions. All six
+corrected fixtures passed 20 scheduler iterations each. This batch changes no
+Sidebar runtime behavior. Hosted execution of the expanded workflow is pending.
 
 New tests cover snapshot isolation through node/hierarchy edits and unchanged
 JSON serialization. A GPUI test also covers closing the visible assistant
@@ -119,7 +151,8 @@ cargo test --locked --offline -p agent_ui --lib test_toggle_closes_visible_agent
 
 Backend coverage includes early idempotent recovery, Gateway planner routing,
 worker source fixes, and safe validation-error formatting. The backend is
-deployed; authenticated end-to-end verification remains pending.
+deployed; default Sonnet streaming and metering passed authenticated production
+API checks. Final native, production media, and payment verification remain pending.
 
 ## Measured snapshot improvement
 
@@ -201,10 +234,11 @@ project, the commit template loaded visibly, an edited draft survived closing
 and reopening the commit dialog, and the native Stage All/Commit flow created
 `ff7bf4a3a0b00e6ae525cee0fe4b88007ea10922` with 15 design files and a clean
 working tree. No `language not found` error occurred in that session. No
-production credentials or paid calls were used. Current source `bccc5fd` is
-pushed; both GitHub checks passed, verified at 21:34 UTC, and its installer
-build is now in progress after `d0bc2d7` completed. The exact corrected installer still requires
-validation.
+production credentials or paid calls were used. Source `bccc5fd` was pushed;
+both GitHub checks passed, verified at 21:34 UTC. Its installer subsequently
+completed and passed downloaded package, revision, signature, and bundled-Git
+checks described above. That package was not launched; later sources need
+their own exact-installer validation.
 
 The app command palette opens the native Image workspace with Image, Video,
 Vector, Design, and Masks modes. The toolbar focus/keymap, ten-minute sign-in
@@ -613,7 +647,8 @@ submission retry, download/save retry, and refusing to complete an unconfirmed
 upload. These tests use fake HTTP responses and GPUI's clock; they do not prove
 production inference or billing. Evidence is in
 `/tmp/fanta-release-qa-20260909/generation-timeout-validation/`.
-Final hosted checks and exact-installer verification remain required.
+Later hosted checks through `eca2b86` cover this network correction and passed.
+Exact-installer verification remains required.
 
 ## Live waitlist correction — September 10
 
@@ -706,11 +741,17 @@ execution also exposed shared test-database state between scheduler iterations;
 the header fixture now uses a separate database each time. The four selection
 tests passed **20 scheduler iterations each** with all assertions retained.
 
-The full suite now reports **137 passes and 6 baseline failures**, improved
-from 133 passes and 7 failures before this correction. The remaining failures
-involve draft/focus/async fixture expectations and are preserved for follow-up;
-they have not been declared fixed. Evidence is in
-`/tmp/fanta-release-qa-20260909/sidebar-selection-validation/`.
+At that stage the full suite reported **137 passes and 6 baseline failures**,
+improved from 133 passes and 7 failures. Subsequent fixture corrections retain
+the exact behavioral assertions. Repeated archive, terminal, and unarchive
+failures were traced to shared test-database metadata and corrected with
+fixture isolation. The final full suite passed **143 tests, 0 failures in
+22.96s**; all six corrected fixtures also passed **20 scheduler iterations
+each**. This fixture batch adds no Sidebar runtime change. Commit `ca56b0a`
+adds full Sidebar and toolbar CI coverage and passed actionlint; its hosted
+execution remains pending. Evidence is in
+`/tmp/fanta-release-qa-20260909/sidebar-selection-validation/` and
+`/tmp/fanta-release-qa-20260909/sidebar-followup-validation/`.
 
 ## Production device API verification — September 10
 
@@ -799,7 +840,8 @@ cancellation. Selecting a segment preserves the authored curve rather than
 inserting a point. Acquisition uses the scene's existing spatial index and a
 screen-space tolerance, respects hidden/locked ancestors, clipping overrides,
 and page scope, and excludes invalid transforms and boolean children. The
-native toolbar now activates this tool. Scale and Text on Path remain placeholders.
+native toolbar activates this tool. Scale is implemented in the subsequent
+`af4cb0f` correction below; Text on Path remains a placeholder.
 
 Two original curve regressions exposed endpoint-only broad-phase bounds that
 excluded the visible body of a curve. Shared `PathData::rough_bounds` now
@@ -819,15 +861,178 @@ compile because its JSON metadata used the wrong API; after that fixture-only
 correction it reproduced the expected selection failure before the runtime fix.
 All these logs remain preserved.
 
-Final results: **336 document tests passed** with one explicit benchmark ignored;
+Results for that batch: **336 document tests passed** with one explicit benchmark ignored;
 **258 editing-tool tests passed**, including all 16 Path Selection cases; and
 **15 native toolbar tests passed**. The new toolbar-to-canvas drag/undo/redo
 regression passed **20 scheduler iterations**. Focused Rust formatting,
 actionlint, and diff checks passed. GitHub now includes the full editing-tool
-suite and the new native regression. These are automated GPUI tests; no new
-standalone app was opened for this batch. The next exact installer still needs
-visual curve/selection/layout checks. Evidence and guarded before/final source
-hashes: `/tmp/fanta-release-qa-20260909/path-selection-validation/`.
+suite and the new native regression. The subsequent **4m39s** native candidate
+passed curve rendering/acquisition and saving without changing the authored
+curve. It also exposed the fast-drag and anchor-delete failures below, so this
+was not a complete canvas interaction pass. The next exact installer still
+needs visual curve/selection/layout checks. Evidence and guarded before/final
+source hashes: `/tmp/fanta-release-qa-20260909/path-selection-validation/`.
+
+## Fast canvas input and proportional Scale — September 10
+
+Native `eca2b86` QA showed press/move/release drags leaving both ordinary
+selection and Path Selection unchanged, while clicking and ordinary-selection
+keyboard nudging worked. Backspace on one selected anchor deleted the entire layer and left
+stale point overlays. Commit `ee8e14d` registers canvas window listeners before
+the press and checks live gesture state, preserving one move/release path.
+Backspace and toolbar Delete now dispatch to NodeEdit/PathSelect; explicit
+layer deletion keeps its object-level meaning.
+
+The tests-only baseline reproduced **three fast-drag failures** and **two
+anchor-delete failures**. All five now pass, each across **20 scheduler
+iterations**. The drag tests dispatch press/move/release without a repaint,
+including release outside the canvas; they check exact geometry, one undo
+entry, Undo, and no continued drag on hover. The delete tests load the shipped
+keymap and check layer preservation, removal of one anchor, updated overlays,
+Undo, and explicit layer deletion. Evidence:
+`/tmp/fanta-release-qa-20260909/fast-drag-validation/`.
+
+Commit `af4cb0f` implements proportional Scale handles. Geometry, descendant
+positions, text and dimensional styles scale together without compounding
+selected descendants; placement-only content preserves its source. Visible
+variable-bound frame dimensions determine the pivot, and release consumes its
+final pointer position even without a matching move. Undo/Redo and cancellation
+preserve original geometry, styles, and bindings. Text on Path remains pending.
+
+Scale's revised tests-only baseline produced **14 engine failures**, with
+**three controls passing**, and **one native failure**. At that stage, all
+**275 editing-tool tests** and **21 native toolbar adapter tests** passed. The Scale native
+regression also passed **20 scheduler iterations**, checking real toolbar
+activation, text size/font preview, a single undo entry, Undo/Redo, and Escape.
+Evidence: `/tmp/fanta-release-qa-20260909/scale-validation/`.
+
+These automated before/after results preceded the combined native run below,
+which verified fast drags, anchor deletion, Scale, and save/reopen but exposed
+viewport clipping. Commit `16533e6` subsequently connected the K shortcut. The
+full Sidebar suite passed all 143 tests, and all six corrected fixtures passed
+20 scheduler iterations each. Full Sidebar and toolbar CI coverage is committed
+in `ca56b0a`; hosted execution and an exact installer remain pending.
+
+## Combined native candidate — September 10
+
+The candidate built from `ca56b0a` source in **4m41s** and passed strict ad-hoc
+signature checks in the reused QA bundle. Ordinary rectangle dragging and
+Undo worked. Path Selection now committed the expected translated cubic
+geometry, and deleting one anchor kept the layer as a three-anchor triangle;
+Undo/Redo rendered the correct states. Scale activated from the toolbar,
+changed a 100×60 rectangle to 198.802×119.281 with a fixed top-left corner,
+and passed Undo/Redo. A quadratic curve changed from 200×160 to
+300.351×240.281 while its stroke changed proportionally from 4 to 6.007.
+Saving and reopening preserved those shapes and the saved page hash; the
+other two curve source lines remained exact. Both native QA processes exited
+normally, leaving the user's existing app alone.
+
+This was **not a complete native pass**: a point edit retained an imported
+vector's original `local_size` viewport, clipping the visible curve to its old
+rectangle despite correct geometry and overlays. Clearing the viewport alone
+would be undone by document-load backfill for some paths. The later `dcf27d6`
+correction and its final automated results are recorded next; they do not
+retroactively turn this candidate into a complete native pass.
+Evidence: `/tmp/fanta-release-qa-20260909/canvas-tools-native/`.
+
+## Persistent viewport correction — September 10
+
+Commit `dcf27d6` uses `NodeFlags::UNCLIPPED_VECTOR` to record that point editing
+removed an imported vector's viewport. This replaces the intermediate approach
+that wrote a marker into `CanvasNode.meta`; that approach could overwrite
+opaque array/string extension data. The final implementation preserves metadata
+objects, arrays, strings, and null without using them for core editing state.
+
+A geometry-changing gesture clears `local_size` and sets the dedicated flag.
+Cancellation, tool changes, and returning to the original position restore the
+original path, viewport, and flag bit while preserving unrelated flags. Path
+and flag changes commit together for Undo/Redo. Load-time viewport backfill
+skips flagged vectors. The flag also overrides a remaining explicit viewport
+in canvas rendering and visual export bounds; ordinary unflagged SVG viewports
+retain their clipping behavior.
+
+The final revision's tests-only baselines reproduced one document failure,
+one tool failure with four controls passing, three viewer pixel/save/reopen
+failures, and one export-bounds failure. These include exact opaque-metadata
+preservation and the mixed flag/remaining-box case. The final six-file source
+then passed **337 document tests with one benchmark ignored**, **280 editing-tool
+tests**, **6 viewport render tests**, and **24 native toolbar adapter tests**.
+Both positive- and negative-coordinate GPUI pixel regressions passed **20
+scheduler iterations each**, including actual project save/load, document
+initialization, exact metadata/flag preservation, and visible overflow after
+reopening. The ordinary raster pixel guard in the same filtered invocation
+ran once; it is not a 20-iteration GPUI test.
+
+Evidence and frozen source hashes:
+`/tmp/fanta-release-qa-20260909/path-viewport-validation/revision2/`, including
+`final-manifest.json`, `after-execution.json`, and the final test logs. Earlier
+metadata-candidate results remain historical evidence, not validation of this
+final revision.
+
+**Native viewport and K checks passed; the separate overlay correction is verified below.**
+The `dcf27d6` build completed in 6m42s. The existing QA bundle was reused and
+passed strict ad-hoc signature verification. Actual pointer drags in both
+positive and negative directions rendered the complete edited curve beyond
+its old viewport. Saved source contains `UNCLIPPED_VECTOR` and no `local_size`.
+Undo restores the exact authored quadratic, original viewport, and absent
+flag; Redo restores edited geometry. K activates Scale, confirmed by its menu
+selection and eight handles. Reopening the negative edit rendered the whole
+curve with an unchanged saved-source hash. Opaque array/string preservation
+is covered by the repeated GPUI write/read tests; this manual fixture has no
+opaque payload.
+
+Undo also exposed a separate UI defect: path anchors/control handles retain
+their previous positions until another pointer event, although the restored
+geometry and ordinary selection bounds are correct. The `849685f` correction
+and its automated results are recorded next; they do not retroactively turn
+this candidate into a complete native editing pass. Both QA instances (72094
+and 72782) quit normally. At the end of that QA run, only the user's retained
+app/helper remained, with no Cargo/rustc or zombie processes
+and about 89 GiB free. Evidence is in
+`/tmp/fanta-release-qa-20260909/path-viewport-validation/native/verification.json`.
+
+## Path-editing overlays after Undo/Redo — September 10
+
+Commit `849685f` refreshes cached NodeEdit and Path Selection overlays after a
+successful Undo/Redo. The tool shell previously kept the final pointer-response
+positions even after document history restored the correct curve. A read-only
+overlay hook now derives anchors and controls from the restored document without
+changing geometry, document/tool selection, gesture state, or history. Other
+tools retain their existing behavior; no synthetic pointer event or tool
+reactivation is required.
+
+Two GPUI regressions use the real toolbar and shipped keymap, one for NodeEdit
+and one for Path Selection. They drag a quadratic anchor, then invoke both
+keyboard and toolbar Undo/Redo without any pointer input. Each checks exact
+anchor/control world positions, the selected-anchor marker, geometry, viewport,
+flags, opaque metadata, document selection, and history depth. Both compiled
+and failed at the stale-overlay assertions before the runtime correction.
+
+The final **280 editing-tool tests** and **26 toolbar adapter tests** pass.
+Both new GPUI cases also passed **20 scheduler iterations each** in **45.67s**.
+The final six source hashes were independently reviewed. Frozen before/after
+source and logs are in
+`/tmp/fanta-release-qa-20260909/path-overlay-history-validation/`, including
+`final-manifest.json`, `verification.json`, `before-tests.log`, and the final
+suite/repetition logs.
+
+**Final overlay native validation: PASSED for the recorded scope.**
+The `849685f` release build completed in 4m36s and the reused QA bundle passed
+strict ad-hoc signature verification. A real Path Selection segment drag
+rendered the complete moved curve. Cmd-Z and Cmd-Shift-Z immediately placed
+all visible anchors and controls on the corresponding restored geometry,
+without intervening pointer input. The saved FNX was byte-identical to the
+same drag on `dcf27d6`; reopening rendered the complete curve with the same
+saved-source hash. The manual check used keyboard history in Path Selection;
+both modes and keyboard/toolbar history are covered by the repeated GPUI tests.
+
+Both QA instances (74384 and 74957) quit normally. The final process check
+found only the user's retained Fanta app and its helper, no Cargo/rustc or
+zombie processes, and about 88.5 GiB free. Evidence, source guards, and saved
+fixtures are under
+`/tmp/fanta-release-qa-20260909/path-overlay-history-validation/native/`.
+Hosted checks and an exact installer for this editing batch remain pending;
+these scoped local checks are not customer-release signoff.
 
 ## Remaining release requirements
 
@@ -836,9 +1041,9 @@ hashes: `/tmp/fanta-release-qa-20260909/path-selection-validation/`.
 | Backend and AI Gateway | Backend head `a2bb2bb` is green in CI and deployed, with all 396 tests passing. Account selection, removed-member/key access, and production mock-model billing guards are included. The earlier additive migration remains verified. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Browser-confirmed device API sign-in, catalog discovery, default Sonnet streaming, one-credit debit and key revocation passed in production. Repeat these checks through the final native installer; Keychain persistence and native account-error handling remain unverified. The earlier native QA session was closed. |
 | Charge customers | The billing page still displays an explicit checkout-not-configured notice and no purchase or manage buttons. The latest API/dashboard check shows Pro/Owner and 387 credits after two one-credit AI verification requests. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
 | Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
-| Additional canvas tools | Path Selection is implemented and passes 258 tool tests, 336 document tests, 15 native toolbar tests, and a 20-iteration native regression. Shared curve bounds are now conservative; verify curved selection/layout visually in the final installer. Scale and Text on Path remain explicit placeholders. |
+| Additional canvas tools | Path Selection, proportional Scale, and the K shortcut are implemented. The combined `ca56b0a` native candidate passed fast input, anchor editing, Scale/strokes, Undo/Redo, and save/reopen, but exposed viewport clipping. The `dcf27d6` viewport revision passed 337 document tests with one ignored, 280 tools, 6 viewport renders, and 24 toolbar adapters; both viewport GPUI pixel/reopen cases passed 20 iterations each. Its native build passed in 6m42s; viewport overflow, save/reopen, and K passed. Undo exposed stale editing handles. The `849685f` read-only overlay correction now passes 280 tools, 26 toolbar adapters, and both new GPUI cases across 20 iterations each. Its 4m36s build passed native immediate Undo/Redo handle alignment and save/reopen. Hosted and exact-installer checks remain pending. Text on Path remains a placeholder. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. Hosted checks through `20d7108` pass; exact-installer verification remains pending. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. Hosted checks through `eca2b86` pass; exact-installer verification remains pending. |
 | Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans. The previously observed descriptor-array scanner signature is absent after the later font correction; its final native snapshot still flags 314 blocks / 19,936 bytes across 20 roots. Other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | Landing head `4e6c9c9` is live as `dpl_7SD2uTp6M2W37XABjH7qm2ynSGnU`; both hosted checks passed. All 15 offline tests, type checks, lint, and the production build passed. The live form rejected an overlong address, disabled edits while submitting, and confirmed the exact test address. Its stored contact and canonical `waitlist_joined` event were retrieved in US PostHog project 410640 with matching submission ID and campaign attribution. Basic signup-to-stored-contact verification passed using one reserved-domain QA address. Exclude that record from customer counts; no conversion improvement or completed outreach campaign is established. |
