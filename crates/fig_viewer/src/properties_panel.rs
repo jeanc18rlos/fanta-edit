@@ -339,6 +339,7 @@ impl FantaPropertiesPanel {
                     .as_ref()
                     .is_some_and(|previous| previous.entity_id() == view.entity_id());
                 if !is_same {
+                    self.reset_for_new_subject(true, cx);
                     // Subscribe to the item's event stream rather than
                     // observing the view: the view notifies on every pan and
                     // pointer-move frame, which re-rendered the inspector at
@@ -411,18 +412,6 @@ impl FantaPropertiesPanel {
                     ));
                     self.active_item = Some(item.downgrade());
                     self.active_view = Some(view.downgrade());
-                    self.editing_field = None;
-                    self.field_edit_snapshot = None;
-                    self.field_edit_text_buffer_snapshot = None;
-                    self.field_edit_previewed = false;
-                    self.scrub = None;
-                    self.picker = None;
-                    self.gradient_editor = None;
-                    self.content_scroll.set_offset(gpui::Point::default());
-                    self.corner_radii_expanded = None;
-                    self.hidden_paint_alpha.clear();
-                    self.export_feedback = None;
-                    self.cancel_export_task();
                 }
             }
             None => {
@@ -464,8 +453,9 @@ impl FantaPropertiesPanel {
 
     fn finish_content_preview(&self, committed: bool, cx: &mut Context<Self>) {
         if let Some(item) = self.active_item(cx) {
+            let preview_owner = cx.entity_id();
             item.update(cx, |item, cx| {
-                item.finish_content_preview(committed, cx);
+                item.finish_content_preview(preview_owner, committed, cx);
             });
         }
     }
@@ -495,6 +485,12 @@ impl FantaPropertiesPanel {
         let Some(item) = self.active_item(cx) else {
             return false;
         };
+        if let Some(view) = self.active_view(cx)
+            && view.read(cx).has_active_text_edit()
+            && item.read(cx).can_preview_for_owner(view.entity_id())
+        {
+            view.update(cx, |view, cx| view.commit_text_edit(cx));
+        }
         let operations = {
             let item_state = item.read(cx);
             if !item_state.is_editable() {
@@ -505,12 +501,13 @@ impl FantaPropertiesPanel {
             };
             finite_transform_operations(build(&document.doc))
         };
+        let preview_owner = cx.entity_id();
         match operations.len() {
             0 => false,
             1 => item.update(cx, |item, cx| {
                 let mut applied = false;
                 for operation in operations {
-                    match item.apply(operation, cx) {
+                    match item.apply_for_preview_owner(preview_owner, operation, cx) {
                         Ok(()) => applied = true,
                         Err(error) => log::error!(
                             "Fanta properties panel failed to apply operation: {error:#}"
@@ -536,8 +533,9 @@ impl FantaPropertiesPanel {
             .first()
             .map(|operation| operation.label().to_string())
             .unwrap_or_else(|| "Edit".to_string());
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
-            let applied = item.with_document(cx, |document| {
+            let applied = item.with_document_for_owner(preview_owner, cx, |document| {
                 let doc = &mut document.doc;
                 doc.history.begin(label, &mut doc.scene);
                 for operation in operations {
@@ -1884,16 +1882,9 @@ impl FantaPropertiesPanel {
         if text_buffer_snapshot.is_some() {
             // BufferEdited already left the live TextEditSession at the final
             // value. Applying the field again here would sample/replace runs a
-            // second time and can collapse mixed typography.
-            if previewed {
-                // Do not read the active `FigView` here. Canvas clicks finish
-                // inspector gestures from inside that view's own update, and
-                // such a read would double-lease it. A previewed text-buffer
-                // edit is already staged in the live session; the snapshot's
-                // presence proves this was the selection-aware path.
-                let committed = true;
-                self.finish_content_preview(committed, cx);
-            }
+            // second time and can collapse mixed typography. The live text
+            // session owns this preview until it commits; keeping the item
+            // boundary active also protects it from sibling-view autosave.
             cx.notify();
             return;
         }
@@ -1938,6 +1929,7 @@ impl FantaPropertiesPanel {
         let field = self.editing_field.take();
         let snapshot = self.field_edit_snapshot.take();
         let text_buffer_snapshot = self.field_edit_text_buffer_snapshot.take();
+        let text_selection_preview = text_buffer_snapshot.is_some();
         let previewed = std::mem::take(&mut self.field_edit_previewed);
         if restore && previewed {
             let restored_text = match (field.as_ref(), text_buffer_snapshot) {
@@ -1951,7 +1943,9 @@ impl FantaPropertiesPanel {
             }
         }
         if previewed {
-            self.finish_content_preview(false, cx);
+            if !text_selection_preview {
+                self.finish_content_preview(false, cx);
+            }
         }
         cx.notify();
     }
@@ -2174,8 +2168,6 @@ impl FantaPropertiesPanel {
             // Avoid reading the active view while a canvas event is updating
             // it; movement with a changed value is sufficient to decide
             // whether this preview becomes committed state.
-            let committed = scrub.current_value != scrub.start_value;
-            self.finish_content_preview(committed, cx);
             cx.notify();
             return;
         }
@@ -2201,6 +2193,7 @@ impl FantaPropertiesPanel {
         if let Some(scrub) = self.scrub.take()
             && scrub.moved
         {
+            let text_selection_preview = scrub.text_buffer_snapshot.is_some();
             if restore {
                 if let Some(buffer) = scrub.text_buffer_snapshot {
                     self.restore_text_selection_buffer(&scrub.field, buffer, cx);
@@ -2208,7 +2201,9 @@ impl FantaPropertiesPanel {
                     self.restore_snapshot_preview(&scrub.snapshot, cx);
                 }
             }
-            self.finish_content_preview(false, cx);
+            if !text_selection_preview {
+                self.finish_content_preview(false, cx);
+            }
         }
     }
 
@@ -2229,11 +2224,12 @@ impl FantaPropertiesPanel {
         let field = field.clone();
         let snapshot = snapshot.clone();
         let text = text.to_string();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
             if !item.is_editable() {
                 return;
             }
-            let applied = item.with_document(cx, |document| {
+            let applied = item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 restore_snapshot(&mut document.doc, &snapshot);
                 let operations =
                     finite_transform_operations(field_operations(&document.doc, &field, &text));
@@ -2253,8 +2249,9 @@ impl FantaPropertiesPanel {
             return;
         };
         let snapshot = snapshot.clone();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
-            let applied = item.with_document(cx, |document| {
+            let applied = item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 restore_snapshot(&mut document.doc, &snapshot);
                 ((), DocChange::ContentPreview)
             });
@@ -2408,7 +2405,9 @@ impl FantaPropertiesPanel {
                     false
                 }
             };
-            self.finish_content_preview(committed, cx);
+            if !selection_preview {
+                self.finish_content_preview(committed, cx);
+            }
         }
         cx.notify();
     }
@@ -2420,11 +2419,15 @@ impl FantaPropertiesPanel {
             && session.changed
             && restore
         {
+            let selection_preview = session.text_buffer_snapshot.is_some();
             if let Some(buffer) = session.text_buffer_snapshot {
                 self.restore_text_selection_buffer(&session.field, buffer, cx);
+            } else {
+                self.restore_snapshot_preview(&session.snapshot, cx);
             }
-            self.restore_snapshot_preview(&session.snapshot, cx);
-            self.finish_content_preview(false, cx);
+            if !selection_preview {
+                self.finish_content_preview(false, cx);
+            }
         }
     }
 
@@ -2535,11 +2538,12 @@ impl FantaPropertiesPanel {
             return;
         };
         let snapshot = snapshot.clone();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
             if !item.is_editable() {
                 return;
             }
-            let applied = item.with_document(cx, |document| {
+            let applied = item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 restore_snapshot(&mut document.doc, &snapshot);
                 let operations = finite_transform_operations(replace_data_operation(
                     &document.doc,
@@ -4442,6 +4446,79 @@ mod panel_integration_tests {
     }
 
     #[gpui::test]
+    async fn switching_active_view_cancels_preview_on_previous_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        let original = linear_gradient_fill();
+        let previous = open_panel_with_gradient(original.clone(), cx).await;
+        let next = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let previous_item = previous._view.read_with(cx, |view, _| view.item().clone());
+        let next_item = next._view.read_with(cx, |view, _| view.item().clone());
+
+        previous
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.toggle_gradient_editor(previous.vector_id, 0, false, original.clone(), cx);
+                let editor = panel
+                    .gradient_editor
+                    .as_ref()
+                    .expect("gradient editor is open")
+                    .editor
+                    .clone();
+                editor.update(cx, |editor, cx| {
+                    editor.set_kind(crate::color_picker::GradientKind::Radial, cx);
+                });
+            })
+            .expect("preview a radial gradient");
+        cx.run_until_parked();
+        previous_item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert!(item.is_dirty());
+        });
+
+        let next_view = next._view;
+        previous
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.set_active_view(Some(next_view), cx);
+            })
+            .expect("switch active view");
+        cx.run_until_parked();
+
+        previous
+            .panel
+            .read_with(cx, |panel, _| {
+                assert!(panel.gradient_editor.is_none());
+                assert_eq!(
+                    panel
+                        .active_item
+                        .as_ref()
+                        .and_then(WeakEntity::upgrade)
+                        .map(|item| item.entity_id()),
+                    Some(next_item.entity_id())
+                );
+            })
+            .expect("read switched properties panel");
+        previous_item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            let node = item
+                .document()
+                .expect("ready document")
+                .doc
+                .scene
+                .get(previous.vector_id)
+                .expect("gradient node");
+            let NodeData::Vector(vector) = &node.data else {
+                panic!("expected vector node");
+            };
+            let Some(Fill::Gradient { gradient, .. }) = vector.fills.first() else {
+                panic!("expected gradient fill");
+            };
+            assert_eq!(gradient, &original);
+        });
+    }
+
+    #[gpui::test]
     async fn real_drag_of_a_gradient_stop_does_not_panic(cx: &mut TestAppContext) {
         init_test(cx);
         let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
@@ -4730,6 +4807,84 @@ mod panel_integration_tests {
         assert!(underline);
         assert_eq!(align, TextAlign::Justify);
         assert_eq!(auto_resize, TextAutoResize::Height);
+    }
+
+    #[gpui::test]
+    async fn discrete_inspector_edit_commits_an_active_text_preview_first(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let text_id = harness.text_id;
+        let view = harness._view.clone();
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text_id, crate::view::TextEditSeed::SelectAll, window, cx);
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view, None, "Draft", window, cx,
+                    );
+                });
+            })
+            .expect("type into the canvas text session");
+        cx.run_until_parked();
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.set_text_align(text_id, TextAlign::Center, cx);
+            })
+            .expect("apply a discrete inspector edit");
+        cx.run_until_parked();
+
+        assert!(!view.read_with(cx, |view, _| view.has_active_text_edit()));
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            let NodeData::Text(text) = &item
+                .document()
+                .expect("document")
+                .doc
+                .scene
+                .get(text_id)
+                .expect("text node")
+                .data
+            else {
+                panic!("expected text data");
+            };
+            assert_eq!(text.content, "Draft");
+            assert_eq!(text.align, TextAlign::Center);
+        });
+
+        item.update(cx, |item, cx| item.undo(cx).expect("undo alignment"));
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("document")
+                .scene
+                .get(text_id)
+                .expect("text node")
+                .data
+            else {
+                panic!("expected text data");
+            };
+            assert_eq!(text.content, "Draft");
+            assert_eq!(text.align, TextAlign::Justify);
+        });
+        item.update(cx, |item, cx| item.undo(cx).expect("undo text edit"));
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("document")
+                .scene
+                .get(text_id)
+                .expect("text node")
+                .data
+            else {
+                panic!("expected text data");
+            };
+            assert_eq!(text.content, "Hello");
+        });
     }
 
     #[gpui::test]

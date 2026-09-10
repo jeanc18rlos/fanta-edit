@@ -12,15 +12,16 @@
 //! Page background, the rotate/flip transforms, and multi-selection
 //! align/distribute. Gated off: layout grids, exports, style registries,
 //! aspect-ratio lock, smart selection, constraints, resize-to-fit, Tidy up,
-//! single-node align, text-path, and pattern/shader/media paint editing
+//! single-node align, text-path direction, and pattern/shader/media paint editing
 //! (gradient and image paints are displayed read-only).
 
 use std::collections::HashMap;
 
 use fanta_doc::{
     BlendMode, Blur, BlurKind, BoundProp, Color as FantaColor, ComponentId, Doc, Fill, Gradient,
-    GradientStop, LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape,
-    Shadow, ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, Transform2D,
+    GradientStop, LayoutMode, MaskType, MeasuredPath, NodeData, NodeFlags, NodeId, Operation,
+    ParametricShape, Shadow, ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign,
+    TextAutoResize, TextPathAlignment, TextPathSide, TextPathStart, Transform2D,
     VAlign as TextVAlign, VarValue,
 };
 use fanta_gpui::design::{
@@ -29,17 +30,19 @@ use fanta_gpui::design::{
     DesignComponentReference, DesignComponentRole, DesignCornerCapabilities, DesignEffect,
     DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop,
     DesignLayout, DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
-    DesignPageBackground, DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintPayload,
-    DesignPaintProperty, DesignPaintTransform, DesignPaintValue, DesignPanel, DesignPanelAction,
-    DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap,
-    DesignPanelCollection, DesignPanelEditPhase, DesignPanelInspectionContext,
-    DesignPanelMultipleSelection, DesignPanelNode, DesignPanelNodeCapabilities,
-    DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelPermissions, DesignPanelProperty,
-    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelTarget, DesignPanelValue,
-    DesignSizingMode, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
-    DesignStrokeDashes, DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights,
-    DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
-    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
+    DesignPageBackground, DesignPageViewData, DesignPaint, DesignPaintCollectionEditMode,
+    DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintTransform,
+    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
+    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
+    DesignPanelEditPhase, DesignPanelInspectionContext, DesignPanelMultipleSelection,
+    DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout,
+    DesignPanelPermissions, DesignPanelProperty, DesignPanelPropertyValueState, DesignPanelSection,
+    DesignPanelTarget, DesignPanelValue, DesignSizingMode, DesignStroke, DesignStrokeAlign,
+    DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeJoin,
+    DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
+    DesignTextHorizontalAlignment, DesignTextPathOrientation, DesignTextPathStartData,
+    DesignTextPathViewData, DesignTextResize, DesignTextVerticalAlignment,
+    DesignTransformOperation, DesignTypography, DesignTypographyTarget,
     DesignViewerPropertiesViewData, DesignViewerPropertyRow, DesignViewerPropertySection,
 };
 use gpui::{AppContext as _, ClipboardItem, Context, Entity, SharedString, Subscription, Window};
@@ -172,7 +175,7 @@ pub(crate) fn design_kind(
             None => DesignPanelNodeKind::Vector,
         },
         NodeData::Text(_) => DesignPanelNodeKind::Text,
-        NodeData::TextPath(_) => DesignPanelNodeKind::Other,
+        NodeData::TextPath(_) => DesignPanelNodeKind::TextPath,
         NodeData::Instance(_) => DesignPanelNodeKind::Instance,
         NodeData::Boolean(_) => DesignPanelNodeKind::BooleanOperation,
         NodeData::Bitmap(_) => DesignPanelNodeKind::Image,
@@ -415,6 +418,43 @@ fn design_typography(snapshot: &TypographySnapshot) -> DesignTypography {
     }
 }
 
+fn design_text_path_typography(text_path: &fanta_doc::TextPathNode) -> DesignTypography {
+    let style = &text_path.style;
+    DesignTypography {
+        family: SharedString::from(style.font_family.clone()),
+        style: if style.italic {
+            "Italic".into()
+        } else {
+            "Regular".into()
+        },
+        weight: f32::from(style.weight),
+        size: style.size_px as f32,
+        line_height: match style.line_height_auto_percent {
+            Some(100.0) => DesignLineHeight::Auto,
+            Some(percent) => DesignLineHeight::Percent(percent as f32),
+            None => DesignLineHeight::Percent((style.line_height * 100.0) as f32),
+        },
+        letter_spacing: DesignLetterSpacing::Pixels(style.letter_spacing as f32),
+        horizontal_alignment: match text_path.alignment {
+            TextPathAlignment::Start => DesignTextHorizontalAlignment::Left,
+            TextPathAlignment::Center => DesignTextHorizontalAlignment::Center,
+            TextPathAlignment::End => DesignTextHorizontalAlignment::Right,
+        },
+        decoration: if style.underline {
+            DesignTextDecoration::Underline
+        } else if style.strikethrough {
+            DesignTextDecoration::Strikethrough
+        } else {
+            DesignTextDecoration::None
+        },
+        // These required compatibility fields are suppressed through explicit
+        // read-only `Unset` property states for TextPath below.
+        vertical_alignment: DesignTextVerticalAlignment::Top,
+        resize: DesignTextResize::Fixed,
+        ..DesignTypography::default()
+    }
+}
+
 fn design_stroke(
     id: NodeId,
     kind: DesignPanelNodeKind,
@@ -528,6 +568,13 @@ fn gate_capabilities(
         capabilities.layer_appearance = true;
         capabilities.visibility = true;
     }
+    if kind == DesignPanelNodeKind::TextPath {
+        capabilities
+            .sections
+            .retain(|section| *section != DesignPanelSection::Stroke);
+        capabilities.stroke = false;
+        capabilities.fill_edit_mode = DesignPaintCollectionEditMode::ColorAndOpacityOnly;
+    }
     let _ = corner_capabilities;
     capabilities
 }
@@ -557,6 +604,8 @@ pub(crate) fn design_node(
     out.component_properties.clear();
     out.transform_modifiers.clear();
     out.typography = None;
+    out.text_path = None;
+    out.text_path_start_data = None;
     out.layout = None;
     out.fill_shows_in_exports = None;
 
@@ -594,6 +643,10 @@ pub(crate) fn design_node(
         smoothing: section.corner_smoothing.is_some(),
     };
 
+    let text_path = match &node.data {
+        NodeData::TextPath(text_path) => Some(text_path),
+        _ => None,
+    };
     if let Some(fills) = &section.fills {
         out.fills = fills
             .iter()
@@ -603,6 +656,10 @@ pub(crate) fn design_node(
     } else if let Some(typography) = &section.typography {
         // A text node's Fill section is its glyph color.
         let mut paint = design_solid_paint(typography.color);
+        paint.id = SharedString::from(format!("{id}-fill-0"));
+        out.fills = vec![paint];
+    } else if let Some(text_path) = text_path {
+        let mut paint = design_solid_paint(text_path.style.color);
         paint.id = SharedString::from(format!("{id}-fill-0"));
         out.fills = vec![paint];
     }
@@ -630,7 +687,24 @@ pub(crate) fn design_node(
         })
         .collect();
     out.layout = design_layout(&section);
-    out.typography = section.typography.as_ref().map(design_typography);
+    out.typography = section
+        .typography
+        .as_ref()
+        .map(design_typography)
+        .or_else(|| text_path.map(design_text_path_typography));
+    if let Some(text_path) = text_path {
+        out.text_path = Some(
+            DesignTextPathViewData::new(match text_path.side {
+                TextPathSide::Default => DesignTextPathOrientation::Default,
+                TextPathSide::Flipped => DesignTextPathOrientation::Flipped,
+            })
+            .with_start_data_debug_controls(true),
+        );
+        out.text_path_start_data = Some(DesignTextPathStartData {
+            segment: text_path.start.segment(),
+            position: text_path.start.position() as f32,
+        });
+    }
     out.is_mask = node.is_mask;
     out.mask_mode = match node.mask_type {
         MaskType::Alpha => DesignMaskType::Alpha,
@@ -1017,6 +1091,38 @@ fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
             .read_only_with_reason("Shadow blend modes are not supported by this document format"),
         ));
     }
+    if matches!(&node.data, NodeData::TextPath(_)) {
+        states.extend(
+            [
+                DesignPanelProperty::TypographyStyle,
+                DesignPanelProperty::TextLeadingTrim,
+                DesignPanelProperty::ParagraphSpacing,
+                DesignPanelProperty::ParagraphIndent,
+                DesignPanelProperty::ListSpacing,
+                DesignPanelProperty::TextHangingPunctuation,
+                DesignPanelProperty::TextHangingLists,
+                DesignPanelProperty::VerticalTextAlignment,
+                DesignPanelProperty::TextResize,
+                DesignPanelProperty::TextTruncate,
+                DesignPanelProperty::TextMaxLines,
+                DesignPanelProperty::TextDecorationStyle,
+                DesignPanelProperty::TextDecorationOffset,
+                DesignPanelProperty::TextDecorationThickness,
+                DesignPanelProperty::TextDecorationColor,
+                DesignPanelProperty::TextDecorationSkipInk,
+                DesignPanelProperty::TextCase,
+                DesignPanelProperty::TextList,
+            ]
+            .into_iter()
+            .map(|property| {
+                (
+                    property,
+                    DesignPanelPropertyValueState::Unset
+                        .read_only_with_reason("This property does not exist on text paths"),
+                )
+            }),
+        );
+    }
     states
 }
 
@@ -1035,9 +1141,19 @@ pub(crate) struct DesignEchoKey {
 
 /// An in-flight Begin/Preview/Commit/Cancel property gesture: the pre-gesture
 /// node state, restored before commit so one gesture is one undo step.
+#[derive(Clone)]
 pub(crate) struct DesignEditSession {
+    pub scene_instance: u64,
     pub node: NodeId,
     pub snapshot: NodeSnapshot,
+}
+
+fn restore_design_edit_session(doc: &mut Doc, session: &DesignEditSession) -> bool {
+    if doc.scene.instance_id() != session.scene_instance {
+        return false;
+    }
+    restore_snapshot(doc, &session.snapshot);
+    true
 }
 
 pub(crate) struct DesignAdapter {
@@ -1222,13 +1338,50 @@ impl FigView {
             return;
         };
         let item = self.item().clone();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                restore_snapshot(&mut document.doc, &session.snapshot);
-                ((), DocChange::ContentPreview)
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let change = if restore_design_edit_session(&mut document.doc, &session) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
         });
+    }
+
+    pub(crate) fn discard_gpui_design_edits(&mut self) {
+        if let Some(adapter) = self.gpui_design.as_mut() {
+            adapter.session = None;
+        }
+    }
+
+    fn design_edit_session_for_preview(
+        &mut self,
+        id: NodeId,
+        cx: &Context<Self>,
+    ) -> Option<DesignEditSession> {
+        let scene_instance = self
+            .item()
+            .read(cx)
+            .document()
+            .map(|document| document.doc.scene.instance_id());
+        let adapter = self.gpui_design.as_mut()?;
+        if adapter
+            .session
+            .as_ref()
+            .is_some_and(|session| Some(session.scene_instance) != scene_instance)
+        {
+            adapter.session = None;
+            return None;
+        }
+        adapter
+            .session
+            .as_ref()
+            .filter(|session| session.node == id)
+            .cloned()
     }
 
     fn current_viewer_properties_for_target(
@@ -1261,6 +1414,7 @@ impl FigView {
             return false;
         }
         let item = self.item().clone();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
             if !item.is_editable() {
                 return false;
@@ -1268,7 +1422,7 @@ impl FigView {
             if operations.len() == 1 {
                 let mut applied = false;
                 for operation in operations {
-                    match item.apply(operation, cx) {
+                    match item.apply_for_preview_owner(preview_owner, operation, cx) {
                         Ok(()) => applied = true,
                         Err(error) => {
                             log::error!("fig design adapter failed to apply operation: {error:#}")
@@ -1281,7 +1435,7 @@ impl FigView {
                     .first()
                     .map(|operation| operation.label().to_string())
                     .unwrap_or_else(|| "Edit".to_string());
-                let applied = item.with_document(cx, |document| {
+                let applied = item.with_document_for_owner(preview_owner, cx, |document| {
                     let doc = &mut document.doc;
                     doc.history.begin(label, &mut doc.scene);
                     for operation in operations {
@@ -1427,6 +1581,74 @@ impl FigView {
                 }
                 crate::view::notify_unavailable("Paint eyedropper", window, cx);
             }
+            DesignPanelAction::TextPathFlipOrientationRequested { node_id: id } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                if !self.design_text_path_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale text-path flip target");
+                    return;
+                }
+                self.finish_document_edits_for_external_change(cx);
+                let operations = self.design_ops(cx, |doc| {
+                    text_path_flip_operations(doc, id).unwrap_or_default()
+                });
+                self.design_apply_ops(operations, cx);
+            }
+            DesignPanelAction::TextPathStartChangeRequested {
+                node_id: id,
+                data,
+                phase,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_start(panel, id, *data, *phase, cx);
+            }
+            DesignPanelAction::TypographyPropertyChangeRequested {
+                node_id: id,
+                target,
+                property,
+                value,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_typography(
+                    panel, id, *target, *property, value, None, window, cx,
+                );
+            }
+            DesignPanelAction::TypographyPropertyEditRequested {
+                node_id: id,
+                target,
+                property,
+                value,
+                phase,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_typography(
+                    panel,
+                    id,
+                    *target,
+                    *property,
+                    value,
+                    Some(*phase),
+                    window,
+                    cx,
+                );
+            }
+            DesignPanelAction::TypographyFontApplyRequested {
+                node_id: id,
+                target,
+                font,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_font_apply(panel, id, *target, font, cx);
+            }
             DesignPanelAction::PropertyChangeRequested {
                 node_id: id,
                 property,
@@ -1435,6 +1657,21 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if !self.design_node_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale property target");
+                    return;
+                }
+                let targets_text_path = panel.read(cx).node().kind == DesignPanelNodeKind::TextPath
+                    || self
+                        .item()
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.scene.get(id))
+                        .is_some_and(|node| matches!(&node.data, NodeData::TextPath(_)));
+                if targets_text_path && !self.design_text_path_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale text-path property target");
+                    return;
+                }
                 self.finish_document_edits_for_external_change(cx);
                 let mut unhandled = false;
                 let ops = self.design_ops(cx, |doc| {
@@ -1459,6 +1696,21 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if !self.design_node_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale property target");
+                    return;
+                }
+                let targets_text_path = panel.read(cx).node().kind == DesignPanelNodeKind::TextPath
+                    || self
+                        .item()
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.scene.get(id))
+                        .is_some_and(|node| matches!(&node.data, NodeData::TextPath(_)));
+                if targets_text_path && !self.design_text_path_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale text-path property target");
+                    return;
+                }
                 self.handle_design_phased_edit(id, *property, value, *phase, window, cx);
             }
             DesignPanelAction::TargetedNodeActionRequested { target, action } => {
@@ -1473,15 +1725,39 @@ impl FigView {
             DesignPanelAction::PaintEditRequested {
                 node_id: id,
                 collection,
-                paint_id: _,
+                target,
+                paint_id,
                 index,
                 edit,
                 phase,
-                ..
             } => {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                let targets_text_path = self.design_action_targets_text_path(panel, id, cx);
+                if targets_text_path {
+                    let supported_value = paint_edit_value(edit).is_some_and(|value| {
+                        matches!(value, PaintEditValue::Color(_) | PaintEditValue::Opacity(_))
+                    });
+                    let document_targets_text_path = self
+                        .item()
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.scene.get(id))
+                        .is_some_and(|node| matches!(&node.data, NodeData::TextPath(_)));
+                    let expected_paint_id = format!("{id}-fill-0");
+                    if !document_targets_text_path
+                        || !self.design_text_path_action_is_current(panel, id, cx)
+                        || *collection != DesignPanelCollection::Fill
+                        || !matches!(target, fanta_gpui::design::DesignPaintTarget::WholeLayer)
+                        || *index != 0
+                        || paint_id.as_ref() != expected_paint_id.as_str()
+                        || (*phase != DesignPanelEditPhase::Cancel && !supported_value)
+                    {
+                        log::warn!("fig design adapter: rejecting stale text-path paint target");
+                        return;
+                    }
+                }
                 self.handle_design_paint_edit(id, *collection, *index, edit, *phase, window, cx);
             }
             DesignPanelAction::PaintChangeRequested {
@@ -1495,6 +1771,10 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if self.design_action_targets_text_path(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting unsupported text-path paint change");
+                    return;
+                }
                 let is_stroke = *collection == DesignPanelCollection::Stroke;
                 let color = fanta_color(paint.color);
                 self.finish_document_edits_for_external_change(cx);
@@ -1514,6 +1794,10 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if self.design_action_targets_text_path(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting unsupported text-path paint reorder");
+                    return;
+                }
                 let is_stroke = *collection == DesignPanelCollection::Stroke;
                 let (from, to) = (*from_index, *to_index);
                 self.finish_document_edits_for_external_change(cx);
@@ -1546,6 +1830,10 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if self.design_action_targets_text_path(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting unsupported text-path paint add");
+                    return;
+                }
                 let is_stroke = *collection == DesignPanelCollection::Stroke;
                 if *collection != DesignPanelCollection::Fill && !is_stroke {
                     return;
@@ -1573,6 +1861,10 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if self.design_action_targets_text_path(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting unsupported text-path paint remove");
+                    return;
+                }
                 let is_stroke = *collection == DesignPanelCollection::Stroke;
                 if *collection != DesignPanelCollection::Fill && !is_stroke {
                     return;
@@ -1697,6 +1989,7 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                self.finish_document_edits_for_external_change(cx);
                 let item = self.item().clone();
                 item.update(cx, |item, cx| {
                     item.with_document(cx, |document| {
@@ -1777,6 +2070,329 @@ impl FigView {
             _ => {
                 log::debug!("fig design adapter: unhandled action {action:?}");
             }
+        }
+    }
+
+    fn design_action_targets_text_path(
+        &self,
+        panel: &Entity<DesignPanel>,
+        id: NodeId,
+        cx: &Context<Self>,
+    ) -> bool {
+        panel.read(cx).node().kind == DesignPanelNodeKind::TextPath
+            || self
+                .item()
+                .read(cx)
+                .document()
+                .and_then(|document| document.doc.scene.get(id))
+                .is_some_and(|node| matches!(&node.data, NodeData::TextPath(_)))
+    }
+
+    fn design_text_path_action_is_current(
+        &self,
+        panel: &Entity<DesignPanel>,
+        id: NodeId,
+        cx: &Context<Self>,
+    ) -> bool {
+        if !self.design_node_action_is_current(panel, id, cx) {
+            return false;
+        }
+        let panel_is_current = {
+            let panel = panel.read(cx);
+            panel.node().kind == DesignPanelNodeKind::TextPath
+        };
+        if !panel_is_current {
+            return false;
+        }
+        let item = self.item().read(cx);
+        let Some(document) = item.document() else {
+            return false;
+        };
+        matches!(
+            document.doc.scene.get(id).map(|node| &node.data),
+            Some(NodeData::TextPath(_))
+        )
+    }
+
+    fn design_node_action_is_current(
+        &self,
+        panel: &Entity<DesignPanel>,
+        id: NodeId,
+        cx: &Context<Self>,
+    ) -> bool {
+        let panel_is_current = {
+            let panel = panel.read(cx);
+            panel.inspection_context().permissions().can_edit()
+                && node_id(&panel.node().id) == Some(id)
+        };
+        if !panel_is_current {
+            return false;
+        }
+        let item = self.item().read(cx);
+        if !item.is_editable() {
+            return false;
+        }
+        let Some(document) = item.document() else {
+            return false;
+        };
+        document.doc.selection.iter().copied().eq([id]) && document.doc.scene.get(id).is_some()
+    }
+
+    fn handle_design_text_path_typography(
+        &mut self,
+        panel: &Entity<DesignPanel>,
+        id: NodeId,
+        target: DesignTypographyTarget,
+        property: DesignPanelProperty,
+        value: &DesignPanelValue,
+        phase: Option<DesignPanelEditPhase>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target != DesignTypographyTarget::WholeLayer
+            || !self.design_text_path_action_is_current(panel, id, cx)
+        {
+            log::warn!("fig design adapter: rejecting stale text-path typography target");
+            return;
+        }
+        if phase == Some(DesignPanelEditPhase::Cancel) {
+            self.handle_design_phased_edit(
+                id,
+                property,
+                value,
+                DesignPanelEditPhase::Cancel,
+                window,
+                cx,
+            );
+            return;
+        }
+        let supported = {
+            let item = self.item().read(cx);
+            item.document().is_some_and(|document| {
+                text_path_typography_operations(&document.doc, id, property, value).is_some()
+            })
+        };
+        if !supported {
+            if phase.is_none() || phase == Some(DesignPanelEditPhase::Commit) {
+                crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            }
+            return;
+        }
+        match phase {
+            None => {
+                self.finish_document_edits_for_external_change(cx);
+                let operations = self.design_ops(cx, |doc| {
+                    text_path_typography_operations(doc, id, property, value).unwrap_or_default()
+                });
+                self.design_apply_ops(operations, cx);
+            }
+            Some(phase) => {
+                self.handle_design_phased_edit(id, property, value, phase, window, cx);
+            }
+        }
+    }
+
+    fn handle_design_text_path_font_apply(
+        &mut self,
+        panel: &Entity<DesignPanel>,
+        id: NodeId,
+        target: DesignTypographyTarget,
+        font: &fanta_gpui::design::DesignFontSelection,
+        cx: &mut Context<Self>,
+    ) {
+        if target != DesignTypographyTarget::WholeLayer
+            || !self.design_text_path_action_is_current(panel, id, cx)
+        {
+            log::warn!("fig design adapter: rejecting stale text-path font target");
+            return;
+        }
+        let resolved = {
+            let panel = panel.read(cx);
+            panel
+                .font_view_data()
+                .font(font)
+                .filter(|(_, style)| style.availability.can_apply())
+                .map(|(family, style)| (family.name.to_string(), style.weight, style.italic))
+        };
+        let Some((family, weight, italic)) = resolved.filter(|(family, _, _)| !family.is_empty())
+        else {
+            log::warn!("fig design adapter: rejecting unknown text-path font");
+            return;
+        };
+        self.finish_document_edits_for_external_change(cx);
+        let operations = self.design_ops(cx, |doc| {
+            replace_data_operation(doc, id, |data| {
+                if !matches!(data, NodeData::TextPath(_)) {
+                    return;
+                }
+                visit_text_styles_mut(data, |style| {
+                    style.font_family.clone_from(&family);
+                    if let Some(weight) = weight {
+                        style.weight = weight;
+                    }
+                    style.italic = italic;
+                    style.font_variations.clear();
+                });
+            })
+        });
+        self.design_apply_ops(operations, cx);
+    }
+
+    fn cancel_design_text_path_start(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        let session = self
+            .gpui_design
+            .as_mut()
+            .and_then(|adapter| adapter.session.take())
+            .filter(|session| session.node == id);
+        let Some(session) = session else {
+            return;
+        };
+        let item = self.item().clone();
+        let preview_owner = cx.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let change = if restore_design_edit_session(&mut document.doc, &session) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            item.finish_content_preview(preview_owner, false, cx);
+        });
+    }
+
+    fn handle_design_text_path_start(
+        &mut self,
+        panel: &Entity<DesignPanel>,
+        id: NodeId,
+        data: DesignTextPathStartData,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    ) {
+        let preview_owner = cx.entity_id();
+        if !self.design_text_path_action_is_current(panel, id, cx) {
+            log::warn!("fig design adapter: rejecting stale text-path start target");
+            return;
+        }
+        if phase == DesignPanelEditPhase::Cancel {
+            self.cancel_design_text_path_start(id, cx);
+            return;
+        }
+        let valid = {
+            let item = self.item().read(cx);
+            item.document().is_some_and(|document| {
+                text_path_start_operations(&document.doc, id, data).is_some()
+            })
+        };
+        if !valid {
+            if phase == DesignPanelEditPhase::Commit {
+                self.cancel_design_text_path_start(id, cx);
+            }
+            return;
+        }
+        match phase {
+            DesignPanelEditPhase::Begin => {
+                self.finish_document_edits_for_external_change(cx);
+                let item = self.item().clone();
+                let (scene_instance, snapshot) = {
+                    let item = item.read(cx);
+                    let Some(document) = item.document() else {
+                        return;
+                    };
+                    let Some(node) = document
+                        .doc
+                        .scene
+                        .get(id)
+                        .filter(|node| matches!(&node.data, NodeData::TextPath(_)))
+                    else {
+                        return;
+                    };
+                    (
+                        document.doc.scene.instance_id(),
+                        NodeSnapshot {
+                            id,
+                            transform: node.transform,
+                            opacity: node.opacity,
+                            data: Box::new(node.data.clone()),
+                            effects: node.effects.clone(),
+                            blurs: node.blurs.clone(),
+                        },
+                    )
+                };
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    adapter.session = Some(DesignEditSession {
+                        scene_instance,
+                        node: id,
+                        snapshot,
+                    });
+                }
+            }
+            DesignPanelEditPhase::Preview => {
+                let Some(session) = self.design_edit_session_for_preview(id, cx) else {
+                    return;
+                };
+                let item = self.item().clone();
+                item.update(cx, |item, cx| {
+                    if !item.is_editable() {
+                        return;
+                    }
+                    item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                        if !restore_design_edit_session(&mut document.doc, &session) {
+                            return ((), DocChange::None);
+                        }
+                        if let Some(operations) =
+                            text_path_start_operations(&document.doc, id, data)
+                        {
+                            for operation in &operations {
+                                apply_preview_operation(&mut document.doc, operation);
+                            }
+                        }
+                        ((), DocChange::ContentPreview)
+                    });
+                });
+            }
+            DesignPanelEditPhase::Commit => {
+                let session = self
+                    .gpui_design
+                    .as_mut()
+                    .and_then(|adapter| adapter.session.take())
+                    .filter(|session| session.node == id);
+                let item = self.item().clone();
+                let session_is_current = if let Some(session) = &session {
+                    item.update(cx, |item, cx| {
+                        item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                            let restored = restore_design_edit_session(&mut document.doc, session);
+                            let change = if restored {
+                                DocChange::ContentPreview
+                            } else {
+                                DocChange::None
+                            };
+                            (restored, change)
+                        })
+                        .unwrap_or(false)
+                    })
+                } else {
+                    self.finish_document_edits_for_external_change(cx);
+                    true
+                };
+                if !session_is_current {
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, false, cx)
+                    });
+                    return;
+                }
+                let operations = self.design_ops(cx, |doc| {
+                    text_path_start_operations(doc, id, data).unwrap_or_default()
+                });
+                let committed = self.design_apply_ops(operations, cx);
+                if session.is_some() {
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, committed, cx)
+                    });
+                }
+            }
+            DesignPanelEditPhase::Cancel => {}
         }
     }
 
@@ -1924,42 +2540,44 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let preview_owner = cx.entity_id();
         match phase {
             DesignPanelEditPhase::Begin => {
                 self.finish_document_edits_for_external_change(cx);
                 let item = self.item().clone();
-                let snapshot = {
+                let (scene_instance, snapshot) = {
                     let item = item.read(cx);
                     if !item.is_editable() {
                         return;
                     }
-                    let Some(node) = item
-                        .document()
-                        .and_then(|document| document.doc.scene.get(id))
-                    else {
+                    let Some(document) = item.document() else {
                         return;
                     };
-                    NodeSnapshot {
-                        id,
-                        transform: node.transform,
-                        opacity: node.opacity,
-                        data: Box::new(node.data.clone()),
-                        effects: node.effects.clone(),
-                        blurs: node.blurs.clone(),
-                    }
+                    let Some(node) = document.doc.scene.get(id) else {
+                        return;
+                    };
+                    (
+                        document.doc.scene.instance_id(),
+                        NodeSnapshot {
+                            id,
+                            transform: node.transform,
+                            opacity: node.opacity,
+                            data: Box::new(node.data.clone()),
+                            effects: node.effects.clone(),
+                            blurs: node.blurs.clone(),
+                        },
+                    )
                 };
                 if let Some(adapter) = self.gpui_design.as_mut() {
-                    adapter.session = Some(DesignEditSession { node: id, snapshot });
+                    adapter.session = Some(DesignEditSession {
+                        scene_instance,
+                        node: id,
+                        snapshot,
+                    });
                 }
             }
             DesignPanelEditPhase::Preview => {
-                let Some(snapshot) = self
-                    .gpui_design
-                    .as_ref()
-                    .and_then(|adapter| adapter.session.as_ref())
-                    .filter(|session| session.node == id)
-                    .map(|session| session.snapshot.clone())
-                else {
+                let Some(session) = self.design_edit_session_for_preview(id, cx) else {
                     return;
                 };
                 let item = self.item().clone();
@@ -1967,8 +2585,10 @@ impl FigView {
                     if !item.is_editable() {
                         return;
                     }
-                    item.with_document(cx, |document| {
-                        restore_snapshot(&mut document.doc, &snapshot);
+                    item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                        if !restore_design_edit_session(&mut document.doc, &session) {
+                            return ((), DocChange::None);
+                        }
                         let operations = finite_transform_operations(
                             property_operations(&document.doc, id, property, value)
                                 .unwrap_or_default(),
@@ -1987,15 +2607,28 @@ impl FigView {
                     .and_then(|adapter| adapter.session.take())
                     .filter(|session| session.node == id);
                 let item = self.item().clone();
-                if let Some(session) = &session {
+                let session_is_current = if let Some(session) = &session {
                     item.update(cx, |item, cx| {
-                        item.with_document(cx, |document| {
-                            restore_snapshot(&mut document.doc, &session.snapshot);
-                            ((), DocChange::ContentPreview)
-                        });
-                    });
+                        item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                            let restored = restore_design_edit_session(&mut document.doc, session);
+                            let change = if restored {
+                                DocChange::ContentPreview
+                            } else {
+                                DocChange::None
+                            };
+                            (restored, change)
+                        })
+                        .unwrap_or(false)
+                    })
                 } else {
                     self.finish_document_edits_for_external_change(cx);
+                    true
+                };
+                if !session_is_current {
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, false, cx)
+                    });
+                    return;
                 }
                 let mut unhandled = false;
                 let ops = self.design_ops(cx, |doc| {
@@ -2006,7 +2639,9 @@ impl FigView {
                 });
                 let committed = self.design_apply_ops(ops, cx);
                 if session.is_some() {
-                    item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, committed, cx)
+                    });
                 }
                 // Only the commit end of a gesture may speak: Preview runs on
                 // every frame of a slider drag, so toasting there would fire
@@ -2027,11 +2662,15 @@ impl FigView {
                 };
                 let item = self.item().clone();
                 item.update(cx, |item, cx| {
-                    item.with_document(cx, |document| {
-                        restore_snapshot(&mut document.doc, &session.snapshot);
-                        ((), DocChange::ContentPreview)
+                    item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                        let change = if restore_design_edit_session(&mut document.doc, &session) {
+                            DocChange::ContentPreview
+                        } else {
+                            DocChange::None
+                        };
+                        ((), change)
                     });
-                    item.finish_content_preview(false, cx);
+                    item.finish_content_preview(preview_owner, false, cx);
                 });
             }
         }
@@ -2047,6 +2686,7 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let preview_owner = cx.entity_id();
         let is_stroke = match collection {
             DesignPanelCollection::Fill => false,
             DesignPanelCollection::Stroke => true,
@@ -2089,13 +2729,7 @@ impl FigView {
                 // Begin captured the snapshot; nothing document-facing yet.
             }
             DesignPanelEditPhase::Preview => {
-                let Some(snapshot) = self
-                    .gpui_design
-                    .as_ref()
-                    .and_then(|adapter| adapter.session.as_ref())
-                    .filter(|session| session.node == id)
-                    .map(|session| session.snapshot.clone())
-                else {
+                let Some(session) = self.design_edit_session_for_preview(id, cx) else {
                     return;
                 };
                 let item = self.item().clone();
@@ -2103,8 +2737,10 @@ impl FigView {
                     if !item.is_editable() {
                         return;
                     }
-                    item.with_document(cx, |document| {
-                        restore_snapshot(&mut document.doc, &snapshot);
+                    item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                        if !restore_design_edit_session(&mut document.doc, &session) {
+                            return ((), DocChange::None);
+                        }
                         let operations = build(&document.doc);
                         for operation in &operations {
                             apply_preview_operation(&mut document.doc, operation);
@@ -2120,20 +2756,35 @@ impl FigView {
                     .and_then(|adapter| adapter.session.take())
                     .filter(|session| session.node == id);
                 let item = self.item().clone();
-                if let Some(session) = &session {
+                let session_is_current = if let Some(session) = &session {
                     item.update(cx, |item, cx| {
-                        item.with_document(cx, |document| {
-                            restore_snapshot(&mut document.doc, &session.snapshot);
-                            ((), DocChange::ContentPreview)
-                        });
-                    });
+                        item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                            let restored = restore_design_edit_session(&mut document.doc, session);
+                            let change = if restored {
+                                DocChange::ContentPreview
+                            } else {
+                                DocChange::None
+                            };
+                            (restored, change)
+                        })
+                        .unwrap_or(false)
+                    })
                 } else {
                     self.finish_document_edits_for_external_change(cx);
+                    true
+                };
+                if !session_is_current {
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, false, cx)
+                    });
+                    return;
                 }
                 let ops = self.design_ops(cx, build);
                 let committed = self.design_apply_ops(ops, cx);
                 if session.is_some() {
-                    item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, committed, cx)
+                    });
                 }
                 if committed && replaces_payload {
                     self.forget_hidden_paint_alpha(id, is_stroke);
@@ -2252,21 +2903,35 @@ impl FigView {
             );
             return;
         }
+        let preview_owner = cx.entity_id();
         let session = self
             .gpui_design
             .as_mut()
             .and_then(|adapter| adapter.session.take())
             .filter(|session| session.node == id);
         let item = self.item().clone();
-        if let Some(session) = &session {
+        let session_is_current = if let Some(session) = &session {
             item.update(cx, |item, cx| {
-                item.with_document(cx, |document| {
-                    restore_snapshot(&mut document.doc, &session.snapshot);
-                    ((), DocChange::ContentPreview)
-                });
-            });
+                item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                    let restored = restore_design_edit_session(&mut document.doc, session);
+                    let change = if restored {
+                        DocChange::ContentPreview
+                    } else {
+                        DocChange::None
+                    };
+                    (restored, change)
+                })
+                .unwrap_or(false)
+            })
         } else {
             self.finish_document_edits_for_external_change(cx);
+            true
+        };
+        if !session_is_current {
+            item.update(cx, |item, cx| {
+                item.finish_content_preview(preview_owner, false, cx)
+            });
+            return;
         }
         let mut unhandled = false;
         let ops = self.design_ops(cx, |doc| {
@@ -2278,7 +2943,9 @@ impl FigView {
         });
         let committed = self.design_apply_ops(ops, cx);
         if session.is_some() {
-            item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
+            item.update(cx, |item, cx| {
+                item.finish_content_preview(preview_owner, committed, cx)
+            });
         }
         if unhandled {
             crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
@@ -2362,6 +3029,188 @@ impl FigView {
 // =============================================================================
 // Intent → operation builders
 // =============================================================================
+
+fn visit_text_styles_mut(data: &mut NodeData, mut visit: impl FnMut(&mut fanta_doc::TextStyle)) {
+    match data {
+        NodeData::Text(text) => visit(&mut text.style),
+        NodeData::TextPath(text_path) => {
+            visit(&mut text_path.style);
+            for run in &mut text_path.style_runs {
+                visit(&mut run.style);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn set_text_style_rgb(style: &mut fanta_doc::TextStyle, color: FantaColor) {
+    style.color.r = color.r;
+    style.color.g = color.g;
+    style.color.b = color.b;
+}
+
+fn set_text_path_metric_line_height_percent(style: &mut fanta_doc::TextStyle, percent: f64) {
+    if style.line_height_auto_percent == Some(percent) {
+        return;
+    }
+    if let Some(previous_percent) = style.line_height_auto_percent {
+        if previous_percent.is_finite() && previous_percent > 0.0 && style.line_height.is_finite() {
+            let approximation = style.line_height * percent / previous_percent;
+            if approximation.is_finite() {
+                style.line_height = approximation;
+            }
+        }
+    }
+    style.line_height_auto_percent = Some(percent);
+}
+
+fn set_text_path_line_height(style: &mut fanta_doc::TextStyle, line_height: DesignLineHeight) {
+    match line_height {
+        DesignLineHeight::Auto => set_text_path_metric_line_height_percent(style, 100.0),
+        DesignLineHeight::Pixels(pixels) => {
+            if style.size_px.is_finite() && style.size_px > 0.0 {
+                style.line_height = f64::from(pixels) / style.size_px;
+                style.line_height_auto_percent = None;
+            }
+        }
+        DesignLineHeight::Percent(percent) => {
+            let percent = f64::from(percent);
+            if style.line_height_auto_percent.is_some() {
+                set_text_path_metric_line_height_percent(style, percent);
+            } else {
+                style.line_height = percent / 100.0;
+                style.line_height_auto_percent = None;
+            }
+        }
+    }
+}
+
+fn text_path_start_operations(
+    doc: &Doc,
+    id: NodeId,
+    data: DesignTextPathStartData,
+) -> Option<Vec<Operation>> {
+    let text_path = match doc.scene.get(id).map(|node| &node.data) {
+        Some(NodeData::TextPath(text_path)) => text_path,
+        _ => return None,
+    };
+    let segment = usize::try_from(data.segment).ok()?;
+    let start = TextPathStart::new(data.segment, f64::from(data.position))?;
+    let measured = MeasuredPath::new(&text_path.path);
+    let measured_segment = measured.segment(segment)?;
+    let contour = measured
+        .contours()
+        .iter()
+        .find(|contour| contour.contour_index() == measured_segment.contour_index())?;
+    let contour_length = contour.length();
+    let start_on_contour = measured.distance_at_segment_position(segment, start.position())?
+        - contour.start_distance();
+    // Match the renderer's geometry threshold so the inspector cannot author a
+    // start that is structurally valid but cannot produce a placement frame.
+    const USABLE_CONTOUR_EPSILON: f64 = 1.0e-9;
+    if !contour_length.is_finite()
+        || contour_length <= USABLE_CONTOUR_EPSILON
+        || !start_on_contour.is_finite()
+    {
+        return None;
+    }
+    let sample = measured.point_tangent_on_contour(contour.contour_index(), start_on_contour)?;
+    let tangent_length = sample.tangent[0].hypot(sample.tangent[1]);
+    if sample
+        .point
+        .iter()
+        .chain(sample.tangent.iter())
+        .any(|coordinate| !coordinate.is_finite())
+        || !tangent_length.is_finite()
+        || tangent_length <= USABLE_CONTOUR_EPSILON
+    {
+        return None;
+    }
+    Some(replace_data_operation(doc, id, |data| {
+        if let NodeData::TextPath(text_path) = data {
+            text_path.start = start;
+        }
+    }))
+}
+
+fn text_path_flip_operations(doc: &Doc, id: NodeId) -> Option<Vec<Operation>> {
+    if !matches!(
+        doc.scene.get(id).map(|node| &node.data),
+        Some(NodeData::TextPath(_))
+    ) {
+        return None;
+    }
+    Some(replace_data_operation(doc, id, |data| {
+        if let NodeData::TextPath(text_path) = data {
+            text_path.side = match text_path.side {
+                TextPathSide::Default => TextPathSide::Flipped,
+                TextPathSide::Flipped => TextPathSide::Default,
+            };
+        }
+    }))
+}
+
+fn text_path_typography_operations(
+    doc: &Doc,
+    id: NodeId,
+    property: DesignPanelProperty,
+    value: &DesignPanelValue,
+) -> Option<Vec<Operation>> {
+    if !matches!(
+        doc.scene.get(id).map(|node| &node.data),
+        Some(NodeData::TextPath(_))
+    ) {
+        return None;
+    }
+    let supported = match (property, value) {
+        (DesignPanelProperty::FontFamily, DesignPanelValue::Text(family)) => !family.is_empty(),
+        (DesignPanelProperty::FontStyle, DesignPanelValue::Text(style)) => {
+            matches!(style.as_ref(), "Regular" | "Italic")
+        }
+        (
+            DesignPanelProperty::FontWeight | DesignPanelProperty::FontSize,
+            DesignPanelValue::Number(value),
+        ) => value.is_finite() && *value > 0.0,
+        (
+            DesignPanelProperty::FontWeight | DesignPanelProperty::FontSize,
+            DesignPanelValue::Integer(value),
+        ) => *value > 0,
+        (DesignPanelProperty::LineHeight, DesignPanelValue::LineHeight(line_height)) => {
+            match line_height {
+                DesignLineHeight::Auto => true,
+                DesignLineHeight::Pixels(value) | DesignLineHeight::Percent(value) => {
+                    value.is_finite() && *value > 0.0
+                }
+            }
+        }
+        (
+            DesignPanelProperty::LetterSpacing,
+            DesignPanelValue::LetterSpacing(DesignLetterSpacing::Pixels(value)),
+        ) => value.is_finite(),
+        (
+            DesignPanelProperty::HorizontalTextAlignment,
+            DesignPanelValue::TextHorizontalAlignment(
+                DesignTextHorizontalAlignment::Left
+                | DesignTextHorizontalAlignment::Center
+                | DesignTextHorizontalAlignment::Right,
+            ),
+        ) => true,
+        (DesignPanelProperty::TextDecoration, DesignPanelValue::TextDecoration(_)) => true,
+        _ => false,
+    };
+    if !supported {
+        return None;
+    }
+    if let (DesignPanelProperty::LineHeight, DesignPanelValue::LineHeight(line_height)) =
+        (property, value)
+    {
+        let line_height = *line_height;
+        return Some(replace_data_operation(doc, id, |data| {
+            visit_text_styles_mut(data, |style| set_text_path_line_height(style, line_height));
+        }));
+    }
+    property_operations(doc, id, property, value)
+}
 
 /// Maps one panel arrange command onto engine operations, or `None` when the
 /// engine has no equivalent (Tidy up, which is auto-layout inference rather
@@ -2545,13 +3394,22 @@ fn paint_edit_operations(
     index: usize,
     value: &PaintEditValue,
 ) -> Vec<Operation> {
-    // A text node's single Fill row edits the glyph color.
+    // Text-backed nodes expose one synthetic Fill row for their glyph color.
     let is_text = matches!(
         doc.scene.get(id).map(|node| &node.data),
-        Some(NodeData::Text(_))
+        Some(NodeData::Text(_) | NodeData::TextPath(_))
+    );
+    let is_text_path = matches!(
+        doc.scene.get(id).map(|node| &node.data),
+        Some(NodeData::TextPath(_))
     );
     match value {
         PaintEditValue::Color(color) => {
+            if is_text_path && !is_stroke {
+                return replace_data_operation(doc, id, |data| {
+                    visit_text_styles_mut(data, |style| set_text_style_rgb(style, *color));
+                });
+            }
             if is_text && !is_stroke {
                 return field_operations(
                     doc,
@@ -2560,6 +3418,12 @@ fn paint_edit_operations(
                 );
             }
             solid_paint_color_operations(doc, id, is_stroke, index, *color)
+        }
+        PaintEditValue::Opacity(percent) if is_text && !is_stroke => {
+            let alpha = ((*percent).clamp(0.0, 100.0) / 100.0 * 255.0).round() as u8;
+            replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| style.color.a = alpha);
+            })
         }
         PaintEditValue::Opacity(percent) => field_operations(
             doc,
@@ -2579,6 +3443,12 @@ fn paint_edit_operations(
                 }
             }
         }),
+        PaintEditValue::SolidPayload(_) if is_text_path && !is_stroke => Vec::new(),
+        PaintEditValue::SolidPayload(color) if is_text && !is_stroke => field_operations(
+            doc,
+            &InspectorField::TextColor(id),
+            &design_color(*color).hex(),
+        ),
         PaintEditValue::SolidPayload(color) => {
             solid_paint_color_operations(doc, id, is_stroke, index, *color)
         }
@@ -3151,39 +4021,118 @@ fn property_operations(
             let minimum = matches!(property, P::MinWidth | P::MinHeight);
             Some(layout_limit_operations(doc, id, &text, horizontal, minimum))
         }
-        (P::FontFamily, V::Text(family)) => Some(field_operations(
-            doc,
-            &InspectorField::FontFamily(id),
-            family,
-        )),
-        (P::FontSize, _) => field(InspectorField::FontSize(id), number(value)?),
+        (P::FontFamily, V::Text(family)) => {
+            if family.is_empty() {
+                return None;
+            }
+            let family = family.to_string();
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| style.font_family.clone_from(&family));
+            }))
+        }
+        (P::FontStyle, V::Text(style_name)) => {
+            let italic = match style_name.as_ref() {
+                "Regular" => false,
+                "Italic" => true,
+                _ => return None,
+            };
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| style.italic = italic);
+            }))
+        }
+        (P::FontSize, _) => {
+            let size = number(value)?;
+            if !size.is_finite() || size <= 0.0 {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| style.size_px = size);
+            }))
+        }
         (P::FontWeight, _) => {
             let weight = number(value)?.clamp(1.0, 1000.0) as u16;
             Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.weight = weight;
-                }
+                visit_text_styles_mut(data, |style| style.weight = weight);
             }))
         }
-        (P::LineHeight, V::LineHeight(DesignLineHeight::Percent(percent))) => {
-            field(InspectorField::LineHeight(id), f64::from(*percent) / 100.0)
+        (P::TextDecoration, V::TextDecoration(decoration)) => {
+            let (underline, strikethrough) = match decoration {
+                DesignTextDecoration::None => (false, false),
+                DesignTextDecoration::Underline => (true, false),
+                DesignTextDecoration::Strikethrough => (false, true),
+            };
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| {
+                    style.underline = underline;
+                    style.strikethrough = strikethrough;
+                });
+            }))
+        }
+        (P::LineHeight, V::LineHeight(line_height)) => {
+            let line_height = *line_height;
+            match line_height {
+                DesignLineHeight::Pixels(pixels) | DesignLineHeight::Percent(pixels)
+                    if !pixels.is_finite() || pixels <= 0.0 =>
+                {
+                    return None;
+                }
+                _ => {}
+            }
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| match line_height {
+                    DesignLineHeight::Auto => style.line_height_auto_percent = Some(100.0),
+                    DesignLineHeight::Pixels(pixels) => {
+                        if style.size_px.is_finite() && style.size_px > 0.0 {
+                            style.line_height = f64::from(pixels) / style.size_px;
+                            style.line_height_auto_percent = None;
+                        }
+                    }
+                    DesignLineHeight::Percent(percent) => {
+                        style.line_height = f64::from(percent) / 100.0;
+                        style.line_height_auto_percent = None;
+                    }
+                });
+            }))
         }
         (P::LineHeight, _) => None,
         (P::LetterSpacing, V::LetterSpacing(DesignLetterSpacing::Pixels(pixels))) => {
-            field(InspectorField::LetterSpacing(id), f64::from(*pixels))
+            let pixels = f64::from(*pixels);
+            if !pixels.is_finite() {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| style.letter_spacing = pixels);
+            }))
         }
         (P::LetterSpacing, _) => None,
         (P::HorizontalTextAlignment, V::TextHorizontalAlignment(align)) => {
-            let align = match align {
+            let text_align = match align {
                 DesignTextHorizontalAlignment::Left => TextAlign::Left,
                 DesignTextHorizontalAlignment::Center => TextAlign::Center,
                 DesignTextHorizontalAlignment::Right => TextAlign::Right,
                 DesignTextHorizontalAlignment::Justified => TextAlign::Justify,
             };
-            Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.align = align;
+            let text_path_alignment = match align {
+                DesignTextHorizontalAlignment::Left => Some(TextPathAlignment::Start),
+                DesignTextHorizontalAlignment::Center => Some(TextPathAlignment::Center),
+                DesignTextHorizontalAlignment::Right => Some(TextPathAlignment::End),
+                DesignTextHorizontalAlignment::Justified => None,
+            };
+            if matches!(
+                doc.scene.get(id).map(|node| &node.data),
+                Some(NodeData::TextPath(_))
+            ) && text_path_alignment.is_none()
+            {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| match data {
+                NodeData::Text(text) => text.align = text_align,
+                NodeData::TextPath(text_path) => {
+                    if let Some(alignment) = text_path_alignment {
+                        text_path.alignment = alignment;
+                    }
                 }
+                _ => {}
             }))
         }
         (P::VerticalTextAlignment, V::TextVerticalAlignment(align)) => {
@@ -3331,7 +4280,10 @@ fn primary_axis_is_horizontal(doc: &Doc, id: NodeId) -> Option<bool> {
 mod tests {
     use std::path::PathBuf;
 
-    use fanta_doc::{CanvasNode, Doc, GroupNode, VectorNode};
+    use fanta_doc::{
+        CanvasNode, Doc, GroupNode, PathData, TextPathDirection, TextPathNode, TextStyleRun,
+        VectorNode,
+    };
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
 
@@ -3407,6 +4359,53 @@ mod tests {
         }
         let ids = [ids[0], ids[1], ids[2]];
         (doc, page_id, ids)
+    }
+
+    fn doc_with_text_path() -> (Doc, NodeId, NodeId) {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0)
+            .line_to(80.0, 0.0)
+            .line_to(120.0, 40.0);
+        let mut text_path = TextPathNode::new(path, "Text on a path");
+        text_path.style.font_family = "Source Serif 4".to_owned();
+        text_path.style.size_px = 24.0;
+        text_path.style.weight = 650;
+        text_path.style.italic = true;
+        text_path.style.underline = true;
+        text_path.style.color = FantaColor::rgba(0x12, 0x34, 0x56, 0xc0);
+        text_path.style.letter_spacing = 1.5;
+        text_path.style.line_height = 1.4;
+        text_path.style_runs.push(TextStyleRun {
+            start: 0,
+            end: 4,
+            style: text_path.style.clone(),
+        });
+        text_path.start = TextPathStart::new(1, 0.25).expect("valid path start");
+        text_path.alignment = TextPathAlignment::End;
+        text_path.direction = TextPathDirection::Reverse;
+        text_path.side = TextPathSide::Flipped;
+
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.name = "Circular title".to_owned();
+        node.parent = Some(page_id);
+        let id = node.id;
+        doc.scene.insert(node).expect("insert text path");
+        (doc, page_id, id)
+    }
+
+    fn text_path(doc: &Doc, id: NodeId) -> &TextPathNode {
+        match &doc.scene.get(id).expect("text path exists").data {
+            NodeData::TextPath(text_path) => text_path,
+            _ => panic!("expected a text path"),
+        }
     }
 
     fn min_x(doc: &Doc, id: NodeId) -> f64 {
@@ -3507,6 +4506,326 @@ mod tests {
         assert_eq!(
             content.copy_value.as_deref(),
             Some("Design\nwith confidence")
+        );
+    }
+
+    #[test]
+    fn text_path_projection_and_operations_preserve_path_specific_state() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let original = text_path(&doc, id).clone();
+        assert_eq!(
+            design_kind(
+                id,
+                &doc.scene.get(id).expect("node exists").data,
+                &HashMap::new()
+            ),
+            DesignPanelNodeKind::TextPath
+        );
+
+        let typography = design_text_path_typography(&original);
+        assert_eq!(typography.family.as_ref(), "Source Serif 4");
+        assert_eq!(typography.style.as_ref(), "Italic");
+        assert_eq!(typography.weight, 650.0);
+        assert_eq!(typography.size, 24.0);
+        assert_eq!(
+            typography.horizontal_alignment,
+            DesignTextHorizontalAlignment::Right
+        );
+        assert_eq!(typography.decoration, DesignTextDecoration::Underline);
+
+        let states = bound_states(&doc, id);
+        for property in [
+            DesignPanelProperty::VerticalTextAlignment,
+            DesignPanelProperty::TextResize,
+            DesignPanelProperty::TextTruncate,
+            DesignPanelProperty::TextCase,
+        ] {
+            let state = states
+                .iter()
+                .find_map(|(candidate, state)| (*candidate == property).then_some(state))
+                .expect("unsupported TextPath property has an explicit state");
+            assert!(state.is_read_only());
+            assert!(state.is_unset());
+        }
+
+        let operations = text_path_start_operations(
+            &doc,
+            id,
+            DesignTextPathStartData {
+                segment: 0,
+                position: 0.75,
+            },
+        )
+        .expect("the first drawable segment is valid");
+        assert_eq!(operations.len(), 1);
+        apply_operations(&mut doc, operations);
+        let changed = text_path(&doc, id);
+        assert_eq!(
+            changed.start,
+            TextPathStart::new(0, 0.75).expect("valid start")
+        );
+        assert_eq!(changed.path, original.path);
+        assert_eq!(changed.content, original.content);
+        assert_eq!(changed.style, original.style);
+        assert_eq!(changed.style_runs, original.style_runs);
+        assert_eq!(changed.alignment, original.alignment);
+        assert_eq!(changed.direction, original.direction);
+        assert_eq!(changed.side, original.side);
+        assert!(
+            text_path_start_operations(
+                &doc,
+                id,
+                DesignTextPathStartData {
+                    segment: 99,
+                    position: 0.5,
+                },
+            )
+            .is_none(),
+            "a segment not present in the owned path must be rejected"
+        );
+
+        let operations = text_path_flip_operations(&doc, id).expect("flip is supported");
+        apply_operations(&mut doc, operations);
+        let flipped = text_path(&doc, id);
+        assert_eq!(flipped.side, TextPathSide::Default);
+        assert_eq!(flipped.direction, TextPathDirection::Reverse);
+    }
+
+    #[test]
+    fn text_path_typography_edits_apply_to_base_and_style_runs() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        for (property, value) in [
+            (
+                DesignPanelProperty::FontWeight,
+                DesignPanelValue::Number(725.0),
+            ),
+            (
+                DesignPanelProperty::HorizontalTextAlignment,
+                DesignPanelValue::TextHorizontalAlignment(DesignTextHorizontalAlignment::Center),
+            ),
+            (
+                DesignPanelProperty::TextDecoration,
+                DesignPanelValue::TextDecoration(DesignTextDecoration::Strikethrough),
+            ),
+        ] {
+            let operations = text_path_typography_operations(&doc, id, property, &value)
+                .expect("supported TextPath typography property");
+            apply_operations(&mut doc, operations);
+        }
+        let text_path = text_path(&doc, id);
+        assert_eq!(text_path.style.weight, 725);
+        assert_eq!(text_path.style_runs[0].style.weight, 725);
+        assert_eq!(text_path.alignment, TextPathAlignment::Center);
+        assert!(text_path.style.strikethrough);
+        assert!(!text_path.style.underline);
+        assert!(text_path.style_runs[0].style.strikethrough);
+        assert!(!text_path.style_runs[0].style.underline);
+        assert!(
+            text_path_typography_operations(
+                &doc,
+                id,
+                DesignPanelProperty::HorizontalTextAlignment,
+                &DesignPanelValue::TextHorizontalAlignment(
+                    DesignTextHorizontalAlignment::Justified,
+                ),
+            )
+            .is_none(),
+            "TextPath has no justified alignment"
+        );
+        assert!(
+            text_path_typography_operations(
+                &doc,
+                id,
+                DesignPanelProperty::VerticalTextAlignment,
+                &DesignPanelValue::TextVerticalAlignment(DesignTextVerticalAlignment::Bottom),
+            )
+            .is_none(),
+            "TextNode-only vertical alignment must remain unavailable"
+        );
+    }
+
+    #[test]
+    fn text_path_rgb_and_opacity_edits_keep_color_channels_independent() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let node = doc.scene.get_mut(id).expect("text path exists");
+        let NodeData::TextPath(text_path_node) = &mut node.data else {
+            panic!("expected a text path");
+        };
+        text_path_node.style_runs[0].style.color.a = 0x40;
+
+        let operations = paint_edit_operations(
+            &doc,
+            id,
+            false,
+            0,
+            &PaintEditValue::Color(FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x11)),
+        );
+        apply_operations(&mut doc, operations);
+        let updated_text_path = text_path(&doc, id);
+        assert_eq!(
+            updated_text_path.style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0xc0)
+        );
+        assert_eq!(
+            updated_text_path.style_runs[0].style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x40)
+        );
+
+        let operations = paint_edit_operations(
+            &doc,
+            id,
+            false,
+            0,
+            &PaintEditValue::SolidPayload(FantaColor::rgba(0x22, 0x44, 0x66, 0x01)),
+        );
+        assert!(
+            operations.is_empty(),
+            "payload replacement is not a glyph-color edit"
+        );
+
+        let operations = paint_edit_operations(&doc, id, false, 0, &PaintEditValue::Opacity(25.0));
+        apply_operations(&mut doc, operations);
+        let updated_text_path = text_path(&doc, id);
+        assert_eq!(
+            updated_text_path.style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x40)
+        );
+        assert_eq!(
+            updated_text_path.style_runs[0].style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x40)
+        );
+    }
+
+    #[test]
+    fn text_path_metric_relative_line_height_round_trips_in_its_original_unit() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let node = doc.scene.get_mut(id).expect("text path exists");
+        let NodeData::TextPath(text_path_node) = &mut node.data else {
+            panic!("expected a text path");
+        };
+        text_path_node.style.line_height = 1.8;
+        text_path_node.style.line_height_auto_percent = Some(150.0);
+        text_path_node.style_runs[0].style.line_height = 1.8;
+        text_path_node.style_runs[0].style.line_height_auto_percent = Some(150.0);
+
+        assert_eq!(
+            design_text_path_typography(text_path_node).line_height,
+            DesignLineHeight::Percent(150.0)
+        );
+        let operations = text_path_typography_operations(
+            &doc,
+            id,
+            DesignPanelProperty::LineHeight,
+            &DesignPanelValue::LineHeight(DesignLineHeight::Percent(150.0)),
+        )
+        .expect("metric-relative percent is supported");
+        assert!(
+            operations.is_empty(),
+            "an unchanged value round-trips exactly"
+        );
+
+        let operations = text_path_typography_operations(
+            &doc,
+            id,
+            DesignPanelProperty::LineHeight,
+            &DesignPanelValue::LineHeight(DesignLineHeight::Percent(125.0)),
+        )
+        .expect("metric-relative percent edit is supported");
+        apply_operations(&mut doc, operations);
+        let text_path = text_path(&doc, id);
+        for style in std::iter::once(&text_path.style)
+            .chain(text_path.style_runs.iter().map(|run| &run.style))
+        {
+            assert_eq!(style.line_height_auto_percent, Some(125.0));
+            assert!((style.line_height - 1.5).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn text_path_start_rejects_an_empty_contour_even_when_another_contour_is_usable() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0).line_to(0.0, 0.0);
+        path.move_to(10.0, 20.0).line_to(110.0, 20.0);
+        let node = doc.scene.get_mut(id).expect("text path exists");
+        let NodeData::TextPath(text_path_node) = &mut node.data else {
+            panic!("expected a text path");
+        };
+        text_path_node.path = path;
+        text_path_node.start = TextPathStart::new(1, 0.25).expect("usable second contour");
+
+        assert!(
+            text_path_start_operations(
+                &doc,
+                id,
+                DesignTextPathStartData {
+                    segment: 0,
+                    position: 0.5,
+                },
+            )
+            .is_none(),
+            "the selected contour cannot produce a finite placement tangent"
+        );
+        let operations = text_path_start_operations(
+            &doc,
+            id,
+            DesignTextPathStartData {
+                segment: 1,
+                position: 0.75,
+            },
+        )
+        .expect("the usable contour remains editable");
+        apply_operations(&mut doc, operations);
+        assert_eq!(
+            text_path(&doc, id).start,
+            TextPathStart::new(1, 0.75).expect("valid edited start")
+        );
+    }
+
+    #[test]
+    fn design_edit_snapshots_restore_only_into_their_originating_scene() {
+        let (mut doc, _page, id) = doc_with_rect();
+        let (scene_instance, expected_transform, snapshot) = {
+            let node = doc.scene.get(id).expect("node exists");
+            (
+                doc.scene.instance_id(),
+                node.transform,
+                NodeSnapshot {
+                    id,
+                    transform: node.transform,
+                    opacity: node.opacity,
+                    data: Box::new(node.data.clone()),
+                    effects: node.effects.clone(),
+                    blurs: node.blurs.clone(),
+                },
+            )
+        };
+        let session = DesignEditSession {
+            scene_instance,
+            node: id,
+            snapshot,
+        };
+
+        doc.scene.get_mut(id).expect("node exists").transform =
+            Transform2D::translation(80.0, 90.0);
+        assert!(restore_design_edit_session(&mut doc, &session));
+        assert_eq!(
+            doc.scene.get(id).expect("node exists").transform,
+            expected_transform
+        );
+
+        let mut replacement = doc.clone();
+        assert_ne!(replacement.scene.instance_id(), session.scene_instance);
+        let replacement_transform = Transform2D::translation(-30.0, -40.0);
+        replacement
+            .scene
+            .get_mut(id)
+            .expect("same node id exists in replacement scene")
+            .transform = replacement_transform;
+        assert!(!restore_design_edit_session(&mut replacement, &session));
+        assert_eq!(
+            replacement.scene.get(id).expect("node exists").transform,
+            replacement_transform
         );
     }
 
@@ -3886,6 +5205,227 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn text_path_echo_uses_exact_kind_name_style_color_and_placement(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, id) = doc_with_text_path();
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let node = panel.node();
+            assert_eq!(node.id.as_ref(), id.to_string());
+            assert_eq!(node.name.as_ref(), "Circular title");
+            assert_eq!(node.kind, DesignPanelNodeKind::TextPath);
+            let typography = node.typography.as_ref().expect("TextPath typography");
+            assert_eq!(typography.family.as_ref(), "Source Serif 4");
+            assert_eq!(typography.style.as_ref(), "Italic");
+            assert_eq!(typography.weight, 650.0);
+            assert_eq!(typography.size, 24.0);
+            assert_eq!(
+                typography.horizontal_alignment,
+                DesignTextHorizontalAlignment::Right
+            );
+            assert_eq!(node.fills.len(), 1);
+            assert_eq!(
+                node.fills[0].color,
+                DesignColor::rgba(0x12, 0x34, 0x56, 0xc0)
+            );
+            assert_eq!(
+                node.text_path.expect("orientation state").orientation,
+                DesignTextPathOrientation::Flipped
+            );
+            assert_eq!(
+                node.text_path_start_data,
+                Some(DesignTextPathStartData {
+                    segment: 1,
+                    position: 0.25,
+                })
+            );
+            let capabilities = node.capabilities.as_ref().expect("capabilities");
+            assert!(
+                capabilities
+                    .sections
+                    .contains(&DesignPanelSection::Typography)
+            );
+            assert!(capabilities.sections.contains(&DesignPanelSection::Fill));
+            assert!(!capabilities.sections.contains(&DesignPanelSection::Stroke));
+            assert!(!capabilities.stroke);
+            assert_eq!(
+                capabilities.fill_edit_mode,
+                DesignPaintCollectionEditMode::ColorAndOpacityOnly
+            );
+        });
+
+        let view_data = panel.read_with(cx, |panel, _| {
+            panel
+                .viewer_properties_view_data()
+                .cloned()
+                .expect("developer projection")
+        });
+        assert_eq!(
+            view_data
+                .section("identity")
+                .and_then(|section| section.row("type"))
+                .map(|row| row.displayed_value.as_ref()),
+            Some("Text path")
+        );
+    }
+
+    #[gpui::test]
+    #[allow(deprecated)]
+    async fn text_path_rejects_forged_paint_structure_and_non_color_edits(cx: &mut TestAppContext) {
+        let (mut doc, _page, id) = doc_with_text_path();
+        doc.selection.replace_with([id]);
+        let original = text_path(&doc, id).clone();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let node_id = SharedString::from(id.to_string());
+        let paint_id = SharedString::from(format!("{id}-fill-0"));
+        let target = fanta_gpui::design::DesignPaintTarget::WholeLayer;
+        let replacement = DesignPaint::solid(DesignColor::rgb(0xaa, 0xbb, 0xcc));
+        let actions = [
+            DesignPanelAction::PaintChangeRequested {
+                node_id: node_id.clone(),
+                collection: DesignPanelCollection::Fill,
+                target,
+                index: 0,
+                paint: replacement.clone(),
+            },
+            DesignPanelAction::PaintReorderRequested {
+                node_id: node_id.clone(),
+                collection: DesignPanelCollection::Fill,
+                target,
+                paint_id: paint_id.clone(),
+                from_index: 0,
+                to_index: 0,
+            },
+            DesignPanelAction::CollectionItemAddRequested {
+                node_id: node_id.clone(),
+                collection: DesignPanelCollection::Fill,
+                target,
+            },
+            DesignPanelAction::CollectionItemRemoveRequested {
+                node_id: node_id.clone(),
+                collection: DesignPanelCollection::Fill,
+                target,
+                index: 0,
+            },
+            DesignPanelAction::PaintEditRequested {
+                node_id: node_id.clone(),
+                collection: DesignPanelCollection::Fill,
+                target,
+                paint_id: paint_id.clone(),
+                index: 0,
+                edit: fanta_gpui::design::DesignPaintEdit {
+                    property: DesignPaintProperty::Payload,
+                    value: DesignPaintValue::Payload(replacement.payload),
+                },
+                phase: DesignPanelEditPhase::Commit,
+            },
+            DesignPanelAction::PaintEditRequested {
+                node_id: node_id.clone(),
+                collection: DesignPanelCollection::Fill,
+                target,
+                paint_id: paint_id.clone(),
+                index: 0,
+                edit: fanta_gpui::design::DesignPaintEdit {
+                    property: DesignPaintProperty::Visible,
+                    value: DesignPaintValue::Bool(false),
+                },
+                phase: DesignPanelEditPhase::Commit,
+            },
+            DesignPanelAction::PaintEditRequested {
+                node_id,
+                collection: DesignPanelCollection::Fill,
+                target,
+                paint_id,
+                index: 0,
+                edit: fanta_gpui::design::DesignPaintEdit {
+                    property: DesignPaintProperty::BlendMode,
+                    value: DesignPaintValue::BlendMode(DesignBlendMode::Multiply),
+                },
+                phase: DesignPanelEditPhase::Commit,
+            },
+        ];
+        for action in actions {
+            view.update_in(cx, |view, window, cx| {
+                view.handle_design_action(&panel, &action, window, cx);
+            });
+        }
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                text_path(item.doc().expect("document ready"), id),
+                &original
+            );
+            assert!(!item.is_dirty());
+            assert!(!item.doc().expect("document ready").history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn text_path_font_action_resolves_the_host_catalog_and_updates_all_runs(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, id) = doc_with_text_path();
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let selection =
+            fanta_gpui::design::DesignFontSelection::local("source-sans-3", "semibold-italic");
+        panel.update_in(cx, |panel, _, cx| {
+            panel.set_font_view_data(
+                fanta_gpui::design::DesignFontViewData::ready([
+                    fanta_gpui::design::DesignFontFamily::local(
+                        "source-sans-3",
+                        "Source Sans 3",
+                        [fanta_gpui::design::DesignFontStyle {
+                            id: "semibold-italic".into(),
+                            name: "Semibold Italic".into(),
+                            weight: Some(600),
+                            italic: true,
+                            availability: fanta_gpui::design::DesignFontAvailability::Imported,
+                            preview: None,
+                        }],
+                    ),
+                ]),
+                cx,
+            );
+            cx.emit(DesignPanelAction::TypographyFontApplyRequested {
+                node_id: SharedString::from(id.to_string()),
+                target: DesignTypographyTarget::WholeLayer,
+                font: selection.clone(),
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let text_path = text_path(item.doc().expect("document ready"), id);
+            for style in std::iter::once(&text_path.style)
+                .chain(text_path.style_runs.iter().map(|run| &run.style))
+            {
+                assert_eq!(style.font_family, "Source Sans 3");
+                assert_eq!(style.weight, 600);
+                assert!(style.italic);
+                assert!(style.font_variations.is_empty());
+            }
+        });
+    }
+
+    #[gpui::test]
     async fn viewer_projection_clears_for_empty_and_multiple_selections(cx: &mut TestAppContext) {
         let (mut doc, page, rect) = doc_with_rect();
         let mut second = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
@@ -4249,6 +5789,201 @@ mod tests {
                 !item.undo(cx).expect("undo call succeeds"),
                 "a cancelled preview must not create an undo step"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn selection_change_cancels_an_in_flight_design_preview(cx: &mut TestAppContext) {
+        let (mut doc, page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        for (value, phase) in [
+            (100.0, DesignPanelEditPhase::Begin),
+            (25.0, DesignPanelEditPhase::Preview),
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PropertyEditRequested {
+                    node_id: SharedString::from(rect.to_string()),
+                    property: DesignPanelProperty::Opacity,
+                    value: DesignPanelValue::Number(value),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let preview_owner = view.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_owner(preview_owner, cx, |document| {
+                document.doc.selection.replace_with([page]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyChangeRequested {
+                node_id: SharedString::from(rect.to_string()),
+                property: DesignPanelProperty::Opacity,
+                value: DesignPanelValue::Number(50.0),
+            });
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(doc.selection.as_slice(), [page]);
+            assert!((doc.scene.get(rect).expect("rect exists").opacity.get() - 1.0).abs() < 1e-6);
+            assert!(!item.is_dirty());
+            assert!(!doc.history.can_undo());
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.session.as_ref())
+                    .is_none()
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn text_path_start_preview_commits_as_one_undo_step(cx: &mut TestAppContext) {
+        let (mut doc, _page, id) = doc_with_text_path();
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let emit = |cx: &mut VisualTestContext,
+                    data: DesignTextPathStartData,
+                    phase: DesignPanelEditPhase| {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::TextPathStartChangeRequested {
+                    node_id: SharedString::from(id.to_string()),
+                    data,
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        };
+        emit(
+            cx,
+            DesignTextPathStartData {
+                segment: 1,
+                position: 0.25,
+            },
+            DesignPanelEditPhase::Begin,
+        );
+        emit(
+            cx,
+            DesignTextPathStartData {
+                segment: 0,
+                position: 0.4,
+            },
+            DesignPanelEditPhase::Preview,
+        );
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(
+                text_path(doc, id).start,
+                TextPathStart::new(0, f64::from(0.4_f32)).expect("valid preview")
+            );
+            assert!(!doc.history.can_undo(), "preview is not history");
+        });
+
+        emit(
+            cx,
+            DesignTextPathStartData {
+                segment: 0,
+                position: 0.6,
+            },
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(
+                text_path(doc, id).start,
+                TextPathStart::new(0, f64::from(0.6_f32)).expect("valid commit")
+            );
+            assert!(doc.history.can_undo());
+        });
+        item.update(cx, |item, cx| {
+            item.undo(cx).expect("undo applies");
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(
+                text_path(doc, id).start,
+                TextPathStart::new(1, 0.25).expect("valid original")
+            );
+            assert!(
+                !doc.history.can_undo(),
+                "the gesture made one history entry"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn text_path_flip_rejects_read_only_and_stale_targets_and_preserves_direction(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, id) = doc_with_text_path();
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let action = DesignPanelAction::TextPathFlipOrientationRequested {
+            node_id: SharedString::from(id.to_string()),
+        };
+        panel.update_in(cx, |_, _, cx| cx.emit(action.clone()));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let text_path = text_path(item.doc().expect("document ready"), id);
+            assert_eq!(text_path.side, TextPathSide::Default);
+            assert_eq!(text_path.direction, TextPathDirection::Reverse);
+        });
+        item.update(cx, |item, cx| {
+            item.undo(cx).expect("undo flip");
+        });
+        cx.run_until_parked();
+
+        set_viewer_permissions(&panel, DesignPanelPermissions::viewer(), cx);
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_action(&panel, &action, window, cx);
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(text_path(doc, id).side, TextPathSide::Flipped);
+            assert!(!doc.history.can_undo());
+        });
+
+        set_viewer_permissions(&panel, DesignPanelPermissions::editor(), cx);
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([page]);
+                ((), DocChange::Selection)
+            });
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_action(&panel, &action, window, cx);
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(text_path(doc, id).side, TextPathSide::Flipped);
+            assert!(!doc.history.can_undo());
         });
     }
 

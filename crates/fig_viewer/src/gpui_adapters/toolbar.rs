@@ -857,7 +857,6 @@ mod echo_tests {
             view.read_with(cx, |view, _| view.active_tool()),
             ToolKind::Scale
         );
-        assert!(!ToolKind::Scale.is_stub());
         view.update(cx, |view, cx| {
             view.set_viewport_silent(Viewport {
                 center: [50., 25.],

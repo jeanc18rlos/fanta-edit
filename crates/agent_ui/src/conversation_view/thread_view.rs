@@ -12056,7 +12056,7 @@ pub(crate) fn open_link(
             MentionUri::File { abs_path } => {
                 open_abs_path_at_point(workspace, abs_path, None, window, cx);
             }
-            MentionUri::PastedImage { .. } => {}
+            MentionUri::PastedImage { .. } | MentionUri::CanvasSelection { .. } => {}
             MentionUri::Directory { abs_path } => {
                 let project = workspace.project();
                 let Some(entry_id) = project.update(cx, |project, cx| {

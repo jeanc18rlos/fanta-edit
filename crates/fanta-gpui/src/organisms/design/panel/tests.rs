@@ -1,9 +1,10 @@
 use super::super::{
     DESIGN_SCRUB_DOUBLE_SPEED_Y_THRESHOLD, DESIGN_SCRUB_HALF_SPEED_Y_THRESHOLD,
     DESIGN_SCRUB_QUARTER_SPEED_Y_THRESHOLD, DesignArcData, DesignComponentResetState,
-    DesignLayoutGrid, DesignPanelNodeCapabilities, DesignPanelPropertyBinding,
-    DesignRepeatModifier, DesignSectionDevStatus, DesignShaderDefinition, DesignShaderEffect,
-    DesignShaderProperty, DesignShaderPropertyDefinition, DesignStroke,
+    DesignLayoutGrid, DesignPaintCollectionEditMode, DesignPanelNodeCapabilities,
+    DesignPanelPropertyBinding, DesignRepeatModifier, DesignSectionDevStatus,
+    DesignShaderDefinition, DesignShaderEffect, DesignShaderProperty,
+    DesignShaderPropertyDefinition, DesignStroke,
 };
 use super::*;
 use std::{cell::RefCell, rc::Rc};
@@ -15705,6 +15706,175 @@ fn read_only_paint_locks_row_controls_and_terminates_an_active_opacity_edit(
         phases,
         vec![DesignPanelEditPhase::Begin, DesignPanelEditPhase::Cancel]
     );
+}
+
+#[gpui::test]
+fn color_and_opacity_only_fill_hides_structure_and_filters_intents(cx: &mut TestAppContext) {
+    let mut node = DesignPanelNode::new("synthetic", "Synthetic", DesignPanelNodeKind::Rectangle);
+    node.fills = vec![
+        DesignPaint::solid(DesignColor::rgb(0x12, 0x34, 0x56)).with_id("fill-a"),
+        DesignPaint::solid(DesignColor::rgb(0x65, 0x43, 0x21)).with_id("fill-b"),
+    ];
+    node.capabilities = Some(
+        DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::Rectangle)
+            .with_fill_edit_mode(DesignPaintCollectionEditMode::ColorAndOpacityOnly),
+    );
+    let full_node = {
+        let mut full_node = node.clone();
+        full_node.capabilities = Some(DesignPanelNodeCapabilities::for_node_kind(
+            DesignPanelNodeKind::Rectangle,
+        ));
+        full_node
+    };
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+    let target = PaintPickerTarget {
+        collection: DesignPanelCollection::Fill,
+        index: 0,
+        paint_id: "fill-a".into(),
+    };
+
+    visual_cx.simulate_event(gpui::ScrollWheelEvent {
+        position: gpui::point(px(160.), px(360.)),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-420.))),
+        ..Default::default()
+    });
+    visual_cx.run_until_parked();
+    assert!(
+        visual_cx
+            .debug_bounds("design-fill-paint-opacity-0")
+            .is_some()
+    );
+    for hidden in ["design-add-fill", "design-fill-paint-visible-0"] {
+        assert!(
+            visual_cx.debug_bounds(hidden).is_none(),
+            "{hidden} must not be exposed for a color-and-opacity-only Fill"
+        );
+    }
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.active_picker = Some(target.clone());
+            panel.sync_paint_picker(window, cx);
+            cx.notify();
+        });
+    });
+    visual_cx.run_until_parked();
+
+    let picker = visual_cx.read(|app| panel.read(app).paint_picker.clone());
+    assert_eq!(
+        visual_cx.read(|app| picker.read(app).color_only_title().cloned()),
+        Some(SharedString::from("Fill color")),
+        "the retained picker must use its color-only rendering path"
+    );
+
+    panel.update(visual_cx, |panel, cx| {
+        let opacity = DesignPanelProperty::PaintOpacity {
+            collection: DesignPanelCollection::Fill,
+            index: 0,
+        };
+        let visibility = DesignPanelProperty::PaintVisible {
+            collection: DesignPanelCollection::Fill,
+            index: 0,
+        };
+        assert!(panel.property_is_editable(opacity));
+        assert!(!panel.property_is_editable(visibility));
+
+        panel.emit_add(DesignPanelCollection::Fill, cx);
+        panel.emit_remove(DesignPanelCollection::Fill, 0, cx);
+        let first_paint = panel
+            .node
+            .fills
+            .first()
+            .expect("the fixture has a first Fill")
+            .clone();
+        panel.emit_paint_reorder(DesignPanelCollection::Fill, &first_paint, 0, 1, cx);
+        for edit in [
+            DesignPaintEdit {
+                property: DesignPaintProperty::Visible,
+                value: DesignPaintValue::Bool(false),
+            },
+            DesignPaintEdit {
+                property: DesignPaintProperty::BlendMode,
+                value: DesignPaintValue::BlendMode(DesignBlendMode::Multiply),
+            },
+            DesignPaintEdit {
+                property: DesignPaintProperty::Payload,
+                value: DesignPaintValue::Payload(DesignPaint::solid(DesignColor::BLACK).payload),
+            },
+        ] {
+            panel.emit_paint_edit(target.clone(), edit, DesignPanelEditPhase::Commit, cx);
+        }
+        panel.emit_paint_edit(
+            target.clone(),
+            DesignPaintEdit {
+                property: DesignPaintProperty::Color,
+                value: DesignPaintValue::Color(DesignColor::rgb(0xaa, 0xbb, 0xcc)),
+            },
+            DesignPanelEditPhase::Commit,
+            cx,
+        );
+        panel.emit_paint_edit(
+            target.clone(),
+            DesignPaintEdit {
+                property: DesignPaintProperty::Opacity,
+                value: DesignPaintValue::Number(42.),
+            },
+            DesignPanelEditPhase::Commit,
+            cx,
+        );
+    });
+    visual_cx.run_until_parked();
+
+    let actions = captured.borrow();
+    assert!(matches!(
+        actions.as_slice(),
+        [
+            DesignPanelAction::PaintEditRequested {
+                edit: DesignPaintEdit {
+                    property: DesignPaintProperty::Color,
+                    ..
+                },
+                ..
+            },
+            DesignPanelAction::PaintEditRequested {
+                edit: DesignPaintEdit {
+                    property: DesignPaintProperty::Opacity,
+                    ..
+                },
+                ..
+            }
+        ]
+    ));
+    drop(actions);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.set_node(full_node, cx);
+            panel.sync_paint_picker(window, cx);
+        });
+    });
+    visual_cx.run_until_parked();
+    assert_eq!(
+        visual_cx.read(|app| picker.read(app).color_only_title().cloned()),
+        None,
+        "a same-target capability upgrade must restore the full picker"
+    );
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.active_picker = None;
+            panel.sync_paint_picker(window, cx);
+            cx.notify();
+        });
+    });
+    visual_cx.run_until_parked();
+    for restored in ["design-add-fill", "design-fill-paint-visible-0"] {
+        assert!(
+            visual_cx.debug_bounds(restored).is_some(),
+            "{restored} must return with full Fill controls"
+        );
+    }
 }
 
 #[gpui::test]

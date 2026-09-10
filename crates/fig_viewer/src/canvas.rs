@@ -2422,6 +2422,11 @@ pub(crate) fn evaluated_world_bounds(
     let node = scene.get(id)?;
     if let Some(motion) = motion {
         let evaluated = motion.apply_to_node(node);
+        if let fanta_doc::NodeData::TextPath(text_path) = &evaluated.data
+            && let Some(local) = fanta_render::text_path_visual_bounds(text_path)
+        {
+            return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
+        }
         if let Some(local) = evaluated.data.local_bounds() {
             return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
         }
@@ -2445,6 +2450,14 @@ pub(crate) fn evaluated_world_bounds(
             // LOCAL space, which differs from the world-space union below
             // under rotation. Keep the world-space union for parity.
             fanta_doc::NodeData::Boolean(_) => {}
+            fanta_doc::NodeData::TextPath(text_path) => {
+                if let Some(local) = fanta_render::text_path_visual_bounds(text_path) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+                if let Some(local) = scene.local_bounds(id) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+            }
             // For every other kind the scene's local bounds ARE
             // `data.local_bounds()` — memoized, so a vector's path walk runs
             // once per edit instead of once per call.
@@ -2480,6 +2493,81 @@ pub(crate) fn evaluated_hit_test_screen(
 ) -> Option<NodeId> {
     let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
     evaluated_hit_test(scene, motion, world_point, precision, active_page)
+}
+
+pub(crate) fn precise_hit_test_screen(
+    scene: &fanta_doc::Scene,
+    viewport: &Viewport,
+    screen_size: DVec2,
+    screen_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
+    precise_hit_test(scene, world_point, precision, active_page)
+}
+
+fn precise_hit_test(
+    scene: &fanta_doc::Scene,
+    world_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    fanta_canvas::hit_test_deep(scene, world_point, precision, active_page)
+        .into_iter()
+        .find(|&id| accepts_precise_hit(scene, id, world_point))
+}
+
+pub(crate) fn accepts_precise_hit(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    world_point: DVec2,
+) -> bool {
+    let Some(node) = scene.get(id) else {
+        return false;
+    };
+    let fanta_doc::NodeData::TextPath(text_path) = &node.data else {
+        return true;
+    };
+    scene
+        .world_transform(id)
+        .is_some_and(|transform| text_path_contains_world_point(text_path, transform, world_point))
+}
+
+fn text_path_contains_world_point(
+    text_path: &fanta_doc::TextPathNode,
+    transform: fanta_doc::Transform2D,
+    world_point: DVec2,
+) -> bool {
+    let [a, b, c, d, _, _] = transform.to_components();
+    let determinant = a * d - b * c;
+    if !transform.is_finite()
+        || !world_point.x.is_finite()
+        || !world_point.y.is_finite()
+        || !determinant.is_finite()
+        || determinant.abs() <= f64::EPSILON
+    {
+        return false;
+    }
+    let local_point = transform.inverse().transform_point(world_point);
+    if text_path.content.is_empty() {
+        let Some(caret) = fanta_render::text_path_caret_segment(text_path, 0) else {
+            return false;
+        };
+        let start = DVec2::from(caret.start);
+        let end = DVec2::from(caret.end);
+        let segment = end - start;
+        let segment_length_squared = segment.length_squared();
+        if !segment_length_squared.is_finite() || segment_length_squared <= f64::EPSILON {
+            return false;
+        }
+        let position =
+            ((local_point - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0);
+        let closest = start + segment * position;
+        let tolerance = (text_path.style.size_px * 0.15).clamp(3.0, 12.0);
+        return local_point.distance(closest) <= tolerance;
+    }
+    fanta_render::text_path_contains_point(text_path, local_point.to_array())
 }
 
 fn evaluated_hit_test(
@@ -2543,17 +2631,27 @@ fn evaluated_hit_test_subtree(
     if let fanta_doc::NodeData::Group(group) = &node.data {
         return group.is_frame_surface().then_some(id);
     }
-    if precision == fanta_canvas::HitPrecision::Path
-        && let fanta_doc::NodeData::Vector(vector) = &node.data
-    {
+    if let fanta_doc::NodeData::TextPath(text_path) = &node.data {
         let transform = evaluated_world_transform(scene, id, Some(motion))?;
-        let [a, b, c, d, _, _] = transform.to_components();
-        let determinant = a * d - b * c;
-        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
-            return None;
+        return text_path_contains_world_point(text_path, transform, world_point).then_some(id);
+    }
+    if precision == fanta_canvas::HitPrecision::Path {
+        let transform = evaluated_world_transform(scene, id, Some(motion))?;
+        match &node.data {
+            fanta_doc::NodeData::Vector(vector) => {
+                let [a, b, c, d, _, _] = transform.to_components();
+                let determinant = a * d - b * c;
+                if !transform.is_finite()
+                    || !determinant.is_finite()
+                    || determinant.abs() <= f64::EPSILON
+                {
+                    return None;
+                }
+                let local_point = transform.inverse().transform_point(world_point);
+                return fanta_canvas::point_in_path(&vector.path, local_point).then_some(id);
+            }
+            _ => {}
         }
-        let local_point = transform.inverse().transform_point(world_point);
-        return fanta_canvas::point_in_path(&vector.path, local_point).then_some(id);
     }
     Some(id)
 }
@@ -2635,16 +2733,26 @@ fn oriented_selection(
     OrientedSelection { corners, handles }
 }
 
-fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
-    let node = doc.scene.get(id)?;
+pub(crate) fn authored_local_bounds(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+) -> Option<fanta_doc::Bounds> {
+    let node = scene.get(id)?;
     match &node.data {
         fanta_doc::NodeData::Group(group) => group
             .clip_size
             .or(group.local_size)
             .map(|[width, height]| fanta_doc::Bounds::from_xywh(0.0, 0.0, width, height))
-            .or_else(|| doc.scene.local_bounds(id)),
-        _ => doc.scene.local_bounds(id),
+            .or_else(|| scene.local_bounds(id)),
+        fanta_doc::NodeData::TextPath(text_path) => {
+            fanta_render::text_path_visual_bounds(text_path).or_else(|| scene.local_bounds(id))
+        }
+        _ => scene.local_bounds(id),
     }
+}
+
+fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
+    authored_local_bounds(&doc.scene, id)
 }
 
 /// Prepaint snapshot of one comment pin (owned, so paint holds no doc borrow).
@@ -2796,7 +2904,11 @@ impl CanvasElement {
             }
         }
         let selection_frame = if view.tools().kind() == crate::tools::ToolKind::Scale {
-            fanta_tools::ScaleTool::selection_frame(doc, doc.active_page())
+            fanta_tools::ScaleTool::selection_frame_with_resolver(
+                doc,
+                doc.active_page(),
+                Some(authored_local_bounds),
+            )
         } else if let &[id] = doc.selection.as_slice() {
             authored_selection_bounds(doc, id).zip(evaluated_world_transform(
                 &doc.scene,
@@ -3696,7 +3808,8 @@ mod geometry_tests {
     use super::*;
     use fanta_doc::{
         AnimationClipId, Bounds as WorldBounds, CanvasNode, Color, GroupNode, MotionProperty,
-        MotionTarget, NodeData, ResolvedVarValue, Scene, Transform2D, VectorNode,
+        MotionTarget, NodeData, PathData, ResolvedVarValue, Scene, TextPathNode, Transform2D,
+        VectorNode,
     };
     use std::collections::BTreeMap;
 
@@ -4051,6 +4164,156 @@ mod geometry_tests {
         assert_eq!(
             doc.scene.local_bounds(group_id),
             Some(WorldBounds::from_xywh(0.0, 0.0, 110.0, 20.0))
+        );
+    }
+
+    #[test]
+    fn text_path_selection_and_world_bounds_use_shaped_glyph_geometry() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "Tight");
+        text_path.style.size_px = 28.0;
+        let exact = fanta_render::text_path_visual_bounds(&text_path)
+            .expect("text path should have shaped visual bounds");
+
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.transform = Transform2D::translation(30.0, -12.0);
+        let node_id = node.id;
+        let mut doc = fanta_doc::Doc::new();
+        doc.scene.insert(node).expect("insert text path");
+
+        assert_eq!(authored_selection_bounds(&doc, node_id), Some(exact));
+        assert_ne!(doc.scene.local_bounds(node_id), Some(exact));
+        assert_eq!(
+            evaluated_world_bounds(&doc.scene, node_id, None),
+            exact.try_transformed(&Transform2D::translation(30.0, -12.0))
+        );
+    }
+
+    #[test]
+    fn text_path_hit_testing_rejects_empty_space_inside_conservative_bounds() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "Tight");
+        text_path.style.size_px = 28.0;
+        let exact = fanta_render::text_path_visual_bounds(&text_path)
+            .expect("text path should have shaped visual bounds");
+        let broad = NodeData::TextPath(text_path.clone())
+            .local_bounds()
+            .expect("text path should have conservative bounds");
+        let broad_only = DVec2::new(broad.center().x, broad.max_y - 1.0);
+        assert!(broad.contains_point(broad_only));
+        assert!(!fanta_render::text_path_contains_point(
+            &text_path,
+            broad_only.to_array()
+        ));
+
+        let mut exact_gap = None;
+        for y_step in 1..20 {
+            for x_step in 1..20 {
+                let point = DVec2::new(
+                    exact.min_x + exact.width() * f64::from(x_step) / 20.0,
+                    exact.min_y + exact.height() * f64::from(y_step) / 20.0,
+                );
+                if !fanta_render::text_path_contains_point(&text_path, point.to_array()) {
+                    exact_gap = Some(point);
+                    break;
+                }
+            }
+            if exact_gap.is_some() {
+                break;
+            }
+        }
+        let exact_gap = exact_gap.expect("visual bounds should include space outside glyph ink");
+
+        let mut scene = Scene::new();
+        let lower = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            broad.min_x - 10.0,
+            broad.min_y - 10.0,
+            broad.width() + 20.0,
+            broad.height() + 20.0,
+            Color::BLACK,
+        )));
+        let lower_id = lower.id;
+        scene.insert(lower).expect("insert lower node");
+
+        let mut upper = CanvasNode::new(NodeData::TextPath(text_path));
+        upper.index = scene.next_root_index();
+        let upper_id = upper.id;
+        scene.insert(upper).expect("insert text path");
+
+        assert_eq!(
+            fanta_canvas::hit_test(&scene, broad_only, fanta_canvas::HitPrecision::Path, None,),
+            Some(upper_id)
+        );
+        assert_eq!(
+            precise_hit_test(&scene, broad_only, fanta_canvas::HitPrecision::Path, None,),
+            Some(lower_id)
+        );
+
+        let motion = MotionEvaluation {
+            clip: AnimationClipId::from_u128(2),
+            playhead_ms: 0,
+            overrides: BTreeMap::new(),
+        };
+        assert_eq!(
+            evaluated_hit_test(
+                &scene,
+                &motion,
+                exact_gap,
+                fanta_canvas::HitPrecision::Bounds,
+                None,
+            ),
+            Some(lower_id)
+        );
+    }
+
+    #[test]
+    fn empty_text_path_keeps_a_small_caret_hit_target() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "");
+        text_path.style.size_px = 28.0;
+        let broad = NodeData::TextPath(text_path.clone())
+            .local_bounds()
+            .expect("empty text path should retain authoring bounds");
+        let caret = fanta_render::text_path_caret_segment(&text_path, 0)
+            .expect("empty text path should expose a fallback caret");
+        let caret_midpoint = (DVec2::from(caret.start) + DVec2::from(caret.end)) * 0.5;
+        let far_from_caret = DVec2::new(broad.max_x - 1.0, broad.max_y - 1.0);
+
+        let mut scene = Scene::new();
+        let lower = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            broad.min_x - 10.0,
+            broad.min_y - 10.0,
+            broad.width() + 20.0,
+            broad.height() + 20.0,
+            Color::BLACK,
+        )));
+        let lower_id = lower.id;
+        scene.insert(lower).expect("insert lower node");
+        let mut upper = CanvasNode::new(NodeData::TextPath(text_path));
+        upper.index = scene.next_root_index();
+        let upper_id = upper.id;
+        scene.insert(upper).expect("insert empty text path");
+
+        assert_eq!(
+            precise_hit_test(
+                &scene,
+                caret_midpoint,
+                fanta_canvas::HitPrecision::Path,
+                None,
+            ),
+            Some(upper_id)
+        );
+        assert_eq!(
+            precise_hit_test(
+                &scene,
+                far_from_caret,
+                fanta_canvas::HitPrecision::Path,
+                None,
+            ),
+            Some(lower_id)
         );
     }
 }

@@ -84,13 +84,16 @@ impl DesignSurface for FigDesignSurface {
         let project_root = item.project_root();
         let selection: Vec<NodeId> = doc.selection.iter().copied().collect();
         Ok(json!({
-            "project": item.title().as_ref(),
+            "project": truncate_summary_string(item.title().as_ref(), SUMMARY_LABEL_CHARS),
+            "document_id": doc.id.to_string(),
+            "document_path": item.abs_path().display().to_string(),
             "project_root": project_root.map(|root| root.display().to_string()),
             "is_editable": item.is_editable(),
             "source_edit_locked": item.source_edit_locked(),
             "dirty": item.is_dirty(),
             "total_nodes": doc.scene.len(),
             "pages": pages_json(&document.pages, doc, project_root),
+            "active_root_id": doc.active_page().map(|id| id.to_string()),
             "active_page_bounds": bounds_json(content_bounds(doc, doc.active_page())),
             "components": components_json(doc, project_root),
             "selection": selection_ids(doc),
@@ -309,7 +312,7 @@ fn pages_json(pages: &[FigPage], doc: &Doc, project_root: Option<&Path>) -> Vec<
                 });
             json!({
                 "index": index,
-                "name": page.name.as_ref(),
+                "name": truncate_summary_string(page.name.as_ref(), SUMMARY_LABEL_CHARS),
                 "root": page.root.map(|id| id.to_string()),
                 "hidden": page.hidden,
                 "active": page.root.is_some() && page.root == active_page,
@@ -334,7 +337,7 @@ fn components_json(doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
                 .and_then(|project_root| fanta_format::locate_master_source(project_root, def.id));
             json!({
                 "id": def.id.to_string(),
-                "name": def.name,
+                "name": truncate_summary_string(&def.name, SUMMARY_LABEL_CHARS),
                 "root": def.root.to_string(),
                 "source": relative_source(project_root, source),
             })
@@ -370,9 +373,10 @@ fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
 /// What every state read tells the model up front, because the mistakes
 /// these prevent (guessed ids, y-up math, unverified results) are the common
 /// ones.
-const STATE_HINTS: [&str; 5] = [
+const STATE_HINTS: [&str; 6] = [
     "Coordinates are world px with y growing downward; x/y of an op is the node's top-left corner.",
     "Ids are exact node ids from this state or a page listing; never guess or use layer names.",
+    "Document and active-root ids identify this live canvas; verify both before reusing ids from an attached snapshot.",
     "Ask for empty_space before creating a new top-level frame so it does not land on existing work.",
     "Batch related ops into one design_edit/batch_design call with a descriptive label; it is one undo step.",
     "Verify substantive edits with a screenshot of the changed frame before reporting done.",
@@ -522,14 +526,22 @@ fn paginated_node_summary(
 /// A compact node-tree projection for page listings: enough for the model to
 /// navigate and target nodes without the full serde payload (fetch specific
 /// ids for that).
-fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: bool) -> Value {
+pub(crate) fn node_summary(
+    doc: &Doc,
+    id: NodeId,
+    depth: Option<u32>,
+    include_geometry: bool,
+) -> Value {
     let Some(node) = doc.scene.get(id) else {
         return Value::Null;
     };
     let mut object = serde_json::Map::new();
     object.insert("id".into(), json!(id.to_string()));
     object.insert("kind".into(), json!(node.data.kind_tag()));
-    object.insert("name".into(), json!(node.name));
+    object.insert(
+        "name".into(),
+        json!(truncate_summary_string(&node.name, SUMMARY_LABEL_CHARS)),
+    );
     if node.flags.contains(NodeFlags::HIDDEN) {
         object.insert("hidden".into(), json!(true));
     }
@@ -564,6 +576,16 @@ fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: boo
 /// content is cut there and reported with its full `text_length`, so a page
 /// listing stays bounded per node (fetch the node by id for the whole text).
 const SUMMARY_TEXT_CHARS: usize = 120;
+pub(crate) const SUMMARY_LABEL_CHARS: usize = 160;
+
+pub(crate) fn truncate_summary_string(value: &str, max_chars: usize) -> String {
+    let mut characters = value.chars();
+    let mut truncated = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        truncated.push('…');
+    }
+    truncated
+}
 
 /// Kind-specific facts a model needs to reason about a node without fetching
 /// it in full: a frame's size and layout mode, a text's font and (truncated)
@@ -605,12 +627,13 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
         NodeData::Instance(instance) => {
             object.insert(
                 "component".into(),
-                json!(
+                json!(truncate_summary_string(
                     doc.components
                         .def(instance.component)
                         .map(|def| def.name.as_str())
-                        .unwrap_or("(missing)")
-                ),
+                        .unwrap_or("(missing)"),
+                    SUMMARY_LABEL_CHARS
+                )),
             );
         }
         NodeData::Bitmap(_)
@@ -639,7 +662,7 @@ fn summarize_text(content: &str, style: &TextStyle, object: &mut serde_json::Map
     object.insert(
         "font".into(),
         json!({
-            "family": style.font_family,
+            "family": truncate_summary_string(&style.font_family, SUMMARY_LABEL_CHARS),
             "size": style.size_px,
             "weight": style.weight,
         }),
@@ -2963,6 +2986,12 @@ mod tests {
         );
         assert_applied(&outcome);
         let text = created_id(&outcome, 0);
+        let text_node = doc.scene.get_mut(text).expect("text node exists");
+        text_node.name = "N".repeat(SUMMARY_LABEL_CHARS + 30);
+        let NodeData::Text(text_data) = &mut text_node.data else {
+            panic!("expected a text node");
+        };
+        text_data.style.font_family = "F".repeat(SUMMARY_LABEL_CHARS + 30);
 
         let summary = node_summary(&doc, page_id, None, false);
         let listed = &summary["children"][0];
@@ -2970,6 +2999,11 @@ mod tests {
         assert_eq!(preview.chars().count(), SUMMARY_TEXT_CHARS + 1);
         assert!(preview.ends_with('…'));
         assert_eq!(listed["text_length"], json!(SUMMARY_TEXT_CHARS + 30));
+        for value in [&listed["name"], &listed["font"]["family"]] {
+            let value = value.as_str().expect("summary label is a string");
+            assert_eq!(value.chars().count(), SUMMARY_LABEL_CHARS + 1);
+            assert!(value.ends_with('…'));
+        }
 
         let NodeData::Text(node) = &doc.scene.get(text).unwrap().data else {
             panic!("expected a text node");

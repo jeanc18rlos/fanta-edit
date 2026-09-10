@@ -257,9 +257,19 @@ impl DesignPanel {
             DesignPanelProperty::SelectionColor(_) => {
                 self.node.supports_section(DesignPanelSection::Selection)
             }
-            DesignPanelProperty::PaintOpacity { collection, index }
-            | DesignPanelProperty::PaintVisible { collection, index } => {
+            DesignPanelProperty::PaintOpacity { collection, index } => {
                 self.collection_is_supported(collection)
+                    && self
+                        .paint_collection(collection)
+                        .and_then(|paints| paints.get(index))
+                        .is_some_and(|paint| !paint.read_only)
+            }
+            DesignPanelProperty::PaintVisible { collection, index } => {
+                self.collection_is_supported(collection)
+                    && self
+                        .node
+                        .paint_collection_edit_mode(collection)
+                        .allows_full_controls()
                     && self
                         .paint_collection(collection)
                         .and_then(|paints| paints.get(index))
@@ -419,7 +429,6 @@ impl DesignPanel {
             DesignPanelAction::CollectionItemAddRequested { collection, .. }
             | DesignPanelAction::CollectionItemRemoveRequested { collection, .. }
             | DesignPanelAction::PaintChangeRequested { collection, .. }
-            | DesignPanelAction::PaintEditRequested { collection, .. }
             | DesignPanelAction::PaintReorderRequested { collection, .. }
             | DesignPanelAction::PaintSourceReplaceRequested { collection, .. }
             | DesignPanelAction::PaintMediaSourceActionRequested { collection, .. }
@@ -441,9 +450,32 @@ impl DesignPanel {
             | DesignPanelAction::PaintColorVariableCreateRequested { collection, .. }
             | DesignPanelAction::PaintColorStyleSampleRequested { collection, .. }
             | DesignPanelAction::PaintColorStyleApplyRequested { collection, .. }
-            | DesignPanelAction::PaintColorStyleCreateRequested { collection, .. }
-            | DesignPanelAction::PaintEyedropperRequested { collection, .. } => {
+            | DesignPanelAction::PaintColorStyleCreateRequested { collection, .. } => {
                 self.collection_is_supported(*collection)
+                    && self
+                        .node
+                        .paint_collection_edit_mode(*collection)
+                        .allows_full_controls()
+            }
+            DesignPanelAction::PaintEditRequested {
+                collection,
+                edit,
+                phase,
+                ..
+            } => {
+                self.collection_is_supported(*collection)
+                    && (*phase == DesignPanelEditPhase::Cancel
+                        || self
+                            .node
+                            .paint_collection_edit_mode(*collection)
+                            .allows_property(&edit.property))
+            }
+            DesignPanelAction::PaintEyedropperRequested { collection, .. } => {
+                self.collection_is_supported(*collection)
+                    && self
+                        .node
+                        .paint_collection_edit_mode(*collection)
+                        .allows_property(&DesignPaintProperty::Color)
             }
             DesignPanelAction::EffectAddRequested { .. }
             | DesignPanelAction::EffectRemoveRequested { .. }
@@ -1412,6 +1444,13 @@ impl DesignPanel {
             }
             return;
         }
+        if !self
+            .node
+            .paint_collection_edit_mode(collection)
+            .allows_full_controls()
+        {
+            return;
+        }
         if !self.can_edit() {
             return;
         }
@@ -1473,6 +1512,13 @@ impl DesignPanel {
                     },
                 );
             }
+            return;
+        }
+        if !self
+            .node
+            .paint_collection_edit_mode(collection)
+            .allows_full_controls()
+        {
             return;
         }
         if !self.can_edit() {

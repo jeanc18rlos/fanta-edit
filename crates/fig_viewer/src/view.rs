@@ -35,8 +35,8 @@ use workspace::{
 };
 
 use crate::canvas::{
-    CanvasElement, RenderedCanvas, bounds_size, evaluated_hit_test_screen,
-    screen_position_in_bounds,
+    CanvasElement, RenderedCanvas, authored_local_bounds, bounds_size, evaluated_hit_test_screen,
+    precise_hit_test_screen, screen_position_in_bounds,
 };
 use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
@@ -165,7 +165,7 @@ actions!(
         ActivateScaleTool,
         /// Activate direct selection of vector anchors and segments.
         ActivatePathSelectTool,
-        /// Activate the text-on-path tool (placeholder).
+        /// Convert the selected vector to editable text on its path.
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
         ActivateCommentTool,
@@ -649,6 +649,10 @@ impl FigView {
             // event); selection and text-selection changes must refresh even
             // though the native panels ignore them.
             #[cfg(feature = "fanta-gpui-ui")]
+            if matches!(event, FigItemEvent::StateChanged) {
+                this.discard_gpui_design_edits();
+            }
+            #[cfg(feature = "fanta-gpui-ui")]
             if !matches!(event, FigItemEvent::EditedTransient) {
                 this.refresh_gpui_design(cx);
             }
@@ -676,6 +680,24 @@ impl FigView {
                     // selected; a resize cursor over a now-empty selection
                     // would promise a gesture the press would not start.
                     this.hover_resize_handle = None;
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    {
+                        // Panel and workspace selection changes can arrive
+                        // while the item is already updating. Restore the
+                        // property preview after that update releases its
+                        // entity borrow, while leaving the new selection intact.
+                        let view = cx.weak_entity();
+                        cx.defer(move |cx| {
+                            view.update(cx, |view, cx| {
+                                view.finish_gpui_design_edits(cx);
+                                // An already-dirty preview only emitted
+                                // EditedTransient, so its rollback has no
+                                // later heavyweight event to refresh the panel.
+                                view.refresh_gpui_design(cx);
+                            })
+                            .log_err();
+                        });
+                    }
                 }
                 FigItemEvent::TextSelectionChanged => {}
                 // A save wrote the document without replacing it, so
@@ -862,6 +884,8 @@ impl FigView {
             return;
         }
 
+        #[cfg(feature = "fanta-gpui-ui")]
+        self.finish_gpui_design_edits(cx);
         self.cancel_motion_keyframe_drag(cx);
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.set_authoring_enabled(false, cx));
@@ -874,8 +898,9 @@ impl FigView {
             DVec2::new(width, height)
         });
         let tools = &mut self.tools;
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let revision_before = document.doc.scene.revision();
                 if let Some(session) = text_session.as_ref() {
                     crate::text_edit::rewind_preview(&mut document.doc, session);
@@ -894,7 +919,7 @@ impl FigView {
                 };
                 ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
         });
         self.viewport = viewport;
         self.remember_tool_face(ToolKind::Select);
@@ -943,6 +968,7 @@ impl FigView {
     }
 
     fn finish_document_edits(&mut self, cx: &mut Context<Self>) {
+        self.commit_text_edit(cx);
         self.finish_panel_edits(cx);
         self.commit_text_edit(cx);
         let clip_edit = self
@@ -982,7 +1008,57 @@ impl FigView {
         }
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.reset_keyframe_drag(cx));
+        self.cancel_tool_preview_if_active(cx);
         self.sync_motion_timeline(cx);
+    }
+
+    fn cancel_tool_preview_if_active(&mut self, cx: &mut Context<Self>) {
+        if !self.item.read(cx).content_preview_active() {
+            return;
+        }
+        let preview_owner = cx.entity_id();
+        let mut viewport = self.viewport;
+        let screen_size = self.container_bounds.map(|bounds| {
+            let (width, height) = bounds_size(bounds);
+            DVec2::new(width, height)
+        });
+        let tools = &mut self.tools;
+        let restored = self.item.update(cx, |item, cx| {
+            let restored = item
+                .with_document_for_preview_owner(preview_owner, cx, |document| {
+                    let revision_before = document.doc.scene.revision();
+                    if let (Some(viewport), Some(screen_size)) = (viewport.as_mut(), screen_size) {
+                        let mut tool_context = tool_context(
+                            &mut document.doc,
+                            viewport,
+                            screen_size,
+                            ToolKind::Select,
+                        );
+                        tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                    } else {
+                        tools.activate_without_context(ToolKind::Select);
+                    }
+                    let change = if document.doc.scene.revision() != revision_before {
+                        DocChange::ContentPreview
+                    } else {
+                        DocChange::None
+                    };
+                    ((), change)
+                })
+                .is_some();
+            if restored {
+                item.finish_content_preview(preview_owner, false, cx);
+            }
+            restored
+        });
+        if restored {
+            self.viewport = viewport;
+            self.primary_pressed = false;
+            self.canvas_pointer_down = false;
+            self.remember_tool_face(ToolKind::Select);
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
     }
 
     pub(crate) fn finish_document_edits_for_external_change(&mut self, cx: &mut Context<Self>) {
@@ -1265,6 +1341,7 @@ impl FigView {
             return;
         }
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         let Some(session) = self
             .motion_keyframe_drag
             .as_mut()
@@ -1273,7 +1350,7 @@ impl FigView {
             return;
         };
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.preview(&mut document.doc, time_us) {
                     DocChange::ContentPreview
                 } else {
@@ -1295,6 +1372,7 @@ impl FigView {
             return;
         }
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         let Some(session) = self
             .motion_keyframe_drag
             .as_mut()
@@ -1303,7 +1381,7 @@ impl FigView {
             return;
         };
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.preview_easing(&mut document.doc, easing) {
                     DocChange::ContentPreview
                 } else {
@@ -1327,8 +1405,9 @@ impl FigView {
             self.restore_motion_keyframe_drag(session, cx);
             return;
         }
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 session.preview(&mut document.doc, time_us);
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
@@ -1338,11 +1417,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
                 log::error!("moving motion keyframe failed: {error:#}");
             }
         });
@@ -1361,8 +1440,9 @@ impl FigView {
             self.restore_motion_keyframe_drag(session, cx);
             return;
         }
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 session.preview_easing(&mut document.doc, easing);
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
@@ -1372,11 +1452,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
                 log::error!("editing motion keyframe easing failed: {error:#}");
             }
         });
@@ -1390,8 +1470,9 @@ impl FigView {
             self.restore_motion_keyframe_drag(session, cx);
             return;
         }
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
                 } else {
@@ -1400,11 +1481,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
                 log::error!("finishing motion keyframe drag failed: {error:#}");
             }
         });
@@ -1422,8 +1503,9 @@ impl FigView {
         session: MotionKeyframeDragSession,
         cx: &mut Context<Self>,
     ) {
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
                 } else {
@@ -1431,7 +1513,7 @@ impl FigView {
                 };
                 ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
         });
     }
 
@@ -1444,8 +1526,9 @@ impl FigView {
         let Some(operation) = operation else {
             return;
         };
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            if let Err(error) = item.apply(operation, cx) {
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
                 log::error!("{action} failed: {error:#}");
             }
         });
@@ -1508,8 +1591,10 @@ impl FigView {
         }
         let clip_id = AnimationClipId::new();
         self.active_motion_clip = Some(clip_id);
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            if let Err(error) = item.apply(
+            if let Err(error) = item.apply_for_preview_owner(
+                preview_owner,
                 Operation::CreateAnimationClip {
                     clip: Box::new(AnimationClip::new(clip_id, "Animation 1", 5_000)),
                 },
@@ -1818,8 +1903,9 @@ impl FigView {
         let mut wants_exit = false;
         let mut content_changed = false;
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            let handle_event = |document: &mut FigDocument| {
                 let revision_before = document.doc.scene.revision();
                 let selection_before: Vec<NodeId> =
                     document.doc.selection.iter().copied().collect();
@@ -1849,7 +1935,12 @@ impl FigView {
                     DocChange::None
                 };
                 ((), change)
-            });
+            };
+            if is_preview_move {
+                item.with_document_for_preview_owner(preview_owner, cx, handle_event);
+            } else {
+                item.with_document_for_owner(preview_owner, cx, handle_event);
+            }
         });
 
         self.viewport = Some(viewport);
@@ -1961,7 +2052,7 @@ impl FigView {
 
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let hit = fanta_canvas::hit_test_screen(
+                let hit = precise_hit_test_screen(
                     &document.doc.scene,
                     &viewport,
                     screen_size,
@@ -1991,9 +2082,17 @@ impl FigView {
         // Switching tools is a document edit boundary for every inspector and
         // inline session, not only text.
         self.finish_document_edits(cx);
+        let activated_kind = if kind == ToolKind::TextPath {
+            ToolKind::Select
+        } else {
+            kind
+        };
         let Some((bounds, viewport)) = self.container_bounds.zip(self.viewport) else {
-            self.tools.activate_without_context(kind);
+            self.tools.activate_without_context(activated_kind);
             self.remember_tool_face(kind);
+            if kind == ToolKind::TextPath {
+                self.convert_selection_to_text_path(cx);
+            }
             cx.notify();
             return;
         };
@@ -2006,8 +2105,13 @@ impl FigView {
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let revision_before = document.doc.scene.revision();
-                let mut ctx = tool_context(&mut document.doc, &mut viewport, screen_size, kind);
-                tools.activate(kind, &mut ctx);
+                let mut ctx = tool_context(
+                    &mut document.doc,
+                    &mut viewport,
+                    screen_size,
+                    activated_kind,
+                );
+                tools.activate(activated_kind, &mut ctx);
                 let change = if document.doc.scene.revision() != revision_before {
                     DocChange::Content
                 } else {
@@ -2018,7 +2122,45 @@ impl FigView {
         });
         self.remember_tool_face(kind);
         self.viewport = Some(viewport);
+        if kind == ToolKind::TextPath {
+            self.convert_selection_to_text_path(cx);
+        }
         cx.notify();
+    }
+
+    fn convert_selection_to_text_path(&mut self, cx: &mut Context<Self>) {
+        let conversion = self
+            .item
+            .read(cx)
+            .document()
+            .map(|document| fanta_tools::text_path_conversion(&document.doc));
+        let Some(conversion) = conversion else {
+            show_canvas_notice_deferred("The document is still loading.".to_owned(), cx);
+            return;
+        };
+        let (node_id, operation) = match conversion {
+            Ok(conversion) => conversion,
+            Err(error) => {
+                show_canvas_notice_deferred(error.to_string(), cx);
+                return;
+            }
+        };
+        let preview_owner = cx.entity_id();
+        let result = self.item.update(cx, |item, cx| {
+            item.apply_for_preview_owner(preview_owner, operation, cx)
+        });
+        match result {
+            Ok(()) => {
+                self.pending_text_edit = Some(node_id);
+                self.invalidate_canvas_cache();
+            }
+            Err(error) => {
+                show_canvas_notice_deferred(
+                    format!("Text on Path could not be created: {error:#}"),
+                    cx,
+                );
+            }
+        }
     }
 
     fn remember_tool_face(&mut self, kind: ToolKind) {
@@ -2395,7 +2537,7 @@ impl FigView {
                         document.doc.active_page(),
                     )
                 } else {
-                    fanta_canvas::hit_test_screen(
+                    precise_hit_test_screen(
                         &document.doc.scene,
                         &viewport,
                         DVec2::new(width, height),
@@ -2432,8 +2574,11 @@ impl FigView {
         let (width, height) = bounds_size(bounds);
         let document = self.item.read(cx).document()?;
         if self.tools.kind() == ToolKind::Scale {
-            let (local, world) =
-                fanta_tools::ScaleTool::selection_frame(&document.doc, document.doc.active_page())?;
+            let (local, world) = fanta_tools::ScaleTool::selection_frame_with_resolver(
+                &document.doc,
+                document.doc.active_page(),
+                Some(authored_local_bounds),
+            )?;
             return fanta_canvas::handles::hit_test_resize_handle_oriented(
                 local,
                 &world,
@@ -2451,7 +2596,8 @@ impl FigView {
         if fanta_canvas::handles::transform_angle(&world_transform).abs() > 1e-4 {
             return None;
         }
-        let world = document.doc.scene.world_bounds(*id)?;
+        let local = authored_local_bounds(&document.doc.scene, *id)?;
+        let world = local.try_transformed(&world_transform)?;
         fanta_canvas::handles::hit_test_resize_handle_screen(
             world,
             screen,
@@ -3490,6 +3636,10 @@ impl FigView {
             && item.is_dirty()
             && !item.has_conflict()
             && !item.source_edit_locked()
+            && !item.external_reconciliation_pending()
+            // Native and GPUI inspectors share this item-level preview flag.
+            // Neither canvas focus nor pointer state covers sidebar scrubs.
+            && !item.content_preview_active()
             // An open text session, a running prototype, or a keyframe drag
             // each hold document state that a write would freeze mid-gesture.
             && self.text_edit.is_none()
@@ -3885,10 +4035,7 @@ impl FigView {
                                             move |mut menu, _window, _cx| {
                                                 for kind in group.iter().copied() {
                                                     let view = view.clone();
-                                                    let mut label = kind.label().to_string();
-                                                    if kind.is_stub() {
-                                                        label.push_str("  ·  soon");
-                                                    }
+                                                    let label = kind.label().to_string();
                                                     let disabled =
                                                         kind.requires_editing() && !editable;
                                                     menu = menu.item(
@@ -5800,14 +5947,16 @@ impl Item for FigView {
         }
     }
 
-    fn deactivated(&mut self, _: &mut Window, _cx: &mut Context<Self>) {
+    fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_document_edits(cx);
         #[cfg(target_os = "macos")]
-        self.set_canvas_video_active(false, _cx);
+        self.set_canvas_video_active(false, cx);
     }
 
-    fn workspace_deactivated(&mut self, _: &mut Window, _cx: &mut Context<Self>) {
+    fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_document_edits(cx);
         #[cfg(target_os = "macos")]
-        self.set_canvas_video_active(false, _cx);
+        self.set_canvas_video_active(false, cx);
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
@@ -6289,9 +6438,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use fanta_doc::{
-        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, TextNode, Transform2D,
-        VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
-        VectorNode,
+        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, PathData, Stroke,
+        TextNode, Transform2D, VarValue, Variable, VariableCollection, VariableCollectionId,
+        VariableId, VariableType, VectorNode,
     };
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
@@ -7333,6 +7482,112 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn text_input_is_blocked_while_save_as_changes_destination(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let (document, text, _) = text_selection_doc(false);
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&copy, cx))
+                .context("copy path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let view = scratch.update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })?;
+            scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text, TextEditSeed::SelectAll, window, cx);
+                });
+            })?;
+
+            let (arrived, resume) =
+                item.read_with(cx, |item, _| item.pause_next_save_for_test(false));
+            let save_as = item.update(cx, |item, cx| {
+                item.save_as(project.clone(), destination, cx)
+            });
+            arrived.await.expect("Save As reached its writer");
+            assert!(!item.read_with(cx, |item, _| {
+                item.can_preview_for_owner(view.entity_id())
+            }));
+
+            scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view,
+                        None,
+                        "Input during Save As",
+                        window,
+                        cx,
+                    );
+                });
+            })?;
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.text_edit
+                        .as_ref()
+                        .expect("text session")
+                        .session
+                        .buffer(),
+                    "Hello world"
+                );
+            });
+            item.read_with(cx, |item, _| {
+                assert!(!item.content_preview_active());
+                assert_eq!(
+                    item.doc()
+                        .expect("document")
+                        .scene
+                        .get(text)
+                        .expect("text node")
+                        .data
+                        .as_text()
+                        .expect("text data")
+                        .content,
+                    "Hello world"
+                );
+            });
+
+            resume.send(()).expect("resume Save As");
+            save_as.await?;
+            cx.run_until_parked();
+            assert!(!view.read_with(cx, |view, _| view.has_active_text_edit()));
+            let (copied, _) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(
+                copied
+                    .scene
+                    .get(text)
+                    .context("copied text node")?
+                    .data
+                    .as_text()
+                    .context("copied text data")?
+                    .content,
+                "Hello world"
+            );
+            Ok(())
+        }
+        .await;
+        result.expect("Save As blocks text input until the destination changes");
+    }
+
+    #[gpui::test]
     async fn save_as_native_picker_starts_beside_the_original_project(cx: &mut TestAppContext) {
         let result: Result<()> = async {
             init_visual_test(cx);
@@ -7625,6 +7880,291 @@ mod tests {
             "the project tree was written to disk"
         );
         view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+    }
+
+    #[gpui::test]
+    async fn autosave_never_persists_an_active_preview_and_rearms_after_cancel(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, root, item, view) = autosave_fixture(cx).await;
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("write the baseline project");
+        let page = item.read_with(cx, |item, _| {
+            item.doc()
+                .and_then(|doc| doc.active_page())
+                .expect("active page")
+        });
+        let preview_owner = view.entity_id();
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Page 1".to_owned(),
+                    new: "Committed".to_owned(),
+                },
+                cx,
+            )
+            .expect("rename page");
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Transient".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+        });
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .is_err(),
+            "an explicit item save must refuse an active preview"
+        );
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+                .await
+                .expect("autosave preview guard")
+                .is_none(),
+            "an autosave must quietly skip an active preview"
+        );
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let (during_preview, _) =
+            fanta_format::read_project_tree(&root).expect("read baseline during preview");
+        assert_eq!(
+            during_preview.scene.get(page).expect("saved page").name,
+            "Page 1",
+            "the debounce must not persist an intermediate preview frame"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.is_dirty());
+            assert!(item.content_preview_active());
+        });
+        view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Committed".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+            item.finish_content_preview(preview_owner, false, cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.autosave_task.is_some(),
+                "ending an already-dirty preview must rearm autosave"
+            );
+        });
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let (after_cancel, _) =
+            fanta_format::read_project_tree(&root).expect("read project after cancel");
+        assert_eq!(
+            after_cancel.scene.get(page).expect("saved page").name,
+            "Committed"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.content_preview_active());
+        });
+    }
+
+    #[gpui::test]
+    async fn deactivation_restores_an_owned_canvas_preview(cx: &mut TestAppContext) {
+        let (_directory, _root, item, view) = autosave_fixture(cx).await;
+        let rectangle = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let page = document.doc.active_page().expect("active page");
+                let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    10.0,
+                    10.0,
+                    Color::BLACK,
+                )));
+                rectangle.parent = Some(page);
+                let id = rectangle.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(rectangle))
+                    .expect("create rectangle");
+                document.doc.selection.select_only(id);
+                (id, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save baseline");
+        let original = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(rectangle)
+                .expect("rectangle")
+                .transform
+        });
+
+        view.update(cx, |view, cx| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+            view.dispatch_tool_event(
+                press_event(
+                    DVec2::new(405.0, 305.0),
+                    ToolButton::Primary,
+                    gpui::Modifiers::default(),
+                    1,
+                ),
+                cx,
+            );
+            view.dispatch_tool_event(
+                move_event(DVec2::new(455.0, 355.0), gpui::Modifiers::default()),
+                cx,
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert_ne!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(rectangle)
+                    .expect("rectangle")
+                    .transform,
+                original
+            );
+        });
+
+        let deactivation_window = cx.add_window(|_, _| gpui::Empty);
+        deactivation_window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| Item::deactivated(view, window, cx));
+            })
+            .expect("deactivate view");
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(rectangle)
+                    .expect("rectangle")
+                    .transform,
+                original
+            );
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn selection_rollback_refreshes_gpui_design_when_already_dirty(cx: &mut TestAppContext) {
+        use fanta_gpui::design::{
+            DesignPanelAction, DesignPanelEditPhase, DesignPanelProperty, DesignPanelValue,
+        };
+
+        init_visual_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        let page = document.active_page().expect("active page");
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            100.0,
+            50.0,
+            Color::BLACK,
+        )));
+        rectangle.parent = Some(page);
+        let rectangle_id = rectangle.id;
+        document
+            .apply(Operation::create_node(rectangle))
+            .expect("create rectangle");
+        document.selection.select_only(rectangle_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Selection-preview.fig"),
+            document,
+            cx,
+        );
+        let view_item = item.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| FigView::new(item, project, window, cx));
+        cx.run_until_parked();
+        let panel = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("design panel mounted")
+                .panel
+                .clone()
+        });
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        view_item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Page 1".to_owned(),
+                    new: "Dirty page".to_owned(),
+                },
+                cx,
+            )
+            .expect("make the item dirty");
+        });
+        cx.run_until_parked();
+        for (value, phase) in [
+            (100.0, DesignPanelEditPhase::Begin),
+            (25.0, DesignPanelEditPhase::Preview),
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PropertyEditRequested {
+                    node_id: SharedString::from(rectangle_id.to_string()),
+                    property: DesignPanelProperty::Opacity,
+                    value: DesignPanelValue::Number(value),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        let preview_owner = view.entity_id();
+        view_item.update(cx, |item, cx| {
+            item.with_document_for_owner(preview_owner, cx, |document| {
+                document.doc.selection.select_only(rectangle_id);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+
+        view_item.read_with(cx, |item, _| {
+            let node = item
+                .doc()
+                .and_then(|doc| doc.scene.get(rectangle_id))
+                .expect("rectangle");
+            assert!((node.opacity.get() - 1.0).abs() < 1e-6);
+            assert!(item.is_dirty(), "rollback preserves the prior dirty state");
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                (panel.node().opacity - 100.0).abs() < 1e-3,
+                "the panel must echo the restored value after deferred rollback"
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.session.as_ref())
+                    .is_none()
+            );
+        });
     }
 
     /// A drag longer than the debounce must not have an intermediate position
@@ -9023,6 +9563,430 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn text_path_command_converts_in_place_and_queues_inline_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0)
+            .cubic_to(40.0, -10.0, 80.0, 50.0, 120.0, 20.0);
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path: path.clone(),
+            strokes: smallvec::smallvec![Stroke::solid(Color::rgb(10, 20, 30), 2.0)],
+            ..VectorNode::default()
+        }));
+        vector.parent = doc.active_page();
+        vector.name = "Orbit".to_owned();
+        vector.transform = Transform2D::translation(30.0, 40.0);
+        let vector_id = vector.id;
+        let wrapper_before = vector.clone();
+        doc.apply(Operation::create_node(vector))
+            .expect("create vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/TextPath.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        view.update(cx, |view, cx| {
+            view.activate_tool(ToolKind::TextPath, cx);
+            assert_eq!(view.active_tool(), ToolKind::Select);
+            assert_eq!(view.pending_text_edit, Some(vector_id));
+        });
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.selection.as_slice(), [vector_id]);
+            assert_eq!(doc.history.undo_depth(), 1);
+            let converted = doc.scene.get(vector_id).expect("same layer");
+            assert_eq!(converted.id, wrapper_before.id);
+            assert_eq!(converted.name, wrapper_before.name);
+            assert_eq!(converted.transform, wrapper_before.transform);
+            let NodeData::TextPath(text_path) = &converted.data else {
+                panic!("expected text path");
+            };
+            assert_eq!(text_path.path, path);
+            assert_eq!(text_path.content, fanta_tools::text::PLACEHOLDER);
+            assert_eq!(text_path.style.color, Color::rgb(10, 20, 30));
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_is_an_immutable_bounded_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let document_id = doc.id.to_string();
+        let page_root = doc.active_page().expect("active page");
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            10.0,
+            20.0,
+            80.0,
+            40.0,
+            Color::rgb(20, 40, 60),
+        )));
+        vector.parent = doc.active_page();
+        vector.name = "Card".to_owned();
+        let node_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create selected layer");
+        doc.selection.select_only(node_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/CanvasAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        let (label, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        assert!(label.contains("1 layer"));
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert_eq!(value["selected_count"], 1);
+        assert_eq!(value["included_count"], 1);
+        assert_eq!(
+            value["source"]["document_path"],
+            "/tmp/CanvasAttachment.fig"
+        );
+        assert_eq!(value["source"]["document_id"], document_id);
+        assert_eq!(value["source"]["active_root_id"], page_root.to_string());
+        assert_eq!(value["source"]["scope_kind"], "page");
+        assert_eq!(value["source"]["scope_name"], "Page 1");
+        assert_eq!(value["scope"]["kind"], "page");
+        assert_eq!(value["scope"]["name"], "Page 1");
+        assert_eq!(value["nodes"][0]["id"], node_id.to_string());
+        assert_eq!(value["nodes"][0]["name"], "Card");
+        assert!(content.len() <= AGENT_ATTACHMENT_MAX_BYTES);
+
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .and_then(|doc| doc.scene.get(node_id))
+                .map(|node| node.name.clone())
+                .expect("selected layer");
+            item.apply(
+                Operation::SetName {
+                    id: node_id,
+                    old,
+                    new: "Renamed later".to_owned(),
+                },
+                cx,
+            )
+            .expect("rename layer");
+        });
+        let captured: serde_json::Value =
+            serde_json::from_str(&content).expect("captured JSON stays valid");
+        assert_eq!(captured["nodes"][0]["name"], "Card");
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_uses_the_live_page_name(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page_root = doc.active_page().expect("active page");
+        let mut child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        child.parent = Some(page_root);
+        let child_id = child.id;
+        doc.apply(Operation::create_node(child))
+            .expect("create selected layer");
+        doc.selection.select_only(child_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/RenamedPageAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .and_then(|doc| doc.scene.get(page_root))
+                .map(|node| node.name.clone())
+                .expect("page root");
+            item.apply(
+                Operation::SetName {
+                    id: page_root,
+                    old,
+                    new: "Renamed page".to_owned(),
+                },
+                cx,
+            )
+            .expect("rename page");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            assert_eq!(
+                document
+                    .pages
+                    .iter()
+                    .find(|page| page.root == Some(page_root))
+                    .expect("cached page")
+                    .name
+                    .as_ref(),
+                "Page 1",
+                "the fixture must exercise the stale page metadata cache"
+            );
+        });
+
+        let (label, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert!(label.contains("Renamed page"));
+        assert_eq!(value["source"]["scope_name"], "Renamed page");
+        assert_eq!(value["scope"]["name"], "Renamed page");
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_uses_the_active_component_scope(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.name = "Button master".to_owned();
+        let master_root = master.id;
+        doc.apply(Operation::create_node(master))
+            .expect("create component master");
+        let component_id = fanta_doc::ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(fanta_doc::ComponentDef::new(
+                component_id,
+                master_root,
+                "Button",
+            )),
+        })
+        .expect("define component");
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            32.0,
+            Color::rgb(20, 40, 60),
+        )));
+        child.parent = Some(master_root);
+        child.name = "Label background".to_owned();
+        let child_id = child.id;
+        doc.apply(Operation::create_node(child))
+            .expect("create component child");
+        assert!(doc.set_active_page(Some(master_root)));
+        doc.selection.select_only(child_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/ComponentAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let (label, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert!(label.contains("Button"));
+        assert_eq!(value["source"]["active_root_id"], master_root.to_string());
+        assert_eq!(value["source"]["scope_kind"], "component");
+        assert_eq!(value["source"]["scope_name"], "Button");
+        assert_eq!(value["nodes"][0]["id"], child_id.to_string());
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_rejects_nodes_outside_the_active_root(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let active_root = doc.active_page().expect("active page");
+        let mut other_page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        other_page.name = "Other page".to_owned();
+        let other_root = other_page.id;
+        doc.apply(Operation::create_node(other_page))
+            .expect("create other page");
+        doc.add_page(other_root);
+        let make_child = |parent: NodeId, name: &str| {
+            let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                20.0,
+                20.0,
+                Color::BLACK,
+            )));
+            child.parent = Some(parent);
+            child.name = name.to_owned();
+            child
+        };
+        let active_child = make_child(active_root, "Active child");
+        let active_child_id = active_child.id;
+        doc.apply(Operation::create_node(active_child))
+            .expect("create active child");
+        let other_child = make_child(other_root, "Other child");
+        let other_child_id = other_child.id;
+        doc.apply(Operation::create_node(other_child))
+            .expect("create other child");
+        doc.set_active_page(Some(active_root));
+        doc.selection
+            .replace_with([active_child_id, other_child_id]);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/MixedAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let error = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect_err("mixed-root selection must be rejected")
+        });
+        assert!(error.to_string().contains("outside the active page root"));
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_caps_nodes_and_serialized_bytes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let root = doc.active_page().expect("active page");
+        let selected_count = AGENT_ATTACHMENT_CONTEXT_LAYERS + 6;
+        let mut selected = Vec::with_capacity(selected_count);
+        for index in 0..selected_count {
+            let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                index as f64,
+                0.0,
+                10.0,
+                10.0,
+                Color::BLACK,
+            )));
+            node.parent = Some(root);
+            node.name = format!("Layer {index} {}", "x".repeat(400));
+            selected.push(node.id);
+            doc.apply(Operation::create_node(node))
+                .expect("create selected node");
+        }
+        doc.selection.replace_with(selected);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/BoundedAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let (_, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert_eq!(value["selected_count"], selected_count);
+        assert_eq!(value["included_count"], AGENT_ATTACHMENT_CONTEXT_LAYERS);
+        assert_eq!(value["omitted_count"], 6);
+        assert!(content.len() <= AGENT_ATTACHMENT_MAX_BYTES);
+        assert!(
+            value["nodes"]
+                .as_array()
+                .expect("node summaries")
+                .iter()
+                .all(|node| node["name"]
+                    .as_str()
+                    .is_some_and(|name| name.chars().count()
+                        <= crate::agent_surface::SUMMARY_LABEL_CHARS + 1))
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_rejects_oversized_identity_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::BLACK,
+        )));
+        node.parent = doc.active_page();
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create selected node");
+        doc.selection.select_only(node_id);
+        let oversized_path = std::path::PathBuf::from(format!(
+            "/tmp/{}.fig",
+            "x".repeat(AGENT_ATTACHMENT_MAX_BYTES)
+        ));
+        let item = crate::document::ready_item_for_test(&project, oversized_path, doc, cx);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let error = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect_err("oversized fixed metadata must be rejected")
+        });
+        assert!(error.to_string().contains("attachment limit"));
+    }
+
+    #[gpui::test]
     async fn canvas_create_rectangle_and_undo_restores_state(cx: &mut TestAppContext) {
         // Covers core BDD scenarios: create shapes, undo across visual ops.
         init_visual_test(cx);
@@ -9319,12 +10283,6 @@ impl FigView {
             } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    // Text-on-path has a canvas tool object but no
-                    // behavior, so activating it would
-                    // arm a face that silently swallows every drag. The
-                    // vendored toolbar has no host-side API to hide a tool
-                    // (see `EditorToolbar`'s setters), so say so instead.
-                    Some(kind) if kind.is_stub() => notify_unavailable(tool.label(), window, cx),
                     Some(kind) => self.activate_tool(kind, cx),
                     None => notify_unavailable(tool.label(), window, cx),
                 }
@@ -9487,14 +10445,158 @@ impl FigView {
             );
             return;
         };
-        if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
-            log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
-            show_canvas_notice(
-                format!("The Agent attachment workflow could not be opened: {error:#}"),
-                window,
-                cx,
-            );
+        match self.agent_canvas_selection_snapshot(cx) {
+            Ok(Some((name, content))) => {
+                if let Err(error) = agent_ui::attach_canvas_selection_for_review(
+                    workspace, name, content, window, cx,
+                ) {
+                    log::error!("attaching the canvas selection failed: {error:#}");
+                    show_canvas_notice(
+                        format!("The canvas selection could not be attached: {error:#}"),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
+                    log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
+                    show_canvas_notice(
+                        format!("The Agent attachment workflow could not be opened: {error:#}"),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Err(error) => {
+                log::error!("snapshotting the canvas selection failed: {error:#}");
+                show_canvas_notice(
+                    format!("The canvas selection could not be attached: {error:#}"),
+                    window,
+                    cx,
+                );
+            }
         }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn agent_canvas_selection_snapshot(
+        &self,
+        cx: &App,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let item = self.item.read(cx);
+        let Some(document) = item.document() else {
+            return Ok(None);
+        };
+        let doc = &document.doc;
+        if doc.selection.is_empty() {
+            return Ok(None);
+        }
+        let active_root = doc
+            .active_page()
+            .context("the canvas has no active page or component root")?;
+        let active_root_node = doc
+            .scene
+            .get(active_root)
+            .with_context(|| format!("the active canvas root {active_root} no longer exists"))?;
+        let (scope_kind, scope_name) = if let Some(page) = document
+            .pages
+            .iter()
+            .find(|page| page.root == Some(active_root))
+        {
+            let live_name = active_root_node.name.as_str();
+            (
+                "page",
+                if live_name.is_empty() {
+                    page.name.as_ref()
+                } else {
+                    live_name
+                },
+            )
+        } else if let Some(component) = doc
+            .components
+            .defs
+            .values()
+            .find(|component| component.root == active_root)
+        {
+            ("component", component.name.as_str())
+        } else {
+            anyhow::bail!(
+                "the active canvas root {active_root} is not a document page or component"
+            );
+        };
+        let scope_name = crate::agent_surface::truncate_summary_string(
+            if scope_name.is_empty() {
+                "Untitled"
+            } else {
+                scope_name
+            },
+            crate::agent_surface::SUMMARY_LABEL_CHARS,
+        );
+        for node_id in doc.selection.iter().copied() {
+            if doc.scene.get(node_id).is_none() {
+                anyhow::bail!("selected node {node_id} no longer exists");
+            }
+            let inside_active_root = node_id == active_root
+                || doc
+                    .scene
+                    .ancestors_of(node_id)
+                    .any(|ancestor| ancestor.id == active_root);
+            if !inside_active_root {
+                anyhow::bail!(
+                    "selected node {node_id} is outside the active {scope_kind} root {active_root}"
+                );
+            }
+        }
+        let item_title = item.title();
+        let source = serde_json::json!({
+            "item_title": crate::agent_surface::truncate_summary_string(
+                item_title.as_ref(),
+                crate::agent_surface::SUMMARY_LABEL_CHARS,
+            ),
+            "document_id": doc.id.to_string(),
+            "document_path": item.abs_path().display().to_string(),
+            "project_root": item.project_root().map(|root| root.display().to_string()),
+            "active_root_id": active_root.to_string(),
+            "scope_kind": scope_kind,
+            "scope_name": scope_name,
+        });
+        let mut nodes: Vec<_> = doc
+            .selection
+            .iter()
+            .take(AGENT_ATTACHMENT_CONTEXT_LAYERS)
+            .map(|node_id| crate::agent_surface::node_summary(doc, *node_id, Some(0), true))
+            .collect();
+        let selected_count = doc.selection.len();
+        let content = loop {
+            let included_count = nodes.len();
+            let snapshot = serde_json::json!({
+                "kind": "fanta_canvas_selection",
+                "source": &source,
+                "scope": { "kind": scope_kind, "name": &scope_name },
+                "selected_count": selected_count,
+                "included_count": included_count,
+                "omitted_count": selected_count.saturating_sub(included_count),
+                "nodes": &nodes,
+                "usage": "This is an immutable attach-time snapshot. Before using its node ids with live design tools, call design_state and verify document_id, document_path, project_root, and active_root_id against source. If any differ, ask the user to focus the source canvas; never apply these ids to another document or canvas root.",
+            });
+            let content = serde_json::to_string_pretty(&snapshot)?;
+            if content.len() <= AGENT_ATTACHMENT_MAX_BYTES {
+                break content;
+            }
+            if nodes.pop().is_none() {
+                anyhow::bail!(
+                    "the canvas selection metadata exceeds the {AGENT_ATTACHMENT_MAX_BYTES}-byte attachment limit"
+                );
+            }
+        };
+        let noun = if selected_count == 1 {
+            "layer"
+        } else {
+            "layers"
+        };
+        let name = format!("Canvas selection — {scope_name} ({selected_count} {noun})");
+        Ok(Some((name, content)))
     }
 
     /// The "what the user is looking at" header prefixed onto a toolbar
@@ -9678,6 +10780,8 @@ const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
 const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
+const AGENT_ATTACHMENT_CONTEXT_LAYERS: usize = 64;
+const AGENT_ATTACHMENT_MAX_BYTES: usize = 128 * 1024;
 
 /// The draft prompt a text-oriented toolbar AI command opens in the Agent Panel
 /// for the user to complete and review. Media and Design commands are routed to

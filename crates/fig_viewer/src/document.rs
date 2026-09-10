@@ -169,6 +169,12 @@ impl Drop for ProjectWriteLease {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ContentPreviewState {
+    owner: EntityId,
+    dirty_before: bool,
+}
+
 pub struct FigItem {
     pub(crate) path: ProjectPath,
     pub(crate) abs_path: PathBuf,
@@ -179,7 +185,11 @@ pub struct FigItem {
     /// Dirty state before the first transient preview frame. Cleared by a
     /// committed edit; canceling a preview restores it so opening and closing
     /// an inspector gesture without a change does not dirty the document.
-    preview_dirty_before: Option<bool>,
+    content_preview: Option<ContentPreviewState>,
+    /// A relevant worktree event arrived while transient content was live.
+    /// Reconciliation waits until that preview commits or rolls back so it
+    /// never adopts or merges a renderer-only intermediate frame.
+    external_change_pending: bool,
     /// The project changed on disk while the canvas had unsaved edits.
     conflict: bool,
     /// An open FNX buffer has edits that are not yet represented by the
@@ -1104,7 +1114,8 @@ impl project::ProjectItem for FigItem {
                     },
                     project_root,
                     dirty: false,
-                    preview_dirty_before: None,
+                    content_preview: None,
+                    external_change_pending: false,
                     conflict: false,
                     source_edit_locked: false,
                     suppress_watcher_until: None,
@@ -1169,6 +1180,14 @@ impl FigItem {
         self.document.ready().is_some() && !self.source_edit_locked
     }
 
+    pub(crate) fn can_preview_for_owner(&self, owner: EntityId) -> bool {
+        self.is_editable()
+            && !self.project_writes.changing_destination()
+            && self
+                .content_preview
+                .is_none_or(|preview| preview.owner == owner)
+    }
+
     pub fn has_ready_document(&self) -> bool {
         self.document.ready().is_some()
     }
@@ -1203,11 +1222,60 @@ impl FigItem {
         self.dirty
     }
 
+    pub(crate) fn content_preview_active(&self) -> bool {
+        self.content_preview.is_some()
+    }
+
+    pub(crate) fn external_reconciliation_pending(&self) -> bool {
+        self.external_change_pending
+    }
+
+    fn defer_external_change_for_preview(&mut self) -> bool {
+        if !self.content_preview_active() {
+            return false;
+        }
+        self.external_change_pending = true;
+        true
+    }
+
+    fn resume_external_change_after_preview(&mut self, cx: &mut Context<Self>) {
+        if self.external_change_pending {
+            self.schedule_resync(cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_save_for_test(
+        &self,
+        after_write: bool,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached, arrived) = futures::channel::oneshot::channel();
+        let (resume, wait) = futures::channel::oneshot::channel();
+        let previous = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save test barrier")
+            .replace(SaveTestBarrier {
+                reached,
+                resume: wait,
+                after_write,
+            });
+        assert!(previous.is_none(), "only one next-save barrier is armed");
+        (arrived, resume)
+    }
+
     pub fn has_conflict(&self) -> bool {
         self.conflict
     }
 
     fn set_conflict(&mut self, conflict: bool, cx: &mut Context<Self>) {
+        if conflict {
+            self.external_change_pending = false;
+        }
         if self.conflict != conflict {
             self.conflict = conflict;
             cx.emit(FigItemEvent::ConflictChanged);
@@ -1280,11 +1348,19 @@ impl FigItem {
         if !relevant {
             return;
         }
+        self.external_change_pending = true;
         if self.source_edit_locked {
             // A dirty FNX buffer owns its live preview; merging under it
             // would race the text the user is still editing.
             self.set_conflict(true, cx);
-        } else if self.dirty {
+            return;
+        }
+        if self.defer_external_change_for_preview() {
+            // The rollback snapshot and the transient document must stay in
+            // the same document generation until the preview ends.
+            return;
+        }
+        if self.dirty {
             // Unsaved canvas edits + external file edits: try a three-way
             // merge against the last agreed state instead of forcing the
             // binary Overwrite/Discard choice.
@@ -1299,6 +1375,10 @@ impl FigItem {
     /// merge is adopted silently (the canvas stays dirty — its half is not
     /// on disk yet); any real conflict falls back to the conflict banner.
     fn schedule_merge(&mut self, cx: &mut Context<Self>) {
+        if self.defer_external_change_for_preview() {
+            return;
+        }
+        self.external_change_pending = true;
         let Some(root) = self.project_root.clone() else {
             self.set_conflict(true, cx);
             return;
@@ -1326,7 +1406,9 @@ impl FigItem {
                     // Possibly a half-written batch; the next watcher event
                     // retries. Keep the canvas and flag the divergence.
                     if let Err(error) = this.update(cx, |this, cx| {
-                        if this.sync_epoch == epoch {
+                        if this.sync_epoch != epoch {
+                            this.schedule_resync(cx);
+                        } else if !this.defer_external_change_for_preview() {
                             this.set_conflict(true, cx);
                         }
                     }) {
@@ -1335,7 +1417,10 @@ impl FigItem {
                     return;
                 }
             };
-            let ours = this.read_with(cx, |this, _| {
+            let ours = this.update(cx, |this, _| {
+                if this.defer_external_change_for_preview() {
+                    return None;
+                }
                 this.document
                     .ready()
                     .map(|document| (document.doc.clone(), document.render_generation()))
@@ -1362,6 +1447,9 @@ impl FigItem {
                 }
                 if this.source_edit_locked {
                     this.set_conflict(true, cx);
+                    return;
+                }
+                if this.defer_external_change_for_preview() {
                     return;
                 }
                 if !this.dirty {
@@ -1453,9 +1541,11 @@ impl FigItem {
         self.document = FigDocumentState::Ready(document);
         self.merge_base = Some(disk.doc);
         self.write_cache = None;
+        self.external_change_pending = false;
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
+        cx.emit(FigItemEvent::Edited);
         cx.notify();
     }
 
@@ -1466,7 +1556,12 @@ impl FigItem {
     fn schedule_resync(&mut self, cx: &mut Context<Self>) {
         if self.source_edit_locked {
             self.set_conflict(true, cx);
-        } else if self.dirty {
+            return;
+        }
+        if self.defer_external_change_for_preview() {
+            return;
+        }
+        if self.dirty {
             self.schedule_merge(cx);
         } else {
             self.schedule_reload(cx);
@@ -1474,10 +1569,13 @@ impl FigItem {
     }
 
     /// Debounce disk changes, then reload the project in the background.
-    /// Content gestures dirty the item on their first preview frame, so a
-    /// mid-gesture reload can only interrupt selection-style gestures, which
-    /// tolerate having their selection reset.
+    /// Content previews are a document-identity boundary: watcher work is
+    /// deferred until the current preview commits or rolls back.
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
+        if self.defer_external_change_for_preview() {
+            return;
+        }
+        self.external_change_pending = true;
         let Some(root) = self.project_root.clone() else {
             return;
         };
@@ -1497,7 +1595,14 @@ impl FigItem {
                     this.schedule_resync(cx);
                     return;
                 }
-                if this.dirty || this.source_edit_locked {
+                if this.source_edit_locked {
+                    this.set_conflict(true, cx);
+                    return;
+                }
+                if this.defer_external_change_for_preview() {
+                    return;
+                }
+                if this.dirty {
                     // Canvas or FNX edits landed while the reload was in
                     // flight; keep them and flag the divergence.
                     this.set_conflict(true, cx);
@@ -1512,6 +1617,7 @@ impl FigItem {
                         log::error!(
                             "reloading Fanta project after a disk change failed: {error:#}"
                         );
+                        this.set_conflict(true, cx);
                         // Keep the last good document: the failure may be a
                         // half-written batch of files whose next watcher
                         // event will reload it in full.
@@ -1549,7 +1655,8 @@ impl FigItem {
         self.document = FigDocumentState::Ready(document);
         self.write_cache = None;
         self.dirty = false;
-        self.preview_dirty_before = None;
+        self.content_preview = None;
+        self.external_change_pending = false;
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
@@ -1576,6 +1683,11 @@ impl FigItem {
     }
 
     fn reload_from_disk_unchecked(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.content_preview_active() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "finish or cancel the active canvas preview before reloading"
+            )));
+        }
         let Some(root) = self.project_root.clone() else {
             return Task::ready(Ok(()));
         };
@@ -1662,8 +1774,32 @@ impl FigItem {
     /// Apply an undoable operation to the document, re-solve the affected
     /// page's layout, and mark the item dirty.
     pub fn apply(&mut self, operation: Operation, cx: &mut Context<Self>) -> Result<()> {
+        self.apply_for_owner(None, operation, cx)
+    }
+
+    pub(crate) fn apply_for_preview_owner(
+        &mut self,
+        owner: EntityId,
+        operation: Operation,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.apply_for_owner(Some(owner), operation, cx)
+    }
+
+    fn apply_for_owner(
+        &mut self,
+        owner: Option<EntityId>,
+        operation: Operation,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
         if self.source_edit_locked {
             anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
+        if self
+            .content_preview
+            .is_some_and(|preview| Some(preview.owner) != owner)
+        {
+            anyhow::bail!("another view has an active canvas preview");
         }
         let document = self
             .document
@@ -1689,8 +1825,11 @@ impl FigItem {
         document.resolve_after_edit(active_page);
         document.advance_render_generation();
         document.mark_variables_changed();
-        self.preview_dirty_before = None;
+        let finished_preview = self.content_preview.take().is_some();
         self.mark_edited(false, cx);
+        if finished_preview {
+            self.resume_external_change_after_preview(cx);
+        }
         Ok(())
     }
 
@@ -1702,8 +1841,45 @@ impl FigItem {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
     ) -> Option<R> {
+        self.with_document_for_owner_impl(None, cx, f)
+    }
+
+    pub(crate) fn with_document_for_owner<R>(
+        &mut self,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
+    ) -> Option<R> {
+        self.with_document_for_owner_impl(Some(owner), cx, f)
+    }
+
+    pub(crate) fn with_document_for_preview_owner<R>(
+        &mut self,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
+    ) -> Option<R> {
+        if self.project_writes.changing_destination() {
+            return None;
+        }
+        self.with_document_for_owner_impl(Some(owner), cx, f)
+    }
+
+    fn with_document_for_owner_impl<R>(
+        &mut self,
+        owner: Option<EntityId>,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
+    ) -> Option<R> {
+        if self
+            .content_preview
+            .is_some_and(|preview| Some(preview.owner) != owner)
+        {
+            return None;
+        }
         let document = self.document.ready_mut()?;
         let (result, change) = f(document);
+        let mut finished_preview = false;
         match change {
             DocChange::None => {}
             DocChange::Selection => {
@@ -1722,16 +1898,33 @@ impl FigItem {
                 document.resolve_after_edit(active_page);
                 document.advance_render_generation();
                 document.mark_variables_changed();
-                self.preview_dirty_before = None;
+                finished_preview = self.content_preview.take().is_some();
                 self.mark_edited(false, cx);
             }
             DocChange::ContentPreview => {
-                if self.preview_dirty_before.is_none() {
-                    self.preview_dirty_before = Some(self.dirty);
+                let Some(owner) = owner else {
+                    log::error!(
+                        "content preview used unowned document access; committing the mutation"
+                    );
+                    let active_page = document.doc.active_page();
+                    document.resolve_after_edit(active_page);
+                    document.advance_render_generation();
+                    document.mark_variables_changed();
+                    self.mark_edited(false, cx);
+                    return Some(result);
+                };
+                if self.content_preview.is_none() {
+                    self.content_preview = Some(ContentPreviewState {
+                        owner,
+                        dirty_before: self.dirty,
+                    });
                 }
                 document.advance_render_generation();
                 self.mark_edited(true, cx);
             }
+        }
+        if finished_preview {
+            self.resume_external_change_after_preview(cx);
         }
         Some(result)
     }
@@ -1739,6 +1932,9 @@ impl FigItem {
     pub fn undo(&mut self, cx: &mut Context<Self>) -> Result<bool> {
         if self.source_edit_locked {
             anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
+        if self.content_preview_active() {
+            anyhow::bail!("finish or cancel the active canvas preview before undoing");
         }
         let document = self
             .document
@@ -1758,7 +1954,6 @@ impl FigItem {
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
             document.mark_variables_changed();
-            self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
         Ok(did)
@@ -1767,6 +1962,9 @@ impl FigItem {
     pub fn redo(&mut self, cx: &mut Context<Self>) -> Result<bool> {
         if self.source_edit_locked {
             anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
+        if self.content_preview_active() {
+            anyhow::bail!("finish or cancel the active canvas preview before redoing");
         }
         let document = self
             .document
@@ -1786,7 +1984,6 @@ impl FigItem {
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
             document.mark_variables_changed();
-            self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
         Ok(did)
@@ -1807,15 +2004,29 @@ impl FigItem {
         cx.notify();
     }
 
-    pub(crate) fn finish_content_preview(&mut self, committed: bool, cx: &mut Context<Self>) {
-        let Some(dirty_before) = self.preview_dirty_before.take() else {
-            return;
+    pub(crate) fn finish_content_preview(
+        &mut self,
+        owner: EntityId,
+        committed: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(preview) = self
+            .content_preview
+            .filter(|preview| preview.owner == owner)
+        else {
+            return false;
         };
-        if !committed && self.dirty != dirty_before {
-            self.dirty = dirty_before;
-            cx.emit(FigItemEvent::Edited);
-            cx.notify();
+        self.content_preview = None;
+        if !committed {
+            self.dirty = preview.dirty_before;
         }
+        // Preview frames deliberately suppress heavyweight listeners after
+        // the initial dirty transition. Announce the boundary even when the
+        // item was dirty beforehand so autosave and inspectors can resume.
+        cx.emit(FigItemEvent::Edited);
+        cx.notify();
+        self.resume_external_change_after_preview(cx);
+        true
     }
 
     /// Install the initial load's outcome: the parsed document and, for a bare
@@ -1887,6 +2098,22 @@ impl FigItem {
                 SaveKind::Auto => Ok(None),
                 SaveKind::Explicit => Err(anyhow::anyhow!(
                     "Save As is still running. Wait for it to finish before saving again."
+                )),
+            });
+        }
+        if self.content_preview_active() {
+            return Task::ready(match kind {
+                SaveKind::Auto => Ok(None),
+                SaveKind::Explicit => Err(anyhow::anyhow!(
+                    "finish or cancel the active canvas preview before saving"
+                )),
+            });
+        }
+        if self.external_change_pending {
+            return Task::ready(match kind {
+                SaveKind::Auto => Ok(None),
+                SaveKind::Explicit => Err(anyhow::anyhow!(
+                    "external changes are still being reconciled; wait for the canvas to update"
                 )),
             });
         }
@@ -1990,9 +2217,6 @@ impl FigItem {
                         .document
                         .ready()
                         .is_none_or(|document| document.render_generation() != generation);
-                    if !this.dirty {
-                        this.preview_dirty_before = None;
-                    }
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
                     cx.emit(FigItemEvent::Saved);
@@ -2025,6 +2249,14 @@ impl FigItem {
             anyhow::ensure!(
                 !self.source_edit_locked,
                 "Save or discard the current FNX edit before using Save As."
+            );
+            anyhow::ensure!(
+                !self.content_preview_active(),
+                "Finish or cancel the active canvas preview before using Save As."
+            );
+            anyhow::ensure!(
+                !self.external_change_pending,
+                "Wait for external changes to finish reconciling before using Save As."
             );
             let document = self
                 .document
@@ -2063,6 +2295,13 @@ impl FigItem {
         let previous_root = self.project_root.clone();
         self.reload_task = None;
         self.sync_epoch += 1;
+        #[cfg(test)]
+        let save_barrier = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save test barrier")
+            .take();
         cx.spawn(async move |this, cx| {
             let result: Result<()> = async {
                 let (root, document, cache) = cx
@@ -2070,12 +2309,30 @@ impl FigItem {
                         let lease = lease.clone();
                         async move {
                             let _lease = lease;
-                            let (root, cache) = write_project_copy(
+                            #[cfg(test)]
+                            let mut save_barrier = save_barrier;
+                            #[cfg(test)]
+                            if save_barrier
+                                .as_ref()
+                                .is_some_and(|barrier| !barrier.after_write)
+                            {
+                                save_barrier
+                                    .take()
+                                    .expect("before-write barrier")
+                                    .wait()
+                                    .await;
+                            }
+                            let result = write_project_copy(
                                 &target,
                                 previous_root.as_deref(),
                                 &document,
                                 &assets,
-                            )?;
+                            );
+                            #[cfg(test)]
+                            if let Some(barrier) = save_barrier {
+                                barrier.wait().await;
+                            }
+                            let (root, cache) = result?;
                             anyhow::Ok((root, document, cache))
                         }
                     })
@@ -2094,7 +2351,6 @@ impl FigItem {
                         .document
                         .ready()
                         .is_none_or(|document| document.render_generation() != generation);
-                    this.preview_dirty_before = None;
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
                     this.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
@@ -2184,7 +2440,8 @@ pub(crate) fn ready_item_with_root_for_test(
         document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
         project_root,
         dirty: false,
-        preview_dirty_before: None,
+        content_preview: None,
+        external_change_pending: false,
         conflict: false,
         source_edit_locked: false,
         suppress_watcher_until: None,
@@ -4386,6 +4643,17 @@ mod tests {
             let save_as = item.update(cx, |item, cx| {
                 item.save_as(project.clone(), destination, cx)
             });
+            let preview_owner = cx.new(|_| ()).entity_id();
+            let preview_started = item.update(cx, |item, cx| {
+                item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                    ((), DocChange::ContentPreview)
+                })
+                .is_some()
+            });
+            assert!(
+                !preview_started && !item.read_with(cx, |item, _| item.content_preview_active()),
+                "Save As must not let a transient preview outlive its destination snapshot"
+            );
             // Edits while the snapshot is being written must remain dirty and
             // must never be autosaved back to the old project during the copy.
             item.update(cx, |item, cx| {
@@ -4968,7 +5236,8 @@ mod tests {
             document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
             project_root,
             dirty: false,
-            preview_dirty_before: None,
+            content_preview: None,
+            external_change_pending: false,
             conflict: false,
             source_edit_locked: false,
             suppress_watcher_until: None,
@@ -5196,6 +5465,7 @@ mod tests {
     #[gpui::test]
     async fn render_generation_tracks_content_but_not_selection_changes(cx: &mut TestAppContext) {
         let project = empty_project(cx).await;
+        let preview_owner = cx.new(|_| ()).entity_id();
         let item = ready_item(
             &project,
             PathBuf::from("/tmp/nowhere/Design.fig"),
@@ -5222,7 +5492,9 @@ mod tests {
             0
         );
         item.update(cx, |item, cx| {
-            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+            item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                ((), DocChange::ContentPreview)
+            });
         });
         assert_eq!(
             item.read_with(cx, |item, _| item
@@ -5232,7 +5504,7 @@ mod tests {
             1
         );
         item.update(cx, |item, cx| {
-            item.with_document(cx, |_| ((), DocChange::Content));
+            item.with_document_for_owner(preview_owner, cx, |_| ((), DocChange::Content));
         });
         assert_eq!(
             item.read_with(cx, |item, _| item
@@ -5246,6 +5518,7 @@ mod tests {
     #[gpui::test]
     async fn canceling_a_content_preview_restores_the_prior_dirty_state(cx: &mut TestAppContext) {
         let project = empty_project(cx).await;
+        let preview_owner = cx.new(|_| ()).entity_id();
         let item = ready_item(
             &project,
             PathBuf::from("/tmp/nowhere/Design.fig"),
@@ -5255,16 +5528,228 @@ mod tests {
         );
 
         item.update(cx, |item, cx| {
-            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+            item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                ((), DocChange::ContentPreview)
+            });
             assert!(item.dirty);
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
             assert!(!item.dirty);
 
             item.with_document(cx, |_| ((), DocChange::Content));
             assert!(item.dirty);
-            item.with_document(cx, |_| ((), DocChange::ContentPreview));
-            item.finish_content_preview(false, cx);
+            item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                ((), DocChange::ContentPreview)
+            });
+            item.finish_content_preview(preview_owner, false, cx);
             assert!(item.dirty);
+        });
+    }
+
+    #[gpui::test]
+    async fn content_preview_owner_serializes_shared_item_mutations(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let owner = cx.new(|_| ()).entity_id();
+        let sibling = cx.new(|_| ()).entity_id();
+        let document = doc_with_one_page();
+        let page = document.active_page().expect("active page");
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            document,
+            cx,
+        );
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Transient".to_owned();
+                ((), DocChange::ContentPreview)
+            })
+            .expect("owner starts preview");
+
+            let sibling_preview = item.with_document_for_preview_owner(sibling, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Sibling preview".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+            assert!(sibling_preview.is_none());
+            assert!(
+                item.apply_for_preview_owner(
+                    sibling,
+                    Operation::SetName {
+                        id: page,
+                        old: "Transient".to_owned(),
+                        new: "Sibling commit".to_owned(),
+                    },
+                    cx,
+                )
+                .is_err()
+            );
+            assert!(!item.finish_content_preview(sibling, true, cx));
+            assert!(item.content_preview_active());
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Transient"
+            );
+
+            item.with_document_for_preview_owner(owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Page 1".to_owned();
+                ((), DocChange::ContentPreview)
+            })
+            .expect("owner restores preview");
+            assert!(item.finish_content_preview(owner, false, cx));
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn explicit_reload_rejects_an_active_content_preview(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let owner = cx.new(|_| ()).entity_id();
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            doc_with_one_page(),
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(owner, cx, |_| ((), DocChange::ContentPreview));
+        });
+
+        let result = item.update(cx, |item, cx| item.reload_from_disk(cx)).await;
+        assert!(result.is_err());
+        item.update(cx, |item, cx| {
+            assert!(item.finish_content_preview(owner, false, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn external_merge_waits_for_content_preview_to_finish(cx: &mut TestAppContext) {
+        use fanta_doc::{CanvasNode, Color, NodeData, VectorNode};
+
+        let project = empty_project(cx).await;
+        let preview_owner = cx.new(|_| ()).entity_id();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("Design");
+        let base = doc_with_one_page();
+        let page = base.active_page().expect("active page");
+        write_project(&root, &base, &BTreeMap::new()).expect("write baseline project");
+        let item = ready_item(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            base.clone(),
+            cx,
+        );
+        item.update(cx, |item, _| item.merge_base = Some(base.clone()));
+
+        let local = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    20.0,
+                    20.0,
+                    Color::BLACK,
+                )));
+                rectangle.name = "Local".to_owned();
+                rectangle.parent = Some(page);
+                let id = rectangle.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(rectangle))
+                    .expect("create local rectangle");
+                (id, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+
+        let mut external = base;
+        external
+            .apply(Operation::SetName {
+                id: page,
+                old: "Page 1".to_owned(),
+                new: "External".to_owned(),
+            })
+            .expect("rename page externally");
+        write_project(&root, &external, &BTreeMap::new()).expect("write external edit");
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(local)
+                    .expect("local rectangle")
+                    .name = "Transient".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+            item.schedule_merge(cx);
+            assert!(item.external_change_pending);
+            assert!(item.reload_task.is_none());
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(page).expect("page").name, "Page 1");
+            assert_eq!(
+                doc.scene.get(local).expect("local rectangle").name,
+                "Transient"
+            );
+        });
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_owner(preview_owner, cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(local)
+                    .expect("local rectangle")
+                    .name = "Committed local".to_owned();
+                ((), DocChange::Content)
+            });
+            item.finish_content_preview(preview_owner, true, cx);
+            assert!(item.external_change_pending);
+            assert!(item.reload_task.is_some());
+        });
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+                .await
+                .expect("pending autosave guard")
+                .is_none()
+        );
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .is_err(),
+            "an explicit save must not overwrite deferred external edits"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.external_change_pending);
+            assert!(item.reload_task.is_some());
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("merged document");
+            assert_eq!(doc.scene.get(page).expect("page").name, "External");
+            assert_eq!(
+                doc.scene.get(local).expect("local rectangle").name,
+                "Committed local"
+            );
+            assert!(item.is_dirty(), "the local half of the merge is unsaved");
+            assert!(!item.content_preview_active());
+            assert!(!item.external_change_pending);
         });
     }
 

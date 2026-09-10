@@ -692,13 +692,9 @@ impl NodeEditTool {
             && (self.target.is_none() || !self.target.is_some_and(|id| is_vector(ctx, id)))
         {
             let world = ctx.screen_to_world(screen);
-            let hit = fanta_canvas::hit_test(
-                &ctx.doc.scene,
-                world,
-                fanta_canvas::HitPrecision::Bounds,
-                ctx.scope(),
-            )
-            .filter(|&id| is_vector(ctx, id));
+            let hit = ctx
+                .hit_test(world, fanta_canvas::HitPrecision::Bounds)
+                .filter(|&id| is_vector(ctx, id));
             if let Some(id) = hit {
                 self.target = Some(id);
                 self.selected.clear();

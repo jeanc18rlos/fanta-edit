@@ -57,7 +57,7 @@ pub mod tool;
 
 // Flat re-exports for ergonomic call sites in `fanta-app`.
 pub use boolean::make_boolean;
-pub use context::ToolContext;
+pub use context::{HitTestRefiner, InteractionBoundsResolver, ToolContext};
 pub use ellipse::EllipseTool;
 pub use event::{Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 pub use frame::FrameTool;
@@ -75,7 +75,7 @@ pub use select::SelectTool;
 pub use slice::SliceTool;
 pub use star::StarTool;
 pub use text::TextTool;
-pub use text_path::TextPathTool;
+pub use text_path::{TextPathConversionError, text_path_conversion};
 pub use tool::{
     CursorHint, MovingSelection, SnapGuide, SnapGuideAxis, Tool, ToolOverlay, ToolResponse,
     bounds_from_corners,

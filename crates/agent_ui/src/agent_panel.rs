@@ -1178,6 +1178,8 @@ pub struct AgentPanel {
     _draft_editor_observation: Option<Subscription>,
     _active_draft_reclaim_observation: Option<Subscription>,
     _pending_add_context_menu_subscription: Option<Subscription>,
+    _pending_external_context_subscription: Option<Subscription>,
+    pending_external_context_blocks: Vec<acp::ContentBlock>,
     _thread_metadata_store_subscription: Subscription,
     last_context_source: Option<AgentContextSource>,
 
@@ -1572,6 +1574,8 @@ impl AgentPanel {
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
             _pending_add_context_menu_subscription: None,
+            _pending_external_context_subscription: None,
+            pending_external_context_blocks: Vec::new(),
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
@@ -2996,6 +3000,69 @@ impl AgentPanel {
         Ok(())
     }
 
+    pub(crate) fn activate_draft_and_insert_external_context(
+        &mut self,
+        blocks: Vec<acp::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        let conversation_view = self
+            .active_conversation_view()
+            .cloned()
+            .ok_or_else(|| anyhow!("the Agent draft could not be created"))?;
+
+        self.pending_external_context_blocks.extend(blocks);
+
+        if let Some(thread_view) = conversation_view.read(cx).root_thread_view() {
+            self._pending_external_context_subscription = None;
+            let blocks = std::mem::take(&mut self.pending_external_context_blocks);
+            Self::insert_external_context(&thread_view, blocks, window, cx);
+            return Ok(());
+        }
+
+        if self._pending_external_context_subscription.is_some() {
+            return Ok(());
+        }
+
+        self._pending_external_context_subscription = Some(cx.subscribe_in(
+            &conversation_view,
+            window,
+            move |this, conversation_view, _event: &RootThreadUpdated, window, cx| {
+                let is_still_active = this.is_active
+                    && this
+                        .active_conversation_view()
+                        .is_some_and(|active| active.entity_id() == conversation_view.entity_id());
+                if !is_still_active {
+                    this._pending_external_context_subscription = None;
+                    this.pending_external_context_blocks.clear();
+                    return;
+                }
+                let Some(thread_view) = conversation_view.read(cx).root_thread_view() else {
+                    return;
+                };
+                let blocks = std::mem::take(&mut this.pending_external_context_blocks);
+                Self::insert_external_context(&thread_view, blocks, window, cx);
+                this._pending_external_context_subscription = None;
+            },
+        ));
+
+        Ok(())
+    }
+
+    fn insert_external_context(
+        thread_view: &Entity<ThreadView>,
+        blocks: Vec<acp::ContentBlock>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let message_editor = thread_view.read(cx).message_editor.clone();
+        message_editor.update(cx, |editor, cx| {
+            editor.append_message(blocks, Some("\n\n"), window, cx);
+        });
+        message_editor.focus_handle(cx).focus(window, cx);
+    }
+
     fn schedule_open_add_context_menu(
         &self,
         conversation_view: &Entity<ConversationView>,
@@ -4305,6 +4372,8 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self._pending_add_context_menu_subscription = None;
+        self._pending_external_context_subscription = None;
+        self.pending_external_context_blocks.clear();
         let old_view = std::mem::replace(&mut self.base_view, new_view);
         self.retain_running_thread(old_view, cx);
 
@@ -5097,6 +5166,8 @@ impl Panel for AgentPanel {
             self.ensure_thread_initialized(window, cx);
         } else {
             self._pending_add_context_menu_subscription = None;
+            self._pending_external_context_subscription = None;
+            self.pending_external_context_blocks.clear();
         }
     }
 
@@ -6881,7 +6952,7 @@ mod tests {
         active_session_id, active_thread_id, open_thread_with_connection,
         open_thread_with_custom_connection, register_test_sidebar, send_message,
     };
-    use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
+    use acp_thread::{AgentConnection, MentionUri, StubAgentConnection, ThreadStatus};
     use action_log::ActionLog;
     use anyhow::{Result, anyhow};
     use feature_flags::FeatureFlagAppExt;
@@ -13007,6 +13078,147 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_canvas_selection_attachment_is_reviewable_and_does_not_send(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+
+        let name = "Canvas selection — Home (2 layers)";
+        let content = r#"{"page":"Home","selected":[{"id":"1:2"},{"id":"3:4"}]}"#;
+        cx.update(|window, cx| {
+            crate::attach_canvas_selection_for_review(
+                workspace.clone(),
+                name.to_string(),
+                content.to_string(),
+                window,
+                cx,
+            )
+            .expect("canvas selection should attach to the registered panel");
+        });
+        cx.run_until_parked();
+
+        let expected_uri = MentionUri::CanvasSelection {
+            name: name.to_string(),
+        }
+        .to_uri()
+        .to_string();
+        assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel._pending_external_context_subscription.is_none());
+            let thread_view = panel
+                .active_thread_view(cx)
+                .expect("attachment route should activate a draft");
+            thread_view.read_with(cx, |thread_view, cx| {
+                let message_editor = thread_view.message_editor.read(cx);
+                assert!(message_editor.text(cx).contains(name));
+                assert!(thread_view.thread.read(cx).entries().is_empty());
+
+                let attached_resource = message_editor
+                    .draft_content_blocks_snapshot(cx)
+                    .into_iter()
+                    .find_map(|block| match block {
+                        acp::ContentBlock::Resource(acp::EmbeddedResource {
+                            resource: acp::EmbeddedResourceResource::TextResourceContents(resource),
+                            ..
+                        }) if resource.uri == expected_uri => Some(resource),
+                        _ => None,
+                    })
+                    .expect("draft should preserve the canvas selection as embedded context");
+                assert_eq!(attached_resource.text, content);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_rapid_external_context_requests_are_queued_until_the_draft_is_ready(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update(&mut cx, |panel, _cx| {
+            panel.selected_agent = Agent::Stub;
+        });
+
+        let first_name = "Canvas selection — First (1 layer)";
+        let first_content = r#"{"page":"First","selected":[{"id":"1:2"}]}"#;
+        let second_name = "Canvas selection — Second (1 layer)";
+        let second_content = r#"{"page":"Second","selected":[{"id":"3:4"}]}"#;
+        cx.update(|window, cx| {
+            crate::attach_canvas_selection_for_review(
+                workspace.clone(),
+                first_name.to_string(),
+                first_content.to_string(),
+                window,
+                cx,
+            )
+            .expect("first canvas selection should be queued");
+            crate::attach_canvas_selection_for_review(
+                workspace.clone(),
+                second_name.to_string(),
+                second_content.to_string(),
+                window,
+                cx,
+            )
+            .expect("second canvas selection should be queued");
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel._pending_external_context_subscription.is_some());
+            assert_eq!(panel.pending_external_context_blocks.len(), 2);
+        });
+        cx.run_until_parked();
+
+        let expected = vec![
+            (
+                MentionUri::CanvasSelection {
+                    name: first_name.to_string(),
+                }
+                .to_uri()
+                .to_string(),
+                first_content.to_string(),
+            ),
+            (
+                MentionUri::CanvasSelection {
+                    name: second_name.to_string(),
+                }
+                .to_uri()
+                .to_string(),
+                second_content.to_string(),
+            ),
+        ];
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel._pending_external_context_subscription.is_none());
+            assert!(panel.pending_external_context_blocks.is_empty());
+            let thread_view = panel
+                .active_thread_view(cx)
+                .expect("attachment requests should activate a draft");
+            thread_view.read_with(cx, |thread_view, cx| {
+                let message_editor = thread_view.message_editor.read(cx);
+                let attached = message_editor
+                    .draft_content_blocks_snapshot(cx)
+                    .into_iter()
+                    .filter_map(|block| match block {
+                        acp::ContentBlock::Resource(acp::EmbeddedResource {
+                            resource: acp::EmbeddedResourceResource::TextResourceContents(resource),
+                            ..
+                        }) => Some((resource.uri, resource.text)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+
+                assert_eq!(attached, expected);
+                assert!(thread_view.thread.read(cx).entries().is_empty());
+            });
+        });
+    }
+
+    #[gpui::test]
     async fn test_pending_attachment_menu_does_not_open_after_agent_panel_closes(
         cx: &mut TestAppContext,
     ) {
@@ -13055,7 +13267,9 @@ mod tests {
 
         assert!(!cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
         assert!(panel.read_with(&cx, |panel, _| {
-            !panel.is_active && panel._pending_add_context_menu_subscription.is_none()
+            !panel.is_active
+                && panel._pending_add_context_menu_subscription.is_none()
+                && panel._pending_external_context_subscription.is_none()
         }));
         assert!(!thread_view.read_with(&cx, |thread_view, _| {
             thread_view.add_context_menu_handle.is_deployed()

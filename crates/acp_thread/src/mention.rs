@@ -24,6 +24,9 @@ pub enum MentionUri {
     PastedImage {
         name: String,
     },
+    CanvasSelection {
+        name: String,
+    },
     Directory {
         abs_path: PathBuf,
     },
@@ -180,6 +183,10 @@ impl MentionUri {
                     let name =
                         single_query_param(&url, "name")?.unwrap_or_else(|| "Image".to_string());
                     Ok(Self::PastedImage { name })
+                } else if path.starts_with("/agent/canvas-selection") {
+                    let name = single_query_param(&url, "name")?
+                        .unwrap_or_else(|| "Canvas selection".to_string());
+                    Ok(Self::CanvasSelection { name })
                 } else if path.starts_with("/agent/untitled-buffer") {
                     let fragment = url
                         .fragment()
@@ -322,6 +329,7 @@ impl MentionUri {
                 skill_file_path, ..
             } => Some(skill_file_path),
             MentionUri::PastedImage { .. }
+            | MentionUri::CanvasSelection { .. }
             | MentionUri::Thread { .. }
             | MentionUri::Rule { .. }
             | MentionUri::Diagnostics { .. }
@@ -340,6 +348,7 @@ impl MentionUri {
                 .to_string_lossy()
                 .into_owned(),
             MentionUri::PastedImage { name } => name.clone(),
+            MentionUri::CanvasSelection { name } => name.clone(),
             MentionUri::Symbol { name, .. } => name.clone(),
             MentionUri::Thread { name, .. } => name.clone(),
             MentionUri::Rule { name, .. } => name.clone(),
@@ -439,6 +448,7 @@ impl MentionUri {
                 FileIcons::get_icon(abs_path, cx).unwrap_or_else(|| IconName::File.path().into())
             }
             MentionUri::PastedImage { .. } => IconName::Image.path().into(),
+            MentionUri::CanvasSelection { .. } => IconName::ToolSelect.path().into(),
             MentionUri::Directory { abs_path } => FileIcons::get_folder_icon(false, abs_path, cx)
                 .unwrap_or_else(|| IconName::Folder.path().into()),
             MentionUri::Symbol { .. } => IconName::Code.path().into(),
@@ -467,6 +477,11 @@ impl MentionUri {
             }
             MentionUri::PastedImage { name } => {
                 let mut url = Url::parse("zed:///agent/pasted-image").unwrap();
+                url.query_pairs_mut().append_pair("name", name);
+                url
+            }
+            MentionUri::CanvasSelection { name } => {
+                let mut url = Url::parse("zed:///agent/canvas-selection").unwrap();
                 url.query_pairs_mut().append_pair("name", name);
                 url
             }
@@ -1412,6 +1427,18 @@ mod tests {
             _ => panic!("Expected Fetch variant"),
         }
         assert_eq!(parsed.to_uri().to_string(), https_uri);
+    }
+
+    #[test]
+    fn test_canvas_selection_uri_round_trip() {
+        let mention = MentionUri::CanvasSelection {
+            name: "Canvas selection (3 layers)".to_owned(),
+        };
+        let uri = mention.to_uri();
+        assert_eq!(
+            MentionUri::parse(uri.as_str(), PathStyle::local()).expect("parse canvas selection"),
+            mention
+        );
     }
 
     #[test]
