@@ -8,12 +8,34 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | --- | --- |
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
-| Editor and video | Both complete `00abf93` hosted checks pass. New local trim source passes 649 editor tests, 11 media library tests and 10 native playback cases. Native trim/edit/save/reopen and the final subsecond counter check passed. All owned QA sessions closed normally. |
+| Editor and video | Both complete `00abf93` hosted checks pass. Trim and its right-edge replay correction pass 649 editor tests, 11 media library tests and 11 native playback cases. Native trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing pass. The final QA app closed normally and all 21 saved files remain exact. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The a9f320d installer passed with notarization skipped; the 00abf93 installer is building. A notarized installer, clean-Mac validation and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
 
 ## Latest trim, database and native checkpoint
+
+A later review found that an exact right-edge scrub lost its logical end
+position when converted to the last included microsecond. Play then advanced
+only that final instant, requiring another click to replay. A new native
+regression failed against `7646e13` with a one-Play restart timeout. The player
+now preserves the latest logical end request separately from the bounded
+decode time. Play supersedes even a pending end seek with the range start;
+a newer lower seek or range change clears the old end intent. The component
+forwards the exact endpoint. Existing exclusive-end pixel guards are unchanged.
+All 649 editor tests, 11 library cases and 11 native playback cases pass; the
+native cases pass both traced and untraced. The regression checks settled and
+pending end seeks, full and trimmed clips, advancing decoded frames and newer
+seek/range overrides. Independent review found no blocker. The native app
+built in 7m21s with unchanged source and protected staged state. Dragging
+beyond the right scrubber edge showed 0.800 seconds and Play; one click then
+showed Pause at 0.319 seconds, followed by Play at the 0.800-second end.
+The included cyan scene, clipping and foreground overlap remained visible.
+A normal Save and quit preserved all 21 fixture files exactly. The QA app
+exited with code zero. This local binary includes preserved user changes and
+is not a notarized installer. Hosted follow-up checks remain pending. Evidence
+is in `video-trim-validation/end-scrub`, including `native-verification.json`
+and the four hashed screenshots.
 
 The normal-speed trim candidate stores its range on the existing video node and
 keeps the original source asset. It prepares a bounded, oriented preview before

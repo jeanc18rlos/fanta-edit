@@ -420,6 +420,7 @@ pub struct VideoPlayback {
     last_frame: Option<(NativeTime, VideoPlaybackFrame)>,
     seeking: bool,
     requested_play: bool,
+    requested_end: bool,
     range_start_us: u64,
     range_end_us: u64,
     _thread_confined: PhantomData<Rc<()>>,
@@ -529,6 +530,7 @@ impl VideoPlayback {
                 last_frame: None,
                 seeking: false,
                 requested_play: false,
+                requested_end: false,
                 _thread_confined: PhantomData,
             })
         })
@@ -541,7 +543,8 @@ impl VideoPlayback {
     pub fn play(&mut self) -> Result<()> {
         let status = self.status()?;
         self.requested_play = true;
-        if status.state == VideoPlaybackState::Ended {
+        if self.requested_end || status.state == VideoPlaybackState::Ended {
+            self.requested_end = false;
             self.pending_seek = Some(self.range_start_us);
         }
         self.advance_seek()?;
@@ -596,6 +599,7 @@ impl VideoPlayback {
         })?;
         self.range_start_us = start_us;
         self.range_end_us = end_us;
+        self.requested_end = false;
         self.pending_seek = Some(start_us);
         self.advance_seek()
     }
@@ -607,6 +611,13 @@ impl VideoPlayback {
             time_us <= self.prepared.info.duration_us,
             "The requested position is outside this video."
         );
+        let requested_end = time_us >= self.range_end_us;
+        if requested_end {
+            self.pause()?;
+        }
+        // Preserve the latest logical end request while decoding the final
+        // included instant, so one Play restarts even before this seek completes.
+        self.requested_end = requested_end;
         self.pending_seek = Some(time_us.clamp(self.range_start_us, self.range_end_us - 1));
         self.advance_seek()
     }
@@ -627,7 +638,9 @@ impl VideoPlayback {
                 bail!("Video playback failed: {}", error_description(error));
             }
             let current: NativeTime = msg_send![player, currentTime];
-            let current_time_us = if item_status == 0 {
+            let current_time_us = if self.requested_end && !self.seeking {
+                self.range_end_us
+            } else if item_status == 0 {
                 self.range_start_us
             } else {
                 time_us(current)?.clamp(self.range_start_us, self.range_end_us)

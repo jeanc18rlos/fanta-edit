@@ -399,12 +399,12 @@ mod native {
             "Trim did not begin at its source time"
         );
 
-        for (requested, target) in [(0, start), (original.duration_us, end - 1)] {
+        for (requested, target, state) in [
+            (0, start, VideoPlaybackState::Paused),
+            (original.duration_us, end, VideoPlaybackState::Ended),
+        ] {
             player.seek(requested)?;
-            wait(
-                || Ok(player.status()?.state == VideoPlaybackState::Paused),
-                "clamped trim seek",
-            )?;
+            wait(|| Ok(player.status()?.state == state), "clamped trim seek")?;
             let position = player.status()?.current_time_us;
             ensure!(
                 position.abs_diff(target) < 40_000,
@@ -484,6 +484,93 @@ mod native {
             player.info() == original,
             "Restoring the range changed the original video"
         );
+        Ok(())
+    }
+
+    fn end_scrub_replays_on_one_play_and_newer_seeks_replace_end_intent() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        for (start, end, expected_color) in [
+            (1_200_000, 2_000_000, [0, 255, 255]),
+            (0, 3_000_000, [255, 0, 0]),
+        ] {
+            for wait_for_seek in [true, false] {
+                player.set_time_range(start, end)?;
+                player.seek(end)?;
+                if wait_for_seek {
+                    wait(
+                        || Ok(player.status()?.state != VideoPlaybackState::Seeking),
+                        "right-edge scrub completion",
+                    )?;
+                    let last = frame(&mut player)?;
+                    ensure!(
+                        last.presentation_time_us < end,
+                        "Scrub exposed excluded pixels"
+                    );
+                    near(
+                        colors(&last)?[0],
+                        if start == 0 {
+                            [255, 0, 255]
+                        } else {
+                            expected_color
+                        },
+                    )?;
+                }
+                player.play()?;
+                wait(
+                    || {
+                        let status = player.status()?;
+                        Ok(status.state == VideoPlaybackState::Playing
+                            && (start..start + 200_000).contains(&status.current_time_us))
+                    },
+                    "one Play after right-edge scrub must restart",
+                )?;
+                let first = frame(&mut player)?;
+                near(colors(&first)?[0], expected_color)?;
+                ensure!(
+                    first.presentation_time_us < start + 200_000,
+                    "Replay missed the start"
+                );
+                let mut advanced = None;
+                wait(
+                    || {
+                        if let VideoFrameUpdate::Frame(current) =
+                            player.frame_for_host_time(video_host_time_seconds())?
+                        {
+                            ensure!(
+                                current.presentation_time_us < end,
+                                "Replay exposed excluded pixels"
+                            );
+                            near(colors(&current)?[0], expected_color)?;
+                            if current.presentation_time_us > first.presentation_time_us {
+                                advanced = Some(current.presentation_time_us);
+                            }
+                        }
+                        Ok(advanced.is_some())
+                    },
+                    "advancing frames after one-click replay",
+                )?;
+                player.pause()?;
+            }
+        }
+        player.set_time_range(1_200_000, 2_000_000)?;
+        player.seek(2_000_000)?;
+        let latest = seek_frame(&mut player, 1_500_000)?;
+        ensure!(
+            latest.presentation_time_us.abs_diff(1_500_000) < 40_000,
+            "End intent survived a newer seek"
+        );
+        near(colors(&latest)?[0], [0, 255, 255])?;
+        player.seek(2_000_000)?;
+        player.set_time_range(0, 3_000_000)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "range change clears end intent",
+        )?;
+        ensure!(
+            player.status()?.current_time_us < 40_000,
+            "Range change did not restore its start"
+        );
+        near(colors(&frame(&mut player)?)?[0], [255, 0, 0])?;
         Ok(())
     }
 
@@ -632,6 +719,10 @@ mod native {
             )?;
         }
         let cases: &[(&str, fn() -> Result<()>)] = &[
+            (
+                "end_scrub_replays_on_one_play_and_newer_seeks_replace_end_intent",
+                end_scrub_replays_on_one_play_and_newer_seeks_replace_end_intent,
+            ),
             (
                 "repeated_same_position_seek_can_resume_advancing_frames",
                 repeated_same_position_seek_can_resume_advancing_frames,

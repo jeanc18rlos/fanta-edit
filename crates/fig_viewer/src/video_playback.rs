@@ -275,7 +275,7 @@ impl VideoPlaybackView {
         if let Some(session) = self.session.as_mut() {
             let time_us = time_us.min(self.status.duration_us);
             let source_time = self.time_range_us.map_or(time_us, |[start, end]| {
-                start.saturating_add(time_us).min(end - 1)
+                start.saturating_add(time_us).min(end)
             });
             match session.seek(source_time) {
                 Ok(()) => {
@@ -836,7 +836,11 @@ mod tests {
             view.seek(u64::MAX, cx);
             view.poll_session(cx);
         });
-        assert!(snapshot(&state).commands.contains(&"seek:6999999".into()));
+        assert!(snapshot(&state).commands.contains(&"seek:7000000".into()));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.status().current_time_us),
+            5_000_000
+        );
         view.update(cx, |view, cx| view.close(cx));
         assert_eq!(snapshot(&state).dropped, 1);
     }

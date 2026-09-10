@@ -40,8 +40,15 @@ new PNG and modification timestamp changed; all 21 saved files were identical
 after another restart/save. A millisecond counter correction for subsecond
 trims passed its final native build/check, including 0.000 → 0.321 → 0.800
 seconds during playback. The final QA session closed normally and all saved
-files remained unchanged. Current candidate hosted
-checks are required after publication.
+files remained unchanged. A follow-up corrects replay after scrubbing exactly
+to the right edge: the first Play now restarts even if the seek is still
+pending, while the preview remains below the excluded end. Its regression
+failed against the published trim runtime, then passed with all 649 editor,
+11 media library and 11 native playback cases, traced and untraced. The
+follow-up native build passed in 7m21s. Dragging to 0.800 seconds, clicking
+Play once, and observing 0.319 then 0.800 seconds verified restart and stop.
+The included cyan scene remained visible, all 21 saved files stayed exact,
+and the QA app closed normally. Hosted checks for this follow-up remain pending.
 
 Backend `9510f61` passes all four CI jobs: 537 backend tests, 153 CPU worker
 tests, 17 real PostgreSQL cases and the container build. It includes guarded
@@ -129,11 +136,16 @@ AI, GPU requests, and customer checkout were unverified. Later device API
 checks below verified default Sonnet streaming and metering; GPU generation
 and customer checkout remain unverified.
 
-Register Polar's webhook at `https://api.fantaisa.net/webhooks/polar` for
-subscription lifecycle events and `order.paid`. Test a sandbox purchase,
-webhook redelivery, cancellation, and a renewed subscription before enabling
-customer checkout. Confirm the customer receives credits exactly once and can
-open the billing portal. No real customer was charged during this work.
+Before enabling checkout, verify migration history, apply pending migrations
+0020 then 0021, and deploy backend `9510f61` or a validated successor. Register
+`https://api.fantaisa.net/webhooks/polar` for subscription lifecycle events and
+both `order.created` and `order.paid`. Subscription credits require matching
+creation and payment evidence; lifecycle events provision access without
+proving payment. Verify sandbox checkout, signed webhook delivery and
+reordering, duplicate delivery, monthly renewal, cancellation/revocation and
+billing portal access. Confirm each paid allocation grants credits exactly
+once before enabling customer checkout. No real customer was charged during
+this work.
 
 Existing catalog amounts are 24/month for Pro (3,000 credits), 40/month for
 Team (6,000 credits), and credit packs of 500/1,500/5,000 for 5/12/35. The current
@@ -142,9 +154,16 @@ cents without a currency. USD references describe usage-cost and credit
 accounting. Displayed prices and currency must match the chosen Polar products
 before checkout is enabled.
 
-Keep yearly product IDs unset for the first release. The current yearly
-subscription implementation grants one monthly allocation per annual billing
-period; monthly replenishment for annual subscribers is not implemented.
+Keep yearly product IDs unset for the first release. Published backend
+`9510f61` implements twelve monthly allocations for a verified paid annual
+term, using UTC calendar-month anniversaries, a frozen monthly allowance and
+existing credit rollover; this implementation is not yet deployed. Annual
+activation requires matching migrations/deployment, finalized product and
+currency configuration, provider sandbox validation, and verified authenticated
+scheduling of `/internal/tick`. Vercel Cron uses `CRON_SECRET`; another
+scheduler must supply the supported authentication. Ambiguous legacy terms
+are not automatically adopted, and proration remains outside the validated
+scope.
 
 Review the Team allowance before selling it. At the default 1.4 billing
 multiplier, 60 USD of fully consumed credits represents roughly 42.86 USD of
