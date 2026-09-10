@@ -40,8 +40,9 @@ use fanta_gpui::design::{
     DesignStrokeDashes, DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights,
     DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
     DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
+    DesignViewerPropertiesViewData, DesignViewerPropertyRow, DesignViewerPropertySection,
 };
-use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
+use gpui::{AppContext as _, ClipboardItem, Context, Entity, SharedString, Subscription, Window};
 
 use crate::color_picker::GradientKind;
 use crate::document::{DocChange, FigDocument};
@@ -171,6 +172,7 @@ pub(crate) fn design_kind(
             None => DesignPanelNodeKind::Vector,
         },
         NodeData::Text(_) => DesignPanelNodeKind::Text,
+        NodeData::TextPath(_) => DesignPanelNodeKind::Other,
         NodeData::Instance(_) => DesignPanelNodeKind::Instance,
         NodeData::Boolean(_) => DesignPanelNodeKind::BooleanOperation,
         NodeData::Bitmap(_) => DesignPanelNodeKind::Image,
@@ -702,6 +704,142 @@ pub(crate) fn design_node(
     Some(out)
 }
 
+fn viewer_number(value: f32) -> String {
+    if value == 0.0 {
+        "0".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn viewer_property_section(
+    id: &'static str,
+    title: &'static str,
+    rows: Vec<DesignViewerPropertyRow>,
+) -> DesignViewerPropertySection {
+    let copy_value = rows
+        .iter()
+        .map(|row| format!("{}: {}", row.label, row.displayed_value))
+        .collect::<Vec<_>>()
+        .join("\n");
+    DesignViewerPropertySection::new(id, title, rows)
+        .with_copy_value(copy_value)
+        .with_copy_all()
+}
+
+/// A deterministic viewer projection of fields whose document-to-panel
+/// mapping is exact. Paint and CSS summaries stay absent until their complete
+/// geometry and source identities can be represented without synthetic data.
+fn viewer_properties_view_data(
+    doc: &Doc,
+    id: NodeId,
+    node: &DesignPanelNode,
+) -> Option<DesignViewerPropertiesViewData> {
+    let document_node = doc.scene.get(id)?;
+    let target = DesignPanelTarget::Nodes {
+        node_ids: vec![SharedString::from(id.to_string())],
+    };
+    let mut sections = Vec::new();
+
+    let content = match &document_node.data {
+        NodeData::Text(text) => Some(text.content.as_str()),
+        NodeData::TextPath(text_path) => Some(text_path.content.as_str()),
+        _ => None,
+    };
+    if let Some(content) = content {
+        sections.push(DesignViewerPropertySection::text_content(
+            "content", content,
+        ));
+    }
+
+    sections.push(viewer_property_section(
+        "identity",
+        "Identity",
+        vec![
+            DesignViewerPropertyRow::new("name", "Name", node.name.clone()),
+            DesignViewerPropertyRow::new("type", "Type", node.kind.label()),
+            DesignViewerPropertyRow::new("id", "ID", node.id.clone()),
+        ],
+    ));
+    sections.push(viewer_property_section(
+        "geometry",
+        "Geometry",
+        vec![
+            DesignViewerPropertyRow::new("x", "X", viewer_number(node.x))
+                .with_property(DesignPanelProperty::X),
+            DesignViewerPropertyRow::new("y", "Y", viewer_number(node.y))
+                .with_property(DesignPanelProperty::Y),
+            DesignViewerPropertyRow::new("width", "Width", viewer_number(node.width))
+                .with_property(DesignPanelProperty::Width),
+            DesignViewerPropertyRow::new("height", "Height", viewer_number(node.height))
+                .with_property(DesignPanelProperty::Height),
+            DesignViewerPropertyRow::new(
+                "rotation",
+                "Rotation",
+                format!("{}°", viewer_number(node.rotation)),
+            )
+            .with_property(DesignPanelProperty::Rotation),
+        ],
+    ));
+    sections.push(viewer_property_section(
+        "appearance",
+        "Appearance",
+        vec![
+            DesignViewerPropertyRow::new(
+                "opacity",
+                "Opacity",
+                format!("{}%", viewer_number(node.opacity)),
+            )
+            .with_property(DesignPanelProperty::Opacity),
+        ],
+    ));
+
+    Some(DesignViewerPropertiesViewData::new(target, sections))
+}
+
+fn viewer_property_copy_payload(
+    view_data: &DesignViewerPropertiesViewData,
+    target: &DesignPanelTarget,
+    property: DesignPanelProperty,
+    displayed_value: &SharedString,
+) -> Option<SharedString> {
+    if !view_data.is_valid() || &view_data.target != target {
+        return None;
+    }
+    view_data
+        .sections
+        .iter()
+        .flat_map(|section| section.rows.iter())
+        .find(|row| row.property == Some(property) && &row.displayed_value == displayed_value)
+        .map(|row| row.displayed_value.clone())
+}
+
+fn viewer_section_copy_payload(
+    view_data: &DesignViewerPropertiesViewData,
+    target: &DesignPanelTarget,
+    section_id: &SharedString,
+    copy_value: &SharedString,
+) -> Option<SharedString> {
+    if !view_data.is_valid() || &view_data.target != target {
+        return None;
+    }
+    view_data
+        .section(section_id.as_ref())
+        .and_then(|section| section.copy_value.as_ref())
+        .filter(|host_value| *host_value == copy_value)
+        .cloned()
+}
+
+fn viewer_section_is_current(
+    view_data: &DesignViewerPropertiesViewData,
+    target: &DesignPanelTarget,
+    section_id: &SharedString,
+) -> bool {
+    view_data.is_valid()
+        && &view_data.target == target
+        && view_data.section(section_id.as_ref()).is_some()
+}
+
 /// Pass through is modeled from `ISOLATED_BLEND` inverted: a Normal-blend
 /// container that does NOT isolate presents as Figma's Pass through.
 fn display_blend_mode(kind: DesignPanelNodeKind, node: &fanta_doc::CanvasNode) -> DesignBlendMode {
@@ -977,11 +1115,16 @@ impl FigView {
             } else {
                 DesignPanelPermissions::viewer()
             };
-            let (context, states) = match selection.as_slice() {
-                [] => (DesignPanelInspectionContext::page(permissions), Vec::new()),
+            let (context, states, viewer_properties) = match selection.as_slice() {
+                [] => (
+                    DesignPanelInspectionContext::page(permissions),
+                    Vec::new(),
+                    None,
+                ),
                 [id] => match design_node(document, *id, &masters) {
                     Some(node) => {
                         let states = bound_states(doc, *id);
+                        let viewer_properties = viewer_properties_view_data(doc, *id, &node);
                         (
                             DesignPanelInspectionContext::single(
                                 node,
@@ -989,9 +1132,14 @@ impl FigView {
                                 permissions,
                             ),
                             states,
+                            viewer_properties,
                         )
                     }
-                    None => (DesignPanelInspectionContext::page(permissions), Vec::new()),
+                    None => (
+                        DesignPanelInspectionContext::page(permissions),
+                        Vec::new(),
+                        None,
+                    ),
                 },
                 ids => {
                     let (aggregate, states) = aggregate_selection(document, ids, &masters);
@@ -1017,6 +1165,7 @@ impl FigView {
                             permissions,
                         ),
                         states,
+                        None,
                     )
                 }
             };
@@ -1038,9 +1187,9 @@ impl FigView {
                     .unwrap_or_else(|| format!("page-{}", page_index.unwrap_or(0)));
                 DesignPageViewData::canonical(page_id, background)
             });
-            Some((key, context, states, page_data))
+            Some((key, context, states, page_data, viewer_properties))
         };
-        let Some((key, context, states, page_data)) = built else {
+        let Some((key, context, states, page_data, viewer_properties)) = built else {
             return;
         };
         let Some(adapter) = self.gpui_design.as_mut() else {
@@ -1053,6 +1202,11 @@ impl FigView {
             }
             panel.set_inspection_context(context, cx);
             panel.set_property_value_states(states, cx);
+            if let Some(viewer_properties) = viewer_properties {
+                panel.set_viewer_properties_view_data(viewer_properties, cx);
+            } else {
+                panel.clear_viewer_properties_view_data(cx);
+            }
         });
     }
 
@@ -1075,6 +1229,28 @@ impl FigView {
             });
             item.finish_content_preview(false, cx);
         });
+    }
+
+    fn current_viewer_properties_for_target(
+        &self,
+        target: &DesignPanelTarget,
+        cx: &Context<Self>,
+    ) -> Option<DesignViewerPropertiesViewData> {
+        let DesignPanelTarget::Nodes { node_ids } = target else {
+            return None;
+        };
+        let [target_id] = node_ids.as_slice() else {
+            return None;
+        };
+        let target_id = node_id(target_id)?;
+        let item = self.item().read(cx);
+        let document = item.document()?;
+        if !document.doc.selection.iter().copied().eq([target_id]) {
+            return None;
+        }
+        let masters = master_roots(&document.doc.components);
+        let node = design_node(document, target_id, &masters)?;
+        viewer_properties_view_data(&document.doc, target_id, &node)
     }
 
     /// Applies committed operations through the item: one op directly, many
@@ -1143,12 +1319,114 @@ impl FigView {
     #[allow(deprecated)]
     pub(crate) fn handle_design_action(
         &mut self,
-        _panel: &Entity<DesignPanel>,
+        panel: &Entity<DesignPanel>,
         action: &DesignPanelAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match action {
+            DesignPanelAction::PropertyCopyRequested {
+                target,
+                property,
+                displayed_value,
+            } => {
+                let permissions = panel.read(cx).inspection_context().permissions();
+                if permissions.can_edit() || !permissions.can_copy() {
+                    log::warn!("fig design adapter: rejecting unavailable property copy");
+                    return;
+                }
+                let Some(view_data) = self.current_viewer_properties_for_target(target, cx) else {
+                    log::warn!("fig design adapter: rejecting stale property copy target");
+                    return;
+                };
+                let Some(payload) =
+                    viewer_property_copy_payload(&view_data, target, *property, displayed_value)
+                else {
+                    log::warn!("fig design adapter: rejecting stale property copy payload");
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(payload.to_string()));
+            }
+            DesignPanelAction::ViewerSectionCopyRequested {
+                target,
+                section_id,
+                copy_value,
+            } => {
+                let permissions = panel.read(cx).inspection_context().permissions();
+                if permissions.can_edit() || !permissions.can_copy() {
+                    log::warn!("fig design adapter: rejecting unavailable viewer section copy");
+                    return;
+                }
+                let Some(view_data) = self.current_viewer_properties_for_target(target, cx) else {
+                    log::warn!("fig design adapter: rejecting stale viewer section copy target");
+                    return;
+                };
+                let Some(payload) =
+                    viewer_section_copy_payload(&view_data, target, section_id, copy_value)
+                else {
+                    log::warn!("fig design adapter: rejecting stale viewer section copy payload");
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(payload.to_string()));
+            }
+            DesignPanelAction::ViewerSectionRepresentationChangeRequested {
+                target,
+                section_id,
+                ..
+            } => {
+                let permissions = panel.read(cx).inspection_context().permissions();
+                if permissions.can_edit() || !permissions.can_copy() {
+                    log::warn!("fig design adapter: rejecting unavailable viewer representation");
+                    return;
+                }
+                let Some(view_data) = self.current_viewer_properties_for_target(target, cx) else {
+                    log::warn!("fig design adapter: rejecting stale viewer representation target");
+                    return;
+                };
+                if !viewer_section_is_current(&view_data, target, section_id) {
+                    log::warn!("fig design adapter: rejecting stale viewer representation section");
+                    return;
+                }
+                crate::view::notify_unavailable(
+                    "Developer property representation changes",
+                    window,
+                    cx,
+                );
+            }
+            DesignPanelAction::PaintEyedropperRequested {
+                node_id: id,
+                collection,
+                paint_id,
+                index,
+                ..
+            } => {
+                let target = DesignPanelTarget::Nodes {
+                    node_ids: vec![id.clone()],
+                };
+                if !self.design_target_matches_selection(&target, cx) {
+                    log::warn!("fig design adapter: rejecting stale eyedropper target");
+                    return;
+                }
+                let current = panel.read(cx);
+                let node = current.node();
+                let paint = match collection {
+                    DesignPanelCollection::Fill => node.fills.get(*index),
+                    DesignPanelCollection::Stroke => node
+                        .stroke
+                        .as_ref()
+                        .and_then(|stroke| stroke.paints.get(*index)),
+                    DesignPanelCollection::Effect
+                    | DesignPanelCollection::LayoutGrid
+                    | DesignPanelCollection::Export => None,
+                };
+                let current = node.id.as_ref() == id.as_ref()
+                    && paint.is_some_and(|paint| paint.id.as_ref() == paint_id.as_ref());
+                if !current {
+                    log::warn!("fig design adapter: rejecting stale eyedropper paint");
+                    return;
+                }
+                crate::view::notify_unavailable("Paint eyedropper", window, cx);
+            }
             DesignPanelAction::PropertyChangeRequested {
                 node_id: id,
                 property,
@@ -3139,6 +3417,100 @@ mod tests {
     }
 
     #[test]
+    fn viewer_projection_uses_stable_host_values_without_lossy_paint_summaries() {
+        let (doc, _page, rect) = doc_with_rect();
+        let mut node =
+            DesignPanelNode::new(rect.to_string(), "Hero", DesignPanelNodeKind::Rectangle);
+        node.x = 10.25;
+        node.y = -0.0;
+        node.width = 200.5;
+        node.height = 100.0;
+        node.rotation = 12.75;
+        node.opacity = 87.5;
+        let mut gradient = DesignPaint::gradient(
+            DesignPaintKind::LinearGradient,
+            vec![
+                DesignGradientStop::new(0.0, DesignColor::rgb(0x11, 0x22, 0x33)),
+                DesignGradientStop::new(1.0, DesignColor::rgba(0x44, 0x55, 0x66, 0x80)),
+            ],
+        );
+        gradient.opacity = 75.25;
+        gradient.visible = false;
+        gradient.blend_mode = DesignBlendMode::Multiply;
+        node.fills = vec![
+            DesignPaint::solid(DesignColor::rgba(0xe0, 0x30, 0x30, 0x80)),
+            gradient,
+        ];
+        node.stroke = Some(DesignStroke::for_node(
+            DesignPanelNodeKind::Rectangle,
+            DesignPaint::solid(DesignColor::rgb(0x10, 0x20, 0x30)),
+            2.5,
+            DesignStrokeAlign::Outside,
+        ));
+
+        let view_data =
+            viewer_properties_view_data(&doc, rect, &node).expect("selected node projection");
+        assert!(view_data.is_valid());
+        assert_eq!(
+            &view_data.target,
+            &DesignPanelTarget::Nodes {
+                node_ids: vec![SharedString::from(rect.to_string())]
+            }
+        );
+        assert_eq!(
+            view_data
+                .sections
+                .iter()
+                .map(|section| section.id.as_ref())
+                .collect::<Vec<_>>(),
+            ["identity", "geometry", "appearance"]
+        );
+        assert!(
+            view_data
+                .sections
+                .iter()
+                .all(|section| section.color_representation.is_none()),
+            "the host must not claim a CSS or converted color representation"
+        );
+
+        let geometry = view_data.section("geometry").expect("geometry section");
+        assert_eq!(
+            geometry
+                .rows
+                .iter()
+                .map(|row| (row.id.as_ref(), row.displayed_value.as_ref(), row.property))
+                .collect::<Vec<_>>(),
+            [
+                ("x", "10.25", Some(DesignPanelProperty::X)),
+                ("y", "0", Some(DesignPanelProperty::Y)),
+                ("width", "200.5", Some(DesignPanelProperty::Width)),
+                ("height", "100", Some(DesignPanelProperty::Height)),
+                ("rotation", "12.75°", Some(DesignPanelProperty::Rotation)),
+            ]
+        );
+        assert!(view_data.section("fills").is_none());
+        assert!(view_data.section("strokes").is_none());
+    }
+
+    #[test]
+    fn viewer_projection_includes_exact_text_content() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.scene.get_mut(rect).expect("node exists").data = NodeData::Text(
+            fanta_doc::TextNode::new("Design\nwith confidence", 200.0, 60.0),
+        );
+        let node = DesignPanelNode::new(rect.to_string(), "Title", DesignPanelNodeKind::Text);
+
+        let view_data =
+            viewer_properties_view_data(&doc, rect, &node).expect("text projection exists");
+        let content = view_data.section("content").expect("content section");
+        assert_eq!(content.summary.as_deref(), Some("Design\nwith confidence"));
+        assert_eq!(
+            content.copy_value.as_deref(),
+            Some("Design\nwith confidence")
+        );
+    }
+
+    #[test]
     fn arrange_maps_align_and_distribute_and_declines_tidy_up() {
         let (mut doc, _page, ids) = doc_with_three_squares();
 
@@ -3439,6 +3811,24 @@ mod tests {
         (view, panel, cx)
     }
 
+    fn set_viewer_permissions(
+        panel: &Entity<DesignPanel>,
+        permissions: DesignPanelPermissions,
+        cx: &mut VisualTestContext,
+    ) {
+        let node = panel.read_with(cx, |panel, _| panel.node().clone());
+        panel.update_in(cx, |panel, _, cx| {
+            panel.set_inspection_context(
+                DesignPanelInspectionContext::single(
+                    node,
+                    DesignPanelParentLayout::Canvas,
+                    permissions,
+                ),
+                cx,
+            );
+        });
+    }
+
     #[gpui::test]
     async fn mounting_under_the_flag_echoes_the_selected_rectangle(cx: &mut TestAppContext) {
         let (mut doc, _page, rect) = doc_with_rect();
@@ -3474,6 +3864,284 @@ mod tests {
                 "exports are gated off"
             );
             assert!(!capabilities.aspect_ratio_lock);
+
+            let view_data = panel
+                .viewer_properties_view_data()
+                .expect("one selected node should have developer properties");
+            assert_eq!(
+                &view_data.target,
+                &DesignPanelTarget::Nodes {
+                    node_ids: vec![SharedString::from(rect.to_string())]
+                }
+            );
+            assert_eq!(
+                view_data
+                    .section("geometry")
+                    .and_then(|section| section.row("x"))
+                    .map(|row| row.displayed_value.as_ref()),
+                Some("10")
+            );
+            assert!(view_data.section("fills").is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_projection_clears_for_empty_and_multiple_selections(cx: &mut TestAppContext) {
+        let (mut doc, page, rect) = doc_with_rect();
+        let mut second = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            40.0,
+            FantaColor::rgb(0x30, 0x30, 0xe0),
+        )));
+        second.name = "Second".to_owned();
+        second.parent = Some(page);
+        let second_id = second.id;
+        doc.scene.insert(second).expect("insert second");
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.viewer_properties_view_data().is_some()));
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.clear();
+                ((), DocChange::Selection)
+            });
+        });
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.viewer_properties_view_data().is_none()),
+            "no selection must not retain the previous developer projection"
+        );
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([rect, second_id]);
+                ((), DocChange::Selection)
+            });
+        });
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.viewer_properties_view_data().is_none()),
+            "multiple selection must not show a single layer's developer projection"
+        );
+    }
+
+    #[gpui::test]
+    async fn viewer_copy_actions_require_the_exact_selection_and_host_payload(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        set_viewer_permissions(&panel, DesignPanelPermissions::viewer(), cx);
+
+        let target = DesignPanelTarget::Nodes {
+            node_ids: vec![SharedString::from(rect.to_string())],
+        };
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyCopyRequested {
+                target: target.clone(),
+                property: DesignPanelProperty::X,
+                displayed_value: "10".into(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("10".to_owned())
+        );
+
+        let identity_copy = format!("Name: Hero\nType: Rectangle\nID: {rect}");
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ViewerSectionCopyRequested {
+                target: target.clone(),
+                section_id: "identity".into(),
+                copy_value: identity_copy.clone().into(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some(identity_copy)
+        );
+
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned())));
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyCopyRequested {
+                target: target.clone(),
+                property: DesignPanelProperty::X,
+                displayed_value: "forged value".into(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("sentinel".to_owned()),
+            "a payload not present in the host projection must not be copied"
+        );
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.clear();
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyCopyRequested {
+                target,
+                property: DesignPanelProperty::X,
+                displayed_value: "10".into(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("sentinel".to_owned()),
+            "an action captured for an older selection must not be copied"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.doc().expect("document ready").history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn viewer_copy_revalidates_same_selection_content_and_permissions(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        set_viewer_permissions(&panel, DesignPanelPermissions::viewer(), cx);
+
+        let target = DesignPanelTarget::Nodes {
+            node_ids: vec![SharedString::from(rect.to_string())],
+        };
+        let old_identity = format!("Name: Hero\nType: Rectangle\nID: {rect}");
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let node = document.doc.scene.get_mut(rect).expect("rectangle exists");
+                node.name = "Updated Hero".to_owned();
+                node.transform = Transform2D::translation(42.0, 20.0);
+                ((), DocChange::Content)
+            });
+        });
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_owned())));
+
+        for action in [
+            DesignPanelAction::PropertyCopyRequested {
+                target: target.clone(),
+                property: DesignPanelProperty::X,
+                displayed_value: "10".into(),
+            },
+            DesignPanelAction::ViewerSectionCopyRequested {
+                target: target.clone(),
+                section_id: "identity".into(),
+                copy_value: old_identity.into(),
+            },
+        ] {
+            view.update_in(cx, |view, window, cx| {
+                view.handle_design_action(&panel, &action, window, cx);
+            });
+        }
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("sentinel".to_owned()),
+            "copy requests from a stale same-selection snapshot must be rejected"
+        );
+        let current = view.update_in(cx, |view, _, cx| {
+            view.current_viewer_properties_for_target(&target, cx)
+                .expect("current projection")
+        });
+        assert_eq!(
+            current
+                .section("geometry")
+                .and_then(|section| section.row("x"))
+                .map(|row| row.displayed_value.as_ref()),
+            Some("42")
+        );
+
+        set_viewer_permissions(&panel, DesignPanelPermissions::restricted_viewer(), cx);
+        let current_action = DesignPanelAction::PropertyCopyRequested {
+            target,
+            property: DesignPanelProperty::X,
+            displayed_value: "42".into(),
+        };
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_action(&panel, &current_action, window, cx);
+        });
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("sentinel".to_owned()),
+            "restricted viewer permissions must be rechecked by the host"
+        );
+    }
+
+    #[gpui::test]
+    async fn unsupported_representation_and_eyedropper_actions_do_not_mutate_the_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        set_viewer_permissions(&panel, DesignPanelPermissions::viewer(), cx);
+
+        let target = DesignPanelTarget::Nodes {
+            node_ids: vec![SharedString::from(rect.to_string())],
+        };
+        let paint_id = panel.read_with(cx, |panel, _| panel.node().fills[0].id.clone());
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let before = item.read_with(cx, |item, _| {
+            item.doc()
+                .and_then(|doc| doc.scene.get(rect))
+                .expect("selected rectangle")
+                .clone()
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(
+                DesignPanelAction::ViewerSectionRepresentationChangeRequested {
+                    target,
+                    section_id: "geometry".into(),
+                    representation: fanta_gpui::design::DesignViewerColorRepresentation::Hex,
+                },
+            );
+            cx.emit(DesignPanelAction::PaintEyedropperRequested {
+                node_id: SharedString::from(rect.to_string()),
+                collection: DesignPanelCollection::Fill,
+                target: fanta_gpui::design::DesignPaintTarget::WholeLayer,
+                paint_id,
+                index: 0,
+                color_target: fanta_gpui::design::DesignPaintColorTarget::Solid,
+            });
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(doc.scene.get(rect), Some(&before));
+            assert!(!doc.history.can_undo());
+            assert!(!item.is_dirty());
         });
     }
 
