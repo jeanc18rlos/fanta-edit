@@ -1490,6 +1490,120 @@ async fn test_selection_clamps_after_entry_removal(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_selection_falls_back_after_selected_thread_is_removed(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    save_n_test_threads(3, &project, cx).await;
+
+    assert_eq!(sidebar.read_with(cx, |sidebar, _| sidebar.selection), None);
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.selection = Some(2);
+        cx.notify();
+    });
+
+    for (session_id, expected_selection, expected_entries) in [
+        (
+            "thread-1",
+            2,
+            vec!["v [my-project]", "  Thread 3", "  Thread 1  <== selected"],
+        ),
+        (
+            "thread-0",
+            1,
+            vec!["v [my-project]", "  Thread 3  <== selected"],
+        ),
+        ("thread-2", 0, vec!["v [my-project]  <== selected"]),
+    ] {
+        let thread_id = thread_id_for(&acp::SessionId::new(session_id), cx);
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.delete(thread_id, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            sidebar.read_with(cx, |sidebar, _| sidebar.selection),
+            Some(expected_selection),
+            "removing the selected row should select its successor or the last remaining row"
+        );
+        assert_eq!(visible_entries_as_strings(&sidebar, cx), expected_entries);
+    }
+}
+
+#[gpui::test]
+async fn test_selection_preserves_project_header_when_groups_change(cx: &mut TestAppContext) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT_TEST_DB: AtomicUsize = AtomicUsize::new(0);
+
+    let test_db_id = NEXT_TEST_DB.fetch_add(1, Ordering::SeqCst);
+    cx.update(|cx| {
+        cx.set_global(agent_ui::thread_metadata_store::TestMetadataDbName(
+            format!("SIDEBAR_HEADER_SELECTION_{test_db_id}"),
+        ));
+    });
+    let project = init_test_project("/project-a", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let fs = project.read_with(cx, |project, _| project.fs().as_fake().clone());
+    fs.insert_tree("/project-b", serde_json::json!({ "src": {} }))
+        .await;
+    let project_b = project::Project::test(fs, [Path::new("/project-b")], cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b.clone(), window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(sidebar.read_with(cx, |sidebar, _| sidebar.selection), None);
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [project-b]", "v [project-a]"]
+    );
+    let project_a_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/project-a")]));
+    let header_index = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::ProjectHeader { key, .. } if key == &project_a_key)
+            })
+            .expect("the original project group should remain visible below the new group")
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.selection = Some(header_index);
+        cx.notify();
+    });
+
+    save_n_test_threads(1, &project_b, cx).await;
+    save_named_thread_metadata("project-a-thread", "Project A thread", &project, cx).await;
+    sidebar.read_with(cx, |sidebar, _| {
+        let moved_header_index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::ProjectHeader { key, .. } if key == &project_a_key)
+            })
+            .expect("the original project header should still be visible");
+        assert_eq!(
+            moved_header_index,
+            header_index + 1,
+            "the preceding project gained a row"
+        );
+        assert_eq!(
+            sidebar.selection,
+            Some(moved_header_index),
+            "selection should follow the project header when the preceding group gains a row"
+        );
+        assert!(matches!(
+            sidebar.contents.entries.get(moved_header_index),
+            Some(ListEntry::ProjectHeader { key, has_threads: true, .. }) if key == &project_a_key
+        ));
+    });
+}
+
 async fn init_test_project_with_agent_panel(
     worktree_path: &str,
     cx: &mut TestAppContext,
@@ -4636,6 +4750,83 @@ async fn test_confirm_on_historical_thread_preserves_historical_timestamp_and_or
             "  Older Historical Thread  <== selected".to_string(),
         ],
         "activating an older historical thread should not reorder it ahead of a newer historical thread"
+    );
+}
+
+#[gpui::test]
+async fn test_selection_follows_thread_when_empty_draft_disappears(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    save_n_test_threads(2, &project, cx).await;
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        cx.bind_keys([gpui::KeyBinding::new(
+            "enter",
+            Confirm,
+            Some("ThreadsSidebar"),
+        )]);
+    });
+
+    let selected_thread_id = thread_id_for(&acp::SessionId::new("thread-1"), cx);
+    let (draft_thread_id, selected_index) = sidebar.read_with(cx, |sidebar, _| {
+        let draft_thread_id = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Thread(thread) if thread.draft == Some(DraftKind::Empty) => {
+                    Some(thread.metadata.thread_id)
+                }
+                _ => None,
+            })
+            .expect("the active panel should have an empty draft before activation");
+        let selected_index = sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == selected_thread_id)
+            })
+            .expect("the historical thread should be visible");
+        assert!(
+            matches!(sidebar.contents.entries.get(selected_index + 1), Some(ListEntry::Thread(_))),
+            "a different thread must follow the selection so a stale index would activate it"
+        );
+        (draft_thread_id, selected_index)
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.selection = Some(selected_index);
+        cx.notify();
+    });
+    focus_sidebar(&sidebar, cx);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx)),
+        Some(selected_thread_id)
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(!sidebar.contents.entries.iter().any(|entry| {
+            matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == draft_thread_id)
+        }));
+        let selection = sidebar.selection.expect("the surviving thread should remain selected");
+        assert!(selection < selected_index, "the empty draft above the selection disappeared");
+        assert!(matches!(
+            sidebar.contents.entries.get(selection),
+            Some(ListEntry::Thread(thread)) if thread.metadata.thread_id == selected_thread_id
+        ));
+    });
+
+    focus_sidebar(&sidebar, cx);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        panel.read_with(cx, |panel, cx| panel.active_thread_id(cx)),
+        Some(selected_thread_id),
+        "Enter after the draft disappears must not activate the next historical thread"
     );
 }
 

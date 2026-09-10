@@ -535,6 +535,23 @@ enum EntryShape {
     Terminal(TerminalId),
 }
 
+impl EntryShape {
+    fn matches_entry(&self, entry: &ListEntry) -> bool {
+        match (self, entry) {
+            (Self::ProjectHeader { key, .. }, ListEntry::ProjectHeader { key: other, .. }) => {
+                key == other
+            }
+            (Self::Thread(thread_id), ListEntry::Thread(thread)) => {
+                *thread_id == thread.metadata.thread_id
+            }
+            (Self::Terminal(terminal_id), ListEntry::Terminal(terminal)) => {
+                *terminal_id == terminal.metadata.terminal_id
+            }
+            _ => false,
+        }
+    }
+}
+
 impl SidebarContents {
     fn is_thread_notified(&self, thread_id: &agent_ui::ThreadId) -> bool {
         self.notified_threads.contains(thread_id)
@@ -2068,6 +2085,23 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
+        self.selection = self.selection.and_then(|previous_index| {
+            previous_shapes
+                .get(previous_index)
+                .and_then(|selected| {
+                    self.contents
+                        .entries
+                        .iter()
+                        .position(|entry| selected.matches_entry(entry))
+                })
+                .or_else(|| {
+                    self.contents
+                        .entries
+                        .len()
+                        .checked_sub(1)
+                        .map(|last_index| previous_index.min(last_index))
+                })
+        });
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 

@@ -84,6 +84,11 @@ jobs:
           cargo test --locked -p sidebar --lib creating_a_sidebar_synchronizes_an_existing_agent_panel
           cargo test --locked -p sidebar --lib property_test::test_sidebar_invariants
 
+      - name: Test sidebar selection during list updates
+        run: |
+          cargo test --locked -p sidebar --lib test_selection_
+          cargo test --locked -p sidebar --lib test_confirm_on_historical_thread_preserves_historical_timestamp_and_order
+
       - name: Test canvas toolbar text entry
         run: |
           cargo test --locked -p fanta-gpui --lib organisms::toolbar::component::interaction_tests
