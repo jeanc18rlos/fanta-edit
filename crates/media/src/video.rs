@@ -470,6 +470,9 @@ impl VideoPlayback {
             let track_id: i32 = msg_send![**track, trackID];
             let _: () = msg_send![composition, setSourceTrackIDForFrameTiming:track_id];
             let _: () = msg_send![*item, setVideoComposition:composition];
+            // Seek completion must wait for the composed frame, or video output
+            // can still return the previous scene after the item clock advances.
+            let _: () = msg_send![*item, setSeekingWaitsForVideoCompositionRendering:YES];
             let attributes: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
             ensure!(!attributes.is_null(), "Could not configure video frames.");
             let format: *mut Object =
