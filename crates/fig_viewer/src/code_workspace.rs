@@ -139,13 +139,13 @@ impl FantaCodeWorkspace {
                         this.sync_selection_to_source(window, cx);
                     }
                 } else if matches!(event, FigItemEvent::Saved) {
-                    // An autosave rewrote the source and, with it, the id
-                    // sidecar the caret was derived from. The buffers are the
-                    // project's own and reload themselves, so only the caret
-                    // has to be re-derived — deliberately WITHOUT
-                    // `refresh_from_item`, which would open editors from
-                    // inside an item event and so demand a fully themed app
-                    // on a path that is only reached by an autosave.
+                    // Renaming a page/master moves its source directory;
+                    // first materialization creates paths the pane did not
+                    // have. Unchanged buffers reload themselves, so preserve
+                    // their editor entities and only re-derive the caret.
+                    if this.saved_source_paths_changed(cx) {
+                        this.refresh_from_item(window, cx);
+                    }
                     this.last_synced_selection = None;
                     this.sync_selection_to_source(window, cx);
                 }
@@ -216,6 +216,33 @@ impl FantaCodeWorkspace {
     /// to save. Reload paths await this before reloading the canvas.
     pub(crate) fn discard_source_edit(&mut self, _cx: &mut Context<Self>) -> Task<Result<()>> {
         Task::ready(Ok(()))
+    }
+
+    fn saved_source_paths_changed(&self, cx: &App) -> bool {
+        let item = self.item.read(cx);
+        let page = self
+            .requested_page
+            .or_else(|| item.doc().and_then(|doc| doc.active_page()));
+        let component = page.and_then(|root| {
+            item.doc().and_then(|doc| {
+                doc.components
+                    .defs
+                    .iter()
+                    .find(|(_, definition)| definition.root == root)
+                    .map(|(id, _)| *id)
+            })
+        });
+        let (fnx_path, json_file) = match (item.project_root(), page, component) {
+            (Some(root), Some(_), Some(component)) => {
+                (fanta_format::locate_master_source(root, component), "def.json")
+            }
+            (Some(root), Some(page), None) => {
+                (fanta_format::locate_page_source(root, page), "page.json")
+            }
+            _ => (None, "page.json"),
+        };
+        let json_path = fnx_path.as_ref().map(|path| path.with_file_name(json_file));
+        self.fnx_path != fnx_path || self.json_path != json_path
     }
 
     fn refresh_from_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1155,6 +1182,138 @@ mod tests {
                 .name
                 .clone()
         })
+    }
+
+    #[gpui::test]
+    async fn saved_reconciles_renamed_page_source_paths(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let original_path = page_source_path(temporary.path(), page);
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        item.update(cx, |item, cx| {
+            item.apply(
+                fanta_doc::Operation::SetName {
+                    id: page,
+                    old: "Original".into(),
+                    new: "Renamed page".into(),
+                },
+                cx,
+            )
+            .expect("rename page");
+        });
+        item.update(cx, |item, cx| item.save(crate::document::SaveKind::Auto, cx))
+            .await
+            .expect("save renamed page");
+        cx.run_until_parked();
+        let current_path = page_source_path(temporary.path(), page);
+        assert_ne!(current_path, original_path, "renaming moves the source slug");
+        assert!(!original_path.exists(), "the old source was pruned");
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert_eq!(workspace.fnx_path.as_ref(), Some(&current_path));
+                assert_eq!(
+                    workspace.json_path.as_ref(),
+                    Some(&current_path.with_file_name("page.json"))
+                );
+                let source = workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("renamed FNX editor")
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .snapshot(cx)
+                    .text();
+                assert!(source.contains("name=\"Renamed page\""));
+                assert!(workspace.json_editor.is_some());
+                assert!(workspace.error_message.is_none());
+            })
+            .expect("read renamed source workspace");
+    }
+
+    #[gpui::test]
+    async fn saved_reconciles_first_materialized_source(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let project = open_test_project(temporary.path(), cx).await;
+        let mut document = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "First page".into();
+        let page_id = page.id;
+        document.scene.insert(page).expect("insert page");
+        document.add_page(page_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            temporary.path().join("New design.fig"),
+            document,
+            cx,
+        );
+        let workspace = cx.add_window({
+            let item = item.clone();
+            move |window, cx| FantaCodeWorkspace::new(item, project, window, cx)
+        });
+        workspace
+            .read_with(cx, |workspace, _| {
+                assert!(workspace.fnx_editor.is_none());
+                assert!(workspace.error_message.as_ref().is_some_and(|message| {
+                    message.contains("Save the document once")
+                }));
+            })
+            .expect("read unmaterialized source workspace");
+        // Exercise the Saved event already used by persistence before explicit
+        // saves adopt it, without relying on their old StateChanged refresh.
+        let root = item
+            .update(cx, |item, cx| item.save(crate::document::SaveKind::Auto, cx))
+            .await
+            .expect("materialize the saved snapshot")
+            .expect("new project root");
+        cx.run_until_parked();
+        workspace
+            .read_with(cx, |workspace, _| {
+                assert_eq!(workspace.fnx_path, Some(page_source_path(&root, page_id)));
+                assert_eq!(workspace.json_path, Some(page_json_path(&root, page_id)));
+                assert!(workspace.fnx_editor.is_some());
+                assert!(workspace.json_editor.is_some());
+                assert!(workspace.error_message.is_none());
+            })
+            .expect("read materialized source workspace");
+    }
+
+    #[gpui::test]
+    async fn saved_reconciliation_preserves_editors_when_source_paths_are_unchanged(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        write_project(temporary.path());
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        let editors = workspace
+            .update(cx, |workspace, _, _| {
+                workspace.selected_file = CodeWorkspaceFile::Json;
+                (
+                    workspace.fnx_editor.as_ref().expect("FNX editor").entity_id(),
+                    workspace.json_editor.as_ref().expect("JSON editor").entity_id(),
+                )
+            })
+            .expect("select JSON pane");
+        item.update(cx, |item, cx| item.save(crate::document::SaveKind::Auto, cx))
+            .await
+            .expect("save unchanged source paths");
+        cx.run_until_parked();
+        workspace
+            .read_with(cx, |workspace, _| {
+                assert_eq!(workspace.selected_file, CodeWorkspaceFile::Json);
+                assert_eq!(
+                    workspace.fnx_editor.as_ref().expect("FNX editor").entity_id(),
+                    editors.0
+                );
+                assert_eq!(
+                    workspace.json_editor.as_ref().expect("JSON editor").entity_id(),
+                    editors.1
+                );
+            })
+            .expect("read preserved editors");
     }
 
     fn remove_editor_prelude(source: &str) -> String {

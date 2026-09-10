@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
 use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver, solve_scene_layout};
+use futures::FutureExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
     SharedString, Subscription, Task, WeakEntity,
@@ -40,6 +41,23 @@ pub(crate) const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 #[derive(Default)]
 struct ProjectWrites {
     state: Mutex<ProjectWriteState>,
+    #[cfg(test)]
+    next_save_barrier: Mutex<Option<SaveTestBarrier>>,
+}
+
+#[cfg(test)]
+struct SaveTestBarrier {
+    reached: futures::channel::oneshot::Sender<()>,
+    resume: futures::channel::oneshot::Receiver<()>,
+    after_write: bool,
+}
+
+#[cfg(test)]
+impl SaveTestBarrier {
+    async fn wait(self) {
+        self.reached.send(()).expect("save test observes writer");
+        self.resume.await.expect("save test releases writer");
+    }
 }
 
 #[derive(Default)]
@@ -47,23 +65,20 @@ struct ProjectWriteState {
     active: usize,
     changing_destination: bool,
     quiet_until: Option<Instant>,
+    last_write: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
 }
 
 struct ProjectWriteLease {
     writes: Arc<ProjectWrites>,
     changing_destination: bool,
+    predecessor: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
+    completed: Option<futures::channel::oneshot::Sender<()>>,
 }
 
 impl ProjectWrites {
     fn begin(self: &Arc<Self>) -> Arc<ProjectWriteLease> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .active += 1;
-        Arc::new(ProjectWriteLease {
-            writes: self.clone(),
-            changing_destination: false,
-        })
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.enqueue(&mut state, false)
     }
 
     fn begin_destination_change(self: &Arc<Self>) -> Result<Arc<ProjectWriteLease>> {
@@ -72,12 +87,42 @@ impl ProjectWrites {
             state.active == 0,
             "A save is already running. Try Save As again when it finishes."
         );
+        Ok(self.enqueue(&mut state, true))
+    }
+
+    fn enqueue(
+        self: &Arc<Self>,
+        state: &mut ProjectWriteState,
+        changing_destination: bool,
+    ) -> Arc<ProjectWriteLease> {
+        let predecessor = state.last_write.take();
+        let (completed, completion) = futures::channel::oneshot::channel();
+        // Reserve order when the snapshot is captured, not when its task is
+        // first polled. A canceled queued save must still wait for its
+        // predecessor before letting subsequent writers touch the tree.
+        state.last_write = Some(
+            {
+                let predecessor = predecessor.clone();
+                async move {
+                    if let Some(predecessor) = predecessor {
+                        predecessor.await;
+                    }
+                    if completion.await.is_err() {
+                        log::debug!("a project write lease ended without its completion signal");
+                    }
+                }
+            }
+            .boxed()
+            .shared(),
+        );
         state.active += 1;
-        state.changing_destination = true;
-        Ok(Arc::new(ProjectWriteLease {
+        state.changing_destination |= changing_destination;
+        Arc::new(ProjectWriteLease {
             writes: self.clone(),
-            changing_destination: true,
-        }))
+            changing_destination,
+            predecessor,
+            completed: Some(completed),
+        })
     }
 
     fn changing_destination(&self) -> bool {
@@ -93,6 +138,14 @@ impl ProjectWrites {
     }
 }
 
+impl ProjectWriteLease {
+    async fn wait_for_turn(&self) {
+        if let Some(predecessor) = self.predecessor.clone() {
+            predecessor.await;
+        }
+    }
+}
+
 impl Drop for ProjectWriteLease {
     fn drop(&mut self) {
         let mut state = self
@@ -103,6 +156,14 @@ impl Drop for ProjectWriteLease {
         state.active = state.active.saturating_sub(1);
         if self.changing_destination {
             state.changing_destination = false;
+        }
+        if let Some(completed) = self.completed.take()
+            && completed.send(()).is_err()
+        {
+            log::debug!("project write completion no longer has a waiting queue");
+        }
+        if state.active == 0 {
+            state.last_write = None;
         }
         state.quiet_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
     }
@@ -235,15 +296,15 @@ pub enum FigItemEvent {
     /// changed, or its effective typography changed. This refreshes inspector
     /// values without changing which document node the inspector is bound to.
     TextSelectionChanged,
-    /// The document finished (re)loading, or an explicit save replaced its
+    /// The document finished (re)loading, or Save As replaced its
     /// persisted state. Listeners treat this as "the document may have been
     /// replaced": in-flight text sessions, inspector previews and rename
-    /// gestures are dropped. The debounced autosave deliberately emits
+    /// gestures are dropped. Ordinary persistence deliberately emits
     /// [`Saved`](Self::Saved) instead, so it never cancels what the user is
     /// doing.
     StateChanged,
-    /// The document was written to disk without being replaced: the dirty
-    /// flag cleared and nothing else about the in-memory state changed.
+    /// A document snapshot was written without replacing the live document.
+    /// Newer edits, if any, remain dirty and also emit [`Edited`](Self::Edited).
     Saved,
     /// The document was replaced by an external reload (`merged: false`) or by
     /// a clean three-way merge of the external edit into the canvas's unsaved
@@ -284,9 +345,8 @@ pub enum ScopeRequester {
 }
 
 /// Whether a save came from the user (Cmd-S, File > Save) or from the
-/// canvas's debounced autosave. Explicit saves announce
-/// [`FigItemEvent::StateChanged`]; autosaves announce
-/// [`FigItemEvent::Saved`], which listeners must not treat as a reload.
+/// canvas's debounced autosave. Both announce [`FigItemEvent::Saved`], which
+/// listeners must not treat as a reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveKind {
     Explicit,
@@ -1809,11 +1869,8 @@ impl FigItem {
     /// creates it — so the view can add it to the workspace as a visible
     /// worktree — and `None` when the project already existed.
     ///
-    /// `kind` only picks the event announced on success: an explicit save
-    /// emits [`FigItemEvent::StateChanged`], which every listener reads as
-    /// "the document may have been replaced" and uses to drop in-flight
-    /// sessions; the debounced autosave emits [`FigItemEvent::Saved`] so a
-    /// rename or half-typed inspector value survives it.
+    /// A save persists its snapshot without replacing the live document.
+    /// Newer edits remain dirty and rearm autosave when the write completes.
     pub fn save(
         &mut self,
         kind: SaveKind,
@@ -1841,23 +1898,7 @@ impl FigItem {
         // once per autosave was the save path's memory high-water mark.
         let doc = document.doc.clone_for_persist();
         let raw_assets = document.raw_assets.clone();
-        let existing_root = self.project_root.clone();
-        let materializing = existing_root.is_none();
-        // Materialize next to the `.fig` on the first save; reuse the existing
-        // project directory on every save after that.
-        let target = existing_root.unwrap_or_else(|| available_project_dir(&self.abs_path));
-        if materializing && fanta_format::is_project_dir(&target) {
-            // A Fanta project already exists at the destination that this
-            // in-memory `.fig` was never loaded from (it appeared after we
-            // opened). Materializing would full-overwrite newer on-disk content
-            // with a stale import — refuse rather than destroy it. Reopening the
-            // `.fig` will redirect to and load that project (see `try_open`).
-            return Task::ready(Err(anyhow::anyhow!(
-                "a Fanta project already exists at {}; open it directly instead of overwriting it with {}",
-                target.display(),
-                self.abs_path.display()
-            )));
-        }
+        let generation = document.render_generation();
         // Our own writes echo back through the worktree watcher; suppress it
         // both from save start (covers sub-second saves entirely) and again at
         // completion (covers watcher latency after longer saves). On the
@@ -1871,10 +1912,40 @@ impl FigItem {
         // lands (silently reverting — and on the next save destroying — the
         // content saved here).
         self.reload_task = None;
-        // A save already in flight holds the cache; this one starts cold
-        // rather than waiting, and whichever finishes last keeps its memo.
-        let write_cache = self.write_cache.take().unwrap_or_default();
+        #[cfg(test)]
+        let save_barrier = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save test barrier")
+            .take();
         cx.spawn(async move |this, cx| {
+            write_lease.wait_for_turn().await;
+            let (target, materializing, write_cache) = this.update(cx, |this, _| {
+                anyhow::ensure!(
+                    !this.source_edit_locked,
+                    "the FNX source is dirty; save it through the code workspace before saving the canvas"
+                );
+                anyhow::ensure!(this.document.ready().is_some(), "the document is still loading");
+                let materializing = this.project_root.is_none();
+                // An earlier queued save may have just materialized the
+                // project. Resolve its adopted root only after that save ends.
+                let target = this
+                    .project_root
+                    .clone()
+                    .unwrap_or_else(|| available_project_dir(&this.abs_path));
+                anyhow::ensure!(
+                    !materializing || !fanta_format::is_project_dir(&target),
+                    "a Fanta project already exists at {}; open it directly instead of overwriting it with {}",
+                    target.display(),
+                    this.abs_path.display()
+                );
+                Ok::<_, anyhow::Error>((
+                    target,
+                    materializing,
+                    this.write_cache.take().unwrap_or_default(),
+                ))
+            })??;
             // The persisted clone travels through the write and comes back
             // to become the merge base — one clone per save, not two.
             let (result, saved_doc, write_cache) = cx
@@ -1884,8 +1955,18 @@ impl FigItem {
                     async move {
                         let _write_lease = write_lease;
                         let mut write_cache = write_cache;
+                        #[cfg(test)]
+                        let mut save_barrier = save_barrier;
+                        #[cfg(test)]
+                        if save_barrier.as_ref().is_some_and(|barrier| !barrier.after_write) {
+                            save_barrier.take().expect("before-write barrier").wait().await;
+                        }
                         let result =
                             write_project_cached(&target, &doc, &raw_assets, &mut write_cache);
+                        #[cfg(test)]
+                        if let Some(barrier) = save_barrier {
+                            barrier.wait().await;
+                        }
                         (result, doc, write_cache)
                     }
                 })
@@ -1896,16 +1977,23 @@ impl FigItem {
                     if materializing {
                         this.project_root = Some(target.clone());
                     }
-                    // Disk and canvas agree again — this is the new merge
-                    // ancestor for reconciling future concurrent edits.
+                    // The disk contains this snapshot even if the live
+                    // document advanced while the writer was running.
                     this.merge_base = Some(saved_doc);
-                    this.dirty = false;
-                    this.preview_dirty_before = None;
+                    this.dirty = this
+                        .document
+                        .ready()
+                        .is_none_or(|document| document.render_generation() != generation);
+                    if !this.dirty {
+                        this.preview_dirty_before = None;
+                    }
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
-                    match kind {
-                        SaveKind::Explicit => cx.emit(FigItemEvent::StateChanged),
-                        SaveKind::Auto => cx.emit(FigItemEvent::Saved),
+                    cx.emit(FigItemEvent::Saved);
+                    if this.dirty {
+                        // Other views may have consumed their debounce while
+                        // this snapshot was queued or writing.
+                        cx.emit(FigItemEvent::Edited);
                     }
                     cx.notify();
                 }
@@ -3346,6 +3434,577 @@ mod tests {
         let fs = FakeFs::new(cx.executor());
         let roots: [&Path; 0] = [];
         Project::test(fs, roots, cx).await
+    }
+
+    struct SaveGenerationFixture {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        item: Entity<FigItem>,
+        view: Entity<crate::FigView>,
+        window: gpui::WindowHandle<gpui::Empty>,
+        page: NodeId,
+        text: NodeId,
+    }
+
+    async fn save_generation_fixture(cx: &mut TestAppContext) -> SaveGenerationFixture {
+        let project = empty_project(cx).await;
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+        });
+        let directory = tempfile::tempdir().expect("temporary save project");
+        let root = directory.path().join("Design");
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut text = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Text(
+            fanta_doc::TextNode::new("Before saving", 180.0, 30.0),
+        ));
+        text.parent = Some(page);
+        let text_id = text.id;
+        doc.apply(Operation::create_node(text))
+            .expect("create text");
+        write_project(&root, &doc, &BTreeMap::new()).expect("write initial project");
+        let item = ready_item(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let view = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| crate::FigView::new(item.clone(), project, window, cx))
+            })
+            .expect("create autosaving view");
+        SaveGenerationFixture {
+            _directory: directory,
+            root,
+            item,
+            view,
+            window,
+            page,
+            text: text_id,
+        }
+    }
+
+    fn pause_next_save(
+        item: &Entity<FigItem>,
+        cx: &mut TestAppContext,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        pause_next_save_at(item, false, cx)
+    }
+
+    fn pause_next_save_at(
+        item: &Entity<FigItem>,
+        after_write: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached, arrived) = futures::channel::oneshot::channel();
+        let (resume, wait) = futures::channel::oneshot::channel();
+        item.read_with(cx, |item, _| {
+            let previous = item
+                .project_writes
+                .next_save_barrier
+                .lock()
+                .expect("save test barrier")
+                .replace(SaveTestBarrier {
+                    reached,
+                    resume: wait,
+                    after_write,
+                });
+            assert!(previous.is_none(), "only one next-save barrier is armed");
+        });
+        (arrived, resume)
+    }
+
+    fn rename_saved_page(fixture: &SaveGenerationFixture, name: &str, cx: &mut TestAppContext) {
+        fixture.item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(fixture.page)
+                .expect("page")
+                .name
+                .clone();
+            item.apply(
+                Operation::SetName {
+                    id: fixture.page,
+                    old,
+                    new: name.into(),
+                },
+                cx,
+            )
+            .expect("rename page");
+        });
+    }
+
+    fn place_image_during_save(
+        fixture: &SaveGenerationFixture,
+        cx: &mut TestAppContext,
+    ) -> (NodeId, AssetId, Vec<u8>) {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([34, 197, 94, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode image");
+        let (node, asset) = fixture.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (doc, mut assets) = document.doc_and_assets();
+                let (asset, natural_size) = assets.add_image(bytes.clone()).expect("ingest image");
+                let mut bitmap = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Bitmap(
+                    fanta_doc::BitmapNode {
+                        asset,
+                        natural_size,
+                        local_size: [24.0, 24.0],
+                        crop: None,
+                        fit: fanta_doc::ImageFitMode::Fill,
+                        tint: None,
+                    },
+                ));
+                bitmap.parent = Some(fixture.page);
+                let node = bitmap.id;
+                doc.apply(Operation::create_node(bitmap))
+                    .expect("place image");
+                ((node, asset), DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        (node, asset, bytes)
+    }
+
+    async fn assert_save_generation_preserves_later_media(kind: SaveKind, cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let save = fixture.item.update(cx, |item, cx| item.save(kind, cx));
+        arrived.await.expect("save reached background writer");
+        rename_saved_page(&fixture, "Newer edit B", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        resume.send(()).expect("resume first save");
+        save.await.expect("first save succeeds");
+        cx.run_until_parked();
+
+        fixture.item.read_with(cx, |item, _| {
+            assert!(
+                item.is_dirty(),
+                "an older snapshot cannot mark newer edits clean"
+            );
+            assert_eq!(
+                item.merge_base
+                    .as_ref()
+                    .expect("saved merge base")
+                    .scene
+                    .get(fixture.page)
+                    .expect("saved page")
+                    .name,
+                "Snapshot A"
+            );
+            assert_eq!(
+                item.document().expect("document").raw_assets.get(&asset),
+                Some(&bytes)
+            );
+        });
+        let (first, first_assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("first save");
+        assert_eq!(
+            first.scene.get(fixture.page).expect("page").name,
+            "Snapshot A"
+        );
+        assert!(!first.scene.contains(node));
+        assert!(!first_assets.contains_key(&asset));
+
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(
+            !fixture.item.read_with(cx, |item, _| item.is_dirty()),
+            "the real view must autosave the remaining edit"
+        );
+        let (reopened, assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen autosaved project");
+        assert_eq!(
+            reopened.scene.get(fixture.page).expect("page").name,
+            "Newer edit B"
+        );
+        let fanta_doc::NodeData::Bitmap(bitmap) =
+            &reopened.scene.get(node).expect("new image node").data
+        else {
+            panic!("placed image must reopen as a bitmap");
+        };
+        assert_eq!(bitmap.asset, asset);
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        let reopened = FigDocument::from_doc(reopened, assets);
+        assert!(
+            reopened.gpui_images.contains_key(&asset),
+            "reopened image is decodable"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_generation_explicit_preserves_later_edits_and_image_assets(
+        cx: &mut TestAppContext,
+    ) {
+        assert_save_generation_preserves_later_media(SaveKind::Explicit, cx).await;
+    }
+
+    #[gpui::test]
+    async fn save_generation_auto_preserves_later_edits_and_image_assets(cx: &mut TestAppContext) {
+        assert_save_generation_preserves_later_media(SaveKind::Auto, cx).await;
+    }
+
+    #[gpui::test]
+    async fn save_generation_preserves_text_input_started_after_its_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let save = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("save reached background writer");
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                fixture.view.update(cx, |view, cx| {
+                    view.open_text_edit(
+                        fixture.text,
+                        crate::view::TextEditSeed::SelectAll,
+                        window,
+                        cx,
+                    );
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view,
+                        None,
+                        "Typed during save",
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("edit text while saving");
+        resume.send(()).expect("resume save");
+        save.await.expect("save completes");
+        cx.run_until_parked();
+        fixture.view.read_with(cx, |view, _| {
+            let edit = view
+                .text_edit
+                .as_ref()
+                .expect("saving must not discard a newer text session");
+            assert_eq!(edit.session.buffer(), "Typed during save");
+        });
+        fixture
+            .view
+            .update(cx, |view, cx| view.commit_text_edit(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let (reopened, _) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen committed text");
+        assert_eq!(
+            reopened
+                .scene
+                .get(fixture.text)
+                .expect("text node")
+                .data
+                .as_text()
+                .expect("text")
+                .content,
+            "Typed during save"
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn save_generation_serializes_writers_and_rearms_newer_edits(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("first writer paused");
+        rename_saved_page(&fixture, "Snapshot B", cx);
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+        cx.run_until_parked();
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "overlapping saves must not write the same tree concurrently"
+        );
+        let (before, _) = fanta_format::read_project_tree(&fixture.root).expect("original tree");
+        assert_eq!(before.scene.get(fixture.page).expect("page").name, "Page 1");
+        rename_saved_page(&fixture, "Current edit C", cx);
+        resume.send(()).expect("release first writer");
+        first.await.expect("first save");
+        second.await.expect("second save");
+        cx.run_until_parked();
+        fixture.item.read_with(cx, |item, _| {
+            assert!(item.is_dirty(), "neither snapshot contains C");
+            assert_eq!(
+                item.merge_base
+                    .as_ref()
+                    .expect("base")
+                    .scene
+                    .get(fixture.page)
+                    .expect("page")
+                    .name,
+                "Snapshot B"
+            );
+        });
+        let (saved, _) = fanta_format::read_project_tree(&fixture.root).expect("second tree");
+        assert_eq!(
+            saved.scene.get(fixture.page).expect("page").name,
+            "Snapshot B"
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let (current, _) =
+            fanta_format::read_project_tree(&fixture.root).expect("current autosave");
+        assert_eq!(
+            current.scene.get(fixture.page).expect("page").name,
+            "Current edit C"
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn save_generation_queue_preserves_capture_order_when_polled_backwards(
+        _cx: &mut TestAppContext,
+    ) {
+        let writes = Arc::new(ProjectWrites::default());
+        let first = writes.begin();
+        let second = writes.begin();
+        let mut second_turn = Box::pin(second.wait_for_turn());
+        assert!(futures::poll!(&mut second_turn).is_pending());
+        first.wait_for_turn().await;
+        assert!(futures::poll!(&mut second_turn).is_pending());
+        drop(first);
+        second_turn.await;
+        drop(second);
+        let state = writes.state.lock().expect("write state");
+        assert_eq!(state.active, 0);
+        assert!(
+            state.last_write.is_none(),
+            "completed chains must not accumulate"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_generation_rechecks_source_lock_before_a_queued_write(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("first writer paused");
+        rename_saved_page(&fixture, "Newer edit B", cx);
+        let second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        fixture
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        resume.send(()).expect("release already started writer");
+        first.await.expect("first save");
+        let error = second
+            .await
+            .expect_err("queued canvas write must respect the new source lock");
+        assert!(error.to_string().contains("FNX source is dirty"));
+        let (saved, _) = fanta_format::read_project_tree(&fixture.root).expect("saved tree");
+        assert_eq!(
+            saved.scene.get(fixture.page).expect("page").name,
+            "Snapshot A"
+        );
+        assert!(fixture.item.read_with(cx, |item, _| item.is_dirty()));
+        fixture
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save after source lock released");
+        let (saved, _) = fanta_format::read_project_tree(&fixture.root).expect("current tree");
+        assert_eq!(
+            saved.scene.get(fixture.page).expect("page").name,
+            "Newer edit B"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_generation_queue_waits_for_a_canceled_predecessors_worker(
+        _cx: &mut TestAppContext,
+    ) {
+        let writes = Arc::new(ProjectWrites::default());
+        let foreground = writes.begin();
+        let background = foreground.clone();
+        let canceled_queued = writes.begin();
+        let surviving = writes.begin();
+        let mut turn = Box::pin(surviving.wait_for_turn());
+        drop(foreground);
+        drop(canceled_queued);
+        assert!(
+            futures::poll!(&mut turn).is_pending(),
+            "canceling the middle save cannot bypass the first writer"
+        );
+        assert!(writes.suppresses_watcher(Instant::now() + Duration::from_secs(120)));
+        drop(background);
+        turn.await;
+        drop(surviving);
+        let state = writes.state.lock().expect("write state");
+        assert_eq!(state.active, 0);
+        assert!(state.last_write.is_none());
+    }
+
+    #[gpui::test]
+    async fn save_generation_overlapping_materialization_reuses_the_adopted_root(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        let source = fixture._directory.path().join("Imported.fig");
+        let root = fixture._directory.path().join("Imported");
+        let source_bytes = b"untouched original import";
+        std::fs::write(&source, source_bytes).expect("original source");
+        fixture.item.update(cx, |item, _| {
+            item.project_root = None;
+            item.abs_path = source.clone();
+        });
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save_at(&fixture.item, true, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived
+            .await
+            .expect("project written, adoption still paused");
+        assert!(fanta_format::is_project_dir(&root));
+        assert!(
+            fixture
+                .item
+                .read_with(cx, |item, _| item.project_root().is_none())
+        );
+        rename_saved_page(&fixture, "Newer edit B", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.run_until_parked();
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "the second save must wait for adoption of the first root"
+        );
+        resume.send(()).expect("finish materialization");
+        assert_eq!(first.await.expect("first save"), Some(root.clone()));
+        assert_eq!(second.await.expect("second save"), None);
+        cx.run_until_parked();
+        assert_eq!(
+            fixture
+                .item
+                .read_with(cx, |item, _| item.project_root().map(Path::to_path_buf)),
+            Some(root.clone())
+        );
+        let (reopened, assets) =
+            fanta_format::read_project_tree(&root).expect("reopen adopted root");
+        assert_eq!(
+            reopened.scene.get(fixture.page).expect("page").name,
+            "Newer edit B"
+        );
+        assert!(reopened.scene.contains(node));
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        assert_eq!(
+            std::fs::read(&source).expect("original source"),
+            source_bytes
+        );
+        assert!(!fixture._directory.path().join("Imported-2").exists());
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn save_generation_canceled_materialization_refuses_to_overwrite_external_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        let source = fixture._directory.path().join("Imported.fig");
+        let root = fixture._directory.path().join("Imported");
+        let source_bytes = b"untouched original import";
+        std::fs::write(&source, source_bytes).expect("original source");
+        fixture.item.update(cx, |item, _| {
+            item.project_root = None;
+            item.abs_path = source.clone();
+        });
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save_at(&fixture.item, true, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("write completed before cancellation");
+        rename_saved_page(&fixture, "Unsaved edit B", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        drop(first);
+        // The worker may already have observed cancellation; either outcome
+        // releases the test gate without letting its foreground adopt the root.
+        match resume.send(()) {
+            Ok(()) | Err(()) => {}
+        }
+        cx.run_until_parked();
+        let (mut external, assets) =
+            fanta_format::read_project_tree(&root).expect("completed tree");
+        external
+            .apply(Operation::SetName {
+                id: fixture.page,
+                old: "Snapshot A".into(),
+                new: "External edit".into(),
+            })
+            .expect("external edit");
+        write_project(&root, &external, &assets).expect("write external edit");
+        let error = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect_err("do not adopt an unverified foreign tree");
+        assert!(error.to_string().contains("already exists"));
+        fixture.item.read_with(cx, |item, _| {
+            assert!(item.is_dirty());
+            assert!(item.project_root().is_none());
+            assert!(item.doc().expect("document").scene.contains(node));
+            assert_eq!(
+                item.document().expect("document").raw_assets.get(&asset),
+                Some(&bytes)
+            );
+        });
+        let (unchanged, _) =
+            fanta_format::read_project_tree(&root).expect("external tree preserved");
+        assert_eq!(
+            unchanged.scene.get(fixture.page).expect("page").name,
+            "External edit"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("original source"),
+            source_bytes
+        );
     }
 
     #[gpui::test]

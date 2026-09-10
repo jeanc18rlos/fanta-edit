@@ -568,6 +568,17 @@ impl FigView {
         }
     }
 
+    fn reconcile_opened_entry_with_project_root(&mut self, cx: &App) {
+        if let Some(root) = self.item.read(cx).project_root() {
+            self.opened_entry_id = self.opened_entry_id.filter(|entry_id| {
+                let project = self.project.read(cx);
+                project.path_for_entry(*entry_id, cx)
+                    .and_then(|path| project.absolute_path(&path, cx))
+                    .is_some_and(|path| path.starts_with(root))
+            });
+        }
+    }
+
     fn subscribe_to_item(item: &Entity<FigItem>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(item, |this, _, event: &FigItemEvent, cx| {
             // Echo document state into the DesignPanel inspector. Preview
@@ -604,23 +615,17 @@ impl FigView {
                     this.hover_resize_handle = None;
                 }
                 FigItemEvent::TextSelectionChanged => {}
-                // An autosave wrote the document without replacing it, so
+                // A save wrote the document without replacing it, so
                 // nothing view-side is stale: only the tab's dirty mark
                 // changes. Deliberately NOT `StateChanged`, which every
                 // listener reads as a reload and answers by dropping
                 // in-flight sessions.
                 FigItemEvent::Saved => {
+                    this.reconcile_opened_entry_with_project_root(cx);
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::StateChanged => {
-                    if let Some(root) = this.item.read(cx).project_root() {
-                        this.opened_entry_id = this.opened_entry_id.filter(|entry_id| {
-                            let project = this.project.read(cx);
-                            project.path_for_entry(*entry_id, cx)
-                                .and_then(|path| project.absolute_path(&path, cx))
-                                .is_some_and(|path| path.starts_with(root))
-                        });
-                    }
+                    this.reconcile_opened_entry_with_project_root(cx);
                     // A reload replaces the document while prototype state
                     // contains node/variable IDs from the previous tree. Drop
                     // the session locally without trying to update the item
@@ -5622,7 +5627,7 @@ mod tests {
         Entity<FigItem>,
         Entity<FigView>,
     ) {
-        init_test(cx);
+        init_visual_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("Design");
