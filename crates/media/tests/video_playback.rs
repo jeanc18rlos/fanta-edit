@@ -1,0 +1,388 @@
+#[cfg(target_os = "macos")]
+mod native {
+    use anyhow::{Context, Result, bail, ensure};
+    use core_foundation::runloop::{CFRunLoopRunInMode, kCFRunLoopDefaultMode};
+    use media::video::{
+        PreparedVideoPlayback, VideoFrameUpdate, VideoPlayback, VideoPlaybackFrame,
+        VideoPlaybackState, prepare_video_playback, video_host_time_seconds,
+    };
+    use std::{
+        collections::BTreeSet,
+        path::PathBuf,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    const CLIP: &[u8] = include_bytes!("../test_fixtures/playback-three-scenes.mp4");
+    const QUADRANTS: &[u8] = include_bytes!("../test_fixtures/quadrants.mp4");
+    const ROTATE_90: &[u8] = include_bytes!("../test_fixtures/quadrants-rotate-90.mp4");
+    const ROTATE_180: &[u8] = include_bytes!("../test_fixtures/quadrants-rotate-180.mp4");
+    const ROTATE_270: &[u8] = include_bytes!("../test_fixtures/quadrants-rotate-270.mp4");
+    const MIRROR: &[u8] = include_bytes!("../test_fixtures/quadrants-mirrored.mp4");
+    const CORRUPT: &[u8] = include_bytes!("../test_fixtures/quadrants-corrupt.mp4");
+
+    fn tick() {
+        unsafe {
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, 0);
+        }
+    }
+
+    fn wait(mut predicate: impl FnMut() -> Result<bool>, label: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if predicate()? {
+                return Ok(());
+            }
+            ensure!(Instant::now() < deadline, "Timed out: {label}");
+            tick();
+        }
+    }
+
+    fn prepare(bytes: &[u8], maximum: u32) -> Result<PreparedVideoPlayback> {
+        use std::future::Future;
+        let mut request = Box::pin(prepare_video_playback(Arc::from(bytes), maximum)?);
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let std::task::Poll::Ready(result) = request.as_mut().poll(&mut context) {
+                return result;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "Timed out preparing local playback"
+            );
+            tick();
+        }
+    }
+
+    fn player(bytes: &[u8], maximum: u32) -> Result<VideoPlayback> {
+        let mut player = VideoPlayback::new(prepare(bytes, maximum)?)?;
+        player.set_audio(true, 0.)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "player ready",
+        )?;
+        Ok(player)
+    }
+
+    fn frame(player: &mut VideoPlayback) -> Result<VideoPlaybackFrame> {
+        let mut result = None;
+        wait(
+            || {
+                if let VideoFrameUpdate::Frame(frame) =
+                    player.frame_for_host_time(video_host_time_seconds())?
+                {
+                    result = Some(frame);
+                }
+                Ok(result.is_some())
+            },
+            "decoded output frame",
+        )?;
+        result.context("Missing decoded output frame")
+    }
+
+    fn colors(frame: &VideoPlaybackFrame) -> Result<[[u8; 3]; 4]> {
+        let buffer = &frame.buffer;
+        ensure!(
+            buffer.lock_base_address(1) == 0,
+            "Could not lock video frame"
+        );
+        let result = (|| {
+            let width = buffer.get_width();
+            let height = buffer.get_height();
+            let stride = buffer.get_bytes_per_row();
+            ensure!(
+                width > 0 && height > 0 && stride >= width * 4,
+                "Invalid video frame layout"
+            );
+            let pointer = unsafe { buffer.get_base_address() };
+            ensure!(!pointer.is_null(), "Frame has no CPU-readable storage");
+            let bytes =
+                unsafe { std::slice::from_raw_parts(pointer.cast::<u8>(), stride * height) };
+            let mut result = [[0; 3]; 4];
+            for (destination, (x, y)) in result.iter_mut().zip([
+                (width / 4, height / 4),
+                (width * 3 / 4, height / 4),
+                (width / 4, height * 3 / 4),
+                (width * 3 / 4, height * 3 / 4),
+            ]) {
+                let pixel = &bytes[y * stride + x * 4..y * stride + x * 4 + 4];
+                *destination = [pixel[2], pixel[1], pixel[0]];
+                ensure!(pixel[3] == 255, "Expected opaque decoded frame");
+            }
+            Ok(result)
+        })();
+        ensure!(
+            buffer.unlock_base_address(1) == 0,
+            "Could not unlock video frame"
+        );
+        result
+    }
+
+    fn near(actual: [u8; 3], expected: [u8; 3]) -> Result<()> {
+        ensure!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (i16::from(*a) - i16::from(b)).abs() < 35),
+            "Pixel {actual:?} differs from {expected:?}"
+        );
+        Ok(())
+    }
+
+    fn seek_frame(player: &mut VideoPlayback, position: u64) -> Result<VideoPlaybackFrame> {
+        player.seek(position)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "paused seek completion",
+        )?;
+        let frame = frame(player)?;
+        ensure!(
+            frame.presentation_time_us.abs_diff(position) <= 40_000,
+            "Seek returned an old frame: {} vs {position}",
+            frame.presentation_time_us
+        );
+        Ok(frame)
+    }
+
+    fn playback_advances_pauses_and_seeks() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        ensure!(
+            player.info().width == 128
+                && player.info().height == 96
+                && player.info().duration_us == 3_000_000,
+            "Unexpected playback metadata"
+        );
+        near(colors(&seek_frame(&mut player, 0)?)?[0], [255, 0, 0])?;
+        player.play()?;
+        let mut timestamps = BTreeSet::new();
+        wait(
+            || {
+                if let VideoFrameUpdate::Frame(frame) =
+                    player.frame_for_host_time(video_host_time_seconds())?
+                {
+                    timestamps.insert(frame.presentation_time_us);
+                }
+                Ok(player.status()?.current_time_us >= 450_000)
+            },
+            "video clock advance",
+        )?;
+        ensure!(
+            timestamps.len() >= 3,
+            "The player did not supply multiple advancing frames: {timestamps:?}"
+        );
+        player.pause()?;
+        let paused = player.status()?.current_time_us;
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            tick();
+        }
+        ensure!(
+            player.status()?.current_time_us.abs_diff(paused) < 35_000,
+            "Paused video kept advancing"
+        );
+        near(
+            colors(&seek_frame(&mut player, 1_500_000)?)?[0],
+            [0, 255, 255],
+        )?;
+        near(
+            colors(&seek_frame(&mut player, 2_500_000)?)?[0],
+            [255, 0, 255],
+        )?;
+        player.play()?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Ended),
+            "natural end",
+        )?;
+        player.play()?;
+        wait(
+            || {
+                let status = player.status()?;
+                Ok(status.state == VideoPlaybackState::Playing && status.current_time_us < 500_000)
+            },
+            "restart after end",
+        )?;
+        player.pause()?;
+        Ok(())
+    }
+
+    fn rapid_seek_keeps_only_the_latest_target() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        player.seek(2_700_000)?;
+        player.seek(1_300_000)?;
+        player.seek(200_000)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "latest seek",
+        )?;
+        let frame = frame(&mut player)?;
+        ensure!(
+            frame.presentation_time_us.abs_diff(200_000) < 40_000,
+            "Obsolete seek won: {}",
+            frame.presentation_time_us
+        );
+        near(colors(&frame)?[0], [255, 0, 0])?;
+        player.play()?;
+        player.seek(1_500_000)?;
+        player.pause()?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "pause during seek",
+        )?;
+        let time = player.status()?.current_time_us;
+        ensure!(
+            time.abs_diff(1_500_000) < 40_000,
+            "Pause lost seek position"
+        );
+        Ok(())
+    }
+
+    fn playback_preserves_oriented_bounded_pixels() -> Result<()> {
+        let palette = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
+        for (bytes, dimensions, expected) in [
+            (QUADRANTS, (64, 48), [0, 1, 2, 3]),
+            (ROTATE_90, (48, 64), [1, 3, 0, 2]),
+            (ROTATE_180, (64, 48), [3, 2, 1, 0]),
+            (ROTATE_270, (48, 64), [2, 0, 3, 1]),
+            (MIRROR, (64, 48), [1, 0, 3, 2]),
+        ] {
+            let mut player = player(bytes, 64)?;
+            let frame = seek_frame(&mut player, 0)?;
+            ensure!(
+                (frame.buffer.get_width(), frame.buffer.get_height()) == dimensions,
+                "Incorrect oriented dimensions"
+            );
+            for (actual, index) in colors(&frame)?.into_iter().zip(expected) {
+                near(actual, palette[index])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn native_failure_and_thread_restriction_surface_errors() -> Result<()> {
+        ensure!(
+            prepare_video_playback(Arc::from([]), 64).is_err(),
+            "Empty input accepted"
+        );
+        ensure!(
+            prepare_video_playback(Arc::from(CLIP), 0).is_err(),
+            "Invalid output limit accepted"
+        );
+        let prepared = prepare(CLIP, 64)?;
+        let rejected = std::thread::spawn(move || VideoPlayback::new(prepared).is_err())
+            .join()
+            .map_err(|_| anyhow::anyhow!("Thread-restriction test panicked"))?;
+        ensure!(rejected, "Player accepted a non-main-thread session");
+        let error = match prepare(CORRUPT, 64) {
+            Err(error) => error,
+            Ok(_) => bail!("Corrupt samples were accepted as usable video"),
+        };
+        ensure!(
+            error.to_string().contains("decodable first frame"),
+            "Corruption must fail actual source decoding, not a readiness timeout: {error:#}"
+        );
+        Ok(())
+    }
+
+    fn owned_inputs() -> Result<BTreeSet<PathBuf>> {
+        let prefix = format!("fanta-video-playback-{}-", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())?
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.file_name().to_string_lossy().starts_with(&prefix) => {
+                    Some(Ok(entry.path()))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            })
+            .collect()
+    }
+
+    fn close_and_cancel_release_sessions_and_files() -> Result<()> {
+        let baseline = owned_inputs()?;
+        for _ in 0..3 {
+            let request = prepare_video_playback(Arc::from(CLIP), 128)?;
+            ensure!(
+                owned_inputs()?.len() > baseline.len(),
+                "No owned loading input found"
+            );
+            drop(request);
+            wait(
+                || Ok(owned_inputs()? == baseline),
+                "canceled loading cleanup",
+            )?;
+            let mut player = player(CLIP, 128)?;
+            let frame = seek_frame(&mut player, 0)?;
+            player.play()?;
+            player.seek(2_000_000)?;
+            drop(player);
+            // A retained output frame must remain usable after the player is gone.
+            near(colors(&frame)?[0], [255, 0, 0])?;
+            drop(frame);
+            wait(
+                || Ok(owned_inputs()? == baseline),
+                "closed playback cleanup",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn run() -> Result<()> {
+        let cases: &[(&str, fn() -> Result<()>)] = &[
+            (
+                "playback_advances_pauses_and_seeks",
+                playback_advances_pauses_and_seeks,
+            ),
+            (
+                "rapid_seek_keeps_only_the_latest_target",
+                rapid_seek_keeps_only_the_latest_target,
+            ),
+            (
+                "playback_preserves_oriented_bounded_pixels",
+                playback_preserves_oriented_bounded_pixels,
+            ),
+            (
+                "native_failure_and_thread_restriction_surface_errors",
+                native_failure_and_thread_restriction_surface_errors,
+            ),
+            (
+                "close_and_cancel_release_sessions_and_files",
+                close_and_cancel_release_sessions_and_files,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (name, test) in cases {
+            let result = std::panic::catch_unwind(*test)
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Native case panicked")));
+            match result {
+                Ok(()) => println!("PASS {name}"),
+                Err(error) => {
+                    eprintln!("FAIL {name}: {error:#}");
+                    failures.push(*name);
+                }
+            }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "{} native playback cases failed: {failures:?}",
+                failures.len()
+            );
+        }
+        wait(
+            || Ok(owned_inputs()?.is_empty()),
+            "final native input cleanup",
+        )?;
+        println!("All {} native playback cases passed", cases.len());
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn main() -> anyhow::Result<()> {
+    native::run()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    println!("Native AVFoundation playback tests require macOS.");
+}

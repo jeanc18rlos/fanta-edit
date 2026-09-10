@@ -70,8 +70,10 @@ jobs:
       - name: Test the full native editor suite
         run: cargo test --locked -p fig_viewer --lib
 
-      - name: Test native video previews and decoder cleanup
-        run: cargo test --locked -p media --lib video_poster_
+      - name: Test native video previews, playback and cleanup
+        run: |
+          cargo test --locked -p media --lib
+          cargo test --locked -p media --test video_playback
 
       - name: Test Save As path prompts
         run: cargo test --locked -p open_path_prompt --lib save_as_

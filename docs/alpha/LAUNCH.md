@@ -23,10 +23,37 @@ Video preview runtime `110868d` passes six real native decoder tests and all
 606 editor tests. Generated MP4 results now have first-frame posters, oriented
 canvas placement, cached Save/Play bytes and account-change guards. Negative
 prompts follow the selected model's capabilities while preserving the draft.
-Seven timing cases passed 20 iterations each. Full native app and installer QA
-for this source is pending; playback still uses the system player, and inline
-video playback/editing plus production GPU verification remain unfinished.
+Seven timing cases passed 20 iterations each. The local app build passed,
+but native poster and installer QA remain pending after blocked sign-in, as
+recorded below. Playback in that build uses the system player; production GPU
+verification and planned video editing remain unfinished.
 See the video-poster section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
+
+## Latest video validation — September 10
+
+Backend video URL fix `0d3753a` was reviewed and passes **449 backend tests
+across 44 files**, **78 CPU-only worker tests**, and type checking. It is **not
+deployed**. URL renewal requires the backend and `videogen` worker with
+matching R2 configuration; historical URL-only results remain unchanged.
+
+The local poster app built successfully in **7m11s**, from runtime `110868d`
+plus protected user-staged changes, and passed strict ad-hoc signature checks.
+Normal local-fixture sign-in then stalled in `SecItemAdd` while writing to
+Keychain. Automation could not interact with SecurityAgent, so manual user
+approval was requested. The idle QA app and helper subsequently quit normally,
+and the fixture stopped. No native poster visual, video Save/Play/Place or
+video-project save/reopen result was obtained. A separate native playback
+engine now passes seven library tests and five real playback cases, including
+corrupt-first-frame rejection and cleanup. Its generation controls and canvas
+integration remain unfinished; the app still uses the system player.
+Evidence: `/tmp/fanta-release-qa-20260909/video-preview-validation/native/`
+(`native-build.json` and `verification.json`).
+
+The subsequent housekeeping check found only user app **21997** and helper
+**22010**, zero Cargo/zombie processes and **60.88 GiB free**. Daily **04:00
+Europe/Madrid** housekeeping remains scheduled, with Cargo cleanup on Sundays
+when idle, below 40 GiB free, or when a deferred cleanup becomes safe. Active
+work is preserved; the video fixture's port 47843 is closed.
 
 ## Required before accepting payment
 

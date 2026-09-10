@@ -1,19 +1,22 @@
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use block::ConcreteBlock;
 use core_foundation::{base::TCFType, string::CFString};
+use core_video::pixel_buffer::{CVPixelBuffer, CVPixelBufferRef, kCVPixelFormatType_32BGRA};
 use futures::channel::oneshot;
 use objc::{
     Encode, Encoding, class, msg_send,
     rc::{StrongPtr, autoreleasepool},
-    runtime::{Object, YES},
+    runtime::{BOOL, NO, Object, YES},
     sel, sel_impl,
 };
 use std::{
     ffi::c_void,
     future::Future,
     io::Write,
+    marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -23,6 +26,764 @@ use std::{
 
 const MAX_INPUT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_DIMENSION: u32 = 2048;
+
+const ASSET_KEYS: &[&str] = &["tracks", "duration", "playable", "hasProtectedContent"];
+const TRACK_KEYS: &[&str] = &[
+    "naturalSize",
+    "preferredTransform",
+    "nominalFrameRate",
+    "formatDescriptions",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoPlaybackInfo {
+    pub width: u32,
+    pub height: u32,
+    pub duration_us: u64,
+}
+
+pub struct PreparedVideoPlayback {
+    asset: Option<StrongPtr>,
+    track: Option<StrongPtr>,
+    input: Arc<tempfile::TempPath>,
+    info: VideoPlaybackInfo,
+    transform: NativeTransform,
+    frame_duration: NativeTime,
+    duration: NativeTime,
+}
+
+// Preparation contains only immutable, asynchronously loaded AVAsset/AVAssetTrack
+// objects. AVPlayer itself is created later on the consuming UI thread.
+unsafe impl Send for PreparedVideoPlayback {}
+
+impl PreparedVideoPlayback {
+    pub fn info(&self) -> VideoPlaybackInfo {
+        self.info
+    }
+}
+
+impl Drop for PreparedVideoPlayback {
+    fn drop(&mut self) {
+        autoreleasepool(|| {
+            drop(self.track.take());
+            drop(self.asset.take());
+        });
+    }
+}
+
+pub struct VideoPlaybackRequest {
+    asset: Option<StrongPtr>,
+    track: Option<StrongPtr>,
+    input: Arc<tempfile::TempPath>,
+    loaded: oneshot::Receiver<()>,
+    maximum_dimension: u32,
+    finished: bool,
+    sample_check: Option<VideoFrameRequest>,
+    prepared: Option<PreparedVideoPlayback>,
+}
+
+// This moves immutable asset loading state and the same cancellable image
+// generator used for posters. No player or native UI object crosses threads.
+unsafe impl Send for VideoPlaybackRequest {}
+
+impl Drop for VideoPlaybackRequest {
+    fn drop(&mut self) {
+        drop(self.sample_check.take());
+        drop(self.prepared.take());
+        autoreleasepool(|| unsafe {
+            if !self.finished
+                && let Some(asset) = &self.asset
+            {
+                let _: () = msg_send![**asset, cancelLoading];
+            }
+            drop(self.track.take());
+            drop(self.asset.take());
+        });
+    }
+}
+
+impl Future for VideoPlaybackRequest {
+    type Output = Result<PreparedVideoPlayback>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.finished {
+            return Poll::Ready(Err(anyhow!("Video preparation was already consumed.")));
+        }
+        loop {
+            if let Some(check) = self.sample_check.as_mut() {
+                match Pin::new(check).poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(error)) => {
+                        return Poll::Ready(Err(
+                            error.context("The video has no decodable first frame.")
+                        ));
+                    }
+                    Poll::Ready(Ok(frame)) => {
+                        drop(frame);
+                        self.finished = true;
+                        drop(self.sample_check.take());
+                        return Poll::Ready(
+                            self.prepared
+                                .take()
+                                .context("The prepared video was released."),
+                        );
+                    }
+                }
+            }
+            match Pin::new(&mut self.loaded).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(_)) => {
+                    return Poll::Ready(Err(anyhow!(
+                        "Video preparation stopped before completion."
+                    )));
+                }
+                Poll::Ready(Ok(())) => {}
+            }
+            let step = autoreleasepool(|| unsafe { self.finish_loading_step() });
+            match step {
+                Ok(Some(prepared)) => {
+                    // The player compositor can replace corrupt samples with black and
+                    // report normal completion. Verify one source sample before composing.
+                    let check = prepared
+                        .asset
+                        .as_ref()
+                        .context("The video asset was released.")
+                        .and_then(|asset| asset_frame(asset, prepared.input.clone(), 64));
+                    match check {
+                        Ok(check) => {
+                            self.sample_check = Some(check);
+                            self.prepared = Some(prepared);
+                        }
+                        Err(error) => return Poll::Ready(Err(error)),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
+impl VideoPlaybackRequest {
+    unsafe fn finish_loading_step(&mut self) -> Result<Option<PreparedVideoPlayback>> {
+        let asset = self.asset.as_ref().context("Video asset was released.")?;
+        if self.track.is_none() {
+            check_loaded(**asset, ASSET_KEYS)?;
+            let playable: BOOL = unsafe { msg_send![**asset, isPlayable] };
+            let protected: BOOL = unsafe { msg_send![**asset, hasProtectedContent] };
+            ensure!(
+                playable == YES && protected == NO,
+                "This video cannot be played locally."
+            );
+            let tracks: *mut Object =
+                unsafe { msg_send![**asset, tracksWithMediaType:AVMediaTypeVideo] };
+            ensure!(!tracks.is_null(), "The video has no playable track.");
+            let count: usize = unsafe { msg_send![tracks, count] };
+            ensure!(
+                count == 1,
+                "Video preview requires exactly one video track."
+            );
+            let track: *mut Object = unsafe { msg_send![tracks, objectAtIndex:0usize] };
+            ensure!(!track.is_null(), "The video track could not be loaded.");
+            self.track = Some(unsafe { StrongPtr::retain(track) });
+            self.loaded = load_native_keys(track, TRACK_KEYS, self.input.clone());
+            return Ok(None);
+        }
+        let track = self.track.as_ref().context("Video track was released.")?;
+        check_loaded(**track, TRACK_KEYS)?;
+        let duration: NativeTime = unsafe { msg_send![**asset, duration] };
+        let duration_us = time_us(duration)?;
+        ensure!(
+            duration_us > 0 && duration_us <= 86_400_000_000,
+            "Video duration is invalid or exceeds 24 hours."
+        );
+        let descriptions: *mut Object = unsafe { msg_send![**track, formatDescriptions] };
+        ensure!(
+            !descriptions.is_null(),
+            "The video has no format description."
+        );
+        let count: usize = unsafe { msg_send![descriptions, count] };
+        ensure!(
+            count == 1,
+            "Videos that change format during playback are unsupported."
+        );
+        let description: *const c_void = unsafe { msg_send![descriptions, objectAtIndex:0usize] };
+        ensure!(
+            !description.is_null(),
+            "The video format could not be read."
+        );
+        let size = unsafe { CMVideoFormatDescriptionGetPresentationDimensions(description, 1, 0) };
+        let transform: NativeTransform = unsafe { msg_send![**track, preferredTransform] };
+        let (info, transform) =
+            playback_geometry(size, transform, self.maximum_dimension, duration_us)?;
+        let frame_rate: f32 = unsafe { msg_send![**track, nominalFrameRate] };
+        ensure!(
+            frame_rate.is_finite() && frame_rate >= 0. && frame_rate <= 120.,
+            "Video frame rate exceeds the preview limit."
+        );
+        let frame_duration = NativeTime {
+            value: 1,
+            timescale: frame_rate.round().clamp(1., 60.) as i32,
+            flags: 1,
+            epoch: 0,
+        };
+        Ok(Some(PreparedVideoPlayback {
+            asset: self.asset.take(),
+            track: self.track.take(),
+            input: self.input.clone(),
+            info,
+            transform,
+            frame_duration,
+            duration,
+        }))
+    }
+}
+
+/// Writes the local input on the caller's thread, then loads metadata and checks one source frame asynchronously.
+/// Call this constructor on a background executor and impose a loading deadline.
+pub fn prepare_video_playback(
+    bytes: Arc<[u8]>,
+    maximum_dimension: u32,
+) -> Result<VideoPlaybackRequest> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= MAX_INPUT_BYTES,
+        "Choose a video smaller than 100 MiB."
+    );
+    ensure!(
+        (1..=MAX_DIMENSION).contains(&maximum_dimension),
+        "Video preview dimensions must be between 1 and 2048 pixels."
+    );
+    let mut input = tempfile::Builder::new()
+        .prefix(&format!("fanta-video-playback-{}-", std::process::id()))
+        .suffix(".mp4")
+        .tempfile()?;
+    input
+        .write_all(&bytes)
+        .context("Could not prepare the video for playback.")?;
+    input.flush()?;
+    let input = Arc::new(input.into_temp_path());
+    autoreleasepool(|| unsafe {
+        let path = CFString::new(
+            input
+                .to_str()
+                .context("The temporary video path is not valid text.")?,
+        );
+        let url: *mut Object =
+            msg_send![class!(NSURL), fileURLWithPath:path.as_concrete_TypeRef() as *mut Object];
+        ensure!(!url.is_null(), "Could not create the local video URL.");
+        let restrictions: *mut Object =
+            msg_send![class!(NSNumber), numberWithUnsignedInteger:0xffffusize];
+        ensure!(
+            !restrictions.is_null(),
+            "Could not restrict video references."
+        );
+        let options: *mut Object = msg_send![class!(NSDictionary), dictionaryWithObject:restrictions forKey:AVURLAssetReferenceRestrictionsKey];
+        ensure!(!options.is_null(), "Could not configure video playback.");
+        let asset: *mut Object = msg_send![class!(AVURLAsset), alloc];
+        let asset: *mut Object = msg_send![asset, initWithURL:url options:options];
+        ensure!(!asset.is_null(), "Could not open the local video asset.");
+        let asset = StrongPtr::new(asset);
+        let loaded = load_native_keys(*asset, ASSET_KEYS, input.clone());
+        Ok(VideoPlaybackRequest {
+            asset: Some(asset),
+            track: None,
+            input,
+            loaded,
+            maximum_dimension,
+            finished: false,
+            sample_check: None,
+            prepared: None,
+        })
+    })
+}
+
+fn load_native_keys(
+    object: *mut Object,
+    keys: &[&str],
+    input: Arc<tempfile::TempPath>,
+) -> oneshot::Receiver<()> {
+    let keys = core_foundation::array::CFArray::from_CFTypes(
+        &keys
+            .iter()
+            .map(|key| CFString::new(key))
+            .collect::<Vec<_>>(),
+    );
+    let (sender, receiver) = oneshot::channel();
+    let sender = Mutex::new(Some(sender));
+    let callback = ConcreteBlock::new(move || {
+        let _input = &input;
+        let mut sender = sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(sender) = sender.take()
+            && sender.send(()).is_err()
+        {
+            // Dropping the loading future deliberately abandons this completion.
+        }
+    })
+    .copy();
+    unsafe {
+        let _: () = msg_send![object, loadValuesAsynchronouslyForKeys:keys.as_concrete_TypeRef() as *mut Object completionHandler:&*callback];
+    }
+    receiver
+}
+
+fn check_loaded(object: *mut Object, keys: &[&str]) -> Result<()> {
+    for key in keys {
+        let name = CFString::new(key);
+        let mut error: *mut Object = std::ptr::null_mut();
+        let status: isize = unsafe {
+            msg_send![object, statusOfValueForKey:name.as_concrete_TypeRef() as *mut Object error:&mut error]
+        };
+        ensure!(
+            status == 2,
+            "Could not load video {key}: {}",
+            error_description(error)
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoPlaybackState {
+    Loading,
+    Paused,
+    Playing,
+    Seeking,
+    Ended,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoPlaybackStatus {
+    pub state: VideoPlaybackState,
+    pub current_time_us: u64,
+    pub duration_us: u64,
+}
+
+pub struct VideoPlaybackFrame {
+    pub buffer: CVPixelBuffer,
+    pub presentation_time_us: u64,
+}
+
+pub enum VideoFrameUpdate {
+    Unchanged,
+    Empty,
+    Frame(VideoPlaybackFrame),
+}
+
+pub struct VideoPlayback {
+    player: Option<StrongPtr>,
+    item: Option<StrongPtr>,
+    output: Option<StrongPtr>,
+    prepared: PreparedVideoPlayback,
+    seek_completion: Arc<Mutex<Option<bool>>>,
+    pending_seek: Option<u64>,
+    seeking: bool,
+    requested_play: bool,
+    _thread_confined: PhantomData<Rc<()>>,
+}
+
+impl VideoPlayback {
+    /// Create and use the session on a single UI thread. It owns no frame queue;
+    /// callers retain only the currently displayed frame and discard replaced ones.
+    pub fn new(prepared: PreparedVideoPlayback) -> Result<Self> {
+        autoreleasepool(|| unsafe {
+            let main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
+            ensure!(
+                main_thread == YES,
+                "Create video playback on the main UI thread."
+            );
+            let asset = prepared
+                .asset
+                .as_ref()
+                .context("The prepared video was released.")?;
+            let track = prepared
+                .track
+                .as_ref()
+                .context("The prepared track was released.")?;
+            let item: *mut Object = msg_send![class!(AVPlayerItem), alloc];
+            let item: *mut Object = msg_send![item, initWithAsset:**asset];
+            ensure!(!item.is_null(), "Could not create video playback.");
+            let item = StrongPtr::new(item);
+            let composition: *mut Object =
+                msg_send![class!(AVMutableVideoComposition), videoComposition];
+            let instruction: *mut Object = msg_send![
+                class!(AVMutableVideoCompositionInstruction),
+                videoCompositionInstruction
+            ];
+            let layer: *mut Object = msg_send![class!(AVMutableVideoCompositionLayerInstruction), videoCompositionLayerInstructionWithAssetTrack:**track];
+            ensure!(
+                !composition.is_null() && !instruction.is_null() && !layer.is_null(),
+                "Could not prepare oriented video playback."
+            );
+            let _: () = msg_send![layer, setTransform:prepared.transform atTime:NativeTime::ZERO];
+            let layers: *mut Object = msg_send![class!(NSArray), arrayWithObject:layer];
+            ensure!(!layers.is_null(), "Could not prepare the video layer.");
+            let _: () = msg_send![instruction, setLayerInstructions:layers];
+            let _: () = msg_send![instruction, setTimeRange:NativeTimeRange { start: NativeTime::ZERO, duration: prepared.duration }];
+            let instructions: *mut Object = msg_send![class!(NSArray), arrayWithObject:instruction];
+            ensure!(
+                !instructions.is_null(),
+                "Could not prepare video composition instructions."
+            );
+            let _: () = msg_send![composition, setInstructions:instructions];
+            let _: () = msg_send![composition, setRenderSize:NativeSize { width: prepared.info.width as f64, height: prepared.info.height as f64 }];
+            let _: () = msg_send![composition, setFrameDuration:prepared.frame_duration];
+            let track_id: i32 = msg_send![**track, trackID];
+            let _: () = msg_send![composition, setSourceTrackIDForFrameTiming:track_id];
+            let _: () = msg_send![*item, setVideoComposition:composition];
+            let attributes: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
+            ensure!(!attributes.is_null(), "Could not configure video frames.");
+            let format: *mut Object =
+                msg_send![class!(NSNumber), numberWithUnsignedInt:kCVPixelFormatType_32BGRA];
+            let compatible: *mut Object = msg_send![class!(NSNumber), numberWithBool:YES];
+            let surface: *mut Object = msg_send![class!(NSDictionary), dictionary];
+            ensure!(
+                !format.is_null() && !compatible.is_null() && !surface.is_null(),
+                "Could not configure video frame storage."
+            );
+            let _: () =
+                msg_send![attributes, setObject:format forKey:kCVPixelBufferPixelFormatTypeKey];
+            let _: () = msg_send![attributes, setObject:compatible forKey:kCVPixelBufferMetalCompatibilityKey];
+            let _: () = msg_send![attributes, setObject:surface forKey:kCVPixelBufferIOSurfacePropertiesKey];
+            let output: *mut Object = msg_send![class!(AVPlayerItemVideoOutput), alloc];
+            let output: *mut Object = msg_send![output, initWithPixelBufferAttributes:attributes];
+            ensure!(
+                !output.is_null(),
+                "Could not initialize video frame output."
+            );
+            let output = StrongPtr::new(output);
+            let _: () = msg_send![*output, setSuppressesPlayerRendering:YES];
+            let _: () = msg_send![*item, addOutput:*output];
+            let player: *mut Object = msg_send![class!(AVPlayer), alloc];
+            let player: *mut Object = msg_send![player, initWithPlayerItem:*item];
+            ensure!(!player.is_null(), "Could not initialize the video player.");
+            let player = StrongPtr::new(player);
+            Ok(Self {
+                player: Some(player),
+                item: Some(item),
+                output: Some(output),
+                prepared,
+                seek_completion: Arc::new(Mutex::new(None)),
+                pending_seek: None,
+                seeking: false,
+                requested_play: false,
+                _thread_confined: PhantomData,
+            })
+        })
+    }
+
+    pub fn info(&self) -> VideoPlaybackInfo {
+        self.prepared.info
+    }
+
+    pub fn play(&mut self) -> Result<()> {
+        let status = self.status()?;
+        self.requested_play = true;
+        if status.state == VideoPlaybackState::Ended {
+            self.pending_seek = Some(0);
+        }
+        self.advance_seek()?;
+        if !self.seeking {
+            autoreleasepool(|| unsafe {
+                let _: () = msg_send![self.player()?, play];
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn pause(&mut self) -> Result<()> {
+        self.requested_play = false;
+        autoreleasepool(|| unsafe {
+            let _: () = msg_send![self.player()?, pause];
+            Ok(())
+        })
+    }
+
+    pub fn set_audio(&mut self, muted: bool, volume: f32) -> Result<()> {
+        ensure!(
+            volume.is_finite() && (0. ..=1.).contains(&volume),
+            "Video volume must be between zero and one."
+        );
+        autoreleasepool(|| unsafe {
+            let player = self.player()?;
+            let _: () = msg_send![player, setMuted:if muted { YES } else { NO }];
+            let _: () = msg_send![player, setVolume:volume];
+            Ok(())
+        })
+    }
+
+    /// Only one native seek runs at a time. Repeated requests replace its queued
+    /// successor; status/frame polling applies the latest completion on this thread.
+    pub fn seek(&mut self, time_us: u64) -> Result<()> {
+        ensure!(
+            time_us <= self.prepared.info.duration_us,
+            "The requested position is outside this video."
+        );
+        self.pending_seek = Some(time_us);
+        self.advance_seek()
+    }
+
+    pub fn status(&mut self) -> Result<VideoPlaybackStatus> {
+        self.advance_seek()?;
+        autoreleasepool(|| unsafe {
+            let player = self.player()?;
+            let item = self.item.as_ref().context("The video player was closed.")?;
+            let item_status: isize = msg_send![**item, status];
+            let player_status: isize = msg_send![player, status];
+            if item_status == 2 || player_status == 2 {
+                let error: *mut Object = if item_status == 2 {
+                    msg_send![**item, error]
+                } else {
+                    msg_send![player, error]
+                };
+                bail!("Video playback failed: {}", error_description(error));
+            }
+            let current: NativeTime = msg_send![player, currentTime];
+            let current_time_us = if item_status == 0 {
+                0
+            } else {
+                time_us(current)?.min(self.prepared.info.duration_us)
+            };
+            let control: isize = msg_send![player, timeControlStatus];
+            let state = if self.seeking {
+                VideoPlaybackState::Seeking
+            } else if current_time_us >= self.prepared.info.duration_us {
+                self.requested_play = false;
+                VideoPlaybackState::Ended
+            } else if item_status == 0 || (self.requested_play && control != 2) {
+                VideoPlaybackState::Loading
+            } else if control == 2 {
+                VideoPlaybackState::Playing
+            } else {
+                VideoPlaybackState::Paused
+            };
+            Ok(VideoPlaybackStatus {
+                state,
+                current_time_us,
+                duration_us: self.prepared.info.duration_us,
+            })
+        })
+    }
+
+    pub fn frame_for_host_time(&mut self, host_time: f64) -> Result<VideoFrameUpdate> {
+        ensure!(
+            host_time.is_finite() && host_time >= 0.,
+            "The video display timestamp is invalid."
+        );
+        self.status()?;
+        if self.seeking {
+            return Ok(VideoFrameUpdate::Unchanged);
+        }
+        autoreleasepool(|| unsafe {
+            let output = self
+                .output
+                .as_ref()
+                .context("The video player was closed.")?;
+            let requested: NativeTime = msg_send![**output, itemTimeForHostTime:host_time];
+            if requested.flags & 1 == 0 {
+                return Ok(VideoFrameUpdate::Unchanged);
+            }
+            let available: BOOL = msg_send![**output, hasNewPixelBufferForItemTime:requested];
+            if available != YES {
+                return Ok(VideoFrameUpdate::Unchanged);
+            }
+            let mut presentation = NativeTime::ZERO;
+            let buffer: CVPixelBufferRef = msg_send![**output, copyPixelBufferForItemTime:requested itemTimeForDisplay:&mut presentation];
+            if buffer.is_null() {
+                return Ok(VideoFrameUpdate::Empty);
+            }
+            let buffer = CVPixelBuffer::wrap_under_create_rule(buffer);
+            ensure!(
+                buffer.get_pixel_format() == kCVPixelFormatType_32BGRA
+                    && buffer.get_width() == self.prepared.info.width as usize
+                    && buffer.get_height() == self.prepared.info.height as usize,
+                "The video player returned an unexpected frame format or size."
+            );
+            let presentation_time_us = time_us(presentation)?;
+            ensure!(
+                presentation_time_us <= self.prepared.info.duration_us,
+                "The video player returned an invalid frame time."
+            );
+            Ok(VideoFrameUpdate::Frame(VideoPlaybackFrame {
+                buffer,
+                presentation_time_us,
+            }))
+        })
+    }
+
+    fn player(&self) -> Result<*mut Object> {
+        self.player
+            .as_ref()
+            .map(|player| **player)
+            .context("The video player was closed.")
+    }
+
+    fn advance_seek(&mut self) -> Result<()> {
+        let mut completed = false;
+        if self.seeking {
+            let completion = self
+                .seek_completion
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            let Some(finished) = completion else {
+                return Ok(());
+            };
+            self.seeking = false;
+            ensure!(
+                finished || self.pending_seek.is_some(),
+                "The video seek was interrupted. Try seeking again."
+            );
+            completed = true;
+        }
+        if let Some(target) = self.pending_seek.take() {
+            let completion = Arc::downgrade(&self.seek_completion);
+            let input = self.prepared.input.clone();
+            let callback = ConcreteBlock::new(move |finished: BOOL| {
+                let _input = &input;
+                if let Some(completion) = completion.upgrade() {
+                    *completion
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(finished == YES);
+                }
+            })
+            .copy();
+            autoreleasepool(|| unsafe {
+                let player = self.player()?;
+                let _: () = msg_send![player, pause];
+                let time = NativeTime {
+                    value: target as i64,
+                    timescale: 1_000_000,
+                    flags: 1,
+                    epoch: 0,
+                };
+                let _: () = msg_send![player, seekToTime:time toleranceBefore:NativeTime::ZERO toleranceAfter:NativeTime::ZERO completionHandler:&*callback];
+                Ok::<_, anyhow::Error>(())
+            })?;
+            self.seeking = true;
+        } else if completed && self.requested_play {
+            autoreleasepool(|| unsafe {
+                let _: () = msg_send![self.player()?, play];
+                Ok::<_, anyhow::Error>(())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VideoPlayback {
+    fn drop(&mut self) {
+        autoreleasepool(|| unsafe {
+            if let Some(player) = &self.player {
+                let _: () = msg_send![**player, pause];
+            }
+            if let Some(item) = &self.item {
+                let _: () = msg_send![**item, cancelPendingSeeks];
+                if let Some(output) = &self.output {
+                    let _: () = msg_send![**item, removeOutput:**output];
+                }
+            }
+            if let Some(player) = &self.player {
+                let _: () = msg_send![**player, replaceCurrentItemWithPlayerItem:std::ptr::null_mut::<Object>()];
+            }
+            drop(self.player.take());
+            drop(self.output.take());
+            drop(self.item.take());
+        });
+    }
+}
+
+pub fn video_host_time_seconds() -> f64 {
+    unsafe { CACurrentMediaTime() }
+}
+
+fn time_us(time: NativeTime) -> Result<u64> {
+    ensure!(
+        time.flags & 1 != 0
+            && time.flags & (4 | 8 | 16) == 0
+            && time.timescale > 0
+            && time.epoch == 0
+            && time.value >= 0,
+        "The video returned an invalid timestamp."
+    );
+    Ok(u64::try_from(
+        i128::from(time.value) * 1_000_000 / i128::from(time.timescale),
+    )?)
+}
+
+fn playback_geometry(
+    size: NativeSize,
+    transform: NativeTransform,
+    maximum: u32,
+    duration_us: u64,
+) -> Result<(VideoPlaybackInfo, NativeTransform)> {
+    ensure!(
+        size.width.is_finite()
+            && size.height.is_finite()
+            && size.width > 0.
+            && size.height > 0.
+            && size.width <= 8192.
+            && size.height <= 8192.
+            && size.width * size.height <= 33_554_432.,
+        "Video source dimensions exceed the preview limit."
+    );
+    let NativeTransform { a, b, c, d, tx, ty } = transform;
+    ensure!(
+        [a, b, c, d, tx, ty].iter().all(|value| value.is_finite())
+            && [a, b, c, d]
+                .iter()
+                .all(|value| [0., 1., -1.].contains(value))
+            && (a * d - b * c).abs() == 1.
+            && a * b == 0.
+            && c * d == 0.
+            && tx.abs() <= 1e9
+            && ty.abs() <= 1e9,
+        "Video preview supports only quarter-turn rotations and reflections."
+    );
+    let points = [
+        (0., 0.),
+        (size.width, 0.),
+        (0., size.height),
+        (size.width, size.height),
+    ]
+    .map(|(x, y)| (a * x + c * y + tx, b * x + d * y + ty));
+    let min_x = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f64::INFINITY, f64::min);
+    let min_y = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f64::INFINITY, f64::min);
+    let width = points
+        .iter()
+        .map(|point| point.0)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - min_x;
+    let height = points
+        .iter()
+        .map(|point| point.1)
+        .fold(f64::NEG_INFINITY, f64::max)
+        - min_y;
+    let scale = (f64::from(maximum) / width.max(height)).min(1.);
+    Ok((
+        VideoPlaybackInfo {
+            width: (width * scale).ceil().min(f64::from(maximum)) as u32,
+            height: (height * scale).ceil().min(f64::from(maximum)) as u32,
+            duration_us,
+        },
+        NativeTransform {
+            a: a * scale,
+            b: b * scale,
+            c: c * scale,
+            d: d * scale,
+            tx: (tx - min_x) * scale,
+            ty: (ty - min_y) * scale,
+        },
+    ))
+}
 
 #[derive(Debug)]
 pub struct VideoFrame {
@@ -97,10 +858,7 @@ pub fn video_frame(bytes: Arc<[u8]>, maximum_dimension: u32) -> Result<VideoFram
         .context("Could not prepare the video for decoding.")?;
     input.flush()?;
     let input = Arc::new(input.into_temp_path());
-    let canceled = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = oneshot::channel();
-    let sender = Mutex::new(Some(sender));
-    let generator = autoreleasepool(|| unsafe {
+    autoreleasepool(|| unsafe {
         let path = input
             .to_str()
             .context("The temporary video path is not valid text.")?;
@@ -124,8 +882,21 @@ pub fn video_frame(bytes: Arc<[u8]>, maximum_dimension: u32) -> Result<VideoFram
         let asset: *mut Object = msg_send![asset, initWithURL:url options:options];
         ensure!(!asset.is_null(), "Could not open the local video asset.");
         let asset = StrongPtr::new(asset);
+        asset_frame(&asset, input.clone(), maximum_dimension)
+    })
+}
+
+fn asset_frame(
+    asset: &StrongPtr,
+    input: Arc<tempfile::TempPath>,
+    maximum_dimension: u32,
+) -> Result<VideoFrameRequest> {
+    let canceled = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = oneshot::channel();
+    let sender = Mutex::new(Some(sender));
+    let generator = autoreleasepool(|| unsafe {
         let generator: *mut Object = msg_send![class!(AVAssetImageGenerator), alloc];
-        let generator: *mut Object = msg_send![generator, initWithAsset:*asset];
+        let generator: *mut Object = msg_send![generator, initWithAsset:**asset];
         ensure!(
             !generator.is_null(),
             "Could not initialize the video decoder."
@@ -342,6 +1113,33 @@ struct NativeSize {
     width: f64,
     height: f64,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct NativeTransform {
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    tx: f64,
+    ty: f64,
+}
+unsafe impl Encode for NativeTransform {
+    fn encode() -> Encoding {
+        unsafe { Encoding::from_str("{CGAffineTransform=dddddd}") }
+    }
+}
+
+#[repr(C)]
+struct NativeTimeRange {
+    start: NativeTime,
+    duration: NativeTime,
+}
+unsafe impl Encode for NativeTimeRange {
+    fn encode() -> Encoding {
+        unsafe { Encoding::from_str("{CMTimeRange={CMTime=qiIq}{CMTime=qiIq}}") }
+    }
+}
 unsafe impl Encode for NativeSize {
     fn encode() -> Encoding {
         unsafe { Encoding::from_str("{CGSize=dd}") }
@@ -362,6 +1160,28 @@ struct NativeRect {
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {
     static AVURLAssetReferenceRestrictionsKey: *mut Object;
+    static AVMediaTypeVideo: *mut Object;
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    static kCVPixelBufferPixelFormatTypeKey: *mut Object;
+    static kCVPixelBufferMetalCompatibilityKey: *mut Object;
+    static kCVPixelBufferIOSurfacePropertiesKey: *mut Object;
+}
+
+#[link(name = "CoreMedia", kind = "framework")]
+unsafe extern "C" {
+    fn CMVideoFormatDescriptionGetPresentationDimensions(
+        description: *const c_void,
+        use_pixel_aspect_ratio: u8,
+        use_clean_aperture: u8,
+    ) -> NativeSize;
+}
+
+#[link(name = "QuartzCore", kind = "framework")]
+unsafe extern "C" {
+    fn CACurrentMediaTime() -> f64;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -400,6 +1220,100 @@ mod tests {
     const ROTATE_270: &[u8] = include_bytes!("../test_fixtures/quadrants-rotate-270.mp4");
     const MIRRORED: &[u8] = include_bytes!("../test_fixtures/quadrants-mirrored.mp4");
     const CORRUPT: &[u8] = include_bytes!("../test_fixtures/quadrants-corrupt.mp4");
+
+    #[test]
+    fn video_playback_geometry_rejects_unbounded_or_nonorthogonal_sources() -> Result<()> {
+        let identity = NativeTransform {
+            a: 1.,
+            b: 0.,
+            c: 0.,
+            d: 1.,
+            tx: 0.,
+            ty: 0.,
+        };
+        let (info, transform) = playback_geometry(
+            NativeSize {
+                width: 1920.,
+                height: 1080.,
+            },
+            identity,
+            640,
+            1_000_000,
+        )?;
+        assert_eq!((info.width, info.height), (640, 360));
+        assert!((transform.a - 1. / 3.).abs() < 1e-12);
+        assert!(
+            playback_geometry(
+                NativeSize {
+                    width: 10_000.,
+                    height: 1080.
+                },
+                identity,
+                640,
+                1_000_000
+            )
+            .is_err()
+        );
+        assert!(
+            playback_geometry(
+                NativeSize {
+                    width: f64::NAN,
+                    height: 1080.
+                },
+                identity,
+                640,
+                1_000_000
+            )
+            .is_err()
+        );
+        assert!(
+            playback_geometry(
+                NativeSize {
+                    width: 1920.,
+                    height: 1080.
+                },
+                NativeTransform { c: 0.2, ..identity },
+                640,
+                1_000_000
+            )
+            .is_err()
+        );
+        assert!(
+            playback_geometry(
+                NativeSize {
+                    width: 1920.,
+                    height: 1080.
+                },
+                NativeTransform {
+                    a: 2.,
+                    d: 2.,
+                    ..identity
+                },
+                640,
+                1_000_000
+            )
+            .is_err()
+        );
+        let (info, transform) = playback_geometry(
+            NativeSize {
+                width: 1920.,
+                height: 1080.,
+            },
+            NativeTransform {
+                a: 0.,
+                b: 1.,
+                c: -1.,
+                d: 0.,
+                tx: 35.,
+                ty: -90.,
+            },
+            640,
+            1_000_000,
+        )?;
+        assert_eq!((info.width, info.height), (360, 640));
+        assert_eq!((transform.tx, transform.ty), (360., 0.));
+        Ok(())
+    }
 
     fn decode(bytes: &[u8], maximum_dimension: u32) -> Result<VideoFrame> {
         let request = video_frame(Arc::from(bytes), maximum_dimension)?;

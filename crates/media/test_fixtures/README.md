@@ -16,3 +16,7 @@ ffmpeg -f lavfi -i color=black:s=256x192:r=4:d=1 \
 For the tiny control, dimensions and quadrant boundaries are divided by four, and `-x264-params 8x8dct=0` is added. The variants' transform matrices apply the corresponding quarter turn or horizontal reflection with positive display-space translation.
 
 All fixture artwork and generated clips are original synthetic test data, released under the repository's Apache-2.0 license. Runtime tests use the platform decoder; ffmpeg is not a dependency of the app or its tests.
+
+`playback-three-scenes.mp4` is a three-second, 30 fps, 256×192 High-profile clip with the same BT.709 encoding settings. Its first second contains the quadrants, the second is cyan and the third is magenta. It has no audio. Native player tests use these distinct frames to verify time advancement, pause, accurate seeking, latest-request coalescing and restart after the end. The dedicated `video_playback` Cargo test target runs on its main thread and pumps the public Core Foundation run loop because AVPlayer readiness requires the main queue; ordinary worker-thread libtest is retained for poster and pure geometry tests.
+
+The corrupt fixture must fail an actual first-source-frame decode during preparation. On the validation Mac, AVPlayer's video compositor substituted a black frame and reported a normal end for these zeroed samples, so ready/end status alone did not validate media. The preparation check uses the same asset and temporary input at a 64-pixel bound; it does not validate every later sample or replace real-time player output.
