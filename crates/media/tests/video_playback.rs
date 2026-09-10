@@ -208,6 +208,40 @@ mod native {
         Ok(())
     }
 
+    fn repeated_same_position_seek_can_resume_advancing_frames() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        for _ in 0..3 {
+            near(
+                colors(&seek_frame(&mut player, 1_200_000)?)?[0],
+                [0, 255, 255],
+            )?;
+        }
+        player.play()?;
+        let mut timestamps = BTreeSet::new();
+        wait(
+            || {
+                if let VideoFrameUpdate::Frame(frame) =
+                    player.frame_for_host_time(video_host_time_seconds())?
+                {
+                    near(colors(&frame)?[0], [0, 255, 255])?;
+                    timestamps.insert(frame.presentation_time_us);
+                }
+                Ok(player.status()?.current_time_us >= 1_650_000)
+            },
+            "playback after repeated same-position seeks",
+        )?;
+        ensure!(
+            timestamps.len() >= 3 && timestamps.last().is_some_and(|time| *time > 1_400_000),
+            "Repeated seek pinned the frame query: {timestamps:?}"
+        );
+        player.pause()?;
+        near(
+            colors(&seek_frame(&mut player, 2_500_000)?)?[0],
+            [255, 0, 255],
+        )?;
+        Ok(())
+    }
+
     fn rapid_seek_keeps_only_the_latest_target() -> Result<()> {
         let mut player = player(CLIP, 128)?;
         player.seek(2_700_000)?;
@@ -291,6 +325,9 @@ mod native {
         let mut player = self::player(QUADRANTS, 128)?;
         for (target, sample_start, sample_end, expected) in [
             (125_000, 0, 250_000, [255, 0, 0]),
+            (150_000, 0, 250_000, [255, 0, 0]),
+            (175_000, 0, 250_000, [255, 0, 0]),
+            (125_000, 0, 250_000, [255, 0, 0]),
             (875_000, 750_000, 1_000_000, [0, 255, 255]),
         ] {
             player.seek(target)?;
@@ -331,6 +368,191 @@ mod native {
                 near(actual, palette[index])?;
             }
         }
+        Ok(())
+    }
+
+    fn trim_clamps_seeks_pauses_at_end_and_replays_from_start() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        let original = player.info();
+        for (start, end) in [(0, 0), (2_000_000, 1_000_000), (0, 3_000_001)] {
+            ensure!(
+                player.set_time_range(start, end).is_err(),
+                "Invalid trim was accepted"
+            );
+        }
+        let start = 1_200_000;
+        let end = 2_000_000;
+        player.set_time_range(start, end)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "trim start",
+        )?;
+        ensure!(player.info() == original, "Trim changed source metadata");
+        ensure!(
+            player.status()?.duration_us == original.duration_us,
+            "Trim lost source duration"
+        );
+        let first = frame(&mut player)?;
+        near(colors(&first)?[0], [0, 255, 255])?;
+        ensure!(
+            first.presentation_time_us.abs_diff(start) < 40_000,
+            "Trim did not begin at its source time"
+        );
+
+        for (requested, target) in [(0, start), (original.duration_us, end - 1)] {
+            player.seek(requested)?;
+            wait(
+                || Ok(player.status()?.state == VideoPlaybackState::Paused),
+                "clamped trim seek",
+            )?;
+            let position = player.status()?.current_time_us;
+            ensure!(
+                position.abs_diff(target) < 40_000,
+                "Seek escaped trim: {position} vs {target}"
+            );
+            let current = frame(&mut player)?;
+            ensure!(
+                current.presentation_time_us < end,
+                "Seek exposed the excluded next scene"
+            );
+            near(colors(&current)?[0], [0, 255, 255])?;
+        }
+        near(
+            colors(&seek_frame(&mut player, 1_400_000)?)?[0],
+            [0, 255, 255],
+        )?;
+        player.play()?;
+        wait(
+            || Ok(player.status()?.current_time_us >= 1_500_000),
+            "trim playback advance",
+        )?;
+        player.pause()?;
+        let paused = player.status()?.current_time_us;
+        let until = Instant::now() + Duration::from_millis(150);
+        while Instant::now() < until {
+            tick();
+        }
+        ensure!(
+            player.status()?.current_time_us.abs_diff(paused) < 35_000,
+            "Trim advanced while paused"
+        );
+        player.play()?;
+        let mut frame_count = 0;
+        wait(
+            || {
+                if let VideoFrameUpdate::Frame(current) =
+                    player.frame_for_host_time(video_host_time_seconds())?
+                {
+                    ensure!(
+                        current.presentation_time_us < end,
+                        "Playback exposed the excluded next scene"
+                    );
+                    near(colors(&current)?[0], [0, 255, 255])?;
+                    frame_count += 1;
+                }
+                Ok(player.status()?.state == VideoPlaybackState::Ended)
+            },
+            "native trim end",
+        )?;
+        ensure!(frame_count > 0, "Trim supplied no advancing frames");
+        ensure!(
+            player.status()?.current_time_us.abs_diff(end) <= 1,
+            "Native trim did not stop at its end"
+        );
+        player.play()?;
+        wait(
+            || {
+                let status = player.status()?;
+                Ok(status.state == VideoPlaybackState::Playing
+                    && status.current_time_us < 1_400_000)
+            },
+            "trim replay",
+        )?;
+        let replay = frame(&mut player)?;
+        near(colors(&replay)?[0], [0, 255, 255])?;
+        ensure!(
+            replay.presentation_time_us < 1_400_000,
+            "Replay ignored trim start"
+        );
+        player.pause()?;
+        player.set_time_range(0, original.duration_us)?;
+        near(
+            colors(&seek_frame(&mut player, 2_500_000)?)?[0],
+            [255, 0, 255],
+        )?;
+        ensure!(
+            player.info() == original,
+            "Restoring the range changed the original video"
+        );
+        Ok(())
+    }
+
+    fn trim_change_replaces_pending_seek_without_leaking_old_frames() -> Result<()> {
+        let mut player = player(CLIP, 128)?;
+        player.play()?;
+        player.seek(2_700_000)?;
+        player.seek(200_000)?;
+        player.set_time_range(1_100_000, 1_800_000)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "trim replaced queued seek",
+        )?;
+        let first = frame(&mut player)?;
+        ensure!(
+            first.presentation_time_us.abs_diff(1_100_000) < 40_000,
+            "Old queued seek escaped new trim"
+        );
+        near(colors(&first)?[0], [0, 255, 255])?;
+        ensure!(
+            player.set_time_range(1_800_000, 1_100_000).is_err(),
+            "Reversed trim accepted"
+        );
+        player.seek(0)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "valid trim survives rejection",
+        )?;
+        ensure!(
+            player.status()?.current_time_us.abs_diff(1_100_000) < 40_000,
+            "Rejected trim changed prior bounds"
+        );
+        near(colors(&frame(&mut player)?)?[0], [0, 255, 255])?;
+        Ok(())
+    }
+
+    fn trim_inside_long_sample_keeps_containing_pixels() -> Result<()> {
+        let mut player = player(QUADRANTS, 128)?;
+        player.set_time_range(125_000, 200_000)?;
+        wait(
+            || Ok(player.status()?.state == VideoPlaybackState::Paused),
+            "trim inside low-FPS sample",
+        )?;
+        let first = frame(&mut player)?;
+        ensure!(
+            first.presentation_time_us <= 125_001,
+            "Trim began after its requested sample"
+        );
+        near(colors(&first)?[0], [255, 0, 0])?;
+        player.play()?;
+        wait(
+            || {
+                if let VideoFrameUpdate::Frame(current) =
+                    player.frame_for_host_time(video_host_time_seconds())?
+                {
+                    ensure!(
+                        current.presentation_time_us < 200_000,
+                        "Low-FPS trim emitted an excluded frame"
+                    );
+                    near(colors(&current)?[0], [255, 0, 0])?;
+                }
+                Ok(player.status()?.state == VideoPlaybackState::Ended)
+            },
+            "low-FPS native trim end",
+        )?;
+        ensure!(
+            player.status()?.current_time_us.abs_diff(200_000) <= 1,
+            "Low-FPS trim overran its end"
+        );
         Ok(())
     }
 
@@ -411,6 +633,10 @@ mod native {
         }
         let cases: &[(&str, fn() -> Result<()>)] = &[
             (
+                "repeated_same_position_seek_can_resume_advancing_frames",
+                repeated_same_position_seek_can_resume_advancing_frames,
+            ),
+            (
                 "playback_advances_pauses_and_seeks",
                 playback_advances_pauses_and_seeks,
             ),
@@ -425,6 +651,18 @@ mod native {
             (
                 "playback_preserves_oriented_bounded_pixels",
                 playback_preserves_oriented_bounded_pixels,
+            ),
+            (
+                "trim_clamps_seeks_pauses_at_end_and_replays_from_start",
+                trim_clamps_seeks_pauses_at_end_and_replays_from_start,
+            ),
+            (
+                "trim_change_replaces_pending_seek_without_leaking_old_frames",
+                trim_change_replaces_pending_seek_without_leaking_old_frames,
+            ),
+            (
+                "trim_inside_long_sample_keeps_containing_pixels",
+                trim_inside_long_sample_keeps_containing_pixels,
             ),
             (
                 "native_failure_and_thread_restriction_surface_errors",

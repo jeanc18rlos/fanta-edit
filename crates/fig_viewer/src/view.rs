@@ -376,6 +376,20 @@ struct CanvasVideoSession {
     observation: Option<Subscription>,
     error: Option<SharedString>,
     audio: (bool, u32),
+    bytes: Option<std::sync::Arc<[u8]>>,
+    trim: Option<CanvasVideoTrim>,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasVideoTrim {
+    source: CanvasVideoSource,
+    expected: fanta_doc::VideoNode,
+    start: Entity<ui_input::InputField>,
+    end: Entity<ui_input::InputField>,
+    duration_us: u64,
+    task: std::cell::RefCell<Option<Task<()>>>,
+    cancelled: std::cell::Cell<bool>,
+    error: Option<SharedString>,
 }
 
 struct PrototypeRenderCache {
@@ -2629,6 +2643,15 @@ impl FigView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self
+            .canvas_video
+            .as_ref()
+            .is_some_and(|session| session.trim.is_some())
+        {
+            self.cancel_video_trim(cx);
+            return;
+        }
         if self.prototype_player.is_some() {
             self.exit_prototype_session(cx);
             return;
@@ -4420,6 +4443,9 @@ impl FigView {
 
     fn set_canvas_video_active(&self, active: bool, cx: &mut Context<Self>) {
         self.canvas_video_active.set(active);
+        if !active {
+            self.cancel_pending_video_trim();
+        }
         if let Some(playback) = self
             .canvas_video
             .as_ref()
@@ -4456,8 +4482,8 @@ impl FigView {
             self.set_canvas_video_active(window_active, cx);
             return;
         }
-        let unsupported = source.time_range_us[0] != 0
-            || source.time_range_us[1] <= 0
+        let unsupported = source.time_range_us[0] < 0
+            || source.time_range_us[1] <= source.time_range_us[0]
             || source.speed_bits != 1_f32.to_bits();
         self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
         let generation = self.canvas_video_generation;
@@ -4466,8 +4492,10 @@ impl FigView {
             loading: None,
             playback: None,
             observation: None,
-            error: unsupported.then(|| "Inline playback supports full clips at normal speed. This layer uses a different playback range or speed.".into()),
+            error: unsupported.then(|| "Inline playback and trimming support normal-speed video with a valid source range.".into()),
             audio: (muted, volume.to_bits()),
+            bytes: None,
+            trim: None,
         });
         if unsupported {
             return;
@@ -4524,7 +4552,22 @@ impl FigView {
             return;
         }
         let playback = match result {
-            Ok(bytes) => Some(cx.new(|cx| VideoPlaybackView::new(bytes, 2048, cx))),
+            Ok(bytes) => {
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.bytes = Some(bytes.clone());
+                }
+                Some(cx.new(|cx| {
+                    VideoPlaybackView::new_with_range(
+                        bytes,
+                        2048,
+                        [
+                            source.time_range_us[0] as u64,
+                            source.time_range_us[1] as u64,
+                        ],
+                        cx,
+                    )
+                }))
+            }
             Err(error) => {
                 if let Some(session) = self.canvas_video.as_mut() {
                     session.loading = None;
@@ -4567,7 +4610,10 @@ impl FigView {
         }
         let playback = session.playback.as_ref()?.read(cx);
         let status = playback.status();
-        if !canvas_video_duration_supported(session.source.time_range_us, status.duration_us) {
+        if !canvas_video_duration_supported(
+            session.source.time_range_us,
+            playback.source_duration_us(),
+        ) {
             return None;
         }
         Some(CanvasVideoFrame {
@@ -4577,6 +4623,357 @@ impl FigView {
             revision: playback.frame_revision(),
             session_revision: self.canvas_video_generation,
         })
+    }
+
+    fn cancel_pending_video_trim(&self) {
+        if let Some(trim) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.trim.as_ref())
+        {
+            trim.cancelled.set(true);
+            trim.task.borrow_mut().take();
+        }
+    }
+
+    fn begin_video_trim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) || self.canvas_video_removed.get() {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let Some(session) = self.canvas_video.as_ref() else {
+            return;
+        };
+        let Some(playback) = session.playback.clone() else {
+            return;
+        };
+        let duration_us = playback.read(cx).source_duration_us();
+        if duration_us == 0
+            || session.bytes.is_none()
+            || session.source.speed_bits != 1_f32.to_bits()
+        {
+            return;
+        }
+        let source = session.source;
+        let Some(NodeData::Video(expected)) = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(source.node))
+            .map(|node| &node.data)
+        else {
+            return;
+        };
+        let expected = expected.clone();
+        let start = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "0")
+                .label("Start (seconds)")
+                .label_min_width(px(0.))
+        });
+        let end = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "0")
+                .label("End (seconds)")
+                .label_min_width(px(0.))
+        });
+        start.update(cx, |input, cx| {
+            input.set_text(&video_trim_time_text(expected.time_range_us[0]), window, cx)
+        });
+        end.update(cx, |input, cx| {
+            input.set_text(&video_trim_time_text(expected.time_range_us[1]), window, cx)
+        });
+        playback.update(cx, |playback, cx| playback.pause(cx));
+        self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.trim = Some(CanvasVideoTrim {
+                source,
+                expected,
+                start,
+                end,
+                duration_us,
+                task: Default::default(),
+                cancelled: std::cell::Cell::new(false),
+                error: None,
+            });
+        }
+        cx.notify();
+    }
+
+    fn cancel_video_trim(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.trim = None;
+        }
+        cx.notify();
+    }
+
+    fn apply_video_trim(&mut self, cx: &mut Context<Self>) {
+        self.apply_video_trim_with(
+            |bytes, range| Box::pin(crate::generation_media::prepare_video_trim(bytes, range)),
+            cx,
+        );
+    }
+
+    fn apply_video_trim_with(
+        &mut self,
+        prepare: impl FnOnce(
+            std::sync::Arc<[u8]>,
+            [i64; 2],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::generation_media::PreparedVideoTrim>>
+                    + Send,
+            >,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx)
+            || self.canvas_video_removed.get()
+            || !self.canvas_video_active.get()
+        {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let Some(session) = self.canvas_video.as_ref() else {
+            return;
+        };
+        let Some(trim) = session.trim.as_ref() else {
+            return;
+        };
+        if trim.task.borrow().is_some() {
+            return;
+        }
+        let parsed = (|| {
+            let range = [
+                parse_video_trim_time(&trim.start.read(cx).text(cx))?,
+                parse_video_trim_time(&trim.end.read(cx).text(cx))?,
+            ];
+            crate::generation_media::validate_video_trim(range, i64::try_from(trim.duration_us)?)?;
+            Ok::<_, anyhow::Error>(range)
+        })();
+        let range = match parsed {
+            Ok(range) => range,
+            Err(error) => {
+                if let Some(trim) = self
+                    .canvas_video
+                    .as_mut()
+                    .and_then(|session| session.trim.as_mut())
+                {
+                    trim.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if range == trim.expected.time_range_us {
+            self.cancel_video_trim(cx);
+            return;
+        }
+        let Some(bytes) = session.bytes.clone() else {
+            return;
+        };
+        let source = trim.source;
+        let generation = self.canvas_video_generation;
+        let expected = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(source.node))
+            .and_then(|node| match &node.data {
+                NodeData::Video(video) => Some(video.clone()),
+                _ => None,
+            });
+        let Some(expected) = expected else { return };
+        if let Some(trim) = self
+            .canvas_video
+            .as_mut()
+            .and_then(|session| session.trim.as_mut())
+        {
+            trim.expected = expected;
+            trim.cancelled.set(false);
+        }
+        let work = cx.background_spawn(prepare(bytes, range));
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(20));
+        let task = cx.spawn(async move |this, cx| {
+            let result = match futures::future::select(work, timer).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+                    "Preparing the trim preview took too long. The video was not changed."
+                )),
+            };
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.finish_video_trim(source, generation, result, cx)
+            }) {
+                log::debug!("Video trim owner was released: {error}");
+            }
+        });
+        if let Some(trim) = self
+            .canvas_video
+            .as_mut()
+            .and_then(|session| session.trim.as_mut())
+        {
+            trim.error = None;
+            *trim.task.borrow_mut() = Some(task);
+        }
+        cx.notify();
+    }
+
+    fn finish_video_trim(
+        &mut self,
+        source: CanvasVideoSource,
+        generation: u64,
+        result: Result<crate::generation_media::PreparedVideoTrim>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.canvas_video_removed.get()
+            || !self.canvas_video_active.get()
+            || generation != self.canvas_video_generation
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(source)
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+        {
+            return;
+        }
+        let Some(trim) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.trim.as_ref())
+        else {
+            return;
+        };
+        if trim.cancelled.get() || trim.source != source {
+            return;
+        }
+        trim.task.borrow_mut().take();
+        let expected = trim.expected.clone();
+        let requested_range = (|| {
+            Ok::<_, anyhow::Error>([
+                parse_video_trim_time(&trim.start.read(cx).text(cx))?,
+                parse_video_trim_time(&trim.end.read(cx).text(cx))?,
+            ])
+        })();
+        let result = result.and_then(|prepared| {
+            anyhow::ensure!(
+                requested_range? == prepared.range_us,
+                "The trim times changed while the preview was loading. Apply the trim again."
+            );
+            anyhow::ensure!(
+                self.is_editable(cx),
+                "This document is currently read-only."
+            );
+            self.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    crate::generation_media::trim_video(document, source.node, &expected, prepared)
+                })
+                .context("The video document was closed.")?
+            })
+        });
+        match result {
+            Ok(()) => {
+                self.clear_canvas_video(cx);
+                self.invalidate_canvas_cache();
+            }
+            Err(error) => {
+                if let Some(trim) = self
+                    .canvas_video
+                    .as_mut()
+                    .and_then(|session| session.trim.as_mut())
+                {
+                    trim.error = Some(format!("Could not trim video: {error:#}").into());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_video_trim_controls(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = self.canvas_video.as_ref()?;
+        if let Some(trim) = session.trim.as_ref() {
+            let busy = trim.task.borrow().is_some();
+            let error = trim.error.clone();
+            return Some(
+                v_flex()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        Label::new(format!(
+                            "Trim original video · {} seconds",
+                            video_trim_time_text(trim.duration_us as i64)
+                        ))
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .w_full()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .debug_selector(|| "video-trim-start".to_owned())
+                                    .child(trim.start.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .debug_selector(|| "video-trim-end".to_owned())
+                                    .child(trim.end.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new(
+                                    "video-trim-apply",
+                                    if busy {
+                                        "Preparing preview…"
+                                    } else {
+                                        "Apply trim"
+                                    },
+                                )
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_video_trim(cx))),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "video-trim-cancel-target".to_owned())
+                                    .child(Button::new("video-trim-cancel", "Cancel").on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_video_trim(cx)),
+                                    )),
+                            ),
+                    )
+                    .when_some(error, |element, error| {
+                        element.child(Label::new(error).color(Color::Error))
+                    })
+                    .into_any_element(),
+            );
+        }
+        let enabled = self.is_editable(cx)
+            && session.bytes.is_some()
+            && session.source.speed_bits == 1_f32.to_bits()
+            && session.playback.as_ref().is_some_and(|playback| {
+                playback.read(cx).source_duration_us() > 0 && playback.read(cx).error().is_none()
+            });
+        Some(
+            div()
+                .debug_selector(|| "video-trim-open-target".to_owned())
+                .child(
+                    Button::new("video-trim", "Trim video")
+                        .disabled(!enabled)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.begin_video_trim(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_canvas_video_controls(
@@ -4591,10 +4988,11 @@ impl FigView {
         let mut controls = None;
         if let Some(playback) = playback {
             let rendered = playback.update(cx, |playback, cx| playback.render_controls(window, cx));
-            let duration = playback.read(cx).status().duration_us;
+            let duration = playback.read(cx).source_duration_us();
             if duration > 0 && !canvas_video_duration_supported(range, duration) {
                 playback.update(cx, |playback, cx| playback.close(cx));
-                error = Some("Inline playback supports full clips at normal speed. This layer uses a trimmed range.".into());
+                error =
+                    Some("This video range extends beyond the original source duration.".into());
                 if let Some(session) = self.canvas_video.as_mut() {
                     session.error = error.clone();
                     session.playback = None;
@@ -4604,6 +5002,7 @@ impl FigView {
                 controls = Some(rendered);
             }
         }
+        let trim_controls = self.render_video_trim_controls(window, cx);
         Some(
             v_flex()
                 .id("canvas-video-controls")
@@ -4617,6 +5016,7 @@ impl FigView {
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().panel_background)
                 .children(controls)
+                .children(trim_controls)
                 .when_some(error, |element, error| {
                     element.child(Label::new(error).color(Color::Error))
                 })
@@ -4632,10 +5032,43 @@ impl FigView {
 }
 
 #[cfg(target_os = "macos")]
+fn parse_video_trim_time(text: &str) -> Result<i64> {
+    let (seconds, fraction) = text.trim().split_once('.').unwrap_or((text.trim(), ""));
+    anyhow::ensure!(
+        !seconds.is_empty()
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.len() <= 6
+            && fraction.bytes().all(|byte| byte.is_ascii_digit()),
+        "Enter seconds with up to six decimal places, such as 1.25."
+    );
+    let seconds: i64 = seconds.parse().context("The time is too large.")?;
+    let fraction: i64 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i64>()? * 10_i64.pow(6 - fraction.len() as u32)
+    };
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|time| time.checked_add(fraction))
+        .context("The time is too large.")
+}
+
+#[cfg(target_os = "macos")]
+fn video_trim_time_text(time: i64) -> String {
+    if time % 1_000_000 == 0 {
+        return (time / 1_000_000).to_string();
+    }
+    format!("{}.{:06}", time / 1_000_000, time % 1_000_000)
+        .trim_end_matches('0')
+        .to_owned()
+}
+
+#[cfg(target_os = "macos")]
 fn canvas_video_duration_supported(range: [i64; 2], duration: u64) -> bool {
-    range[0] == 0
+    range[0] >= 0
+        && range[0] < range[1]
         && duration > 0
-        && u64::try_from(range[1]).is_ok_and(|end| end.abs_diff(duration) <= 1_000)
+        && u64::try_from(range[1]).is_ok_and(|end| end <= duration)
 }
 
 impl Render for FigView {
@@ -5380,6 +5813,7 @@ impl Item for FigView {
         #[cfg(target_os = "macos")]
         {
             self.canvas_video_removed.set(true);
+            self.cancel_pending_video_trim();
             if let Some(playback) = self
                 .canvas_video
                 .as_ref()
@@ -5895,6 +6329,406 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    async fn video_trim_view_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<FigItem>,
+        gpui::WindowHandle<FigView>,
+    ) {
+        let (directory, item, previous_view) = canvas_video_fixture(cx).await;
+        let project = previous_view.read_with(cx, |view, _| view.project.clone());
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        let window = cx.add_window(|window, cx| FigView::new(item.clone(), project, window, cx));
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .expect("activate trim window");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                playback.update(cx, |playback, cx| playback.tick(window, cx));
+                let (source, muted, volume) = view.selected_canvas_video_source(cx).expect("video");
+                view.canvas_video = Some(CanvasVideoSession {
+                    source,
+                    loading: None,
+                    playback: Some(playback),
+                    observation: None,
+                    error: None,
+                    audio: (muted, volume.to_bits()),
+                    bytes: Some(std::sync::Arc::from(&b"original MP4 bytes"[..])),
+                    trim: None,
+                });
+                view.begin_video_trim(window, cx);
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("trim controls");
+                trim.start
+                    .update(cx, |input, cx| input.set_text("0.5", window, cx));
+                trim.end
+                    .update(cx, |input, cx| input.set_text("2", window, cx));
+            })
+            .expect("trim controls");
+        (directory, item, window)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_trim_for_view(range_us: [i64; 2]) -> crate::generation_media::PreparedVideoTrim {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([225, 0, 225, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("poster");
+        crate::generation_media::PreparedVideoTrim {
+            range_us,
+            source_duration_us: 3_000_000,
+            poster: crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: range_us[0],
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_apply_waits_for_poster_and_commits_one_history_step(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            let id = single_selection(doc).expect("video");
+            (
+                id,
+                doc.scene.get(id).expect("video").clone(),
+                doc.history.undo_depth(),
+            )
+        });
+        let (send, receive) = futures::channel::oneshot::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.apply_video_trim_with(
+                    |bytes, range| {
+                        assert_eq!(bytes.as_ref(), b"original MP4 bytes");
+                        assert_eq!(range, [500_000, 2_000_000]);
+                        Box::pin(async move { receive.await.context("poster response")? })
+                    },
+                    cx,
+                )
+            })
+            .expect("apply");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            assert_eq!(
+                doc.scene.get(before.0),
+                Some(&before.1),
+                "no partial range mutation before the poster"
+            );
+            assert_eq!(doc.history.undo_depth(), before.2);
+        });
+        send.send(Ok(prepared_trim_for_view([500_000, 2_000_000])))
+            .unwrap_or_else(|_| panic!("pending poster"));
+        cx.run_until_parked();
+        item.update(cx, |item, cx| {
+            let doc = &item.document().expect("document").doc;
+            let NodeData::Video(video) = &doc.scene.get(before.0).expect("video").data else {
+                panic!("video")
+            };
+            assert_eq!(video.time_range_us, [500_000, 2_000_000]);
+            assert_eq!(video.poster_frame_us, Some(500_000));
+            assert!(video.poster.is_some());
+            assert_eq!(doc.history.undo_depth(), before.2 + 1);
+            assert!(item.undo(cx).expect("undo trim"));
+            assert_eq!(
+                item.document().expect("document").doc.scene.get(before.0),
+                Some(&before.1)
+            );
+            assert!(item.redo(cx).expect("redo trim"));
+            assert!(item.is_dirty());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_cancel_error_timeout_and_stale_target_preserve_document(
+        cx: &mut TestAppContext,
+    ) {
+        for case in [
+            "cancel",
+            "error",
+            "timeout",
+            "deactivate",
+            "remove",
+            "source-change",
+            "input-change",
+        ] {
+            let (_directory, item, window) = video_trim_view_fixture(cx).await;
+            let before = item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                let id = single_selection(&document.doc).expect("video");
+                (
+                    id,
+                    document.doc.scene.get(id).expect("video").clone(),
+                    document.raw_assets.clone(),
+                    document.doc.history.undo_depth(),
+                )
+            });
+            let (send, receive) = futures::channel::oneshot::channel::<
+                Result<crate::generation_media::PreparedVideoTrim>,
+            >();
+            let (source, generation) = window
+                .update(cx, |view, _, cx| {
+                    view.apply_video_trim_with(
+                        |_, _| Box::pin(async move { receive.await.context("poster response")? }),
+                        cx,
+                    );
+                    (
+                        view.canvas_video.as_ref().expect("session").source,
+                        view.canvas_video_generation,
+                    )
+                })
+                .expect("apply");
+            cx.run_until_parked();
+            match case {
+                "cancel" => window
+                    .update(cx, |view, _, cx| view.cancel_video_trim(cx))
+                    .expect("cancel"),
+                "deactivate" => window
+                    .update(cx, |view, _, cx| view.set_canvas_video_active(false, cx))
+                    .expect("deactivate"),
+                "remove" => window
+                    .update(cx, |view, _, cx| Item::on_removed(view, cx))
+                    .expect("remove"),
+                "timeout" => {
+                    cx.executor()
+                        .advance_clock(std::time::Duration::from_secs(21));
+                    cx.run_until_parked();
+                }
+                "input-change" => window
+                    .update(cx, |view, window, cx| {
+                        let trim = view
+                            .canvas_video
+                            .as_ref()
+                            .and_then(|session| session.trim.as_ref())
+                            .expect("trim");
+                        trim.start
+                            .update(cx, |input, cx| input.set_text("1", window, cx));
+                    })
+                    .expect("new trim time"),
+                "source-change" => item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.clear();
+                        ((), DocChange::Selection)
+                    });
+                }),
+                "error" => {
+                    send.send(Err(anyhow::anyhow!("injected poster decode failure")))
+                        .unwrap_or_else(|_| panic!("pending poster"));
+                    cx.run_until_parked();
+                }
+                _ => unreachable!(),
+            }
+            if case != "error" && case != "timeout" {
+                // Even an already queued completion must not mutate a cancelled or rebound view.
+                window
+                    .update(cx, |view, _, cx| {
+                        view.finish_video_trim(
+                            source,
+                            generation,
+                            Ok(prepared_trim_for_view([500_000, 2_000_000])),
+                            cx,
+                        )
+                    })
+                    .expect("late completion");
+            }
+            if matches!(case, "error" | "timeout" | "input-change") {
+                window
+                    .update(cx, |view, _, _| {
+                        let trim = view
+                            .canvas_video
+                            .as_ref()
+                            .and_then(|session| session.trim.as_ref())
+                            .expect("retryable trim inputs");
+                        assert!(trim.error.is_some(), "{case}");
+                        assert!(trim.task.borrow().is_none(), "{case}");
+                    })
+                    .expect("visible failure");
+            }
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(document.doc.scene.get(before.0), Some(&before.1), "{case}");
+                assert_eq!(document.raw_assets, before.2, "{case}");
+                assert_eq!(document.doc.history.undo_depth(), before.3, "{case}");
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_controls_open_cancel_and_fit_the_canvas_footer(cx: &mut TestAppContext) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let view = window.entity(cx).expect("view");
+        let depth = item.read_with(cx, |item, _| {
+            item.document().expect("document").doc.history.undo_depth()
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [1_000., 1_200.] {
+            visual.simulate_resize(size(px(width), px(900.)));
+            visual.update(|window, cx| window.draw(cx).clear());
+            let footer = visual
+                .debug_bounds("canvas-video-controls")
+                .expect("video controls");
+            for selector in [
+                "video-trim-start",
+                "video-trim-end",
+                "video-trim-cancel-target",
+            ] {
+                let bounds = visual.debug_bounds(selector).expect("visible trim control");
+                assert!(
+                    bounds.left() >= footer.left() && bounds.right() <= footer.right(),
+                    "{selector}: {bounds:?} outside {footer:?}"
+                );
+                assert!(
+                    bounds.top() >= footer.top() && bounds.bottom() <= footer.bottom(),
+                    "{selector}"
+                );
+            }
+        }
+        let cancel = visual
+            .debug_bounds("video-trim-cancel-target")
+            .expect("cancel");
+        visual.simulate_click(cancel.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(&visual, |view, _| {
+            assert!(view.canvas_video.as_ref().expect("session").trim.is_none())
+        });
+        let open = visual
+            .debug_bounds("video-trim-open-target")
+            .expect("trim button");
+        visual.simulate_click(open.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("video-trim-start").is_some());
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.document().expect("document").doc.history.undo_depth(),
+                depth
+            )
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_invalid_input_never_starts_preparation(cx: &mut TestAppContext) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            item.document().expect("document").doc.history.undo_depth()
+        });
+        for (start, end) in [
+            ("NaN", "2"),
+            ("-1", "2"),
+            ("2", "2"),
+            ("2", "1"),
+            ("0", "11"),
+        ] {
+            window
+                .update(cx, |view, window, cx| {
+                    let trim = view
+                        .canvas_video
+                        .as_ref()
+                        .and_then(|session| session.trim.as_ref())
+                        .expect("trim");
+                    trim.start
+                        .update(cx, |input, cx| input.set_text(start, window, cx));
+                    trim.end
+                        .update(cx, |input, cx| input.set_text(end, window, cx));
+                    view.apply_video_trim_with(|_, _| panic!("invalid input reached decoder"), cx);
+                    let trim = view
+                        .canvas_video
+                        .as_ref()
+                        .and_then(|session| session.trim.as_ref())
+                        .expect("trim");
+                    assert!(trim.error.is_some());
+                    assert!(trim.task.borrow().is_none());
+                })
+                .expect("validate input");
+        }
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("document")
+                .doc
+                .history
+                .undo_depth()),
+            before
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_trim_decimal_times_preserve_microseconds_without_float_rounding() {
+        for (text, expected) in [
+            ("0", 0),
+            ("1.25", 1_250_000),
+            ("0.000001", 1),
+            ("9223372036854.775807", i64::MAX),
+        ] {
+            assert_eq!(parse_video_trim_time(text).expect("valid time"), expected);
+            assert_eq!(
+                parse_video_trim_time(&video_trim_time_text(expected)).expect("round trip"),
+                expected
+            );
+        }
+        for text in ["NaN", "-0.1", "1e3", "1.0000001", "9223372036854.775808"] {
+            assert!(parse_video_trim_time(text).is_err(), "{text}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_authored_range_starts_canvas_loading(cx: &mut TestAppContext) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let id = single_selection(&document.doc).expect("selected video");
+                let old = document.doc.scene.get(id).expect("video").data.clone();
+                let mut new = old.clone();
+                let NodeData::Video(video) = &mut new else {
+                    panic!("video")
+                };
+                video.time_range_us = [500_000, 2_000_000];
+                document
+                    .doc
+                    .apply(Operation::ReplaceData {
+                        id,
+                        old: Box::new(old),
+                        new: Box::new(new),
+                    })
+                    .expect("author source range");
+                ((), DocChange::Content)
+            });
+        });
+        view.update(cx, |view, cx| {
+            view.sync_canvas_video(true, cx);
+            let session = view.canvas_video.as_ref().expect("video session");
+            assert!(
+                session.error.is_none(),
+                "valid authored trim must be playable"
+            );
+            assert!(
+                session.loading.is_some(),
+                "load the original source without rewriting it"
+            );
+            view.clear_canvas_video(cx);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn canvas_video_controls_remain_below_the_design_toolbar(cx: &mut TestAppContext) {
         init_visual_test(cx);
@@ -5945,6 +6779,8 @@ mod tests {
                 observation: None,
                 error: None,
                 audio: (muted, volume.to_bits()),
+                bytes: None,
+                trim: None,
             });
         });
         let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
@@ -6045,6 +6881,8 @@ mod tests {
                 observation: None,
                 error: None,
                 audio: (muted, volume.to_bits()),
+                bytes: None,
+                trim: None,
             });
             Item::on_removed(view, cx);
             assert!(view.canvas_video_frame(cx).is_none());
@@ -6105,13 +6943,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn canvas_video_full_source_validation_rejects_trimmed_and_unknown_duration() {
+    fn video_trim_source_validation_accepts_bounded_ranges_and_rejects_unknown_duration() {
         assert!(canvas_video_duration_supported([0, 3_000_000], 3_000_000));
-        assert!(!canvas_video_duration_supported(
+        assert!(canvas_video_duration_supported(
             [1_000_000, 3_000_000],
             3_000_000
         ));
-        assert!(!canvas_video_duration_supported([0, 2_000_000], 3_000_000));
+        assert!(canvas_video_duration_supported([0, 2_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported([0, 4_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported([-1, 2_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported(
+            [2_000_000, 2_000_000],
+            3_000_000
+        ));
         assert!(!canvas_video_duration_supported([0, -1], 3_000_000));
         assert!(!canvas_video_duration_supported([0, 3_000_000], 0));
     }

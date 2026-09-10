@@ -6,12 +6,76 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 
 | Area | Current status |
 | --- | --- |
-| Backend and AI | Video URL fix `0d3753a` is live, with 449 backend/78 worker tests and candidate/production public checks passed. Earlier Sonnet streaming, credit metering, catalog access and key revocation passed. Matching-R2 video worker rollout, final native sign-in/persistence and real production media remain unverified. |
-| Customer payments | Not enabled. Resolve product/pricing/currency/credit allowances, configure Polar, and verify checkout and subscription lifecycle before charging customers. |
-| Editor | Creation/editing, Save As, reopening, Git commit/push, Scale, curve viewport and Undo/Redo checks have native evidence. Local durable recovery passed two full restarts, with exact SVG/image bytes and no automatic generation or status requests. Hosted-installer verification remains open. Text on Path is unfinished. |
-| Leads | PostHog US access recovered. The live waitlist stores contacts and attribution correctly. Exclude the synthetic QA signup; no outreach or conversion improvement is claimed. |
-| Distribution | Both checks for `66bef60` failed the queued consecutive-seek timestamp assertion; its installer remains queued behind the running `a984699` build. Local release builds pass, but final GitHub checks, Apple notarization and clean-Mac validation remain open. |
-| Housekeeping | Check at 09:10 UTC: only user app 21997/helper 22010, zero Cargo/zombies, 57.3 GiB free. Both completed local video QA sessions closed normally. Daily 04:00 Europe/Madrid checks clean Cargo on idle Sundays, below 40 GiB, or after a deferred request becomes safe. Earlier cleanup recovered about 49.24 GiB. |
+| Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
+| Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
+| Editor and video | Both complete `00abf93` hosted checks pass. New local trim source passes 649 editor tests, 11 media library tests and 10 native playback cases. Native trim/edit/save/reopen and the final subsecond counter check passed. All owned QA sessions closed normally. |
+| Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
+| Distribution | The a9f320d installer passed with notarization skipped; the 00abf93 installer is building. A notarized installer, clean-Mac validation and automatic updates remain open. |
+| Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
+
+## Latest trim, database and native checkpoint
+
+The normal-speed trim candidate stores its range on the existing video node and
+keeps the original source asset. It prepares a bounded, oriented preview before
+one `ReplaceData` history step commits the range and poster. Cancellation,
+timeout, changed inputs, changed video data, hidden/locked targets, deactivation
+and removal reject or cancel pending work without partial document changes.
+
+The existing-API authored-trim baseline failed before the change. The initial
+engine candidate passed 11 library cases but failed two new native cases after
+repeated identical seeks. AVFoundation can withhold a new-buffer notification
+for an acquired sample. One precisely keyed validated frame now releases that
+seek gate, without weakening the original timestamp/pixel assertions. All ten
+native cases pass traced and untraced. Additional nearby forward/backward
+positions inside one low-frame-rate sample also pass with unchanged runtime.
+The held frame is replaced on new accepted output and dropped with the player.
+
+The first combined trim build passed in 7m49s. Native QA rejected a reversed
+range, applied 1.2–2.0 seconds of a three-second clip with the correct cyan
+preview, restored the original preview/range with Undo, restored the trim with
+Redo, and played/replayed without showing the excluded scene. Saved source
+changed only the range/poster attributes, new PNG and modification timestamp;
+all original MP4s, other scene values and sidecars remained exact. A normal
+restart restored the saved preview and 1.2/2 inputs; a subsequent Save kept all
+21 files byte-identical. Both owned QA processes exited normally. This local
+binary includes preserved user changes and is not a notarized installer.
+The native 800ms trim exposed a whole-second counter displaying zero; the
+millisecond display correction passes the full 649-test editor suite. Its
+final native build completed in 5m15s; UI observations show 0.000 → 0.321 →
+0.800 seconds, followed by a stopped player at the range end. All 21 saved
+files remained identical and the final owned QA session exited normally.
+
+During that QA, the account card changed to connected without a root-authored
+sign-in action. The origin and credential storage were not investigated, so the
+observation is excluded from controlled production-authentication evidence.
+
+Backend [CI at 9510f61](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34468287843)
+passed all four jobs and 17/17 real PostgreSQL cases. Its preceding paid-term
+revision passed 15/16 but exposed a Date passed directly to postgres-js during
+annual replenishment. The column-aware encoder now fixes it; a preserved
+regression failed against the earlier runtime. Concurrent annual tick/payment,
+duplicate paid delivery, creation/payment ordering, rollback, four account
+purge/accounting barriers and immediate error/draining behavior pass. These
+use real database sessions with controlled effects, not live paid inference or
+provider checkout. Production remains `0d3753a`; migrations 0020/0021 and
+activation remain pending.
+
+The separate closed-project memory sequence retained approximately 5.5 MiB
+and 22,514 allocations above warmup after 180 seconds. IOSurface totals stayed
+stable. Both saved graphs had 294 scanner-classified allocations/14,544 bytes,
+with zero newly classified leaks between them. Most new surviving allocations
+are unlabelled non-object storage, and no allocation stacks were recorded.
+This does not identify an owner or prove absence of reachable retention.
+Matched no-playback controls and stack/retainer attribution remain open.
+
+Evidence under `/tmp/fanta-release-qa-20260909`: `video-trim-validation`,
+`annual-credit-validation/github-9510f61`,
+`inline-video-validation/native-canonical`, and
+`inline-video-validation/native-video-memory`.
+
+The following sections preserve historical observations. Their older failures
+and pending states are superseded only where the checkpoint above states a
+verified result.
 
 ## Native video controls and hosted seek diagnosis — September 10
 

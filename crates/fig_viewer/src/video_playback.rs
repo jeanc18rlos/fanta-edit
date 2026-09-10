@@ -26,6 +26,7 @@ trait PlaybackSession {
     fn play(&mut self) -> Result<()>;
     fn pause(&mut self) -> Result<()>;
     fn seek(&mut self, time_us: u64) -> Result<()>;
+    fn set_time_range(&mut self, start_us: u64, end_us: u64) -> Result<()>;
     fn set_audio(&mut self, muted: bool, volume: f32) -> Result<()>;
     fn status(&mut self) -> Result<VideoPlaybackStatus>;
     fn frame(&mut self) -> Result<VideoFrameUpdate>;
@@ -40,6 +41,9 @@ impl PlaybackSession for VideoPlayback {
     }
     fn seek(&mut self, time_us: u64) -> Result<()> {
         VideoPlayback::seek(self, time_us)
+    }
+    fn set_time_range(&mut self, start_us: u64, end_us: u64) -> Result<()> {
+        VideoPlayback::set_time_range(self, start_us, end_us)
     }
     fn set_audio(&mut self, muted: bool, volume: f32) -> Result<()> {
         VideoPlayback::set_audio(self, muted, volume)
@@ -61,6 +65,8 @@ pub(crate) struct VideoPlaybackView {
     frame: Option<CVPixelBuffer>,
     frame_revision: u64,
     status: VideoPlaybackStatus,
+    source_duration_us: u64,
+    time_range_us: Option<[u64; 2]>,
     error: Option<SharedString>,
     active: bool,
     window_active: bool,
@@ -86,6 +92,21 @@ impl VideoPlaybackView {
             }),
             cx,
         )
+    }
+
+    pub(crate) fn new_with_range(
+        bytes: Arc<[u8]>,
+        maximum_dimension: u32,
+        range: [u64; 2],
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut playback = Self::new(bytes, maximum_dimension, cx);
+        playback.time_range_us = Some(range);
+        playback
+    }
+
+    pub(crate) fn source_duration_us(&self) -> u64 {
+        self.source_duration_us
     }
 
     fn with_preparation(preparation: Preparation, cx: &mut Context<Self>) -> Self {
@@ -129,6 +150,8 @@ impl VideoPlaybackView {
                 current_time_us: 0,
                 duration_us: 0,
             },
+            source_duration_us: 0,
+            time_range_us: None,
             error: None,
             active: true,
             window_active: true,
@@ -153,9 +176,13 @@ impl VideoPlaybackView {
         };
         match factory() {
             Ok(mut session) => {
-                let setup = session
-                    .set_audio(self.muted, self.volume)
-                    .and_then(|()| session.seek(0));
+                let setup = session.set_audio(self.muted, self.volume).and_then(|()| {
+                    if let Some([start, end]) = self.time_range_us {
+                        session.set_time_range(start, end)
+                    } else {
+                        session.seek(0)
+                    }
+                });
                 match setup {
                     Ok(()) => {
                         self.session = Some(session);
@@ -247,7 +274,10 @@ impl VideoPlaybackView {
         }
         if let Some(session) = self.session.as_mut() {
             let time_us = time_us.min(self.status.duration_us);
-            match session.seek(time_us) {
+            let source_time = self.time_range_us.map_or(time_us, |[start, end]| {
+                start.saturating_add(time_us).min(end - 1)
+            });
+            match session.seek(source_time) {
                 Ok(()) => {
                     self.status.current_time_us = time_us;
                     self.status.state = VideoPlaybackState::Seeking;
@@ -337,7 +367,15 @@ impl VideoPlaybackView {
             .status()
             .and_then(|status| Ok((status, session.frame()?)));
         match result {
-            Ok((status, frame)) => {
+            Ok((mut status, frame)) => {
+                self.source_duration_us = status.duration_us;
+                if let Some([start, end]) = self.time_range_us {
+                    status.duration_us = end - start;
+                    status.current_time_us = status
+                        .current_time_us
+                        .saturating_sub(start)
+                        .min(end - start);
+                }
                 let changed = self.status != status;
                 self.status = status;
                 if status.state == VideoPlaybackState::Ended {
@@ -612,7 +650,8 @@ impl Render for VideoPlaybackView {
 
 fn time_label(time_us: u64) -> String {
     let seconds = time_us / 1_000_000;
-    format!("{}:{:02}", seconds / 60, seconds % 60)
+    let milliseconds = (time_us % 1_000_000) / 1_000;
+    format!("{}:{:02}.{milliseconds:03}", seconds / 60, seconds % 60)
 }
 
 #[cfg(test)]
@@ -679,6 +718,18 @@ mod tests {
             state.pending = true;
             state.frame_pending = true;
             Ok(())
+        }
+        fn set_time_range(&mut self, start_us: u64, end_us: u64) -> Result<()> {
+            ensure!(
+                start_us < end_us && end_us <= 10_000_000,
+                "invalid fake source range"
+            );
+            self.0
+                .lock()
+                .expect("fake state")
+                .commands
+                .push(format!("range:{start_us}:{end_us}"));
+            self.seek(start_us)
         }
         fn set_audio(&mut self, muted: bool, volume: f32) -> Result<()> {
             let mut state = self.0.lock().expect("fake state");
@@ -752,6 +803,56 @@ mod tests {
         result.0.update(cx, |view, cx| view.poll_session(cx));
         assert!(result.0.read_with(cx, |view, _| view.frame().is_some()));
         result
+    }
+
+    #[gpui::test]
+    fn video_trim_controls_translate_relative_time_to_source_time(cx: &mut gpui::TestAppContext) {
+        let (view, state) = cx.update(fake_view);
+        view.update(cx, |view, _| {
+            view.time_range_us = Some([2_000_000, 7_000_000])
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.poll_session(cx));
+        assert!(
+            snapshot(&state)
+                .commands
+                .contains(&"range:2000000:7000000".into())
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.status().current_time_us, 0);
+            assert_eq!(view.status().duration_us, 5_000_000);
+            assert_eq!(view.source_duration_us(), 10_000_000);
+        });
+        view.update(cx, |view, cx| {
+            view.seek(1_500_000, cx);
+            view.poll_session(cx);
+        });
+        assert!(snapshot(&state).commands.contains(&"seek:3500000".into()));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.status().current_time_us),
+            1_500_000
+        );
+        view.update(cx, |view, cx| {
+            view.seek(u64::MAX, cx);
+            view.poll_session(cx);
+        });
+        assert!(snapshot(&state).commands.contains(&"seek:6999999".into()));
+        view.update(cx, |view, cx| view.close(cx));
+        assert_eq!(snapshot(&state).dropped, 1);
+    }
+
+    #[gpui::test]
+    fn video_trim_invalid_range_releases_prepared_session(cx: &mut gpui::TestAppContext) {
+        let (view, state) = cx.update(fake_view);
+        view.update(cx, |view, _| {
+            view.time_range_us = Some([7_000_000, 2_000_000])
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.error().is_some());
+            assert!(view.frame().is_none());
+        });
+        assert_eq!(snapshot(&state).dropped, 1);
     }
 
     #[gpui::test]

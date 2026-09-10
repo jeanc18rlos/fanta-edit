@@ -444,6 +444,131 @@ pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
     })
 }
 
+#[derive(Clone)]
+pub(crate) struct PreparedVideoTrim {
+    pub range_us: [i64; 2],
+    pub source_duration_us: i64,
+    pub poster: VideoPoster,
+}
+
+pub(crate) fn validate_video_trim(range: [i64; 2], duration_us: i64) -> Result<()> {
+    ensure!(
+        range[0] >= 0 && range[0] < range[1] && range[1] <= duration_us,
+        "Choose a start before the end, within the original video duration."
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn prepare_video_trim(
+    bytes: Arc<[u8]>,
+    range_us: [i64; 2],
+) -> Result<PreparedVideoTrim> {
+    let metadata = mp4_metadata(&bytes)?;
+    validate_video_trim(range_us, metadata.duration_us)?;
+    let frame = media::video::video_frame_at(bytes, 1200, u64::try_from(range_us[0])?)?.await?;
+    let difference = (i64::from(frame.width) * i64::from(metadata.height)
+        - i64::from(frame.height) * i64::from(metadata.width))
+    .abs();
+    ensure!(
+        difference <= 2 * i64::from(metadata.width.max(metadata.height)),
+        "The decoded video orientation does not match its track."
+    );
+    ensure!(
+        frame.actual_time_us < u64::try_from(range_us[1])?,
+        "The video preview is outside the selected range."
+    );
+    let pixels = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+        .context("The video preview has invalid pixels.")?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(pixels).write_to(&mut png, image::ImageFormat::Png)?;
+    Ok(PreparedVideoTrim {
+        range_us,
+        source_duration_us: metadata.duration_us,
+        poster: VideoPoster {
+            png: png.into_inner().into(),
+            // This is the chosen source position. A containing VFR sample can
+            // begin earlier; its sample timestamp must not move the trim start.
+            time_us: range_us[0],
+        },
+    })
+}
+
+pub(crate) fn trim_video(
+    document: &mut FigDocument,
+    node: NodeId,
+    expected: &VideoNode,
+    trim: PreparedVideoTrim,
+) -> (Result<()>, DocChange) {
+    let result = (|| {
+        validate_video_trim(trim.range_us, trim.source_duration_us)?;
+        ensure!(
+            expected.speed == 1.,
+            "Trimming currently supports normal-speed video only."
+        );
+        ensure!(
+            trim.poster.time_us == trim.range_us[0],
+            "The poster must match the new trim start."
+        );
+        let current = document
+            .doc
+            .scene
+            .get(node)
+            .context("The video layer no longer exists.")?;
+        ensure!(
+            current.data == NodeData::Video(expected.clone()),
+            "The video changed while its preview was loading. Apply the trim again."
+        );
+        ensure!(
+            crate::clipboard::node_is_on_active_page(&document.doc, node),
+            "Return to this video's page before trimming it."
+        );
+        ensure!(
+            !current
+                .flags
+                .intersects(fanta_doc::NodeFlags::LOCKED | fanta_doc::NodeFlags::HIDDEN)
+                && !document.doc.scene.ancestors_of(node).any(|parent| parent
+                    .flags
+                    .intersects(fanta_doc::NodeFlags::LOCKED | fanta_doc::NodeFlags::HIDDEN)),
+            "Unlock and show this video layer before trimming it."
+        );
+        if expected.time_range_us == trim.range_us {
+            return Ok(false);
+        }
+        let (poster, _) = document
+            .doc_and_assets()
+            .1
+            .add_image(trim.poster.png.to_vec())
+            .context("The trimmed video preview could not be added.")?;
+        let mut updated = expected.clone();
+        updated.time_range_us = trim.range_us;
+        updated.poster_frame_us = Some(trim.poster.time_us);
+        updated.poster = Some(poster);
+        match document.doc.apply(Operation::ReplaceData {
+            id: node,
+            old: Box::new(NodeData::Video(expected.clone())),
+            new: Box::new(NodeData::Video(updated)),
+        }) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                document.doc_and_assets().1.remove(poster);
+                Err(error.into())
+            }
+        }
+    })();
+    match result {
+        Ok(changed) => (
+            Ok(()),
+            if changed {
+                DocChange::Content
+            } else {
+                DocChange::None
+            },
+        ),
+        Err(error) => (Err(error), DocChange::None),
+    }
+}
+
 pub(crate) fn mp4_metadata(bytes: &[u8]) -> Result<VideoMetadata> {
     let top = mp4_boxes(bytes)?;
     ensure!(

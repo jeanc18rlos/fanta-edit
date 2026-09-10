@@ -3253,6 +3253,171 @@ mod tests {
         Ok(())
     }
 
+    fn video_trim_fixture() -> Result<(FigDocument, NodeId, fanta_doc::VideoNode)> {
+        let (doc, page, _, _) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        document.doc.set_active_page(Some(page));
+        let (result, _) = crate::generation_media::place_video(
+            &mut document,
+            prepared_video_fixture()?,
+            24.,
+            48.,
+            Some(serde_json::json!({"keep":"source metadata"})),
+        );
+        result?;
+        let id = *document
+            .doc
+            .scene
+            .children_of(Some(page))
+            .last()
+            .context("video")?;
+        let fanta_doc::NodeData::Video(video) = &document.doc.scene.get(id).context("video")?.data
+        else {
+            anyhow::bail!("video expected");
+        };
+        let video = video.clone();
+        Ok((document, id, video))
+    }
+
+    fn video_trim_prepared_fixture() -> Result<crate::generation_media::PreparedVideoTrim> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([225, 0, 225, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(crate::generation_media::PreparedVideoTrim {
+            range_us: [500_000, 1_500_000],
+            source_duration_us: 2_000_000,
+            poster: crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: 500_000,
+            },
+        })
+    }
+
+    #[test]
+    fn video_trim_range_and_poster_are_one_undo_step_and_survive_reopen() -> Result<()> {
+        let (mut document, id, video) = video_trim_fixture()?;
+        let original = document.doc.scene.get(id).context("original")?.clone();
+        let original_assets = document.raw_assets.clone();
+        let depth = document.doc.history.undo_depth();
+        let prepared = video_trim_prepared_fixture()?;
+        let expected_png = prepared.poster.png.clone();
+        let (result, change) =
+            crate::generation_media::trim_video(&mut document, id, &video, prepared);
+        result?;
+        assert!(matches!(change, DocChange::Content));
+        assert_eq!(document.doc.history.undo_depth(), depth + 1);
+        let edited = document.doc.scene.get(id).context("edited")?.clone();
+        let fanta_doc::NodeData::Video(trimmed) = &edited.data else {
+            anyhow::bail!("video expected")
+        };
+        assert_eq!(trimmed.time_range_us, [500_000, 1_500_000]);
+        assert_eq!(trimmed.poster_frame_us, Some(500_000));
+        assert_ne!(trimmed.poster, video.poster);
+        let mut expected_video = video.clone();
+        expected_video.time_range_us = trimmed.time_range_us;
+        expected_video.poster_frame_us = trimmed.poster_frame_us;
+        expected_video.poster = trimmed.poster;
+        assert_eq!(
+            trimmed, &expected_video,
+            "speed, audio, dimensions and original asset remain exact"
+        );
+        assert_eq!(edited.meta, original.meta);
+        assert_eq!(edited.transform, original.transform);
+        assert_eq!(
+            document.raw_assets.get(&video.asset),
+            original_assets.get(&video.asset)
+        );
+        let poster_id = trimmed.poster.context("trimmed poster")?;
+        assert!(document.doc.undo()?);
+        assert_eq!(document.doc.scene.get(id), Some(&original));
+        assert!(document.doc.redo()?);
+        assert_eq!(document.doc.scene.get(id), Some(&edited));
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &document.doc, &document.raw_assets)?;
+        let reopened = load_project_document(directory.path())?;
+        assert_eq!(reopened.doc.scene.get(id), Some(&edited));
+        assert_eq!(
+            reopened.raw_assets.get(&video.asset),
+            original_assets.get(&video.asset)
+        );
+        assert_eq!(
+            reopened
+                .raw_assets
+                .get(&poster_id)
+                .context("saved poster")?
+                .as_slice(),
+            expected_png.as_ref()
+        );
+        let pixels = reopened
+            .asset_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(poster_id))
+            .context("reopened poster")?;
+        assert_eq!(pixels.pixels_rgba.as_slice(), [225, 0, 225, 255].repeat(6));
+        fanta_format::write_project_tree(directory.path(), &reopened.doc, &reopened.raw_assets)?;
+        let reopened_again = load_project_document(directory.path())?;
+        assert_eq!(reopened_again.doc.scene.get(id), Some(&edited));
+        assert_eq!(
+            reopened_again.raw_assets.get(&video.asset),
+            original_assets.get(&video.asset)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_trim_rejections_and_noop_preserve_assets_and_history() -> Result<()> {
+        for case in [
+            "range",
+            "poster-position",
+            "corrupt-poster",
+            "stale",
+            "speed",
+            "locked",
+            "noop",
+        ] {
+            let (mut document, id, mut expected) = video_trim_fixture()?;
+            let mut prepared = video_trim_prepared_fixture()?;
+            match case {
+                "range" => prepared.range_us = [500_000, 2_000_001],
+                "poster-position" => prepared.poster.time_us = 0,
+                "corrupt-poster" => prepared.poster.png = Arc::from(&b"not a PNG"[..]),
+                "stale" => expected.volume = 0.25,
+                "speed" => {
+                    expected.speed = 2.;
+                    document.doc.scene.get_mut(id).context("video")?.data =
+                        fanta_doc::NodeData::Video(expected.clone());
+                }
+                "locked" => document
+                    .doc
+                    .scene
+                    .get_mut(id)
+                    .context("video")?
+                    .flags
+                    .insert(fanta_doc::NodeFlags::LOCKED),
+                "noop" => {
+                    prepared.range_us = expected.time_range_us;
+                    prepared.poster.time_us = expected.time_range_us[0];
+                }
+                _ => unreachable!(),
+            }
+            let node = document.doc.scene.get(id).context("video")?.clone();
+            let assets = document.raw_assets.clone();
+            let depth = document.doc.history.undo_depth();
+            let (result, change) =
+                crate::generation_media::trim_video(&mut document, id, &expected, prepared);
+            assert_eq!(result.is_ok(), case == "noop", "{case}");
+            assert!(matches!(change, DocChange::None), "{case}");
+            assert_eq!(document.doc.scene.get(id), Some(&node), "{case}");
+            assert_eq!(document.raw_assets, assets, "{case}");
+            assert_eq!(document.doc.history.undo_depth(), depth, "{case}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn failed_video_placement_removes_poster_from_asset_stores() -> Result<()> {
         let mut document = FigDocument::from_doc(Doc::new(), BTreeMap::new());

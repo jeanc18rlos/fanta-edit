@@ -148,7 +148,7 @@ impl Future for VideoPlaybackRequest {
                         .asset
                         .as_ref()
                         .context("The video asset was released.")
-                        .and_then(|asset| asset_frame(asset, prepared.input.clone(), 64));
+                        .and_then(|asset| asset_frame(asset, prepared.input.clone(), 64, 0));
                     match check {
                         Ok(check) => {
                             self.sample_check = Some(check);
@@ -360,6 +360,7 @@ pub struct VideoPlaybackStatus {
     pub duration_us: u64,
 }
 
+#[derive(Clone)]
 pub struct VideoPlaybackFrame {
     pub buffer: CVPixelBuffer,
     pub presentation_time_us: u64,
@@ -416,14 +417,17 @@ pub struct VideoPlayback {
     seek_trace: Option<Arc<VideoSeekTrace>>,
     pending_seek: Option<u64>,
     awaiting_seek_frame: Option<u64>,
+    last_frame: Option<(NativeTime, VideoPlaybackFrame)>,
     seeking: bool,
     requested_play: bool,
+    range_start_us: u64,
+    range_end_us: u64,
     _thread_confined: PhantomData<Rc<()>>,
 }
 
 impl VideoPlayback {
-    /// Create and use the session on a single UI thread. It owns no frame queue;
-    /// callers retain only the currently displayed frame and discard replaced ones.
+    /// Create and use the session on a single UI thread. It retains one validated
+    /// output frame; callers discard their displayed frame when replacing it.
     pub fn new(prepared: PreparedVideoPlayback) -> Result<Self> {
         autoreleasepool(|| unsafe {
             let main_thread: BOOL = msg_send![class!(NSThread), isMainThread];
@@ -514,12 +518,15 @@ impl VideoPlayback {
                 player: Some(player),
                 item: Some(item),
                 output: Some(output),
+                range_start_us: 0,
+                range_end_us: prepared.info.duration_us,
                 prepared,
                 seek_completion: Arc::new(Mutex::new(None)),
                 seek_revision: 0,
                 seek_trace,
                 pending_seek: None,
                 awaiting_seek_frame: None,
+                last_frame: None,
                 seeking: false,
                 requested_play: false,
                 _thread_confined: PhantomData,
@@ -535,7 +542,7 @@ impl VideoPlayback {
         let status = self.status()?;
         self.requested_play = true;
         if status.state == VideoPlaybackState::Ended {
-            self.pending_seek = Some(0);
+            self.pending_seek = Some(self.range_start_us);
         }
         self.advance_seek()?;
         if !self.seeking {
@@ -568,6 +575,31 @@ impl VideoPlayback {
         })
     }
 
+    /// Restrict 1x playback to a nonempty source interval, pause and seek its start.
+    /// Metadata and status times remain relative to the unchanged source video.
+    pub fn set_time_range(&mut self, start_us: u64, end_us: u64) -> Result<()> {
+        ensure!(
+            start_us < end_us && end_us <= self.prepared.info.duration_us,
+            "Choose a nonempty trim range within the source video."
+        );
+        self.pause()?;
+        autoreleasepool(|| unsafe {
+            let item = self.item.as_ref().context("The video player was closed.")?;
+            let end = NativeTime {
+                value: end_us as i64,
+                timescale: 1_000_000,
+                flags: 1,
+                epoch: 0,
+            };
+            let _: () = msg_send![**item, setForwardPlaybackEndTime:end];
+            Ok::<_, anyhow::Error>(())
+        })?;
+        self.range_start_us = start_us;
+        self.range_end_us = end_us;
+        self.pending_seek = Some(start_us);
+        self.advance_seek()
+    }
+
     /// Only one native seek runs at a time. Repeated requests replace its queued
     /// successor; status/frame polling applies the latest completion on this thread.
     pub fn seek(&mut self, time_us: u64) -> Result<()> {
@@ -575,7 +607,7 @@ impl VideoPlayback {
             time_us <= self.prepared.info.duration_us,
             "The requested position is outside this video."
         );
-        self.pending_seek = Some(time_us);
+        self.pending_seek = Some(time_us.clamp(self.range_start_us, self.range_end_us - 1));
         self.advance_seek()
     }
 
@@ -596,14 +628,14 @@ impl VideoPlayback {
             }
             let current: NativeTime = msg_send![player, currentTime];
             let current_time_us = if item_status == 0 {
-                0
+                self.range_start_us
             } else {
-                time_us(current)?.min(self.prepared.info.duration_us)
+                time_us(current)?.clamp(self.range_start_us, self.range_end_us)
             };
             let control: isize = msg_send![player, timeControlStatus];
             let state = if self.seeking {
                 VideoPlaybackState::Seeking
-            } else if current_time_us >= self.prepared.info.duration_us {
+            } else if current_time_us >= self.range_end_us {
                 self.requested_play = false;
                 VideoPlaybackState::Ended
             } else if item_status == 0 || (self.requested_play && control != 2) {
@@ -643,8 +675,40 @@ impl VideoPlayback {
             if requested.flags & 1 == 0 {
                 return Ok(VideoFrameUpdate::Unchanged);
             }
+            // The display clock can move beyond a trimmed item end before its
+            // pause is observed. Query the final included instant, never the
+            // first frame of the excluded scene.
+            let requested_us = time_us(requested)?;
+            let requested = if !(self.range_start_us..self.range_end_us).contains(&requested_us) {
+                NativeTime {
+                    value: requested_us.clamp(self.range_start_us, self.range_end_us - 1) as i64,
+                    timescale: 1_000_000,
+                    flags: 1,
+                    epoch: 0,
+                }
+            } else {
+                requested
+            };
             let available: BOOL = msg_send![**output, hasNewPixelBufferForItemTime:requested];
             if available != YES {
+                // AVFoundation need not vend an already acquired sample again.
+                // Reuse it only for the identical source instant after a completed
+                // seek, so the seek gate can release without accepting stale pixels.
+                if self.awaiting_seek_frame.is_some()
+                    && let Some((previous_request, frame)) = &self.last_frame
+                    && i128::from(previous_request.value) * i128::from(requested.timescale)
+                        == i128::from(requested.value) * i128::from(previous_request.timescale)
+                    && frame.presentation_time_us < self.range_end_us
+                    && accept_seek_frame(&mut self.awaiting_seek_frame, frame.presentation_time_us)
+                {
+                    if let Some(trace) = &self.seek_trace {
+                        trace.record(format_args!(
+                            "reused frame revision={} requested={requested:?} presentation_us={}",
+                            self.seek_revision, frame.presentation_time_us
+                        ));
+                    }
+                    return Ok(VideoFrameUpdate::Frame(frame.clone()));
+                }
                 return Ok(VideoFrameUpdate::Unchanged);
             }
             let mut presentation = NativeTime::ZERO;
@@ -668,17 +732,20 @@ impl VideoPlayback {
                 "The video player returned an invalid frame time."
             );
             let seek_target = self.awaiting_seek_frame;
-            let accepted = accept_seek_frame(&mut self.awaiting_seek_frame, presentation_time_us);
+            let accepted = presentation_time_us < self.range_end_us
+                && accept_seek_frame(&mut self.awaiting_seek_frame, presentation_time_us);
             if let Some(trace) = &self.seek_trace {
                 trace.record(format_args!("frame output={:#x} buffer={:#x} revision={} target_us={seek_target:?} requested={requested:?} returned={presentation:?} current_us={} accepted={accepted}", **output as usize, buffer.as_concrete_TypeRef() as usize, self.seek_revision, status.current_time_us));
             }
             if !accepted {
                 return Ok(VideoFrameUpdate::Unchanged);
             }
-            Ok(VideoFrameUpdate::Frame(VideoPlaybackFrame {
+            let frame = VideoPlaybackFrame {
                 buffer,
                 presentation_time_us,
-            }))
+            };
+            self.last_frame = Some((requested, frame.clone()));
+            Ok(VideoFrameUpdate::Frame(frame))
         })
     }
 
@@ -817,6 +884,7 @@ impl Drop for VideoPlayback {
             drop(self.player.take());
             drop(self.output.take());
             drop(self.item.take());
+            drop(self.last_frame.take());
         });
     }
 }
@@ -967,6 +1035,16 @@ impl Drop for VideoFrameRequest {
 /// creating the temporary input writes up to 100 MiB. Dropping the returned future
 /// cancels decoding. Callers should impose their own deadline.
 pub fn video_frame(bytes: Arc<[u8]>, maximum_dimension: u32) -> Result<VideoFrameRequest> {
+    video_frame_at(bytes, maximum_dimension, 0)
+}
+
+/// Decode the source sample containing the requested time, preserving its actual
+/// timestamp and orientation. Input preparation and cancellation match `video_frame`.
+pub fn video_frame_at(
+    bytes: Arc<[u8]>,
+    maximum_dimension: u32,
+    time_us: u64,
+) -> Result<VideoFrameRequest> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_INPUT_BYTES,
         "Choose a video smaller than 100 MiB."
@@ -974,6 +1052,10 @@ pub fn video_frame(bytes: Arc<[u8]>, maximum_dimension: u32) -> Result<VideoFram
     ensure!(
         (1..=MAX_DIMENSION).contains(&maximum_dimension),
         "Video preview dimensions must be between 1 and 2048 pixels."
+    );
+    ensure!(
+        time_us <= 86_400_000_000,
+        "Video preview time must be within the 24-hour source limit."
     );
     let mut input = tempfile::Builder::new()
         .prefix("fanta-video-poster-")
@@ -1008,7 +1090,7 @@ pub fn video_frame(bytes: Arc<[u8]>, maximum_dimension: u32) -> Result<VideoFram
         let asset: *mut Object = msg_send![asset, initWithURL:url options:options];
         ensure!(!asset.is_null(), "Could not open the local video asset.");
         let asset = StrongPtr::new(asset);
-        asset_frame(&asset, input.clone(), maximum_dimension)
+        asset_frame(&asset, input.clone(), maximum_dimension, time_us)
     })
 }
 
@@ -1016,6 +1098,7 @@ fn asset_frame(
     asset: &StrongPtr,
     input: Arc<tempfile::TempPath>,
     maximum_dimension: u32,
+    time_us: u64,
 ) -> Result<VideoFrameRequest> {
     let canceled = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = oneshot::channel();
@@ -1036,7 +1119,13 @@ fn asset_frame(
         let _: () = msg_send![*generator, setMaximumSize:size];
         let _: () = msg_send![*generator, setRequestedTimeToleranceBefore:NativeTime::ZERO];
         let _: () = msg_send![*generator, setRequestedTimeToleranceAfter:NativeTime::ZERO];
-        let time: *mut Object = msg_send![class!(NSValue), valueWithCMTime:NativeTime::ZERO];
+        let requested_time = NativeTime {
+            value: time_us as i64,
+            timescale: 1_000_000,
+            flags: 1,
+            epoch: 0,
+        };
+        let time: *mut Object = msg_send![class!(NSValue), valueWithCMTime:requested_time];
         ensure!(!time.is_null(), "Could not request a video frame time.");
         let times: *mut Object = msg_send![class!(NSArray), arrayWithObject:time];
         ensure!(!times.is_null(), "Could not request the video frame.");
@@ -1346,6 +1435,7 @@ mod tests {
     const ROTATE_270: &[u8] = include_bytes!("../test_fixtures/quadrants-rotate-270.mp4");
     const MIRRORED: &[u8] = include_bytes!("../test_fixtures/quadrants-mirrored.mp4");
     const CORRUPT: &[u8] = include_bytes!("../test_fixtures/quadrants-corrupt.mp4");
+    const THREE_SCENES: &[u8] = include_bytes!("../test_fixtures/playback-three-scenes.mp4");
 
     #[test]
     fn video_playback_seek_queries_item_time_before_obsolete_host_mapping() -> Result<()> {
@@ -1536,6 +1626,21 @@ mod tests {
         })
     }
 
+    fn decode_at(bytes: &[u8], maximum_dimension: u32, time_us: u64) -> Result<VideoFrame> {
+        let request = video_frame_at(Arc::from(bytes), maximum_dimension, time_us)?;
+        smol::block_on(async {
+            match futures::future::select(request, smol::Timer::after(Duration::from_secs(10)))
+                .await
+            {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right((_, request)) => {
+                    drop(request);
+                    bail!("Native trim poster test timed out after ten seconds")
+                }
+            }
+        })
+    }
+
     fn assert_quadrants(frame: &VideoFrame, expected: [usize; 4]) {
         let colors = [[255i16, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
         let width = frame.width as usize;
@@ -1591,6 +1696,45 @@ mod tests {
         let small = decode(QUADRANTS, 16)?;
         assert_eq!((small.width, small.height), (16, 12));
         assert_quadrants(&small, [0, 1, 2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn video_trim_poster_uses_requested_source_scene_without_changing_first_frame() -> Result<()> {
+        for (position, expected) in [(1_500_000, [0i16, 255, 255]), (2_500_000, [255, 0, 255])] {
+            let frame = decode_at(THREE_SCENES, 128, position)?;
+            assert_eq!((frame.width, frame.height), (128, 96));
+            assert!(frame.actual_time_us.abs_diff(position) < 40_000);
+            let pixel = ((frame.height / 4 * frame.width + frame.width / 4) * 4) as usize;
+            let channels = frame
+                .rgba
+                .get(pixel..pixel + 4)
+                .context("Missing trim poster pixel")?;
+            for (actual, expected) in channels.iter().take(3).zip(expected) {
+                assert!((i16::from(*actual) - expected).abs() < 35);
+            }
+            assert_eq!(channels[3], 255);
+        }
+        let first = decode(THREE_SCENES, 128)?;
+        assert_eq!(first.actual_time_us, 0);
+        assert!(first.rgba[0] > 220 && first.rgba[1] < 35 && first.rgba[2] < 35);
+        assert!(video_frame_at(Arc::from(THREE_SCENES), 64, u64::MAX).is_err());
+        assert!(decode_at(THREE_SCENES, 64, 4_000_000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn video_trim_poster_preserves_containing_sample_and_rotation() -> Result<()> {
+        let frame = decode_at(QUADRANTS, 64, 125_000)?;
+        assert!(
+            frame.actual_time_us <= 125_001,
+            "Containing low-FPS sample must not be rejected"
+        );
+        assert_quadrants(&frame, [0, 1, 2, 3]);
+        let rotated = decode_at(ROTATE_90, 64, 125_000)?;
+        assert_eq!((rotated.width, rotated.height), (48, 64));
+        assert!(rotated.actual_time_us <= 125_001);
+        assert_quadrants(&rotated, [1, 3, 0, 2]);
         Ok(())
     }
 

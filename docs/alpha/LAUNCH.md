@@ -19,27 +19,46 @@ Updated on 2026-09-10. First release target: Apple Silicon Mac.
 - Backend analytics now flush within the request lifetime, as required for
   [PostHog in serverless environments](https://posthog.com/docs/libraries/node#short-lived-processes-like-serverless-environments).
 
-Video preview runtime `110868d` passes six real native decoder tests and all
-606 editor tests. Generated MP4 results now have first-frame posters, oriented
-canvas placement, cached Save/Play bytes and account-change guards. Negative
-prompts follow the selected model's capabilities while preserving the draft.
-Seven timing cases passed 20 iterations each. The local app build passed,
-but native poster and installer QA remain pending after blocked sign-in, as
-recorded below. Playback in that build uses the system player; production GPU
-verification and planned video editing remain unfinished.
-See the video-poster section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
+## Latest release checkpoint — September 10
 
-## Latest video validation — September 10
+Both complete hosted checks for desktop `00abf93` pass. Its combined native
+build passed 639 editor tests; a second save and a save after full restart
+preserved all 20 project files, including three original MP4s. Native video
+orientation, clipping and toolbar placement were checked. The earlier hosted
+consecutive-seek failure is corrected and its original timestamp/pixel guards
+pass. The a9f320d installer passed packaging and upload with notarization skipped;
+the 00abf93 installer is building. Notarization and clean-Mac validation remain open.
 
-The native control overlap is corrected and 627 editor tests pass. Actual app
-checks show correctly oriented video pixels, parent clipping and foreground
-composition. Both hosted `66bef60` checks nevertheless fail a consecutive-seek
-display-time assertion. Bounded seek diagnostics and a manual native-video-only
-Check lane are available; the failure is not yet corrected. A native Save
-changed JSON key ordering only, with exact reconstruction proving scene/asset
-values unchanged; deterministic cross-feature serialization and final native
-save/reopen remain open. See the current checkpoint in
-[RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
+Selected normal-speed video now has Start/End inputs and Apply/Cancel. Trimming
+prepares a new poster before one undoable range/poster edit, preserving the
+original MP4, dimensions, geometry, audio and metadata. Playback and the seek
+bar use time relative to the saved trim; other playback speeds remain explicitly
+unsupported. The local candidate passes 649 editor tests, 11 media library
+cases and 10 native playback cases. Native app checks passed invalid input,
+trim/Undo/Redo, playback/replay and save/reopen. Only the expected range/poster,
+new PNG and modification timestamp changed; all 21 saved files were identical
+after another restart/save. A millisecond counter correction for subsecond
+trims passed its final native build/check, including 0.000 → 0.321 → 0.800
+seconds during playback. The final QA session closed normally and all saved
+files remained unchanged. Current candidate hosted
+checks are required after publication.
+
+Backend `9510f61` passes all four CI jobs: 537 backend tests, 153 CPU worker
+tests, 17 real PostgreSQL cases and the container build. It includes guarded
+recovery, paid-term gating, annual monthly allowances and account-deletion
+accounting barriers. This candidate is published but not deployed. Migrations
+0020/0021, compatible workers, provider sandbox validation and the pricing/
+currency decision remain before activation. Annual checkout stays disabled.
+
+A native memory check retained about 5.5 MiB above warmup after three
+open/play/close cycles and a three-minute delay. Saved graphs had no newly
+scanner-classified leaks, but reachable retention remains unattributed. Matched
+no-playback controls and allocation stack/retainer evidence are still required.
+Daily 04:00 Madrid housekeeping remains active and preserves ongoing work.
+See [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md) for evidence and limitations.
+
+The following dated observations record earlier builds and do not supersede
+this checkpoint.
 
 Backend video URL fix `0d3753a` is **deployed** to `api.fantaisa.net` as
 `dpl_CVnuDoWotpCv8v7SG3UyXrbzwvhQ`. Its **449 backend tests across 44 files**,
@@ -392,7 +411,7 @@ The `dcf27d6` native viewport and K-shortcut checks passed after the 6m42s build
 ## September 10 recovery and serialization checkpoint
 
 - Client accepted-input recovery passes 639 editor tests and eight recovery cases across 20 scheduler iterations. It retains exact input until a durable worker claim/terminal result; explicit retry GETs the original ID before any permitted same-body POST. No automatic paid retry is introduced.
-- Backend recovery source `cca83da` is published on the existing draft PR. All four backend PR CI jobs pass, including 501 backend tests, eight real PostgreSQL contention tests and 153 worker tests. Production remains `0d3753a`; migration 0020, model revisions and upgraded workers are not activated. Reference-source recovery and claimed-worker crash recovery remain unfinished.
+- Backend source `9510f61` is published on the existing draft PR. All four backend PR CI jobs pass, including 537 backend tests, 17 real PostgreSQL contention/accounting tests and 153 worker tests. Production remains `0d3753a`; migrations 0020/0021, model revisions and upgraded workers are not activated. Reference-source recovery and claimed-worker crash recovery remain unfinished.
 - Native Save differences were key-order-only. Canonical ordering now covers FNX, project JSON and source/session sidecars; generated indices also match the native numeric representation. All 93 FNX and 147 format library tests pass in both JSON configurations. Combined native save/reopen remains a release gate.
 - Hosted diagnostics prove old video pixels can survive rapid seek completion. The composition-render-wait correction at a9f320d passes local and hosted macOS 26 tests with assertions unchanged: nine library tests and six native cases with tracing both enabled and disabled. Final combined-build native validation remains pending.
 - Payments, production native authentication, live GPU tests, Apple notarization and clean-Mac installation remain release gates.
