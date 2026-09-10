@@ -663,6 +663,21 @@ fn scale_data(data: &mut NodeData, factor: f64) -> Option<()> {
             scale_number(&mut text.paragraph_spacing, factor)?;
             scale_number(&mut text.paragraph_indent, factor)?;
         }
+        NodeData::TextPath(text_path) => {
+            let mut finite = true;
+            text_path.path.map_points_mut(|point| {
+                let scaled = [point[0] * factor, point[1] * factor];
+                finite &= scaled.into_iter().all(f64::is_finite);
+                scaled
+            });
+            if !finite {
+                return None;
+            }
+            scale_text(&mut text_path.style, factor)?;
+            for run in &mut text_path.style_runs {
+                scale_text(&mut run.style, factor)?;
+            }
+        }
         NodeData::Boolean(boolean) => {
             for fill in &mut boolean.fills {
                 scale_paint(fill, factor)?;
@@ -683,7 +698,7 @@ fn scale_data(data: &mut NodeData, factor: f64) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::scale::ScaleTool;
+    use crate::scale::{ScaleTool, scale_data};
     use crate::{
         Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, Tool, ToolContext, ToolEvent,
     };
@@ -691,9 +706,9 @@ mod tests {
     use fanta_doc::{
         AutoLayout, Blur, BoundProp, Bounds, CanvasNode, Color, ComponentDef, ComponentId,
         ConstraintH, ConstraintV, Constraints, Doc, GroupNode, InstanceNode, Mode, ModeId,
-        NodeData, NodeFlags, NodeId, Operation, Shadow, ShadowKind, Stroke, TextNode, TextStyle,
-        TextStyleRun, Transform2D, VarValue, Variable, VariableCollection, VariableCollectionId,
-        VariableId, VariableType, VectorNode, Viewport,
+        NodeData, NodeFlags, NodeId, Operation, Shadow, ShadowKind, Stroke, TextNode, TextPathNode,
+        TextPathStart, TextStyle, TextStyleRun, Transform2D, VarValue, Variable,
+        VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode, Viewport,
     };
     use glam::DVec2;
     use std::collections::BTreeMap;
@@ -948,6 +963,43 @@ mod tests {
             assert_eq!(node(ctx.doc, child_id).data, original_child.data);
             assert_eq!(node(ctx.doc, child_id).transform, original_child.transform);
         }
+    }
+
+    #[test]
+    fn scale_text_path_scales_baseline_and_typography_without_moving_its_start() {
+        let mut path = fanta_doc::PathData::new();
+        path.move_to(1., 2.)
+            .quad_to(3., 4., 5., 6.)
+            .line_to(8., 10.);
+        let mut text_path = TextPathNode::new(path, "Curve");
+        text_path.style.size_px = 20.;
+        text_path.style.letter_spacing = 1.5;
+        text_path.style_runs.push(TextStyleRun {
+            start: 0,
+            end: 5,
+            style: TextStyle {
+                size_px: 24.,
+                letter_spacing: -0.5,
+                ..Default::default()
+            },
+        });
+        text_path.start = TextPathStart::new(1, 0.25).expect("valid path start");
+        let mut data = NodeData::TextPath(text_path);
+
+        scale_data(&mut data, 2.).expect("text path scales");
+        let text_path = data.as_text_path().expect("text path remains text path");
+        assert_eq!(
+            text_path.start,
+            TextPathStart::new(1, 0.25).expect("expected path start")
+        );
+        assert_eq!(text_path.style.size_px, 40.);
+        assert_eq!(text_path.style.letter_spacing, 3.);
+        let run = text_path.style_runs.first().expect("rich text run");
+        assert_eq!(run.style.size_px, 48.);
+        assert_eq!(run.style.letter_spacing, -1.);
+        let bounds = text_path.path.rough_bounds().expect("scaled path bounds");
+        assert_eq!([bounds.min_x, bounds.min_y], [2., 4.]);
+        assert_eq!([bounds.max_x, bounds.max_y], [16., 20.]);
     }
 
     #[test]
