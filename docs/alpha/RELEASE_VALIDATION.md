@@ -9,6 +9,7 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
 | Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity and driven natively: compact Design/Motion layouts, responsive centering, toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export passed. Earlier trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing also passed natively. This is not the final signed/notarized artifact. |
+| Current source-only editor work | Candidate `8fe0316` implements Text on Path creation/editing/render geometry, its bounded Design-inspector surface and preview-persistence boundary, and an active-root-scoped canvas-selection attachment to an unsent Agent draft. The coherent source gate passes 706 viewer tests, the focused text/render/document/tools/GPUI and Agent checks recorded below, and package-scoped Clippy for all affected packages. No native build, hosted artifact, deployment, billing configuration, or customer release validates this combined slice. Dev mode and Voice input remain unavailable. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
@@ -59,6 +60,86 @@ process even with a distinct bundle ID and profile. The candidate was therefore
 closed after the pass and the prior untouched
 `github-d0bc2d7/untouched/Fanta.app` was restarted with its original profile.
 Do not run two stable-channel Fanta QA binaries in parallel.
+
+## Current source-only Text on Path and canvas context — September 10
+
+Source-only candidate `8fe0316` replaces the former Text on Path
+placeholder with a conservative command: exactly one visible, unlocked vector
+is replaced in place, preserving its node identity and wrapper metadata, then
+opened for inline editing. The command accepts an unpainted path or one normal
+solid fill or stroke and rejects rounded, clipped, degenerate, multiply painted,
+gradient/image-painted, or blended vectors without changing the document.
+Text content, base style, and style runs edit through one commit while path,
+start, alignment, direction, and side are preserved. Rendering places shaped
+clusters along the path and exposes shared cluster-derived curved caret, hit,
+selection-quad, containment, and tight visual-bounds geometry. Pointer affinity
+and Left/Right/Home/End navigation follow visual bidirectional order. Caret
+positions inside one shaping cluster containing multiple graphemes use equal
+subdivisions rather than exact glyph-internal positions. Glyphless source
+intervals are retained when Skia exposes cluster geometry; otherwise rendering
+and edit geometry fail closed rather than inventing a caret interval.
+Complex-script offsets, ligatures, bidirectional clusters, trailing whitespace,
+and empty-text carets have passing source regression coverage.
+
+The Design inspector identifies TextPath distinctly and permits document-backed
+edits for name; font family, Regular/Italic style, weight, size, line height,
+pixel letter spacing, start/center/end alignment, and underline/strikethrough;
+side/orientation; and validated API-debug start segment/position data. Its
+single synthetic glyph Fill permits RGB and opacity edits only; add, style,
+visibility, remove, reorder, and forged non-color paint operations are gated.
+Supported typography and color changes update the base style and its runs, and
+flipping the side preserves direction. The shared typography UI still shows
+disabled non-applicable controls, and direction itself remains unexposed because
+the typed inspector has no direction action.
+
+A completed phased start interaction commits as one undo step. While any
+item-level content preview is active, autosave and direct persistence are
+blocked, relevant watcher changes remain deferred instead of being adopted by a
+merge/reload, and cancel or selection change restores and reprojects the
+document. Preview completion re-announces the edit so persistence resumes. The
+new persistence regressions pass in the current source gate. Color/bitmap glyphs
+can be drawn and use conservative editing bounds, but they do not expose an
+exact vector alpha silhouette; path-only inner-shadow and
+background-blur effects are therefore skipped instead of approximated with a
+rectangle.
+
+When every selected node belongs to the active page or component root, the
+toolbar attachment control captures an immutable attach-time JSON snapshot and
+inserts it as a named embedded resource in an unsent Agent draft. The resource
+includes exact node ids, an omitted count, and stable `document_id`, document
+path, project root, `active_root_id`, scope kind, and bounded scope, node-name,
+and font descriptions. It is capped at 64 included nodes and 128 KiB. Mixed-root and
+off-root selections are rejected rather than labelled with the wrong source,
+and the embedded usage contract requires matching the identity against
+`design_state` before live ids are used. Rapid attachment requests queue until
+the draft is ready. The user must review and submit it; no request is sent
+automatically. With no canvas selection, the control opens the existing Agent
+Add Context menu. The snapshot is not a live reference. Voice recording,
+permission handling, transcription, and cancellation are not part of this
+slice, and Dev mode's inspect, measure, annotation, and readiness controls
+remain unavailable.
+
+The coherent candidate source gate passed:
+
+- all 706 `fig_viewer` tests;
+- 116 `fanta-text` unit tests and one doctest, with one network test ignored;
+- 21 focused `fanta-render` TextPath tests and five focused `fanta-doc`
+  TextPath tests;
+- 297 `fanta-tools` tests: 290 unit, six end-to-end, and one ink oracle;
+- 596 `fanta-gpui` checks: 593 unit and three architecture, with one doctest
+  ignored;
+- two Agent canvas-selection request-framing checks; three attachment, one
+  external-context, and nine queue-filter Agent UI checks; 49 `acp_thread`
+  mention checks; and one canvas-selection URI round trip; and
+- package-scoped `./script/clippy` for `fanta-text`, `fanta-render`,
+  `fanta-doc`, `fanta-tools`, `fanta-gpui`, `fig_viewer`, `acp_thread`, `agent`,
+  and `agent_ui`.
+
+The separately filtered Agent UI counts can overlap and are not presented as a
+summed suite total. An earlier wider Agent UI subset reproduced 14 pre-existing
+global-state fixture failures; that historical result is not a current combined
+gate. There is no release build, native interaction, hosted installer,
+deployment, billing activation, or released artifact for this work.
 
 ## Latest trim, database and native checkpoint
 
@@ -1129,7 +1210,8 @@ inserting a point. Acquisition uses the scene's existing spatial index and a
 screen-space tolerance, respects hidden/locked ancestors, clipping overrides,
 and page scope, and excludes invalid transforms and boolean children. The
 native toolbar activates this tool. Scale is implemented in the subsequent
-`af4cb0f` correction below; Text on Path remains a placeholder.
+`af4cb0f` correction below; Text on Path was still a placeholder at this
+historical checkpoint, before the source-only candidate recorded above.
 
 Two original curve regressions exposed endpoint-only broad-phase bounds that
 excluded the visible body of a curve. Shared `PathData::rough_bounds` now
@@ -1185,7 +1267,9 @@ positions, text and dimensional styles scale together without compounding
 selected descendants; placement-only content preserves its source. Visible
 variable-bound frame dimensions determine the pivot, and release consumes its
 final pointer position even without a matching move. Undo/Redo and cancellation
-preserve original geometry, styles, and bindings. Text on Path remains pending.
+preserve original geometry, styles, and bindings. Text on Path was still
+pending at this historical Scale checkpoint; the later source-only candidate
+is recorded above.
 
 Scale's revised tests-only baseline produced **14 engine failures**, with
 **three controls passing**, and **one native failure**. At that stage, all
@@ -1597,7 +1681,7 @@ Evidence: `/tmp/fanta-release-qa-20260909/inline-video-validation/`.
 | Backend and AI Gateway | Runtime `0d3753a` is live as `dpl_CVnuDoWotpCv8v7SG3UyXrbzwvhQ`; its candidate/live checks and remaining worker limits are recorded above. Earlier runtime `830f702` passed 438 tests in 44 files, 60 focused tests, type checking and source CI (`34441329043`) passing. Migration `0019_generation_request_hash` was applied at 05:45:37 UTC and independently verified at 05:49:25 UTC (exact 19→20 history and nullable text column, no seed or customer-row reads). Nine candidate and nine live public checks passed without inference; direct alias verification confirms `api.fantaisa.net` serves this deployment. Atomic submission/body binding now joins the earlier terminal completion/billing, account selection, access/revocation and mock-model guards. The 06:09:09 UTC production API rejection check passed device sign-in, two 400/unreserved responses, unchanged 387 credits and key revocation followed by 401; it used no inference or native app. Earlier unauthenticated chat returned 401 and billing preflight returned 204. Browser-confirmed device API sign-in, catalogs, default Sonnet streaming, one-credit debit and key revocation passed previously in production. Repeat through the final native installer; Keychain persistence and native account-error handling remain unverified. |
 | Charge customers | The billing page still displays an explicit checkout-not-configured notice and no purchase or manage buttons. The latest API/dashboard check shows Pro/Owner and 387 credits after two one-credit AI verification requests. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
 | Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. The durable-recovery implementation described above passes all 596 viewer tests and persists generation state across reopening. Its `be2b282` native build passed in 4m46s, and both hosted checks at `02a32f6` passed. Local native full-restart QA passed at 06:20:39 UTC: no automatic generation/status/Messages requests, GET-only accepted-job recovery, exact uncertain-request replay and exact SVG/PNG bytes. The hosted installer and production GPU/Keychain remain unverified. The earlier `12ad6d3` has only tab-lifetime recovery. Runtime `110868d` adds video posters and account-safe result completion; the six native decoder tests and 606 editor tests pass as described above. Its 7m11s native build passed, but sign-in stalled in Keychain before poster Save/Play/Place/reopen checks; native app/installer QA remains pending. That build uses the system player. The subsequent inline generation controls and selected-video canvas rendering pass the automated checks above. Native UI/installer validation, audible playback, sustained resource measurements and planned video editing remain unfinished. |
-| Additional canvas tools | Path Selection, proportional Scale, and the K shortcut are implemented. The combined `ca56b0a` native candidate passed fast input, anchor editing, Scale/strokes, Undo/Redo, and save/reopen, but exposed viewport clipping. The `dcf27d6` viewport revision passed 337 document tests with one ignored, 280 tools, 6 viewport renders, and 24 toolbar adapters; both viewport GPUI pixel/reopen cases passed 20 iterations each. Its native build passed in 6m42s; viewport overflow, save/reopen, and K passed. Undo exposed stale editing handles. The `849685f` read-only overlay correction now passes 280 tools, 26 toolbar adapters, and both new GPUI cases across 20 iterations each. Its 4m36s build passed native immediate Undo/Redo handle alignment and save/reopen. Both `9ff7a77` hosted checks pass; exact-installer verification remains pending. Text on Path remains a placeholder. |
+| Additional canvas tools | Path Selection, proportional Scale, and the K shortcut are implemented. The combined `ca56b0a` native candidate passed fast input, anchor editing, Scale/strokes, Undo/Redo, and save/reopen, but exposed viewport clipping. The `dcf27d6` viewport revision passed 337 document tests with one ignored, 280 tools, 6 viewport renders, and 24 toolbar adapters; both viewport GPUI pixel/reopen cases passed 20 iterations each. Its native build passed in 6m42s; viewport overflow, save/reopen, and K passed. Undo exposed stale editing handles. The `849685f` read-only overlay correction now passes 280 tools, 26 toolbar adapters, and both new GPUI cases across 20 iterations each. Its 4m36s build passed native immediate Undo/Redo handle alignment and save/reopen. Both `9ff7a77` hosted checks pass; exact-installer verification remains pending. The current source-only Text on Path implementation is described above; its coherent automated gate passes, while native validation remains pending. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
 | Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. The later `5d3826d` native build passed page rename/Code path, move/Undo/Redo, K and explicit Save/reopen with all 15 saved-file hashes unchanged. Hosted checks through published `12ad6d3` pass, including the save batch; exact-installer verification remains pending. |
 | Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans. The previously observed descriptor-array scanner signature is absent after the later font correction; its final native snapshot still flags 314 blocks / 19,936 bytes across 20 roots. Other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |

@@ -37,6 +37,43 @@ ad-hoc local QA shell is not a distribution candidate. Evidence is retained at
 The remaining paint/blend matrix, native Export failure, and final
 signed/notarized artifact are still gates.
 
+Source-only candidate `8fe0316` implements conservative
+Text on Path conversion, inline curved-text editing, and renderer-backed
+selection geometry. Visual bidirectional navigation is implemented. Caret
+positions inside one shaping cluster containing multiple graphemes remain equal
+subdivisions rather than exact glyph-internal positions. Glyphless source
+intervals are retained when Skia exposes cluster geometry; otherwise rendering
+and edit geometry fail closed rather than inventing a caret interval.
+
+The Design inspector permits TextPath edits for font family, Regular/Italic
+style, weight, size, line height, pixel letter spacing, start/center/end
+alignment, underline/strikethrough, side/orientation, and API-debug start
+segment/position. Its synthetic glyph Fill permits RGB and opacity only;
+structural paint actions are gated. Active content previews block autosave and
+direct persistence, defer relevant external reconciliation, restore and
+reproject on cancellation or selection change, and resume persistence after
+completion. Direction itself still has no typed UI control.
+
+The toolbar attachment captures only selections wholly inside the active page
+or component root. Its immutable review-before-send resource carries exact node
+ids plus stable document/path/project/root/scope identity, bounds descriptive
+strings, and is capped at 64 nodes and 128 KiB; mixed-root or off-root selections
+are rejected and rapid requests queue without sending automatically. The
+coherent candidate source gate passed all 706 viewer tests; 116
+`fanta-text` unit tests and one doctest, with one network test ignored; 21
+focused renderer TextPath tests; five focused document TextPath tests; 297
+tools tests (290 unit, six end-to-end, and one ink oracle); and 596 GPUI checks
+(593 unit and three architecture), with one doctest ignored. Focused Agent
+coverage passed two canvas-selection request-framing checks; three attachment,
+one external-context, and nine queue-filter Agent UI checks; 49 mention checks;
+and one canvas-selection URI round trip. The package-scoped `./script/clippy`
+gate is green for `fanta-text`, `fanta-render`, `fanta-doc`, `fanta-tools`,
+`fanta-gpui`, `fig_viewer`, `acp_thread`, `agent`, and `agent_ui`. No native
+build or hosted release artifact validates this slice. Color/bitmap-glyph
+path-only inner-shadow/background-blur effects are skipped; Dev mode and Voice
+input remain unavailable. None of this source-only work is a deployment,
+billing, or customer-release claim.
+
 Desktop `17de5eb` now has successful push and pull-request checks. Its local
 candidate passes the 649 editor, 11 media-library and 11 native-playback cases
 described below. Its exact hosted Apple Silicon installer completed successfully
@@ -446,7 +483,7 @@ The old `eca2b86` native candidate rendered/acquired curves and preserved author
 
 Commit `dcf27d6` records edited vectors with `NodeFlags::UNCLIPPED_VECTOR`, preserving opaque extension metadata and keeping canvas rendering and export bounds consistent after save/reopen. It supersedes the intermediate metadata-marker approach. The viewport revision passed 337 document tests with one benchmark ignored, 280 editing-tool tests, 6 viewport render tests, and 24 native toolbar adapter tests. Both GPUI pixel/save/reopen regressions passed 20 scheduler iterations each; the ordinary raster pixel guard passed once. These results cover the final flag-based source, not just the earlier candidate.
 
-The `dcf27d6` native viewport and K-shortcut checks passed after the 6m42s build. That candidate restored saved geometry correctly on Undo but left editing handles stale until pointer input. Commit `849685f` refreshes cached path-editing overlays after successful Undo/Redo through a read-only hook, without changing geometry, selection, gesture state, or history. Both NodeEdit and Path Selection regressions failed at exact overlay positions before the fix. The final 280 editing-tool tests and 26 toolbar adapter tests pass, and both new GPUI regressions pass 20 scheduler iterations each. The `849685f` build passed in 4m36s, followed by native immediate Undo/Redo handle alignment and save/reopen with an unchanged source hash. Text on Path remains a placeholder. The full Sidebar suite passed all 143 tests, and six corrected fixtures each passed 20 scheduler iterations. Commit `ca56b0a` adds full Sidebar and toolbar CI coverage and passed actionlint; the fixture corrections add no Sidebar runtime change. Both hosted checks at `9ff7a77` passed for this editing batch, and published `12ad6d3` also passed both checks. The exact `12ad6d3` installer remained in progress at 05:26 UTC; final installer verification is pending.
+The `dcf27d6` native viewport and K-shortcut checks passed after the 6m42s build. That candidate restored saved geometry correctly on Undo but left editing handles stale until pointer input. Commit `849685f` refreshes cached path-editing overlays after successful Undo/Redo through a read-only hook, without changing geometry, selection, gesture state, or history. Both NodeEdit and Path Selection regressions failed at exact overlay positions before the fix. The final 280 editing-tool tests and 26 toolbar adapter tests pass, and both new GPUI regressions pass 20 scheduler iterations each. The `849685f` build passed in 4m36s, followed by native immediate Undo/Redo handle alignment and save/reopen with an unchanged source hash. Text on Path was still a placeholder in that historical candidate; the later source-only implementation is summarized near the top of this document and has no native evidence. The full Sidebar suite passed all 143 tests, and six corrected fixtures each passed 20 scheduler iterations. Commit `ca56b0a` adds full Sidebar and toolbar CI coverage and passed actionlint; the fixture corrections add no Sidebar runtime change. Both hosted checks at `9ff7a77` passed for this editing batch, and published `12ad6d3` also passed both checks. The exact `12ad6d3` installer remained in progress at 05:26 UTC; final installer verification is pending.
 
 
 ## September 10 recovery and serialization checkpoint
