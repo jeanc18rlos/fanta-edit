@@ -40,6 +40,10 @@ const HISTORY_LIMIT: usize = 12;
 const API_TIMEOUT: Duration = Duration::from_secs(125);
 const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const VIDEO_PREVIEW_TIMEOUT: Duration = Duration::from_secs(20);
+const DESIGN_SUBMIT_LABEL: &str = "Prepare unsent Agent brief";
+const DESIGN_HELP_TEXT: &str = "Prepare an unsent draft for Fanta Agent. Nothing runs until you review and send it in the Agent panel.";
+const DESIGN_READY_STATUS: &str =
+    "An unsent design brief is ready in the Agent panel. Review and send it to begin.";
 
 actions!(
     fanta,
@@ -96,6 +100,17 @@ impl GenerationMode {
             Self::Design => false,
         }
     }
+}
+
+fn design_agent_prompt(description: &str) -> Result<String> {
+    let description = description.trim();
+    ensure!(
+        !description.is_empty(),
+        "Describe the design you want to create."
+    );
+    Ok(format!(
+        "Create this design in the active Fanta canvas using editable native layers: {description}\n\nUse `design_state` first to inspect the canvas and find empty space. Use one or more `design_edit` batches to create editable frames, text, shapes, and auto layout while preserving existing work. Finish by verifying the result with `design_screenshot`."
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -749,7 +764,7 @@ impl GenerationWorkspace {
             cx.notify();
             return;
         };
-        if self.catalog_task.is_some() || self.task.is_some() {
+        if self.catalog_task.is_some() || self.identity_controls_locked() {
             return;
         }
         match normalize_endpoint(&self.base_url) {
@@ -891,8 +906,12 @@ impl GenerationWorkspace {
             .find(|model| Some(model.id.as_str()) == self.selected_model.as_deref())
     }
 
+    fn identity_controls_locked(&self) -> bool {
+        self.task.is_some() || self.pending
+    }
+
     fn set_mode(&mut self, mode: GenerationMode, window: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == mode {
+        if self.identity_controls_locked() || self.mode == mode {
             return;
         }
         self.prompt = if let Some((_, prompt)) = self
@@ -926,7 +945,7 @@ impl GenerationWorkspace {
                     "Create editable vectors from a prompt or trace an image."
                 }
                 GenerationMode::Design => {
-                    "Describe your design to prepare a brief for Fanta Agent."
+                    "Describe your design to prepare an unsent brief for Fanta Agent."
                 }
                 GenerationMode::Masks => {
                     "Click your source image to mark an area, or describe what to select."
@@ -2196,11 +2215,7 @@ impl GenerationWorkspace {
 
     fn generate_design(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let result = (|| {
-            let prompt = self.prompt.read(cx).text(cx);
-            ensure!(
-                !prompt.trim().is_empty(),
-                "Describe the design you want to create."
-            );
+            let prompt = design_agent_prompt(&self.prompt.read(cx).text(cx))?;
             let item = self
                 .canvas_item
                 .as_ref()
@@ -2211,21 +2226,25 @@ impl GenerationWorkspace {
                 .workspace
                 .upgrade()
                 .context("This workspace was closed.")?;
-            let prompt = format!(
-                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state and design_get_guidelines first, then design_batch with frames, text, shapes, and auto layout. Keep existing work and create in empty space. Finish by checking design_screenshot.",
-                prompt.trim()
-            );
             agent_ui::open_external_prompt_for_review(workspace, &prompt, window, cx)
         })();
         match result {
             Ok(()) => {
                 self.error = None;
-                self.status =
-                    "Your editable design brief is ready in the Agent panel. Send it to begin."
-                        .into();
+                self.status = DESIGN_READY_STATUS.into();
             }
             Err(error) => self.fail(error, cx),
         }
+        cx.notify();
+    }
+
+    fn select_model(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.identity_controls_locked() {
+            return;
+        }
+        self.selected_model = Some(id);
+        self.choose_default_model();
+        self.error = None;
         cx.notify();
     }
 
@@ -2247,10 +2266,7 @@ impl GenerationWorkspace {
                         .toggleable(IconPosition::End, selected.as_deref() == Some(&model.id))
                         .handler(move |_, cx| {
                             this.update(cx, |this, cx| {
-                                this.selected_model = Some(id.clone());
-                                this.choose_default_model();
-                                this.error = None;
-                                cx.notify();
+                                this.select_model(id.clone(), cx);
                             })
                             .log_err();
                         }),
@@ -2267,6 +2283,7 @@ impl GenerationWorkspace {
         )
         .style(DropdownStyle::Outlined)
         .full_width(true)
+        .disabled(self.identity_controls_locked())
         .into_any_element()
     }
 
@@ -2286,6 +2303,9 @@ impl GenerationWorkspace {
                         .toggleable(IconPosition::End, size == selected)
                         .handler(move |_, cx| {
                             this.update(cx, |this, cx| {
+                                if this.identity_controls_locked() {
+                                    return;
+                                }
                                 this.size = size.clone();
                                 cx.notify();
                             })
@@ -2298,6 +2318,7 @@ impl GenerationWorkspace {
         DropdownMenu::new("generation-size", self.size.clone(), menu)
             .style(DropdownStyle::Outlined)
             .full_width(true)
+            .disabled(self.identity_controls_locked())
             .into_any_element()
     }
 
@@ -2632,6 +2653,7 @@ impl Render for GenerationWorkspace {
         self.set_playback_active(true, cx);
         let signed_in = self.client.account_access_token().is_some();
         let is_design = self.mode == GenerationMode::Design;
+        let identity_controls_locked = self.identity_controls_locked();
         let prompt_vectors =
             self.mode == GenerationMode::Vector && self.vector_operation == VectorOperation::Create;
         let trace_vectors =
@@ -2653,7 +2675,7 @@ impl Render for GenerationWorkspace {
             .child(h_flex().flex_shrink_0().gap_2().flex_wrap().justify_between()
                 .child(Label::new("Create with Fanta").size(LabelSize::Large).weight(gpui::FontWeight::SEMIBOLD))
                 .child(h_flex().gap_2()
-                    .child(Label::new(if signed_in { "Fanta account connected" } else { "Connect your account to generate" }).color(Color::Muted))
+                    .child(Label::new(if is_design { "Agent brief stays local and unsent until you send it" } else if signed_in { "Fanta account connected" } else { "Connect your account to generate" }).color(Color::Muted))
                     .when(!signed_in || self.error.is_some(), |element| element.child(Button::new("generation-sign-in", "Sign in")
                         .disabled(self.task.is_some()).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))))
                     .child(Button::new("generation-billing", "Credits & billing").on_click(|_, _, cx| {
@@ -2661,6 +2683,7 @@ impl Render for GenerationWorkspace {
                     }))))
             .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::ALL.into_iter().map(|mode| {
                 Button::new(("generation-mode", mode as usize), mode.label()).toggle_state(self.mode == mode)
+                    .disabled(identity_controls_locked)
                     .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
             })))
             .child(h_flex().flex_shrink_0().items_start().gap_5().flex_wrap()
@@ -2669,7 +2692,11 @@ impl Render for GenerationWorkspace {
                         .child(Label::new("Vector tool").color(Color::Muted))
                         .child(h_flex().gap_1().flex_wrap().children([VectorOperation::Create, VectorOperation::Trace].into_iter().map(|operation| {
                             Button::new(("vector-operation", operation as usize), operation.label()).toggle_state(self.vector_operation == operation)
+                                .disabled(identity_controls_locked)
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    if this.identity_controls_locked() {
+                                        return;
+                                    }
                                     this.vector_operation = operation;
                                     this.choose_default_model();
                                     this.error = None;
@@ -2680,7 +2707,7 @@ impl Render for GenerationWorkspace {
                         .child(Label::new(if prompt_vectors { "Describe artwork to create editable vectors with Fanta AI." } else { "Upload an image or capture the canvas to turn it into vectors." }).color(Color::Muted)))
                     .when(!is_design, |element| element
                         .child(Label::new("Model").color(Color::Muted)).child(model_dropdown)
-                        .child(Button::new("refresh-generation-models", "Refresh models").disabled(self.catalog_task.is_some() || self.task.is_some())
+                        .child(Button::new("refresh-generation-models", "Refresh models").disabled(self.catalog_task.is_some() || identity_controls_locked)
                             .on_click(cx.listener(|this, _, _, cx| this.refresh_catalog(cx)))))
                     .child(Label::new(if self.mode == GenerationMode::Masks { "What to select (optional)" } else if trace_vectors { "Guidance (optional)" } else { "Your idea" }).color(Color::Muted))
                     // Auto-height editors need a definite width; InputField's
@@ -2690,7 +2717,7 @@ impl Render for GenerationWorkspace {
                         .bg(cx.theme().colors().editor_background)
                         .when(self.prompt.read(cx).focus_handle(cx).contains_focused(window, cx), |element| element.border_color(cx.theme().colors().border_focused))
                         .child(self.prompt.read(cx).editor().render(window, cx)))
-                    .when(is_design, |element| element.child(Label::new("Create editable frames, text, and shapes with the Fanta Agent. Review and send your brief in the Agent panel.").color(Color::Muted)))
+                    .when(is_design, |element| element.child(Label::new(DESIGN_HELP_TEXT).color(Color::Muted)))
                     .when(!is_design, |element| element
                         .when(self.mode != GenerationMode::Masks && !trace_vectors, |element| element
                             .child(Label::new("Size").color(Color::Muted)).child(size_dropdown))
@@ -2714,9 +2741,9 @@ impl Render for GenerationWorkspace {
                             .child(Button::new("clear-generation-mask", "Clear mask").on_click(cx.listener(|this, _, _, cx| { this.mask = None; cx.notify(); })))))
                     .when(prompt_vectors, |element| element.child(Label::new("Uses your Fanta AI credits. The final charge depends on AI usage.").size(LabelSize::Small).color(Color::Muted)))
                     .when_some(price.filter(|_| !is_design && !prompt_vectors), |element, price| element.child(Label::new(price).size(LabelSize::Small).color(Color::Muted)))
-                    .child(div().debug_selector(|| "generation-submit".into()).child(Button::new("submit-generation", if is_design { "Prepare design brief" } else if self.mode == GenerationMode::Masks { "Generate masks" } else if prompt_vectors { "Create vectors" } else if trace_vectors { "Trace image" } else { "Generate" })
+                    .child(div().debug_selector(|| "generation-submit".into()).child(Button::new("submit-generation", if is_design { DESIGN_SUBMIT_LABEL } else if self.mode == GenerationMode::Masks { "Generate masks" } else if prompt_vectors { "Create vectors" } else if trace_vectors { "Trace image" } else { "Generate" })
                         .style(ButtonStyle::Filled).full_width()
-                        .disabled(self.task.is_some() || !signed_in || (!is_design && (self.journal.is_none() || self.model().is_none() || self.unresolved_submission.is_some())))
+                        .disabled(self.task.is_some() || (!is_design && (!signed_in || self.journal.is_none() || self.model().is_none() || self.unresolved_submission.is_some())))
                         .on_click(cx.listener(|this, _, window, cx| this.generate(window, cx)))))
                     .when(self.unresolved_submission.is_some() && self.task.is_none(), |element| element
                         .child(Label::new("A saved request needs recovery. Retrying preserves its original input and recovery key.").color(Color::Muted))
@@ -3547,6 +3574,80 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1000.), px(768.)));
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[test]
+    fn design_brief_uses_registered_tools_and_is_explicitly_unsent() {
+        let prompt = design_agent_prompt("  a settings screen with two account cards  ")
+            .expect("valid design brief");
+        assert!(prompt.contains("a settings screen with two account cards"));
+        assert!(prompt.contains("`design_state`"));
+        assert!(prompt.contains("`design_edit`"));
+        assert!(prompt.contains("`design_screenshot`"));
+        assert!(!prompt.contains("design_get_guidelines"));
+        assert!(!prompt.contains("design_batch"));
+        assert!(design_agent_prompt(" \n ").is_err());
+        assert!(DESIGN_SUBMIT_LABEL.contains("unsent"));
+        assert!(DESIGN_HELP_TEXT.contains("Nothing runs until"));
+        assert!(DESIGN_READY_STATUS.contains("unsent"));
+    }
+
+    #[gpui::test]
+    fn signed_out_design_brief_does_not_require_a_generation_model(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Design, cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.client.account_access_token().is_none());
+            assert!(view.model().is_none());
+            view.prompt.update(cx, |prompt, cx| {
+                prompt.set_text("A launch dashboard", window, cx);
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        let submit = cx
+            .debug_bounds("generation-submit")
+            .expect("design brief button");
+        cx.simulate_click(submit.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            let error = view.error.as_deref().expect("local draft action ran");
+            assert!(
+                error.contains("Open a design canvas"),
+                "signed-out Design should reach the local canvas check: {error}"
+            );
+            assert!(!error.contains("Sign in"));
+            assert!(!error.contains("model"));
+        });
+    }
+
+    #[gpui::test]
+    fn in_flight_request_locks_mode_and_model_identity(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        view.update_in(cx, |view, window, cx| {
+            let first = model("image");
+            let mut second = model("image");
+            second.id = "fanta-image-2".into();
+            view.models = vec![first.clone(), second.clone()];
+            view.selected_model = Some(first.id.clone());
+            view.task = Some(Task::ready(()));
+
+            view.set_mode(GenerationMode::Video, window, cx);
+            view.select_model(second.id, cx);
+
+            assert_eq!(view.mode, GenerationMode::Image);
+            assert_eq!(view.selected_model.as_deref(), Some(first.id.as_str()));
+            view.task = None;
+
+            view.pending = true;
+            view.set_mode(GenerationMode::Video, window, cx);
+            view.select_model("fanta-image-2".into(), cx);
+
+            assert_eq!(view.mode, GenerationMode::Image);
+            assert_eq!(view.selected_model.as_deref(), Some(first.id.as_str()));
+            view.pending = false;
+        });
     }
 
     #[gpui::test]
