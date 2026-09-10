@@ -27,12 +27,17 @@ inspector-selection fix; the matching `d0bc2d7`
 [installer build](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34392882537)
 completed successfully at 22:22 UTC. Its downloaded checksum, embedded source
 revision, and strict signatures passed. It precedes the Git commit-buffer and
-memory corrections below. The `bccc5fd` installer started building at 22:24 UTC.
+memory corrections below. The `bccc5fd` installer has also completed and passed
+downloaded checksums, embedded revision, strict ad-hoc signatures, and bundled
+Git init/commit/push/fetch with an empty PATH. That package was not launched;
+its read-only disk image was unmounted normally. Evidence is in
+`/tmp/fanta-release-qa-20260909/github-bccc5fd/`.
 Both checks passed at documentation head `95bbef4` and callback/list memory-fix
-source `96d366a`. Its
-[installer run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34412799333)
-is pending behind the `bccc5fd` build. The subsequent Save As and font changes
-have local automated validation below. The final native build passed in
+source `96d366a`. The queued `96d366a` installer was superseded; the
+[4a8f3d9 installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34419050153)
+is now building. The subsequent generation-timeout correction has local
+validation below and still needs hosted checks and an exact installer.
+The last local native build passed in
 **5m45s**, and Save As passed copy/adoption, original-file preservation,
 autosave recovery, and rejection without opening the destination tab. The
 font correction at `8ab306a` has completed local allocation review below.
@@ -579,18 +584,64 @@ Save As focus correction. Evidence is in
 `save-as-validation/independent-memory-review.md` and `.json`.
 **Exact installer validation remains pending.**
 
+## Generation network recovery — September 10
+
+Generation API requests now have a 125-second deadline covering the response
+headers and body, accommodating the backend's 120-second submission limit.
+Media uploads and downloads have a separate five-minute deadline. An uncertain
+submission retains its original request and idempotency key so Retry same
+request can recover the existing job. Failed downloads preserve the job,
+history, output, and existing destination file. Successful save/play/place
+retries clear the previous transfer error.
+
+The generation filter passed **33 tests**. Six new stalled-header and
+stalled-body regressions passed **20 scheduler seeds each**, including same-key
+submission retry, download/save retry, and refusing to complete an unconfirmed
+upload. These tests use fake HTTP responses and GPUI's clock; they do not prove
+production inference or billing. Evidence is in
+`/tmp/fanta-release-qa-20260909/generation-timeout-validation/`.
+Final hosted checks and exact-installer verification remain required.
+
+## Live waitlist correction — September 10
+
+Landing commit `4e6c9c9` fixes silent address truncation, false confirmation
+from malformed success responses, and confirmation of an address edited during
+submission. All **15 offline tests**, TypeScript, focused lint, and the production
+build passed. Both hosted checks passed (`34419688177` and `34419692662`).
+Deployment `dpl_7SD2uTp6M2W37XABjH7qm2ynSGnU` is live on
+`https://www.fantaisa.net/`. Promotion exceeded the CLI observation deadline;
+the subsequent promotion status and production deployment lookup confirmed
+success. No duplicate promotion was started. The protected candidate was not
+browser-verified; public browser verification followed promotion.
+
+The live form rejected an overlong address, disabled editing while submitting,
+and confirmed the exact reserved test address
+`release-qa-20260910-001@fanta.invalid`. The test uses campaign
+`signup_validation_20260910` and source `release_qa`; it is not a customer lead.
+Three invalid API cases returned HTTP 400. Only PostHog is listed as the
+configured production sink. A fresh Google sign-in to the recovered US project
+then retrieved the saved contact with its exact email, `waitlisted=true`,
+placement, and campaign attributes. Its `waitlist_joined` event has matching
+submission ID `dabc9eba-4c5c-4914-8db1-3d850df95790` and timestamp
+`2026-09-10T00:11:31.546Z`; one canonical signup event appears in the loaded
+person history. Basic signup-to-stored-contact verification passed. Evidence
+is in `/tmp/fanta-release-qa-20260909/waitlist-live-verification.json` and
+`waitlist-live-invalid-cases.json`. Exclude this synthetic record from customer
+lead counts. No conversion improvement is established, and saved dashboard
+configuration was not changed.
+
 ## Remaining release requirements
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
 | Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Authenticated native streaming, debit, errors, and sign-out remain unverified against production. A fresh production sign-in and authenticated native check remain required; the earlier QA session was closed. |
 | Charge customers | The existing authenticated owner session displayed Pro and 389 credits after migration, with an explicit checkout-not-configured notice and no purchase or manage buttons. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
-| Native generation | 27 targeted tests passed. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
+| Native generation | 33 generation tests passed, including six network-timeout regressions that each passed 20 scheduler seeds. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
 | Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. Final hosted checks and exact-installer verification remain pending. |
 | Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans. The previously observed descriptor-array scanner signature is absent after the later font correction; its final native snapshot still flags 314 blocks / 19,936 bytes across 20 roots. Other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
-| Leads | Landing runtime `388e70d` is live as `dpl_HQURSm5XizjgZvvWUtPExb39tbd1`. Workflow head `e61e547` passed push/PR CI runs `34406236688`/`34406236734`. Seven analytics/navigation tests, nine initial-HTML checks, and desktop/mobile direct-hash and CTA checks passed with the complete waitlist form server-rendered. US PostHog project 410640 is accessible. No real lead was submitted; visit-to-signup reporting and durable contact capture still need end-to-end verification. No conversion improvement is established. |
+| Leads | Landing head `4e6c9c9` is live as `dpl_7SD2uTp6M2W37XABjH7qm2ynSGnU`; both hosted checks passed. All 15 offline tests, type checks, lint, and the production build passed. The live form rejected an overlong address, disabled edits while submitting, and confirmed the exact test address. Its stored contact and canonical `waitlist_joined` event were retrieved in US PostHog project 410640 with matching submission ID and campaign attribution. Basic signup-to-stored-contact verification passed using one reserved-domain QA address. Exclude that record from customer counts; no conversion improvement or completed outreach campaign is established. |
 
 Do not publish a release or enable customer checkout on the strength of the
 synthetic benchmark, public health checks, or the earlier green CI runs alone.
