@@ -8,7 +8,7 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | --- | --- |
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
-| Editor and video | Both `17de5eb` hosted checks pass. The current candidate through `5184d4b` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its compact toolbar, command registration, Export feedback, Design draft contract, and inspector paint changes still need exact-candidate native verification. Earlier trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing passed natively; the QA app closed normally and all 21 saved files remain exact. |
+| Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity and driven natively: compact Design/Motion layouts, responsive centering, toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export passed. Earlier trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing also passed natively. This is not the final signed/notarized artifact. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
@@ -18,6 +18,47 @@ image CRC, embedded `17de5eb` revision, strict ad-hoc signature, arm64 app/CLI,
 and bundled Git 2.53.0 passed non-launch inspection. The image was detached
 normally and the user's existing Fanta processes remained unchanged. Evidence:
 `/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
+
+## Exact `9d92b30` toolbar milestone — September 10
+
+`CARGO_TARGET_DIR=/Users/jeanrojas/fanta-edit/target cargo build --offline
+--locked --release -p zed` completed in 7m14s with embedded revision
+`9d92b30d437ad7ce3cfa72b9843284d26cdce83f`. The unsigned build output had
+SHA-256 `1df79b5bc5a1d06135a2a49b427d6b5bc6fae5193c7c4672e00167f5aa7292c2`.
+The local QA bundle used identifier `dev.fanta.ToolbarMilestoneQA`, a fresh
+`--user-data-dir`, and an ad-hoc signature that passed strict/deep verification;
+its post-sign main-executable SHA-256 is
+`63c86ec977baaa2b71bf9fcce06165f95217614dc5cae495e83d4d604f21bdc3`.
+It reused the prior QA shell's unchanged CLI, Git, icons, and plist structure,
+so it is native smoke evidence rather than an installer candidate.
+
+The app created and saved a local project, drew one rectangle, and passed these
+observations:
+
+- Design rendered one compact row centered in the canvas. Motion rendered its
+  contextual row directly above the real timeline without overlap. Panel
+  toggles and a narrower window recentered the toolbar; the narrow tier hid
+  zoom while keeping the explicit Ask AI action.
+- Selecting Ellipse from the shape flyout armed the tool without creating an
+  extra node. Toolbar Actions returned Group/Ungroup, Frame Selection, Replace
+  Content, Rewrite Text, Translate Text, and Rename Layers.
+- A signed-out Ask AI suggestion populated an unsent local draft. No AI request
+  was submitted and no production inference was used.
+- Fill and Stroke visibility changed the selected rectangle. Undo restored the
+  Fill. Switching Fill to Linear produced a finite two-stop gradient.
+- Toolbar Export preserved sidebar state, showed a visible success notice, and
+  wrote `Shape@2x.png`: a valid 418×354 RGBA PNG with SHA-256
+  `8427c595a3682c42d5fb8c03823d0b195cb93cdb0c4d95f3fee4e1d60fd9539e`.
+
+The QA app quit normally with exit code zero. Retained evidence is under
+`/tmp/fanta-release-qa-20260909/toolbar-milestone-9d92b30`, including the
+bundle, isolated profile/project, exported PNG, and `native-design-toolbar.png`,
+`native-motion-toolbar.png`, and `native-toolbar-narrow.png` screenshots.
+Launching this stable-channel QA binary displaced the previously running Fanta
+process even with a distinct bundle ID and profile. The candidate was therefore
+closed after the pass and the prior untouched
+`github-d0bc2d7/untouched/Fanta.app` was restarted with its original profile.
+Do not run two stable-channel Fanta QA binaries in parallel.
 
 ## Latest trim, database and native checkpoint
 

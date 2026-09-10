@@ -1,7 +1,7 @@
 # Fanta release capability inventory
 
 This is the release-facing inventory for desktop commit `17de5eb` and the
-current release candidate work on top of it. It separates implemented behavior
+exact first-milestone candidate `9d92b30` built on top of it. It separates implemented behavior
 from test evidence and production readiness so a source implementation is not
 mistaken for a shipped, verified capability.
 
@@ -23,16 +23,16 @@ notarization were used.
 | Surface | Implemented | Automated | Native | Production | Release boundary |
 |---|---:|---:|---:|---:|---|
 | Canvas selection and drawing | Yes | Yes | Partial | N/A | Move, Hand, Scale, Path Select, Node Edit, shapes, Pen, Pencil, Frame, Section, Slice, Text, and Comment are wired. Text-on-path is unavailable. Scale and Path Select have native history/reopen evidence; the complete visible set still needs the manual toolbar pass. |
-| Toolbar chrome and editing commands | Yes | Yes | Partial | N/A | Resources, Actions, zoom, panel toggles, undo/redo, clipboard, duplicate/delete/select-all, Group, Ungroup, Frame Selection, Present, Design/Motion, and AI routes are wired. The structure and four text-AI commands are registered and covered by exact palette-action tests; the complete native toolbar pass remains open. |
+| Toolbar chrome and editing commands | Yes | Yes | Partial | N/A | Resources, Actions, zoom, panel toggles, undo/redo, clipboard, duplicate/delete/select-all, Group, Ungroup, Frame Selection, Present, Design/Motion, and AI routes are wired. The exact `9d92b30` native pass verified centered Design and Motion layouts, responsive zoom collapse, panel-toggle recentering, flyout event isolation, explicit Ask AI, and searchable structure/text-AI Actions. The remaining editing-command and menu matrix still needs the final artifact pass. |
 | Roadmap toolbar controls | No | Yes | Unknown | N/A | Arrow, direct Image/Video placement, Annotation, Measure, Text-on-path, Dev mode/tools, auto-keyframe, motion path, and time comments report that they are unavailable. They are not release claims. |
 | Application menus | Yes | Partial | Unknown | N/A | Fanta, File, Edit, View, Window, and Help are declared and routed in source. The packaged-installer menu pass is outstanding. |
-| Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. In the current candidate, fill/stroke visibility, supported solid and finite unbound identity-transform gradient payloads, and per-paint blend modes produce undoable document edits. Unsupported paint payloads and node blend modes decline explicitly; shadow blend is read-only. Exact-artifact native coverage of these changes is outstanding. |
+| Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Supported solid and finite unbound identity-transform gradient payloads and per-paint blend modes have automated coverage. Unsupported paint payloads and node blend modes decline explicitly; shadow blend is read-only. The remaining paint/blend matrix still needs final-artifact native coverage. |
 | Prototype mode | Yes | Yes | Unknown | N/A | Triggers, navigation/overlay/scroll actions, variables/components, transitions, flows, and presentation runtime are implemented. |
 | Motion mode and timeline | Partial | Yes | Unknown | N/A | The production `TimelineShell` supports clip creation/selection/rename/duration, property-track keyframes, move/delete, interpolation/easing, entrance presets, playback, looping, scrub, and zoom. Toolbar Animation Style only echoes local UI state, both Add Keyframe faces fail to reach the real timeline-wide property menu, and the duplicate primary Motion flyout contradicts working secondary controls. Auto-keyframe, motion paths, and time comments remain unavailable. |
 | Comments | Yes | Yes | Unknown | N/A | Pins, threads, replies, resolve/delete, mentions, attachments, and skill routing are implemented. |
 | Variables workspace | Yes | Yes | Unknown | N/A | Collections, variables, modes, values, scopes, binding, preview, and undo are implemented. Typography-variable editing is read-only. |
 | Code workspace | Yes | Yes | Unknown | N/A | FNX and JSON follow the current selection and source. Both panes are intentionally read-only. |
-| Export engine | Partial | Yes | Unknown | N/A | PNG, JPEG, SVG, and PDF engines and 1×/2×/4× presets exist. Toolbar Export uses the same engine and now mirrors running, success, and failure feedback to the canvas without changing sidebar state. The default inspector still does not expose preset configuration. |
+| Export engine | Partial | Yes | Partial | N/A | PNG, JPEG, SVG, and PDF engines and 1×/2×/4× presets exist. On exact `9d92b30`, toolbar Export visibly reported success without changing the Inspector and wrote a valid 418×354 `Shape@2x.png`; automated coverage also exercises the unsaved-canvas failure. The default inspector still does not expose preset configuration, and native failure feedback remains to be driven. |
 | Image generation/editing | Yes | Yes | Yes | Unknown | Prompt/model/source/inpaint controls plus submit, poll, save, reuse, and place passed deterministic native QA. Authenticated production inference is not verified. |
 | Video generation | Yes | Yes | Partial | Unknown | Generation, save/place, and native playback controls exist; deterministic client/native flow passed. Production inference and full frame-specific playback validation remain open. |
 | Vector generation/trace | Yes | Yes | Yes | Unknown | Prompt-to-SVG, validation/sanitization, save/place, and source-required Trace paths exist. Production Create is unverified; production Trace is blocked until an SVG worker is configured. |
@@ -70,8 +70,37 @@ change state, produce output, or give an explicit unavailable message.
 - Shadow blend is read-only because the document model has no representation
   for it.
 
-These changes have automated coverage; exact-artifact native verification is
-still a release gate.
+These changes have automated coverage. Exact `9d92b30` native QA additionally
+verified Fill and Stroke visibility, Fill Undo, and a finite Linear gradient;
+the remaining payload/blend matrix stays a final-artifact release gate.
+
+## Exact first-milestone native checkpoint
+
+The release build embedded exact commit
+`9d92b30d437ad7ce3cfa72b9843284d26cdce83f` and completed in 7m14s. A distinct
+ad-hoc-signed `dev.fanta.ToolbarMilestoneQA` bundle used a fresh profile and a
+local project. Native observations covered:
+
+- the one-row Design toolbar and two-row Motion toolbar centered within the
+  current canvas bounds, including after panel changes and a narrower window;
+- responsive zoom hiding at the narrow tier, an explicit Ask AI control, and
+  the Motion toolbar clearing the production timeline;
+- shape flyout selection without creating a canvas node, plus searchable
+  Group/Ungroup, Frame Selection, Replace Content, Rewrite Text, Translate
+  Text, and Rename Layers entries in the toolbar Actions palette;
+- a signed-out Ask AI suggestion becoming a local unsent draft;
+- document-backed Fill/Stroke visibility, Fill Undo, and a finite Linear
+  gradient; and
+- toolbar Export preserving sidebar state, showing a success notice, and
+  writing a valid 418×354 PNG.
+
+The candidate quit with exit code zero. Its screenshots, exported PNG, bundle,
+profile, and verification record are retained under
+`/tmp/fanta-release-qa-20260909/toolbar-milestone-9d92b30`. Starting this QA
+bundle displaced the previously running stable-channel Fanta process despite
+the distinct bundle ID and profile; after QA, that prior untouched bundle was
+restarted with its original profile. Parallel native instances must therefore
+not be assumed safe.
 
 ## Intentionally gated behavior
 
@@ -105,8 +134,9 @@ The detailed test and native-run record is in
 and production-auth limitations are tracked in [`LAUNCH.md`](LAUNCH.md).
 Before release sign-off:
 
-1. Complete exact-artifact native coverage for the inspector paint fixes and
-   keep unsupported choices explicitly unavailable or read-only.
+1. Complete final-artifact native coverage for the remaining inspector
+   paint/blend matrix and keep unsupported choices explicitly unavailable or
+   read-only.
 2. Expose Export preset configuration in the default product surface and
    native-verify both success and failure feedback.
 3. Connect toolbar Animation Style and Add Keyframe to the existing production

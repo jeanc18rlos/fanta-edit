@@ -21,15 +21,21 @@ Updated on 2026-09-10. First release target: Apple Silicon Mac.
 
 ## Latest release checkpoint — September 10
 
-The current desktop candidate through `5184d4b` adds the compact centered
+The exact first-milestone desktop candidate `9d92b30` adds the compact centered
 canvas toolbar, restrained shared popup styling, explicit Ask AI action,
 responsive zoom tiers, registered structure/text-AI commands, visible toolbar
 Export feedback, an honest unsent Design AI brief contract, and undoable
 inspector paint edits with explicit unsupported states. It passes all 646
 viewer tests, all 591 shared GPUI tests plus three architecture tests, all 11
 media-library and 11 native-playback cases, and release-mode Clippy for
-`fig_viewer`/`fanta-gpui`. Exact native interaction and persistence checks for
-this candidate are the next gate.
+`fig_viewer`/`fanta-gpui`. Its exact 7m14s release build also passed focused
+native interaction: centered Design/Motion and narrow-window layouts, toolbar
+Actions, a signed-out unsent AI draft, Fill/Stroke visibility, Fill Undo, a
+finite Linear gradient, and visible successful Export to a valid PNG. The
+ad-hoc local QA shell is not a distribution candidate. Evidence is retained at
+`/tmp/fanta-release-qa-20260909/toolbar-milestone-9d92b30/verification.json`.
+The remaining paint/blend matrix, native Export failure, and final
+signed/notarized artifact are still gates.
 
 Desktop `17de5eb` now has successful push and pull-request checks. Its local
 candidate passes the 649 editor, 11 media-library and 11 native-playback cases

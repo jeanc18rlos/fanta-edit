@@ -92,7 +92,11 @@ actually driven. Nothing here claims more than that record supports.
   `Fanta is already running` and exits without opening the project
   (`crates/zed/src/main.rs:390`; the single-instance check is live because
   `crates/zed/RELEASE_CHANNEL` is `stable`). Open the folder from the running
-  app instead.
+  app instead. A separate `9d92b30` QA bundle with its own bundle identifier
+  and `--user-data-dir` nevertheless displaced the already-running stable
+  Fanta process during native validation. The prior untouched bundle/profile
+  was restarted after the pass, but parallel stable-channel QA instances must
+  not be treated as isolated.
 - **`fanta` with no arguments restores your last session, so you may never see
   the welcome page again.** The rehearsal hit this: after a project had been
   opened once, a bare launch reopened it rather than showing
@@ -155,8 +159,10 @@ actually driven. Nothing here claims more than that record supports.
   finite unbound gradients with an identity transform, and per-paint blend-mode
   changes produce document edits. Pattern, Image, Video, and Shader payloads,
   bound paint payloads, and unsupported or nonidentity-transform gradients
-  raise the existing unavailable notice. These changes have automated coverage;
-  exact-artifact native verification remains open.
+  raise the existing unavailable notice. Exact `9d92b30` native QA verified
+  Fill/Stroke visibility, Fill Undo, and a rendered/exported finite Linear
+  gradient. Per-paint blends and the remaining unsupported-payload notices
+  retain automated rather than native coverage.
 - Pass Through works. Linear Burn and Linear Dodge are explicitly unavailable
   because they cannot map to engine blend modes. Shadow blend is read-only
   because the document model has no representation for it.
@@ -262,7 +268,9 @@ actually driven. Nothing here claims more than that record supports.
   success, and failure messages to the canvas. The default GPUI inspector still
   removes the legacy Export section, so users cannot configure the existing
   1×/2×/4× presets or formats from the shipped surface. Automated success and
-  unsaved-canvas cases pass; exact-artifact native verification remains open.
+  unsaved-canvas cases pass. Exact `9d92b30` native QA exercised the success
+  route and wrote a valid 418×354 `Shape@2x.png`; native failure feedback is
+  still open.
 - **The document-backed timeline is ahead of its toolbar.** Motion mode can
   create/select/rename clips, change duration, add property tracks and
   keyframes from the timeline-wide `+ Keyframe` menu, move/delete keyframes,
