@@ -1629,8 +1629,27 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn export_selection(&mut self, cx: &mut Context<Self>) {
+        self.export_selection_with_feedback(false, cx);
+    }
+
+    /// Runs the same export flow while mirroring its status to the canvas
+    /// notice surface. The toolbar needs this because the shipped Design
+    /// inspector replaces this legacy panel, so its inline feedback is hidden.
+    pub(crate) fn export_selection_with_canvas_feedback(&mut self, cx: &mut Context<Self>) {
+        self.export_selection_with_feedback(true, cx);
+    }
+
+    fn export_selection_with_feedback(
+        &mut self,
+        show_canvas_feedback: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(view) = self.active_view(cx) else {
-            self.show_export_error("The canvas is no longer available.", cx);
+            self.show_export_error(
+                "The canvas is no longer available.",
+                show_canvas_feedback,
+                cx,
+            );
             return;
         };
         let (item, selected_page_index) = {
@@ -1640,11 +1659,19 @@ impl FantaPropertiesPanel {
         let jobs = {
             let item = item.read(cx);
             let Some(project_root) = item.project_root().map(|path| path.to_path_buf()) else {
-                self.show_export_error("Save this canvas as a Fanta project before exporting.", cx);
+                self.show_export_error(
+                    "Save this canvas as a Fanta project before exporting.",
+                    show_canvas_feedback,
+                    cx,
+                );
                 return;
             };
             let Some(document) = item.document() else {
-                self.show_export_error("The document is not ready to export.", cx);
+                self.show_export_error(
+                    "The document is not ready to export.",
+                    show_canvas_feedback,
+                    cx,
+                );
                 return;
             };
             prepare_export_jobs(
@@ -1658,7 +1685,11 @@ impl FantaPropertiesPanel {
         let jobs = match jobs {
             Ok(jobs) => jobs,
             Err(error) => {
-                self.show_export_error(format!("Export failed: {error:#}"), cx);
+                self.show_export_error(
+                    format!("Export failed: {error:#}"),
+                    show_canvas_feedback,
+                    cx,
+                );
                 return;
             }
         };
@@ -1667,15 +1698,18 @@ impl FantaPropertiesPanel {
         let format_summary = jobs.format_summary();
         self.export_generation = self.export_generation.wrapping_add(1);
         let export_generation = self.export_generation;
-        self.export_feedback = Some(ExportFeedback {
-            message: if job_count == 1 {
-                format!("Exporting {format_summary}…").into()
-            } else {
-                format!("Exporting {job_count} files ({format_summary})…").into()
+        self.set_export_feedback(
+            ExportFeedback {
+                message: if job_count == 1 {
+                    format!("Exporting {format_summary}…").into()
+                } else {
+                    format!("Exporting {job_count} files ({format_summary})…").into()
+                },
+                kind: ExportFeedbackKind::Running,
             },
-            kind: ExportFeedbackKind::Running,
-        });
-        cx.notify();
+            show_canvas_feedback,
+            cx,
+        );
         self.export_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { run_export_jobs(jobs) })
@@ -1700,33 +1734,61 @@ impl FantaPropertiesPanel {
                                 .unwrap_or_else(|| "the exports directory".to_string());
                             format!("Exported {} files to {directory}", paths.len())
                         };
-                        this.export_feedback = Some(ExportFeedback {
-                            message: message.into(),
-                            kind: ExportFeedbackKind::Success,
-                        });
+                        this.set_export_feedback(
+                            ExportFeedback {
+                                message: message.into(),
+                                kind: ExportFeedbackKind::Success,
+                            },
+                            show_canvas_feedback,
+                            cx,
+                        );
                     }
                     Err(error) => {
                         log::error!("Fanta export failed: {error:#}");
-                        this.export_feedback = Some(ExportFeedback {
-                            message: format!("Export failed: {error:#}").into(),
-                            kind: ExportFeedbackKind::Error,
-                        });
+                        this.set_export_feedback(
+                            ExportFeedback {
+                                message: format!("Export failed: {error:#}").into(),
+                                kind: ExportFeedbackKind::Error,
+                            },
+                            show_canvas_feedback,
+                            cx,
+                        );
                     }
                 }
-                cx.notify();
             }) {
                 log::debug!("dropping export result for a closed inspector: {update_error:#}");
             }
         }));
     }
 
-    fn show_export_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+    fn show_export_error(
+        &mut self,
+        message: impl Into<SharedString>,
+        show_canvas_feedback: bool,
+        cx: &mut Context<Self>,
+    ) {
         let message = message.into();
         log::error!("Fanta export failed: {message}");
-        self.export_feedback = Some(ExportFeedback {
-            message,
-            kind: ExportFeedbackKind::Error,
-        });
+        self.set_export_feedback(
+            ExportFeedback {
+                message,
+                kind: ExportFeedbackKind::Error,
+            },
+            show_canvas_feedback,
+            cx,
+        );
+    }
+
+    fn set_export_feedback(
+        &mut self,
+        feedback: ExportFeedback,
+        show_canvas_feedback: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if show_canvas_feedback {
+            crate::view::show_canvas_notice_deferred(feedback.message.to_string(), cx);
+        }
+        self.export_feedback = Some(feedback);
         cx.notify();
     }
 

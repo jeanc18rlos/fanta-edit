@@ -836,7 +836,7 @@ mod tests {
         // The legacy category/description substring survives as the fallback
         // tier without label highlights.
         assert_eq!(
-            EditorToolbar::match_command(ToolbarCommand::GenerateDesign, "figma agent"),
+            EditorToolbar::match_command(ToolbarCommand::GenerateDesign, "editable frames"),
             Some((4, Vec::new()))
         );
         assert_eq!(

@@ -3807,9 +3807,10 @@ impl FigView {
         h_flex()
             .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(px(16.))
+            .bottom(px(12.))
             .left_0()
             .right_0()
+            .px_3()
             .justify_center()
             .child(
                 h_flex()
@@ -6804,6 +6805,21 @@ mod tests {
                 toolbar.bottom() < controls.top(),
                 "toolbar covers video controls: {toolbar:?} vs {controls:?}"
             );
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                let surface = visual_context
+                    .debug_bounds("editor-toolbar-surface")
+                    .expect("compact toolbar surface");
+                assert!(surface.is_contained_within(&canvas));
+                assert!(
+                    (f32::from(surface.center().x) - f32::from(canvas.center().x)).abs() <= 0.5,
+                    "toolbar surface must stay centered in the canvas: {surface:?} vs {canvas:?}"
+                );
+                assert!(
+                    surface.bottom() + px(12.) <= controls.top(),
+                    "canvas inset must keep the surface clear of video controls: {surface:?} vs {controls:?}"
+                );
+            }
         }
     }
 
@@ -7128,6 +7144,102 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn toolbar_export_writes_the_default_preset_and_shows_canvas_feedback(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let directory = tempfile::tempdir().expect("temporary export directory");
+        let project_root = directory.path().join("Design");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(project_root.clone()),
+            doc_with_one_page(),
+            cx,
+        );
+        add_rect(&item, cx);
+
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let view = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create canvas in workspace window");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                view.update(cx, |view, cx| {
+                    view.inspector_sidebar_visible = false;
+                    view.export_from_toolbar(window, cx);
+                });
+            })
+            .expect("invoke toolbar export");
+        cx.run_until_parked();
+
+        assert!(project_root.join("exports/Page 1@2x.png").is_file());
+        assert!(!view.read_with(cx, |view, _| view.inspector_sidebar_visible));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace window remains open");
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids()),
+            [NotificationId::named(CANVAS_NOTICE_ID.into())]
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn toolbar_export_reports_an_unsaved_canvas_on_the_canvas_surface(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Unsaved-export.fig"),
+            doc_with_one_page(),
+            cx,
+        );
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let view = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create unsaved canvas in workspace window");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                view.update(cx, |view, cx| {
+                    view.inspector_sidebar_visible = false;
+                    view.export_from_toolbar(window, cx);
+                });
+            })
+            .expect("invoke toolbar export");
+        cx.run_until_parked();
+
+        assert!(!view.read_with(cx, |view, _| view.inspector_sidebar_visible));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace window remains open");
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids()),
+            [NotificationId::named(CANVAS_NOTICE_ID.into())]
+        );
     }
 
     #[gpui::test]
@@ -9142,9 +9254,10 @@ impl FigView {
         h_flex()
             .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(px(16.))
+            .bottom(px(12.))
             .left_0()
             .right_0()
+            .px_3()
             .justify_center()
             .child(adapter.panel.clone())
             .into_any_element()
@@ -9301,22 +9414,21 @@ impl FigView {
     }
 
     /// The toolbar's Export command runs the inspector's export flow — the
-    /// same presets, the same `exports/` destination, the same in-panel
-    /// feedback — rather than a second, divergent export path. Deferred
-    /// because that flow reads this view, which is leased for the duration of
-    /// the toolbar event.
+    /// same presets and the same `exports/` destination — rather than a second,
+    /// divergent export path. Deferred because that flow reads this view,
+    /// which is leased for the duration of the toolbar event.
     #[cfg(feature = "fanta-gpui-ui")]
-    fn export_from_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The flow reports progress, the written paths, and every failure
-        // (unsaved project, unexportable bounds) as inspector feedback, so the
-        // panel has to be on screen or the command looks like it did nothing.
-        if !self.inspector_sidebar_visible {
-            self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
-        }
+    fn export_from_toolbar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // The shipped Design inspector replaces the legacy panel that owns
+        // the export engine. Mirror its status to canvas notices so progress,
+        // written paths, and failures remain visible without changing the
+        // user's sidebar layout.
         let inspector = self.inspector_sidebar.downgrade();
         cx.defer(move |cx| {
             inspector
-                .update(cx, |inspector, cx| inspector.export_selection(cx))
+                .update(cx, |inspector, cx| {
+                    inspector.export_selection_with_canvas_feedback(cx)
+                })
                 .log_err();
         });
     }
@@ -9533,9 +9645,9 @@ const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 #[cfg(feature = "fanta-gpui-ui")]
 const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
 
-/// The draft prompt a toolbar AI command opens in the Agent Panel for the
-/// user to complete and review. Media commands stay `None`: there is no image
-/// backend to hand them to, so they are declined by name instead.
+/// The draft prompt a text-oriented toolbar AI command opens in the Agent Panel
+/// for the user to complete and review. Media and Design commands are routed to
+/// their dedicated generation workspaces before this helper is reached.
 #[cfg(feature = "fanta-gpui-ui")]
 fn toolbar_agent_prompt_template(
     command: fanta_gpui::toolbar::ToolbarCommand,
@@ -9589,10 +9701,9 @@ pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut 
     });
 }
 
-/// Show a canvas notice from a place that holds no `Window` — an item event
-/// subscription. The notice lands on the active window at the next effect
-/// flush, which is also when the reload it announces has finished applying.
-fn show_canvas_notice_deferred(message: String, cx: &mut App) {
+/// Show a canvas notice from a path that holds no `Window`. The notice lands
+/// on the active window at the next effect flush.
+pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
     cx.defer(move |cx| {
         let Some(window) = cx.active_window() else {
             log::warn!("fanta: no active window to show a canvas notice in: {message}");

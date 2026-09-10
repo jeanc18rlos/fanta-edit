@@ -1,17 +1,17 @@
-//! Persistent dock assembly: the mode-specific secondary strip, the primary
-//! tool strip, and the utility row with the mode tray, zoom cluster, Agent
-//! launcher, and the host chrome capsule.
+//! Persistent dock assembly: one primary row combining the tool strip with a
+//! utility segment, plus a mode-specific contextual strip when needed.
 
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
     ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Window, canvas,
     div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, h_flex, tooltip::Tooltip,
-};
+use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, tooltip::Tooltip};
 
-use super::{CHROME_CONTROL_SIZE, EditorToolbar, TOOL_SIZE, ToolbarOverlay, ZoomClusterTier};
+use super::{
+    AGENT_LAUNCHER_WIDTH, CHROME_CONTROL_SIZE, EditorToolbar, TOOL_SIZE,
+    TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH, ToolbarOverlay, ZoomClusterTier,
+};
 use crate::atoms::{ActivateControl, CONTROL_KEY_CONTEXT, ControlExt as _, icon_button};
 use crate::molecules::{horizontal_fade_overlays, track_horizontal_edge_fades};
 use crate::toolbar::icons::{render_icon_asset, render_mode_icon, render_tool_icon};
@@ -285,6 +285,7 @@ impl EditorToolbar {
 
         h_flex()
             .relative()
+            .flex_shrink_1()
             .max_w_full()
             .min_w(px(0.))
             .child(
@@ -360,9 +361,14 @@ impl EditorToolbar {
         let toolbar = cx.entity();
         // A flex wrapper so the scroll viewport keeps its flex-item sizing; a
         // block wrapper collapses a scroll child to zero width and culls the
-        // row's hitboxes.
+        // row's hitboxes. The full-tier width is its shrinkable basis; host
+        // chrome extends that basis rather than stealing room from zoom.
         h_flex()
             .relative()
+            .w(px(
+                TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH + self.chrome_cluster_width()
+            ))
+            .flex_shrink_1()
             .max_w_full()
             .min_w(px(0.))
             .child(
@@ -399,8 +405,8 @@ impl EditorToolbar {
                     .id(SharedString::from(format!("{}-utility-viewport", self.id)))
                     .debug_selector(|| "toolbar-utility-viewport".to_owned())
                     .flex()
-                    .w_full()
                     .min_w(px(0.))
+                    .flex_shrink_1()
                     .overflow_x_scroll()
                     .track_scroll(&self.utility_scroll_handle)
                     .child(
@@ -411,10 +417,7 @@ impl EditorToolbar {
                             .h(px(40.))
                             .px_1()
                             .gap_1()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
                             .child(self.render_mode_tray(cx))
-                            .child(div().flex_1().min_w(px(0.)))
                             .when(tier != ZoomClusterTier::Hidden, |row| {
                                 row.child(self.render_zoom_control(tier, window, cx)).child(
                                     div().w(px(1.)).h(px(22.)).flex_none().bg(cx.theme().border),
@@ -469,7 +472,6 @@ impl EditorToolbar {
             .rounded(px(7.))
             .cursor_pointer()
             .text_xs()
-            .font_medium()
             .border_1()
             .border_color(cx.theme().transparent)
             .bg(if selected {
@@ -517,7 +519,6 @@ impl EditorToolbar {
             .rounded(px(7.))
             .cursor_pointer()
             .text_xs()
-            .font_medium()
             .border_1()
             .border_color(cx.theme().transparent)
             .bg(if selected {
@@ -571,7 +572,6 @@ impl EditorToolbar {
                     .rounded(px(7.))
                     .cursor_pointer()
                     .text_xs()
-                    .font_medium()
                     .border_1()
                     .border_color(cx.theme().transparent)
                     .text_color(cx.theme().popover_foreground)
@@ -867,12 +867,7 @@ impl EditorToolbar {
                                     this.toggle_zoom(open, cx);
                                 }),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .child(format!("{}%", self.zoom_percent)),
-                            )
+                            .child(div().text_xs().child(format!("{}%", self.zoom_percent)))
                             .child(
                                 Icon::new(if open {
                                     IconName::ChevronUp
@@ -971,10 +966,11 @@ impl EditorToolbar {
         let open = self.overlay == Some(ToolbarOverlay::Agent);
         icon_button(
             SharedString::from(format!("{}-agent-launcher", self.id)),
-            px(36.),
-            px(10.),
+            px(32.),
+            px(8.),
             cx,
         )
+        .w(px(AGENT_LAUNCHER_WIDTH))
         .debug_selector(|| "toolbar-agent-launcher".to_owned())
         // Top alignment keeps the anchored composer's origin at the
         // launcher's top edge, exactly like the other popup-hosting triggers.
@@ -987,7 +983,8 @@ impl EditorToolbar {
             cx.theme().secondary
         })
         .text_color(cx.theme().magenta)
-        .tooltip(|window, cx| Tooltip::new("Agent · Command/Ctrl+Enter").build(window, cx))
+        .text_xs()
+        .tooltip(|window, cx| Tooltip::new("Ask AI · Command/Ctrl+Enter").build(window, cx))
         // Contract (§16): press-activation so the launcher wins the race
         // against the composer's capture-phase outside-dismiss; a click
         // handler would reopen the composer it just closed.
@@ -1004,8 +1001,14 @@ impl EditorToolbar {
         .child(
             h_flex()
                 .size_full()
+                .gap_1()
                 .justify_center()
-                .child(Icon::new(IconName::Bot).xsmall()),
+                .child(Icon::new(IconName::Bot).xsmall())
+                .child(
+                    div()
+                        .debug_selector(|| "toolbar-agent-label".to_owned())
+                        .child("Ask AI"),
+                ),
         )
         .when(open, |launcher| {
             launcher.child(self.render_agent_composer(window, cx))
