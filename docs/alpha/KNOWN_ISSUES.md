@@ -110,15 +110,15 @@ actually driven. Nothing here claims more than that record supports.
 
 - **Unfinished roadmap faces either decline explicitly or stay hidden.** Direct
   Image/Video placement, Arrow, Annotation, Measure, Dev mode/tools, arbitrary
-  toolbar file attachment and voice, auto-keyframe recording, time-anchored
-  comments, page duplication, and page links are not implemented. Their visible
+  toolbar file attachment and voice, auto-keyframe recording, page duplication,
+  and page links are not implemented. Their visible
   handlers raise *"&lt;control&gt; is not available in the Fanta alpha yet."* or an
   equally specific notice. Motion Path is hidden and unimplemented. Text on
-  Path and the bounded canvas-selection attachment are implemented only in the
-  current source candidate and have no native-artifact evidence. Scale and Path
-  Select are implemented and have focused native history/reopen evidence;
-  Image, Video, Vector, Masks, and Remove Background open their dedicated
-  generation workspaces.
+  Path, the bounded canvas-selection attachment, and Motion time comments are
+  implemented only in the current source line and have no native-artifact
+  evidence. Scale and Path Select are implemented and have focused native
+  history/reopen evidence; Image, Video, Vector, Masks, and Remove Background
+  open their dedicated generation workspaces.
 - **Ask AI and text-oriented commands prepare Agent drafts, not automatic
   edits.** A typed Ask AI prompt and the Replace Content, Rewrite Text,
   Translate Text, and Rename Layers templates open a fresh Agent Panel draft
@@ -274,18 +274,31 @@ actually driven. Nothing here claims more than that record supports.
   unsaved-canvas cases pass. Exact `9d92b30` native QA exercised the success
   route and wrote a valid 418×354 `Shape@2x.png`; native failure feedback is
   still open.
-- **Auto-keyframe, motion paths, and time comments remain unfinished.** Motion
-  mode can create/select/rename clips, change duration, add property tracks and
-  keyframes, move/delete keyframes, edit interpolation/easing, apply entrance
+- **Auto-keyframe and Motion Path remain unfinished; time comments are
+  source-only.** Motion mode can create/select/rename clips, change duration,
+  add property tracks and keyframes, move/delete keyframes, edit
+  interpolation/easing, apply entrance
   presets, play, loop, scrub, and zoom. The timeline-wide and contextual
   Keyframe menus now share the same seven-property catalog; a contextual choice
   adds or replaces one keyframe at the playhead in one undoable transaction.
   Animation Style applies an undoable preset and synchronizes the timeline, and
-  the contradictory primary Motion flyout is removed. Auto-keyframe and time
-  comments still decline explicitly; Motion Path is hidden and has no document
-  implementation. Production uses `fig_viewer::TimelineShell`; the reusable
-  `fanta-gpui` timeline tests exercise the pseudo editor, not the shipped
-  timeline. None of the new contextual keyframing has native-artifact evidence.
+  the contradictory primary Motion flyout is removed. The source-only Time
+  comment action captures the active page, clip, and exact integer-ms playhead,
+  pauses, and arms canvas placement. Posting persists one `SetMeta` history
+  operation, so one Undo removes the comment; FNX write/reopen preserves it.
+  Static comments remain visible everywhere, but a timed pin is visible only in
+  Motion on its exact clip. Thread navigation uses stable page/clip identity,
+  pauses at the anchored time, clamps to a shortened clip without rewriting the
+  anchor, and keeps an explicitly opened deleted-clip thread accessible without
+  retargeting another clip. Mode, workspace, tool, page, clip, timeline-time,
+  playback, scope, and source-lock changes clear unplaced intent. Time-comment
+  arming, placement, and thread navigation refuse to replace an existing draft
+  or unsent reply; unrelated mode and tool actions can still intentionally
+  cancel a placed draft. Auto-keyframe still declines explicitly, and Motion
+  Path remains hidden with no document implementation. Production uses
+  `fig_viewer::TimelineShell`; the reusable `fanta-gpui` timeline tests exercise
+  the pseudo editor, not the shipped timeline. None of the contextual keyframing
+  or time-comment work has native or final-artifact evidence.
 - The Code tab is read-only by design. Edit `.fnx` in your own editor and the
   canvas follows the file. Note that with autosave on, `page.fnx`'s mtime moves
   about a second after any canvas edit — **an unchanged mtime is no longer a

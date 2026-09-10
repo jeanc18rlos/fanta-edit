@@ -1,6 +1,6 @@
 # Fanta launch readiness
 
-Updated on 2026-09-10. First release target: Apple Silicon Mac.
+Updated on 2026-09-11. First release target: Apple Silicon Mac.
 
 ## What is connected
 
@@ -64,20 +64,35 @@ The contextual Motion Keyframe control now shares the production timeline's
 seven-property catalog and adds or replaces one keyframe at the playhead as one
 undoable transaction. Rejected requests do not author a keyframe, and a foreign
 content preview remains intact. The duplicate primary Motion flyout is removed.
-Auto-keyframe, Motion Path, and time comments remain unimplemented, and this
-Motion change has no native-artifact evidence.
+The current source tree also implements Motion time comments. Time comment
+captures the active page, clip, and exact integer-ms playhead, pauses playback,
+and enters page-bound canvas placement. Posting persists the comment and anchor
+through one `SetMeta` history operation, so one Undo removes it; FNX write and
+reopen preserve it. Static comments remain visible everywhere, while timed pins
+and ordinary overlays appear only in Motion on their exact clip. Opening a timed
+thread restores its stable page, clip, and time when that clip exists. Navigation
+to a time beyond a shortened duration clamps without rewriting the anchor; after
+clip deletion, explicitly opening the thread keeps it accessible without
+retargeting another clip. State, mode, workspace, tool, page, clip,
+timeline-time, playback, scope, and source-lock changes clear unplaced intent.
+Time-comment arming, placement, and thread navigation refuse to replace an
+existing draft or unsent reply; unrelated mode and tool actions can still
+intentionally cancel a placed draft. Auto-keyframe and Motion Path remain
+unimplemented, and none of this Motion work has native or final-artifact
+evidence.
 
-The coherent candidate source gate passed all 708 viewer tests; 116
+The current coherent source gate passed all 726/726 viewer tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21
 focused renderer TextPath tests; five focused document TextPath tests; 297
-tools tests (290 unit, six end-to-end, and one ink oracle); and 597 GPUI checks
-(594 unit and three architecture), with one doctest ignored. Focused Agent
+tools tests (290 unit, six end-to-end, and one ink oracle); and 598 GPUI checks
+(595 unit and three architecture), with one doctest ignored. Focused Agent
 coverage passed two canvas-selection request-framing checks; three attachment,
 one external-context, and nine queue-filter Agent UI checks; 49 mention checks;
 and one canvas-selection URI round trip. The package-scoped `./script/clippy`
 gate is green for `fanta-text`, `fanta-render`, `fanta-doc`, `fanta-tools`,
-`fanta-gpui`, `fig_viewer`, `acp_thread`, `agent`, and `agent_ui`. No native
-build or hosted release artifact validates this slice. Color/bitmap-glyph
+`fanta-gpui`, `fig_viewer`, `acp_thread`, `agent`, and `agent_ui`, including its
+Cargo Machete check. No native build or hosted release artifact validates this
+slice. Color/bitmap-glyph
 path-only inner-shadow/background-blur effects are skipped; Dev mode and Voice
 input remain unavailable. None of this source-only work is a deployment,
 billing, or customer-release claim.

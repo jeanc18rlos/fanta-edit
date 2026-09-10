@@ -1,4 +1,4 @@
-# Release validation — 2026-09-10
+# Release validation — 2026-09-11
 
 **The customer release is not yet validated.** This records completed checks
 and the remaining work for the Apple Silicon alpha. Configuration and launch
@@ -9,7 +9,7 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
 | Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity and driven natively: compact Design/Motion layouts, responsive centering, toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export passed. Earlier trim/edit/save/reopen, subsecond counters and one-click replay after end scrubbing also passed natively. This is not the final signed/notarized artifact. |
-| Current source-only editor work | Candidate `895b6b7` implements Text on Path creation/editing/render geometry, its bounded Design-inspector surface and preview-persistence boundary, an active-root-scoped canvas-selection attachment to an unsent Agent draft, and contextual seven-property Motion keyframing without the duplicate primary flyout. The coherent source gate passes 708 viewer tests, the focused text/render/document/tools/GPUI and Agent checks recorded below, and package-scoped Clippy for all affected packages. No native build, hosted artifact, deployment, billing configuration, or customer release validates this combined slice. Dev mode, auto-keyframe, Motion Path, time comments, and Voice input remain unavailable. |
+| Current source-only editor work | Candidate `895b6b7` implements Text on Path creation/editing/render geometry, its bounded Design-inspector surface and preview-persistence boundary, an active-root-scoped canvas-selection attachment to an unsent Agent draft, and contextual seven-property Motion keyframing without the duplicate primary flyout. The current source tree adds persisted Motion time comments with exact clip/time capture, exact-clip visibility, stable navigation, guarded composers, one-step history, and FNX reopen coverage. The current coherent source gate passes 726/726 viewer tests, 595 shared GPUI unit tests plus three architecture checks, and the focused text/render/document/tools/Agent checks recorded below; release Clippy and Cargo Machete are green. No native build or hosted artifact validates this combined slice, which is not deployed or released to customers and does not change billing configuration. Dev mode, auto-keyframe, Motion Path, and Voice input remain unavailable. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
@@ -61,7 +61,7 @@ closed after the pass and the prior untouched
 `github-d0bc2d7/untouched/Fanta.app` was restarted with its original profile.
 Do not run two stable-channel Fanta QA binaries in parallel.
 
-## Current source-only Text on Path, canvas context, and Motion keyframing — September 10
+## Current source-only Text on Path, canvas context, Motion keyframing, and time comments — September 11
 
 Source-only candidate `895b6b734e11253c3320918f60492cd1f0758a41` replaces the former Text on Path
 placeholder with a conservative command: exactly one visible, unlocked vector
@@ -126,24 +126,46 @@ keyframe at the current playhead in one undoable transaction. Exact label
 parsing rejects forged choices, and a content preview owned elsewhere blocks the
 operation without changing motion state or history. The former duplicate
 primary Motion flyout is absent; Move remains the primary selection face.
-Auto-keyframe, Motion Path, and time comments remain unimplemented. This source
-behavior has automated evidence only and still needs native-artifact validation.
 
-The coherent candidate source gate passed:
+The current source tree also replaces the Time comment placeholder. Invocation
+captures the active page, clip, and exact integer-ms playhead, pauses playback,
+and enters page-bound Comment placement. Posting stores the root comment's
+motion anchor in one `SetMeta` history operation; one Undo removes it, Redo
+restores it, and FNX write/reopen preserves it. Static comments remain visible
+in every mode. Timed pins and ordinary overlays appear only in Motion on their
+exact active clip. Opening a timed thread from Comments or Properties navigates
+by stable page and clip identity, seeks to its time, and pauses without adding
+history. If the clip duration later shrinks, navigation clamps to the new end
+without rewriting the authored anchor. If the clip is deleted, explicitly
+opening the thread keeps it accessible in the Canvas workspace, reports its
+unavailable anchor, and does not select or retarget another clip.
 
-- all 708 `fig_viewer` tests;
+Mode, workspace, tool, page, clip, timeline-time, playback, scope, and
+source-lock changes clear an unplaced time-comment intent. Time-comment arming,
+placement, and thread navigation refuse to replace an existing comment draft or
+unsent reply; unrelated mode and tool actions can still intentionally cancel a
+placed draft. Preview ownership, source locking, Save As, or a missing clip
+refuses an unsafe post without losing the draft. Malformed or future comment
+metadata is preserved rather than hiding valid comments or being overwritten by
+a later mutation. Auto-keyframe and Motion Path remain unimplemented. This
+source behavior has automated evidence only and still needs native and
+final-artifact validation.
+
+The current coherent source gate passed:
+
+- all 726/726 `fig_viewer` tests;
 - 116 `fanta-text` unit tests and one doctest, with one network test ignored;
 - 21 focused `fanta-render` TextPath tests and five focused `fanta-doc`
   TextPath tests;
 - 297 `fanta-tools` tests: 290 unit, six end-to-end, and one ink oracle;
-- 597 `fanta-gpui` checks: 594 unit and three architecture, with one doctest
+- 598 `fanta-gpui` checks: 595 unit and three architecture, with one doctest
   ignored;
 - two Agent canvas-selection request-framing checks; three attachment, one
   external-context, and nine queue-filter Agent UI checks; 49 `acp_thread`
   mention checks; and one canvas-selection URI round trip; and
 - package-scoped `./script/clippy` for `fanta-text`, `fanta-render`,
   `fanta-doc`, `fanta-tools`, `fanta-gpui`, `fig_viewer`, `acp_thread`, `agent`,
-  and `agent_ui`.
+  and `agent_ui`, including its Cargo Machete check.
 
 The separately filtered Agent UI counts can overlap and are not presented as a
 summed suite total. An earlier wider Agent UI subset reproduced 14 pre-existing

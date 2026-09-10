@@ -1,8 +1,9 @@
 # Fanta release capability inventory
 
 This is the release-facing inventory for desktop commit `17de5eb`, the exact
-first-milestone candidate `9d92b30` built on top of it, and source-only
-candidate `895b6b7` identified below. It separates
+first-milestone candidate `9d92b30` built on top of it, source-only candidate
+`895b6b7`, and the current source-only Motion time-comment work identified
+below. It separates
 implemented behavior from test evidence and production readiness so a source
 implementation is not mistaken for a shipped, verified capability.
 
@@ -25,12 +26,12 @@ notarization were used.
 |---|---:|---:|---:|---:|---|
 | Canvas selection and drawing | Yes | Yes | Partial | N/A | Move, Hand, Scale, Path Select, Node Edit, shapes, Pen, Pencil, Frame, Section, Slice, Text, Comment, and the source-only Text on Path work are wired. Text on Path conservatively converts one eligible selected vector in place, enters inline editing, and uses cluster-derived curved caret, hit, selection, and visual-bounds geometry. Scale and Path Select have native history/reopen evidence; Text on Path has no native or final-artifact evidence. |
 | Toolbar chrome and editing commands | Yes | Yes | Partial | N/A | Resources, Actions, zoom, panel toggles, undo/redo, clipboard, duplicate/delete/select-all, Group, Ungroup, Frame Selection, Present, Design/Motion, and AI routes are wired. The exact `9d92b30` native pass verified centered Design and Motion layouts, responsive zoom collapse, panel-toggle recentering, flyout event isolation, explicit Ask AI, and searchable structure/text-AI Actions. The remaining editing-command and menu matrix still needs the final artifact pass. |
-| Roadmap toolbar controls | Partial | Yes | Unknown | N/A | Text on Path and contextual Motion keyframing are implemented only in source candidate `895b6b7`. Arrow, direct Image/Video placement, Annotation, Measure, Dev mode/tools, auto-keyframe, and time comments still report that they are unavailable; Motion Path is hidden and unimplemented. They are not release claims. |
+| Roadmap toolbar controls | Partial | Yes | Unknown | N/A | Text on Path and contextual Motion keyframing are implemented in source candidate `895b6b7`; Motion time comments are implemented in the current source tree. Arrow, direct Image/Video placement, Annotation, Measure, Dev mode/tools, and auto-keyframe still report that they are unavailable; Motion Path is hidden and unimplemented. None of the source-only work is a native or release-artifact claim. |
 | Application menus | Yes | Partial | Unknown | N/A | Fanta, File, Edit, View, Window, and Help are declared and routed in source. The packaged-installer menu pass is outstanding. |
-| Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. The source-only TextPath inspector projects its exact kind/name; font family, Regular/Italic style, weight, size, line height, pixel letter spacing, start/center/end alignment, and underline/strikethrough; side/orientation; and validated API-debug start segment/position controls. Its synthetic glyph Fill permits RGB and opacity edits only; paint add, style, visibility, remove, and reorder actions are gated. Direction is preserved and rendered but has no typed UI action, and disabled non-applicable typography controls remain visible. The coherent candidate source gate passed, including all 708 viewer tests. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Text on Path and the remaining paint/blend matrix still need final-artifact native coverage. |
+| Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. The source-only TextPath inspector projects its exact kind/name; font family, Regular/Italic style, weight, size, line height, pixel letter spacing, start/center/end alignment, and underline/strikethrough; side/orientation; and validated API-debug start segment/position controls. Its synthetic glyph Fill permits RGB and opacity edits only; paint add, style, visibility, remove, and reorder actions are gated. Direction is preserved and rendered but has no typed UI action, and disabled non-applicable typography controls remain visible. The current coherent source gate passed, including all 726 viewer tests. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Text on Path and the remaining paint/blend matrix still need final-artifact native coverage. |
 | Prototype mode | Yes | Yes | Unknown | N/A | Triggers, navigation/overlay/scroll actions, variables/components, transitions, flows, and presentation runtime are implemented. |
-| Motion mode and timeline | Partial | Yes | Unknown | N/A | The production `TimelineShell` supports clip creation/selection/rename/duration, property-track keyframes, move/delete, interpolation/easing, entrance presets, playback, looping, scrub, and zoom. The contextual toolbar's Keyframe chooser shares the timeline's seven-property catalog and adds or replaces one keyframe at the playhead in a single undoable transaction; Animation Style applies an undoable entrance preset and synchronizes the timeline. The contradictory primary Motion flyout is removed. Auto-keyframe, motion paths, and time comments remain unavailable. |
-| Comments | Yes | Yes | Unknown | N/A | Pins, threads, replies, resolve/delete, mentions, attachments, and skill routing are implemented. |
+| Motion mode and timeline | Partial | Yes | Unknown | N/A | The production `TimelineShell` supports clip creation/selection/rename/duration, property-track keyframes, move/delete, interpolation/easing, entrance presets, playback, looping, scrub, and zoom. The contextual toolbar's Keyframe chooser shares the timeline's seven-property catalog and adds or replaces one keyframe at the playhead in a single undoable transaction; Animation Style applies an undoable entrance preset and synchronizes the timeline. The current source tree also lets Time comment capture the active clip and exact integer-millisecond playhead, pause playback, and arm canvas placement. The contradictory primary Motion flyout is removed. Auto-keyframe and Motion Path remain unimplemented; the time-comment work has no native or final-artifact validation. |
+| Comments | Yes | Yes | Unknown | N/A | Pins, threads, replies, resolve/delete, mentions, attachments, and skill routing are implemented. Static comments remain visible everywhere. Source-only timed comments persist their clip/time anchor and are visible as pins only for that exact active clip in Motion; panel navigation restores the stable page, clip, and time when available without rewriting the anchor. |
 | Variables workspace | Yes | Yes | Unknown | N/A | Collections, variables, modes, values, scopes, binding, preview, and undo are implemented. Typography-variable editing is read-only. |
 | Code workspace | Yes | Yes | Unknown | N/A | FNX and JSON follow the current selection and source. Both panes are intentionally read-only. |
 | Export engine | Partial | Yes | Partial | N/A | PNG, JPEG, SVG, and PDF engines and 1×/2×/4× presets exist. On exact `9d92b30`, toolbar Export visibly reported success without changing the Inspector and wrote a valid 418×354 `Shape@2x.png`; automated coverage also exercises the unsaved-canvas failure. The default inspector still does not expose preset configuration, and native failure feedback remains to be driven. |
@@ -55,8 +56,9 @@ change state, produce output, or give an explicit unavailable message.
    surface.
 2. The production timeline and contextual toolbar can author keyframes and
    entrance presets without the former duplicate primary flyout. Auto-keyframe
-   and time comments remain visible but explicitly unavailable; Motion Path is
-   hidden and has no document implementation.
+   remains visible but explicitly unavailable, and Motion Path is hidden with
+   no document implementation. Time comments are source-implemented, but their
+   native and final-artifact validation remains open.
 3. Text on Path direction is serialized and honored by rendering, but it is not
    exposed by the typed inspector UI. Caret positions inside one shaping
    cluster that contains multiple graphemes use equal subdivisions rather than
@@ -103,14 +105,37 @@ restores and reprojects the document before persistence resumes. Direction
 remains unexposed, and this inspector work has not been exercised in a native
 build.
 
-The coherent source-only gate passed all 708 `fig_viewer` tests; 116
+The current source tree additionally implements Motion time-anchored comments.
+Invoking Time comment captures the active page, clip, and exact integer-ms
+playhead before pausing playback and entering Comment placement. Posting the
+canvas draft persists the anchor through one `SetMeta` history entry, so one
+Undo removes it and Redo restores it; FNX write and reopen preserve the anchor.
+Static comments remain visible in every mode, while timed pins and ordinary
+overlays appear only in Motion for the exact active clip. Opening a timed thread
+from the Comments or Properties surface navigates by stable page and clip
+identity, seeks to its time, and pauses. A later duration reduction clamps
+navigation to the new clip end without rewriting the authored time. If the clip
+is deleted, explicitly opening the thread keeps it accessible, reports the
+unavailable anchor, returns to the Canvas workspace, and does not fall back to
+or retarget another clip.
+
+Unplaced time-comment intent is cleared by mode, workspace, tool, page, clip,
+timeline-time, playback, scope, or source-lock changes. Time-comment arming,
+placement, and thread navigation refuse to replace an existing comment draft or
+unsent reply; unrelated mode and tool actions can still intentionally cancel a
+placed draft. Posting is refused while preview ownership, source locking, Save
+As, or a missing clip makes the write unsafe. This is automated source evidence
+only; no native build or final artifact has exercised the flow.
+
+The coherent source-only gate passed all 726/726 `fig_viewer` tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21
 focused `fanta-render` TextPath tests; five focused `fanta-doc` TextPath tests;
-297 `fanta-tools` tests (290 unit, six end-to-end, and one ink oracle); and 597
-`fanta-gpui` checks (594 unit and three architecture), with one doctest ignored.
+297 `fanta-tools` tests (290 unit, six end-to-end, and one ink oracle); and 598
+`fanta-gpui` checks (595 unit and three architecture), with one doctest ignored.
 The package-scoped `./script/clippy` gate is also green for `fanta-text`,
 `fanta-render`, `fanta-doc`, `fanta-tools`, `fanta-gpui`, `fig_viewer`,
-`acp_thread`, `agent`, and `agent_ui`. Focused Agent evidence includes two
+`acp_thread`, `agent`, and `agent_ui`; its Cargo Machete check is green too.
+Focused Agent evidence includes two
 canvas-selection request-framing checks; three attachment, one external-context,
 and nine queue-filter Agent UI checks; 49 mention checks; and one
 canvas-selection URI round trip. These are source tests, not native or release
@@ -150,9 +175,8 @@ These controls already decline explicitly, are deliberately read-only, or stay
 hidden because their document behavior does not exist. They should stay out of
 release claims, but they are not silent-handler bugs:
 
-- Dev mode/tools, direct media placement tools, Annotation, Measure,
-  auto-keyframe, and time-anchored comments decline explicitly. Motion Path is
-  hidden and unimplemented.
+- Dev mode/tools, direct media placement tools, Annotation, Measure, and
+  auto-keyframe decline explicitly. Motion Path is hidden and unimplemented.
 - Text on Path conversion of rounded, clipped, degenerate, hidden/locked, or
   ambiguously/unsupported-painted vectors; those cases decline without changing
   the document. Direction editing, exact glyph-internal carets within one
@@ -194,19 +218,22 @@ Before release sign-off:
 3. Native-verify the contextual seven-property Keyframe chooser, its single-step
    Undo behavior and rejected requests that author no keyframe, and the absence
    of the contradictory primary Motion flyout.
-4. Native-verify Text on Path create/edit/Undo/Redo/save/reopen/export behavior,
+4. Native-verify Motion time-comment capture, cancellation, exact-clip
+   visibility, stable page/clip/time navigation, one-step Undo, duration-clamp
+   and deleted-clip behavior, protected drafts/replies, and FNX save/reopen.
+5. Native-verify Text on Path create/edit/Undo/Redo/save/reopen/export behavior,
    including multi-grapheme clusters, glyphless intervals, inspector preview
    cancellation/persistence barriers, and explicit rejection paths. Add a typed
    direction control before claiming the full requested scope.
-5. Native-verify the canvas-selection attachment preview/removal flow, including
+6. Native-verify the canvas-selection attachment preview/removal flow, including
    page and component roots, identity checks, mixed-root rejection, both caps,
    and rapid queued requests; then finish the file-attachment and voice
    recording/transcription lifecycles.
-6. Implement Dev mode's inspect, measure, annotation, and readiness controls.
-7. Extend the now-honest Design AI draft handoff into the agreed end-to-end
+7. Implement Dev mode's inspect, measure, annotation, and readiness controls.
+8. Extend the now-honest Design AI draft handoff into the agreed end-to-end
    progress, review, acceptance, and Undo workflow.
-8. Complete authenticated production Image, Video, Vector, and Mask checks
+9. Complete authenticated production Image, Video, Vector, and Mask checks
    only after worker families are ready; do not spend production credits merely
    to probe an unready service.
-9. Complete the hosted, signed/notarized installer and Gatekeeper pass.
-10. Run the manual smoke checklist against that exact artifact.
+10. Complete the hosted, signed/notarized installer and Gatekeeper pass.
+11. Run the manual smoke checklist against that exact artifact.
