@@ -35,13 +35,15 @@ its read-only disk image was unmounted normally. Evidence is in
 Both checks passed at documentation head `95bbef4` and callback/list memory-fix
 source `96d366a`. The queued `96d366a` installer was superseded; the
 [4a8f3d9 installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34419050153)
-is now building. The subsequent generation-timeout correction has local
-validation below and still needs hosted checks and an exact installer.
+is now building. Both hosted checks at `f03a26d5` now pass, including the Save As/font and
+generation-timeout corrections. The later backend-contract and sidebar-selection
+corrections below still need hosted checks and a matching installer.
 The last local native build passed in
 **5m45s**, and Save As passed copy/adoption, original-file preservation,
 autosave recovery, and rejection without opening the destination tab. The
 font correction at `8ab306a` has completed local allocation review below.
-Final hosted checks and exact installer validation remain pending.
+Hosted checks through `f03a26d5` pass. The latest generation/selection changes
+still need hosted checks, and exact installer validation remains pending.
 No signed/notarized installer is validated.
 An earlier native release build passed in **5m30s**, including the page-switch
 inspector correction. Candidate app `dev.fanta.CandidateQA` (PID 93583)
@@ -53,13 +55,18 @@ Native QA used the original checkout, including the user’s separate staged
 edits; hosted CI validates the isolated PR branch. Retired QA sessions have
 been closed. Cleaning the retired secondary Cargo target recovered about
 49.24 GiB of disk space; the current local target and user-active installer
-were preserved. The two retired disk-image mounts were unmounted normally;
+were preserved. Daily housekeeping is active at 04:00 local time, with Sunday
+`cargo clean` deferred whenever builds, tests, or native validation are active.
+The latest process check found only the user-active app and its helper, with
+no zombie processes. The retired disk-image mounts were unmounted normally;
 downloaded images and untouched app copies remain available.
 
-The backend [CI run](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34380169196)
-passed at pull request head `9d05908`, with **365 TypeScript tests**, **73
-isolated GPU tests**, and type checking. These checks do not establish deployed
-GPU readiness or successful production AI requests.
+The latest backend [CI run](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34421837511)
+passed at pull request head `6fae7a8`, with **369 TypeScript tests**, **73
+isolated GPU tests**, type checking, and Docker. This source is deployed;
+the account-contract verification below records its fresh browser sign-in.
+These checks do not establish deployed GPU readiness or successful production
+AI requests.
 
 Production migration `0018_subscription_event_order` was applied at 20:13 UTC
 on September 9 after all 18 preceding migration timestamps and SQL hashes
@@ -88,12 +95,13 @@ Local validation results:
 | Inspector integration suite | 34 passed; real page switching clears off-page selection, preserves selection on the current page, updates the inspector, and leaves the old shape unchanged |
 | Native toolbar interaction suite | 32 passed, including pointer focus, popup dismissal, input editing, and keyboard navigation |
 | Toolbar input with the shipped canvas keymap | 1 passed; typing and clicking in search preserve the query, Escape restores shortcuts |
-| Native generation/media suite | 27 passed, including actual toolbar activation, catalog authorization, prompt-to-SVG, visible prompt rendering, accurate source clicks, and scrollable inpainting controls |
-| Sidebar suite with ownership and startup fixes | 133 passed, 7 failed; baseline was 128 passed with 8 failures. Four new regressions and the previously failing selection invariant (20 generated cases) pass; the suite is not fully green. |
+| Native generation/media suite | 37 passed, including backend string-seed submission/poll/replay responses, integer segmentation clicks, toolbar activation, catalog authorization, prompt-to-SVG, and scrollable inpainting controls |
+| Sidebar suite with ownership, startup, and selection fixes | 137 passed, 6 existing failures. Three new selection regressions and the previously failing historical-thread selection test pass. The initial baseline was 128 passes and 8 failures; the suite is not fully green. |
 
 The local CI workflow includes the focused sidebar ownership regressions.
-Seven unrelated baseline failures remain; their exclusion from the focused
-check is not evidence that they are fixed.
+Six baseline failures remain; their exclusion from the focused check is not
+evidence that they are fixed. The current CI also runs selection-remapping
+regressions and the historical-thread activation check.
 
 New tests cover snapshot isolation through node/hierarchy edits and unchanged
 JSON serialization. A GPUI test also covers closing the visible assistant
@@ -533,7 +541,7 @@ Evidence is in `native-prevalidation-events.json`,
 `native-events.json`, `native-fixture-integrity.json`, and `build-provenance.json`
 retain the earlier observations. Both local builds include preserved user
 changes and are not exact GitHub installers.
-**Final hosted checks and exact-installer verification remain pending.**
+**Hosted checks through `f03a26d5` pass; exact-installer verification remains pending.**
 
 ## Font ownership reproduction — September 10
 
@@ -630,15 +638,86 @@ is in `/tmp/fanta-release-qa-20260909/waitlist-live-verification.json` and
 lead counts. No conversion improvement is established, and saved dashboard
 configuration was not changed.
 
+## Backend account contracts — September 10
+
+Backend `6fae7a8` corrects two reproduced defects. The desktop account endpoint
+now selects the current subscription using the same rule as billing, instead
+of returning dates from an older canceled row. Dashboard sessions now select
+the signed-in user's membership role; a member can no longer inherit the first
+owner row's billing or API-key administration permissions.
+
+All **369 tests across 42 files**, type checking, and
+[GitHub CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34421837511)
+passed, including the hosted GPU suite and Docker build. The committed source
+passed the pinned Next.js 16.2.10 Turbopack production build and generated type
+validation on Vercel. Candidate and post-promotion public checks passed all
+nine cases. Deployment `dpl_7snZZNo5pfUkroT4axaGNPQZT9ee` is live at
+`https://api.fantaisa.net`; no new migration or payment configuration was used.
+A fresh browser sign-in after promotion displayed Pro, Owner, and 389 credits,
+with checkout explicitly unconfigured. The member-denial tests used isolated
+database fixtures; no production membership was changed.
+
+Supplemental local Webpack validation exposed pre-existing generated page and
+route-wrapper type incompatibilities; default hosted Turbopack and Docker
+builds passed. No Webpack workaround, configuration weakening, or unrelated
+Gallery change was retained. Native sign-in still selects its first membership
+while browser APIs honor the active organization; multi-organization alignment
+remains separate work. Evidence is in
+`/tmp/fanta-release-qa-20260909/account-contract-verification.json`.
+
+## Native generation wire compatibility — September 10
+
+The backend returns generation seeds as text, while the native response type
+previously required an integer. Completed submission, polling, and same-key
+replay responses could therefore fail decoding after successful generation.
+The desktop now preserves text seeds exactly, including values beyond numeric
+precision limits, while continuing to accept numeric, null, and omitted seeds.
+
+Segmentation preview clicks previously sent fractional source coordinates to
+workers that require integer pixel indices. Clicks now map to their containing
+source pixel, and requests serialize integer coordinates. Off-grid clicks,
+right/bottom edges, negative/outside clicks, and invalid coordinates are covered.
+
+The new and extended cases failed **8 checks before the correction**; all
+**37 generation checks now pass**. Two new submission/poll tests also passed
+20 scheduler iterations each. These use backend-shaped HTTP fixtures and the
+GPUI clock, not production inference. Evidence is in
+`/tmp/fanta-release-qa-20260909/generation-contract-validation/`.
+
+## Sidebar selection identity — September 10
+
+When an empty draft disappeared during thread activation, selection retained
+its old row index. The highlight could move to another thread and the next
+Enter could activate it. Selection now follows the surviving thread, terminal,
+or project identity through list rebuilds. Removing the selected item falls
+back to the nearest remaining row; an absent selection stays absent.
+
+Three new regressions cover real draft disappearance and Enter activation,
+selected-row deletion, and a project-header shift with changed layout. They
+failed against the prior implementation and now pass. The existing historical
+thread selection failure also passes. One new header fixture initially assumed
+the wrong group order; it was corrected to assert actual ordering and a real
+one-row shift, and then reproduced the prior bug independently. Repeated
+execution also exposed shared test-database state between scheduler iterations;
+the header fixture now uses a separate database each time. The four selection
+tests passed **20 scheduler iterations each** with all assertions retained.
+
+The full suite now reports **137 passes and 6 baseline failures**, improved
+from 133 passes and 7 failures before this correction. The remaining failures
+involve draft/focus/async fixture expectations and are preserved for follow-up;
+they have not been declared fixed. Evidence is in
+`/tmp/fanta-release-qa-20260909/sidebar-selection-validation/`.
+
 ## Remaining release requirements
 
 | Goal | Evidence and remaining verification |
 | --- | --- |
-| Backend and AI Gateway | Backend head `9d05908` is green in CI and deployed after its verified additive migration. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Authenticated native streaming, debit, errors, and sign-out remain unverified against production. A fresh production sign-in and authenticated native check remain required; the earlier QA session was closed. |
-| Charge customers | The existing authenticated owner session displayed Pro and 389 credits after migration, with an explicit checkout-not-configured notice and no purchase or manage buttons. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
-| Native generation | 33 generation tests passed, including six network-timeout regressions that each passed 20 scheduler seeds. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
+| Backend and AI Gateway | Backend head `6fae7a8` is green in CI and deployed; its account-period and member-permission corrections passed all 369 tests. The earlier additive migration remains verified. Nine public checks passed; unauthenticated chat returned 401 and billing CORS preflight returned 204. Authenticated native streaming, debit, errors, and sign-out remain unverified against production. Fresh browser sign-in passed; native production sign-in and authenticated checks remain required. The earlier native QA session was closed. |
+| Charge customers | A fresh browser sign-in after the latest deployment displayed Pro/Owner and 389 credits, with an explicit checkout-not-configured notice and no purchase or manage buttons. Pricing/product/currency selection and production Polar configuration remain blocked. Checkout, webhook retry/cancellation/renewal, exactly-once credits, and billing portal remain unverified. No purchase or customer charge was made. |
+| Native generation | 37 generation tests passed, including string-seed submission/poll/replay and integer segmentation coordinates. Six network-timeout regressions passed 20 scheduler seeds each; the two new submission/poll checks also passed 20 each. Requests and transfers now time out without losing their recovery state. Local fixture sign-in/catalog, image polling/gallery/save/place, masks/background removal, editable SVG preview/place/save, and MP4 poll/play/place/save passed, with saved assets/layers verified. Final native checks also passed visible prompts, per-mode drafts, source-point selection, mask-to-inpaint source restoration, scrolling, and inpaint completion. Verify real media requests in production. Retry state/history lasts only for the tab lifetime; video playback uses the system player and canvas cards have no poster yet. |
+| Additional canvas tools | Scale, Path Selection, and Text on Path remain explicit placeholders in the native tool shell. Their behavior still needs implementation and verification before claiming all canvas capabilities work. |
 | GPU service | Backend CI tests passed. Production HMAC access remains blocked; deployed GPU availability and successful end-to-end generation are not established. |
-| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. Final hosted checks and exact-installer verification remain pending. |
+| Design and Git UI | Synthetic creation/edit/save/reopen and app-driven review/stage/commit/push passed. Final native import/edit/undo/redo/save and a second reopen/edit/save/close passed for the 29,301-node fixture. The candidate now renders a fresh 128 MB UI-kit import and Grid/Icons page changes; a visible green fill edit, Undo/Redo, and saved source passed. Complete bundled Git verification passed. The final native inspector check passed, including same-page selection preservation, clearing on page changes, and unchanged saved source. The Save As correction passed 9 automated regressions, a 20-seed destination-prevalidation regression, an earlier GPUI sweep, and the custom-picker suite. Native cancel, sibling default, copy adoption/edit/reopen, original-file preservation, occupied-destination rejection, and autosave recovery passed. The final 5m45s build also passed rejection with one unchanged source tab, post-error autosave, and valid Save As/reopen of a 208×160 copy. Hosted checks through `f03a26d5` pass; exact-installer verification remains pending. |
 | Performance and UI quality | The repeated native lifecycle above released document-sized allocations in one warm-up plus four measured cycles. After the final five-minute idle, live malloc was 33.3 MiB and physical footprint 218.9 MiB; a 6.3 MiB residual above warm-up remains unattributed. The offline leak scanner flagged 340 allocations totaling 23,120 bytes. Earlier editing/UI-kit checks also released document-sized allocations. Two specific callback/list retain cycles were subsequently fixed and absent from repeated native after-fix scans. The previously observed descriptor-array scanner signature is absent after the later font correction; its final native snapshot still flags 314 blocks / 19,936 bytes across 20 roots. Other scanner findings remain unresolved. No leak-free or Figma-performance claim is established. Test sustained edits under controlled conditions. |
 | Installer | Developer ID Application certificate `ML3GCBU926` for team `SP6J7Q6M3J` was issued/downloaded, with private-key match and G2 certificate chain verified; it expires 2031-09-10. GitHub secret names `MACOS_CERTIFICATE` and `MACOS_CERTIFICATE_PASSWORD` were verified after setting them at 17:57 UTC. No local keychain import was performed. The App Store Connect API terms modal awaits explicit user approval before notarization-key generation. Then build a signed/notarized DMG and install/launch it on a clean Mac. |
 | Leads | Landing head `4e6c9c9` is live as `dpl_7SD2uTp6M2W37XABjH7qm2ynSGnU`; both hosted checks passed. All 15 offline tests, type checks, lint, and the production build passed. The live form rejected an overlong address, disabled edits while submitting, and confirmed the exact test address. Its stored contact and canonical `waitlist_joined` event were retrieved in US PostHog project 410640 with matching submission ID and campaign attribution. Basic signup-to-stored-contact verification passed using one reserved-domain QA address. Exclude that record from customer counts; no conversion improvement or completed outreach campaign is established. |
