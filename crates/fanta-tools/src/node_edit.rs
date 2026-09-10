@@ -31,7 +31,7 @@ use crate::node_math::{
     self, AnchorId, AnchorInfo, HandleSide, closest_point_on_path, enumerate_anchors,
 };
 use crate::tool::{CursorHint, Tool, ToolOverlay, ToolResponse, bounds_from_corners};
-use fanta_doc::{NodeData, NodeFlags, NodeId, Operation, PathData, Transform2D};
+use fanta_doc::{Doc, NodeData, NodeFlags, NodeId, Operation, PathData, Transform2D};
 use glam::DVec2;
 use std::collections::BTreeSet;
 
@@ -165,6 +165,10 @@ impl Tool for NodeEditTool {
             ToolEvent::Pointer(p) => self.handle_pointer(ctx, p),
             ToolEvent::Key(k) => self.handle_key(ctx, k),
         }
+    }
+
+    fn overlays_after_document_change(&self, doc: &Doc) -> Option<Vec<ToolOverlay>> {
+        Some(self.path_overlays(doc))
     }
 
     fn activate(&mut self, ctx: &mut ToolContext) {
@@ -592,20 +596,29 @@ impl NodeEditTool {
 
     // -- overlays ---------------------------------------------------------------
 
-    /// Anchor squares + visible handles, in world space, for the renderer.
-    fn base_overlays(&self, ctx: &ToolContext, response: &mut ToolResponse) {
-        let Some(path) = self.target_path(ctx) else {
-            return;
+    fn path_overlays(&self, doc: &Doc) -> Vec<ToolOverlay> {
+        let Some(id) = self.target else {
+            return Vec::new();
         };
-        let world_t = self.target_world(ctx);
-        let anchors = enumerate_anchors(&path);
+        let Some(vector) = doc.scene.get(id).and_then(|node| node.data.as_vector()) else {
+            return Vec::new();
+        };
+        if self.select_segments && !doc.selection.contains(id) {
+            return Vec::new();
+        }
+        let world_t = doc
+            .scene
+            .world_transform(id)
+            .unwrap_or(Transform2D::IDENTITY);
+        let anchors = enumerate_anchors(&vector.path);
         let visible = self.handle_visible_set(&anchors);
+        let mut overlays = Vec::new();
         for a in &anchors {
             if visible.contains(&a.id) {
                 let wa = world_t.transform_point(a.pos);
                 for ctrl in [a.ctrl_in, a.ctrl_out].into_iter().flatten() {
                     let wc = world_t.transform_point(ctrl);
-                    response.overlays.push(ToolOverlay::PathHandle {
+                    overlays.push(ToolOverlay::PathHandle {
                         world_anchor: [wa.x, wa.y],
                         world_ctrl: [wc.x, wc.y],
                     });
@@ -614,11 +627,19 @@ impl NodeEditTool {
         }
         for a in &anchors {
             let w = world_t.transform_point(a.pos);
-            response.overlays.push(ToolOverlay::PathAnchor {
+            overlays.push(ToolOverlay::PathAnchor {
                 world: [w.x, w.y],
                 selected: self.selected.contains(&a.id),
             });
         }
+        overlays
+    }
+
+    fn base_overlays(&self, ctx: &ToolContext, response: &mut ToolResponse) {
+        if !self.target.is_some_and(|id| is_vector(ctx, id)) {
+            return;
+        }
+        response.overlays.extend(self.path_overlays(ctx.doc));
         if let Some(p) = self.insert_hover {
             response
                 .overlays

@@ -1229,6 +1229,146 @@ mod echo_tests {
         }
     }
 
+    async fn assert_path_overlays_follow_history(cx: &mut TestAppContext, tool: ToolbarTool) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            ..
+        } = canvas_gesture_fixture(cx, tool).await;
+        let original = item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let node = document
+                    .doc
+                    .scene
+                    .get_mut(vector_id)
+                    .expect("curve fixture");
+                let vector = node.data.as_vector_mut().expect("vector fixture");
+                let mut path = fanta_doc::PathData::new();
+                path.move_to(0., 100.).quad_to(50., 0., 100., 100.);
+                vector.path = path;
+                vector.local_size = Some([100., 100.]);
+                node.transform = Transform2D::translation(20., 30.);
+                node.meta = serde_json::json!(["preserve", 42]);
+                let original = node.clone();
+                document.doc.history = Default::default();
+                (original, crate::document::DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        view.update(&mut cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [70., 80.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped key bindings");
+            app.bind_keys(bindings);
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas"));
+        let start = bounds.center() + point(px(-50.), px(50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        let edited = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            let node = doc.scene.get(vector_id).expect("edited curve");
+            assert_ne!(node.data, original.data);
+            node.clone()
+        });
+        let assert_overlays = |cx: &VisualTestContext| {
+            let expected = item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(vector_id).expect("curve");
+                let anchors = fanta_tools::node_math::enumerate_anchors(
+                    &node.data.as_vector().expect("vector").path,
+                );
+                assert_eq!(anchors.len(), 2);
+                let transform = doc
+                    .scene
+                    .world_transform(vector_id)
+                    .expect("world transform");
+                let mut expected = Vec::new();
+                for anchor in &anchors {
+                    for control in [anchor.ctrl_in, anchor.ctrl_out].into_iter().flatten() {
+                        expected.push(fanta_tools::ToolOverlay::PathHandle {
+                            world_anchor: transform.transform_point(anchor.pos).to_array(),
+                            world_ctrl: transform.transform_point(control).to_array(),
+                        });
+                    }
+                }
+                for (index, anchor) in anchors.iter().enumerate() {
+                    expected.push(fanta_tools::ToolOverlay::PathAnchor {
+                        world: transform.transform_point(anchor.pos).to_array(),
+                        selected: index == 0,
+                    });
+                }
+                expected
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.tools().overlays, expected,
+                    "every anchor/control overlay must follow document history without pointer input");
+            });
+        };
+        assert_overlays(&cx);
+        for from_toolbar in [false, true] {
+            for (command, expected_node, expected_depth) in [
+                (ToolbarCommand::Undo, &original, 0),
+                (ToolbarCommand::Redo, &edited, 1),
+            ] {
+                if from_toolbar {
+                    toolbar.update(&mut cx, |_, cx| {
+                        cx.emit(ToolbarAction::CommandInvoked { command });
+                    });
+                    cx.run_until_parked();
+                } else {
+                    cx.simulate_keystrokes(match command {
+                        ToolbarCommand::Undo => "secondary-z",
+                        ToolbarCommand::Redo => "secondary-shift-z",
+                        _ => unreachable!(),
+                    });
+                }
+                item.read_with(&cx, |item, _| {
+                    let doc = item.doc().expect("document");
+                    let node = doc.scene.get(vector_id).expect("restored curve");
+                    assert_eq!(node.data, expected_node.data);
+                    assert_eq!(node.flags, expected_node.flags);
+                    assert_eq!(node.meta, original.meta);
+                    assert_eq!(node.transform, original.transform);
+                    assert_eq!(doc.history.undo_depth(), expected_depth);
+                    assert_eq!(doc.selection.len(), 1);
+                    assert!(doc.selection.contains(vector_id));
+                });
+                assert_overlays(&cx);
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn path_overlays_follow_keyboard_and_toolbar_history_in_path_selection(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_overlays_follow_history(cx, ToolbarTool::PathSelect).await;
+    }
+
+    #[gpui::test]
+    async fn path_overlays_follow_keyboard_and_toolbar_history_in_node_edit(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_overlays_follow_history(cx, ToolbarTool::NodeEdit).await;
+    }
+
     async fn assert_fast_canvas_drag(
         cx: &mut TestAppContext,
         tool: ToolbarTool,

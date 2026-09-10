@@ -245,6 +245,17 @@ impl ToolShell {
         response
     }
 
+    pub fn refresh_overlays(&mut self, doc: &Doc) -> bool {
+        let Some(overlays) = self.tool.overlays_after_document_change(doc) else {
+            return false;
+        };
+        if self.overlays == overlays {
+            return false;
+        }
+        self.overlays = overlays;
+        true
+    }
+
     pub fn cursor_style(&self, dragging_canvas: bool) -> CursorStyle {
         if dragging_canvas {
             return CursorStyle::ClosedHand;

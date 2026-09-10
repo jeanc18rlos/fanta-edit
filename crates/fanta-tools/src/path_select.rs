@@ -3,7 +3,8 @@
 use crate::context::ToolContext;
 use crate::event::ToolEvent;
 use crate::node_edit::NodeEditTool;
-use crate::tool::{Tool, ToolResponse};
+use crate::tool::{Tool, ToolOverlay, ToolResponse};
+use fanta_doc::Doc;
 
 pub struct PathSelectTool {
     editor: NodeEditTool,
@@ -30,6 +31,10 @@ impl Tool for PathSelectTool {
 
     fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {
         self.editor.handle_event(ctx, event)
+    }
+
+    fn overlays_after_document_change(&self, doc: &Doc) -> Option<Vec<ToolOverlay>> {
+        self.editor.overlays_after_document_change(doc)
     }
 
     fn activate(&mut self, ctx: &mut ToolContext) {

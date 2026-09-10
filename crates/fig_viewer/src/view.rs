@@ -2537,11 +2537,16 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.undo(cx) {
+        let changed = self.item.update(cx, |item, cx| match item.undo(cx) {
+            Ok(changed) => changed,
+            Err(error) => {
                 log::error!("fig_viewer undo failed: {error:#}");
+                false
             }
         });
+        if changed {
+            self.refresh_tool_overlays(cx);
+        }
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2549,11 +2554,24 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.redo(cx) {
+        let changed = self.item.update(cx, |item, cx| match item.redo(cx) {
+            Ok(changed) => changed,
+            Err(error) => {
                 log::error!("fig_viewer redo failed: {error:#}");
+                false
             }
         });
+        if changed {
+            self.refresh_tool_overlays(cx);
+        }
+    }
+
+    fn refresh_tool_overlays(&mut self, cx: &mut Context<Self>) {
+        if let Some(doc) = self.item.read(cx).doc()
+            && self.tools.refresh_overlays(doc)
+        {
+            cx.notify();
+        }
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
