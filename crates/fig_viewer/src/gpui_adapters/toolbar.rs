@@ -773,6 +773,145 @@ mod echo_tests {
         }
     }
 
+    #[gpui::test]
+    async fn toolbar_scale_resizes_text_contents_with_undo_redo_and_escape(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut text = TextNode::new("Scale this text", 100., 50.);
+        text.style.size_px = 20.;
+        let mut layer = CanvasNode::new(NodeData::Text(text));
+        layer.parent = Some(page_id);
+        let text_id = layer.id;
+        doc.apply(Operation::create_node(layer))
+            .expect("create text");
+        doc.selection.select_only(text_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Scale-tool.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::Scale,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Scale
+        );
+        assert!(!ToolKind::Scale.is_stub());
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [50., 25.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let original_handle = bounds.center() + point(px(50.), px(25.));
+        let scaled_handle = original_handle + point(px(100.), px(50.));
+        cx.simulate_mouse_down(original_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_id).expect("text layer").data else {
+                panic!("text remains editable text");
+            };
+            assert_eq!(text.local_size, [200., 100.]);
+            assert_eq!(
+                text.style.size_px, 40.,
+                "Scale changes font size as well as its box"
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        cx.simulate_mouse_up(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 1);
+        });
+        for (command, expected_size, expected_font) in [
+            (ToolbarCommand::Undo, [100., 50.], 20.),
+            (ToolbarCommand::Redo, [200., 100.], 40.),
+        ] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(text_id).expect("text layer");
+                let NodeData::Text(text) = &node.data else {
+                    panic!("text remains text")
+                };
+                assert_eq!(text.local_size, expected_size);
+                assert_eq!(text.style.size_px, expected_font);
+                assert_eq!(node.transform, Transform2D::IDENTITY);
+            });
+        }
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load shipped keymap");
+            app.bind_keys(bindings);
+        });
+        let enlarged_handle = scaled_handle + point(px(100.), px(50.));
+        cx.simulate_mouse_down(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(enlarged_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("document")
+                .scene
+                .get(text_id)
+                .expect("text")
+                .data
+            else {
+                panic!("text remains text")
+            };
+            assert_eq!(text.style.size_px, 60.);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.simulate_mouse_up(enlarged_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_id).expect("text").data else {
+                panic!("text remains text")
+            };
+            assert_eq!(text.local_size, [200., 100.]);
+            assert_eq!(text.style.size_px, 40.);
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "cancelled drag creates no undo step"
+            );
+        });
+    }
+
     struct CanvasGestureFixture {
         view: Entity<FigView>,
         item: Entity<crate::document::FigItem>,

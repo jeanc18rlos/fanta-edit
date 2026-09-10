@@ -158,7 +158,7 @@ actions!(
         ActivateSectionTool,
         /// Activate the slice tool.
         ActivateSliceTool,
-        /// Activate the scale tool (placeholder).
+        /// Proportionally scale selected objects and their contents.
         ActivateScaleTool,
         /// Activate direct selection of vector anchors and segments.
         ActivatePathSelectTool,
@@ -2291,6 +2291,13 @@ impl FigView {
     }
 
     fn update_hover(&mut self, screen: DVec2, cx: &mut Context<Self>) {
+        if self.tools.kind() == ToolKind::Scale {
+            self.update_hover_resize_handle(screen, cx);
+            if self.hovered_node.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         if self.tools.kind() != ToolKind::Select {
             let had_handle = self.hover_resize_handle.take().is_some();
             if self.hovered_node.take().is_some() || had_handle {
@@ -2356,6 +2363,18 @@ impl FigView {
         let bounds = self.container_bounds?;
         let (width, height) = bounds_size(bounds);
         let document = self.item.read(cx).document()?;
+        if self.tools.kind() == ToolKind::Scale {
+            let (local, world) =
+                fanta_tools::ScaleTool::selection_frame(&document.doc, document.doc.active_page())?;
+            return fanta_canvas::handles::hit_test_resize_handle_oriented(
+                local,
+                &world,
+                screen,
+                &viewport,
+                DVec2::new(width, height),
+                fanta_canvas::handles::DEFAULT_HANDLE_THRESHOLD,
+            );
+        }
         let selection = document.doc.selection.as_slice();
         let [id] = selection else {
             return None;
@@ -7705,8 +7724,8 @@ impl FigView {
             } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    // Scale and text-on-path have a canvas
-                    // tool object but no behavior, so activating them would
+                    // Text-on-path has a canvas tool object but no
+                    // behavior, so activating it would
                     // arm a face that silently swallows every drag. The
                     // vendored toolbar has no host-side API to hide a tool
                     // (see `EditorToolbar`'s setters), so say so instead.

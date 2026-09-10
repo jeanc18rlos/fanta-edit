@@ -2527,12 +2527,18 @@ impl CanvasElement {
                 });
             }
         }
-        if let &[id] = doc.selection.as_slice()
-            && let (Some(local), Some(transform)) = (
-                authored_selection_bounds(doc, id),
-                evaluated_world_transform(&doc.scene, id, motion.as_ref()),
-            )
-        {
+        let selection_frame = if view.tools().kind() == crate::tools::ToolKind::Scale {
+            fanta_tools::ScaleTool::selection_frame(doc, doc.active_page())
+        } else if let &[id] = doc.selection.as_slice() {
+            authored_selection_bounds(doc, id).zip(evaluated_world_transform(
+                &doc.scene,
+                id,
+                motion.as_ref(),
+            ))
+        } else {
+            None
+        };
+        if let Some((local, transform)) = selection_frame {
             let oriented = oriented_selection(local, transform);
             data.selection_size = Some((
                 (oriented.corners[1] - oriented.corners[0]).length(),
@@ -2752,9 +2758,10 @@ impl CanvasElement {
                 ));
             }
 
-            // Resize handles on the selection box, Figma-style, only for the
-            // select tool.
-            if view.tools().kind() == crate::tools::ToolKind::Select {
+            if matches!(
+                view.tools().kind(),
+                crate::tools::ToolKind::Select | crate::tools::ToolKind::Scale
+            ) {
                 let handle_px = px(HANDLE_SIZE);
                 let handles = overlay_data
                     .oriented_selection
