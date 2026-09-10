@@ -109,6 +109,58 @@ impl AnimationSettings {
     }
 }
 
+pub(crate) const TOOLBAR_ANIMATION_STYLE_PRESETS: [(&str, AnimationProperty); 5] = [
+    ("Slide in", AnimationProperty::Position),
+    ("Scale in", AnimationProperty::Scale),
+    ("Rotate in", AnimationProperty::Rotation),
+    ("Grow", AnimationProperty::Size),
+    ("Fade in", AnimationProperty::Opacity),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolbarAnimationStyleError {
+    UnknownStyle,
+    DocumentUnavailable,
+    ReadOnly,
+    NoSelection,
+    MultipleSelection,
+    MissingSelection,
+    MissingActiveClip,
+    AlreadyAnimated,
+    UnsupportedLayer,
+    ApplyFailed(String),
+}
+
+impl ToolbarAnimationStyleError {
+    pub(crate) fn user_message(&self, style: &str) -> String {
+        match self {
+            Self::UnknownStyle => format!("{style} is not an available animation style."),
+            Self::DocumentUnavailable => "The design is not ready for animation yet.".to_string(),
+            Self::ReadOnly => "This design is read-only.".to_string(),
+            Self::NoSelection => format!("Select one layer to apply {style}."),
+            Self::MultipleSelection => format!("Select only one layer to apply {style}."),
+            Self::MissingSelection => {
+                "The selected layer no longer exists in this design.".to_string()
+            }
+            Self::MissingActiveClip => {
+                "The active animation clip no longer exists in this design.".to_string()
+            }
+            Self::AlreadyAnimated => {
+                "This layer already has an animation for that property in the active clip."
+                    .to_string()
+            }
+            Self::UnsupportedLayer => format!("{style} cannot be applied to this layer."),
+            Self::ApplyFailed(error) => format!("Applying {style} failed: {error}"),
+        }
+    }
+}
+
+fn toolbar_animation_property(style: &str) -> Option<AnimationProperty> {
+    TOOLBAR_ANIMATION_STYLE_PRESETS
+        .iter()
+        .find_map(|(label, property)| (*label == style).then_some(*property))
+}
+
 #[derive(Clone)]
 struct AnimationSummary {
     property: AnimationProperty,
@@ -250,6 +302,47 @@ impl FantaMotionPanel {
             self.selected_property = Some(property);
             cx.notify();
         }
+    }
+
+    pub(crate) fn apply_toolbar_animation_style(
+        &mut self,
+        active_clip: Option<AnimationClipId>,
+        style: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<AnimationProperty, ToolbarAnimationStyleError> {
+        let (property, mut transaction) = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document() else {
+                return Err(ToolbarAnimationStyleError::DocumentUnavailable);
+            };
+            toolbar_animation_style_transaction(
+                &document.doc,
+                item.is_editable(),
+                active_clip,
+                style,
+            )?
+        };
+        transaction.label = "Add Animation".to_string();
+        let applied = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                match document.doc.apply_transaction(transaction) {
+                    Ok(()) => (Ok(()), DocChange::Content),
+                    Err(error) => {
+                        let error = error.to_string();
+                        log::error!("applying toolbar animation style failed: {error}");
+                        (
+                            Err(ToolbarAnimationStyleError::ApplyFailed(error)),
+                            DocChange::None,
+                        )
+                    }
+                }
+            })
+            .unwrap_or(Err(ToolbarAnimationStyleError::DocumentUnavailable))
+        });
+        applied?;
+        self.selected_property = Some(property);
+        cx.notify();
+        Ok(property)
     }
 
     fn remove_animation(
@@ -1051,6 +1144,49 @@ fn percentage_amount(value: f64) -> Option<f64> {
     (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value / 100.0)
 }
 
+fn toolbar_animation_style_transaction(
+    doc: &Doc,
+    editable: bool,
+    active_clip: Option<AnimationClipId>,
+    style: &str,
+) -> Result<(AnimationProperty, Transaction), ToolbarAnimationStyleError> {
+    let property =
+        toolbar_animation_property(style).ok_or(ToolbarAnimationStyleError::UnknownStyle)?;
+    if !editable {
+        return Err(ToolbarAnimationStyleError::ReadOnly);
+    }
+    let mut selection = doc.selection.iter().copied();
+    let node = selection
+        .next()
+        .ok_or(ToolbarAnimationStyleError::NoSelection)?;
+    if selection.next().is_some() {
+        return Err(ToolbarAnimationStyleError::MultipleSelection);
+    }
+    if doc.scene.get(node).is_none() {
+        return Err(ToolbarAnimationStyleError::MissingSelection);
+    }
+    if active_clip.is_some_and(|clip| doc.motion.clip(clip).is_none()) {
+        return Err(ToolbarAnimationStyleError::MissingActiveClip);
+    }
+    if resolved_clip(doc, active_clip).is_some_and(|clip| {
+        clip.tracks.values().any(|track| {
+            track.target.node == node
+                && property_for_target(track.target.property) == Some(property)
+        })
+    }) {
+        return Err(ToolbarAnimationStyleError::AlreadyAnimated);
+    }
+    let transaction = build_animation_transaction(
+        doc,
+        active_clip,
+        node,
+        property,
+        AnimationSettings::for_property(property),
+    )
+    .ok_or(ToolbarAnimationStyleError::UnsupportedLayer)?;
+    Ok((property, transaction))
+}
+
 fn build_animation_transaction(
     doc: &Doc,
     active_clip: Option<AnimationClipId>,
@@ -1292,6 +1428,156 @@ mod tests {
         })
         .expect("create animation clip");
         id
+    }
+
+    #[test]
+    fn toolbar_animation_style_validation_has_explicit_outcomes() {
+        let (mut doc, node) = document_with_selected_node();
+
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Bounce"),
+            Err(ToolbarAnimationStyleError::UnknownStyle)
+        ));
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, false, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::ReadOnly)
+        ));
+
+        doc.selection.clear();
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::NoSelection)
+        ));
+
+        doc.selection.select_only(node);
+        doc.selection.add(NodeId::new());
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::MultipleSelection)
+        ));
+
+        doc.selection.select_only(NodeId::new());
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::MissingSelection)
+        ));
+
+        doc.selection.select_only(node);
+        let before = doc.motion.clone();
+        assert!(matches!(
+            toolbar_animation_style_transaction(
+                &doc,
+                true,
+                Some(AnimationClipId::new()),
+                "Fade in"
+            ),
+            Err(ToolbarAnimationStyleError::MissingActiveClip)
+        ));
+        assert_eq!(doc.motion, before);
+
+        doc.scene
+            .get_mut(node)
+            .expect("selected group")
+            .data
+            .as_group_mut()
+            .expect("group data")
+            .clip_size = Some([0.0, 40.0]);
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Grow"),
+            Err(ToolbarAnimationStyleError::UnsupportedLayer)
+        ));
+        assert_eq!(
+            ToolbarAnimationStyleError::ReadOnly.user_message("Fade in"),
+            "This design is read-only."
+        );
+    }
+
+    #[test]
+    fn toolbar_animation_style_targets_only_the_active_clip() {
+        let (mut doc, node) = document_with_selected_node();
+        let first = create_clip(&mut doc, "First");
+        let second = create_clip(&mut doc, "Second");
+        let first_before = doc.motion.clips[&first].clone();
+        doc.history = Default::default();
+
+        let (_, transaction) =
+            toolbar_animation_style_transaction(&doc, true, Some(second), "Fade in")
+                .expect("Fade in should build for the active clip");
+        doc.apply_transaction(transaction)
+            .expect("apply toolbar animation style");
+
+        assert_eq!(doc.motion.clips[&first], first_before);
+        let target = MotionTarget::new(node, MotionProperty::bound(BoundProp::Opacity));
+        assert!(doc.motion.clips[&second].track_for_target(target).is_some());
+        assert_eq!(doc.history.undo_depth(), 1);
+    }
+
+    #[test]
+    fn toolbar_animation_style_preserves_existing_custom_animation() {
+        let (mut doc, node) = document_with_selected_node();
+        let transaction = build_animation_transaction(
+            &doc,
+            None,
+            node,
+            AnimationProperty::Position,
+            AnimationSettings::default(),
+        )
+        .expect("position animation");
+        doc.apply_transaction(transaction)
+            .expect("apply position animation");
+        let clip_id = first_clip(&doc).expect("created clip").id;
+        let target = MotionTarget::new(node, MotionProperty::PositionX);
+        let track_id = doc.motion.clips[&clip_id]
+            .track_for_target(target)
+            .expect("position track")
+            .id;
+        let custom_id = KeyframeId::new();
+        doc.motion
+            .clips
+            .get_mut(&clip_id)
+            .and_then(|clip| clip.tracks.get_mut(&track_id))
+            .expect("position track remains")
+            .keyframes
+            .insert(
+                custom_id,
+                Keyframe::new(custom_id, 250, ResolvedVarValue::Float { value: 200.0 }),
+            );
+        let custom_position = doc.motion.clips[&clip_id]
+            .track_for_target(target)
+            .expect("custom position track")
+            .clone();
+        doc.history = Default::default();
+
+        let (_, fade_transaction) =
+            toolbar_animation_style_transaction(&doc, true, Some(clip_id), "Fade in")
+                .expect("a different property preset should remain available");
+        doc.apply_transaction(fade_transaction)
+            .expect("apply Fade in alongside custom position");
+        assert_eq!(
+            doc.motion.clips[&clip_id]
+                .track_for_target(target)
+                .expect("custom position track remains"),
+            &custom_position
+        );
+        assert!(
+            doc.motion.clips[&clip_id]
+                .track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .is_some()
+        );
+        assert_eq!(doc.history.undo_depth(), 1);
+
+        let before = doc.motion.clone();
+        doc.history = Default::default();
+
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, Some(clip_id), "Slide in"),
+            Err(ToolbarAnimationStyleError::AlreadyAnimated)
+        ));
+        assert_eq!(doc.motion, before);
+        assert_eq!(doc.history.undo_depth(), 0);
     }
 
     fn assert_preset_round_trip(

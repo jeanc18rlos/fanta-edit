@@ -59,12 +59,12 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
 /// catalog as `motion_panel.rs`'s `AnimationProperty` preset labels (Position,
 /// Scale, Rotation, Size, Opacity). The document has no per-clip style field
 /// yet, so this single host-side list feeds both the toolbar's read model and
-/// the accepted-style echo; the `Path` preset is excluded because it needs an
+/// the applied-style echo; the `Path` preset is excluded because it needs an
 /// authored motion path and cannot be applied as a one-click style.
 pub(crate) fn motion_animation_styles() -> Vec<SharedString> {
-    ["Slide in", "Scale in", "Rotate in", "Grow", "Fade in"]
-        .into_iter()
-        .map(Into::into)
+    crate::motion_panel::TOOLBAR_ANIMATION_STYLE_PRESETS
+        .iter()
+        .map(|(label, _)| SharedString::from(*label))
         .collect()
 }
 
@@ -207,10 +207,10 @@ pub(crate) struct ToolbarAdapter {
     last_pushed_dev: Option<DevToolbarOptions>,
     last_pushed_agent: Option<AgentToolbarOptions>,
     last_pushed_chrome: Option<Vec<ToolbarChromeControl>>,
-    /// The accepted Motion animation style. Host-side UI state held on the
-    /// adapter because the document model has no per-clip style field yet;
-    /// `ControlChangeRequested` updates it and the render-time refresh echoes
-    /// it back through `set_motion_options`.
+    /// The most recently applied Motion animation style. Host-side UI state
+    /// held on the adapter because the document model has no per-clip style
+    /// field yet; a successful document mutation updates it and the
+    /// render-time refresh echoes it back through `set_motion_options`.
     animation_style: SharedString,
     /// Test-only: how many option-model pushes reached the panel, so the
     /// echo tests can prove the diff guard instead of counting notifies.
@@ -266,10 +266,10 @@ impl ToolbarAdapter {
     #[cfg(not(test))]
     fn record_option_push(&self) {}
 
-    /// Accepts a `MotionAnimationStyle` control change when the candidate is
-    /// in the host catalog. Returns whether the accepted style changed; the
+    /// Remembers a successfully applied animation style when it belongs to the
+    /// host catalog. Returns whether the remembered style changed; the
     /// echo happens on the next render-time [`Self::refresh`].
-    pub(crate) fn accept_animation_style(&mut self, style: &SharedString) -> bool {
+    pub(crate) fn remember_animation_style(&mut self, style: &SharedString) -> bool {
         if self.animation_style == *style || !motion_animation_styles().contains(style) {
             return false;
         }
@@ -278,7 +278,7 @@ impl ToolbarAdapter {
     }
 
     #[cfg(test)]
-    pub(crate) fn accepted_animation_style(&self) -> &SharedString {
+    pub(crate) fn remembered_animation_style(&self) -> &SharedString {
         &self.animation_style
     }
 
@@ -608,8 +608,8 @@ mod echo_tests {
     use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use fanta_doc::{
-        AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, Operation, TextNode,
-        Transform2D, Viewport,
+        AnimationClip, AnimationClipId, BoundProp, CanvasNode, Doc, GroupNode, MotionProperty,
+        MotionTarget, NodeData, Operation, ResolvedVarValue, TextNode, Transform2D, Viewport,
     };
     use fanta_gpui::toolbar::{ToolbarAction, ToolbarControlValue, ToolbarSecondaryControl};
     use gpui::{Bounds, Modifiers, TestAppContext, VisualTestContext, point, px, size};
@@ -2008,11 +2008,30 @@ mod echo_tests {
     }
 
     #[gpui::test]
-    async fn animation_style_choice_round_trips_and_unknown_candidates_are_refused(
+    async fn animation_style_choice_creates_one_undoable_fade_and_syncs_the_timeline(
         cx: &mut TestAppContext,
     ) {
         let (view, toolbar, mut cx) = setup(cx).await;
         let cx = &mut cx;
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        assert!(item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.motion.clips.clear();
+                document.doc.history = Default::default();
+                ((), crate::document::DocChange::Content)
+            })
+            .is_some()
+        }));
+        cx.run_until_parked();
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().duration_ms),
+            0
+        );
 
         toolbar.update_in(cx, |_, _, cx| {
             cx.emit(ToolbarAction::ControlChangeRequested {
@@ -2022,16 +2041,126 @@ mod echo_tests {
             });
         });
         cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            assert_eq!(doc.motion.clips.len(), 1);
+            let clip = doc.motion.clips.values().next().expect("created clip");
+            assert_eq!(clip.duration_ms, 2_000);
+            let track = clip
+                .track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .expect("Fade in opacity track");
+            assert_eq!(track.keyframes.len(), 2);
+            let mut keyframes = track.keyframes.values().collect::<Vec<_>>();
+            keyframes.sort_by_key(|keyframe| (keyframe.time_ms, keyframe.id));
+            assert_eq!(keyframes[0].time_ms, 0);
+            assert_eq!(keyframes[0].value, ResolvedVarValue::Float { value: 0.0 });
+            assert_eq!(keyframes[1].time_ms, 500);
+            assert_eq!(keyframes[1].value, ResolvedVarValue::Float { value: 1.0 });
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
         toolbar.read_with(cx, |toolbar, _| {
             assert_eq!(toolbar.motion_options().animation_style, "Fade in");
+            assert_eq!(toolbar.motion_options().duration_ms, 2_000);
         });
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.gpui_toolbar_adapter()
                     .expect("adapter")
-                    .accepted_animation_style(),
+                    .remembered_animation_style(),
                 &SharedString::from("Fade in"),
             );
+        });
+
+        assert!(item.update(cx, |item, cx| {
+            item.undo(cx).expect("undo toolbar animation style")
+        }));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.motion.clips.is_empty());
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        assert_eq!(
+            toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().duration_ms),
+            0,
+            "undo must immediately clear the echoed timeline model"
+        );
+    }
+
+    #[gpui::test]
+    async fn same_animation_style_applies_to_a_new_selection_and_failures_do_not_echo(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let (first_node, second_node) = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let first_node = doc.selection.iter().copied().next().expect("selection");
+            let second_node = doc
+                .scene
+                .children_of(doc.active_page())
+                .iter()
+                .copied()
+                .find(|node| *node != first_node)
+                .expect("second layer");
+            (first_node, second_node)
+        });
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+
+        for node in [first_node, second_node] {
+            if node == second_node {
+                assert!(item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(node);
+                        ((), crate::document::DocChange::Selection)
+                    })
+                    .is_some()
+                }));
+                cx.run_until_parked();
+            }
+            toolbar.update_in(cx, |_, _, cx| {
+                cx.emit(ToolbarAction::ControlChangeRequested {
+                    mode: ToolbarMode::Motion,
+                    control: ToolbarSecondaryControl::MotionAnimationStyle,
+                    value: ToolbarControlValue::Choice("Slide in".into()),
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            for node in [first_node, second_node] {
+                assert!(
+                    clip.track_for_target(MotionTarget::new(node, MotionProperty::PositionX))
+                        .is_some(),
+                    "the unchanged Slide in choice must apply to layer {node}"
+                );
+            }
+            assert_eq!(doc.history.undo_depth(), 2);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.gpui_toolbar_adapter()
+                    .expect("adapter")
+                    .remembered_animation_style(),
+                &SharedString::from("Slide in"),
+            );
+        });
+
+        let before_failure = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            (doc.motion.clone(), doc.history.undo_depth())
         });
 
         // A candidate outside the host catalog is refused, not echoed.
@@ -2044,7 +2173,31 @@ mod echo_tests {
         });
         cx.run_until_parked();
         toolbar.read_with(cx, |toolbar, _| {
-            assert_eq!(toolbar.motion_options().animation_style, "Fade in");
+            assert_eq!(toolbar.motion_options().animation_style, "Slide in");
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.motion, before_failure.0);
+            assert_eq!(doc.history.undo_depth(), before_failure.1);
+        });
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAnimationStyle,
+                value: ToolbarControlValue::Choice("Fade in".into()),
+            });
+        });
+        cx.run_until_parked();
+        toolbar.read_with(cx, |toolbar, _| {
+            assert_eq!(toolbar.motion_options().animation_style, "Slide in");
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.motion, before_failure.0);
+            assert_eq!(doc.history.undo_depth(), before_failure.1);
         });
     }
 

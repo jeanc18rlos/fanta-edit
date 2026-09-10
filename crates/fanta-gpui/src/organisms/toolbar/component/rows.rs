@@ -716,7 +716,7 @@ impl EditorToolbar {
             ))
             .child(self.render_editor_chip(
                 "motion-style",
-                self.motion_options.animation_style.clone(),
+                "Animate",
                 ToolbarSecondaryControl::MotionAnimationStyle,
                 window,
                 cx,

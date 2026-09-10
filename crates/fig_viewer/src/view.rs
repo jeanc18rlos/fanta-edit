@@ -9558,10 +9558,20 @@ impl FigView {
                 cx.notify();
             }
             (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
-                if let Some(adapter) = self.gpui_toolbar.as_mut()
-                    && adapter.accept_animation_style(style)
-                {
-                    cx.notify();
+                let active_clip = self.active_motion_clip;
+                let result = self.motion_sidebar.update(cx, |panel, cx| {
+                    panel.apply_toolbar_animation_style(active_clip, style, cx)
+                });
+                match result {
+                    Ok(_) => {
+                        if let Some(adapter) = self.gpui_toolbar.as_mut() {
+                            adapter.remember_animation_style(style);
+                        }
+                        self.sync_motion_timeline(cx);
+                        show_canvas_notice(format!("{style} animation added."), window, cx);
+                        cx.notify();
+                    }
+                    Err(error) => show_canvas_notice(error.user_message(style), window, cx),
                 }
             }
             (ToolbarSecondaryControl::MotionAutoKeyframe, _) => {
