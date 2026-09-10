@@ -63,10 +63,11 @@ use crate::properties_panel::FantaPropertiesPanel;
 use crate::prototype_panel::FantaPrototypePanel;
 use crate::prototype_player::PrototypePlayerState;
 use crate::text_edit::CanvasTextEdit;
+#[cfg(test)]
+use crate::timeline::TIMELINE_HEIGHT;
 use crate::timeline::{
-    TIMELINE_HEIGHT, TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection,
-    TimelineKeyframeViewModel, TimelineProperty, TimelineShell, TimelineTrackViewModel,
-    TimelineViewModel,
+    TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection, TimelineKeyframeViewModel,
+    TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
 };
 use crate::tools::{
     TOOLBAR_GROUPS, ToolKind, ToolShell, key_event, move_event, pointer_button, press_event,
@@ -3781,12 +3782,9 @@ impl FigView {
         let view = cx.weak_entity();
 
         h_flex()
+            .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
-                TIMELINE_HEIGHT + px(16.)
-            } else {
-                px(16.)
-            })
+            .bottom(px(16.))
             .left_0()
             .right_0()
             .justify_center()
@@ -4609,6 +4607,7 @@ impl FigView {
         Some(
             v_flex()
                 .id("canvas-video-controls")
+                .debug_selector(|| "canvas-video-controls".to_owned())
                 .w_full()
                 .flex_none()
                 .min_w_0()
@@ -5025,7 +5024,8 @@ impl Render for FigView {
                                                                 c.push(render_empty_page_hint(cx));
                                                             }
                                                             c
-                                                        }),
+                                                        })
+                                                        .child(self.render_toolbar_slot(cx)),
                                                 )
                                                 .children({
                                                     #[cfg(target_os = "macos")]
@@ -5050,7 +5050,6 @@ impl Render for FigView {
                                         .then(|| self.timeline_shell.clone()),
                                 ),
                         )
-                        .child(self.render_toolbar_slot(cx))
                         .children(
                             self.item
                                 .read(cx)
@@ -5893,6 +5892,83 @@ mod tests {
             });
         });
         (directory, item, view)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_controls_remain_below_the_design_toolbar(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        #[cfg(feature = "fanta-gpui-ui")]
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        let mut video = CanvasNode::new(NodeData::Video(fanta_doc::VideoNode {
+            asset: AssetId::new(),
+            natural_size: [16, 16],
+            local_size: [80., 80.],
+            time_range_us: [0, 10_000_000],
+            speed: 1.,
+            muted: true,
+            volume: 1.,
+            poster_frame_us: None,
+            poster: None,
+            fit: fanta_doc::ImageFitMode::Fit,
+        }));
+        video.parent = document.active_page();
+        let node = video.id;
+        document
+            .apply(Operation::create_node(video))
+            .expect("video");
+        document.selection.replace_with([node]);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Video-layout.fig"),
+            document,
+            cx,
+        );
+        let window = cx.add_window(move |window, cx| FigView::new(item, project, window, cx));
+        let view = window.entity(cx).expect("fig view");
+        #[cfg(feature = "fanta-gpui-ui")]
+        assert!(view.read_with(cx, |view, _| view.gpui_toolbar.is_some()));
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let (source, muted, volume) = view.selected_canvas_video_source(cx).expect("video");
+            view.canvas_video = Some(CanvasVideoSession {
+                source,
+                loading: None,
+                playback: Some(playback),
+                observation: None,
+                error: None,
+                audio: (muted, volume.to_bits()),
+            });
+        });
+        let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [1_000., 1_400.] {
+            visual_context.simulate_resize(size(px(width), px(800.)));
+            visual_context.update(|window, cx| window.draw(cx).clear());
+            let canvas = visual_context
+                .debug_bounds("fig-container")
+                .expect("canvas");
+            let controls = visual_context
+                .debug_bounds("canvas-video-controls")
+                .expect("controls");
+            let toolbar = visual_context
+                .debug_bounds("fanta-canvas-toolbar")
+                .expect("toolbar");
+            assert!(
+                toolbar.bottom() <= canvas.bottom(),
+                "toolbar must stay in the canvas: {toolbar:?} vs {canvas:?}"
+            );
+            assert!(
+                toolbar.bottom() < controls.top(),
+                "toolbar covers video controls: {toolbar:?} vs {controls:?}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -8220,12 +8296,9 @@ impl FigView {
             return self.render_tool_pill(cx);
         };
         h_flex()
+            .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
-                TIMELINE_HEIGHT + px(16.)
-            } else {
-                px(16.)
-            })
+            .bottom(px(16.))
             .left_0()
             .right_0()
             .justify_center()

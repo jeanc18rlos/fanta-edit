@@ -10,8 +10,48 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Customer payments | Not enabled. Resolve product/pricing/currency/credit allowances, configure Polar, and verify checkout and subscription lifecycle before charging customers. |
 | Editor | Creation/editing, Save As, reopening, Git commit/push, Scale, curve viewport and Undo/Redo checks have native evidence. Local durable recovery passed two full restarts, with exact SVG/image bytes and no automatic generation or status requests. Hosted-installer verification remains open. Text on Path is unfinished. |
 | Leads | PostHog US access recovered. The live waitlist stores contacts and attribution correctly. Exclude the synthetic QA signup; no outreach or conversion improvement is claimed. |
-| Distribution | Both checks at published recovery head `02a32f6` passed by 06:09 UTC; its installer was pending behind the running `12ad6d3` installer. The earlier `eca2b86` installer passed with notarization skipped. Apple notarization and clean-Mac validation remain open. |
-| Housekeeping | Latest check at 08:32 UTC: only user app 21997/helper 22010, zero Cargo/zombies, 56.52 GiB free; the idle video QA app and fixture are closed. Daily 04:00 Europe/Madrid checks clean Cargo on idle Sundays, below 40 GiB, or after a deferred request becomes safe. Earlier cleanup recovered about 49.24 GiB. |
+| Distribution | Both checks for `66bef60` failed the queued consecutive-seek timestamp assertion; its installer remains queued behind the running `a984699` build. Local release builds pass, but final GitHub checks, Apple notarization and clean-Mac validation remain open. |
+| Housekeeping | Check at 09:10 UTC: only user app 21997/helper 22010, zero Cargo/zombies, 57.3 GiB free. Both completed local video QA sessions closed normally. Daily 04:00 Europe/Madrid checks clean Cargo on idle Sundays, below 40 GiB, or after a deferred request becomes safe. Earlier cleanup recovered about 49.24 GiB. |
+
+## Native video controls and hosted seek diagnosis — September 10
+
+Actual app QA exposed the floating design toolbar covering the selected-video
+controls. The toolbar now belongs to the canvas container, keeping it above
+video controls and the motion timeline. A bounds regression failed before the
+change, then passed; all **627 editor tests**, the themed layout regression and
+the existing toolbar click-through guard pass. The corrected native release
+build completed in 4m39s with the protected staged changes unchanged.
+
+Native screenshots show early/late decoded quadrant pixels with correct normal
+and 90-degree orientation, scaled parent clipping and opaque foreground overlap.
+The corrected control row and seek bar are visible. Playback progressed from
+cyan to the magenta end frame; returning from Code view preserved the selected
+paused canvas session. A user interaction changed the viewport/selection during
+one sequence, so that sequence is excluded from controlled playback evidence.
+The explicit Save and normal quit changed four projected file byte sequences:
+independent exact-hash reconstruction proves only JSON object-key ordering
+changed. Geometry, IDs, metadata values, timestamps and all three MP4s are
+unchanged; `.git/HEAD` and `.git/config` were created. Cross-feature canonical
+ordering and a subsequent native byte-stable save/reopen check remain open.
+
+Both hosted checks at `66bef60` failed
+`queued_obsolete_frames_never_escape_a_completed_seek`, returning display time
+200000 after seeks 1500000 -> 200000 -> 2500000 while the player clock was
+2500000. The prior assertion ran before pixel sampling, so those failures do not
+yet prove stale pixels. No new timing gate or weaker assertion is introduced.
+The test now includes all four sampled colors on failure. Optional
+`FANTA_VIDEO_SEEK_TRACE=1` emits at most 128 seek/frame records per player without
+retaining frames. Local validation passed all nine media library tests and six
+native cases both with and without tracing; this does not resolve the hosted
+failure. The Check workflow has an explicit manual native-video-only lane,
+with a separate concurrency group, to gather hosted evidence without canceling
+full checks or installer builds. Its workflow syntax passes actionlint 1.7.12.
+
+Evidence: `inline-video-validation/toolbar-overlap`, `native-fixed`,
+`native-fixed/serialization-audit`, `github-failures`, and
+`seek-timestamp-diagnostics` under `/tmp/fanta-release-qa-20260909`.
+Final production media, audible playback, sustained resource measurements and
+trusted installer validation remain unverified.
 
 ## Backend video URL deployment — September 10
 

@@ -31,6 +31,16 @@ See the video-poster section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
 
 ## Latest video validation — September 10
 
+The native control overlap is corrected and 627 editor tests pass. Actual app
+checks show correctly oriented video pixels, parent clipping and foreground
+composition. Both hosted `66bef60` checks nevertheless fail a consecutive-seek
+display-time assertion. Bounded seek diagnostics and a manual native-video-only
+Check lane are available; the failure is not yet corrected. A native Save
+changed JSON key ordering only, with exact reconstruction proving scene/asset
+values unchanged; deterministic cross-feature serialization and final native
+save/reopen remain open. See the current checkpoint in
+[RELEASE_VALIDATION.md](RELEASE_VALIDATION.md).
+
 Backend video URL fix `0d3753a` is **deployed** to `api.fantaisa.net` as
 `dpl_CVnuDoWotpCv8v7SG3UyXrbzwvhQ`. Its **449 backend tests across 44 files**,
 **78 CPU-only worker tests**, type checking and source CI passed. Nine public

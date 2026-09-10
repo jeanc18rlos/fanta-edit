@@ -19,7 +19,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
 };
@@ -371,12 +371,49 @@ pub enum VideoFrameUpdate {
     Frame(VideoPlaybackFrame),
 }
 
+struct VideoSeekTrace {
+    events: AtomicUsize,
+}
+
+impl VideoSeekTrace {
+    fn from_environment() -> Option<Arc<Self>> {
+        (std::env::var_os("FANTA_VIDEO_SEEK_TRACE").as_deref() == Some(std::ffi::OsStr::new("1")))
+            .then(|| {
+                Arc::new(Self {
+                    events: AtomicUsize::new(0),
+                })
+            })
+    }
+
+    fn record(&self, event: std::fmt::Arguments<'_>) {
+        const LIMIT: usize = 128;
+        if let Ok(index) = self
+            .events
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < LIMIT).then(|| count + 1)
+            })
+        {
+            // Diagnostics must never unwind through a native completion block.
+            if writeln!(
+                std::io::stderr().lock(),
+                "FANTA_VIDEO_SEEK_TRACE {index}: {event}"
+            )
+            .is_err()
+            {
+                self.events.store(LIMIT, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 pub struct VideoPlayback {
     player: Option<StrongPtr>,
     item: Option<StrongPtr>,
     output: Option<StrongPtr>,
     prepared: PreparedVideoPlayback,
     seek_completion: Arc<Mutex<Option<bool>>>,
+    seek_revision: u64,
+    seek_trace: Option<Arc<VideoSeekTrace>>,
     pending_seek: Option<u64>,
     awaiting_seek_frame: Option<u64>,
     seeking: bool,
@@ -460,12 +497,24 @@ impl VideoPlayback {
             let player: *mut Object = msg_send![player, initWithPlayerItem:*item];
             ensure!(!player.is_null(), "Could not initialize the video player.");
             let player = StrongPtr::new(player);
+            let seek_trace = VideoSeekTrace::from_environment();
+            if let Some(trace) = &seek_trace {
+                trace.record(format_args!(
+                    "created output={:#x} dimensions={}x{} duration_us={}",
+                    *output as usize,
+                    prepared.info.width,
+                    prepared.info.height,
+                    prepared.info.duration_us
+                ));
+            }
             Ok(Self {
                 player: Some(player),
                 item: Some(item),
                 output: Some(output),
                 prepared,
                 seek_completion: Arc::new(Mutex::new(None)),
+                seek_revision: 0,
+                seek_trace,
                 pending_seek: None,
                 awaiting_seek_frame: None,
                 seeking: false,
@@ -598,6 +647,9 @@ impl VideoPlayback {
             let mut presentation = NativeTime::ZERO;
             let buffer: CVPixelBufferRef = msg_send![**output, copyPixelBufferForItemTime:requested itemTimeForDisplay:&mut presentation];
             if buffer.is_null() {
+                if let Some(trace) = &self.seek_trace {
+                    trace.record(format_args!("empty output={:#x} revision={} target_us={:?} requested={requested:?} returned={presentation:?} current_us={}", **output as usize, self.seek_revision, self.awaiting_seek_frame, status.current_time_us));
+                }
                 return Ok(VideoFrameUpdate::Empty);
             }
             let buffer = CVPixelBuffer::wrap_under_create_rule(buffer);
@@ -612,7 +664,12 @@ impl VideoPlayback {
                 presentation_time_us <= self.prepared.info.duration_us,
                 "The video player returned an invalid frame time."
             );
-            if !accept_seek_frame(&mut self.awaiting_seek_frame, presentation_time_us) {
+            let seek_target = self.awaiting_seek_frame;
+            let accepted = accept_seek_frame(&mut self.awaiting_seek_frame, presentation_time_us);
+            if let Some(trace) = &self.seek_trace {
+                trace.record(format_args!("frame output={:#x} buffer={:#x} revision={} target_us={seek_target:?} requested={requested:?} returned={presentation:?} current_us={} accepted={accepted}", **output as usize, buffer.as_concrete_TypeRef() as usize, self.seek_revision, status.current_time_us));
+            }
+            if !accepted {
                 return Ok(VideoFrameUpdate::Unchanged);
             }
             Ok(VideoFrameUpdate::Frame(VideoPlaybackFrame {
@@ -641,6 +698,12 @@ impl VideoPlayback {
                 return Ok(());
             };
             self.seeking = false;
+            if let Some(trace) = &self.seek_trace {
+                trace.record(format_args!(
+                    "completion-applied revision={} finished={finished} queued_target_us={:?}",
+                    self.seek_revision, self.pending_seek
+                ));
+            }
             ensure!(
                 finished || self.pending_seek.is_some(),
                 "The video seek was interrupted. Try seeking again."
@@ -648,10 +711,21 @@ impl VideoPlayback {
             completed = true;
         }
         if let Some(target) = self.pending_seek.take() {
+            self.seek_revision = self.seek_revision.saturating_add(1);
+            let revision = self.seek_revision;
+            let trace = self.seek_trace.clone();
+            let output_identity = self
+                .output
+                .as_ref()
+                .map(|output| **output as usize)
+                .unwrap_or(0);
             let completion = Arc::downgrade(&self.seek_completion);
             let input = self.prepared.input.clone();
             let callback = ConcreteBlock::new(move |finished: BOOL| {
                 let _input = &input;
+                if let Some(trace) = &trace {
+                    trace.record(format_args!("native-completion output={output_identity:#x} revision={revision} target_us={target} finished={}", finished == YES));
+                }
                 if let Some(completion) = completion.upgrade() {
                     *completion
                         .lock()
@@ -668,6 +742,10 @@ impl VideoPlayback {
                     flags: 1,
                     epoch: 0,
                 };
+                if let Some(trace) = &self.seek_trace {
+                    let current: NativeTime = msg_send![player, currentTime];
+                    trace.record(format_args!("seek-start output={output_identity:#x} revision={revision} requested={time:?} current={current:?}"));
+                }
                 let _: () = msg_send![player, seekToTime:time toleranceBefore:NativeTime::ZERO toleranceAfter:NativeTime::ZERO completionHandler:&*callback];
                 Ok::<_, anyhow::Error>(())
             })?;
@@ -1131,7 +1209,7 @@ impl Drop for BitmapContext {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct NativeTime {
     value: i64,

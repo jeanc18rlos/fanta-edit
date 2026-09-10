@@ -5,12 +5,17 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      native_video_only:
+        description: Run the native video diagnostics without unrelated checks
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: check-${{ github.workflow }}-${{ github.ref }}
+  group: check-${{ github.workflow }}-${{ github.ref }}-${{ inputs.native_video_only && 'native-video' || 'full' }}
   cancel-in-progress: true
 
 env:
@@ -20,6 +25,7 @@ env:
 
 jobs:
   check:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
     runs-on: macos-26
     timeout-minutes: 60
     steps:
@@ -91,3 +97,27 @@ jobs:
 
       - name: Test canvas toolbar interactions
         run: cargo test --locked -p fanta-gpui --lib organisms::toolbar::component::interaction_tests
+
+  native-video:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-check
+      - name: Test native video library
+        id: native-library
+        run: cargo test --locked -p media --lib
+      - name: Test native video with bounded seek diagnostics
+        env:
+          FANTA_VIDEO_SEEK_TRACE: '1'
+        run: cargo test --locked -p media --test video_playback
+      - name: Test native video without diagnostic timing overhead
+        if: ${{ !cancelled() && steps.native-library.outcome == 'success' }}
+        run: cargo test --locked -p media --test video_playback

@@ -8,6 +8,7 @@ mod native {
     };
     use std::{
         collections::BTreeSet,
+        io::Write as _,
         path::PathBuf,
         sync::Arc,
         time::{Duration, Instant},
@@ -222,13 +223,14 @@ mod native {
             "Latest seek did not settle at its target: {settled:?}"
         );
         let frame = frame(&mut player)?;
+        let frame_colors = colors(&frame)?;
         ensure!(
             frame.presentation_time_us.abs_diff(200_000) < 40_000,
-            "Obsolete seek won: {} after player settled at {}",
+            "Obsolete seek won: {} after player settled at {}; quadrants={frame_colors:?}, expected_first=[255, 0, 0]",
             frame.presentation_time_us,
             settled.current_time_us
         );
-        near(colors(&frame)?[0], [255, 0, 0])?;
+        near(frame_colors[0], [255, 0, 0])?;
         player.play()?;
         player.seek(1_500_000)?;
         player.pause()?;
@@ -277,13 +279,14 @@ mod native {
                 "Coalesced seek clock lost latest target {latest}: {settled:?}"
             );
             let first = frame(&mut player)?;
+            let first_colors = colors(&first)?;
             ensure!(
                 first.presentation_time_us.abs_diff(latest) < 40_000,
-                "First published frame {} is obsolete after {obsolete} -> {intermediate} -> {latest}; player settled at {}",
+                "First published frame {} is obsolete after {obsolete} -> {intermediate} -> {latest}; player settled at {}; quadrants={first_colors:?}, expected_first={expected:?}",
                 first.presentation_time_us,
                 settled.current_time_us
             );
-            near(colors(&first)?[0], expected)?;
+            near(first_colors[0], expected)?;
         }
         let mut player = self::player(QUADRANTS, 128)?;
         for (target, sample_start, sample_end, expected) in [
@@ -399,6 +402,13 @@ mod native {
     }
 
     pub fn run() -> Result<()> {
+        if std::env::var_os("FANTA_VIDEO_SEEK_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+        {
+            writeln!(
+                std::io::stderr().lock(),
+                "FANTA_VIDEO_SEEK_TRACE=1: native seek/frame diagnostics enabled, at most 128 records per player"
+            )?;
+        }
         let cases: &[(&str, fn() -> Result<()>)] = &[
             (
                 "playback_advances_pauses_and_seeks",
