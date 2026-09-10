@@ -4643,9 +4643,9 @@ dependencies = [
  "base64 0.22.1",
  "client",
  "context_server",
- "db",
  "core-foundation 0.10.0",
  "core-video",
+ "db",
  "design_surface",
  "editor",
  "fanta-canvas",
@@ -4670,6 +4670,7 @@ dependencies = [
  "image",
  "language",
  "log",
+ "media",
  "metal",
  "paths",
  "project",
@@ -8524,12 +8525,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bindgen",
+ "block",
  "core-foundation 0.10.0",
  "core-video",
  "ctor",
  "foreign-types 0.5.0",
+ "futures 0.3.32",
  "metal",
  "objc",
+ "smol",
+ "tempfile",
 ]
 
 [[package]]

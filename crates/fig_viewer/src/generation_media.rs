@@ -384,11 +384,64 @@ pub(crate) fn place_svg(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VideoMetadata {
     pub width: u32,
     pub height: u32,
     pub duration_us: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct VideoPoster {
+    pub png: Arc<[u8]>,
+    pub time_us: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedVideo {
+    pub bytes: Arc<[u8]>,
+    pub metadata: VideoMetadata,
+    pub poster: Option<VideoPoster>,
+}
+
+pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
+    let metadata = mp4_metadata(&bytes)?;
+    ensure!(
+        u64::from(metadata.width) * u64::from(metadata.height) <= 32 * 1024 * 1024,
+        "The video resolution is too large to preview. Save it to open it in a video player."
+    );
+    #[cfg(target_os = "macos")]
+    let poster = {
+        let frame = media::video::video_frame(bytes.clone(), 1200)?.await?;
+        let difference = (i64::from(frame.width) * i64::from(metadata.height)
+            - i64::from(frame.height) * i64::from(metadata.width))
+        .abs();
+        ensure!(
+            difference <= 2 * i64::from(metadata.width.max(metadata.height)),
+            "The decoded video orientation does not match its track. Save it to open it in a video player."
+        );
+        let pixels = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+            .context("The video preview has invalid pixels.")?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels).write_to(&mut png, image::ImageFormat::Png)?;
+        let time_us = i64::try_from(frame.actual_time_us)
+            .context("The video preview timestamp is invalid.")?;
+        ensure!(
+            time_us < metadata.duration_us,
+            "The video preview is outside the clip."
+        );
+        Some(VideoPoster {
+            png: png.into_inner().into(),
+            time_us,
+        })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let poster = None;
+    Ok(PreparedVideo {
+        bytes,
+        metadata,
+        poster,
+    })
 }
 
 pub(crate) fn mp4_metadata(bytes: &[u8]) -> Result<VideoMetadata> {
@@ -420,9 +473,7 @@ pub(crate) fn mp4_metadata(bytes: &[u8]) -> Result<VideoMetadata> {
         if handler.get(8..12) != Some(b"vide") {
             continue;
         }
-        ensure!(header.len() >= 8, "The MP4 video track is incomplete.");
-        let width = be_u32(header, header.len() - 8)? >> 16;
-        let height = be_u32(header, header.len() - 4)? >> 16;
+        let (width, height) = mp4_display_dimensions(header)?;
         let duration_header = media
             .iter()
             .find(|(kind, _)| kind == b"mdhd")
@@ -458,6 +509,52 @@ pub(crate) fn mp4_metadata(bytes: &[u8]) -> Result<VideoMetadata> {
         });
     }
     bail!("The MP4 contains no supported video track.")
+}
+
+fn mp4_display_dimensions(header: &[u8]) -> Result<(u32, u32)> {
+    let matrix_offset = match header.first() {
+        Some(0) => 40,
+        Some(1) => 52,
+        _ => bail!("The MP4 uses an unsupported track header."),
+    };
+    let width = f64::from(be_u32(header, matrix_offset + 36)?) / 65536.;
+    let height = f64::from(be_u32(header, matrix_offset + 40)?) / 65536.;
+    ensure!(
+        width > 0. && height > 0. && width <= 16384. && height <= 16384.,
+        "The video dimensions are invalid."
+    );
+    let mut matrix = [0; 9];
+    for (index, value) in matrix.iter_mut().enumerate() {
+        *value = be_u32(header, matrix_offset + index * 4)? as i32;
+    }
+    let [a, b, u, c, d, v, _, _, w] = matrix;
+    ensure!(
+        u == 0 && v == 0 && w == 1 << 30,
+        "The video uses an unsupported perspective transform."
+    );
+    let unit = |value: i32| matches!(value, -65536 | 65536);
+    ensure!(
+        (unit(a) && b == 0 && c == 0 && unit(d)) || (a == 0 && unit(b) && unit(c) && d == 0),
+        "The video uses an unsupported scale or rotation. Save it to open it in a video player."
+    );
+    let a = f64::from(a) / 65536.;
+    let b = f64::from(b) / 65536.;
+    let c = f64::from(c) / 65536.;
+    let d = f64::from(d) / 65536.;
+    ensure!(
+        (a * d - b * c).abs() > f64::EPSILON,
+        "The video transform is invalid."
+    );
+    let display_width = (width * a.abs() + height * c.abs()).ceil();
+    let display_height = (width * b.abs() + height * d.abs()).ceil();
+    ensure!(
+        display_width > 0.
+            && display_height > 0.
+            && display_width <= 16384.
+            && display_height <= 16384.,
+        "The transformed video dimensions are invalid."
+    );
+    Ok((display_width as u32, display_height as u32))
 }
 
 fn be_u32(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -501,12 +598,28 @@ fn mp4_boxes(mut bytes: &[u8]) -> Result<Vec<([u8; 4], &[u8])>> {
 
 pub(crate) fn place_video(
     document: &mut FigDocument,
-    bytes: Arc<[u8]>,
-    metadata: VideoMetadata,
+    video: PreparedVideo,
     x: f64,
     y: f64,
     provenance: Option<Value>,
 ) -> (Result<()>, DocChange) {
+    let PreparedVideo {
+        bytes,
+        metadata,
+        poster,
+    } = video;
+    let poster_asset = match poster.as_ref() {
+        Some(poster) => match document.doc_and_assets().1.add_image(poster.png.to_vec()) {
+            Ok((asset, _)) => Some(asset),
+            Err(error) => {
+                return (
+                    Err(error.context("The video preview could not be added.")),
+                    DocChange::None,
+                );
+            }
+        },
+        None => None,
+    };
     let asset = AssetId::new();
     let mut node = CanvasNode::new(NodeData::Video(VideoNode {
         asset,
@@ -516,8 +629,8 @@ pub(crate) fn place_video(
         speed: 1.,
         muted: false,
         volume: 1.,
-        poster_frame_us: None,
-        poster: None,
+        poster_frame_us: poster.map(|poster| poster.time_us),
+        poster: poster_asset,
         fit: ImageFitMode::Fit,
     }));
     node.name = "Generated video".into();
@@ -532,7 +645,12 @@ pub(crate) fn place_video(
             Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
             (Ok(()), DocChange::Content)
         }
-        Err(error) => (Err(error.into()), DocChange::None),
+        Err(error) => {
+            if let Some(asset) = poster_asset {
+                document.doc_and_assets().1.remove(asset);
+            }
+            (Err(error.into()), DocChange::None)
+        }
     }
 }
 
@@ -632,6 +750,9 @@ mod tests {
             bytes
         }
         let mut track = vec![0; 84];
+        track[40..44].copy_from_slice(&65536u32.to_be_bytes());
+        track[56..60].copy_from_slice(&65536u32.to_be_bytes());
+        track[72..76].copy_from_slice(&(1u32 << 30).to_be_bytes());
         track[76..80].copy_from_slice(&(1280u32 << 16).to_be_bytes());
         track[80..84].copy_from_slice(&(720u32 << 16).to_be_bytes());
         let mut media_header = vec![0; 24];
@@ -649,6 +770,81 @@ mod tests {
         assert_eq!(
             (metadata.width, metadata.height, metadata.duration_us),
             (1280, 720, 5_000_000)
+        );
+    }
+
+    #[test]
+    fn mp4_display_dimensions_apply_rotation_reflection_and_version_one_headers() {
+        let transforms: [([i32; 4], (u32, u32)); 6] = [
+            ([1, 0, 0, 1], (320, 180)),
+            ([0, 1, -1, 0], (180, 320)),
+            ([-1, 0, 0, -1], (320, 180)),
+            ([0, -1, 1, 0], (180, 320)),
+            ([-1, 0, 0, 1], (320, 180)),
+            ([0, 1, 1, 0], (180, 320)),
+        ];
+        for version in [0, 1] {
+            for ([a, b, c, d], expected) in transforms {
+                let offset = if version == 0 { 40 } else { 52 };
+                let mut header = vec![0; offset + 44];
+                header[0] = version;
+                let matrix = [
+                    a * 65536,
+                    b * 65536,
+                    0,
+                    c * 65536,
+                    d * 65536,
+                    0,
+                    180 * 65536,
+                    320 * 65536,
+                    1 << 30,
+                ];
+                for (index, value) in matrix.into_iter().enumerate() {
+                    header[offset + index * 4..offset + index * 4 + 4]
+                        .copy_from_slice(&value.to_be_bytes());
+                }
+                header[offset + 36..offset + 40].copy_from_slice(&(320u32 << 16).to_be_bytes());
+                header[offset + 40..offset + 44].copy_from_slice(&(180u32 << 16).to_be_bytes());
+                assert_eq!(
+                    mp4_display_dimensions(&header).expect("affine track"),
+                    expected
+                );
+                header[offset + 8..offset + 12].copy_from_slice(&1u32.to_be_bytes());
+                assert!(
+                    mp4_display_dimensions(&header).is_err(),
+                    "perspective must not be silently flattened"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mp4_display_dimensions_reject_truncated_singular_and_oversized_tracks() {
+        let mut header = vec![0; 84];
+        header[40..44].copy_from_slice(&65536u32.to_be_bytes());
+        header[56..60].copy_from_slice(&65536u32.to_be_bytes());
+        header[72..76].copy_from_slice(&(1u32 << 30).to_be_bytes());
+        header[76..80].copy_from_slice(&(320u32 << 16).to_be_bytes());
+        header[80..84].copy_from_slice(&(180u32 << 16).to_be_bytes());
+        for end in 0..header.len() {
+            assert!(mp4_display_dimensions(&header[..end]).is_err());
+        }
+        header[40..44].copy_from_slice(&0u32.to_be_bytes());
+        assert!(mp4_display_dimensions(&header).is_err());
+        header[40..44].copy_from_slice(&(100u32 << 16).to_be_bytes());
+        assert!(mp4_display_dimensions(&header).is_err());
+        header[40..44].copy_from_slice(&65536u32.to_be_bytes());
+        header[44..48].copy_from_slice(&32768u32.to_be_bytes());
+        assert!(
+            mp4_display_dimensions(&header).is_err(),
+            "shear is not supported"
+        );
+        header[44..48].copy_from_slice(&0u32.to_be_bytes());
+        header[40..44].copy_from_slice(&32768u32.to_be_bytes());
+        header[56..60].copy_from_slice(&32768u32.to_be_bytes());
+        assert!(
+            mp4_display_dimensions(&header).is_err(),
+            "uniform scale is not supported"
         );
     }
 

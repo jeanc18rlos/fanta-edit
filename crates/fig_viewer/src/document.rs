@@ -3140,6 +3140,149 @@ mod tests {
         );
     }
 
+    fn prepared_video_fixture() -> Result<crate::generation_media::PreparedVideo> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([34, 197, 94, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(crate::generation_media::PreparedVideo {
+            bytes: Arc::from(&b"exact video source bytes"[..]),
+            metadata: crate::generation_media::VideoMetadata {
+                width: 180,
+                height: 320,
+                duration_us: 2_000_000,
+            },
+            poster: Some(crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: 100_000,
+            }),
+        })
+    }
+
+    #[test]
+    fn generated_video_poster_survives_undo_redo_save_and_reopen() -> Result<()> {
+        let (doc, page, _, _) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        document.doc.set_active_page(Some(page));
+        let prepared = prepared_video_fixture()?;
+        let expected_png = prepared
+            .poster
+            .as_ref()
+            .context("fixture poster")?
+            .png
+            .clone();
+        let expected_video = prepared.bytes.clone();
+        let provenance = serde_json::json!({"generation_id":"video-poster-fixture"});
+        let (result, change) = crate::generation_media::place_video(
+            &mut document,
+            prepared,
+            24.,
+            48.,
+            Some(provenance.clone()),
+        );
+        result?;
+        assert!(matches!(change, DocChange::Content));
+        let node_id = *document
+            .doc
+            .scene
+            .children_of(Some(page))
+            .last()
+            .context("video node")?;
+        let node = document
+            .doc
+            .scene
+            .get(node_id)
+            .context("placed video")?
+            .clone();
+        let fanta_doc::NodeData::Video(video) = &node.data else {
+            anyhow::bail!("video node expected");
+        };
+        let poster_id = video.poster.context("placed poster")?;
+        assert_eq!(video.natural_size, [180, 320]);
+        assert_eq!(video.local_size, [180., 320.]);
+        assert_eq!(video.poster_frame_us, Some(100_000));
+        assert_eq!(
+            node.transform,
+            fanta_doc::Transform2D::translation(24., 48.)
+        );
+        assert_eq!(node.meta, provenance);
+        let pixels = document
+            .asset_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(poster_id))
+            .context("poster resolves immediately")?;
+        assert_eq!((pixels.width, pixels.height), (2, 3));
+        assert_eq!(pixels.pixels_rgba.as_slice(), [34, 197, 94, 255].repeat(6));
+        assert!(document.gpui_images.contains_key(&poster_id));
+        assert!(document.doc.undo()?);
+        assert!(!document.doc.scene.contains(node_id));
+        assert!(document.doc.redo()?);
+        assert_eq!(document.doc.scene.get(node_id), Some(&node));
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &document.doc, &document.raw_assets)?;
+        let reopened = load_project_document(directory.path())?;
+        let restored = reopened.doc.scene.get(node_id).context("reopened video")?;
+        assert_eq!(restored.data, node.data);
+        assert_eq!(restored.transform, node.transform);
+        assert_eq!(restored.meta, provenance);
+        assert_eq!(
+            reopened
+                .raw_assets
+                .get(&video.asset)
+                .context("saved MP4")?
+                .as_slice(),
+            expected_video.as_ref()
+        );
+        assert_eq!(
+            reopened
+                .raw_assets
+                .get(&poster_id)
+                .context("saved PNG")?
+                .as_slice(),
+            expected_png.as_ref()
+        );
+        let restored_pixels = reopened
+            .asset_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(poster_id))
+            .context("reopened poster")?;
+        assert_eq!(restored_pixels.pixels_rgba, pixels.pixels_rgba);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_video_placement_removes_poster_from_asset_stores() -> Result<()> {
+        let mut document = FigDocument::from_doc(Doc::new(), BTreeMap::new());
+        // A stale page registry forces insertion to fail after adding the poster.
+        document.doc.add_page(NodeId::new());
+        let (result, change) = crate::generation_media::place_video(
+            &mut document,
+            prepared_video_fixture()?,
+            0.,
+            0.,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(matches!(change, DocChange::None));
+        assert!(document.doc.scene.is_empty());
+        assert!(document.raw_assets.is_empty());
+        assert!(document.gpui_images.is_empty());
+        assert!(
+            document
+                .agent_asset_overlay
+                .as_ref()
+                .context("poster overlay")?
+                .added
+                .read()
+                .expect("overlay lock")
+                .is_empty()
+        );
+        Ok(())
+    }
+
     /// Prewarming decodes what a page's first frame will draw. Images that
     /// only appear as paints (a rectangle's image fill, an image stroke, a
     /// frame background) or through an instance's component master used to

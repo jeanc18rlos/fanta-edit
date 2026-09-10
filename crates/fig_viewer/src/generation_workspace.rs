@@ -39,6 +39,7 @@ const HISTORY_LIMIT: usize = 12;
 // Generation submissions can run for 120 seconds before returning a job.
 const API_TIMEOUT: Duration = Duration::from_secs(125);
 const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const VIDEO_PREVIEW_TIMEOUT: Duration = Duration::from_secs(20);
 
 actions!(
     fanta,
@@ -433,7 +434,7 @@ impl std::error::Error for ApiRejected {}
 enum PreparedPlacement {
     Image(String, u32, u32),
     Vector(generation_media::VectorArtwork),
-    Video(Arc<[u8]>, generation_media::VideoMetadata),
+    Video(Arc<generation_media::PreparedVideo>),
 }
 
 struct GenerationWorkspace {
@@ -462,6 +463,8 @@ struct GenerationWorkspace {
     outputs: Vec<MediaOutput>,
     selected_output: usize,
     preview: Option<Preview>,
+    prepared_video: Option<Arc<generation_media::PreparedVideo>>,
+    preview_request: Option<uuid::Uuid>,
     history: Vec<RunSummary>,
     active_run: Option<RunSummary>,
     pending: bool,
@@ -591,6 +594,8 @@ impl GenerationWorkspace {
             outputs: Vec::new(),
             selected_output: 0,
             preview: None,
+            prepared_video: None,
+            preview_request: None,
             history: Vec::new(),
             active_run: None,
             pending: false,
@@ -623,6 +628,8 @@ impl GenerationWorkspace {
         self.selected_model = None;
         self.task = None;
         self.preview_task = None;
+        self.prepared_video = None;
+        self.preview_request = None;
         self.unresolved_submission = None;
         self.recovered_submissions.clear();
         self.journal = None;
@@ -975,6 +982,8 @@ impl GenerationWorkspace {
         self.outputs.clear();
         self.preview = None;
         self.preview_task = None;
+        self.prepared_video = None;
+        self.preview_request = None;
         self.active_run = None;
         self.error = None;
         self.status = "Creating vector artwork…".into();
@@ -1121,6 +1130,8 @@ impl GenerationWorkspace {
                         this.outputs.clear();
                         this.preview = None;
                         this.preview_task = None;
+                        this.prepared_video = None;
+                        this.preview_request = None;
                         this.accept_response(&response, cx);
                         true
                     }).log_err().unwrap_or(false);
@@ -1301,6 +1312,8 @@ impl GenerationWorkspace {
         self.outputs.clear();
         self.preview = None;
         self.preview_task = None;
+        self.prepared_video = None;
+        self.preview_request = None;
         self.pending = false;
         self.active_run = Some(run.clone());
         if let RunResult::VectorMessage { svg, .. } = &run.result {
@@ -1437,25 +1450,61 @@ impl GenerationWorkspace {
     fn load_preview(&mut self, cx: &mut Context<Self>) {
         self.preview = None;
         self.preview_task = None;
+        self.prepared_video = None;
+        self.preview_request = None;
         let Some(output) = self.outputs.get(self.selected_output).cloned() else {
             return;
         };
-        if !output.mime.starts_with("image/") {
+        if !output.mime.starts_with("image/") && !output.mime.starts_with("video/") {
             return;
         }
         let client = self.client.clone();
+        let account = client.account_access_token();
+        let request = uuid::Uuid::new_v4();
+        self.preview_request = Some(request);
         self.preview_task = Some(cx.spawn(async move |this, cx| {
             let result = async {
                 let bytes =
                     media_bytes(&client, &output.location, cx.background_executor()).await?;
-                cx.background_spawn(async move { make_preview(&bytes, &output.mime) })
+                if output.mime.starts_with("video/") {
+                    network_deadline(
+                        cx.background_executor(),
+                        VIDEO_PREVIEW_TIMEOUT,
+                        "The video preview took too long. Try loading the result again.",
+                        cx.background_spawn(async move {
+                            let prepared = generation_media::prepare_video(bytes).await?;
+                            let preview = prepared
+                                .poster
+                                .as_ref()
+                                .map(|poster| make_preview(&poster.png, "image/png"))
+                                .transpose()?;
+                            Ok((preview, Some(Arc::new(prepared))))
+                        }),
+                    )
                     .await
+                } else {
+                    let preview = cx
+                        .background_spawn(async move { make_preview(&bytes, &output.mime) })
+                        .await?;
+                    Ok::<_, anyhow::Error>((Some(preview), None))
+                }
             }
             .await;
             this.update(cx, |this, cx| {
+                if this.client.account_access_token() != account {
+                    this.sync_account(cx);
+                    return;
+                }
+                if this.preview_request != Some(request) {
+                    return;
+                }
                 this.preview_task = None;
+                this.preview_request = None;
                 match result {
-                    Ok(preview) => this.preview = Some(preview),
+                    Ok((preview, video)) => {
+                        this.preview = preview;
+                        this.prepared_video = video;
+                    }
                     Err(error) => {
                         this.error = Some(
                             format!("Preview unavailable: {error}. You can still save the result.")
@@ -1783,19 +1832,35 @@ impl GenerationWorkspace {
         let name = format!("fanta-generation.{extension}");
         let path = cx.prompt_for_new_path(&PathBuf::from(paths::home_dir().as_path()), Some(&name));
         let client = self.client.clone();
+        let account = client.account_access_token();
+        let cached_video = self.prepared_video.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result: Result<bool> = async {
                 let Some(path) = path.await?? else {
                     return Ok(false);
                 };
-                let bytes =
-                    media_bytes(&client, &output.location, cx.background_executor()).await?;
+                ensure!(
+                    client.account_access_token() == account,
+                    "Your Fanta account changed. Choose the result again before saving it."
+                );
+                let bytes = match cached_video {
+                    Some(video) if output.mime.starts_with("video/") => video.bytes.clone(),
+                    _ => media_bytes(&client, &output.location, cx.background_executor()).await?,
+                };
+                ensure!(
+                    client.account_access_token() == account,
+                    "Your Fanta account changed. Choose the result again before saving it."
+                );
                 cx.background_spawn(async move { generation_media::write_output(&path, &bytes) })
                     .await?;
                 Ok(true)
             }
             .await;
             this.update(cx, |this, cx| {
+                if this.client.account_access_token() != account {
+                    this.sync_account(cx);
+                    return;
+                }
                 this.task = None;
                 match result {
                     Ok(true) => {
@@ -1820,10 +1885,18 @@ impl GenerationWorkspace {
             return;
         };
         let client = self.client.clone();
+        let account = client.account_access_token();
+        let cached_video = self.prepared_video.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
-                let bytes =
-                    media_bytes(&client, &output.location, cx.background_executor()).await?;
+                let bytes = match cached_video {
+                    Some(video) if output.mime.starts_with("video/") => video.bytes.clone(),
+                    _ => media_bytes(&client, &output.location, cx.background_executor()).await?,
+                };
+                ensure!(
+                    client.account_access_token() == account,
+                    "Your Fanta account changed. Choose the result again before playing it."
+                );
                 cx.background_spawn(async move {
                     generation_media::mp4_metadata(&bytes)?;
                     let file = tempfile::Builder::new()
@@ -1837,6 +1910,10 @@ impl GenerationWorkspace {
             }
             .await;
             this.update(cx, |this, cx| {
+                if this.client.account_access_token() != account {
+                    this.sync_account(cx);
+                    return;
+                }
                 this.task = None;
                 match result {
                     Ok(file) => {
@@ -1862,6 +1939,9 @@ impl GenerationWorkspace {
         let Some(output) = self.outputs.get(self.selected_output).cloned() else {
             return;
         };
+        if output.mime.starts_with("video/") && self.preview_task.is_some() {
+            return;
+        }
         let Some(item) = self.canvas_item.clone() else {
             self.fail(
                 anyhow!("Open this tool from a design canvas to place the result."),
@@ -1871,28 +1951,41 @@ impl GenerationWorkspace {
         };
         let client = self.client.clone();
         let run = self.active_run.clone();
+        let account = client.account_access_token();
+        let cached_video = self.prepared_video.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
-                let bytes = media_bytes(&client, &output.location, cx.background_executor()).await?;
-                let media = cx.background_spawn(async move {
-                    if output.mime == "image/svg+xml" {
-                        Ok::<_, anyhow::Error>(PreparedPlacement::Vector(generation_media::parse_svg(&bytes)?))
-                    } else if output.mime.starts_with("video/") {
-                        let metadata = generation_media::mp4_metadata(&bytes)?;
-                        Ok(PreparedPlacement::Video(bytes, metadata))
-                    } else {
-                        let preview = make_preview(&bytes, &output.mime)?;
-                        Ok(PreparedPlacement::Image(STANDARD.encode(bytes), preview.width, preview.height))
-                    }
-                }).await?;
+                let media = if output.mime.starts_with("video/") {
+                    let video = if let Some(video) = cached_video { video } else {
+                        let bytes = media_bytes(&client, &output.location, cx.background_executor()).await?;
+                        Arc::new(network_deadline(
+                            cx.background_executor(), VIDEO_PREVIEW_TIMEOUT,
+                            "The video preview took too long. Try adding the result again.",
+                            cx.background_spawn(async move { generation_media::prepare_video(bytes).await }),
+                        ).await?)
+                    };
+                    PreparedPlacement::Video(video)
+                } else {
+                    let bytes = media_bytes(&client, &output.location, cx.background_executor()).await?;
+                    cx.background_spawn(async move {
+                        if output.mime == "image/svg+xml" {
+                            Ok::<_, anyhow::Error>(PreparedPlacement::Vector(generation_media::parse_svg(&bytes)?))
+                        } else {
+                            let preview = make_preview(&bytes, &output.mime)?;
+                            Ok(PreparedPlacement::Image(STANDARD.encode(bytes), preview.width, preview.height))
+                        }
+                    }).await?
+                };
                 cx.update(|cx| {
+                    ensure!(client.account_access_token() == account,
+                        "Your Fanta account changed. Choose the result again before adding it.");
                     let item = item.upgrade().context("The source design was closed. Save the result and open a design to place it.")?;
                     agent_surface::set_active_item(item.downgrade(), cx);
                     let surface = design_surface::active(cx).context("The design canvas is unavailable.")?;
                     let (width, height) = match &media {
                         PreparedPlacement::Image(_, width, height) => (*width as f64, *height as f64),
                         PreparedPlacement::Vector(artwork) => (artwork.width, artwork.height),
-                        PreparedPlacement::Video(_, metadata) => (metadata.width as f64, metadata.height as f64),
+                        PreparedPlacement::Video(video) => (video.metadata.width as f64, video.metadata.height as f64),
                     };
                     let spot = surface.find_empty_space(width, height, None, cx)?;
                     let x = spot["x"].as_f64().context("No placement position was returned.")?;
@@ -1911,7 +2004,7 @@ impl GenerationWorkspace {
                             ensure!(item.is_editable(), "Save or discard source edits before placing media on the canvas.");
                             item.with_document(cx, |document| match media {
                                 PreparedPlacement::Vector(artwork) => generation_media::place_svg(document, artwork, x, y, meta),
-                                PreparedPlacement::Video(bytes, metadata) => generation_media::place_video(document, bytes, metadata, x, y, meta),
+                                PreparedPlacement::Video(video) => generation_media::place_video(document, (*video).clone(), x, y, meta),
                                 PreparedPlacement::Image(_, _, _) => (Err(anyhow!("The media type changed before placement.")), crate::document::DocChange::None),
                             }).context("The design is still loading.")?
                         }),
@@ -1919,6 +2012,10 @@ impl GenerationWorkspace {
                 })
             }.await;
             this.update(cx, |this, cx| {
+                if this.client.account_access_token() != account {
+                    this.sync_account(cx);
+                    return;
+                }
                 this.task = None;
                 match result { Ok(()) => { this.error = None; this.status = "Added to your design. Save the design to keep it.".into(); }, Err(error) => this.fail(error, cx) }
                 cx.notify();
@@ -2310,7 +2407,7 @@ impl GenerationWorkspace {
                                 element.child(
                                     Button::new("place-generation", "Add to design")
                                         .style(ButtonStyle::Filled)
-                                        .disabled(self.task.is_some())
+                                        .disabled(self.task.is_some() || (output.as_ref().is_some_and(|output| output.mime.starts_with("video/")) && self.preview_task.is_some()))
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.place_output(cx)),
                                         ),
@@ -2907,7 +3004,9 @@ fn build_request(
         if !prompt.trim().is_empty() {
             request["prompt"] = json!(prompt.trim());
         }
-        if !negative.trim().is_empty() {
+        if model.capabilities["negative_prompt"]["supported"].as_bool() == Some(true)
+            && !negative.trim().is_empty()
+        {
             request["negative"] = json!(negative.trim());
         }
         let (width, height) = parse_size(size)?;
@@ -3279,6 +3378,56 @@ mod tests {
             view.read_with(cx, |view, cx| view.prompt.read(cx).text(cx)),
             "a green landscape"
         );
+    }
+
+    #[gpui::test]
+    fn generation_negative_draft_survives_model_and_mode_switches(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        view.update_in(cx, |view, window, cx| {
+            let mut supported = model("image");
+            supported.capabilities = json!({"negative_prompt":{"supported":true}});
+            let mut unsupported = supported.clone();
+            unsupported.id = "fanta-image-no-negative".into();
+            unsupported.capabilities = json!({"negative_prompt":{"supported":false}});
+            let mut video = model("video");
+            video.capabilities = json!({});
+            view.selected_model = Some(supported.id.clone());
+            view.models = vec![supported, unsupported, video];
+            view.prompt.update(cx, |prompt, cx| {
+                prompt.set_text("a landscape", window, cx);
+            });
+            view.negative.update(cx, |negative, cx| {
+                negative.set_text("  blur and watermarks  ", window, cx);
+            });
+            assert_eq!(
+                view.request(cx).expect("supported image request")["negative"],
+                "blur and watermarks"
+            );
+
+            view.selected_model = Some("fanta-image-no-negative".into());
+            view.choose_default_model();
+            let unsupported_request = view.request(cx).expect("unsupported image request");
+            assert_eq!(unsupported_request["model"], "fanta-image-no-negative");
+            assert_eq!(view.negative.read(cx).text(cx), "  blur and watermarks  ");
+
+            view.set_mode(GenerationMode::Video, window, cx);
+            view.prompt.update(cx, |prompt, cx| {
+                prompt.set_text("a moving landscape", window, cx);
+            });
+            let video_request = view.request(cx).expect("video request");
+            assert_eq!(video_request["model"], "fanta-video-1");
+            assert_eq!(view.negative.read(cx).text(cx), "  blur and watermarks  ");
+
+            view.set_mode(GenerationMode::Image, window, cx);
+            view.selected_model = Some("fanta-image-1".into());
+            view.choose_default_model();
+            let restored_request = view.request(cx).expect("restored image request");
+            assert_eq!(restored_request["prompt"], "a landscape");
+            assert_eq!(restored_request["negative"], "blur and watermarks");
+            assert_eq!(view.negative.read(cx).text(cx), "  blur and watermarks  ");
+            assert!(unsupported_request.get("negative").is_none());
+            assert!(video_request.get("negative").is_none());
+        });
     }
 
     #[gpui::test]
@@ -4431,6 +4580,12 @@ mod tests {
                             .status(200)
                             .body(r#"{"models":[]}"#.into())?);
                     }
+                    if request.uri().path() == "/result.mp4" {
+                        assert_eq!(request.method(), Method::GET);
+                        assert!(request.headers().get("Authorization").is_none());
+                        // Keep native decoding out of this deterministic submission-recovery test.
+                        return stalled_response(false).await;
+                    }
                     assert_eq!(request.method(), Method::POST);
                     assert_eq!(request.uri().path(), "/v1/generations");
                     let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
@@ -4533,6 +4688,211 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         assert_submission_timeout_recovers(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_video_preview_switch_cancels_download(cx: &mut gpui::TestAppContext) {
+        struct CancelWatch(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for CancelWatch {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let http = http_client::FakeHttpClient::create({
+            let cancelled = cancelled.clone();
+            let started = started.clone();
+            move |request| {
+                let cancelled = cancelled.clone();
+                let started = started.clone();
+                async move {
+                    let body = match request.uri().path() {
+                        "/v1/models" => json!({"models":[]}),
+                        "/v1/me" => recovery_account_fixture(),
+                        "/pending.mp4" => {
+                            assert!(request.headers().get("Authorization").is_none());
+                            started.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let _watch = CancelWatch(cancelled);
+                            return futures::future::pending().await;
+                        }
+                        route => panic!("unexpected preview request: {route}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(body.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, cx);
+        view.update(cx, |view, cx| {
+            view.outputs = vec![MediaOutput {
+                label: "Video".into(),
+                mime: "video/mp4".into(),
+                mask: false,
+                location: MediaLocation::Url("https://media.example/pending.mp4".into()),
+            }];
+            view.load_preview(cx);
+        });
+        cx.run_until_parked();
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(view.read_with(cx, |view, _| view.preview_task.is_some()));
+        view.update(cx, |view, cx| {
+            let mut png = Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(32, 24)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .expect("replacement image");
+            view.outputs = vec![MediaOutput {
+                label: "Image".into(),
+                mime: "image/png".into(),
+                mask: false,
+                location: MediaLocation::Inline(png.into_inner().into()),
+            }];
+            view.load_preview(cx);
+        });
+        cx.run_until_parked();
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        view.read_with(cx, |view, _| {
+            let preview = view.preview.as_ref().expect("new image preview");
+            assert_eq!((preview.width, preview.height), (32, 24));
+            assert!(view.prepared_video.is_none());
+            assert!(view.preview_task.is_none());
+            assert!(view.error.is_none());
+        });
+        cx.executor().advance_clock(MEDIA_TRANSFER_TIMEOUT);
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, _| view.error.is_none()),
+            "cancelled video must not overwrite the next result"
+        );
+    }
+
+    async fn assert_pending_save_cannot_cross_sign_out(
+        retain_save_task: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let http = http_client::FakeHttpClient::create(|request| async move {
+            let body = match request.uri().path() {
+                "/v1/models" => json!({"models":[]}),
+                "/v1/me" => recovery_account_fixture(),
+                route => panic!("an inline result must not make media requests: {route}"),
+            };
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(body.to_string().into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Vector, client.clone(), cx);
+        let directory = tempfile::tempdir().expect("save directory");
+        let path = directory.path().join("existing.svg");
+        let existing = b"existing customer file";
+        std::fs::write(&path, existing).expect("existing destination");
+        let retained_task = view.update(cx, |view, cx| {
+            view.outputs = vec![vector_output(Arc::from(
+                &br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><path d="M0 0H32V24H0Z" fill="#22c55e"/></svg>"##[..],
+            ))];
+            view.save_output(cx);
+            assert!(view.task.is_some(), "the save must be pending on the dialog");
+            if retain_save_task {
+                // Keep the future alive so this case verifies the account guard,
+                // independently of the account observer dropping the task handle.
+                Some(view.task.take().expect("pending save task"))
+            } else {
+                None
+            }
+        });
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_new_path());
+        assert_eq!(
+            std::fs::read(&path).expect("destination before reply"),
+            existing
+        );
+
+        client.sign_out(&cx.to_async()).await;
+        cx.run_until_parked();
+        assert!(client.account_access_token().is_none());
+        view.read_with(cx, |view, _| {
+            assert!(view.account.is_none());
+            assert!(view.outputs.is_empty());
+            assert!(view.task.is_none());
+        });
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        if let Some(task) = retained_task {
+            task.await;
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read(&path).expect("destination after old dialog reply"),
+            existing,
+            "answering an old account's save dialog must not overwrite a file"
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.outputs.is_empty());
+            assert!(view.task.is_none());
+            assert!(view.error.is_none());
+            assert_ne!(view.status.as_ref(), "Result saved.");
+        });
+    }
+
+    #[gpui::test]
+    async fn generation_save_dialog_sign_out_cancels_old_account_result(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_pending_save_cannot_cross_sign_out(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_save_dialog_sign_out_blocks_retained_task(cx: &mut gpui::TestAppContext) {
+        assert_pending_save_cannot_cross_sign_out(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_video_save_reuses_preview_bytes(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|request| async move {
+            let body = match request.uri().path() {
+                "/v1/models" => json!({"models":[]}),
+                "/v1/me" => recovery_account_fixture(),
+                route => panic!("cached video must not be downloaded again: {route}"),
+            };
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(body.to_string().into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, cx);
+        let directory = tempfile::tempdir().expect("save directory");
+        let path = directory.path().join("cached.mp4");
+        let expected: Arc<[u8]> = Arc::from(&b"exact previously downloaded MP4 bytes"[..]);
+        view.update(cx, |view, cx| {
+            view.outputs = vec![MediaOutput {
+                label: "Video".into(),
+                mime: "video/mp4".into(),
+                mask: false,
+                location: MediaLocation::Url("https://media.example/expired.mp4".into()),
+            }];
+            view.prepared_video = Some(Arc::new(generation_media::PreparedVideo {
+                bytes: expected.clone(),
+                metadata: generation_media::VideoMetadata {
+                    width: 320,
+                    height: 180,
+                    duration_us: 1_000_000,
+                },
+                poster: None,
+            }));
+            view.save_output(cx);
+        });
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read(path).expect("saved video"), expected.as_ref());
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_none());
+            assert_eq!(view.status.as_ref(), "Result saved.");
+        });
     }
 
     async fn assert_download_timeout_preserves_result(
@@ -4880,6 +5240,49 @@ mod tests {
         assert_eq!(request["input"]["mask_polarity"], "edit_white");
         assert_eq!(request["input"]["operation"], "inpaint");
         assert_eq!(request["seed"], 42);
+    }
+
+    #[test]
+    fn negative_prompt_requires_explicit_model_support() {
+        for (capabilities, negative, expected) in [
+            (
+                json!({"negative_prompt":{"supported":true}}),
+                "  blur  ",
+                Some("blur"),
+            ),
+            (json!({"negative_prompt":{"supported":true}}), "   ", None),
+            (json!({"negative_prompt":{"supported":false}}), "blur", None),
+            (json!({}), "blur", None),
+            (
+                json!({"negative_prompt":{"supported":"true"}}),
+                "blur",
+                None,
+            ),
+        ] {
+            let mut model = model("image");
+            model.capabilities = capabilities;
+            let request = build_request(
+                &model,
+                "a landscape",
+                negative,
+                "1024x1024",
+                "",
+                "",
+                "",
+                "",
+                "",
+                None,
+                None,
+                &[],
+            )
+            .expect("valid request");
+            assert_eq!(
+                request.get("negative").and_then(Value::as_str),
+                expected,
+                "capabilities: {}",
+                model.capabilities
+            );
+        }
     }
 
     #[test]
