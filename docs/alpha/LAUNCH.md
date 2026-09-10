@@ -80,6 +80,16 @@ preserved, not approved as a sustainable launch offer.
 
 ## GitHub builds and installers
 
+At **06:09 UTC**, both checks for published recovery head `02a32f6` had passed:
+[push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34441705781)
+completed at 05:58:11 UTC and
+[PR checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34441708551)
+completed at 06:04:48 UTC. Its
+[exact installer](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34441705786)
+was pending behind the still-running `12ad6d3` installer. These checks include
+`be2b282` durable recovery. Local native full-restart QA subsequently passed at
+06:20:39 UTC; exact-installer and production authentication/media checks remain open.
+
 At **05:26 UTC on September 10**, published desktop head `12ad6d3` had passed
 both [push checks](https://github.com/jeanc18rlos/fanta-edit/actions/runs/34438558490)
 (05:20:34 UTC) and
@@ -236,13 +246,43 @@ up to 8 unconfirmed submissions, plus 12 completed records within a 64 MiB
 journal cap. Completed SVG results are retained, but uncertain vector Messages
 requests are not recovered and `/v1/messages` is not replayed.
 
-Backend submission source `830f702` is published in the draft PR and passed
-438 tests in 44 files, 60 focused tests and type checking. Its hosted CI is
-running; migration `0019_generation_request_hash` and production deployment
-remain pending. The full desktop viewer suite passed all 596 tests, and ten new recovery cases
-each passed 20 scheduler iterations. Root and independent peer review passed. Hosted
-and native recovery validation remain pending; the earlier `12ad6d3` checks
-do not cover this update. See the
+Backend submission source `830f702` is now live as
+`dpl_12FMtF55tpV1pJnyr93nx4pPz6BS`. All 438 tests in 44 files, 60 focused tests,
+type checking and [source CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34441329043)
+passed. Migration `0019_generation_request_hash` was applied at 05:45:37 UTC
+on September 10, after the preceding 19 history entries matched; the resulting
+20-entry history and nullable text column were independently verified at
+05:49:25 UTC. No seed ran or customer rows were read by those checks. Nine
+candidate and nine live public checks passed without inference. Direct lookup
+of `api.fantaisa.net` confirmed this production deployment.
+
+A production API check completed at **06:09:09 UTC**: device sign-in passed,
+the same deliberately invalid generation request returned HTTP 400 with
+`invalid_request_error` and `x-fanta-generation-unreserved: true` twice, and
+the credit balance stayed **387 → 387**. The temporary key was revoked and
+subsequently rejected with HTTP 401. Credentials stayed in process memory;
+no inference, checkout or native application was used. Evidence:
+`/tmp/fanta-release-qa-20260909/generation-submission-validation/production/live-rejection-verification.json`.
+
+The full desktop viewer suite passed all 596 tests, and ten new recovery cases
+each passed 20 scheduler iterations. Root and independent peer review passed.
+The local native build at `be2b282` completed successfully in **4m46s**.
+Both hosted checks at `02a32f6` passed by 06:09 UTC. **Local native full-restart
+recovery QA passed at 06:20:39 UTC.** Across two full restarts, opening the same
+profile issued no generation POST, status read or Messages call before an
+explicit action. Accepted jobs resumed through GET only; a dropped inpaint
+response recovered the same job using the exact key, body, mask and source.
+The run created three unique jobs with four generation POSTs and one Messages
+call. SVG bytes matched before and after restart, the recovered PNG matched
+the fixture, and the original orange 512×512 source, white edit mask and SVG
+were restored. All three QA app sessions quit normally, and the fixture stopped.
+
+This used the same ad-hoc signed local bundle/profile, including protected
+user-staged changes. It does not validate the hosted installer, production GPU
+or production Keychain persistence. Exact-installer verification remains
+pending. Evidence is in
+`/tmp/fanta-release-qa-20260909/generation-journal-validation/native/verification.json`.
+See the
 [recovery validation record](RELEASE_VALIDATION.md#durable-generation-recovery--september-10)
 for the marker, legacy-record and provider-dispatch limits.
 
@@ -284,7 +324,7 @@ Production device authorization and the default Sonnet stream passed against `6f
 
 Earlier backend `a2bb2bb` passed 396 tests, type checking, GitHub CI, Docker/GPU checks, and its production build. REST and MCP production catalogs excluded mock models; three direct mock requests returned 400 with no credit debit. A default Sonnet stream then passed with one credit debited (388 → 387), usage recorded, and the temporary key revoked and rejected. These API checks do not establish final native sign-in, real media generation, all models, or customer payment.
 
-Current runtime `42a4885` is live as `dpl_5484e7wjBBFjX7W2DguXBw5cHay6`, with backend PR documentation head `abc3d17`. Its concurrent generation completion/billing fix passed all 408 tests in 43 files, type checking and [GitHub CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34436154574). The documentation head also passed all jobs in [CI run 34436789383](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34436789383). Nine public checks passed on the candidate and nine on the live domain. No new paid calls or migration were used for this promotion. Final native authentication, production media and customer payment remain unvalidated.
+Previous runtime `42a4885` was deployed as `dpl_5484e7wjBBFjX7W2DguXBw5cHay6`, with backend PR documentation head `abc3d17`; current runtime `830f702` is deployed and verified as recorded in Durable generation recovery above. Its concurrent generation completion/billing fix passed all 408 tests in 43 files, type checking and [GitHub CI](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34436154574). The documentation head also passed all jobs in [CI run 34436789383](https://github.com/jeanc18rlos/fanta-backend/actions/runs/34436789383). Nine public checks passed on the candidate and nine on the live domain. No new paid calls or migration were used for this promotion. Final native authentication, production media and customer payment remain unvalidated.
 
 Path Selection edits existing anchors, handles, and segment endpoints. Commit `ee8e14d` fixes drags delivered before repaint and routes Backspace/toolbar Delete to selected anchors. Commit `af4cb0f` implements proportional Scale handles, including nested geometry, text and dimensional styles, with Undo/Redo and cancellation; `16533e6` connects the K shortcut. The fast-input baseline failed all five new checks; Scale's revised baseline failed 14 engine checks and its native check, with three engine controls passing. The five fast-drag/delete regressions and the Scale native regression each passed 20 scheduler iterations.
 
