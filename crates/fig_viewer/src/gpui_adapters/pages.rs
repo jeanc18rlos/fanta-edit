@@ -95,7 +95,7 @@ pub(crate) fn element_kind(
     component_roots: &std::collections::HashSet<NodeId>,
 ) -> PagesPanelElementKind {
     match data {
-        NodeData::Text(_) => PagesPanelElementKind::Text,
+        NodeData::Text(_) | NodeData::TextPath(_) => PagesPanelElementKind::Text,
         NodeData::Instance(_) => PagesPanelElementKind::Instance,
         NodeData::Group(_) if component_roots.contains(&id) => PagesPanelElementKind::Component,
         NodeData::Group(_) => PagesPanelElementKind::FrameGroup,
@@ -238,15 +238,19 @@ pub(crate) fn search_pages(
                 request.match_case,
                 request.whole_words,
             );
-            let text_hit = match &node.data {
-                NodeData::Text(text) => matches_query(
-                    &text.content,
+            let text_content = match &node.data {
+                NodeData::Text(text) => Some(text.content.as_str()),
+                NodeData::TextPath(text_path) => Some(text_path.content.as_str()),
+                _ => None,
+            };
+            let text_hit = text_content.is_some_and(|content| {
+                matches_query(
+                    content,
                     &request.query,
                     request.match_case,
                     request.whole_words,
-                ),
-                _ => false,
-            };
+                )
+            });
             if !name_hit && !text_hit {
                 continue;
             }
@@ -259,8 +263,8 @@ pub(crate) fn search_pages(
             let result_id = SharedString::from(id.to_string());
             let title = if name_hit || node.name.is_empty() {
                 SharedString::from(node.name.clone())
-            } else if let NodeData::Text(text) = &node.data {
-                SharedString::from(text.content.clone())
+            } else if let Some(content) = text_content {
+                SharedString::from(content.to_string())
             } else {
                 SharedString::from(node.name.clone())
             };

@@ -33,4 +33,5 @@ mod shapes_per_side_rounded;
 mod shapes_stroke;
 mod shapes_zero_stroke;
 mod text;
+mod text_path;
 mod variables;

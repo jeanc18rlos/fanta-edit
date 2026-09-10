@@ -5,7 +5,8 @@
 use super::{
     AudioNode, Bounds, Canvas, CanvasNode, Color, Fill, GroupNode, Model3dNode, NodeData, NodeId,
     Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached, draw_placeholder,
-    draw_text_node, draw_vector, fill_to_paint, rounded_rect_path, stroke_box_path,
+    draw_text_node, draw_text_path_node, draw_vector, fill_to_paint, rounded_rect_path,
+    stroke_box_path,
 };
 
 /// This node's live playback position (0..=1) from the app-playback→render seam,
@@ -120,6 +121,11 @@ pub(crate) fn paint_node_content(
             // caller concatenated `node.transform`), so we draw in LOCAL
             // coordinates — no zoom/scale re-application here.
             draw_text_node(canvas, t);
+            ctx.metrics.nodes_drawn += 1;
+            ContentPaintState::default()
+        }
+        NodeData::TextPath(text_path) => {
+            draw_text_path_node(canvas, text_path);
             ctx.metrics.nodes_drawn += 1;
             ContentPaintState::default()
         }

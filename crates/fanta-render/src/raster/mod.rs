@@ -93,6 +93,7 @@ mod layer_cache;
 mod media;
 mod renderer;
 mod text;
+mod text_path;
 mod vector;
 mod walk;
 
@@ -130,6 +131,7 @@ pub(crate) use renderer::{
     BooleanCache, CachedVectorPaths, InstanceCache, InstanceCacheKey, PathCache,
 };
 pub(crate) use text::{draw_text_node, with_shaped_layout};
+pub(crate) use text_path::{draw_text_path_node, text_path_bounds, text_path_outline};
 pub(crate) use vector::{
     bounds_to_f32, draw_placeholder, draw_unresolved_outline, draw_vector, path_is_rect,
     rounded_rect_path, stroke_box_path,

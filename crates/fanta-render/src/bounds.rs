@@ -1,6 +1,7 @@
 use fanta_doc::{Bounds, NodeData, NodeFlags, NodeId, Scene, StrokeAlign, StrokeJoin};
 
 use crate::raster::shadow_expanded_local_bounds;
+use crate::raster::text_path_bounds;
 
 /// Conservative world-space bounds of everything that can paint in `root`'s
 /// subtree, including outside/center strokes, drop shadows, and layer blurs.
@@ -67,6 +68,7 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
                 .map(|bounds| expand_for_strokes(bounds, &boolean.strokes, false)),
             true,
         ),
+        NodeData::TextPath(text_path) => (text_path_bounds(text_path), false),
         _ => (node.data.local_bounds(), false),
     };
     if !skip_children {

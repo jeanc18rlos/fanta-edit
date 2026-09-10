@@ -62,5 +62,7 @@ pub use font_resolver::{
     INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY,
     bundled_family_names, bundled_preview_bytes, prewarm_font_downloads,
 };
-pub use layout::{LayoutEngine, LayoutOptions, LineMetrics, TextLayout};
+pub use layout::{
+    LayoutEngine, LayoutOptions, LineMetrics, ShapedGlyph, ShapedGlyphRun, TextLayout,
+};
 pub use style::{FontWeight, TextStyle};

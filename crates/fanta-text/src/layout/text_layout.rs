@@ -1,9 +1,10 @@
 //! The laid-out paragraph artifact: query geometry, hit-test, caret, paint.
 
 use skia_safe::{
-    Canvas,
+    Canvas, Font,
     textlayout::{RectHeightStyle, RectWidthStyle},
 };
+use std::ops::Range;
 
 /// Per-line geometry extracted from a laid-out paragraph.
 ///
@@ -27,6 +28,41 @@ pub struct LineMetrics {
     pub start_byte: usize,
     /// One-past-last byte offset on the line (including any trailing newline).
     pub end_byte: usize,
+}
+
+/// One glyph from Skia's fully shaped paragraph output.
+///
+/// Positions and bounds are relative to the owning [`ShapedGlyphRun`]'s
+/// baseline origin. The UTF-8 range is the source cluster that produced the
+/// glyph; multiple glyphs may share a range, and one glyph may cover several
+/// code points after ligature shaping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapedGlyph {
+    pub glyph_id: u16,
+    pub position: [f64; 2],
+    pub bounds: [f64; 4],
+    pub utf8_range: Range<usize>,
+}
+
+/// An owned snapshot of one visual font run from a shaped paragraph.
+///
+/// The resolved Skia font is retained so downstream renderers can draw the
+/// exact glyph IDs returned by shaping, including glyph-level fallback, rather
+/// than converting clusters back to text and shaping them a second time.
+#[derive(Debug, Clone)]
+pub struct ShapedGlyphRun {
+    pub line: usize,
+    pub origin: [f64; 2],
+    pub advance: [f64; 2],
+    pub glyphs: Vec<ShapedGlyph>,
+    font: Font,
+}
+
+impl ShapedGlyphRun {
+    /// The resolved font that owns [`ShapedGlyph::glyph_id`] for this run.
+    pub fn font(&self) -> &Font {
+        &self.font
+    }
 }
 
 /// A laid-out paragraph: the shaped, line-broken result of running a
@@ -113,6 +149,60 @@ impl TextLayout {
                 end_byte: lm.end_index,
             })
             .collect()
+    }
+
+    /// Copy the paragraph's fully shaped visual runs into safe, owned data.
+    ///
+    /// Skia's visitor lends slices that are valid only during its callback.
+    /// Owning the glyph IDs, positions, bounds, source clusters, and resolved
+    /// font lets a renderer transform those glyphs after the callback without
+    /// retaining native pointers. This visits the paragraph that was already
+    /// shaped as a whole; it never reshapes individual graphemes.
+    pub fn shaped_glyph_runs(&mut self) -> Vec<ShapedGlyphRun> {
+        if self.text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut runs = Vec::new();
+        self.paragraph.extended_visit(|line, info| {
+            let Some(info) = info else {
+                return;
+            };
+            let utf8_starts = info.utf8_starts();
+            let glyphs = info
+                .glyphs()
+                .iter()
+                .copied()
+                .zip(info.positions().iter().copied())
+                .zip(info.bounds().iter().copied())
+                .enumerate()
+                .filter_map(|(index, ((glyph_id, position), bounds))| {
+                    let start = usize::try_from(*utf8_starts.get(index)?).ok()?;
+                    let end = usize::try_from(*utf8_starts.get(index + 1)?).ok()?;
+                    Some(ShapedGlyph {
+                        glyph_id,
+                        position: [f64::from(position.x), f64::from(position.y)],
+                        bounds: [
+                            f64::from(bounds.left),
+                            f64::from(bounds.top),
+                            f64::from(bounds.right),
+                            f64::from(bounds.bottom),
+                        ],
+                        utf8_range: start.min(end)..start.max(end),
+                    })
+                })
+                .collect();
+            let origin = info.origin();
+            let advance = info.advance();
+            runs.push(ShapedGlyphRun {
+                line,
+                origin: [f64::from(origin.x), f64::from(origin.y)],
+                advance: [f64::from(advance.width), f64::from(advance.height)],
+                glyphs,
+                font: info.font().clone(),
+            });
+        });
+        runs
     }
 
     /// The byte offset nearest a point in paragraph-local coordinates.
@@ -865,6 +955,47 @@ mod tests {
         let layout = engine.layout(&buf, 2000.0);
         assert!(layout.height() > 0.0);
         assert!(layout.width() > 0.0);
+    }
+
+    #[test]
+    fn shaped_glyph_snapshot_keeps_clusters_and_resolved_fonts_owned() {
+        let engine = LayoutEngine::new();
+        let mut buf = TextBuffer::from_str("office 🦀", body());
+        buf.set_style(
+            0..6,
+            TextStyle::new("Source Serif 4", 28.0).with_color(fanta_doc::Color::rgb(200, 0, 0)),
+        )
+        .unwrap();
+        let mut layout = engine.layout(&buf, f64::INFINITY);
+        let runs = layout.shaped_glyph_runs();
+
+        assert!(!runs.is_empty());
+        assert!(
+            runs.iter().all(|run| run.font().size() > 0.0),
+            "every visitor run retains its resolved font"
+        );
+        let glyphs: Vec<_> = runs.iter().flat_map(|run| &run.glyphs).collect();
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.iter().all(|glyph| {
+            glyph.utf8_range.start <= glyph.utf8_range.end
+                && glyph.utf8_range.end <= buf.len()
+                && glyph.position.iter().all(|value| value.is_finite())
+                && glyph.bounds.iter().all(|value| value.is_finite())
+        }));
+        let crab_start = buf.text().find('🦀').unwrap();
+        assert!(
+            glyphs.iter().any(|glyph| {
+                glyph.utf8_range.start <= crab_start && crab_start < glyph.utf8_range.end
+            }),
+            "fallback glyph keeps its source cluster"
+        );
+    }
+
+    #[test]
+    fn shaped_glyph_snapshot_of_empty_layout_is_empty() {
+        let engine = LayoutEngine::new();
+        let mut layout = engine.layout(&TextBuffer::new(), f64::INFINITY);
+        assert!(layout.shaped_glyph_runs().is_empty());
     }
 
     #[test]

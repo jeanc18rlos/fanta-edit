@@ -646,13 +646,19 @@ impl FigDocument {
         };
         for root in self.doc.scene.roots().to_vec() {
             for id in self.doc.scene.descendants_of(root) {
-                if let Some(node) = self.doc.scene.get(id)
-                    && let fanta_doc::NodeData::Text(text) = &node.data
-                {
-                    push(&text.style.font_family);
-                    for run in &text.style_runs {
-                        push(&run.style.font_family);
+                let Some(node) = self.doc.scene.get(id) else {
+                    continue;
+                };
+                let (style, style_runs) = match &node.data {
+                    fanta_doc::NodeData::Text(text) => (&text.style, &text.style_runs),
+                    fanta_doc::NodeData::TextPath(text_path) => {
+                        (&text_path.style, &text_path.style_runs)
                     }
+                    _ => continue,
+                };
+                push(&style.font_family);
+                for run in style_runs {
+                    push(&run.style.font_family);
                 }
             }
         }
@@ -2796,6 +2802,7 @@ fn page_image_assets(doc: &Doc, page_root: NodeId) -> Vec<AssetId> {
                     }
                 }
                 NodeData::Text(_)
+                | NodeData::TextPath(_)
                 | NodeData::Audio(_)
                 | NodeData::NodeGraph(_)
                 | NodeData::Model3d(_)

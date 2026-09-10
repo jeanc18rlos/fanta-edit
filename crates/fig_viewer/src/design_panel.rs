@@ -3422,21 +3422,37 @@ impl FantaDesignPanel {
                             }
                         }
                         HitField::TextContent => {
-                            if let NodeData::Text(text) = &node.data {
-                                let mut updated = text.clone();
-                                updated.content = replace_matches(
-                                    &text.content,
-                                    &query,
-                                    &replacement,
-                                    match_case,
-                                );
-                                if updated.content != text.content {
-                                    operations.push(Operation::ReplaceData {
-                                        id: hit.node,
-                                        old: Box::new(node.data.clone()),
-                                        new: Box::new(NodeData::Text(updated)),
-                                    });
+                            let replacement_data = match &node.data {
+                                NodeData::Text(text) => {
+                                    let mut updated = text.clone();
+                                    updated.content = replace_matches(
+                                        &text.content,
+                                        &query,
+                                        &replacement,
+                                        match_case,
+                                    );
+                                    (updated.content != text.content)
+                                        .then_some(NodeData::Text(updated))
                                 }
+                                NodeData::TextPath(text_path) => {
+                                    let mut updated = text_path.clone();
+                                    updated.content = replace_matches(
+                                        &text_path.content,
+                                        &query,
+                                        &replacement,
+                                        match_case,
+                                    );
+                                    (updated.content != text_path.content)
+                                        .then_some(NodeData::TextPath(updated))
+                                }
+                                _ => None,
+                            };
+                            if let Some(new) = replacement_data {
+                                operations.push(Operation::ReplaceData {
+                                    id: hit.node,
+                                    old: Box::new(node.data.clone()),
+                                    new: Box::new(new),
+                                });
                             }
                         }
                     }

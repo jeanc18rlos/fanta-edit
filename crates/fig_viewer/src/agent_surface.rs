@@ -20,7 +20,7 @@ use fanta_doc::{
     AssetId, AutoLayout, BitmapNode, Bounds, CanvasNode, Color, ComponentId, CounterAlign, Doc,
     Fill, GroupNode, ImageFitMode, IndexKey, InstanceNode, LayoutMode, NodeData, NodeFlags, NodeId,
     Operation, PathData, PrimaryAlign, ShadowKind, Stroke, StrokeAlign, TextAlign, TextNode,
-    Transform2D, UnitInterval, VectorNode, Viewport,
+    TextStyle, Transform2D, UnitInterval, VectorNode, Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
@@ -587,27 +587,10 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
             }
         }
         NodeData::Text(text) => {
-            let text_length = text.content.chars().count();
-            if text_length > SUMMARY_TEXT_CHARS {
-                let preview: String = text
-                    .content
-                    .chars()
-                    .take(SUMMARY_TEXT_CHARS)
-                    .chain(std::iter::once('…'))
-                    .collect();
-                object.insert("text".into(), json!(preview));
-                object.insert("text_length".into(), json!(text_length));
-            } else {
-                object.insert("text".into(), json!(text.content));
-            }
-            object.insert(
-                "font".into(),
-                json!({
-                    "family": text.style.font_family,
-                    "size": text.style.size_px,
-                    "weight": text.style.weight,
-                }),
-            );
+            summarize_text(&text.content, &text.style, object);
+        }
+        NodeData::TextPath(text_path) => {
+            summarize_text(&text_path.content, &text_path.style, object);
         }
         NodeData::Vector(vector) => {
             if let Some(color) = vector.fills.first().and_then(Fill::solid_color) {
@@ -638,6 +621,29 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
         | NodeData::AiArtifact(_)
         | NodeData::Embed(_) => {}
     }
+}
+
+fn summarize_text(content: &str, style: &TextStyle, object: &mut serde_json::Map<String, Value>) {
+    let text_length = content.chars().count();
+    if text_length > SUMMARY_TEXT_CHARS {
+        let preview: String = content
+            .chars()
+            .take(SUMMARY_TEXT_CHARS)
+            .chain(std::iter::once('…'))
+            .collect();
+        object.insert("text".into(), json!(preview));
+        object.insert("text_length".into(), json!(text_length));
+    } else {
+        object.insert("text".into(), json!(content));
+    }
+    object.insert(
+        "font".into(),
+        json!({
+            "family": style.font_family,
+            "size": style.size_px,
+            "weight": style.weight,
+        }),
+    );
 }
 
 #[allow(clippy::type_complexity)]
