@@ -1418,10 +1418,8 @@ impl GenerationWorkspace {
                 };
                 let bytes =
                     media_bytes(&client, &output.location, cx.background_executor()).await?;
-                cx.background_spawn(async move {
-                    std::fs::write(path, bytes).context("The result could not be saved")
-                })
-                .await?;
+                cx.background_spawn(async move { generation_media::write_output(&path, &bytes) })
+                    .await?;
                 Ok(true)
             }
             .await;

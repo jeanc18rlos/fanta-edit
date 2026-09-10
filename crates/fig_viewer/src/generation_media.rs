@@ -5,9 +5,56 @@ use fanta_doc::{
     Transaction, Transform2D, UnitInterval, VectorNode, VideoNode,
 };
 use serde_json::Value;
-use std::sync::Arc;
+use std::{fs::File, io::Write as _, path::Path, sync::Arc};
 
 use crate::document::{DocChange, FigDocument};
+
+pub(crate) fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_output_with(path, |file| file.write_all(bytes)).context("The result could not be saved")
+}
+
+fn write_output_with(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let permissions = match std::fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let result = (|| {
+        if let Some(permissions) = permissions {
+            temporary.as_file().set_permissions(permissions)?;
+        }
+        write(temporary.as_file_mut())?;
+        temporary.as_file().sync_all()
+    })();
+    if let Err(error) = result {
+        return Err(discard_output_temporary(temporary, error));
+    }
+    match temporary.persist(path) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(discard_output_temporary(error.file, error.error)),
+    }
+}
+
+fn discard_output_temporary(
+    temporary: tempfile::NamedTempFile,
+    primary: std::io::Error,
+) -> std::io::Error {
+    match temporary.close() {
+        Ok(()) => primary,
+        Err(cleanup) => std::io::Error::new(
+            primary.kind(),
+            format!("{primary}; also failed to remove the temporary result: {cleanup}"),
+        ),
+    }
+}
 
 pub(crate) struct VectorArtwork {
     pub width: f64,
@@ -492,6 +539,50 @@ pub(crate) fn place_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_partial_write_failure_preserves_existing_file() {
+        let directory = tempfile::tempdir().expect("output directory");
+        let destination = directory.path().join("result.mp4");
+        std::fs::write(&destination, b"previous complete video").expect("existing output");
+
+        let error = write_output_with(&destination, |file| {
+            file.write_all(b"incomplete new video")?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .expect_err("partial write must fail");
+
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(
+            std::fs::read(&destination).expect("previous output remains readable"),
+            b"previous complete video"
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("output directory")
+                .count(),
+            1,
+            "failed writes must not leave temporary files"
+        );
+    }
+
+    #[test]
+    fn output_write_replaces_existing_file_with_exact_bytes() {
+        let directory = tempfile::tempdir().expect("output directory");
+        let destination = directory.path().join("result.png");
+        std::fs::write(&destination, b"a longer previous image").expect("existing output");
+        let expected = b"\x89PNG\r\n\x1a\n\0complete image";
+
+        write_output(&destination, expected).expect("save replacement");
+
+        assert_eq!(std::fs::read(&destination).expect("saved output"), expected);
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("output directory")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn svg_import_keeps_editable_paths_and_fill_rules() {
