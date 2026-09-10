@@ -2937,8 +2937,13 @@ impl CanvasElement {
         // Comment pins for the active page (annotation overlay, not scene
         // content, so they paint above the rendered canvas like the badges).
         if let Some(page) = doc.active_page() {
+            let active_motion_clip = (view.editor_mode(cx) == EditorMode::Motion)
+                .then(|| view.active_motion_clip_id())
+                .flatten()
+                .filter(|clip| doc.motion.clip(*clip).is_some());
             data.comment_pins = crate::comments::read_comments(doc, page)
                 .into_iter()
+                .filter(|comment| crate::comments::comment_is_visible(comment, active_motion_clip))
                 .map(|comment| CommentPin {
                     world: DVec2::new(comment.world[0], comment.world[1]),
                     author: comment.author.clone(),

@@ -283,6 +283,14 @@ impl TimelineShell {
         self.playhead_us
     }
 
+    /// Navigate to an authored moment without leaving playback running past
+    /// the comment the user explicitly opened. The existing setter owns the
+    /// clip-boundary clamp and emits the normal playhead event.
+    pub(crate) fn seek_to(&mut self, playhead_us: i64, cx: &mut Context<Self>) {
+        self.pause(cx);
+        self.set_playhead(playhead_us, cx);
+    }
+
     pub fn selected_keyframe(&self) -> Option<&TimelineKeyframeSelection> {
         self.selected_keyframe.as_ref()
     }
@@ -2908,6 +2916,26 @@ mod tests {
             assert!(!timeline.playing);
             assert_eq!(timeline.view_model().duration_us, 1);
             assert!(timeline.playback_task.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn controlled_seek_pauses_and_clamps_to_the_active_clip(cx: &mut TestAppContext) {
+        let timeline = cx.new(|_| TimelineShell::new());
+        timeline.update(cx, |timeline, cx| {
+            timeline.set_model(
+                TimelineViewModel::for_clip("Entrance", 1_500_000, Vec::new()),
+                cx,
+            );
+            timeline.toggle_playback(cx);
+            assert!(timeline.is_playing());
+
+            timeline.seek_to(875_000, cx);
+            assert!(!timeline.is_playing());
+            assert_eq!(timeline.playhead_us(), 875_000);
+
+            timeline.seek_to(9_000_000, cx);
+            assert_eq!(timeline.playhead_us(), 1_500_000);
         });
     }
 }

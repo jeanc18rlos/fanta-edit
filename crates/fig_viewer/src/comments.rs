@@ -9,7 +9,7 @@
 //!
 //! [`meta`]: fanta_doc::CanvasNode::meta
 
-use fanta_doc::{Doc, NodeId, Operation};
+use fanta_doc::{AnimationClipId, Doc, NodeId, Operation};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -92,6 +92,17 @@ pub(crate) struct CommentReply {
     pub(crate) skill: Option<CommentSkill>,
 }
 
+/// A comment's stable location on one authored animation timeline.
+///
+/// The canvas position remains the visual pin anchor. Keeping both the clip
+/// and time avoids silently retargeting a comment when another animation is
+/// selected or becomes the document's first clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MotionCommentAnchor {
+    pub(crate) clip: AnimationClipId,
+    pub(crate) time_ms: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Comment {
     /// Stable identity for panel rows and pin hit-testing.
@@ -118,6 +129,8 @@ pub(crate) struct Comment {
     pub(crate) skill: Option<CommentSkill>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) question: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) motion_anchor: Option<MotionCommentAnchor>,
 }
 
 impl Comment {
@@ -151,25 +164,163 @@ pub(crate) fn read_comments(doc: &Doc, page: NodeId) -> Vec<Comment> {
     doc.scene
         .get(page)
         .and_then(|node| node.meta.get(META_KEY))
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| serde_json::from_value(value.clone()).ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
+fn merge_comment_value(
+    original_value: &serde_json::Value,
+    original: &Comment,
+    comment: &Comment,
+) -> Option<serde_json::Value> {
+    if original == comment {
+        return Some(original_value.clone());
+    }
+    let serialized = serde_json::to_value(comment).ok()?;
+    let (Some(original_value), Some(serialized)) =
+        (original_value.as_object(), serialized.as_object())
+    else {
+        return Some(serialized);
+    };
+    let mut merged = original_value.clone();
+    let mut replace_if_changed = |field: &str, changed: bool| {
+        if !changed {
+            return;
+        }
+        if let Some(value) = serialized.get(field) {
+            merged.insert(field.to_string(), value.clone());
+        } else {
+            merged.remove(field);
+        }
+    };
+    replace_if_changed("id", original.id != comment.id);
+    replace_if_changed("world", original.world != comment.world);
+    replace_if_changed("author", original.author != comment.author);
+    replace_if_changed("text", original.text != comment.text);
+    replace_if_changed("created", original.created != comment.created);
+    replace_if_changed("resolved", original.resolved != comment.resolved);
+    replace_if_changed("from_agent", original.from_agent != comment.from_agent);
+    replace_if_changed("mentions", original.mentions != comment.mentions);
+    replace_if_changed("attachments", original.attachments != comment.attachments);
+    replace_if_changed("skill", original.skill != comment.skill);
+    replace_if_changed("question", original.question != comment.question);
+
+    if original.replies != comment.replies {
+        let preserved_prefix = if comment.replies.starts_with(&original.replies) {
+            let mut values = original_value
+                .get("replies")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let serialized_replies = serialized
+                .get("replies")
+                .and_then(serde_json::Value::as_array);
+            if values.len() == original.replies.len()
+                && serialized_replies.is_some_and(|replies| replies.len() == comment.replies.len())
+            {
+                let serialized_replies = serialized_replies?;
+                values.extend(
+                    serialized_replies
+                        .iter()
+                        .skip(original.replies.len())
+                        .cloned(),
+                );
+                Some(values)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(values) = preserved_prefix {
+            merged.insert("replies".to_string(), serde_json::Value::Array(values));
+        } else if let Some(value) = serialized.get("replies") {
+            merged.insert("replies".to_string(), value.clone());
+        } else {
+            merged.remove("replies");
+        }
+    }
+
+    if original.motion_anchor != comment.motion_anchor {
+        if let Some(value) = serialized.get("motion_anchor") {
+            let value = match (
+                original_value
+                    .get("motion_anchor")
+                    .and_then(serde_json::Value::as_object),
+                value.as_object(),
+            ) {
+                (Some(original_anchor), Some(serialized_anchor)) => {
+                    let mut merged_anchor = original_anchor.clone();
+                    merged_anchor.extend(serialized_anchor.clone());
+                    serde_json::Value::Object(merged_anchor)
+                }
+                _ => value.clone(),
+            };
+            merged.insert("motion_anchor".to_string(), value);
+        } else {
+            merged.remove("motion_anchor");
+        }
+    }
+    Some(serde_json::Value::Object(merged))
+}
+
+fn merge_comment_list(
+    existing: Option<&serde_json::Value>,
+    comments: &[Comment],
+) -> Option<Vec<serde_json::Value>> {
+    let Some(existing) = existing else {
+        return serde_json::to_value(comments).ok()?.as_array().cloned();
+    };
+    let existing = existing.as_array()?;
+    let mut used = vec![false; comments.len()];
+    let mut merged = Vec::with_capacity(existing.len().max(comments.len()));
+    for value in existing {
+        let Ok(original) = serde_json::from_value::<Comment>(value.clone()) else {
+            merged.push(value.clone());
+            continue;
+        };
+        let Some((index, comment)) = comments
+            .iter()
+            .enumerate()
+            .find(|(index, comment)| !used[*index] && comment.id == original.id)
+        else {
+            continue;
+        };
+        used[index] = true;
+        merged.push(merge_comment_value(value, &original, comment)?);
+    }
+    for (index, comment) in comments.iter().enumerate() {
+        if !used[index] {
+            merged.push(serde_json::to_value(comment).ok()?);
+        }
+    }
+    Some(merged)
+}
+
 /// One undoable [`Operation::SetMeta`] replacing the page's comment list while
-/// preserving every unrelated meta key. `None` when the page is gone or the
-/// list is unchanged.
+/// preserving every unrelated meta key and any comment entries written by a
+/// newer client that this build cannot decode. `None` when the page is gone,
+/// the existing comments value is not a list, or the list is unchanged.
 fn set_comments_op(doc: &Doc, page: NodeId, comments: &[Comment]) -> Option<Operation> {
     let node = doc.scene.get(page)?;
     let old = node.meta.clone();
     let mut new = match &old {
         serde_json::Value::Object(map) => serde_json::Value::Object(map.clone()),
-        _ => serde_json::json!({}),
+        serde_json::Value::Null => serde_json::json!({}),
+        _ => return None,
     };
-    let list = serde_json::to_value(comments).ok()?;
-    if comments.is_empty() {
+    let list = merge_comment_list(node.meta.get(META_KEY), comments)?;
+    if list.is_empty() {
         new.as_object_mut()?.remove(META_KEY);
     } else {
-        new.as_object_mut()?.insert(META_KEY.to_string(), list);
+        new.as_object_mut()?
+            .insert(META_KEY.to_string(), serde_json::Value::Array(list));
     }
     (new != old).then_some(Operation::SetMeta { id: page, old, new })
 }
@@ -181,7 +332,7 @@ pub(crate) fn add_comment_op(
     world: [f64; 2],
     text: &str,
 ) -> Option<(String, Operation)> {
-    add_comment_full_op(doc, page, world, text, Vec::new(), Vec::new(), None)
+    add_comment_full_op(doc, page, world, text, Vec::new(), Vec::new(), None, None)
 }
 
 pub(crate) fn add_comment_full_op(
@@ -192,6 +343,7 @@ pub(crate) fn add_comment_full_op(
     mentions: Vec<Mention>,
     attachments: Vec<Attachment>,
     skill: Option<CommentSkill>,
+    motion_anchor: Option<MotionCommentAnchor>,
 ) -> Option<(String, Operation)> {
     let text = text.trim();
     if text.is_empty() && attachments.is_empty() && skill.is_none() {
@@ -212,8 +364,43 @@ pub(crate) fn add_comment_full_op(
         replies: Vec::new(),
         skill,
         question: false,
+        motion_anchor,
     });
     set_comments_op(doc, page, &comments).map(|op| (id, op))
+}
+
+/// Static comments are visible on every canvas surface. Motion comments are
+/// pins for one clip and are only visible while that clip is being authored.
+pub(crate) fn comment_is_visible(
+    comment: &Comment,
+    active_motion_clip: Option<AnimationClipId>,
+) -> bool {
+    comment
+        .motion_anchor
+        .is_none_or(|anchor| active_motion_clip == Some(anchor.clip))
+}
+
+pub(crate) fn motion_comment_time_label(time_ms: u32) -> String {
+    fanta_ui::timeline::format_timecode(i64::from(time_ms).saturating_mul(1_000))
+}
+
+pub(crate) fn motion_comment_label(doc: &Doc, anchor: MotionCommentAnchor) -> String {
+    let animation = doc
+        .motion
+        .clip(anchor.clip)
+        .map(|clip| clean_context_line(&clip.name))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            if doc.motion.clip(anchor.clip).is_some() {
+                "Untitled animation".to_string()
+            } else {
+                "Animation unavailable".to_string()
+            }
+        });
+    format!(
+        "{animation} · {}",
+        motion_comment_time_label(anchor.time_ms)
+    )
 }
 
 /// Append a reply to a thread. Blank replies (empty trimmed body) are dropped.
@@ -346,6 +533,13 @@ pub(crate) fn skill_prompt_for_comment(
         comment.world[1],
         skill = skill.label(),
     );
+    if let Some(anchor) = comment.motion_anchor {
+        prompt.push_str(&format!(
+            "\n- Animation: {}\n- Timeline time: {}",
+            anchor.clip,
+            motion_comment_time_label(anchor.time_ms)
+        ));
+    }
     if selected_layers.is_empty() {
         prompt.push_str("\n- Selected layers: none");
     } else {
@@ -498,6 +692,11 @@ mod tests {
         assert_eq!(comments[0].text, "first");
         assert_eq!(comments[0].world, [10.0, 20.0]);
         assert!(!comments[0].resolved);
+        assert!(comment_is_visible(&comments[0], None));
+        assert!(comment_is_visible(
+            &comments[0],
+            Some(AnimationClipId::from_u128(5))
+        ));
 
         doc.apply(update_comment_text_op(&doc, page, &id, "edited").expect("edit"))
             .expect("apply edit");
@@ -560,6 +759,7 @@ mod tests {
             mentions,
             vec![attachment.clone()],
             Some(CommentSkill::Search),
+            None,
         )
         .expect("rich add");
         doc.apply(add).expect("apply rich add");
@@ -603,6 +803,7 @@ mod tests {
             "The first observation",
             Vec::new(),
             Vec::new(),
+            None,
             None,
         )
         .expect("comment");
@@ -655,6 +856,7 @@ mod tests {
                 )),
             }],
             Some(CommentSkill::Search),
+            None,
         )
         .expect("comment");
         doc.apply(add).expect("apply comment");
@@ -692,6 +894,212 @@ mod tests {
         assert_eq!(comments[0].text, "old note");
         assert_eq!(comments[0].author, "");
         assert!(comments[0].replies.is_empty());
+        assert_eq!(comments[0].motion_anchor, None);
+    }
+
+    #[test]
+    fn non_object_page_meta_refuses_comment_writes_without_replacing_it() {
+        let (mut doc, page) = doc_with_page();
+        let opaque_meta = serde_json::json!("metadata from a newer client");
+        let old = doc.scene.get(page).expect("page").meta.clone();
+        doc.apply(Operation::SetMeta {
+            id: page,
+            old,
+            new: opaque_meta.clone(),
+        })
+        .expect("seed opaque meta");
+
+        assert!(add_comment_op(&doc, page, [0.0, 0.0], "Comment").is_none());
+        assert_eq!(doc.scene.get(page).expect("page").meta, opaque_meta);
+    }
+
+    #[test]
+    fn malformed_future_anchor_does_not_hide_or_get_overwritten_with_valid_comments() {
+        let (mut doc, page) = doc_with_page();
+        let known_anchor = MotionCommentAnchor {
+            clip: AnimationClipId::from_u128(7),
+            time_ms: 875,
+        };
+        let mut known_anchor_value = serde_json::to_value(known_anchor).expect("serialize anchor");
+        known_anchor_value
+            .as_object_mut()
+            .expect("anchor object")
+            .insert("track_id".to_string(), serde_json::json!("future-track"));
+        let mut malformed_anchor = serde_json::to_value(MotionCommentAnchor {
+            clip: AnimationClipId::from_u128(42),
+            time_ms: 875,
+        })
+        .expect("serialize anchor");
+        malformed_anchor
+            .as_object_mut()
+            .expect("anchor object")
+            .insert("time_ms".to_string(), serde_json::json!("future-time"));
+        let malformed = serde_json::json!({
+            "id": "future",
+            "world": [2.0, 3.0],
+            "text": "Newer comment",
+            "motion_anchor": malformed_anchor,
+            "future_entry": { "keep": true }
+        });
+        let old = doc.scene.get(page).expect("page").meta.clone();
+        doc.apply(Operation::SetMeta {
+            id: page,
+            old,
+            new: serde_json::json!({
+                "comments": [
+                    {
+                        "id": "known",
+                        "world": [0.0, 1.0],
+                        "text": "Known comment",
+                        "avatar": "future-avatar",
+                        "future_field": { "keep": true },
+                        "motion_anchor": known_anchor_value,
+                        "replies": [{
+                            "author": "Reviewer",
+                            "body": "Existing reply",
+                            "created": 1,
+                            "future_reply": { "keep": true }
+                        }]
+                    },
+                    malformed
+                ]
+            }),
+        })
+        .expect("seed mixed-version comments");
+
+        let comments = read_comments(&doc, page);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, "known");
+        assert_eq!(comments[0].motion_anchor, Some(known_anchor));
+        assert_eq!(comments[0].replies.len(), 1);
+        doc.apply(update_comment_text_op(&doc, page, "known", "Updated").expect("update"))
+            .expect("apply update");
+        doc.apply(reply_comment_op(&doc, page, "known", "Another reply").expect("reply"))
+            .expect("apply reply");
+        let (_, add) = add_comment_op(&doc, page, [4.0, 5.0], "Another").expect("add");
+        doc.apply(add).expect("apply add");
+
+        let stored = doc
+            .scene
+            .get(page)
+            .and_then(|node| node.meta.get(META_KEY))
+            .and_then(serde_json::Value::as_array)
+            .expect("stored comments");
+        assert_eq!(stored.len(), 3);
+        assert!(stored.iter().any(|value| value == &malformed));
+        let known = stored
+            .iter()
+            .find(|value| value.get("id").and_then(serde_json::Value::as_str) == Some("known"))
+            .expect("known comment");
+        assert_eq!(
+            known.get("future_field"),
+            Some(&serde_json::json!({ "keep": true }))
+        );
+        assert_eq!(
+            known.get("avatar").and_then(serde_json::Value::as_str),
+            Some("future-avatar")
+        );
+        assert_eq!(
+            known
+                .get("motion_anchor")
+                .and_then(|anchor| anchor.get("track_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("future-track")
+        );
+        let replies = known
+            .get("replies")
+            .and_then(serde_json::Value::as_array)
+            .expect("stored replies");
+        assert_eq!(replies.len(), 2);
+        assert_eq!(
+            replies.first().and_then(|reply| reply.get("future_reply")),
+            Some(&serde_json::json!({ "keep": true }))
+        );
+        assert_eq!(
+            replies
+                .get(1)
+                .and_then(|reply| reply.get("body"))
+                .and_then(serde_json::Value::as_str),
+            Some("Another reply")
+        );
+        assert_eq!(read_comments(&doc, page).len(), 2);
+    }
+
+    #[test]
+    fn motion_anchor_round_trips_and_undoes_with_the_comment() {
+        let (mut doc, page) = doc_with_page();
+        let anchor = MotionCommentAnchor {
+            clip: AnimationClipId::from_u128(42),
+            time_ms: 875,
+        };
+        let (id, operation) = add_comment_full_op(
+            &doc,
+            page,
+            [11.0, 22.0],
+            "Check this transition",
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(anchor),
+        )
+        .expect("anchored comment");
+
+        doc.apply(operation).expect("apply anchored comment");
+        let comment = read_comments(&doc, page).remove(0);
+        assert_eq!(comment.id, id);
+        assert_eq!(comment.motion_anchor, Some(anchor));
+        assert!(comment_is_visible(&comment, Some(anchor.clip)));
+        assert!(!comment_is_visible(
+            &comment,
+            Some(AnimationClipId::from_u128(99))
+        ));
+        assert!(!comment_is_visible(&comment, None));
+        assert_eq!(motion_comment_time_label(anchor.time_ms), "00:00.875");
+
+        assert!(doc.undo().expect("undo"));
+        assert!(read_comments(&doc, page).is_empty());
+        assert!(doc.redo().expect("redo"));
+        assert_eq!(read_comments(&doc, page)[0].motion_anchor, Some(anchor));
+
+        doc.apply(reply_comment_op(&doc, page, &id, "Looks good").expect("reply"))
+            .expect("apply reply");
+        assert_eq!(read_comments(&doc, page)[0].motion_anchor, Some(anchor));
+        doc.apply(update_comment_text_op(&doc, page, &id, "Updated").expect("edit"))
+            .expect("apply edit");
+        assert_eq!(read_comments(&doc, page)[0].motion_anchor, Some(anchor));
+        doc.apply(toggle_resolved_op(&doc, page, &id).expect("resolve"))
+            .expect("apply resolve");
+        assert_eq!(read_comments(&doc, page)[0].motion_anchor, Some(anchor));
+    }
+
+    #[test]
+    fn motion_anchor_survives_fnx_write_and_reopen() -> anyhow::Result<()> {
+        let (mut doc, page) = doc_with_page();
+        let anchor = MotionCommentAnchor {
+            clip: AnimationClipId::from_u128(42),
+            time_ms: 875,
+        };
+        let (_, operation) = add_comment_full_op(
+            &doc,
+            page,
+            [11.0, 22.0],
+            "Persist this moment",
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(anchor),
+        )
+        .expect("anchored comment");
+        doc.apply(operation)?;
+
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        let (reopened, _) = fanta_format::read_project_tree(directory.path())?;
+        let comment = read_comments(&reopened, page).remove(0);
+        assert_eq!(comment.text, "Persist this moment");
+        assert_eq!(comment.world, [11.0, 22.0]);
+        assert_eq!(comment.motion_anchor, Some(anchor));
+        Ok(())
     }
 
     /// Comments share the meta blob with other extensions — writing the list

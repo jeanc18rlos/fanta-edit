@@ -469,6 +469,7 @@ pub(crate) struct CommentSnapshot {
     pub(crate) mentions: usize,
     pub(crate) skill: Option<SharedString>,
     pub(crate) resolved: bool,
+    pub(crate) motion_label: Option<SharedString>,
 }
 
 pub(crate) enum PageBackgroundValue {
@@ -864,6 +865,9 @@ pub(crate) fn page_section(
                         .or_else(|| comment.replies.iter().rev().find_map(|reply| reply.skill))
                         .map(|skill| skill.label().into()),
                     resolved: comment.resolved,
+                    motion_label: comment
+                        .motion_anchor
+                        .map(|anchor| crate::comments::motion_comment_label(doc, anchor).into()),
                 })
                 .collect()
         })

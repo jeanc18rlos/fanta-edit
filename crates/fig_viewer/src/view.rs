@@ -43,6 +43,7 @@ use crate::clipboard::{
     create_operations, delete_operations,
 };
 use crate::code_workspace::FantaCodeWorkspace;
+use crate::comments::MotionCommentAnchor;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
 use crate::document::{
@@ -711,6 +712,7 @@ impl FigView {
                 }
                 FigItemEvent::StateChanged => {
                     this.reconcile_opened_entry_with_project_root(cx);
+                    this.comment_state.clear_pending_motion_anchor();
                     // A reload replaces the document while prototype state
                     // contains node/variable IDs from the previous tree. Drop
                     // the session locally without trying to update the item
@@ -820,6 +822,7 @@ impl FigView {
                         .and_then(|document| document.doc.active_page());
                     if follows && this.last_seen_root != root {
                         this.last_seen_root = root;
+                        this.comment_state.clear_pending_motion_anchor();
                         match scope {
                             FigScope::Variables => {
                                 this.set_editor_workspace(EditorWorkspace::Variables, cx);
@@ -884,6 +887,7 @@ impl FigView {
             return;
         }
 
+        self.comment_state.clear_pending_motion_anchor();
         #[cfg(feature = "fanta-gpui-ui")]
         self.finish_gpui_design_edits(cx);
         self.cancel_motion_keyframe_drag(cx);
@@ -1069,6 +1073,7 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
+        self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && workspace != EditorWorkspace::Canvas {
             self.exit_prototype_session(cx);
         }
@@ -1088,6 +1093,7 @@ impl FigView {
         if self.editor_mode(cx) == mode {
             return;
         }
+        self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && mode != EditorMode::Prototype {
             self.exit_prototype_session(cx);
         }
@@ -1127,9 +1133,163 @@ impl FigView {
         document.doc.motion.evaluate(clip, playhead_ms)
     }
 
+    pub(crate) fn active_motion_comment_clip(&self, cx: &App) -> Option<AnimationClipId> {
+        if self.editor_mode(cx) != EditorMode::Motion {
+            return None;
+        }
+        let clip = self.active_motion_clip?;
+        self.item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.motion.clip(clip))
+            .map(|_| clip)
+    }
+
+    pub(crate) fn active_motion_clip_id(&self) -> Option<AnimationClipId> {
+        self.active_motion_clip
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn arm_motion_time_comment(&mut self, cx: &mut Context<Self>) -> Result<u32> {
+        self.finish_document_edits(cx);
+        if self.comment_state.draft.is_some() {
+            anyhow::bail!("send or cancel the current comment draft before starting another one");
+        }
+        if self.has_unsent_comment_reply(cx) {
+            anyhow::bail!("send or clear the current reply before starting a time comment");
+        }
+        if self.editor_workspace(cx) != EditorWorkspace::Canvas
+            || self.editor_mode(cx) != EditorMode::Motion
+        {
+            anyhow::bail!("open the Motion canvas before adding a time comment");
+        }
+
+        let preview_owner = cx.entity_id();
+        let (clip, time_ms) = {
+            let item = self.item.read(cx);
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                anyhow::bail!(
+                    "finish the current Save As operation or canvas preview before adding a time comment"
+                );
+            }
+            let document = item.document().context("the document is still loading")?;
+            let page = document
+                .doc
+                .active_page()
+                .context("open a page before adding a time comment")?;
+            if !document.doc.pages.contains(&page) {
+                anyhow::bail!("open a page before adding a time comment");
+            }
+            let clip = self
+                .active_motion_clip
+                .context("create an animation before adding a time comment")?;
+            let duration_ms = document
+                .doc
+                .motion
+                .clip(clip)
+                .context("the active animation no longer exists")?
+                .duration_ms;
+            let time_ms = self
+                .timeline_shell
+                .read(cx)
+                .playhead_us()
+                .max(0)
+                .div_euclid(1_000)
+                .min(i64::from(duration_ms)) as u32;
+            (clip, time_ms)
+        };
+
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.pause(cx));
+        self.activate_tool(ToolKind::Comment, cx);
+        if !self.arm_motion_comment_anchor(MotionCommentAnchor { clip, time_ms }, cx) {
+            self.activate_tool(ToolKind::Select, cx);
+            anyhow::bail!("open a page before adding a time comment");
+        }
+        cx.notify();
+        Ok(time_ms)
+    }
+
+    pub(crate) fn navigate_to_motion_comment(
+        &mut self,
+        anchor: MotionCommentAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_document_edits(cx);
+        self.comment_state.clear_pending_motion_anchor();
+        let Some(duration_ms) = self.item.read(cx).document().and_then(|document| {
+            document
+                .doc
+                .motion
+                .clip(anchor.clip)
+                .map(|clip| clip.duration_ms)
+        }) else {
+            self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+            self.hovered_node = None;
+            self.comment_state.hovered_pin = None;
+            self.invalidate_canvas_cache();
+            cx.notify();
+            show_canvas_notice(
+                "This comment's animation is no longer available.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+
+        self.active_motion_clip = Some(anchor.clip);
+        self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+        self.set_editor_mode(EditorMode::Motion, cx);
+        self.sync_motion_timeline(cx);
+        self.timeline_shell.update(cx, |timeline, cx| {
+            timeline.seek_to(i64::from(anchor.time_ms).saturating_mul(1_000), cx)
+        });
+        self.hovered_node = None;
+        self.comment_state.hovered_pin = None;
+        self.invalidate_canvas_cache();
+        cx.notify();
+
+        if anchor.time_ms > duration_ms {
+            show_canvas_notice(
+                format!(
+                    "This comment was anchored at {}; the animation now ends at {}, so the timeline moved to its end.",
+                    crate::comments::motion_comment_time_label(anchor.time_ms),
+                    crate::comments::motion_comment_time_label(duration_ms)
+                ),
+                window,
+                cx,
+            );
+        }
+    }
+
     fn handle_timeline_event(&mut self, event: TimelineEvent, cx: &mut Context<Self>) {
         match event {
-            TimelineEvent::PlayheadChanged(_) | TimelineEvent::PlaybackChanged(_) => {
+            TimelineEvent::PlayheadChanged(_) => {
+                let current_anchor =
+                    self.comment_state
+                        .pending_motion_anchor()
+                        .is_some_and(|anchor| {
+                            let current_time_ms = self
+                                .timeline_shell
+                                .read(cx)
+                                .playhead_us()
+                                .max(0)
+                                .div_euclid(1_000)
+                                .min(i64::from(u32::MAX))
+                                as u32;
+                            self.active_motion_clip == Some(anchor.clip)
+                                && current_time_ms == anchor.time_ms
+                        });
+                if !current_anchor {
+                    self.comment_state.clear_pending_motion_anchor();
+                }
+                self.invalidate_canvas_cache();
+            }
+            TimelineEvent::PlaybackChanged(playing) => {
+                if playing && self.timeline_shell.read(cx).is_playing() {
+                    self.comment_state.clear_pending_motion_anchor();
+                }
                 self.invalidate_canvas_cache();
             }
             TimelineEvent::CreateClip => {
@@ -1238,8 +1398,10 @@ impl FigView {
                     return;
                 }
                 self.finish_document_edits(cx);
+                self.comment_state.clear_pending_motion_anchor();
                 self.active_motion_clip = Some(clip);
                 self.sync_motion_timeline(cx);
+                self.comment_state.hovered_pin = None;
                 self.invalidate_canvas_cache();
                 cx.notify();
             }
@@ -1595,6 +1757,7 @@ impl FigView {
             return;
         }
         let clip_id = AnimationClipId::new();
+        self.comment_state.clear_pending_motion_anchor();
         self.active_motion_clip = Some(clip_id);
         let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
@@ -1718,6 +1881,7 @@ impl FigView {
     }
 
     fn sync_motion_timeline(&mut self, cx: &mut Context<Self>) {
+        let previous_clip = self.active_motion_clip;
         let authoring_enabled = self.is_editable(cx)
             && self.editor_workspace(cx) == EditorWorkspace::Canvas
             && self.editor_mode(cx) == EditorMode::Motion;
@@ -1733,6 +1897,10 @@ impl FigView {
             self.active_motion_clip = None;
             TimelineViewModel::empty()
         };
+        if self.active_motion_clip != previous_clip {
+            self.comment_state.clear_pending_motion_anchor();
+            self.comment_state.hovered_pin = None;
+        }
         self.timeline_shell.update(cx, |timeline, cx| {
             if timeline.authoring_enabled() != authoring_enabled {
                 timeline.set_authoring_enabled(authoring_enabled, cx);
@@ -2099,6 +2267,7 @@ impl FigView {
     }
 
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        self.comment_state.clear_pending_motion_anchor();
         if kind.requires_editing() && !self.is_editable(cx) {
             return;
         }
@@ -2835,8 +3004,7 @@ impl FigView {
             return;
         }
         if self.comment_state.open_thread.is_some() {
-            self.comment_state.open_thread = None;
-            self.comment_state.reply_editor = None;
+            self.comment_state.close_thread();
             cx.notify();
             return;
         }
@@ -3606,6 +3774,7 @@ impl FigView {
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
+        self.comment_state.clear_pending_motion_anchor();
         let (root, prewarm) = self
             .item
             .update(cx, |item, cx| {
@@ -3871,12 +4040,9 @@ impl FigView {
             .map(|document| document_comment_rows(&document.doc, &document.pages))
             .unwrap_or_default();
         let view = cx.weak_entity();
-        FantaCommentsPanel::new(rows, move |page_index, comment_id, window, cx| {
+        FantaCommentsPanel::new(rows, move |page_root, comment_id, window, cx| {
             view.update(cx, |view, cx| {
-                view.select_page(page_index, cx);
-                if view.comment_state.open_thread.as_deref() != Some(comment_id.as_str()) {
-                    view.toggle_comment_thread(comment_id, window, cx);
-                }
+                view.show_comment_thread_on_page(page_root, comment_id, window, cx);
             })
             .log_err();
         })
@@ -8907,6 +9073,112 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn creating_motion_clip_clears_armed_time_comment(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let first_clip = AnimationClipId::from_u128(100);
+        doc.motion.clips.insert(
+            first_clip,
+            AnimationClip::new(first_clip, "Entrance", 1_000),
+        );
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project, window, cx))
+            })
+            .expect("scratch window");
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            assert_eq!(view.active_motion_clip, Some(first_clip));
+            assert_eq!(view.arm_motion_time_comment(cx).expect("arm comment"), 0);
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(MotionCommentAnchor {
+                    clip: first_clip,
+                    time_ms: 0,
+                })
+            );
+            view.create_motion_clip(cx);
+            assert_ne!(view.active_motion_clip, Some(first_clip));
+            assert_eq!(view.comment_state.pending_motion_anchor(), None);
+            assert!(!view.comment_state.motion_time_comment_active());
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("ready document");
+            assert_eq!(document.motion.clips.len(), 2);
+            assert_eq!(document.history.undo_depth(), 1);
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn timeline_changes_clear_armed_time_comment(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let clip = AnimationClipId::from_u128(100);
+        doc.motion
+            .clips
+            .insert(clip, AnimationClip::new(clip, "Entrance", 1_000));
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("scratch window");
+        let timeline = view.read_with(cx, |view, _| view.timeline_shell.clone());
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            let timeline = view.timeline_shell.clone();
+            timeline.update(cx, |timeline, cx| timeline.seek_to(250_000, cx));
+            assert_eq!(view.arm_motion_time_comment(cx).expect("arm comment"), 250);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(MotionCommentAnchor { clip, time_ms: 250 })
+            )
+        });
+        timeline.update(cx, |timeline, cx| timeline.seek_to(500_000, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.comment_state.pending_motion_anchor(), None)
+        });
+
+        view.update(cx, |view, cx| {
+            assert_eq!(
+                view.arm_motion_time_comment(cx).expect("re-arm comment"),
+                500
+            );
+        });
+        timeline.update(cx, |timeline, cx| timeline.set_playing(true, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.comment_state.pending_motion_anchor(), None)
+        });
+        timeline.update(cx, |timeline, cx| timeline.pause(cx));
+    }
+
     #[gpui::test]
     async fn timeline_drag_previews_realtime_and_commits_one_undo_step(cx: &mut TestAppContext) {
         init_test(cx);
@@ -10134,6 +10406,7 @@ impl FigView {
         crate::gpui_adapters::toolbar::ToolbarOptionInputs {
             playing: timeline.is_playing(),
             looping: timeline.loop_playback_enabled(),
+            time_comment_armed: self.comment_state.motion_time_comment_active(),
             current_time_ms,
             duration_ms,
             agent_context_label: self.toolbar_agent_context_label(cx),
@@ -10801,9 +11074,19 @@ impl FigView {
                     cx,
                 );
             }
-            ToolbarSecondaryControl::MotionTimeComment => {
-                notify_unavailable("Time-anchored comments", window, cx);
-            }
+            ToolbarSecondaryControl::MotionTimeComment => match self.arm_motion_time_comment(cx) {
+                Ok(time_ms) => show_canvas_notice(
+                    format!(
+                        "Click the canvas to place a comment at {}.",
+                        crate::comments::motion_comment_time_label(time_ms)
+                    ),
+                    window,
+                    cx,
+                ),
+                Err(error) => {
+                    show_canvas_notice(format!("Could not add time comment: {error}"), window, cx)
+                }
+            },
             ToolbarSecondaryControl::DevInspect
             | ToolbarSecondaryControl::DevAnnotate
             | ToolbarSecondaryControl::DevMeasure => {

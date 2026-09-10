@@ -1240,6 +1240,47 @@ fn motion_keyframe_chip_offers_host_candidates(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn motion_time_comment_emits_one_typed_intent_and_echoes_armed_state(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| toolbar.set_mode(ToolbarMode::Motion, cx));
+    });
+    cx.run_until_parked();
+
+    let comment = cx
+        .debug_bounds("toolbar-secondary-motion-time-comment")
+        .expect("time comment control should render");
+    cx.simulate_click(comment.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[ToolbarAction::SecondaryControlInvoked {
+            mode: ToolbarMode::Motion,
+            control: ToolbarSecondaryControl::MotionTimeComment,
+        }]
+    );
+
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_motion_options(
+                MotionToolbarOptions {
+                    time_comment_armed: true,
+                    ..MotionToolbarOptions::default()
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    toolbar.read_with(cx, |toolbar, _| {
+        assert!(toolbar.motion_options().time_comment_armed)
+    });
+}
+
+#[gpui::test]
 fn motion_style_editor_arrows_move_the_highlight_and_enter_commits(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     cx.simulate_resize(size(px(900.), px(700.)));

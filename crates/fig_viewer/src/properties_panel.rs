@@ -983,10 +983,23 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn delete_comment(&mut self, page: NodeId, id: String, cx: &mut Context<Self>) {
-        self.apply_document_ops(cx, move |doc| {
+        let deleted_id = id.clone();
+        if !self.apply_document_ops(cx, move |doc| {
             crate::comments::remove_comment_op(doc, page, &id)
                 .into_iter()
                 .collect()
+        }) {
+            return;
+        }
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let view = view.downgrade();
+        cx.defer(move |cx| {
+            view.update(cx, |view, cx| {
+                view.close_comment_thread_if_matches(page, &deleted_id, cx);
+            })
+            .log_err();
         });
     }
 
@@ -999,10 +1012,12 @@ impl FantaPropertiesPanel {
         let Some(view) = self.active_view.as_ref().and_then(WeakEntity::upgrade) else {
             return;
         };
-        view.update(cx, |view, cx| {
-            if view.comment_state.open_thread.as_deref() != Some(id.as_str()) {
-                view.toggle_comment_thread(id, window, cx);
-            }
+        let view = view.downgrade();
+        window.defer(cx, move |window, cx| {
+            view.update(cx, |view, cx| {
+                view.show_comment_thread(id, window, cx);
+            })
+            .log_err();
         });
     }
 
@@ -3044,7 +3059,7 @@ mod panel_integration_tests {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use fanta_doc::{CanvasNode, GradientStop, GroupNode, VectorNode};
+    use fanta_doc::{AnimationClipId, CanvasNode, GradientStop, GroupNode, VectorNode};
 
     use crate::properties_ops::fill_slot_mut;
     use gpui::{MouseButton, TestAppContext};
@@ -3502,6 +3517,144 @@ mod panel_integration_tests {
             window.draw(cx).clear();
         });
         vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn real_click_on_a_time_comment_opens_after_the_panel_listener_unwinds(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let clip = AnimationClipId::from_u128(7);
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let id = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.clear();
+                    document
+                        .doc
+                        .motion
+                        .clips
+                        .insert(clip, fanta_doc::AnimationClip::new(clip, "Entrance", 1_500));
+                    let page = document.doc.active_page().expect("page");
+                    let (id, operation) = crate::comments::add_comment_full_op(
+                        &document.doc,
+                        page,
+                        [0.0, 0.0],
+                        "Open from properties",
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 }),
+                    )
+                    .expect("time comment");
+                    document.doc.apply(operation).expect("add comment");
+                    document.doc.history = Default::default();
+                    (id, DocChange::Content)
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        let mut vcx = gpui::VisualTestContext::from_window(harness.panel.into(), cx);
+        vcx.simulate_resize(gpui::size(px(360.), px(1_600.)));
+        vcx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        vcx.run_until_parked();
+        let open = vcx
+            .debug_bounds("fanta-comment-open-0")
+            .expect("properties comment action");
+        vcx.simulate_click(open.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        drop(vcx);
+
+        harness._view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.editor_mode(cx),
+                crate::editor_session::EditorMode::Motion
+            );
+            assert_eq!(view.active_motion_clip_id(), Some(clip));
+            assert_eq!(view.comment_state.open_thread.as_deref(), Some(id.as_str()));
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+    }
+
+    #[gpui::test]
+    async fn deleting_the_open_thread_from_properties_clears_its_reply_state(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let (page, id) = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let page = document.doc.active_page().expect("page");
+                    let (id, operation) = crate::comments::add_comment_op(
+                        &document.doc,
+                        page,
+                        [0.0, 0.0],
+                        "Delete from properties",
+                    )
+                    .expect("comment");
+                    document.doc.apply(operation).expect("add comment");
+                    document.doc.history = Default::default();
+                    ((page, id), DocChange::Content)
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                panel.open_comment_thread(id.clone(), window, cx);
+            })
+            .expect("properties panel remains open");
+        cx.run_until_parked();
+        let reply_editor = harness._view.read_with(cx, |view, _| {
+            view.comment_state
+                .reply_editor
+                .clone()
+                .expect("reply editor")
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                reply_editor.update(cx, |editor, cx| {
+                    editor.set_text("Unsent reply", window, cx);
+                });
+            })
+            .expect("scratch window remains open");
+        harness._view.read_with(cx, |view, cx| {
+            assert!(view.has_unsent_comment_reply(cx));
+        });
+
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.delete_comment(page, id.clone(), cx);
+            })
+            .expect("properties panel remains open");
+        cx.run_until_parked();
+
+        harness._view.read_with(cx, |view, cx| {
+            assert!(view.comment_state.open_thread.is_none());
+            assert!(view.comment_state.reply_editor.is_none());
+            assert!(!view.has_unsent_comment_reply(cx));
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(
+                crate::comments::read_comments(document, page)
+                    .iter()
+                    .all(|comment| comment.id != id)
+            );
+            assert_eq!(document.history.undo_depth(), 1);
+        });
     }
 
     fn node_x(harness: &Harness, cx: &mut TestAppContext) -> f64 {

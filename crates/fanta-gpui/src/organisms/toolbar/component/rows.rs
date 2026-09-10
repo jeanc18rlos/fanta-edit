@@ -732,7 +732,7 @@ impl EditorToolbar {
                 "motion-time-comment",
                 "Comment",
                 ToolbarSecondaryControl::MotionTimeComment,
-                false,
+                self.motion_options.time_comment_armed,
                 cx,
             ))
             .into_any_element()
