@@ -80,20 +80,10 @@ jobs:
       - name: Test the agent panel toggle
         run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
 
-      - name: Test closed project ownership
-        run: |
-          cargo test --locked -p sidebar --lib closing_a_project_releases_its_workspace
-          cargo test --locked -p sidebar --lib adding_a_ready_agent_panel_synchronizes_the_current_sidebar_selection
-          cargo test --locked -p sidebar --lib creating_a_sidebar_synchronizes_an_existing_agent_panel
-          cargo test --locked -p sidebar --lib property_test::test_sidebar_invariants
-
-      - name: Test sidebar selection during list updates
-        run: |
-          cargo test --locked -p sidebar --lib test_selection_
-          cargo test --locked -p sidebar --lib test_confirm_on_historical_thread_preserves_historical_timestamp_and_order
+      - name: Test sidebar behavior and project ownership
+        run: cargo test --locked -p sidebar --lib
 
       - name: Test canvas toolbar interactions
         run: |
           cargo test --locked -p fanta-gpui --lib organisms::toolbar::component::interaction_tests
-          cargo test --locked -p fig_viewer --lib toolbar_actions_query_keeps_text_input_with_canvas_keybindings
-          cargo test --locked -p fig_viewer --lib path_selection_toolbar_drag_edits_segment_endpoints_and_undoes
+          cargo test --locked -p fig_viewer --lib gpui_adapters::toolbar::
