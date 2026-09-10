@@ -50,7 +50,9 @@ jobs:
         run: cargo check --locked -p zed -p cli
 
       - name: Test document snapshots and file compatibility
-        run: cargo test --locked -p fanta-doc -p fanta-format
+        run: |
+          cargo test --locked -p fanta-doc -p fanta-format
+          cargo test --locked -p fanta-fnx -p fanta-format --lib --features serde_json/preserve_order
 
       - name: Test canvas editing tools
         run: cargo test --locked -p fanta-tools --lib

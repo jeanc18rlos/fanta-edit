@@ -91,6 +91,17 @@ pub(super) struct SavedSubmission {
     pub mode: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) enum SavedDispatch {
+    #[default]
+    Unknown,
+    Unclaimed {
+        retry_requires_input: bool,
+    },
+    Claimed,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(super) enum SavedRunResult {
@@ -98,11 +109,39 @@ pub(super) enum SavedRunResult {
         id: String,
         #[serde(default)]
         finished: bool,
+        #[serde(default)]
+        dispatch: SavedDispatch,
     },
     VectorMessage {
         message_id: Option<String>,
         svg: String,
     },
+}
+
+impl SavedRunResult {
+    pub(super) fn requires_input(&self) -> bool {
+        matches!(
+            self,
+            Self::Generation {
+                finished: false,
+                dispatch: SavedDispatch::Unclaimed {
+                    retry_requires_input: true
+                },
+                ..
+            }
+        )
+    }
+
+    fn releases_request(&self) -> bool {
+        result_finished(self)
+            || matches!(
+                self,
+                Self::Generation {
+                    dispatch: SavedDispatch::Claimed,
+                    ..
+                }
+            )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -127,8 +166,8 @@ pub(super) struct JournalSnapshot {
 #[serde(deny_unknown_fields)]
 struct StoredRecord {
     record: JournalRecord,
-    // Accepted entries discard the replay body, but must still reject a key
-    // reused for a different payload instead of authorizing another POST.
+    // Keep the fingerprint after a claim releases the body so an old UI retry
+    // cannot reuse the key for a different payload.
     submission_fingerprint: String,
 }
 
@@ -220,7 +259,7 @@ impl GenerationJournal {
         }).await
     }
 
-    pub(super) async fn accept(&self, key: &str, result: SavedRunResult) -> Result<()> {
+    pub(super) async fn accept(&self, key: &str, result: SavedRunResult) -> Result<JournalRecord> {
         let key = key.to_owned();
         self.change(move |journal| {
             validate_result(&result)?;
@@ -229,14 +268,10 @@ impl GenerationJournal {
                 .iter_mut()
                 .find(|stored| stored.record.key == key)
                 .context("The generation has no saved submission to resolve.")?;
-            if let Some(previous) = &mut stored.record.result {
-                merge_result(previous, result)?;
-            } else {
-                stored.record.result = Some(result);
-                stored.record.request = None;
-            }
+            accept_result(&mut stored.record, result)?;
+            let record = stored.record.clone();
             prune_finished(journal);
-            Ok(())
+            Ok(record)
         })
         .await
     }
@@ -263,12 +298,7 @@ impl GenerationJournal {
                     stored.submission_fingerprint == fingerprint,
                     "This generation recovery key already belongs to a different submission."
                 );
-                if let Some(previous) = &mut stored.record.result {
-                    merge_result(previous, result)?;
-                } else {
-                    stored.record.result = Some(result);
-                    stored.record.request = None;
-                }
+                accept_result(&mut stored.record, result)?;
             } else {
                 journal.records.insert(
                     0,
@@ -292,6 +322,43 @@ impl GenerationJournal {
         .await
     }
 
+    pub(super) async fn observe_generation(
+        &self,
+        result: SavedRunResult,
+    ) -> Result<(bool, Option<SavedRunResult>)> {
+        let SavedRunResult::Generation { id, .. } = &result else {
+            bail!("A generation status cannot replace vector artwork.");
+        };
+        validate_result(&result)?;
+        if result_finished(&result) {
+            self.mark_finished(id).await?;
+            return Ok((true, None));
+        }
+        let id = id.clone();
+        let namespace = self.namespace.clone();
+        self.store.write(move |connection| {
+            connection.with_savepoint("fanta_generation_journal", || {
+                let mut journal = read_journal(connection, &namespace)?;
+                let mut changed = false;
+                let mut observed = None;
+                for stored in &mut journal.records {
+                    if matches!(&stored.record.result, Some(SavedRunResult::Generation { id: stored_id, .. }) if *stored_id == id) {
+                        let previous = stored.record.result.clone();
+                        let retained_request = stored.record.request.is_some();
+                        accept_result(&mut stored.record, result.clone())?;
+                        changed |= previous != stored.record.result
+                            || retained_request != stored.record.request.is_some();
+                        observed = stored.record.result.clone();
+                    }
+                }
+                if changed {
+                    write_journal(connection, &namespace, &journal)?;
+                }
+                Ok((changed, observed))
+            })
+        }).await.context("Could not update saved generation recovery. The previous record was preserved.")
+    }
+
     pub(super) async fn mark_finished(&self, id: &str) -> Result<()> {
         ensure!(!id.trim().is_empty(), "The generation ID is missing.");
         let id = id.to_owned();
@@ -300,10 +367,12 @@ impl GenerationJournal {
                 if let Some(SavedRunResult::Generation {
                     id: stored_id,
                     finished,
+                    ..
                 }) = &mut stored.record.result
                 {
                     if *stored_id == id {
                         *finished = true;
+                        stored.record.request = None;
                     }
                 }
             }
@@ -340,20 +409,29 @@ impl GenerationJournal {
         change: impl FnOnce(&mut StoredJournal) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let namespace = self.namespace.clone();
-        self.store.write(move |connection| {
-            connection.with_savepoint("fanta_generation_journal", || {
-                let mut journal = read_journal(connection, &namespace)?;
-                let result = change(&mut journal)?;
-                validate_journal(&journal)?;
-                let encoded = bounded_json(&journal)?;
-                let encoded = String::from_utf8(encoded)?;
-                connection.exec_bound::<(&str, &str, &str)>(
-                    "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES (?, ?, ?)",
-                )?((&namespace, STORAGE_KEY, &encoded))?;
-                Ok(result)
+        self.store
+            .write(move |connection| {
+                connection.with_savepoint("fanta_generation_journal", || {
+                    let mut journal = read_journal(connection, &namespace)?;
+                    let result = change(&mut journal)?;
+                    write_journal(connection, &namespace, &journal)?;
+                    Ok(result)
+                })
             })
-        }).await.context("Could not save local generation recovery. No new request should be submitted.")
+            .await
+            .context(
+                "Could not save local generation recovery. No new request should be submitted.",
+            )
     }
+}
+
+fn write_journal(connection: &Connection, namespace: &str, journal: &StoredJournal) -> Result<()> {
+    validate_journal(journal)?;
+    let encoded = String::from_utf8(bounded_json(journal)?)?;
+    connection.exec_bound::<(&str, &str, &str)>(
+        "INSERT OR REPLACE INTO scoped_kv_store(namespace, key, value) VALUES (?, ?, ?)",
+    )?((namespace, STORAGE_KEY, &encoded))?;
+    Ok(())
 }
 
 fn result_finished(result: &SavedRunResult) -> bool {
@@ -381,19 +459,43 @@ fn merge_result(previous: &mut SavedRunResult, result: SavedRunResult) -> Result
             SavedRunResult::Generation {
                 id: previous_id,
                 finished: previous_finished,
+                dispatch: previous_dispatch,
             },
-            SavedRunResult::Generation { id, finished },
+            SavedRunResult::Generation {
+                id,
+                finished,
+                dispatch,
+            },
         ) => {
             ensure!(
                 *previous_id == id,
                 "This generation already has a different saved result."
             );
             *previous_finished |= finished;
+            if *previous_dispatch != SavedDispatch::Claimed {
+                *previous_dispatch = dispatch;
+            }
         }
         (previous, result) => ensure!(
             *previous == result,
             "This generation already has a different saved result."
         ),
+    }
+    Ok(())
+}
+
+fn accept_result(record: &mut JournalRecord, result: SavedRunResult) -> Result<()> {
+    if let Some(previous) = &mut record.result {
+        merge_result(previous, result)?;
+    } else {
+        record.result = Some(result);
+    }
+    if record
+        .result
+        .as_ref()
+        .is_some_and(SavedRunResult::releases_request)
+    {
+        record.request = None;
     }
     Ok(())
 }
@@ -469,7 +571,14 @@ fn validate_journal(journal: &StoredJournal) -> Result<()> {
             "Generation history has an invalid submission fingerprint."
         );
         match (&record.request, &record.result) {
-            (Some(request), None) => {
+            (Some(request), result) => {
+                if let Some(result) = result {
+                    validate_result(result)?;
+                    ensure!(
+                        !result.releases_request(),
+                        "A claimed or finished generation still contains a recovery request."
+                    );
+                }
                 let submission = SavedSubmission {
                     key: record.key.clone(),
                     request: request.clone(),
@@ -624,6 +733,7 @@ mod tests {
         SavedRunResult::Generation {
             id: id.into(),
             finished: true,
+            dispatch: SavedDispatch::Unknown,
         }
     }
 
@@ -631,6 +741,7 @@ mod tests {
         SavedRunResult::Generation {
             id: id.into(),
             finished: false,
+            dispatch: SavedDispatch::Unknown,
         }
     }
 
@@ -711,7 +822,7 @@ mod tests {
             assert!(
                 records
                     .iter()
-                    .all(|record| !record_finished(record) && record.request.is_none())
+                    .all(|record| !record_finished(record) && record.request.is_some())
             );
             assert!(records.iter().any(|record| record.key == "job-0"));
             assert!(journal.prepare(submission("overflow")).await.is_err());
@@ -1019,6 +1130,7 @@ mod tests {
                 scope(),
             )?;
             journal.prepare(submission("existing")).await?;
+            journal.accept("existing", pending("existing")).await?;
             let before = journal.load().await?;
             let mut too_large = submission("large");
             too_large.prompt = "x".repeat(MAX_BYTES);
@@ -1057,5 +1169,125 @@ mod tests {
         }
         .await
         .expect("storage limits and authentication material cannot replace recoverable data");
+    }
+    fn dispatching(id: &str, dispatch: SavedDispatch) -> SavedRunResult {
+        SavedRunResult::Generation {
+            id: id.into(),
+            finished: false,
+            dispatch,
+        }
+    }
+
+    #[gpui::test]
+    async fn generation_journal_unclaimed_reopens_exact_input_and_claim_is_permanent() {
+        async {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("dispatch.sqlite");
+            let mut saved = submission("unclaimed-input");
+            saved.request["input"] = json!({"source":{"asset_id":"original"}, "mask":"AA==", "points":[{"x":123,"y":45}], "seed":"18446744073709551615"});
+            saved.source = Some(SavedSource { reference: json!({"asset_id":"original"}), name:"Original".into(), preview_png:"AA==".into(), width:400, height:200 });
+            let retryable = dispatching("accepted-id", SavedDispatch::Unclaimed { retry_requires_input:true });
+            {
+                let journal = GenerationJournal::new(store(&path).await?, scope())?;
+                journal.prepare(saved.clone()).await?;
+                let accepted = journal.accept(&saved.key, retryable.clone()).await?;
+                assert_eq!(accepted.request, Some(saved.request.clone()));
+                assert!(accepted.result.as_ref().is_some_and(SavedRunResult::requires_input));
+            }
+            let journal = GenerationJournal::new(store(&path).await?, scope())?;
+            let restored = journal.prepare(saved.clone()).await?;
+            assert_eq!(restored.request, Some(saved.request.clone()));
+            assert_eq!(restored.source, saved.source);
+            journal.observe_generation(pending("accepted-id")).await?;
+            let unknown = journal.prepare(saved.clone()).await?;
+            assert_eq!(unknown.request, restored.request, "missing rollout metadata cannot destroy the only retry input");
+            assert!(!unknown.result.as_ref().is_some_and(SavedRunResult::requires_input));
+            journal.observe_generation(retryable.clone()).await?;
+            assert!(journal.prepare(saved.clone()).await?.result.as_ref().is_some_and(SavedRunResult::requires_input));
+            journal.observe_generation(dispatching("accepted-id", SavedDispatch::Claimed)).await?;
+            let claimed = journal.prepare(saved.clone()).await?;
+            assert!(claimed.request.is_none());
+            assert_eq!(claimed.source, saved.source, "history keeps the bounded source thumbnail");
+            journal.accept(&saved.key, retryable).await?;
+            journal.observe_generation(pending("accepted-id")).await?;
+            assert_eq!(journal.prepare(saved.clone()).await?, claimed, "late unclaimed or legacy replies cannot undo a permanent worker claim");
+            let mut changed = saved.clone();
+            changed.request["input"]["mask"] = json!("different");
+            assert!(journal.prepare(changed).await.is_err());
+            journal.mark_finished("accepted-id").await?;
+            assert!(journal.prepare(saved).await?.request.is_none());
+            Ok::<_, anyhow::Error>(())
+        }.await.expect("accepted input survives restart until permanent worker claim or terminal status");
+    }
+
+    #[gpui::test]
+    async fn generation_journal_claim_write_failure_preserves_recoverable_input() {
+        async {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("dispatch.sqlite");
+            let database = store(&path).await?;
+            let journal = GenerationJournal::new(database.clone(), scope())?;
+            let saved = submission("claim-write-failure");
+            journal.prepare(saved.clone()).await?;
+            journal.accept(&saved.key, dispatching("accepted-id", SavedDispatch::Unclaimed { retry_requires_input:true })).await?;
+            let before = database.scoped(&journal.namespace).read(STORAGE_KEY)?;
+            database.write(|connection| connection.exec(
+                "CREATE TRIGGER fail_claim_write AFTER INSERT ON scoped_kv_store BEGIN
+                 INSERT OR REPLACE INTO kv_store(key,value) VALUES ('claim-side-effect','must roll back');
+                 SELECT RAISE(FAIL,'injected claim persistence failure'); END;"
+            )?()).await?;
+            assert!(!journal.observe_generation(dispatching("accepted-id", SavedDispatch::Unclaimed { retry_requires_input:true })).await?.0, "unchanged polling must not rewrite the journal");
+            assert!(journal.observe_generation(dispatching("accepted-id", SavedDispatch::Claimed)).await.is_err());
+            assert_eq!(database.scoped(&journal.namespace).read(STORAGE_KEY)?, before);
+            assert_eq!(database.read_kvp("claim-side-effect")?, None);
+            let reopened = GenerationJournal::new(store(&path).await?, scope())?;
+            let record = reopened.load().await?.records.into_iter().next().context("saved record")?;
+            assert_eq!(record.request, Some(saved.request.clone()));
+            assert!(record.result.as_ref().is_some_and(SavedRunResult::requires_input));
+            database.write(|connection| connection.exec("DROP TRIGGER fail_claim_write")?()).await?;
+            journal.observe_generation(dispatching("accepted-id", SavedDispatch::Claimed)).await?;
+            assert!(reopened.prepare(saved).await?.request.is_none());
+            Ok::<_, anyhow::Error>(())
+        }.await.expect("a failed claim transaction cannot erase the durable input or publish a partial state");
+    }
+
+    #[gpui::test]
+    async fn generation_journal_legacy_accepted_record_never_recreates_discarded_body() {
+        async {
+            let directory = tempfile::tempdir()?;
+            let database = store(&directory.path().join("dispatch.sqlite")).await?;
+            let journal = GenerationJournal::new(database.clone(), scope())?;
+            let saved = submission("legacy-key");
+            let legacy = json!({"version":1,"records":[{
+                "submission_fingerprint":request_fingerprint(&saved.request)?,
+                "record":{"key":saved.key,"request":null,"model":saved.model,"prompt":saved.prompt,
+                    "source":null,"mode":saved.mode,"result":{"Generation":{"id":"legacy-id","finished":false}}}
+            }]});
+            database.scoped(&journal.namespace).write(STORAGE_KEY.into(), legacy.to_string()).await?;
+            let record = journal.prepare(saved.clone()).await?;
+            assert!(record.request.is_none());
+            journal.observe_generation(dispatching("legacy-id", SavedDispatch::Unclaimed { retry_requires_input:true })).await?;
+            let record = journal.prepare(saved).await?;
+            assert!(record.request.is_none(), "a new response cannot reconstruct or authorize replay of discarded input");
+            Ok::<_, anyhow::Error>(())
+        }.await.expect("legacy accepted history remains readable without retroactive replay");
+    }
+    #[gpui::test]
+    async fn generation_journal_accepted_pending_keeps_exact_input_after_reopen() {
+        async {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("pending.sqlite");
+            let mut saved = submission("pending-before-claim");
+            saved.request["input"] = json!({"source":{"asset_id":"original"},"mask":"AA=="});
+            {
+                let journal = GenerationJournal::new(store(&path).await?,scope())?;
+                journal.prepare(saved.clone()).await?;
+                journal.accept(&saved.key,pending("accepted-before-claim")).await?;
+            }
+            let reopened = GenerationJournal::new(store(&path).await?,scope())?;
+            let record = reopened.prepare(saved.clone()).await?;
+            assert_eq!(record.request,Some(saved.request),"an accepted ID alone cannot prove that a worker permanently owns the only replay input");
+            Ok::<_,anyhow::Error>(())
+        }.await.expect("pending accepted input survives database reopen");
     }
 }

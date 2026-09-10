@@ -23,8 +23,8 @@ use workspace::{Item, MultiWorkspace, Workspace, item::ItemEvent};
 use crate::{
     FigItem, FigView, agent_surface,
     generation_journal::{
-        GenerationJournal, JournalRecord, JournalScope, JournalSnapshot, SavedRunResult,
-        SavedSource, SavedSubmission, normalize_endpoint,
+        GenerationJournal, JournalRecord, JournalScope, JournalSnapshot, SavedDispatch,
+        SavedRunResult, SavedSource, SavedSubmission, normalize_endpoint,
     },
     generation_media,
 };
@@ -175,6 +175,12 @@ struct GenerationResponse {
     billed_credits: Option<f64>,
     #[serde(default)]
     error: Option<Value>,
+    #[serde(default)]
+    dispatch_protocol: Option<String>,
+    #[serde(default)]
+    dispatch_state: Option<String>,
+    #[serde(default)]
+    retry_requires_input: bool,
 }
 
 fn deserialize_generation_seed<'de, D>(
@@ -201,6 +207,48 @@ where
 impl GenerationResponse {
     fn pending(&self) -> bool {
         matches!(self.status.as_str(), "queued" | "processing" | "warming")
+    }
+
+    fn saved_result(&self) -> SavedRunResult {
+        let dispatch = if self.dispatch_protocol.as_deref() == Some("fanta-dispatch-v1") {
+            match self.dispatch_state.as_deref() {
+                Some("awaiting_input" | "delivering") => SavedDispatch::Unclaimed {
+                    retry_requires_input: self.retry_requires_input,
+                },
+                Some("claimed" | "terminal") if !self.retry_requires_input => {
+                    SavedDispatch::Claimed
+                }
+                _ => SavedDispatch::Unknown,
+            }
+        } else {
+            SavedDispatch::Unknown
+        };
+        SavedRunResult::Generation {
+            id: self.id.clone(),
+            finished: !self.pending(),
+            dispatch,
+        }
+    }
+
+    fn honor_saved_claim(&mut self, result: Option<&SavedRunResult>) {
+        if matches!(result, Some(SavedRunResult::Generation { id, dispatch: SavedDispatch::Claimed, .. }) if *id == self.id)
+        {
+            self.dispatch_protocol = Some("fanta-dispatch-v1".into());
+            self.dispatch_state = Some("claimed".into());
+            self.retry_requires_input = false;
+        }
+    }
+
+    fn requires_input(&self) -> bool {
+        self.saved_result().requires_input()
+    }
+
+    fn awaiting_input(&self) -> bool {
+        self.requires_input() && self.dispatch_state.as_deref() == Some("awaiting_input")
+    }
+
+    fn should_poll(&self) -> bool {
+        self.pending() && !self.awaiting_input()
     }
 }
 
@@ -403,7 +451,14 @@ fn restore_journal(
         let mode = GenerationMode::from_label(&record.mode)?;
         if record.result.is_some() {
             history.push(run_from_record(&record)?);
-        } else {
+        }
+        if record.result.is_none()
+            || (record.request.is_some()
+                && record
+                    .result
+                    .as_ref()
+                    .is_some_and(SavedRunResult::requires_input))
+        {
             submissions.push(Submission {
                 source: record.source.as_ref().map(restore_source).transpose()?,
                 request: record.request.context("The saved request is missing.")?,
@@ -416,6 +471,24 @@ fn restore_journal(
         }
     }
     Ok((submissions, history))
+}
+
+async fn persist_generation_status(
+    journal: &GenerationJournal,
+    response: &mut GenerationResponse,
+    account: Option<Arc<str>>,
+    cx: &gpui::AsyncApp,
+) -> Result<Option<(Vec<Submission>, Vec<RunSummary>)>> {
+    let (changed, observed) = journal.observe_generation(response.saved_result()).await?;
+    response.honor_saved_claim(observed.as_ref());
+    if !changed {
+        return Ok(None);
+    }
+    let snapshot = journal.load().await?;
+    let account = account.context("Sign in to restore your experiments.")?;
+    cx.background_spawn(async move { restore_journal(snapshot, account) })
+        .await
+        .map(Some)
 }
 
 #[derive(Debug)]
@@ -763,8 +836,7 @@ impl GenerationWorkspace {
         self.history = history;
         if self.unresolved_submission.is_some() {
             self.status =
-                "An earlier request needs confirmation. Retry the saved request to check it."
-                    .into();
+                "An earlier request needs recovery. Retry its saved submission to continue.".into();
         }
     }
 
@@ -939,7 +1011,7 @@ impl GenerationWorkspace {
             }
         };
         if self.unresolved_submission.is_some() {
-            self.fail(anyhow!("Check the previous submission using Retry same request before starting another generation."), cx);
+            self.fail(anyhow!("Use Retry submission to recover the saved request before starting another generation."), cx);
             return;
         }
         self.submit(
@@ -1089,7 +1161,6 @@ impl GenerationWorkspace {
         self.unresolved_submission = Some(submission.clone());
         let Submission {
             key,
-            request,
             model,
             prompt,
             source,
@@ -1103,26 +1174,47 @@ impl GenerationWorkspace {
         self.status = "Saving your request for recovery…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = async {
-                let previous = journal.prepare(saved).await?;
-                let value = match previous.result {
+                let previous = journal.prepare(saved).await.map_err(|error| anyhow!("{error:#}"))?;
+                let mut response = match &previous.result {
                     Some(SavedRunResult::Generation { id, .. }) => {
                         let value = api_json(&client, &base_url, Method::GET,
                             &format!("/v1/generations/{id}"), None, None,
                             account.as_deref(), cx.background_executor()).await?;
-                        ensure!(value["id"].as_str() == Some(id.as_str()),
+                        let mut response = parse_generation_response(value)?;
+                        ensure!(response.id == *id,
                             "The status response did not match the saved generation.");
-                        value
+                        // A stale retry must observe a permanent claim before deciding
+                        // whether the original input can be delivered again.
+                        let observed = journal.accept(&key, response.saved_result()).await?;
+                        response.honor_saved_claim(observed.result.as_ref());
+                        if observed.result.as_ref().is_some_and(SavedRunResult::requires_input)
+                            && observed.request.is_some()
+                        {
+                            let value = api_json(&client, &base_url, Method::POST,
+                                "/v1/generations", observed.request, Some(&key),
+                                account.as_deref(), cx.background_executor()).await?;
+                            let retried = parse_generation_response(value)?;
+                            ensure!(retried.id == *id,
+                                "The retry response did not match the saved generation. Keep this request for recovery.");
+                            retried
+                        } else {
+                            response
+                        }
                     }
                     Some(SavedRunResult::VectorMessage { .. }) => {
                         bail!("This experiment already has artwork. Open it from Recent experiments.")
                     }
-                    None => api_json(&client, &base_url, Method::POST,
-                        "/v1/generations", Some(request), Some(&key),
-                        account.as_deref(), cx.background_executor()).await?,
+                    None => {
+                        let request = previous.request.context("The saved request is missing.")?;
+                        let value = api_json(&client, &base_url, Method::POST,
+                            "/v1/generations", Some(request), Some(&key),
+                            account.as_deref(), cx.background_executor()).await?;
+                        parse_generation_response(value)?
+                    }
                 };
-                let response = parse_generation_response(value)?;
-                journal.accept(&key, SavedRunResult::Generation { id: response.id.clone(), finished: !response.pending() }).await
+                let accepted = journal.accept(&key, response.saved_result()).await
                     .with_context(|| format!("Generation {} was accepted, but its recovery record could not be saved. Retry the same request", response.id))?;
+                response.honor_saved_claim(accepted.result.as_ref());
                 let snapshot = journal.load().await?;
                 let restored = cx.background_spawn({
                     let account = account.clone().context("Sign in to restore your experiments.")?;
@@ -1152,7 +1244,7 @@ impl GenerationWorkspace {
                         this.accept_response(&response, cx);
                         true
                     }).log_err().unwrap_or(false);
-                    if applied && response.pending() {
+                    if applied && response.should_poll() {
                         Self::poll(this.clone(), client, base_url, response.id, account.clone(), journal.clone(), cx).await;
                     }
                 }
@@ -1221,22 +1313,28 @@ impl GenerationWorkspace {
                 Ok(response)
             });
             match result {
-                Ok(response) => {
-                    let pending = response.pending();
-                    let persistence_error = if pending {
-                        None
-                    } else {
-                        journal.mark_finished(&id).await.err()
-                    };
+                Ok(mut response) => {
+                    let persisted =
+                        persist_generation_status(&journal, &mut response, account.clone(), cx)
+                            .await;
                     let applied = this
                         .update(cx, |this, cx| {
                             if this.client.account_access_token() != account {
                                 this.sync_account(cx);
                                 return false;
                             }
+                            let persistence_error = match persisted {
+                                Ok(restored) => {
+                                    if let Some((submissions, history)) = restored {
+                                        this.restore_history(submissions, history);
+                                    }
+                                    None
+                                }
+                                Err(error) => Some(error),
+                            };
                             this.accept_response(&response, cx);
                             if let Some(error) = persistence_error {
-                                this.error = Some(format!("The result is available, but its saved status could not be updated: {error}. Check status again to finish recovery.").into());
+                                this.error = Some(format!("The saved status could not be updated: {error}. Check status again to finish recovery.").into());
                             }
                             true
                         })
@@ -1244,7 +1342,7 @@ impl GenerationWorkspace {
                     if !applied {
                         return;
                     }
-                    if !pending {
+                    if !response.should_poll() {
                         return;
                     }
                 }
@@ -1366,21 +1464,30 @@ impl GenerationWorkspace {
                 Ok(response)
             });
             match result {
-                Ok(response) => {
-                    let persistence_error = if response.pending() { None } else { journal.mark_finished(&generation_id).await.err() };
+                Ok(mut response) => {
+                    let persisted = persist_generation_status(&journal, &mut response, account.clone(), cx).await;
                     let applied = this.update(cx, |this, cx| {
                         if this.client.account_access_token() != account {
                             this.sync_account(cx);
                             return false;
                         }
+                        let persistence_error = match persisted {
+                            Ok(restored) => {
+                                if let Some((submissions, history)) = restored {
+                                    this.restore_history(submissions, history);
+                                }
+                                None
+                            }
+                            Err(error) => Some(error),
+                        };
                         this.accept_response(&response, cx);
                         if let Some(error) = persistence_error {
-                            this.error = Some(format!("The result is available, but its saved status could not be updated: {error}. Check status again to finish recovery.").into());
+                            this.error = Some(format!("The saved status could not be updated: {error}. Check status again to finish recovery.").into());
                         }
                         true
                     })
                         .log_err().unwrap_or(false);
-                    if applied && response.pending() {
+                    if applied && response.should_poll() {
                         Self::poll(
                             this.clone(),
                             client,
@@ -1415,7 +1522,9 @@ impl GenerationWorkspace {
     fn accept_response(&mut self, response: &GenerationResponse, cx: &mut Context<Self>) {
         self.pending = response.pending();
         if self.pending {
-            self.status = if response.status == "warming" {
+            self.status = if response.awaiting_input() {
+                "This job is waiting for input. Use its saved request to retry delivery."
+            } else if response.status == "warming" {
                 "The model is warming up…"
             } else {
                 "Creating your result…"
@@ -2610,8 +2719,8 @@ impl Render for GenerationWorkspace {
                         .disabled(self.task.is_some() || !signed_in || (!is_design && (self.journal.is_none() || self.model().is_none() || self.unresolved_submission.is_some())))
                         .on_click(cx.listener(|this, _, window, cx| this.generate(window, cx)))))
                     .when(self.unresolved_submission.is_some() && self.task.is_none(), |element| element
-                        .child(Label::new("The previous submission was not confirmed. Retry it with the same request to avoid a duplicate charge.").color(Color::Muted))
-                        .child(Button::new("retry-generation-submission", "Retry same request").disabled(self.journal.is_none())
+                        .child(Label::new("A saved request needs recovery. Retrying preserves its original input and recovery key.").color(Color::Muted))
+                        .child(Button::new("retry-generation-submission", "Retry submission").disabled(self.journal.is_none())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(submission) = this.unresolved_submission.clone() { this.submit(submission, cx); }
                             })))
@@ -5784,5 +5893,658 @@ mod tests {
             (100., 100.)
         );
         assert_eq!(image_point(200., 100., 200., 200., 1000, 500), None);
+    }
+    async fn assert_accepted_dispatch_recovery(
+        retry_state: usize,
+        fail_claim_write: bool,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="4"><rect width="8" height="4" fill="#22c55e"/></svg>"##;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let requests = requests.clone();
+            let posts = posts.clone();
+            let state = state.clone();
+            move |request| {
+                let requests = requests.clone();
+                let posts = posts.clone();
+                let state = state.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models":[]}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            let key = request.headers()["Idempotency-Key"].to_str()?.to_owned();
+                            let body: Value = serde_json::from_slice(
+                                &bounded_body(request.into_body(), MAX_JSON_BYTES).await?,
+                            )?;
+                            requests
+                                .lock()
+                                .expect("request log")
+                                .push(("POST", Some((key, body))));
+                            let count = posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if count == 0 {
+                                json!({"id":"dispatch-job", "status":"processing", "dispatch_protocol":"fanta-dispatch-v1", "dispatch_state":"awaiting_input", "retry_requires_input":true})
+                            } else {
+                                assert_eq!(
+                                    count, 1,
+                                    "one explicit redelivery must retain the same accepted job"
+                                );
+                                json!({"id":"dispatch-job", "status":"succeeded", "output":[{"svg":SVG}], "dispatch_protocol":"fanta-dispatch-v1", "dispatch_state":"terminal", "retry_requires_input":false})
+                            }
+                        }
+                        (&Method::GET, "/v1/generations/dispatch-job") => {
+                            requests.lock().expect("request log").push(("GET", None));
+                            if posts.load(std::sync::atomic::Ordering::SeqCst) > 1 {
+                                json!({"id":"dispatch-job", "status":"succeeded", "output":[{"svg":SVG}]})
+                            } else {
+                                match state.load(std::sync::atomic::Ordering::SeqCst) {
+                                    0 => {
+                                        json!({"id":"dispatch-job", "status":"processing", "dispatch_protocol":"fanta-dispatch-v1", "dispatch_state":"awaiting_input", "retry_requires_input":true})
+                                    }
+                                    1 => {
+                                        json!({"id":"dispatch-job", "status":"processing", "dispatch_protocol":"fanta-dispatch-v1", "dispatch_state":"claimed", "retry_requires_input":false})
+                                    }
+                                    2 => {
+                                        json!({"id":"dispatch-job", "status":"processing", "retry_requires_input":true})
+                                    }
+                                    _ => panic!("Unexpected dispatch state"),
+                                }
+                            }
+                        }
+                        route => panic!("Unexpected dispatch recovery route: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Image, client.clone(), cx);
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(4, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("source PNG");
+        let mut preview = make_preview(&png.into_inner(), "image/png").expect("source preview");
+        preview.width = 400;
+        preview.height = 200;
+        let submission = Submission {
+            key: "durable-unclaimed-key".into(),
+            request: json!({"model":"fanta-image-1","prompt":"Replace the sky","seed":"18446744073709551615",
+                "input":{"source":{"asset_id":"source-original"},"mask":"AA==","mask_polarity":"edit_white","points":[{"x":123,"y":45,"positive":true}]}}),
+            model: "fanta-image-1".into(),
+            prompt: "Replace the sky".into(),
+            source: Some(SourceImage {
+                reference: json!({"asset_id":"source-original"}),
+                name: "Original mask source".into(),
+                preview,
+            }),
+            account,
+            mode: GenerationMode::Image,
+        };
+        let expected = submission.saved().expect("saved exact source");
+        let journal = view.read_with(cx, |view, _| {
+            view.journal.clone().expect("persistent journal")
+        });
+        view.update(cx, |view, cx| view.submit(submission.clone(), cx));
+        cx.run_until_parked();
+        let snapshot = journal.load().await.expect("saved acceptance");
+        assert_eq!(
+            snapshot
+                .records
+                .first()
+                .and_then(|record| record.request.as_ref()),
+            Some(&expected.request),
+            "acceptance before worker claim must retain the only input"
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.error.is_none(), "acceptance error: {:?}", view.error);
+            assert!(
+                view.task.is_none(),
+                "unclaimed input waits for explicit user retry, not polling"
+            );
+            assert_eq!(
+                view.history.first().and_then(RunSummary::generation_id),
+                Some("dispatch-job")
+            );
+            assert_eq!(
+                view.unresolved_submission
+                    .as_ref()
+                    .map(|saved| saved.key.as_str()),
+                Some(expected.key.as_str())
+            );
+        });
+        let mut context = cx.cx.clone();
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        context.run_until_parked();
+        let (view, cx) =
+            visual_workspace_with_client(GenerationMode::Image, client.clone(), &mut context);
+        let recovered = view.read_with(cx, |view, _| {
+            view.unresolved_submission
+                .clone()
+                .expect("accepted input restored")
+        });
+        assert_eq!(recovered.saved().expect("restored source"), expected);
+        assert_eq!(
+            requests.lock().expect("request log").len(),
+            1,
+            "reopening must not POST or automatically redeliver"
+        );
+        let database = cx.update(|_, cx| db::kvp::KeyValueStore::global(cx));
+        if fail_claim_write {
+            database
+                .write(|connection| {
+                    connection.exec(
+                        "CREATE TRIGGER fail_dispatch_claim BEFORE INSERT ON scoped_kv_store
+                 WHEN instr(NEW.value, 'Claimed') > 0
+                 BEGIN SELECT RAISE(FAIL,'injected claim write failure'); END;",
+                    )?()
+                })
+                .await
+                .expect("install claim write failure");
+        }
+        state.store(retry_state, std::sync::atomic::Ordering::SeqCst);
+        view.update(cx, |view, cx| view.submit(recovered, cx));
+        cx.run_until_parked();
+        if fail_claim_write {
+            view.read_with(cx, |view, _| {
+                assert!(view.error.is_some());
+                assert!(view.task.is_none());
+                assert!(view.unresolved_submission.is_some());
+            });
+            assert_eq!(
+                journal.load().await.expect("unchanged acceptance"),
+                snapshot,
+                "a failed claim write must preserve the prior request and dispatch state"
+            );
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "claim persistence failure cannot lead to another POST"
+            );
+            let mut context = cx.cx.clone();
+            cx.update(|window, _| window.remove_window());
+            drop(view);
+            context.run_until_parked();
+            let (view, cx) =
+                visual_workspace_with_client(GenerationMode::Image, client, &mut context);
+            let recovered = view.read_with(cx, |view, _| {
+                view.unresolved_submission
+                    .clone()
+                    .expect("failed claim still recoverable")
+            });
+            assert_eq!(recovered.saved().expect("source after failure"), expected);
+            database
+                .write(|connection| connection.exec("DROP TRIGGER fail_dispatch_claim")?())
+                .await
+                .expect("restore claim storage");
+            view.update(cx, |view, cx| view.submit(recovered, cx));
+            cx.run_until_parked();
+            assert!(
+                journal
+                    .load()
+                    .await
+                    .expect("saved claim")
+                    .records
+                    .first()
+                    .is_some_and(|record| record.request.is_none())
+            );
+            assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            view.update(cx, |view, _| view.task = None);
+            return;
+        }
+        if retry_state == 2 {
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "an unrecognized/missing protocol cannot authorize accepted-job POST"
+            );
+            let retained = journal.load().await.expect("mixed rollout state");
+            assert_eq!(
+                retained
+                    .records
+                    .first()
+                    .and_then(|record| record.request.as_ref()),
+                Some(&expected.request)
+            );
+            view.update(cx, |view, _| view.task = None);
+            let run = view.read_with(cx, |view, _| {
+                assert!(
+                    view.unresolved_submission.is_none(),
+                    "unknown metadata must not offer an unsafe retry"
+                );
+                view.history.first().cloned().expect("accepted history")
+            });
+            state.store(0, std::sync::atomic::Ordering::SeqCst);
+            view.update(cx, |view, cx| view.check_status(run, cx));
+            cx.run_until_parked();
+            assert_eq!(
+                posts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "status check cannot redeliver input"
+            );
+            view.read_with(cx, |view, _| {
+                assert!(view.task.is_none());
+                assert_eq!(
+                    view.unresolved_submission
+                        .as_ref()
+                        .map(|saved| saved.key.as_str()),
+                    Some(expected.key.as_str())
+                );
+            });
+        } else {
+            assert!(
+                journal
+                    .load()
+                    .await
+                    .expect("released input")
+                    .records
+                    .first()
+                    .is_some_and(|record| record.request.is_none())
+            );
+            let requests = requests.lock().expect("request log").clone();
+            if retry_state == 0 {
+                view.read_with(cx, |view, _| {
+                    assert!(
+                        view.error.is_none(),
+                        "completed recovery error: {:?}",
+                        view.error
+                    );
+                    assert_eq!(view.outputs.len(), 1);
+                    assert!(view.preview.is_some());
+                });
+                assert_eq!(
+                    requests.iter().map(|request| request.0).collect::<Vec<_>>(),
+                    vec!["POST", "GET", "POST"]
+                );
+                assert_eq!(
+                    requests.first(),
+                    requests.get(2),
+                    "redelivery preserves the original body and idempotency key"
+                );
+                view.update(cx, |view, cx| view.submit(submission, cx));
+                cx.run_until_parked();
+                assert_eq!(
+                    posts.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "a stale accepted submission fetches its finished job and cannot repeat it"
+                );
+            } else {
+                assert_eq!(
+                    requests.iter().map(|request| request.0).collect::<Vec<_>>(),
+                    vec!["POST", "GET"]
+                );
+                assert_eq!(
+                    posts.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "a claim discovered after reopen prevents redelivery"
+                );
+                view.update(cx, |view, _| view.task = None);
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_reopens_accepted_input_and_redelivers_only_explicitly(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_accepted_dispatch_recovery(0, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_claim_discovered_after_restart_prevents_redelivery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_accepted_dispatch_recovery(1, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_unknown_rollout_keeps_input_without_post_permission(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_accepted_dispatch_recovery(2, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_claim_write_failure_preserves_restart_recovery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_accepted_dispatch_recovery(1, true, cx).await;
+    }
+
+    #[test]
+    fn generation_dispatch_contract_requires_recognized_explicit_permission() {
+        for (protocol, state, retry, can_retry, releases, polls) in [
+            (
+                Some("fanta-dispatch-v1"),
+                Some("awaiting_input"),
+                true,
+                true,
+                false,
+                false,
+            ),
+            (
+                Some("fanta-dispatch-v1"),
+                Some("delivering"),
+                true,
+                true,
+                false,
+                true,
+            ),
+            (
+                Some("fanta-dispatch-v1"),
+                Some("awaiting_input"),
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                Some("fanta-dispatch-v1"),
+                Some("claimed"),
+                false,
+                false,
+                true,
+                true,
+            ),
+            (
+                Some("fanta-dispatch-v1"),
+                Some("claimed"),
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                Some("fanta-dispatch-v1"),
+                Some("unknown"),
+                true,
+                false,
+                false,
+                true,
+            ),
+            (
+                Some("fanta-dispatch-v2"),
+                Some("awaiting_input"),
+                true,
+                false,
+                false,
+                true,
+            ),
+            (None, Some("awaiting_input"), true, false, false, true),
+            (Some("fanta-dispatch-v1"), None, true, false, false, true),
+        ] {
+            let response =
+                parse_generation_response(json!({"id":"dispatch-contract","status":"processing",
+                "dispatch_protocol":protocol,"dispatch_state":state,"retry_requires_input":retry}))
+                .expect("response");
+            assert_eq!(
+                response.requires_input(),
+                can_retry,
+                "{protocol:?}/{state:?}/{retry}"
+            );
+            assert_eq!(
+                matches!(
+                    response.saved_result(),
+                    SavedRunResult::Generation {
+                        dispatch: SavedDispatch::Claimed,
+                        ..
+                    }
+                ),
+                releases
+            );
+            assert_eq!(response.should_poll(), polls);
+        }
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_delivering_keeps_polling_through_claim_and_completion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let posts = posts.clone();
+            let gets = gets.clone();
+            move |request| {
+                let posts = posts.clone();
+                let gets = gets.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models":[]}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            assert_eq!(
+                                posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                                0,
+                                "polling cannot repeat a submission"
+                            );
+                            json!({"id":"dispatch-poll","status":"processing","dispatch_protocol":"fanta-dispatch-v1","dispatch_state":"delivering","retry_requires_input":true})
+                        }
+                        (&Method::GET, "/v1/generations/dispatch-poll") => {
+                            let count = gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if count == 0 {
+                                json!({"id":"dispatch-poll","status":"processing","dispatch_protocol":"fanta-dispatch-v1","dispatch_state":"claimed","retry_requires_input":false})
+                            } else {
+                                json!({"id":"dispatch-poll","status":"failed","error":{"message":"Synthetic worker terminal result"},"dispatch_protocol":"fanta-dispatch-v1","dispatch_state":"terminal","retry_requires_input":false})
+                            }
+                        }
+                        route => panic!("Unexpected polling route: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client, cx);
+        let journal = view.read_with(cx, |view, _| view.journal.clone().expect("journal"));
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "dispatch-poll-key".into(),
+                    request: json!({"model":"fanta-video-1","prompt":"Sunrise"}),
+                    model: "fanta-video-1".into(),
+                    prompt: "Sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Video,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.pending && view.task.is_some()));
+        assert!(
+            journal
+                .load()
+                .await
+                .expect("delivery saved")
+                .records
+                .first()
+                .is_some_and(|record| record.request.is_some())
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(view.read_with(cx, |view, _| view.pending && view.task.is_some()));
+        assert!(
+            journal
+                .load()
+                .await
+                .expect("claim saved")
+                .records
+                .first()
+                .is_some_and(|record| record.request.is_none())
+        );
+        assert!(view.read_with(cx, |view, _| view.unresolved_submission.is_none()));
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.pending);
+            assert!(view.task.is_none());
+            assert!(
+                view.error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("Synthetic worker terminal result"))
+            );
+        });
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(matches!(
+            journal
+                .load()
+                .await
+                .expect("terminal saved")
+                .records
+                .first()
+                .and_then(|record| record.result.as_ref()),
+            Some(SavedRunResult::Generation { finished: true, .. })
+        ));
+    }
+    async fn assert_dispatch_retry_race(sign_out: bool, cx: &mut gpui::TestAppContext) {
+        let (sender, receiver) = futures::channel::oneshot::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(Some(receiver)));
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let http = http_client::FakeHttpClient::create({
+            let gate = gate.clone();
+            let posts = posts.clone();
+            let gets = gets.clone();
+            move |request| {
+                let gate = gate.clone();
+                let posts = posts.clone();
+                let gets = gets.clone();
+                async move {
+                    let response = match (request.method(), request.uri().path()) {
+                        (&Method::GET, "/v1/models") => json!({"models":[]}),
+                        (&Method::GET, "/v1/me") => recovery_account_fixture(),
+                        (&Method::POST, "/v1/generations") => {
+                            assert_eq!(
+                                posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                                0,
+                                "a stale recovery response cannot authorize another POST"
+                            );
+                            json!({"id":"dispatch-race","status":"processing","dispatch_protocol":"fanta-dispatch-v1","dispatch_state":"awaiting_input","retry_requires_input":true})
+                        }
+                        (&Method::GET, "/v1/generations/dispatch-race") => {
+                            gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let receiver = gate
+                                .lock()
+                                .expect("response gate")
+                                .take()
+                                .context("status requested more than once")?;
+                            receiver.await?;
+                            json!({"id":"dispatch-race","status":"processing","dispatch_protocol":"fanta-dispatch-v1","dispatch_state":"awaiting_input","retry_requires_input":true})
+                        }
+                        route => panic!("Unexpected race route: {route:?}"),
+                    };
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(response.to_string().into())?)
+                }
+            }
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let account = client.account_access_token();
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Video, client.clone(), cx);
+        let journal = view.read_with(cx, |view, _| view.journal.clone().expect("journal"));
+        view.update(cx, |view, cx| {
+            view.submit(
+                Submission {
+                    key: "dispatch-race-key".into(),
+                    request: json!({"model":"fanta-video-1","prompt":"Sunrise"}),
+                    model: "fanta-video-1".into(),
+                    prompt: "Sunrise".into(),
+                    source: None,
+                    account,
+                    mode: GenerationMode::Video,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let submission = view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            view.unresolved_submission
+                .clone()
+                .expect("accepted input requires recovery")
+        });
+        view.update(cx, |view, cx| view.submit(submission, cx));
+        cx.run_until_parked();
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+        if sign_out {
+            let task = view.update(cx, |view, _| {
+                view.task.take().expect("retain in-flight operation")
+            });
+            client.sign_out(&cx.to_async()).await;
+            cx.run_until_parked();
+            sender.send(()).expect("release old-account response");
+            task.await;
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.active_run.is_none());
+                assert!(view.history.is_empty());
+                assert!(view.unresolved_submission.is_none());
+            });
+            assert!(
+                journal
+                    .load()
+                    .await
+                    .expect("old account recovery retained")
+                    .records
+                    .first()
+                    .is_some_and(|record| record.request.is_some())
+            );
+        } else {
+            let claimed: SavedRunResult = serde_json::from_value(
+                json!({"Generation":{"id":"dispatch-race","finished":false,"dispatch":"Claimed"}}),
+            )
+            .expect("permanent worker claim");
+            journal
+                .accept("dispatch-race-key", claimed)
+                .await
+                .expect("another tab persists worker claim");
+            sender.send(()).expect("release stale unclaimed response");
+            cx.run_until_parked();
+            assert!(
+                journal
+                    .load()
+                    .await
+                    .expect("claim wins")
+                    .records
+                    .first()
+                    .is_some_and(|record| record.request.is_none())
+            );
+            view.read_with(cx,|view,_| {
+                assert!(view.unresolved_submission.is_none());
+                assert!(view.task.is_some(),"a durable claim overrides stale awaiting-input metadata and continues GET polling");
+            });
+            view.update(cx, |view, _| view.task = None);
+        }
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_concurrent_claim_wins_over_stale_unclaimed_get(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_dispatch_retry_race(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn generation_dispatch_signout_during_retry_get_cannot_redeliver(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_dispatch_retry_race(true, cx).await;
     }
 }

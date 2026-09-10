@@ -63,6 +63,50 @@ fn full_subtree_round_trips_losslessly() {
 }
 
 #[test]
+fn embedded_objects_print_identically_across_insertion_orders() {
+    let unsorted = r#"{"z":[{"z":9,"a":"$Colors/Accent"},null,3,false],"a":{"z":21.762165069580078,"a":"literal reference"}}"#;
+    let sorted = r#"{"a":{"a":"literal reference","z":21.762165069580078},"z":[{"a":"$Colors/Accent","z":9},null,3,false]}"#;
+    let mut root = FnxElement::new("Frame");
+    root.attrs.insert(
+        "meta".to_owned(),
+        serde_json::from_str(unsorted).expect("unsorted metadata"),
+    );
+    root.attrs.insert(
+        "background".to_owned(),
+        serde_json::from_str(r#"{"kind":"solid","color":{"r":37,"g":99,"b":235,"a":255}}"#)
+            .expect("solid fill"),
+    );
+    let mut instance = FnxElement::new("Instance");
+    instance.attrs.insert(
+        "component".to_owned(),
+        Value::String("COMP0000000000000000000000".to_owned()),
+    );
+    root.children.push(instance);
+    let original_metadata = serde_json::to_string(&root.attrs["meta"]).expect("original metadata");
+    let source = print_doc("Ordering", &root);
+    assert_eq!(parse_doc(&source).expect("printed source parses"), root);
+    assert_eq!(
+        serde_json::to_string(&root.attrs["meta"]).expect("metadata after print"),
+        original_metadata,
+        "printing must not reorder the caller's opaque metadata"
+    );
+    assert!(source.contains(r##"background={{"color": fnxColor("#2563EB"), "kind": "solid"}}"##));
+    assert!(source.contains(r#"meta={{"a": {"a": "literal reference", "z": 21.762165069580078}, "z": [{"a": "$Colors/Accent", "z": 9}, null, 3, false]}}"#));
+    assert!(source.contains(r#"component="COMP0000000000000000000000""#));
+
+    root.attrs.insert(
+        "meta".to_owned(),
+        serde_json::from_str(sorted).expect("sorted metadata"),
+    );
+    root.attrs.insert(
+        "background".to_owned(),
+        serde_json::from_str(r#"{"color":{"a":255,"b":235,"g":99,"r":37},"kind":"solid"}"#)
+            .expect("reordered solid fill"),
+    );
+    assert_eq!(print_doc("Ordering", &root), source);
+}
+
+#[test]
 fn duplicate_node_ids_are_rejected_before_tree_indexing() {
     let mut nodes = sample();
     let duplicate = nodes[0]["id"].clone();
@@ -350,9 +394,9 @@ fn sidecar_reconciliation_assigns_ids_and_source_order_to_added_elements() {
     assert_eq!(reconciled.ids[0].id, "ROOT0000000000000000000000");
     assert_eq!(reconciled.ids[0].index, json!(7.0));
     assert_eq!(reconciled.ids[1].id, "OLD00000000000000000000000");
-    assert_eq!(reconciled.ids[1].index, json!(1));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
     assert_eq!(reconciled.ids[2].id, "NEW00000000000000000000000");
-    assert_eq!(reconciled.ids[2].index, json!(2));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
 
     let decoded = decode_subtree(&source, &reconciled).unwrap();
     assert_eq!(
@@ -383,6 +427,54 @@ fn reconcile_fixture() -> (String, FnxSidecar) {
         }),
     ];
     encode_subtree(&nodes, "Page").expect("encode fixture")
+}
+
+#[test]
+fn reconciled_sidecar_indices_match_document_index_serialization() {
+    let (source, sidecar) = reconcile_fixture();
+    let edited = source.replace(
+        "<Vector name=\"A\" />",
+        "<Vector name=\"A\" />\n      <Vector name=\"Added\" />",
+    );
+    assert_ne!(edited, source);
+    let reconciled =
+        reconcile_sidecar(&edited, &sidecar, sequential_minter()).expect("reconcile inserted node");
+    assert_eq!(reconciled.ids.len(), sidecar.ids.len() + 1);
+    for (position, entry) in reconciled.ids.iter().skip(1).enumerate() {
+        let native_index = fanta_doc::IndexKey::from_raw(position as f64 + 1.0);
+        assert_eq!(
+            serde_json::to_vec(&entry.index).expect("sidecar index bytes"),
+            serde_json::to_vec(&native_index).expect("document index bytes"),
+            "a reconciled index must survive materialization and ordinary Save byte-identically"
+        );
+    }
+}
+
+#[test]
+fn sidecar_attribute_edit_preserves_fractional_index_bytes() {
+    let (source, mut sidecar) = reconcile_fixture();
+    for (entry, index) in sidecar
+        .ids
+        .iter_mut()
+        .zip([7.125, 0.125, 1.0000000000000002, 9.75])
+    {
+        entry.index = json!(index);
+    }
+    let original_bytes = serde_json::to_vec(&sidecar).expect("fractional sidecar bytes");
+    let edited = source.replacen("name=\"Page\"", "name=\"Page\" opacity={0.75}", 1);
+    assert_ne!(edited, source);
+    let mut minted = false;
+    let reconciled = reconcile_sidecar(&edited, &sidecar, || {
+        minted = true;
+        "unexpected new identity".to_owned()
+    })
+    .expect("reconcile attribute edit");
+    assert!(!minted);
+    assert_eq!(reconciled, sidecar);
+    assert_eq!(
+        serde_json::to_vec(&reconciled).expect("unchanged fractional sidecar bytes"),
+        original_bytes
+    );
 }
 
 fn sequential_minter() -> impl FnMut() -> String {
@@ -457,10 +549,10 @@ fn inserting_a_mid_tree_element_keeps_every_existing_id() {
     );
     // Indices are normalized to source order on structural change.
     assert_eq!(reconciled.ids[0].index, json!(7.0));
-    assert_eq!(reconciled.ids[1].index, json!(1));
-    assert_eq!(reconciled.ids[2].index, json!(2));
-    assert_eq!(reconciled.ids[3].index, json!(3));
-    assert_eq!(reconciled.ids[4].index, json!(4));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
+    assert_eq!(reconciled.ids[3].index, json!(3.0));
+    assert_eq!(reconciled.ids[4].index, json!(4.0));
 
     // Fingerprints stay in the sidecar only — decoded nodes carry none of them.
     let decoded = decode_subtree(&edited, &reconciled).unwrap();
@@ -616,8 +708,8 @@ fn preorder_preserving_reparent_normalizes_indices_and_keeps_ids() {
     );
     // Sibling indices are normalized to source order (A before B under the
     // page), so the decoded z-order matches the edited source.
-    assert_eq!(reconciled.ids[1].index, json!(1));
-    assert_eq!(reconciled.ids[2].index, json!(2));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
     assert_eq!(reconciled.ids[1].parent_index, Some(0));
     assert_eq!(reconciled.ids[2].parent_index, Some(0));
 }
@@ -738,7 +830,7 @@ fn replacing_the_root_tag_keeps_the_pinned_id_but_rebuilds_the_sidecar() {
         Some("Boolean"),
         "the persisted root fingerprint must track the new tag"
     );
-    assert_eq!(reconciled.ids[1].index, json!(1));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
 }
 
 #[test]
