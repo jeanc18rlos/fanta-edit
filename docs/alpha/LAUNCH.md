@@ -1,6 +1,6 @@
 # Fanta launch readiness
 
-Updated on 2026-09-11. First release target: Apple Silicon Mac.
+Updated on 2026-09-12. First release target: Apple Silicon Mac.
 
 ## What is connected
 
@@ -19,7 +19,7 @@ Updated on 2026-09-11. First release target: Apple Silicon Mac.
 - Backend analytics now flush within the request lifetime, as required for
   [PostHog in serverless environments](https://posthog.com/docs/libraries/node#short-lived-processes-like-serverless-environments).
 
-## Latest release checkpoint — September 10
+## Latest release checkpoint — September 12
 
 The exact first-milestone desktop candidate `9d92b30` adds the compact centered
 canvas toolbar, restrained shared popup styling, explicit Ask AI action,
@@ -29,16 +29,28 @@ inspector paint edits with explicit unsupported states. It passes all 646
 viewer tests, all 591 shared GPUI tests plus three architecture tests, all 11
 media-library and 11 native-playback cases, and release-mode Clippy for
 `fig_viewer`/`fanta-gpui`. Its exact 7m14s release build also passed focused
-native interaction: centered Design/Motion and narrow-window layouts, toolbar
-Actions, a signed-out unsent AI draft, Fill/Stroke visibility, Fill Undo, a
-finite Linear gradient, and visible successful Export to a valid PNG. The
-ad-hoc local QA shell is not a distribution candidate. Evidence is retained at
+native interaction for toolbar Actions, a signed-out unsent AI draft,
+Fill/Stroke visibility, Fill Undo, a finite Linear gradient, and visible
+successful Export to a valid PNG. Its reported centered Design/Motion and
+narrow-window layout result is unsubstantiated because the retained screenshots
+show the wrong app. The ad-hoc local QA shell is not a distribution candidate.
+Evidence is retained at
 `/tmp/fanta-release-qa-20260909/toolbar-milestone-9d92b30/verification.json`.
 The remaining paint/blend matrix, native Export failure, and final
 signed/notarized artifact are still gates.
 
-Source-only candidate `895b6b7` implements conservative
-Text on Path conversion, inline curved-text editing, and renderer-backed
+The three retained `9d92b30` toolbar screenshots are invalid: each shows
+ChatGPT rather than Fanta. They remain preserved only as rejected evidence and
+do not validate that candidate's layout claims. Fresh, immediately inspected
+Fanta captures from exact runtime candidate `12e2e4c` validate the current
+Design, Motion, and 1025-point narrow layouts at
+`/tmp/fanta-release-qa-20260912/toolbar-correction-12e2e4c/verification.json`.
+The other `9d92b30` native interactions above remain recorded but were not
+repeated by the correction pass.
+
+Validated source/runtime candidate `12e2e4c` includes source-only candidate
+`895b6b7`'s conservative Text on Path conversion, inline curved-text editing,
+and renderer-backed
 selection geometry. Visual bidirectional navigation is implemented. Caret
 positions inside one shaping cluster containing multiple graphemes remain equal
 subdivisions rather than exact glyph-internal positions. Glyphless source
@@ -64,6 +76,13 @@ The contextual Motion Keyframe control now shares the production timeline's
 seven-property catalog and adds or replaces one keyframe at the playhead as one
 undoable transaction. Rejected requests do not author a keyframe, and a foreign
 content preview remains intact. The duplicate primary Motion flyout is removed.
+Auto key now supports only Motion's At playhead fields for Position X/Y,
+Rotation, Scale X/Y, Opacity, and Fill color. With a single editable selection
+and active clip, paused field edits preview live, commit as one undoable
+keyframe change, and autosave only after commit; guarded context changes disarm
+the toggle and stale states fail closed. Direct canvas manipulation does not
+auto-author keyframes.
+
 The current source tree also implements Motion time comments. Time comment
 captures the active page, clip, and exact integer-ms playhead, pauses playback,
 and enters page-bound canvas placement. Posting persists the comment and anchor
@@ -77,24 +96,27 @@ retargeting another clip. State, mode, workspace, tool, page, clip,
 timeline-time, playback, scope, and source-lock changes clear unplaced intent.
 Time-comment arming, placement, and thread navigation refuse to replace an
 existing draft or unsent reply; unrelated mode and tool actions can still
-intentionally cancel a placed draft. Auto-keyframe and Motion Path remain
-unimplemented, and none of this Motion work has native or final-artifact
-evidence.
+intentionally cancel a placed draft. Direct-canvas auto-keying and Motion Path
+remain unimplemented. The exact `12e2e4c` local release build passed a bounded
+native Position X Auto key preview/restore/commit/Undo/reopen smoke. The
+intermediate disk states were observed during the run; the retained final file
+and reopen show the clip without tracks. The other current Motion behavior
+still lacks native and final-artifact evidence.
 
-The current coherent source gate passed all 726/726 viewer tests; 116
+The current coherent source gate passed all 737/737 viewer tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21
 focused renderer TextPath tests; five focused document TextPath tests; 297
 tools tests (290 unit, six end-to-end, and one ink oracle); and 598 GPUI checks
 (595 unit and three architecture), with one doctest ignored. Focused Agent
 coverage passed two canvas-selection request-framing checks; three attachment,
 one external-context, and nine queue-filter Agent UI checks; 49 mention checks;
-and one canvas-selection URI round trip. The package-scoped `./script/clippy`
-gate is green for `fanta-text`, `fanta-render`, `fanta-doc`, `fanta-tools`,
-`fanta-gpui`, `fig_viewer`, `acp_thread`, `agent`, and `agent_ui`, including its
-Cargo Machete check. No native build or hosted release artifact validates this
-slice. Color/bitmap-glyph
-path-only inner-shadow/background-blur effects are skipped; Dev mode and Voice
-input remain unavailable. None of this source-only work is a deployment,
+and one canvas-selection URI round trip. Candidate-scoped
+`./script/clippy -p fanta-gpui -p fig_viewer` is green, including Cargo Machete;
+the earlier wider gate remains evidence for the unchanged TextPath and Agent
+crates. The exact local build and bounded native evidence are retained in the
+correction record; no hosted release artifact validates this combined slice.
+Color/bitmap-glyph path-only inner-shadow/background-blur effects are skipped;
+Dev mode and Voice input remain unavailable. None of this work is a deployment,
 billing, or customer-release claim.
 
 Desktop `17de5eb` now has successful push and pull-request checks. Its local
