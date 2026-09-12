@@ -81,6 +81,7 @@ pub(crate) fn motion_keyframe_properties() -> Vec<SharedString> {
 pub(crate) struct ToolbarOptionInputs {
     pub playing: bool,
     pub looping: bool,
+    pub auto_keyframe: bool,
     pub time_comment_armed: bool,
     pub current_time_ms: u32,
     /// Duration of the active motion clip; `None` when the document has none.
@@ -322,9 +323,7 @@ impl ToolbarAdapter {
         let motion = MotionToolbarOptions {
             playing: options.playing,
             looping: options.looping,
-            // fig_viewer has no keyframe-recording mode; the toggle stays off
-            // and its intents are logged in `handle_toolbar_control_change`.
-            auto_keyframe: false,
+            auto_keyframe: options.auto_keyframe,
             time_comment_armed: options.time_comment_armed,
             current_time_ms: options.current_time_ms,
             // No clip means nothing can play: report a zero-length transport
@@ -1967,6 +1966,21 @@ mod echo_tests {
             assert_eq!(motion.duration_ms, 0);
         });
 
+        // Auto key cannot be enabled outside the Motion canvas. This request
+        // is rejected even though handling it completes the initial clip sync.
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAutoKeyframe,
+                value: ToolbarControlValue::Toggle(true),
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().auto_keyframe),
+            "a pre-Motion Auto key request must be rejected"
+        );
+
         // Entering Motion mode adopts the document's clip; its real duration
         // reaches the transport read model.
         view.update_in(cx, |view, _, cx| {
@@ -2020,6 +2034,39 @@ mod echo_tests {
             }),
             baseline + 1,
             "one change, one push"
+        );
+
+        // In Motion, the same request is accepted and the next host render
+        // echoes the new value through exactly one options push.
+        let before_accepted_auto_key = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter()
+                .expect("adapter")
+                .option_push_count()
+        });
+        toolbar.update_in(cx, |toolbar, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAutoKeyframe,
+                value: ToolbarControlValue::Toggle(true),
+            });
+            assert!(
+                !toolbar.motion_options().auto_keyframe,
+                "the controlled toggle must wait for the host echo"
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().auto_keyframe),
+            "the accepted auto-keyframe value must round-trip into the echoed options"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.gpui_toolbar_adapter()
+                    .expect("adapter")
+                    .option_push_count()
+            }),
+            before_accepted_auto_key + 1,
+            "one accepted Auto key change, one options push"
         );
     }
 

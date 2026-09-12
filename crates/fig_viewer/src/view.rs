@@ -8,10 +8,8 @@ use std::collections::HashSet;
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, BoundProp,
-    CanvasNode, Doc, Easing, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
-    MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue,
-    Transaction, Viewport,
+    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, IndexKey,
+    Interpolation, MotionEvaluation, MotionProperty, NodeData, NodeId, Operation, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -54,9 +52,9 @@ use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
 use crate::motion_edit::{
-    MotionKeyframeDragSession, delete_keyframe_operation, rename_clip_operation,
-    set_clip_duration_operation, set_keyframe_easing_operation,
-    set_keyframe_interpolation_operation,
+    MotionKeyframeDragSession, delete_keyframe_operation, evaluated_motion_value,
+    rename_clip_operation, set_clip_duration_operation, set_keyframe_easing_operation,
+    set_keyframe_interpolation_operation, upsert_motion_keyframe_operation,
 };
 use crate::motion_panel::{FantaMotionPanel, MotionPanelEvent};
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
@@ -252,6 +250,7 @@ pub struct FigView {
     code_workspace: Entity<FantaCodeWorkspace>,
     timeline_shell: Entity<TimelineShell>,
     active_motion_clip: Option<AnimationClipId>,
+    motion_auto_keyframe: bool,
     motion_keyframe_drag: Option<MotionKeyframeDragSession>,
     layers_sidebar_visible: bool,
     inspector_sidebar_visible: bool,
@@ -488,7 +487,13 @@ impl FigView {
         let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
         let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-        let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
+        let timeline_shell = cx.new(|cx| {
+            let mut timeline = TimelineShell::new();
+            timeline.set_authoring_enabled(false, cx);
+            timeline
+        });
+        let motion_sidebar =
+            cx.new(|cx| FantaMotionPanel::new(item.clone(), timeline_shell.clone(), window, cx));
         let motion_sidebar_subscription =
             cx.subscribe(&motion_sidebar, |_this, _, event: &MotionPanelEvent, cx| {
                 let event = *event;
@@ -502,11 +507,6 @@ impl FigView {
             cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
         let code_workspace =
             cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-        let timeline_shell = cx.new(|cx| {
-            let mut timeline = TimelineShell::new();
-            timeline.set_authoring_enabled(false, cx);
-            timeline
-        });
         let timeline_subscription =
             cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
                 this.handle_timeline_event(event.clone(), cx);
@@ -563,6 +563,7 @@ impl FigView {
             code_workspace,
             timeline_shell,
             active_motion_clip: None,
+            motion_auto_keyframe: false,
             motion_keyframe_drag: None,
             layers_sidebar_visible,
             inspector_sidebar_visible,
@@ -736,6 +737,9 @@ impl FigView {
                     // counter, so cached frames keyed by revision must go.
                     this.invalidate_canvas_cache();
                     this.motion_keyframe_drag = None;
+                    this.motion_auto_keyframe = false;
+                    this.motion_sidebar
+                        .update(cx, |panel, cx| panel.discard_continuous_edits(cx));
                     this.timeline_shell
                         .update(cx, |timeline, cx| timeline.cancel_authoring_gestures(cx));
                     this.active_motion_clip = None;
@@ -890,6 +894,9 @@ impl FigView {
         self.comment_state.clear_pending_motion_anchor();
         #[cfg(feature = "fanta-gpui-ui")]
         self.finish_gpui_design_edits(cx);
+        self.motion_sidebar
+            .update(cx, |panel, cx| panel.cancel_continuous_edits(cx));
+        self.set_motion_auto_keyframe_state(false, cx);
         self.cancel_motion_keyframe_drag(cx);
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.set_authoring_enabled(false, cx));
@@ -962,6 +969,8 @@ impl FigView {
 
     fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
         self.inspector_sidebar
+            .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+        self.motion_sidebar
             .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
         self.variables_workspace
             .update(cx, |workspace, cx| workspace.finish_value_edit(cx));
@@ -1079,6 +1088,7 @@ impl FigView {
         }
         self.finish_document_edits(cx);
         if workspace != EditorWorkspace::Canvas {
+            self.set_motion_auto_keyframe_state(false, cx);
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
@@ -1099,6 +1109,7 @@ impl FigView {
         }
         self.finish_document_edits(cx);
         if mode != EditorMode::Motion {
+            self.set_motion_auto_keyframe_state(false, cx);
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
@@ -1110,6 +1121,64 @@ impl FigView {
         self.sync_motion_timeline(cx);
         self.invalidate_canvas_cache();
         cx.notify();
+    }
+
+    fn set_motion_auto_keyframe_state(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let changed = self.motion_auto_keyframe != enabled;
+        self.motion_auto_keyframe = enabled;
+        self.motion_sidebar
+            .update(cx, |panel, cx| panel.set_auto_keyframe(enabled, cx));
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn set_motion_auto_keyframe(&mut self, enabled: bool, cx: &mut Context<Self>) -> Result<()> {
+        if !enabled {
+            self.motion_sidebar
+                .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+            self.set_motion_auto_keyframe_state(false, cx);
+            return Ok(());
+        }
+        if self.motion_auto_keyframe {
+            return Ok(());
+        }
+
+        self.finish_document_edits(cx);
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas
+                && self.editor_mode(cx) == EditorMode::Motion,
+            "open the Motion canvas first"
+        );
+        let active_clip = self
+            .active_motion_clip
+            .context("create an animation clip first")?;
+        let panel_owner = self.motion_sidebar.entity_id();
+        {
+            let item = self.item.read(cx);
+            anyhow::ensure!(item.is_editable(), "the canvas is read-only");
+            anyhow::ensure!(
+                item.can_preview_for_owner(panel_owner) && !item.content_preview_active(),
+                "finish the active canvas preview first"
+            );
+            let document = item.document().context("the document is still loading")?;
+            anyhow::ensure!(
+                document.doc.motion.clip(active_clip).is_some(),
+                "the active animation no longer exists"
+            );
+            let node = single_selection(&document.doc)
+                .context("select one layer before turning on Auto key")?;
+            anyhow::ensure!(
+                document.doc.scene.get(node).is_some(),
+                "the selected layer no longer exists"
+            );
+        }
+
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.pause(cx));
+        self.set_motion_auto_keyframe_state(true, cx);
+        self.sync_motion_timeline(cx);
+        Ok(())
     }
 
     pub(crate) fn motion_evaluation(
@@ -1288,6 +1357,8 @@ impl FigView {
             }
             TimelineEvent::PlaybackChanged(playing) => {
                 if playing && self.timeline_shell.read(cx).is_playing() {
+                    self.motion_sidebar
+                        .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
                     self.comment_state.clear_pending_motion_anchor();
                 }
                 self.invalidate_canvas_cache();
@@ -1429,6 +1500,7 @@ impl FigView {
         interpolation: Interpolation,
         cx: &mut Context<Self>,
     ) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1448,6 +1520,7 @@ impl FigView {
         easing: Easing,
         cx: &mut Context<Self>,
     ) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1706,6 +1779,7 @@ impl FigView {
         keyframe: TimelineKeyframeSelection,
         cx: &mut Context<Self>,
     ) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1722,6 +1796,7 @@ impl FigView {
     }
 
     fn rename_motion_clip(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1738,6 +1813,7 @@ impl FigView {
     }
 
     fn set_motion_clip_duration(&mut self, duration_us: i64, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1753,6 +1829,8 @@ impl FigView {
     }
 
     fn create_motion_clip(&mut self, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
+        self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
         }
@@ -1799,73 +1877,39 @@ impl FigView {
         let preview_owner = cx.entity_id();
         let result = self.item.update(cx, |item, cx| {
             item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                let result: Result<()> = (|| {
+                let result: Result<bool> = (|| {
                     let node_id = single_selection(&document.doc)
                         .context("select one layer before adding a keyframe")?;
-                    let node = motion_source_node(&document.doc, node_id)
-                        .context("the selected layer cannot be animated")?;
-                    let motion_property = motion_property(property);
-                    let value = motion_value(&node, motion_property).with_context(|| {
+                    let (_, value) = evaluated_motion_value(
+                        &document.doc,
+                        clip_id,
+                        node_id,
+                        property,
+                        playhead_ms,
+                    )
+                    .with_context(|| {
                         format!(
                             "{} is not available for the selected layer",
                             property.label()
                         )
                     })?;
-                    let target = MotionTarget::new(node_id, motion_property);
-                    let clip = document
-                        .doc
-                        .motion
-                        .clip(clip_id)
-                        .context("the active animation no longer exists")?;
-                    let time_ms = playhead_ms.min(clip.duration_ms);
-                    let mut transaction = Transaction::new("Add Keyframe");
-                    let track_id = if let Some(track) = clip.track_for_target(target) {
-                        track.id
-                    } else {
-                        let track_id = AnimationTrackId::new();
-                        transaction.push(Operation::SetAnimationTrack {
-                            clip: clip_id,
-                            track: track_id,
-                            old: None,
-                            new: Some(Box::new(AnimationTrack::new(track_id, target))),
-                        });
-                        track_id
+                    let Some(operation) = upsert_motion_keyframe_operation(
+                        &document.doc,
+                        clip_id,
+                        node_id,
+                        property,
+                        playhead_ms,
+                        value,
+                    ) else {
+                        return Ok(false);
                     };
-                    let existing = clip
-                        .tracks
-                        .get(&track_id)
-                        .and_then(|track| {
-                            track
-                                .keyframes
-                                .values()
-                                .find(|keyframe| keyframe.time_ms == time_ms)
-                        })
-                        .cloned();
-                    let keyframe_id = existing
-                        .as_ref()
-                        .map(|keyframe| keyframe.id)
-                        .unwrap_or_else(KeyframeId::new);
-                    transaction.push(Operation::SetKeyframe {
-                        clip: clip_id,
-                        track: track_id,
-                        target,
-                        keyframe: keyframe_id,
-                        old: existing,
-                        new: Some(Keyframe {
-                            id: keyframe_id,
-                            time_ms,
-                            value,
-                            interpolation: Interpolation::Linear,
-                            easing: Easing::EaseInOut,
-                        }),
-                    });
                     document
                         .doc
-                        .apply_transaction(transaction)
-                        .context("applying the keyframe transaction")?;
-                    Ok(())
+                        .apply(operation)
+                        .context("applying the keyframe")?;
+                    Ok(true)
                 })();
-                let change = if result.is_ok() {
+                let change = if result.as_ref().is_ok_and(|changed| *changed) {
                     DocChange::Content
                 } else {
                     DocChange::None
@@ -1897,6 +1941,9 @@ impl FigView {
             self.active_motion_clip = None;
             TimelineViewModel::empty()
         };
+        if !authoring_enabled || self.active_motion_clip.is_none() {
+            self.motion_auto_keyframe = false;
+        }
         if self.active_motion_clip != previous_clip {
             self.comment_state.clear_pending_motion_anchor();
             self.comment_state.hovered_pin = None;
@@ -1908,10 +1955,14 @@ impl FigView {
             timeline.set_model(model, cx);
         });
         let active_clip = self.active_motion_clip;
+        let auto_keyframe = self.motion_auto_keyframe;
         let motion_sidebar = self.motion_sidebar.downgrade();
         cx.defer(move |cx| {
             motion_sidebar
-                .update(cx, |panel, cx| panel.set_active_clip(active_clip, cx))
+                .update(cx, |panel, cx| {
+                    panel.set_active_clip(active_clip, cx);
+                    panel.set_auto_keyframe(auto_keyframe, cx);
+                })
                 .log_err();
         });
     }
@@ -5997,59 +6048,6 @@ fn place_ingested_images(
     Ok(placed)
 }
 
-fn motion_property(property: TimelineProperty) -> MotionProperty {
-    match property {
-        TimelineProperty::PositionX => MotionProperty::PositionX,
-        TimelineProperty::PositionY => MotionProperty::PositionY,
-        TimelineProperty::Rotation => MotionProperty::Rotation,
-        TimelineProperty::ScaleX => MotionProperty::ScaleX,
-        TimelineProperty::ScaleY => MotionProperty::ScaleY,
-        TimelineProperty::Opacity => MotionProperty::bound(BoundProp::Opacity),
-        TimelineProperty::FillColor => MotionProperty::bound(BoundProp::FillColor { index: 0 }),
-    }
-}
-
-fn motion_value(
-    node: &fanta_doc::CanvasNode,
-    property: MotionProperty,
-) -> Option<ResolvedVarValue> {
-    match property {
-        MotionProperty::Bound { prop } => prop.read_resolved(node),
-        MotionProperty::PositionX
-        | MotionProperty::PositionY
-        | MotionProperty::Rotation
-        | MotionProperty::ScaleX
-        | MotionProperty::ScaleY => {
-            let transform = MotionTransform::decompose(node.transform)?;
-            let value = match property {
-                MotionProperty::PositionX => transform.position[0],
-                MotionProperty::PositionY => transform.position[1],
-                MotionProperty::Rotation => transform.rotation_radians,
-                MotionProperty::ScaleX => transform.scale[0],
-                MotionProperty::ScaleY => transform.scale[1],
-                MotionProperty::Bound { .. } => return None,
-            };
-            Some(ResolvedVarValue::Float { value })
-        }
-    }
-}
-
-fn motion_source_node(doc: &fanta_doc::Doc, node_id: NodeId) -> Option<fanta_doc::CanvasNode> {
-    let mut node = doc.scene.get(node_id)?.clone();
-    for (property, variable) in node.bindings.clone() {
-        if let Some(value) = fanta_doc::resolve_bound_value(
-            &doc.variables,
-            &doc.scene,
-            node_id,
-            &doc.active_modes,
-            variable,
-        ) {
-            property.apply_resolved(&mut node, value);
-        }
-    }
-    Some(node)
-}
-
 fn motion_property_label(property: MotionProperty) -> &'static str {
     match property {
         MotionProperty::PositionX => "Position X",
@@ -6445,7 +6443,14 @@ impl Item for FigView {
             let (layers_sidebar, inspector_sidebar) =
                 Self::new_embedded_sidebars(&project, window, cx);
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-            let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
+            let timeline_shell = cx.new(|cx| {
+                let mut timeline = TimelineShell::new();
+                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
+                timeline.set_model(timeline_model, cx);
+                timeline
+            });
+            let motion_sidebar = cx
+                .new(|cx| FantaMotionPanel::new(item.clone(), timeline_shell.clone(), window, cx));
             motion_sidebar.update(cx, |panel, cx| {
                 panel.set_active_clip(active_motion_clip, cx)
             });
@@ -6462,12 +6467,6 @@ impl Item for FigView {
                 cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
             let code_workspace =
                 cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-            let timeline_shell = cx.new(|cx| {
-                let mut timeline = TimelineShell::new();
-                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
-                timeline.set_model(timeline_model, cx);
-                timeline
-            });
             let timeline_subscription =
                 cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
                     this.handle_timeline_event(event.clone(), cx);
@@ -6485,6 +6484,7 @@ impl Item for FigView {
                 code_workspace,
                 timeline_shell,
                 active_motion_clip,
+                motion_auto_keyframe: false,
                 motion_keyframe_drag: None,
                 layers_sidebar_visible,
                 inspector_sidebar_visible,
@@ -6631,13 +6631,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use fanta_doc::{
-        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, PathData, Stroke,
-        TextNode, Transform2D, VarValue, Variable, VariableCollection, VariableCollectionId,
-        VariableId, VariableType, VectorNode,
+        AnimationTrack, AnimationTrackId, CanvasNode, Color, GroupNode, Keyframe, KeyframeId, Mode,
+        ModeId, MotionTarget, NodeData, Operation, PathData, ResolvedVarValue, Stroke, TextNode,
+        Transform2D, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
+        VariableType, VectorNode,
     };
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
+
+    use crate::motion_edit::{motion_property, motion_value};
 
     #[cfg(target_os = "macos")]
     async fn canvas_video_fixture(
@@ -7371,6 +7374,46 @@ mod tests {
         doc.add_page(root);
         doc.set_active_page(Some(root));
         doc
+    }
+
+    fn doc_with_auto_key_target(position_x: f64) -> (fanta_doc::Doc, NodeId, AnimationClipId) {
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            40.0,
+            Color::BLACK,
+        )));
+        rectangle.name = "Animated layer".to_owned();
+        rectangle.parent = Some(page);
+        rectangle.transform = Transform2D::translation(position_x, 34.0);
+        let node = rectangle.id;
+        doc.apply(Operation::create_node(rectangle))
+            .expect("create animated layer");
+        doc.selection.replace_with([node]);
+        let clip = AnimationClipId::from_u128(0xA170);
+        doc.motion
+            .clips
+            .insert(clip, AnimationClip::new(clip, "Auto key", 1_000));
+        doc.history = Default::default();
+        (doc, node, clip)
+    }
+
+    fn evaluated_position_x(
+        doc: &fanta_doc::Doc,
+        clip: AnimationClipId,
+        node: NodeId,
+        time_ms: u32,
+    ) -> f64 {
+        let (_, value) =
+            evaluated_motion_value(doc, clip, node, TimelineProperty::PositionX, time_ms)
+                .expect("position X evaluates");
+        let ResolvedVarValue::Float { value } = value else {
+            panic!("position X must evaluate to a float");
+        };
+        value
     }
 
     fn text_selection_doc(wrapped: bool) -> (fanta_doc::Doc, NodeId, Option<NodeId>) {
@@ -8753,15 +8796,19 @@ mod tests {
         doc.apply(Operation::create_node(node))
             .expect("create bound node");
 
-        let resolved = motion_source_node(&doc, node_id).expect("resolved node");
+        let clip_id = AnimationClipId::new();
+        doc.motion.clips.insert(
+            clip_id,
+            AnimationClip::new(clip_id, "Variable sampling", 1_000),
+        );
+        let (_, resolved) =
+            evaluated_motion_value(&doc, clip_id, node_id, TimelineProperty::FillColor, 0)
+                .expect("resolved value");
         assert_eq!(
-            motion_value(
-                &resolved,
-                MotionProperty::bound(BoundProp::FillColor { index: 0 })
-            ),
-            Some(ResolvedVarValue::Color {
+            resolved,
+            ResolvedVarValue::Color {
                 value: Color::rgb(255, 0, 0)
-            })
+            }
         );
     }
 
@@ -9024,6 +9071,273 @@ mod tests {
             assert_eq!(view.last_seen_root, Some(page_two));
             assert_eq!(view.selected_page_root, Some(page_two));
             assert_eq!(view.selected_page_index, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn motion_auto_key_previews_live_commits_once_and_only_then_autosaves(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let directory = tempfile::tempdir().expect("temporary auto-key project");
+        let root = directory.path().join("Design");
+        let (doc, node, clip) = doc_with_auto_key_target(1.234_567);
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("write the baseline project");
+        let item_for_window = item.clone();
+        let window =
+            cx.add_window(move |window, cx| FigView::new(item_for_window, project, window, cx));
+        let view = window.entity(cx).expect("auto-key canvas");
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("enable Auto key");
+        });
+        cx.run_until_parked();
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1_200.), px(800.)));
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.run_until_parked();
+
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.motion.clips[&clip].tracks.is_empty());
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 1.234_567).abs() < 1e-12);
+        });
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field after untouched edit");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_input("42");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 42.0).abs() < 1e-12);
+        });
+
+        visual.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::SelectAll), cx);
+        });
+        visual.simulate_input(&crate::properties_ops::format_number(1.234_567));
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.motion.clips[&clip].tracks.is_empty());
+            assert!(item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 1.234_567).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_none()));
+        visual.cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        visual.run_until_parked();
+        let (during_restored_preview, _) =
+            fanta_format::read_project_tree(&root).expect("read baseline during restored preview");
+        assert!(
+            during_restored_preview.motion.clips[&clip]
+                .tracks
+                .is_empty()
+        );
+
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.motion.clips[&clip].tracks.is_empty());
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 1.234_567).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_none()));
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field after restored edit");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_input("42");
+        visual.run_until_parked();
+
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 42.0).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_none()));
+        visual.cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        visual.run_until_parked();
+        let (during_preview, _) =
+            fanta_format::read_project_tree(&root).expect("read project during preview");
+        assert!(during_preview.motion.clips[&clip].tracks.is_empty());
+
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 42.0).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_some()));
+
+        visual.cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        visual.run_until_parked();
+        let (saved, _) = fanta_format::read_project_tree(&root).expect("read saved auto key");
+        assert!((evaluated_position_x(&saved, clip, node, 0) - 42.0).abs() < 1e-12);
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field after commit");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_input("55");
+        let timeline = view.read_with(&visual.cx, |view, _| view.timeline_shell.clone());
+        timeline.update(&mut visual.cx, |timeline, cx| timeline.seek_to(500_000, cx));
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 2);
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 55.0).abs() < 1e-12);
+        });
+    }
+
+    #[gpui::test]
+    async fn motion_auto_key_is_gated_and_disarms_at_context_boundaries(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, node, clip) = doc_with_auto_key_target(12.0);
+        let page = doc.active_page().expect("active page");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Auto-key-lifecycle.fig"),
+            doc,
+            cx,
+        );
+        let item_for_window = item.clone();
+        let window =
+            cx.add_window(move |window, cx| FigView::new(item_for_window, project, window, cx));
+        let view = window.entity(cx).expect("auto-key lifecycle canvas");
+
+        view.update(cx, |view, cx| {
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+            assert!(!view.motion_auto_keyframe);
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("enable Auto key in Motion");
+            assert!(view.motion_auto_keyframe);
+        });
+        cx.run_until_parked();
+
+        let split = window
+            .update(cx, |view, window, cx| view.clone_on_split(None, window, cx))
+            .expect("clone view")
+            .await
+            .expect("split view");
+        view.read_with(cx, |view, _| assert!(view.motion_auto_keyframe));
+        split.read_with(cx, |view, _| assert!(!view.motion_auto_keyframe));
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Design, cx);
+            assert!(!view.motion_auto_keyframe);
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key");
+            view.set_editor_workspace(EditorWorkspace::Variables, cx);
+            assert!(!view.motion_auto_keyframe);
+            view.set_editor_workspace(EditorWorkspace::Canvas, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key on canvas");
+        });
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.motion_auto_keyframe);
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        cx.run_until_parked();
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([node, page]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([node]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key after valid selection");
+        });
+
+        item.update(cx, |_, cx| cx.emit(FigItemEvent::StateChanged));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.motion_auto_keyframe);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key after state refresh");
+        });
+
+        let clip_snapshot = item.read_with(cx, |item, _| {
+            item.doc().expect("ready document").motion.clips[&clip].clone()
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::DeleteAnimationClip {
+                    id: clip,
+                    clip: Box::new(clip_snapshot),
+                },
+                cx,
+            )
+            .expect("delete active clip");
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.motion_auto_keyframe);
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
         });
     }
 
@@ -10406,6 +10720,7 @@ impl FigView {
         crate::gpui_adapters::toolbar::ToolbarOptionInputs {
             playing: timeline.is_playing(),
             looping: timeline.loop_playback_enabled(),
+            auto_keyframe: self.motion_auto_keyframe,
             time_comment_armed: self.comment_state.motion_time_comment_active(),
             current_time_ms,
             duration_ms,
@@ -10981,6 +11296,10 @@ impl FigView {
         use fanta_gpui::toolbar::{ToolbarControlValue, ToolbarSecondaryControl};
         match (control, value) {
             (ToolbarSecondaryControl::MotionPlayPause, ToolbarControlValue::Toggle(playing)) => {
+                if *playing {
+                    self.motion_sidebar
+                        .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+                }
                 self.timeline_shell
                     .update(cx, |timeline, cx| timeline.set_playing(*playing, cx));
                 cx.notify();
@@ -11032,10 +11351,10 @@ impl FigView {
                     Err(error) => show_canvas_notice(error.user_message(style), window, cx),
                 }
             }
-            (ToolbarSecondaryControl::MotionAutoKeyframe, _) => {
-                // Echoing "recording" without a recorder would lie; leave the
-                // chip off until a keyframe-recording mode exists.
-                notify_unavailable("Auto keyframe recording", window, cx);
+            (ToolbarSecondaryControl::MotionAutoKeyframe, ToolbarControlValue::Toggle(enabled)) => {
+                if let Err(error) = self.set_motion_auto_keyframe(*enabled, cx) {
+                    show_canvas_notice(format!("Could not turn on Auto key: {error}"), window, cx);
+                }
             }
             (ToolbarSecondaryControl::DevReadyForDevelopment, _) => {
                 notify_unavailable("Marking a design ready for dev", window, cx);
