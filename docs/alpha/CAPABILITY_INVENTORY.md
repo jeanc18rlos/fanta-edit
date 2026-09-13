@@ -23,9 +23,9 @@ notarization were used.
 
 | Surface | Implemented | Automated | Native | Production | Release boundary |
 |---|---:|---:|---:|---:|---|
-| Canvas selection and drawing | Yes | Yes | Partial | N/A | Move, Hand, Scale, Path Select, Node Edit, shapes, Pen, Pencil, Frame, Section, Slice, Text, Comment, and Text on Path are wired. Text on Path conservatively converts one eligible selected vector in place, enters inline editing, and uses cluster-derived curved caret, hit, selection, and visual-bounds geometry. Scale and Path Select have native history/reopen evidence; exact `f9a67f4` has native inspector, text-edit, history, and reopen evidence; the final installer remains unverified. |
+| Canvas selection and drawing | Yes | Yes | Partial | N/A | Move, Inspect, Hand, Scale, Path Select, Node Edit, shapes including Arrow, Pen, Pencil, Frame, Section, Slice, Text, Comment, Text on Path, and local image/MP4 placement are wired. Text on Path conservatively converts one eligible selected vector in place, enters inline editing, and uses cluster-derived curved caret, hit, selection, and visual-bounds geometry. Scale and Path Select have native history/reopen evidence; exact `f9a67f4` has native inspector, text-edit, history, and reopen evidence; the final installer remains unverified. |
 | Toolbar chrome and editing commands | Yes | Yes | Partial | N/A | Resources, Actions, zoom, panel toggles, undo/redo, clipboard, duplicate/delete/select-all, Group, Ungroup, Frame Selection, Present, Design/Motion, and AI routes are wired. Fresh exact-`12e2e4c` captures verify centered Design/Motion layouts and narrow-window zoom collapse; the three old `9d92b30` images show the wrong app and remain rejected. Other `9d92b30` interaction evidence covers flyout isolation, Ask AI, and searchable Actions. The remaining editing-command and menu matrix still needs the final artifact pass. |
-| Roadmap toolbar controls | Partial | Yes | Partial | N/A | Text on Path and contextual Motion keyframing are implemented in source candidate `895b6b7`; Motion time comments are implemented in the current source tree. Auto key supports the seven At playhead Motion fields with guarded preview/commit persistence. Arrow, direct Image/Video placement, Annotation, Measure, and Dev mode/tools still report that they are unavailable; Motion Path is hidden and unimplemented. Bounded TextPath, Auto key, and time-comment native checks exist; remaining native workflows and the final installer are separate gates. |
+| Roadmap toolbar controls | Partial | Yes | Partial | N/A | Text on Path and contextual Motion keyframing are implemented in source candidate `895b6b7`; Motion time comments are implemented in the current source tree. Auto key supports the seven At playhead Motion fields with guarded preview/commit persistence. Arrow drawing and local image/MP4 placement are implemented with native history, export, and reopen evidence. Standalone Inspect is available in Design’s Move menu with read-only properties and selection. Annotation, persistent Measure, and full Dev mode/readiness remain unavailable; Motion Path is hidden and unimplemented. Bounded TextPath, Auto key, and time-comment native checks exist; remaining native workflows and the final installer are separate gates. |
 | Application menus | Yes | Partial | Unknown | N/A | Fanta, File, Edit, View, Window, and Help are declared and routed in source. The packaged-installer menu pass is outstanding. |
 | Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. The TextPath inspector projects its exact kind/name; font family, Regular/Italic style, weight, size, line height, pixel letter spacing, start/center/end alignment, and underline/strikethrough; side/orientation; Forward/Reverse direction; and Start offset as a percentage of the current path length. Its synthetic glyph Fill permits RGB and opacity edits only; paint add, style, visibility, remove, and reorder actions are gated. Direction and offset use typed, document-backed actions; disabled non-applicable typography controls remain visible. See the current validation record for source gates. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Text on Path and the remaining paint/blend matrix still need final-artifact native coverage. |
 | Prototype mode | Yes | Yes | Unknown | N/A | Triggers, navigation/overlay/scroll actions, variables/components, transitions, flows, and presentation runtime are implemented. |
@@ -67,8 +67,12 @@ change state, produce output, or give an explicit unavailable message.
    cannot provide an exact vector silhouette, so path-silhouette-dependent
    inner-shadow and background-blur effects are skipped instead of using a
    false rectangle.
-4. Dev mode and its inspect, measure, annotation, and readiness controls remain
-   unavailable. The Text on Path fields in the Design inspector are not Dev mode.
+4. Standalone Inspect is available in the Design Move menu. It permits layer
+   selection and property copying, blocks authoring until an explicit tool/mode
+   exit, and preserves pending drafts by refusing entry. Locked layers remain
+   selectable through Layers. Size and gap guides are transient world-space
+   measurements; persistent Measure, Annotation, and full Dev/readiness remain
+   unfinished.
 5. Voice input remains unavailable; no recorder, permission, transcription, or
    cancellation lifecycle is implemented.
 
@@ -179,15 +183,16 @@ These controls already decline explicitly, are deliberately read-only, or stay
 hidden because their document behavior does not exist. They should stay out of
 release claims, but they are not silent-handler bugs:
 
-- Dev mode/tools, direct media placement tools, Annotation, Measure, and
-  auto-keyframe decline explicitly. Motion Path is hidden and unimplemented.
+- Full Dev mode/readiness, Annotation, and persistent Measure decline explicitly.
+  Standalone Inspect, Arrow, and local media placement are implemented. Motion
+  Path is hidden; direct-canvas auto-keyframe recording remains unimplemented.
 - Text on Path conversion of rounded, clipped, degenerate, hidden/locked, or
   ambiguously/unsupported-painted vectors; those cases decline without changing
-  the document. Direction editing, exact glyph-internal carets within one
+  the document. Exact glyph-internal carets within one
   multi-grapheme shaping cluster, structural edits to the synthetic glyph Fill,
   and color/bitmap-glyph path-only inner or background effects remain
   unavailable. Missing source-cluster geometry fails closed.
-- Layout Grid, inspector Export and Selection sections, aspect lock,
+- Layout Grid, the inspector Selection section, aspect lock,
   constraints, single-node arrange, resize-to-fit, grid auto layout, layout
   guides, unsupported effect families, Pattern/Image/Video/Shader paint
   payloads, bound paint payloads, unsupported or nonidentity-transform

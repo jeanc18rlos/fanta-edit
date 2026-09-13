@@ -223,6 +223,7 @@ pub struct LayersPanel {
     /// the tree or the expansion set changes — never per frame.
     visible_rows: Vec<usize>,
     panel_expanded: bool,
+    read_only: bool,
     selected_node_ids: HashSet<SharedString>,
     expanded_node_ids: HashSet<SharedString>,
     editing: Option<LayerEditorTarget>,
@@ -274,6 +275,7 @@ impl LayersPanel {
             arena,
             visible_rows,
             panel_expanded: true,
+            read_only: false,
             selected_node_ids: HashSet::new(),
             expanded_node_ids,
             editing: None,
@@ -289,6 +291,18 @@ impl LayersPanel {
             drop_validator: None,
             _subscriptions: vec![subscription],
         }
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            self.menu = None;
+            cx.notify();
+        }
+    }
+
+    pub fn has_pending_authoring(&self, _cx: &App) -> bool {
+        self.editing.is_some()
     }
 
     /// Replaces the host-controlled tree.

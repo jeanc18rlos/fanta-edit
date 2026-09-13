@@ -15,6 +15,103 @@ use super::{events::layer_drop_position, menu::menu_sections_for, *};
 
 actions!(layers_input_regression, [CompetingDeleteSelection]);
 
+#[gpui::test]
+fn read_only_layers_keep_selection_and_copy_without_authoring(cx: &mut TestAppContext) {
+    let (host, actions, cx) = setup(cx);
+    let panel = panel(&host, cx);
+    panel.update(cx, |panel, cx| panel.set_read_only(true, cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("layers-lock-group").is_none());
+    assert!(cx.debug_bounds("layers-visibility-image").is_none());
+    double_click(cx, "layers-row-group");
+    assert!(!cx.read(|app| panel.read(app).has_pending_authoring(app)));
+    assert!(actions.borrow().iter().any(|action| matches!(
+        action,
+        LayersPanelAction::SelectRequested { node_id, .. } if node_id == "group"
+    )));
+    actions.borrow_mut().clear();
+    cx.simulate_keystrokes("shift-secondary-h shift-secondary-l");
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            let node = panel
+                .arena
+                .get(panel.arena.index_of(&"group".into()).expect("group"))
+                .expect("group node")
+                .clone();
+            panel.request_visibility(&node, cx);
+            panel.request_lock(&node, cx);
+            panel.begin_rename(node.id, node.title, window, cx);
+            panel.request_move(
+                "group".into(),
+                "section".into(),
+                window.mouse_position(),
+                cx,
+            );
+        });
+    });
+    assert!(actions.borrow().is_empty());
+    secondary_click(cx, "layers-row-text");
+    assert!(cx.debug_bounds("layers-menu-rename").is_none());
+    assert!(cx.debug_bounds("layers-menu-show-hide").is_none());
+    actions.borrow_mut().clear();
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.activate_menu_action(LayersPanelContextAction::Rename, window, cx);
+        });
+    });
+    assert!(actions.borrow().is_empty());
+    click(cx, "layers-menu-copy", Modifiers::none());
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[LayersPanelAction::ContextActionRequested {
+            node_id: "text".into(),
+            action: LayersPanelContextAction::Copy,
+        }]
+    );
+    panel.update(cx, |panel, cx| panel.set_read_only(false, cx));
+    cx.run_until_parked();
+    double_click(cx, "layers-row-text");
+    assert!(cx.read(|app| panel.read(app).has_pending_authoring(app)));
+}
+
+#[gpui::test]
+fn read_only_layers_preserve_pending_rename_drafts(cx: &mut TestAppContext) {
+    let (host, actions, cx) = setup(cx);
+    let panel = panel(&host, cx);
+    double_click(cx, "layers-row-text");
+    actions.borrow_mut().clear();
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.rename_input.update(cx, |input, cx| {
+                input.set_value("  pending layer name  ", window, cx);
+            });
+            panel.set_read_only(true, cx);
+            panel.commit_rename(false, window, cx);
+            assert!(panel.has_pending_authoring(cx));
+            assert_eq!(
+                panel.rename_input.read(cx).value(),
+                "  pending layer name  "
+            );
+        });
+    });
+    assert!(actions.borrow().is_empty());
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.set_read_only(false, cx);
+            panel.commit_rename(true, window, cx);
+            assert!(!panel.has_pending_authoring(cx));
+        });
+    });
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[LayersPanelAction::RenameRequested {
+            node_id: "text".into(),
+            title: "pending layer name".into(),
+        }]
+    );
+}
+
 type Host = Entity<ProbeHost<LayersPanel, LayersPanelAction>>;
 
 fn fixture_nodes() -> Vec<LayersPanelItem> {

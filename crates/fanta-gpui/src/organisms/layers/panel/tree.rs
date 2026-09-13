@@ -186,6 +186,9 @@ impl LayersPanel {
         pointer: Point<Pixels>,
         cx: &App,
     ) -> Option<LayersPanelDropPosition> {
+        if self.read_only {
+            return None;
+        }
         let dragged_index = self.arena.index_of(dragged)?;
         let target_index = self.arena.index_of(target)?;
         if self.arena.is_within(target_index, dragged_index) {
@@ -286,7 +289,8 @@ impl LayersPanel {
         .pl(self.row_indent(node.depth) + px(4.))
         .pr_1()
         .text_xs()
-        .cursor_move()
+        .when(self.read_only, |row| row.cursor_pointer())
+        .when(!self.read_only, |row| row.cursor_move())
         .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.7)))
         .when(within_hovered_group, |row| {
             row.bg(cx.theme().sidebar_accent.opacity(0.32))
@@ -322,8 +326,10 @@ impl LayersPanel {
         }));
 
         row_element
-            .on_drag(drag, |drag, _, _, cx| {
-                cx.new(|_| LayerDragPreview { drag: drag.clone() })
+            .when(!self.read_only, |row| {
+                row.on_drag(drag, |drag, _, _, cx| {
+                    cx.new(|_| LayerDragPreview { drag: drag.clone() })
+                })
             })
             // Validity is decided from the arena and the host validator; gpui
             // applies the `drag_over` treatment only where this says yes, so
@@ -389,7 +395,7 @@ impl LayersPanel {
                 if event.is_keyboard() {
                     return;
                 }
-                if event.click_count() >= 2 {
+                if event.click_count() >= 2 && !this.read_only {
                     this.begin_rename(row_node.id.clone(), row_node.title.clone(), window, cx);
                     return;
                 }
@@ -461,8 +467,11 @@ impl LayersPanel {
                     )),
             )
             .child(truncating_label(node.title.clone()))
-            .child(self.render_lock_control(row, &node, group_name.clone(), cx))
-            .child(self.render_visibility_control(row, &node, group_name, cx))
+            .when(!self.read_only, |element| {
+                element
+                    .child(self.render_lock_control(row, &node, group_name.clone(), cx))
+                    .child(self.render_visibility_control(row, &node, group_name, cx))
+            })
             .child(track_bounds(cx.entity(), move |this, bounds| {
                 this.node_row_bounds.insert(bounds_id.clone(), bounds);
             }))

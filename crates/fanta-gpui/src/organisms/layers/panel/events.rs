@@ -219,6 +219,9 @@ impl LayersPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         self.menu = None;
         self.editing = Some(LayerEditorTarget {
             node_id,
@@ -238,6 +241,9 @@ impl LayersPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let Some(target) = self.editing.take() else {
             return;
         };
@@ -306,6 +312,9 @@ impl LayersPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only && !Self::context_action_is_read_only(action) {
+            return;
+        }
         let Some(menu) = self.menu.take() else {
             return;
         };
@@ -339,6 +348,9 @@ impl LayersPanel {
     }
 
     pub(super) fn request_visibility(&mut self, node: &LayerNode, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         cx.emit(LayersPanelAction::VisibilityChanged {
             node_id: node.id.clone(),
             visible: !node.visible,
@@ -347,6 +359,9 @@ impl LayersPanel {
     }
 
     pub(super) fn request_lock(&mut self, node: &LayerNode, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         cx.emit(LayersPanelAction::LockChanged {
             node_id: node.id.clone(),
             locked: !node.locked,

@@ -288,6 +288,7 @@ impl ToolbarToolGroup {
                 ToolbarTool::Hand,
                 ToolbarTool::Scale,
                 ToolbarTool::PathSelect,
+                ToolbarTool::Inspect,
             ],
             Self::Region => &[ToolbarTool::Frame, ToolbarTool::Section, ToolbarTool::Slice],
             Self::Shape => &[
@@ -1021,6 +1022,20 @@ mod tests {
     fn design_mode_exposes_the_resources_tool() {
         assert!(ToolbarTool::Resources.is_available_in(ToolbarMode::Design));
         assert_eq!(ToolbarTool::Resources.shortcut(), Some("⇧ I"));
+    }
+
+    #[test]
+    fn inspect_is_reachable_in_the_move_group_and_preserves_its_active_face() {
+        assert!(ToolbarTool::Inspect.is_available_in(ToolbarMode::Design));
+        assert!(
+            ToolbarToolGroup::Move
+                .tools()
+                .contains(&ToolbarTool::Inspect)
+        );
+        assert_eq!(
+            ToolbarToolGroup::Move.display_tool(ToolbarTool::Inspect),
+            ToolbarTool::Inspect
+        );
     }
 
     #[test]

@@ -34,7 +34,7 @@ use workspace::{
 
 use crate::canvas::{
     CanvasElement, RenderedCanvas, authored_local_bounds, bounds_size, evaluated_hit_test_screen,
-    precise_hit_test_screen, screen_position_in_bounds,
+    inspect_hit_test_screen, precise_hit_test_screen, screen_position_in_bounds,
 };
 use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
@@ -136,6 +136,8 @@ actions!(
         NudgeDown,
         /// Activate the move/select tool.
         ActivateSelectTool,
+        /// Inspect layers and properties without editing the design.
+        ActivateInspectTool,
         /// Activate the hand (pan) tool.
         ActivateHandTool,
         /// Activate the rectangle tool.
@@ -189,6 +191,7 @@ actions!(
 fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
     match kind {
         ToolKind::Select => Box::new(ActivateSelectTool),
+        ToolKind::Inspect => Box::new(ActivateInspectTool),
         ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
         ToolKind::NodeEdit => Box::new(ActivateNodeEditTool),
         ToolKind::Hand => Box::new(ActivateHandTool),
@@ -916,6 +919,9 @@ impl FigView {
         if !self.item.read(cx).source_edit_locked() {
             return;
         }
+        if self.is_inspecting() {
+            return;
+        }
 
         self.comment_state.clear_pending_motion_anchor();
         #[cfg(feature = "fanta-gpui-ui")]
@@ -1108,6 +1114,9 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
+        if self.is_inspecting() {
+            self.activate_tool(ToolKind::Select, cx);
+        }
         self.invalidate_local_media_origin();
         self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && workspace != EditorWorkspace::Canvas {
@@ -1129,6 +1138,9 @@ impl FigView {
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
         if self.editor_mode(cx) == mode {
             return;
+        }
+        if self.is_inspecting() {
+            self.activate_tool(ToolKind::Select, cx);
         }
         self.invalidate_local_media_origin();
         self.comment_state.clear_pending_motion_anchor();
@@ -2053,7 +2065,11 @@ impl FigView {
     }
 
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
-        self.item.read(cx).is_editable()
+        !self.is_inspecting() && self.item.read(cx).is_editable()
+    }
+
+    pub(crate) fn is_inspecting(&self) -> bool {
+        self.tools.kind() == ToolKind::Inspect
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
@@ -2308,7 +2324,10 @@ impl FigView {
     /// and layers panels stay useful before a project exists.
     fn handle_read_only_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
         let ToolEvent::Pointer(fanta_tools::PointerEvent::Press {
-            screen, modifiers, ..
+            screen,
+            modifiers,
+            button: ToolButton::Primary,
+            ..
         }) = event
         else {
             return;
@@ -2323,17 +2342,28 @@ impl FigView {
         let screen_size = DVec2::new(width, height);
         let screen_point = DVec2::new(screen[0], screen[1]);
         let extend = modifiers.extend_selection();
+        let inspecting = self.is_inspecting();
 
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let hit = precise_hit_test_screen(
-                    &document.doc.scene,
-                    &viewport,
-                    screen_size,
-                    screen_point,
-                    HitPrecision::Path,
-                    document.doc.active_page(),
-                );
+                let hit = if inspecting {
+                    inspect_hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        screen_size,
+                        screen_point,
+                        document.doc.active_page(),
+                    )
+                } else {
+                    precise_hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        screen_size,
+                        screen_point,
+                        HitPrecision::Path,
+                        document.doc.active_page(),
+                    )
+                };
                 match hit {
                     Some(node) if extend => document.doc.selection.toggle(node),
                     Some(node) => document.doc.selection.select_only(node),
@@ -2346,8 +2376,47 @@ impl FigView {
     }
 
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        if kind == ToolKind::Inspect {
+            if self.is_inspecting() {
+                return;
+            }
+            if self.has_pending_authoring(cx)
+                || self.comment_state.draft.is_some()
+                || self.has_unsent_comment_reply(cx)
+            {
+                show_canvas_notice_deferred(
+                    "Finish or cancel the current edit before inspecting layers.".into(),
+                    cx,
+                );
+                return;
+            }
+            if self.editor_mode(cx) != EditorMode::Design
+                || self.editor_workspace(cx) != EditorWorkspace::Canvas
+                || self.prototype_player.is_some()
+            {
+                show_canvas_notice_deferred(
+                    "Return to the Design canvas to inspect layers.".into(),
+                    cx,
+                );
+                return;
+            }
+            self.invalidate_local_media_origin();
+            self.comment_state.close_thread();
+            self.tools.activate_without_context(kind);
+            self.remember_tool_face(kind);
+            self.hovered_node = None;
+            self.hover_resize_handle = None;
+            self.inspector_sidebar
+                .update(cx, |panel, cx| panel.set_inspecting(true, cx));
+            self.layers_sidebar
+                .update(cx, |panel, cx| panel.set_inspecting(true, cx));
+            self.inspector_sidebar_visible = true;
+            self.invalidate_canvas_cache();
+            cx.notify();
+            return;
+        }
         self.comment_state.clear_pending_motion_anchor();
-        if kind.requires_editing() && !self.is_editable(cx) {
+        if kind.requires_editing() && !self.item.read(cx).is_editable() {
             return;
         }
         if kind != ToolKind::Comment {
@@ -2357,6 +2426,12 @@ impl FigView {
         // Switching tools is a document edit boundary for every inspector and
         // inline session, not only text.
         self.finish_document_edits(cx);
+        self.inspector_sidebar
+            .update(cx, |panel, cx| panel.set_inspecting(false, cx));
+        self.layers_sidebar
+            .update(cx, |panel, cx| panel.set_inspecting(false, cx));
+        self.hover_resize_handle = None;
+        self.hovered_node = None;
         let activated_kind = if kind == ToolKind::TextPath {
             ToolKind::Select
         } else {
@@ -2499,7 +2574,7 @@ impl FigView {
             }
             return;
         }
-        if event.button == MouseButton::Left {
+        if event.button == MouseButton::Left && !self.is_inspecting() {
             self.finish_panel_edits(cx);
         }
         // While a text session is live, a left press inside the edited node
@@ -2583,6 +2658,7 @@ impl FigView {
         // canvas click opens the draft composer (nothing hits the doc until
         // Send) — the original fanta flow.
         if event.button == MouseButton::Left
+            && !self.is_inspecting()
             && self.handle_comment_mouse_down(event.position, window, cx)
         {
             return;
@@ -2805,14 +2881,18 @@ impl FigView {
             }
             return;
         }
-        if self.tools.kind() != ToolKind::Select {
+        if !matches!(self.tools.kind(), ToolKind::Select | ToolKind::Inspect) {
             let had_handle = self.hover_resize_handle.take().is_some();
             if self.hovered_node.take().is_some() || had_handle {
                 cx.notify();
             }
             return;
         }
-        self.update_hover_resize_handle(screen, cx);
+        if self.is_inspecting() {
+            self.hover_resize_handle = None;
+        } else {
+            self.update_hover_resize_handle(screen, cx);
+        }
         let Some(bounds) = self.container_bounds else {
             return;
         };
@@ -2823,7 +2903,15 @@ impl FigView {
         let hovered = {
             let item = self.item.read(cx);
             item.document().and_then(|document| {
-                if let Some(evaluation) = self.motion_evaluation(document, cx) {
+                if self.is_inspecting() {
+                    inspect_hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        DVec2::new(width, height),
+                        screen,
+                        document.doc.active_page(),
+                    )
+                } else if let Some(evaluation) = self.motion_evaluation(document, cx) {
                     evaluated_hit_test_screen(
                         &document.doc.scene,
                         &evaluation,
@@ -2866,6 +2954,9 @@ impl FigView {
     }
 
     fn resize_handle_at(&self, screen: DVec2, cx: &App) -> Option<fanta_canvas::ResizeHandle> {
+        if self.is_inspecting() {
+            return None;
+        }
         let viewport = self.viewport?;
         let bounds = self.container_bounds?;
         let (width, height) = bounds_size(bounds);
@@ -3136,6 +3227,9 @@ impl FigView {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_inspecting() {
+            return;
+        }
         if self.prototype_player.is_some() {
             self.trigger_prototype_key("enter", cx);
             return;
@@ -3360,7 +3454,9 @@ impl FigView {
     }
 
     pub(crate) fn copy_selected_nodes(&mut self, cx: &mut Context<Self>) {
-        self.finish_document_edits(cx);
+        if !self.is_inspecting() {
+            self.finish_document_edits(cx);
+        }
         let payload = self
             .item
             .read(cx)
@@ -3411,24 +3507,19 @@ impl FigView {
         self.timeline_shell.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inspector_for_test(&self) -> Entity<FantaPropertiesPanel> {
+        self.inspector_sidebar.clone()
+    }
+
     fn invalidate_local_media_origin(&self) {
         self.media_import_generation
             .set(self.media_import_generation.get().wrapping_add(1));
     }
 
-    fn local_media_origin(&self, cx: &Context<Self>) -> Result<LocalMediaOrigin> {
-        let item = self.item.read(cx);
-        anyhow::ensure!(item.is_editable(), "This document is currently read-only.");
-        anyhow::ensure!(
-            item.can_preview_for_owner(cx.entity_id()),
-            "Finish saving or editing this document before placing media."
-        );
-        anyhow::ensure!(
-            self.editor_workspace(cx) == EditorWorkspace::Canvas && self.prototype_player.is_none(),
-            "Return to the canvas editor before placing media."
-        );
+    fn has_pending_authoring(&self, cx: &App) -> bool {
         let inspector = self.inspector_sidebar.read(cx);
-        let pending_edit = item.content_preview_active()
+        let pending_edit = self.item.read(cx).content_preview_active()
             || self.text_edit.is_some()
             || self.pending_text_edit.is_some()
             || self.motion_keyframe_drag.is_some()
@@ -3441,6 +3532,8 @@ impl FigView {
             || self.motion_sidebar.read(cx).has_continuous_edit()
             || self.timeline_shell.read(cx).has_pending_authoring()
             || self.prototype_sidebar.read(cx).has_pending_parameter_edit()
+            || self.variables_workspace.read(cx).has_pending_authoring()
+            || self.layers_sidebar.read(cx).has_pending_authoring(cx)
             || self.tools.overlays.iter().any(|overlay| {
                 matches!(
                     overlay,
@@ -3461,8 +3554,25 @@ impl FigView {
                 .gpui_design
                 .as_ref()
                 .is_some_and(|adapter| adapter.session.is_some());
+        pending_edit
+    }
+
+    fn local_media_origin(&self, cx: &Context<Self>) -> Result<LocalMediaOrigin> {
+        let item = self.item.read(cx);
         anyhow::ensure!(
-            !pending_edit,
+            self.is_editable(cx),
+            "This document is currently read-only."
+        );
+        anyhow::ensure!(
+            item.can_preview_for_owner(cx.entity_id()),
+            "Finish saving or editing this document before placing media."
+        );
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas && self.prototype_player.is_none(),
+            "Return to the canvas editor before placing media."
+        );
+        anyhow::ensure!(
+            !self.has_pending_authoring(cx),
             "Finish or cancel the current edit before placing media."
         );
         let document = item
@@ -3703,6 +3813,13 @@ impl FigView {
     /// single undo step. An image that cannot be ingested (undecodable, or
     /// over the asset cap) is reported and skipped without failing the rest.
     fn place_pasted_images(&mut self, images: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            show_canvas_notice_deferred(
+                "Could not paste images: the canvas is read-only.".into(),
+                cx,
+            );
+            return;
+        }
         let viewport = self.viewport.unwrap_or(Viewport {
             center: [0.0, 0.0],
             zoom: 1.0,
@@ -3782,6 +3899,9 @@ impl FigView {
         placement: ClipboardPlacement,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let result = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let pasted = match payload.instantiate(&document.doc, offset, placement) {
@@ -4444,7 +4564,7 @@ impl FigView {
     }
 
     fn render_tool_pill(&self, cx: &mut Context<Self>) -> AnyElement {
-        let editable = self.is_editable(cx);
+        let editable = self.item.read(cx).is_editable();
         let active = self.tools.kind();
         // Before any interaction the viewport is initialized silently during
         // paint, so fall back to the fit zoom the canvas will use rather than
@@ -5911,6 +6031,9 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivateSelectTool, _, cx| {
                 this.activate_tool(ToolKind::Select, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActivateInspectTool, _, cx| {
+                this.activate_tool(ToolKind::Inspect, cx)
+            }))
             .on_action(cx.listener(|this, _: &ActivateHandTool, _, cx| {
                 this.activate_tool(ToolKind::Hand, cx)
             }))
@@ -6869,7 +6992,7 @@ impl Focusable for FigView {
 
 impl ToolKind {
     fn requires_editing(self) -> bool {
-        !matches!(self, Self::Select | Self::Hand)
+        !matches!(self, Self::Select | Self::Inspect | Self::Hand)
     }
 }
 
@@ -7954,6 +8077,262 @@ mod tests {
                     .expect("create rect");
                 ((), DocChange::Content)
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_rejects_an_image_file_paste_that_finishes_after_activation(
+        cx: &mut TestAppContext,
+    ) {
+        let (directory, _root, item, view) = autosave_fixture(cx).await;
+        let path = directory.path().join("picture.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([32, 64, 128, 255]))
+            .save(&path)
+            .expect("PNG fixture");
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(&item.doc().expect("document")).expect("snapshot")
+        });
+        view.update(cx, |view, cx| {
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    smallvec::smallvec![path],
+                ))],
+            });
+            view.paste_selected_nodes(cx);
+            view.activate_tool(ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document")).expect("snapshot"),
+                before
+            );
+            assert!(item.document().expect("document").raw_assets.is_empty());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_selection_and_host_actions_preserve_authored_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, _root, item, view) = autosave_fixture(cx).await;
+        add_rect(&item, cx);
+        cx.run_until_parked();
+        let snapshot = |item: &FigItem, _: &App| {
+            let mut document = item.document().expect("document").doc.clone();
+            document.selection.clear();
+            (
+                serde_json::to_value(document).expect("snapshot"),
+                item.is_dirty(),
+            )
+        };
+        let before = item.read_with(cx, snapshot);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.container_bounds =
+                        Some(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
+                    view.viewport = Some(Viewport {
+                        center: [5., 5.],
+                        zoom: 2.,
+                    });
+                    view.activate_tool(ToolKind::Inspect, cx);
+                    assert!(view.is_inspecting());
+                    assert!(view.item.read(cx).is_editable());
+                    for clicks in [1, 2] {
+                        let position = point(px(400.), px(300.));
+                        view.handle_mouse_down(
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: gpui::Modifiers::none(),
+                                click_count: clicks,
+                                first_mouse: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        view.handle_mouse_move(
+                            &MouseMoveEvent {
+                                position: point(px(460.), px(340.)),
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: gpui::Modifiers::none(),
+                            },
+                            window,
+                            cx,
+                        );
+                        view.handle_mouse_up(
+                            &MouseUpEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: gpui::Modifiers::none(),
+                                click_count: clicks,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("document").selection.len(),
+                        1
+                    );
+                    view.confirm(&Confirm, window, cx);
+                    view.delete_selection(&DeleteSelection, window, cx);
+                    view.cut_selected_nodes(cx);
+                    view.duplicate_selected_nodes(cx);
+                    view.group_selection(&GroupSelection, window, cx);
+                    view.nudge(LogicalKey::ArrowRight, window, cx);
+                    view.undo(&Undo, window, cx);
+                    view.redo(&Redo, window, cx);
+                    view.choose_local_media(cx);
+                    assert!(view.text_edit.is_none());
+                    assert!(view.media_import_task.is_none());
+                    assert!(view.hover_resize_handle.is_none());
+                    assert!(view.resize_handle_at(DVec2::new(390., 290.), cx).is_none());
+                    assert!(view.tools.overlays.is_empty());
+                });
+            })
+            .expect("inspect interactions");
+        assert_eq!(item.read_with(cx, snapshot), before);
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.is_inspecting());
+            assert!(!view.is_editable(cx));
+        });
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_tool(ToolKind::Select, cx);
+                    assert!(view.is_editable(cx));
+                    view.nudge(LogicalKey::ArrowRight, window, cx);
+                });
+            })
+            .expect("leave inspect");
+        assert_ne!(item.read_with(cx, snapshot), before);
+    }
+
+    #[gpui::test]
+    async fn inspect_hover_and_selection_use_the_same_path_precision_on_active_page(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, page_one, page_two) = doc_with_two_pages();
+        let mut background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            120.,
+            120.,
+            Color::BLACK,
+        )));
+        background.parent = Some(page_one);
+        let other_page_node = background.id;
+        doc.apply(Operation::create_node(background))
+            .expect("page one layer");
+        let mut parent = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        parent.parent = Some(page_two);
+        parent.transform = Transform2D::translation(25., 35.);
+        let parent_id = parent.id;
+        doc.apply(Operation::create_node(parent))
+            .expect("transformed parent");
+        let mut path = PathData::new();
+        path.move_to(0., 0.).line_to(100., 100.);
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            strokes: smallvec::smallvec![Stroke::solid(Color::BLACK, 1.)],
+            ..VectorNode::default()
+        }));
+        vector.parent = Some(parent_id);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("thin diagonal");
+        doc.set_active_page(Some(page_two));
+        let item =
+            crate::document::ready_item_for_test(&project, "/tmp/Inspect.fig".into(), doc, cx);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("inspect view");
+        view.update(cx, |view, cx| {
+            view.select_page(1, cx);
+            view.activate_tool(ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+            let document = view.item.read(cx).doc().expect("document");
+            assert_eq!(document.active_page(), Some(page_two));
+            let transform = document
+                .scene
+                .world_transform(vector_id)
+                .expect("vector world transform");
+            let center = transform.transform_point(DVec2::new(50., 50.));
+            view.container_bounds =
+                Some(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
+            for zoom in [0.5, 1., 2.] {
+                view.viewport = Some(Viewport {
+                    center: center.to_array(),
+                    zoom,
+                });
+                for (world, expected) in [
+                    (center, Some(vector_id)),
+                    (transform.transform_point(DVec2::new(50., 10.)), None),
+                ] {
+                    let screen = (world - center) * zoom + DVec2::new(400., 300.);
+                    view.update_hover(screen, cx);
+                    assert_eq!(view.hovered_node, expected, "zoom {zoom}");
+                    view.dispatch_tool_event(
+                        press_event(screen, ToolButton::Primary, gpui::Modifiers::none(), 1),
+                        cx,
+                    );
+                    assert_eq!(
+                        view.item
+                            .read(cx)
+                            .doc()
+                            .expect("document")
+                            .selection
+                            .as_slice(),
+                        expected.as_slice()
+                    );
+                    assert!(
+                        !view
+                            .item
+                            .read(cx)
+                            .doc()
+                            .expect("document")
+                            .selection
+                            .contains(other_page_node)
+                    );
+                    view.dispatch_tool_event(
+                        press_event(
+                            DVec2::ZERO,
+                            ToolButton::Secondary,
+                            gpui::Modifiers::none(),
+                            1,
+                        ),
+                        cx,
+                    );
+                    assert_eq!(
+                        view.item
+                            .read(cx)
+                            .doc()
+                            .expect("document")
+                            .selection
+                            .as_slice(),
+                        expected.as_slice()
+                    );
+                }
+            }
+            view.update_hover(DVec2::new(400., 300.), cx);
+            assert_eq!(view.hovered_node, Some(vector_id));
+            view.select_page(0, cx);
+            assert!(view.is_inspecting());
+            assert!(view.hovered_node.is_none());
         });
     }
 
@@ -11852,9 +12231,8 @@ impl FigView {
                     show_canvas_notice(format!("Could not add time comment: {error}"), window, cx)
                 }
             },
-            ToolbarSecondaryControl::DevInspect
-            | ToolbarSecondaryControl::DevAnnotate
-            | ToolbarSecondaryControl::DevMeasure => {
+            ToolbarSecondaryControl::DevInspect => self.activate_tool(ToolKind::Inspect, cx),
+            ToolbarSecondaryControl::DevAnnotate | ToolbarSecondaryControl::DevMeasure => {
                 notify_unavailable(control.label(), window, cx);
             }
             other => notify_unavailable(other.label(), window, cx),

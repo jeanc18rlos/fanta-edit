@@ -118,7 +118,7 @@ pub use text_path::{
     text_path_selection_quads, text_path_visual_bounds, text_path_visual_line_edge,
     text_path_visual_neighbor, text_path_visual_selection_edge,
 };
-pub use vector::vector_outline_sk_path; // track svg-prod
+pub use vector::{rounded_rect_contains_point, vector_contains_point, vector_outline_sk_path};
 
 // Crate-internal items shared across the submodules (and exercised by the
 // co-located `tests`). `use super::*;` in each submodule resolves these. Only

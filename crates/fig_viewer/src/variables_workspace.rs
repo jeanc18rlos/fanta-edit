@@ -122,6 +122,10 @@ pub struct FantaVariablesWorkspace {
 }
 
 impl FantaVariablesWorkspace {
+    pub(crate) fn has_pending_authoring(&self) -> bool {
+        self.editing_cell.is_some() || self.rename_target.is_some()
+    }
+
     pub fn new(item: Entity<FigItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let value_editor = cx.new(|cx| Editor::single_line(window, cx));
         let rename_editor = cx.new(|cx| Editor::single_line(window, cx));

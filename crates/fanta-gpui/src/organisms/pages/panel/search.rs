@@ -31,9 +31,9 @@ impl PagesPanel {
     }
 
     fn render_search_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let replace = self.mode == PanelMode::Replace;
-        let can_replace_one = !self.results.items.is_empty();
-        let can_replace_all = self.results.total > 0;
+        let replace = self.mode == PanelMode::Replace && !self.read_only;
+        let can_replace_one = !self.read_only && !self.results.items.is_empty();
+        let can_replace_all = !self.read_only && self.results.total > 0;
         let settings_focus_handle = self
             .settings_focus_handle
             .clone()

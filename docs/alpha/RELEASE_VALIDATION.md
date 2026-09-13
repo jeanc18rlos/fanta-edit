@@ -20,6 +20,29 @@ and bundled Git 2.53.0 passed non-launch inspection. The image was detached
 normally and the user's existing Fanta processes remained unchanged. Evidence:
 `/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
 
+## Inspect continuation — September 13
+
+PR 4 is merged as `769bfae63f`, and Arrow PR 5 is merged as `1575ddd754`.
+Both Arrow Check jobs passed for `661fb04e95`; its merge tree exactly matches
+that tested source. The local media and Arrow native evidence remains under
+`/tmp/fanta-release-qa-20260913/direct-media-placement/` and `arrow-tool/`.
+
+The source adds standalone Inspect in the Design Move menu. It provides
+view-local read-only properties, Layers selection, authoring guards, and
+entry that preserves unfinished drafts. Hover and click share vector fill and
+stroke coverage, rounded frame clipping, and inverse-space box geometry for
+rotated layers. The query walks the active subtree in paint order; a
+conservative local vector bound avoids constructing distant Skia paths. It
+reuses transient size/gap guides without storing measurements.
+
+Inspect source validation passes 793 viewer tests, 602 shared UI tests and
+three architecture checks, 282 renderer unit tests and 24 integration tests,
+and 23 legacy-inspector tests. Package-scoped Clippy and Cargo Machete pass.
+Logs and later native evidence are recorded under
+`/tmp/fanta-release-qa-20260913/inspect-tool/`. Exact-source hosted CI, native
+QA, and the customer distribution artifact remain separate gates; source
+tests alone do not validate the released application.
+
 ## Post-merge export and font-scale follow-up — September 13
 
 Both existing PRs were merged after their exact-head checks passed. Desktop

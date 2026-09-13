@@ -151,6 +151,8 @@ pub struct FantaPropertiesPanel {
     /// Reading the view just to recover its item in that path double-leases the
     /// entity and panics.
     pub(crate) active_item: Option<WeakEntity<FigItem>>,
+    inspecting: bool,
+    _inspection_subscription: Option<Subscription>,
     pub(crate) width: Option<Pixels>,
     pub(crate) field_editor: Entity<Editor>,
     pub(crate) editing_field: Option<InspectorField>,
@@ -321,6 +323,8 @@ impl FantaPropertiesPanel {
             fs,
             active_view: None,
             active_item: None,
+            inspecting: false,
+            _inspection_subscription: None,
             width: None,
             field_editor,
             editing_field: None,
@@ -377,6 +381,10 @@ impl FantaPropertiesPanel {
                     // live X/Y during drags — but that render is O(selection),
                     // not O(document).
                     let item = view.read(cx).item().clone();
+                    self.set_inspecting(view.read(cx).is_inspecting(), cx);
+                    self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
+                        this.set_inspecting(view.read(cx).is_inspecting(), cx);
+                    }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
                         |this, item, event: &crate::document::FigItemEvent, cx| {
@@ -472,6 +480,22 @@ impl FantaPropertiesPanel {
         self.active_view.as_ref().and_then(|view| view.upgrade())
     }
 
+    pub(crate) fn set_inspecting(&mut self, inspecting: bool, cx: &mut Context<Self>) {
+        if self.inspecting != inspecting {
+            self.inspecting = inspecting;
+            cx.notify();
+        }
+    }
+
+    fn is_editable(&self, cx: &App) -> bool {
+        // Finishing a gesture may be called from inside a FigView update.
+        // Cache its tool state so checking permission cannot double-lease it.
+        !self.inspecting
+            && self
+                .active_item(cx)
+                .is_some_and(|item| item.read(cx).is_editable())
+    }
+
     fn cancel_export_task(&mut self) {
         self.export_generation = self.export_generation.wrapping_add(1);
         self.export_task = None;
@@ -511,6 +535,9 @@ impl FantaPropertiesPanel {
         cx: &mut Context<Self>,
         build: impl FnOnce(&Doc) -> Vec<Operation>,
     ) -> bool {
+        if !self.is_editable(cx) {
+            return false;
+        }
         self.finish_continuous_edits(cx);
         let Some(item) = self.active_item(cx) else {
             return false;
@@ -559,6 +586,9 @@ impl FantaPropertiesPanel {
         operations: Vec<Operation>,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.is_editable(cx) {
+            return false;
+        }
         let label = operations
             .first()
             .map(|operation| operation.label().to_string())
@@ -611,6 +641,9 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn convert_text_to_outlines(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         if let Some(view) = self.active_view(cx) {
             view.update(cx, |view, cx| view.commit_text_edit(cx));
         }
@@ -669,6 +702,9 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn add_paint(&mut self, id: NodeId, is_stroke: bool, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.forget_hidden_paint_alpha(id, is_stroke);
         self.update_node_data(
             id,
@@ -730,6 +766,9 @@ impl FantaPropertiesPanel {
         is_stroke: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.forget_hidden_paint_alpha(id, is_stroke);
         self.update_node_data(
             id,
@@ -761,6 +800,9 @@ impl FantaPropertiesPanel {
         is_stroke: bool,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let key = PaintKey {
             id,
             index,
@@ -817,6 +859,9 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn set_font_weight(&mut self, id: NodeId, weight: u16, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.finish_continuous_edits(cx);
         // During active text edit with selection, apply only to the selected
         // range (rich text support via the live TextBuffer in the session).
@@ -861,6 +906,9 @@ impl FantaPropertiesPanel {
     }
 
     pub(crate) fn prepare_font_family_picker(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.finish_continuous_edits(cx);
         self.retain_text_selection_on_next_focus_out(&InspectorField::FontFamily(id), cx);
     }
@@ -871,6 +919,9 @@ impl FantaPropertiesPanel {
         family: SharedString,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let family = family.trim();
         if family.is_empty() {
             return;
@@ -902,6 +953,9 @@ impl FantaPropertiesPanel {
         text: &str,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.is_editable(cx) {
+            return false;
+        }
         let id = match field {
             InspectorField::FontFamily(id)
             | InspectorField::FontSize(id)
@@ -1057,6 +1111,9 @@ impl FantaPropertiesPanel {
         decoration: TextDecorationGlyph,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.finish_continuous_edits(cx);
         // Apply only to selection if text editing with active selection.
         if self
@@ -1902,6 +1959,9 @@ impl FantaPropertiesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.finish_continuous_edits(cx);
         self.finish_content_preview(true, cx);
         let snapshot = self.snapshot_for_field(&field, cx);
@@ -1934,6 +1994,9 @@ impl FantaPropertiesPanel {
     }
 
     fn commit_editing_value(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(field) = self.editing_field.take() else {
             return;
         };
@@ -1965,6 +2028,9 @@ impl FantaPropertiesPanel {
     }
 
     fn preview_editing(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         if self.suppress_field_editor_events {
             return;
         }
@@ -2087,6 +2153,9 @@ impl FantaPropertiesPanel {
     /// be recomputed from gesture-start each frame and the commit records
     /// `old` = gesture-start. `None` when the document isn't editable.
     fn snapshot_for_field(&self, field: &InspectorField, cx: &App) -> Option<NodeSnapshot> {
+        if !self.is_editable(cx) {
+            return None;
+        }
         let item = self.active_item(cx)?;
         let item = item.read(cx);
         if !item.is_editable() {
@@ -2112,6 +2181,9 @@ impl FantaPropertiesPanel {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.finish_continuous_edits(cx);
         self.finish_content_preview(true, cx);
         let Some(snapshot) = self.snapshot_for_field(&field, cx) else {
@@ -2140,6 +2212,9 @@ impl FantaPropertiesPanel {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.finish_continuous_edits(cx);
         self.finish_content_preview(true, cx);
         let Some(bounds) = self.slider_tracks[track as usize] else {
@@ -2280,6 +2355,9 @@ impl FantaPropertiesPanel {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(item) = self.active_item(cx) else {
             return;
         };
@@ -2335,6 +2413,9 @@ impl FantaPropertiesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         if self
             .picker
             .as_ref()
@@ -2415,6 +2496,9 @@ impl FantaPropertiesPanel {
     }
 
     fn preview_picker_color(&mut self, color: FantaColor, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(session) = self.picker.as_mut() else {
             return;
         };
@@ -2506,6 +2590,9 @@ impl FantaPropertiesPanel {
         gradient: Gradient,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let field = InspectorField::Gradient {
             id,
             index,
@@ -2569,6 +2656,9 @@ impl FantaPropertiesPanel {
     }
 
     fn preview_gradient(&mut self, gradient: Gradient, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(session) = self.gradient_editor.as_mut() else {
             return;
         };
@@ -2596,6 +2686,9 @@ impl FantaPropertiesPanel {
         gradient: Gradient,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(item) = self.active_item(cx) else {
             return;
         };
@@ -2681,6 +2774,9 @@ impl FantaPropertiesPanel {
         kind: PaintKind,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         self.close_gradient_editor(true, cx);
         self.close_color_picker(true, cx);
         self.update_node_data(
@@ -2712,7 +2808,7 @@ impl FantaPropertiesPanel {
         let Some(document) = item.document() else {
             return InspectorSnapshot::Message(NO_DOCUMENT_MESSAGE.into());
         };
-        let editable = item.is_editable();
+        let editable = view.read(cx).is_editable(cx);
         let doc = &document.doc;
         let selection: Vec<NodeId> = doc
             .selection
@@ -3269,6 +3365,191 @@ mod panel_integration_tests {
             window.draw(cx).clear();
         })
         .expect("drawing the properties panel");
+    }
+
+    #[gpui::test]
+    async fn inspect_keeps_legacy_properties_read_only_and_refreshes_selection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let before = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("loaded document");
+            (
+                doc.scene.get(harness.vector_id).expect("rectangle").clone(),
+                doc.scene.get(harness.text_id).expect("text").clone(),
+            )
+        });
+        harness._view.update(cx, |view, cx| {
+            assert!(view.is_editable(cx));
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+        });
+        cx.run_until_parked();
+        harness
+            .panel
+            .update(cx, |panel, window, cx| {
+                assert!(
+                    matches!(panel.build_snapshot(cx), InspectorSnapshot::Ready {
+                editable: false,
+                body: InspectorBody::Node(node),
+                ..
+            } if node.id == harness.vector_id)
+                );
+                panel.toggle_flag(harness.vector_id, NodeFlags::LOCKED, cx);
+                panel.set_font_weight(harness.text_id, 700, cx);
+                panel.start_editing(
+                    InspectorField::X(harness.vector_id),
+                    "300".into(),
+                    window,
+                    cx,
+                );
+                panel.begin_field_scrub(
+                    InspectorField::Opacity(harness.vector_id),
+                    100.0,
+                    gpui::point(px(0.0), px(0.0)),
+                    cx,
+                );
+                panel.toggle_color_picker(
+                    InspectorField::TextColor(harness.text_id),
+                    FantaColor::BLACK,
+                    window,
+                    cx,
+                );
+                assert!(panel.editing_field.is_none());
+                assert!(panel.scrub.is_none());
+                assert!(panel.picker.is_none());
+            })
+            .expect("inspector window");
+        draw(harness.panel, cx);
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("loaded document");
+            assert_eq!(doc.scene.get(harness.vector_id), Some(&before.0));
+            assert_eq!(doc.scene.get(harness.text_id), Some(&before.1));
+            assert!(!doc.history.can_undo());
+            assert!(!item.is_dirty());
+            assert!(item.is_editable());
+        });
+        harness.select(&[harness.text_id], cx);
+        harness
+            .panel
+            .read_with(cx, |panel, cx| {
+                assert!(
+                    matches!(panel.build_snapshot(cx), InspectorSnapshot::Ready {
+                editable: false,
+                body: InspectorBody::Node(node),
+                ..
+            } if node.id == harness.text_id)
+                );
+            })
+            .expect("inspector window");
+        harness._view.update(cx, |view, cx| {
+            view.activate_tool(crate::tools::ToolKind::Select, cx);
+        });
+        cx.run_until_parked();
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                assert!(matches!(
+                    panel.build_snapshot(cx),
+                    InspectorSnapshot::Ready { editable: true, .. }
+                ));
+                panel.set_font_weight(harness.text_id, 700, cx);
+            })
+            .expect("inspector window");
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("loaded document");
+            let NodeData::Text(text) = &doc.scene.get(harness.text_id).expect("text").data else {
+                panic!("text node remains text");
+            };
+            assert_eq!(text.style.weight, 700);
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_entry_preserves_a_live_numeric_preview_until_cancelled(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let inspector = harness
+            ._view
+            .read_with(cx, |view, _| view.inspector_for_test());
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let original = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(harness.vector_id)
+                .expect("rectangle")
+                .clone()
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                inspector.update(cx, |panel, cx| {
+                    panel.start_editing(
+                        InspectorField::X(harness.vector_id),
+                        "0".into(),
+                        window,
+                        cx,
+                    );
+                    panel
+                        .field_editor
+                        .update(cx, |editor, cx| editor.set_text("55.125", window, cx));
+                });
+            })
+            .expect("scratch window");
+        cx.run_until_parked();
+        let (preview, preview_dirty) = item.read_with(cx, |item, _| {
+            let node = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(harness.vector_id)
+                .expect("rectangle");
+            assert_ne!(node.transform, original.transform);
+            assert!(item.content_preview_active());
+            (node.clone(), item.is_dirty())
+        });
+        harness._view.update(cx, |view, cx| {
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(!view.is_inspecting());
+        });
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(InspectorField::X(harness.vector_id))
+            );
+            assert_eq!(panel.field_editor.read(cx).text(cx), "55.125");
+            assert!(panel.field_edit_previewed);
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(harness.vector_id), Some(&preview));
+            assert!(!doc.history.can_undo());
+            assert_eq!(item.is_dirty(), preview_dirty);
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                inspector.update(cx, |panel, cx| panel.cancel_editing(window, cx));
+            })
+            .expect("scratch window");
+        cx.run_until_parked();
+        harness._view.update(cx, |view, cx| {
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(harness.vector_id), Some(&original));
+            assert!(!doc.history.can_undo());
+            assert!(!item.is_dirty());
+        });
     }
 
     #[gpui::test]

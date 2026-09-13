@@ -1,5 +1,12 @@
 # Fanta launch readiness
 
+The September 13 continuation adds standalone Inspect to Design’s Move menu.
+Selection and property copying remain available while authoring is disabled in
+that view. Pending edits block entry and retain their drafts. Arrow and local
+image/MP4 placement have their own completed native checkpoints. Persistent
+Measure, Annotation, full Dev/readiness, Voice input, motion/video export,
+production inference/billing, and signed customer distribution remain open.
+
 Updated on 2026-09-12. First release target: Apple Silicon Mac.
 
 The September 13 post-merge follow-up exposes the existing export presets in

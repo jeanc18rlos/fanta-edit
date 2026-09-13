@@ -21,6 +21,112 @@ use crate::pages::{
 
 actions!(pages_input_regression, [CompetingDeleteSelection]);
 
+#[gpui::test]
+fn read_only_pages_keep_navigation_copy_and_find_without_authoring(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    let panel = panel(&host, cx);
+    let actions = actions(&host, cx);
+    panel.update(cx, |panel, cx| panel.set_read_only(true, cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pages-add-trigger").is_none());
+    double_click(cx, "pages-row-page-2");
+    assert!(!cx.read(|app| panel.read(app).has_pending_authoring(app)));
+    assert!(actions.borrow().iter().any(|action| matches!(
+        action,
+        PagesPanelAction::SelectRequested { page_id } if page_id == "page-2"
+    )));
+    secondary_click(cx, "pages-row-page-2");
+    assert!(cx.debug_bounds("pages-page-menu-rename").is_none());
+    assert!(cx.debug_bounds("pages-page-menu-delete").is_none());
+    actions.borrow_mut().clear();
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.activate_page_menu_item(super::PageMenuAction::Delete, window, cx);
+        });
+    });
+    assert!(actions.borrow().is_empty());
+    click(cx, "pages-page-menu-copy-link");
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[PagesPanelAction::CopyLinkRequested {
+            page_id: "page-2".into()
+        }]
+    );
+    set_one_search_result(&panel, cx);
+    click(cx, "pages-search-trigger");
+    cx.run_until_parked();
+    actions.borrow_mut().clear();
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.begin_new_page(window, cx);
+            panel.begin_rename("page-2".into(), "Renamed".into(), window, cx);
+            panel.set_panel_mode(PanelMode::Replace, window, cx);
+            panel.request_replace(false, cx);
+            panel.request_replace(true, cx);
+            assert_eq!(panel.mode, PanelMode::Find);
+            assert!(!panel.has_pending_authoring(cx));
+        });
+    });
+    assert!(actions.borrow().is_empty());
+    click(cx, "pages-filter-trigger");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("pages-mode-replace").is_none());
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.search_input.update(cx, |input, cx| {
+                input.set_value("Title", window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(actions.borrow().iter().any(|action| matches!(
+        action, PagesPanelAction::SearchRequested(request) if request.query == "Title"
+    )));
+    panel.update(cx, |panel, cx| panel.set_read_only(false, cx));
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| panel.begin_new_page(window, cx));
+    });
+    assert!(cx.read(|app| panel.read(app).has_pending_authoring(app)));
+}
+
+#[gpui::test]
+fn read_only_pages_preserve_rename_and_replacement_drafts(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    let panel = panel(&host, cx);
+    let actions = actions(&host, cx);
+    double_click(cx, "pages-row-page-2");
+    actions.borrow_mut().clear();
+    cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.rename_input.update(cx, |input, cx| {
+                input.set_value("  pending page name  ", window, cx);
+            });
+            panel.set_read_only(true, cx);
+            panel.commit_page_name(false, window, cx);
+            assert!(panel.has_pending_authoring(cx));
+            assert_eq!(panel.rename_input.read(cx).value(), "  pending page name  ");
+            panel.set_read_only(false, cx);
+            panel.cancel_page_edit(cx);
+            assert!(!panel.has_pending_authoring(cx));
+            panel.replace_input.update(cx, |input, cx| {
+                input.set_value("  replacement draft  ", window, cx);
+            });
+            assert!(!panel.has_pending_authoring(cx));
+            panel.set_panel_mode(PanelMode::Replace, window, cx);
+            assert!(panel.has_pending_authoring(cx));
+            panel.set_read_only(true, cx);
+            assert_eq!(panel.mode, PanelMode::Find);
+            assert!(!panel.has_pending_authoring(cx));
+            assert_eq!(
+                panel.replace_input.read(cx).value(),
+                "  replacement draft  "
+            );
+        });
+    });
+    assert!(actions.borrow().is_empty());
+}
+
 struct TestHost {
     panel: Entity<PagesPanel>,
     actions: Rc<RefCell<Vec<PagesPanelAction>>>,
