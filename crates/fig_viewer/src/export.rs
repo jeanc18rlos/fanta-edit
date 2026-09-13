@@ -890,6 +890,130 @@ mod tests {
     }
 
     #[test]
+    fn drawn_arrow_survives_project_reopen_and_exports_every_segment() {
+        use fanta_tools::{
+            Button, LineTool, ModifierKeys, PointerEvent, Tool, ToolContext, ToolEvent,
+        };
+        use glam::DVec2;
+
+        let directory = tempfile::tempdir().expect("arrow project");
+        let mut document = Doc::new();
+        let page = insert(
+            &mut document,
+            CanvasNode::new(NodeData::Group(GroupNode::default())),
+        );
+        document.add_page(page);
+        document.set_active_page(Some(page));
+        let mut viewport = Viewport::default();
+        let mut context = ToolContext::new(
+            &mut document,
+            &mut viewport,
+            fanta_canvas::SnapEngine {
+                targets: fanta_canvas::SnapTargets::empty(),
+                ..Default::default()
+            },
+            DVec2::new(800.0, 600.0),
+        );
+        let mut arrow = LineTool::arrow();
+        arrow.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: [550.0, 420.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count: 1,
+            }),
+        );
+        arrow.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Release {
+                screen: [250.0, 180.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+            }),
+        );
+        let arrow_id = *document.selection.iter().next().expect("selected arrow");
+        let original = document.scene.get(arrow_id).expect("drawn arrow").clone();
+        fanta_format::write_project_tree(directory.path(), &document, &BTreeMap::new())
+            .expect("save arrow project");
+        let (mut reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("read saved arrow project");
+        let restored = reopened.scene.get(arrow_id).expect("reopened arrow");
+        assert_eq!(restored.data, original.data);
+        assert_eq!(restored.transform, original.transform);
+        assert_eq!(restored.name, "Arrow");
+        reopened.selection.select_only(arrow_id);
+
+        let batch = prepare_export_jobs(
+            &reopened,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            &[
+                ExportPreset {
+                    format: ExportFormat::Png,
+                    scale: ExportScale::Two,
+                },
+                ExportPreset {
+                    format: ExportFormat::Svg,
+                    scale: ExportScale::One,
+                },
+            ],
+        )
+        .expect("arrow has exportable bounds");
+        let target = batch.targets.first().expect("arrow export target");
+        let export_viewport = target_viewport(target, 2.0);
+        let paths = run_export_jobs(batch).expect("export arrow");
+        let raster = image::open(paths.first().expect("PNG output"))
+            .expect("decode exported arrow")
+            .to_rgba8();
+        let NodeData::Vector(vector) = &original.data else {
+            panic!("arrow is a vector");
+        };
+        let mut current = DVec2::ZERO;
+        let mut lines = 0;
+        for segment in &vector.path.segments {
+            match segment {
+                fanta_doc::PathSegment::Move { to } => current = DVec2::from(*to),
+                fanta_doc::PathSegment::Line { to } => {
+                    let end = DVec2::from(*to);
+                    let midpoint = original.transform.transform_point((current + end) / 2.0);
+                    let pixel = fanta_canvas::world_to_screen(
+                        midpoint,
+                        &export_viewport,
+                        DVec2::new(raster.width() as f64, raster.height() as f64),
+                    );
+                    let painted = (-2..=2).any(|offset_x| {
+                        (-2..=2).any(|offset_y| {
+                            let x = pixel.x.round() as i64 + offset_x;
+                            let y = pixel.y.round() as i64 + offset_y;
+                            x >= 0
+                                && y >= 0
+                                && raster.get_pixel_checked(x as u32, y as u32).is_some_and(
+                                    |pixel| {
+                                        pixel[3] > 64
+                                            && pixel[0] < 50
+                                            && pixel[1] < 50
+                                            && pixel[2] < 50
+                                    },
+                                )
+                        })
+                    });
+                    assert!(painted, "arrow segment {lines} is absent from PNG export");
+                    lines += 1;
+                    current = end;
+                }
+                _ => panic!("arrow consists of open straight segments"),
+            }
+        }
+        assert_eq!(lines, 3);
+        let svg =
+            std::fs::read_to_string(paths.get(1).expect("SVG output")).expect("read vector arrow");
+        assert!(svg.contains("<path"));
+        assert!(!svg.contains("<image"));
+    }
+
+    #[test]
     fn empty_bounds_and_empty_presets_are_reported_before_background_export() {
         let mut doc = Doc::new();
         let empty = insert(
