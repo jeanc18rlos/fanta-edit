@@ -2,6 +2,12 @@
 
 Updated on 2026-09-12. First release target: Apple Silicon Mac.
 
+The September 13 post-merge follow-up exposes the existing export presets in
+Design and corrects tab/opacity sizing for enlarged UI fonts. It preserves the
+shared toolbar/inspector export controller and blocks transient or duplicate
+exports. The detailed validation state is in
+[Release validation](RELEASE_VALIDATION.md#post-merge-export-and-font-scale-follow-up--september-13).
+
 ## What is connected
 
 - The production backend is `https://api.fantaisa.net`; `/v1/status` and

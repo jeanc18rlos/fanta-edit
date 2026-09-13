@@ -10,7 +10,7 @@
 //! stroke geometry, drop/inner shadows and layer/background blurs,
 //! single-axis auto layout, whole-layer typography, instance props, the
 //! Page background, the rotate/flip transforms, and multi-selection
-//! align/distribute. Gated off: layout grids, exports, style registries,
+//! align/distribute. Gated off: layout grids, advanced export options, style registries,
 //! aspect-ratio lock, smart selection, constraints, resize-to-fit, Tidy up,
 //! single-node align, text-path direction, and pattern/shader/media paint editing
 //! (gradient and image paints are displayed read-only).
@@ -1171,14 +1171,22 @@ pub(crate) struct DesignAdapter {
 }
 
 impl DesignAdapter {
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<FigView>) -> Self {
+    pub(crate) fn new(
+        inspector: Entity<crate::properties_panel::FantaPropertiesPanel>,
+        window: &mut Window,
+        cx: &mut Context<FigView>,
+    ) -> Self {
+        let export_section =
+            cx.new(|cx| crate::properties_panel::FantaExportSection::new(inspector, cx));
         let panel = cx.new(|cx| {
-            DesignPanel::new(
+            let mut panel = DesignPanel::new(
                 "fig-gpui-design",
                 DesignPanelNode::new("fig-gpui-design-empty", "Page", DesignPanelNodeKind::Frame),
                 window,
                 cx,
-            )
+            );
+            panel.set_export_content(Some(export_section.into()), cx);
+            panel
         });
         let subscription = cx.subscribe_in(&panel, window, FigView::handle_design_action);
         Self {

@@ -33,7 +33,7 @@ notarization were used.
 | Comments | Yes | Yes | Partial | N/A | Pins, threads, replies, resolve/delete, mentions, attachments, and skill routing are implemented. Static comments remain visible everywhere. Timed comments persist their clip/time anchor and are visible as pins only for that exact active clip in Motion; panel navigation restores the stable page, clip, and time when available without rewriting the anchor. |
 | Variables workspace | Yes | Yes | Unknown | N/A | Collections, variables, modes, values, scopes, binding, preview, and undo are implemented. Typography-variable editing is read-only. |
 | Code workspace | Yes | Yes | Unknown | N/A | FNX and JSON follow the current selection and source. Both panes are intentionally read-only. |
-| Export engine | Partial | Yes | Partial | N/A | PNG, JPEG, SVG, and PDF engines and 1×/2×/4× presets exist. On exact `9d92b30`, toolbar Export visibly reported success without changing the Inspector and wrote a valid 418×354 `Shape@2x.png`; automated coverage also exercises the unsaved-canvas failure. The default inspector still does not expose preset configuration, and native failure feedback remains to be driven. |
+| Export engine | Partial | Yes | Partial | N/A | PNG, JPEG, SVG, and PDF engines and 1×/2×/4× presets exist. On exact `9d92b30`, toolbar Export visibly reported success without changing the Inspector and wrote a valid 418×354 `Shape@2x.png`; automated coverage also exercises the unsaved-canvas failure. The post-merge follow-up exposes the existing PNG/JPEG/SVG/PDF presets and 1×/2×/4× raster sizes in the default inspector, sharing settings with toolbar Export. The new native success/failure pass remains pending. |
 | Image generation/editing | Yes | Yes | Yes | Unknown | Prompt/model/source/inpaint controls plus submit, poll, save, reuse, and place passed deterministic native QA. Authenticated production inference is not verified. |
 | Video generation | Yes | Yes | Partial | Unknown | Generation, save/place, and native playback controls exist; deterministic client/native flow passed. Production inference and full frame-specific playback validation remain open. |
 | Vector generation/trace | Yes | Yes | Yes | Unknown | Prompt-to-SVG, validation/sanitization, save/place, and source-required Trace paths exist. Production Create is unverified; production Trace is blocked until an SVG worker is configured. |
@@ -49,10 +49,9 @@ notarization were used.
 These are implementation defects, not cosmetic polish. A visible control must
 change state, produce output, or give an explicit unavailable message.
 
-1. Export runs through a legacy inspector entity while the default inspector
-   hides its Export section. Toolbar export now relays progress and results to
-   the canvas, but preset configuration remains outside the visible product
-   surface.
+1. The default inspector now embeds the existing export controller. Presets
+   are session-only; custom sizing, suffixes, advanced format settings and
+   animated export remain unavailable. The follow-up native pass is pending.
 2. The production timeline and contextual toolbar can author keyframes and
    entrance presets without the former duplicate primary flyout. Auto key works
    through Motion At playhead fields; direct-canvas auto-keying remains absent.
@@ -218,8 +217,8 @@ Before release sign-off:
 1. Complete final-artifact native coverage for the remaining inspector
    paint/blend matrix and keep unsupported choices explicitly unavailable or
    read-only.
-2. Expose Export preset configuration in the default product surface and
-   native-verify both success and failure feedback.
+2. Native-verify the newly visible Export presets, toolbar parity, and both
+   success and failure feedback; repeat on the final artifact.
 3. Native-verify the contextual seven-property Keyframe chooser, its single-step
    Undo behavior and rejected requests that author no keyframe, and the absence
    of the contradictory primary Motion flyout.

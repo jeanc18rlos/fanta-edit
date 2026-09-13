@@ -20,6 +20,33 @@ and bundled Git 2.53.0 passed non-launch inspection. The image was detached
 normally and the user's existing Fanta processes remained unchanged. Evidence:
 `/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
 
+## Post-merge export and font-scale follow-up — September 13
+
+Both existing PRs were merged after their exact-head checks passed. Desktop
+PR 1 merged into `perf/large-documents-ai-alignment` as `2a8d2093d0`; backend
+PR 1 merged into `main` as `d8ff972e41`. Backend post-merge CI passed all four
+jobs. Neither merge is a customer-release sign-off.
+
+The follow-up source exposes the existing export controller inside the default
+Design inspector. It supports multiple PNG/JPEG/SVG/PDF presets and 1×/2×/4×
+raster sizes, shares those settings with toolbar Export, and displays completion
+or failure in the inspector. Output goes to the project's `exports/` folder;
+unsaved canvases require Save As first. Presets are session state and are not
+persisted into the document. Advanced sizing, suffixes, format options and
+animated export remain unavailable. The decorative preview box is replaced by
+a compact format summary.
+
+Exports now refuse active transient edits until they commit or cancel. An
+in-flight export retains its captured settings and cannot be replaced by a
+second click. Tabs measure their labels using the UI font, and tab geometry,
+paint opacity fields and export scale selectors follow the font scale.
+The follow-up passes all 740 viewer tests, 597 shared UI tests, three
+architecture checks, and package-scoped `./script/clippy` with Cargo Machete.
+Coverage verifies host export access, toolbar preset parity, transient-edit
+rejection and recovery, and fixed settings during export. Native validation
+and exact-source hosted CI remain pending at this source checkpoint.
+Evidence: `/Users/jeanrojas/fanta-release-evidence/2026-09-13/merge-followup`.
+
 ## Text on Path direction and placement — September 13
 
 The current source adds explicit Forward/Reverse controls and a Start offset

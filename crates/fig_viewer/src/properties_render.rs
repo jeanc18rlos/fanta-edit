@@ -57,8 +57,6 @@ const LIST_ROW_H: f32 = 32.0;
 const PILL_LABEL_W: f32 = 68.0;
 /// Side length of the auto-layout 3×3 alignment grid box.
 const ALIGN_GRID_SIZE: f32 = 64.0;
-/// Height of the export preview band (the original's `EXPORT_PREVIEW_H`).
-const EXPORT_PREVIEW_H: f32 = 84.0;
 
 fn inspector_field_binding(field: &InspectorField) -> Option<(NodeId, BoundProp)> {
     match field {
@@ -3383,7 +3381,6 @@ impl FantaPropertiesPanel {
     pub(crate) fn render_export_section(
         &self,
         can_export: bool,
-        preview_icon: Option<IconName>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3487,7 +3484,7 @@ impl FantaPropertiesPanel {
                     .gap_1()
                     .items_center()
                     .child(div().flex_1().min_w_0().child(format))
-                    .child(div().w(px(68.)).flex_none().child(scale))
+                    .child(div().w(gpui::rems(4.25)).flex_none().child(scale))
                     .child(
                         IconButton::new(("fanta-export-remove", index), IconName::Close)
                             .icon_size(IconSize::XSmall)
@@ -3502,12 +3499,8 @@ impl FantaPropertiesPanel {
         }
 
         let preset_count = self.export_presets.len();
-        let preset_summary = match preset_count {
-            0 => "Add an export setting".to_string(),
-            1 => "1 format per selected layer".to_string(),
-            count => format!("{count} formats per selected layer"),
-        };
-        let preview_summary = if self.export_presets.is_empty() {
+        let preset_summary = "Saved to exports/";
+        let format_summary = if self.export_presets.is_empty() {
             "No export settings".to_string()
         } else {
             self.export_presets
@@ -3551,65 +3544,9 @@ impl FantaPropertiesPanel {
             )
             .child(
                 h_flex().px_4().child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .h(px(EXPORT_PREVIEW_H))
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.editor_background)
-                        .child(
-                            div().absolute().top_2().left_3().child(
-                                Label::new("Preview")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .pt_3()
-                                .child(
-                                    v_flex()
-                                        .max_w(px(180.))
-                                        .min_h(px(46.))
-                                        .px_3()
-                                        .py_2()
-                                        .gap_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(colors.border_variant)
-                                        .bg(colors.surface_background)
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            Icon::new(
-                                                if self
-                                                    .export_presets
-                                                    .iter()
-                                                    .any(|preset| !preset.format.is_raster())
-                                                {
-                                                    IconName::FileCode
-                                                } else {
-                                                    preview_icon.unwrap_or(IconName::Image)
-                                                },
-                                            )
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            Label::new(preview_summary)
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted)
-                                                .line_clamp(1),
-                                        ),
-                                ),
-                        ),
+                    Label::new(format_summary)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                 ),
             )
             .into_any_element()

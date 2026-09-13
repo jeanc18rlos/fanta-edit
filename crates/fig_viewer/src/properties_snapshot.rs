@@ -515,7 +515,6 @@ pub(crate) struct NodeSection {
     pub(crate) id: NodeId,
     pub(crate) kind: NodeKind,
     pub(crate) type_name: SharedString,
-    pub(crate) type_icon: IconName,
     pub(crate) name: String,
     pub(crate) x: f64,
     pub(crate) y: f64,
@@ -928,7 +927,6 @@ pub(crate) fn node_section(
         id,
         kind,
         type_name: node_type_name(node, kind).into(),
-        type_icon: node_type_icon(node, kind),
         name: node.name.clone(),
         x,
         y,
@@ -1547,20 +1545,6 @@ pub(crate) fn node_type_name(node: &CanvasNode, kind: NodeKind) -> &'static str 
         NodeKind::Component => "Component",
         NodeKind::Frame => "Frame",
         _ => node.data.default_name(),
-    }
-}
-
-pub(crate) fn node_type_icon(node: &CanvasNode, kind: NodeKind) -> IconName {
-    match kind {
-        NodeKind::Component | NodeKind::Instance => IconName::Box,
-        NodeKind::Text => IconName::ToolText,
-        NodeKind::Image => IconName::Image,
-        NodeKind::Shape => IconName::ToolRect,
-        NodeKind::Frame | NodeKind::Group => IconName::ToolFrame,
-        NodeKind::Other => match &node.data {
-            NodeData::Video(_) => IconName::Image,
-            _ => IconName::Box,
-        },
     }
 }
 

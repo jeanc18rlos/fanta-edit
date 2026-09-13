@@ -1406,7 +1406,7 @@ impl DesignPanel {
             )
             .child(
                 div()
-                    .w(px(58.))
+                    .w(gpui::rems(4.25))
                     .h_full()
                     .flex_none()
                     .border_l_1()
