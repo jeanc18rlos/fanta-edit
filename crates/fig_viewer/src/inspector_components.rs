@@ -2,7 +2,7 @@ use std::{rc::Rc, time::Duration};
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, IntoElement, RenderOnce, SharedString, Window,
-    ease_out_quint, px,
+    ease_out_quint, px, rems,
 };
 use ui::prelude::*;
 
@@ -42,10 +42,29 @@ impl CollapsibleIconTab {
 }
 
 impl RenderOnce for CollapsibleIconTab {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let selected = self.selected;
-        let collapsed_width = 32.0;
-        let expanded_width = 36.0 + self.label.chars().count() as f32 * 7.0;
+        let label_width = window
+            .text_system()
+            .shape_line(
+                self.label.clone(),
+                TextSize::Small.rems(cx).to_pixels(window.rem_size()),
+                &[gpui::TextRun {
+                    len: self.label.len(),
+                    font: theme::theme_settings(cx).ui_font(cx).clone(),
+                    color: cx.theme().colors().text,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }],
+                None,
+            )
+            .width
+            .ceil();
+        let collapsed_width = IconSize::Small.rems().to_pixels(window.rem_size())
+            + rems(1.0).to_pixels(window.rem_size());
+        let expanded_width =
+            collapsed_width + rems(0.25).to_pixels(window.rem_size()) + label_width;
         let on_click = self.on_click;
         let label = div().child(Label::new(self.label).size(LabelSize::Small).single_line());
         #[cfg(test)]
@@ -58,7 +77,7 @@ impl RenderOnce for CollapsibleIconTab {
             .when(selected, |container| container.child(label));
         let tab = h_flex()
             .id((self.scope, self.index))
-            .h(px(28.0))
+            .h(rems(1.75))
             .flex_none()
             .items_center()
             .gap_1()
@@ -76,7 +95,7 @@ impl RenderOnce for CollapsibleIconTab {
             })
             .on_click(move |_, window, cx| on_click(window, cx))
             .child(Icon::new(self.icon).size(IconSize::Small))
-            .child(label);
+            .when(selected, |tab| tab.child(label));
         let animation_state = if selected { "expand" } else { "collapsed" };
 
         tab.with_animation(
@@ -91,7 +110,7 @@ impl RenderOnce for CollapsibleIconTab {
                 } else {
                     expanded_width + (collapsed_width - expanded_width) * delta
                 };
-                tab.w(px(width))
+                tab.w(width)
             },
         )
     }
@@ -177,7 +196,7 @@ impl RenderOnce for CollapsibleIconTabBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
             .id(self.id)
-            .h(px(34.0))
+            .h(rems(2.125))
             .p_0p5()
             .gap_0p5()
             .rounded_lg()

@@ -122,11 +122,13 @@ actually driven. Nothing here claims more than that record supports.
   of these local bundles is the final signed installer. Scale and Path Select are implemented and have focused native
   history/reopen evidence; Image, Video, Vector, Masks, and Remove Background
   open their dedicated generation workspaces.
-- **Some fixed-width controls truncate at UI font size 20.** Exact `f9a67f4`
-  native One Light captures show clipped Canvas/Design switcher labels and a
-  truncated Fill opacity readout. TextPath direction and Start offset remain
-  usable through the inspector scroll area. Default-size dark-theme checks
-  do not establish full font-scale compatibility.
+- **Full font-scale compatibility remains unverified.** Exact `f9a67f4`
+  native One Light captures showed clipped Canvas/Design switcher labels and a
+  truncated Fill opacity readout. The post-merge source measures tab text and
+  scales the affected controls with the UI font. Exact `6ca5d89c2a` native
+  captures verify complete labels and opacity in One Light at size 20 and One
+  Dark at size 16, at 1089- and 1025-point window widths. The full application
+  matrix and exact-artifact validation remain open.
 
 - **Ask AI and text-oriented commands prepare Agent drafts, not automatic
   edits.** A typed Ask AI prompt and the Replace Content, Rewrite Text,
@@ -273,16 +275,15 @@ actually driven. Nothing here claims more than that record supports.
   thereafter. (A viewport that genuinely crops the shape has no `<Rect>`
   spelling and still prints as a canonical `<Vector>`; that is correct, not a
   regression.)
-- **Export's engine and toolbar feedback work, but preset configuration is not
-  visible in the default inspector.** Export needs a written project and can
-  produce PNG, JPG, SVG, or PDF under `<project>/exports/`. Toolbar Export calls
-  that same engine, preserves the current sidebar state, and mirrors running,
-  success, and failure messages to the canvas. The default GPUI inspector still
-  removes the legacy Export section, so users cannot configure the existing
-  1×/2×/4× presets or formats from the shipped surface. Automated success and
-  unsaved-canvas cases pass. Exact `9d92b30` native QA exercised the success
-  route and wrote a valid 418×354 `Shape@2x.png`; native failure feedback is
-  still open.
+- **Export presets are session-only and advanced configuration is unavailable.**
+  The post-merge source exposes PNG, JPEG, SVG and PDF plus 1×/2×/4× raster
+  scales in the default Design inspector. Multiple presets and toolbar Export
+  share the same controller. Files are written under the project's `exports/`
+  directory; Save As is required for an unsaved canvas. Presets do not survive
+  application restart. Custom dimensions, suffixes, advanced format options and
+  animated export remain unimplemented. Exact `6ca5d89c2a` passes native
+  multiple presets, all four formats, raster scales, visible write failure,
+  toolbar retry, empty presets, and Save/reopen checks.
 - **Direct-canvas auto-keyframe and Motion Path remain unfinished; time
   comments have bounded native coverage.** Motion mode can create/select/rename
   clips, change duration,

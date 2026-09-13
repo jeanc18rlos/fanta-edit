@@ -556,7 +556,7 @@ impl FigView {
             focus_handle,
             editor_session,
             layers_sidebar,
-            inspector_sidebar,
+            inspector_sidebar: inspector_sidebar.clone(),
             prototype_sidebar,
             motion_sidebar,
             variables_workspace,
@@ -604,7 +604,9 @@ impl FigView {
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_design: (crate::gpui_adapters::runtime_enabled(cx)
                 && crate::gpui_adapters::design::design_enabled())
-            .then(|| crate::gpui_adapters::design::DesignAdapter::new(window, cx)),
+            .then(|| {
+                crate::gpui_adapters::design::DesignAdapter::new(inspector_sidebar, window, cx)
+            }),
             fonts_prewarmed: false,
             hovered_node: None,
             text_edit: None,
@@ -6477,7 +6479,7 @@ impl Item for FigView {
                 focus_handle: cx.focus_handle(),
                 editor_session,
                 layers_sidebar,
-                inspector_sidebar,
+                inspector_sidebar: inspector_sidebar.clone(),
                 prototype_sidebar,
                 motion_sidebar,
                 variables_workspace,
@@ -6525,7 +6527,9 @@ impl Item for FigView {
                 #[cfg(feature = "fanta-gpui-ui")]
                 gpui_design: (crate::gpui_adapters::runtime_enabled(cx)
                     && crate::gpui_adapters::design::design_enabled())
-                .then(|| crate::gpui_adapters::design::DesignAdapter::new(window, cx)),
+                .then(|| {
+                    crate::gpui_adapters::design::DesignAdapter::new(inspector_sidebar, window, cx)
+                }),
                 fonts_prewarmed: false,
                 hovered_node: None,
                 text_edit: None,
@@ -7572,6 +7576,21 @@ mod tests {
         cx.run_until_parked();
 
         assert!(project_root.join("exports/Page 1@2x.png").is_file());
+        let inspector = view.read_with(cx, |view, _| view.inspector_sidebar.clone());
+        inspector.update(cx, |inspector, cx| {
+            inspector.set_export_format(0, crate::export::ExportFormat::Svg, cx);
+            inspector.add_export_preset(cx);
+            inspector.set_export_format(1, crate::export::ExportFormat::Jpeg, cx);
+            inspector.set_export_scale(1, crate::export::ExportScale::Four, cx);
+        });
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| view.export_from_toolbar(window, cx));
+            })
+            .expect("export configured inspector presets from toolbar");
+        cx.run_until_parked();
+        assert!(project_root.join("exports/Page 1.svg").is_file());
+        assert!(project_root.join("exports/Page 1@4x.jpg").is_file());
         assert!(!view.read_with(cx, |view, _| view.inspector_sidebar_visible));
         let workspace = window
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())

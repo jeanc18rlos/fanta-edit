@@ -6,7 +6,7 @@ use std::{
 };
 
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter,
+    Anchor, AnyElement, AnyView, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter,
     ExternalPaths, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent,
     Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
     Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
@@ -995,6 +995,7 @@ pub struct DesignPanel {
     workspace_mode: DesignPanelWorkspaceMode,
     property_value_states: HashMap<DesignPanelProperty, DesignPanelPropertyValueState>,
     export_view_data: Option<DesignExportViewData>,
+    export_content: Option<AnyView>,
     color_style_view_data: DesignColorStyleViewData,
     color_style_sample_view_data: DesignColorStyleSampleViewData,
     color_contrast_view_data: DesignColorContrastViewData,
@@ -2028,6 +2029,7 @@ impl DesignPanel {
             workspace_mode: DesignPanelWorkspaceMode::Design,
             property_value_states: HashMap::new(),
             export_view_data: None,
+            export_content: None,
             color_style_view_data: DesignColorStyleViewData::default(),
             color_style_sample_view_data: DesignColorStyleSampleViewData::default(),
             color_contrast_view_data: DesignColorContrastViewData::default(),
@@ -2756,6 +2758,13 @@ impl DesignPanel {
 
     pub const fn inspection_context(&self) -> &DesignPanelInspectionContext {
         &self.inspection_context
+    }
+
+    /// Replaces the standard export section with the host's existing export
+    /// controls while retaining inspector scrolling and export permissions.
+    pub fn set_export_content(&mut self, content: Option<AnyView>, cx: &mut Context<Self>) {
+        self.export_content = content;
+        cx.notify();
     }
 
     /// Supplies canonical host-owned export rows for the current command
@@ -4022,25 +4031,27 @@ impl Render for DesignPanel {
             self.sync_typography_style_picker(cx);
             self.sync_paint_picker(window, cx);
         }
+        let include_standard_export = self.can_export() && self.export_content.is_none();
         let mut body = v_flex().w_full();
         if !renders_inspector_projection {
             body = body.child(self.render_host_owned_surface(cx));
         } else if selection_kind == DesignPanelSelectionKind::None {
             body = body.child(self.render_page_context(cx));
-            if self.can_export() {
+            if include_standard_export {
                 body = body.child(self.render_export(cx));
             }
         } else if viewer_projection {
             body = body.child(self.render_viewer_properties(cx));
-            if self.can_export() {
+            if include_standard_export {
                 body = body.child(self.render_export(cx));
             }
         } else {
-            for section in resolve_design_panel_sections_with_export(&self.node, self.can_export())
-                .into_iter()
-                .filter(|section| {
-                    design_panel_section_is_visible_in_workspace(*section, self.workspace_mode)
-                })
+            for section in
+                resolve_design_panel_sections_with_export(&self.node, include_standard_export)
+                    .into_iter()
+                    .filter(|section| {
+                        design_panel_section_is_visible_in_workspace(*section, self.workspace_mode)
+                    })
             {
                 let rendered = match section {
                     DesignPanelSection::Selection => self.render_selection_colors(cx),
@@ -4067,6 +4078,17 @@ impl Render for DesignPanel {
                     body = body.child(rendered);
                 }
             }
+        }
+
+        if renders_inspector_projection
+            && self.can_export()
+            && design_panel_section_is_visible_in_workspace(
+                DesignPanelSection::Export,
+                self.workspace_mode,
+            )
+            && let Some(content) = &self.export_content
+        {
+            body = body.child(content.clone());
         }
 
         let scroll_handle = self.scroll_handle.clone();

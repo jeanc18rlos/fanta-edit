@@ -2,6 +2,12 @@
 
 Updated on 2026-09-12. First release target: Apple Silicon Mac.
 
+The September 13 post-merge follow-up exposes the existing export presets in
+Design and corrects tab/opacity sizing for enlarged UI fonts. It preserves the
+shared toolbar/inspector export controller and blocks transient or duplicate
+exports. The detailed validation state is in
+[Release validation](RELEASE_VALIDATION.md#post-merge-export-and-font-scale-follow-up--september-13).
+
 ## What is connected
 
 - The production backend is `https://api.fantaisa.net`; `/v1/status` and
@@ -36,8 +42,8 @@ narrow-window layout result is unsubstantiated because the retained screenshots
 show the wrong app. The ad-hoc local QA shell is not a distribution candidate.
 Evidence is retained at
 `/tmp/fanta-release-qa-20260909/toolbar-milestone-9d92b30/verification.json`.
-The remaining paint/blend matrix, native Export failure, and final
-signed/notarized artifact are still gates.
+The remaining paint/blend matrix and final signed/notarized artifact are still
+gates. Native Export failure and retry passed later at `6ca5d89c2a`.
 
 The three retained `9d92b30` toolbar screenshots are invalid: each shows
 ChatGPT rather than Fanta. They remain preserved only as rejected evidence and
@@ -69,7 +75,7 @@ returning to the rounded initial percentage preserves the exact stored start.
 Exact `f9a67f4` passed native direction/offset, preview restoration, cancellation,
 history, text entry, and reopen checks in dark/light themes. See the September 13
 section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md) for the durable evidence
-and the remaining shared font-scale clipping issue.
+and the later `6ca5d89c2a` correction of the observed font-scale clipping.
 
 The toolbar attachment captures only selections wholly inside the active page
 or component root. Its immutable review-before-send resource carries exact node
@@ -109,7 +115,8 @@ and reopen show the clip without tracks. Exact `f9a67f4` also passed native
 time-comment creation at 1285 ms, one-step Undo/Redo, navigation from a different
 playhead, and saved-thread navigation after full reopen. The remaining Motion
 matrix and final artifact still lack native evidence. Both hosted `f9a67f4`
-source checks pass; the DMG build was still running at this checkpoint.
+source checks and the hosted DMG build pass; final signed-installer validation
+remains open.
 
 The current coherent source gate passed all 737/737 viewer tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21

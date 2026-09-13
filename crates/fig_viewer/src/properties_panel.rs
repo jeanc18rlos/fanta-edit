@@ -197,6 +197,36 @@ pub struct FantaPropertiesPanel {
     pub(crate) _active_view_subscription: Option<Subscription>,
 }
 
+#[cfg(feature = "fanta-gpui-ui")]
+pub(crate) struct FantaExportSection {
+    inspector: Entity<FantaPropertiesPanel>,
+    _subscription: Subscription,
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+impl FantaExportSection {
+    pub(crate) fn new(inspector: Entity<FantaPropertiesPanel>, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.observe(&inspector, |_, _, cx| cx.notify());
+        Self {
+            inspector,
+            _subscription: subscription,
+        }
+    }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+impl Render for FantaExportSection {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.inspector.update(cx, |inspector, cx| {
+            let can_export = inspector.active_item(cx).is_some_and(|item| {
+                let item = item.read(cx);
+                item.project_root().is_some() && item.document().is_some()
+            });
+            inspector.render_export_block(can_export, window, cx)
+        })
+    }
+}
+
 impl FantaPropertiesPanel {
     pub async fn load(
         workspace: WeakEntity<Workspace>,
@@ -1602,12 +1632,18 @@ impl FantaPropertiesPanel {
     // === Export ===========================================================
 
     pub(crate) fn add_export_preset(&mut self, cx: &mut Context<Self>) {
+        if self.export_task.is_some() {
+            return;
+        }
         self.export_presets.push(ExportPreset::default());
         self.export_feedback = None;
         cx.notify();
     }
 
     pub(crate) fn remove_export_preset(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.export_task.is_some() {
+            return;
+        }
         if index < self.export_presets.len() {
             self.export_presets.remove(index);
             self.export_feedback = None;
@@ -1621,6 +1657,9 @@ impl FantaPropertiesPanel {
         format: ExportFormat,
         cx: &mut Context<Self>,
     ) {
+        if self.export_task.is_some() {
+            return;
+        }
         if let Some(preset) = self.export_presets.get_mut(index) {
             preset.format = format;
             self.export_feedback = None;
@@ -1634,6 +1673,9 @@ impl FantaPropertiesPanel {
         scale: ExportScale,
         cx: &mut Context<Self>,
     ) {
+        if self.export_task.is_some() {
+            return;
+        }
         if let Some(preset) = self.export_presets.get_mut(index) {
             preset.scale = scale;
             self.export_feedback = None;
@@ -1657,6 +1699,9 @@ impl FantaPropertiesPanel {
         show_canvas_feedback: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.export_task.is_some() {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             self.show_export_error(
                 "The canvas is no longer available.",
@@ -1671,6 +1716,14 @@ impl FantaPropertiesPanel {
         };
         let jobs = {
             let item = item.read(cx);
+            if item.content_preview_active() {
+                self.show_export_error(
+                    "Finish or cancel the current edit before exporting.",
+                    show_canvas_feedback,
+                    cx,
+                );
+                return;
+            }
             let Some(project_root) = item.project_root().map(|path| path.to_path_buf()) else {
                 self.show_export_error(
                     "Save this canvas as a Fanta project before exporting.",
@@ -1808,18 +1861,12 @@ impl FantaPropertiesPanel {
     fn render_export_block(
         &self,
         can_export: bool,
-        preview_icon: Option<IconName>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let feedback = self.export_feedback.clone();
         v_flex()
-            .child(self.render_export_section(
-                can_export && self.export_task.is_none(),
-                preview_icon,
-                window,
-                cx,
-            ))
+            .child(self.render_export_section(can_export && self.export_task.is_none(), window, cx))
             .when_some(feedback, |section, feedback| {
                 let (icon, color) = match feedback.kind {
                     ExportFeedbackKind::Running => (IconName::ArrowCircle, Color::Info),
@@ -2782,7 +2829,7 @@ impl Render for FantaPropertiesPanel {
                         {
                             sections.push(section);
                         }
-                        sections.push(self.render_export_block(can_export, None, window, cx));
+                        sections.push(self.render_export_block(can_export, window, cx));
                     }
                     InspectorBody::Node(node) => {
                         use NodeKind::*;
@@ -2936,12 +2983,7 @@ impl Render for FantaPropertiesPanel {
                         if !node.bindings.is_empty() {
                             sections.push(self.render_bindings_section(&node.bindings));
                         }
-                        sections.push(self.render_export_block(
-                            can_export,
-                            Some(node.type_icon),
-                            window,
-                            cx,
-                        ));
+                        sections.push(self.render_export_block(can_export, window, cx));
                     }
                     InspectorBody::Multi(multi) => {
                         content = content.child(self.render_header(
@@ -2966,7 +3008,7 @@ impl Render for FantaPropertiesPanel {
                             sections
                                 .push(self.render_combine_variants_section(multi.master_count, cx));
                         }
-                        sections.push(self.render_export_block(can_export, None, window, cx));
+                        sections.push(self.render_export_block(can_export, window, cx));
                     }
                 }
                 for section in sections {
@@ -3360,6 +3402,81 @@ mod panel_integration_tests {
                 ));
             })
             .expect("properties panel remains open");
+    }
+
+    #[gpui::test]
+    async fn export_rejects_an_active_preview_and_recovers_after_cancellation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.vector_id], cx);
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let owner = harness._view.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(owner, cx, |_| ((), DocChange::ContentPreview))
+                .expect("start preview");
+        });
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.export_selection(cx);
+                assert!(panel.export_task.is_none());
+                assert!(matches!(
+                    panel.export_feedback.as_ref(),
+                    Some(feedback) if matches!(feedback.kind, ExportFeedbackKind::Error)
+                        && feedback.message.contains("Finish or cancel")
+                ));
+            })
+            .expect("inspector remains open");
+        cx.run_until_parked();
+        assert!(
+            std::fs::read_dir(harness._temp.path().join("exports"))
+                .expect("project export directory")
+                .next()
+                .is_none(),
+            "a refused preview export must not write any files"
+        );
+
+        item.update(cx, |item, cx| item.finish_content_preview(owner, false, cx));
+        harness
+            .panel
+            .update(cx, |panel, _, cx| {
+                panel.export_selection(cx);
+                let presets = panel.export_presets.clone();
+                panel.add_export_preset(cx);
+                panel.remove_export_preset(0, cx);
+                panel.set_export_format(0, ExportFormat::Svg, cx);
+                panel.set_export_scale(0, ExportScale::Four, cx);
+                assert_eq!(
+                    panel.export_presets, presets,
+                    "in-flight presets stay fixed"
+                );
+                let generation = panel.export_generation;
+                panel.export_selection(cx);
+                assert_eq!(
+                    panel.export_generation, generation,
+                    "an in-flight export cannot be replaced"
+                );
+            })
+            .expect("export retry starts");
+        cx.run_until_parked();
+        assert!(
+            harness
+                ._temp
+                .path()
+                .join("exports/Gradient Rect@2x.png")
+                .is_file()
+        );
+        harness
+            .panel
+            .read_with(cx, |panel, _| {
+                assert!(matches!(
+                    panel.export_feedback.as_ref().map(|feedback| feedback.kind),
+                    Some(ExportFeedbackKind::Success)
+                ));
+            })
+            .expect("inspector remains open");
     }
 
     #[gpui::test]

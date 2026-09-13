@@ -12428,6 +12428,66 @@ fn effect_numeric_clamps_match_each_models_domain() {
 }
 
 #[gpui::test]
+fn host_export_content_follows_inspector_permissions_and_selection(cx: &mut TestAppContext) {
+    struct ExportContent;
+
+    impl Render for ExportContent {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .h(px(32.))
+                .debug_selector(|| "host-export-controls".to_string())
+                .child("Export settings")
+        }
+    }
+
+    let node = DesignPanelNode::new("slice", "Slice", DesignPanelNodeKind::Slice);
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let content = visual_cx.new(|_| ExportContent);
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_export_content(Some(content.into()), cx);
+    });
+
+    for context in [
+        DesignPanelInspectionContext::single(
+            node.clone(),
+            DesignPanelParentLayout::Canvas,
+            DesignPanelPermissions::editor(),
+        ),
+        DesignPanelInspectionContext::page(DesignPanelPermissions::editor()),
+        DesignPanelInspectionContext::single(
+            node,
+            DesignPanelParentLayout::Canvas,
+            DesignPanelPermissions::viewer(),
+        ),
+        DesignPanelInspectionContext::page(DesignPanelPermissions::restricted_viewer()),
+    ] {
+        let can_export = context.permissions().can_export();
+        panel.update(visual_cx, |panel, cx| {
+            panel.set_inspection_context(context, cx)
+        });
+        visual_cx.run_until_parked();
+        visual_cx.update(|window, cx| window.draw(cx).clear());
+        assert_eq!(
+            visual_cx.debug_bounds("host-export-controls").is_some(),
+            can_export,
+            "host controls follow export access across selected-layer and page contexts"
+        );
+    }
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::page(DesignPanelPermissions::editor()),
+            cx,
+        );
+        panel.set_active_surface(DesignPanelSurface::Prototype, cx);
+    });
+    visual_cx.run_until_parked();
+    visual_cx.update(|window, cx| window.draw(cx).clear());
+    assert!(visual_cx.debug_bounds("host-export-controls").is_none());
+}
+
+#[gpui::test]
 fn canonical_export_view_normalizes_sizing_and_emits_stable_ids(cx: &mut TestAppContext) {
     let node = DesignPanelNode::new("slice", "Slice", DesignPanelNodeKind::Slice);
     let (host, visual_cx) = setup(node, cx);
