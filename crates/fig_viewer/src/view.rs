@@ -3446,6 +3446,12 @@ impl FigView {
                         | fanta_tools::ToolOverlay::PreviewEllipse { .. }
                 )
             });
+        #[cfg(target_os = "macos")]
+        let pending_edit = pending_edit
+            || self
+                .canvas_video
+                .as_ref()
+                .is_some_and(|session| session.trim.is_some());
         #[cfg(feature = "fanta-gpui-ui")]
         let pending_edit = pending_edit
             || self
@@ -7289,6 +7295,144 @@ mod tests {
                 .undo_depth()),
             before
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn assert_local_media_preserves_video_trim(cx: &mut TestAppContext, delayed: bool) {
+        let (directory, item, window) = video_trim_view_fixture(cx).await;
+        let snapshot = |item: &FigItem, _cx: &App| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.doc.selection.as_slice().to_vec(),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        };
+        let before = item.read_with(cx, snapshot);
+        let completion = if delayed {
+            let path = directory.path().join("Local picture.png");
+            image::RgbaImage::from_pixel(24, 16, image::Rgba([32, 96, 224, 255]))
+                .save(&path)
+                .expect("local PNG fixture");
+            let (send, receive) = futures::channel::oneshot::channel::<()>();
+            window
+                .update(cx, |view, _, cx| {
+                    view.cancel_video_trim(cx);
+                    view.choose_local_media_with(
+                        move |path| async move {
+                            receive.await.context("release local media preparation")?;
+                            crate::generation_media::prepare_local_media(&path).await
+                        },
+                        cx,
+                    );
+                })
+                .expect("start local media import");
+            cx.run_until_parked();
+            assert!(cx.did_prompt_for_paths());
+            cx.simulate_path_prompt_response(|_| Some(vec![path]));
+            cx.run_until_parked();
+            window
+                .update(cx, |view, window, cx| {
+                    assert!(view.media_import_task.is_some());
+                    let generation = view.media_import_generation.get();
+                    view.begin_video_trim(window, cx);
+                    assert_eq!(
+                        view.media_import_generation.get(),
+                        generation,
+                        "opening trim must exercise the pending edit guard"
+                    );
+                })
+                .expect("open trim while media is preparing");
+            Some(send)
+        } else {
+            None
+        };
+        let draft = window
+            .update(cx, |view, window, cx| {
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("trim draft");
+                trim.start
+                    .update(cx, |input, cx| input.set_text("invalid", window, cx));
+                trim.end
+                    .update(cx, |input, cx| input.set_text("2", window, cx));
+                view.apply_video_trim_with(|_, _| panic!("invalid trim reached decoder"), cx);
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("invalid trim remains open");
+                assert!(trim.error.is_some());
+                assert!(!view.item.read(cx).content_preview_active());
+                (
+                    trim.start.entity_id(),
+                    trim.end.entity_id(),
+                    trim.start.read(cx).text(cx),
+                    trim.end.read(cx).text(cx),
+                    trim.error.clone(),
+                )
+            })
+            .expect("enter invalid trim input");
+        if let Some(send) = completion {
+            send.send(())
+                .unwrap_or_else(|_| panic!("local media preparation must still be pending"));
+        } else {
+            window
+                .update(cx, |view, _, cx| view.choose_local_media(cx))
+                .expect("request import with trim open");
+        }
+        cx.run_until_parked();
+        assert!(!cx.did_prompt_for_paths());
+        assert_eq!(item.read_with(cx, snapshot), before);
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.media_import_task.is_none());
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("media import must preserve the trim draft");
+                assert_eq!(
+                    (
+                        trim.start.entity_id(),
+                        trim.end.entity_id(),
+                        trim.start.read(cx).text(cx),
+                        trim.end.read(cx).text(cx),
+                        trim.error.clone(),
+                    ),
+                    draft
+                );
+                assert!(trim.task.borrow().is_none());
+                assert!(!trim.cancelled.get());
+                view.cancel_video_trim(cx);
+                view.choose_local_media(cx);
+            })
+            .expect("cancel draft and retry import");
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(item.read_with(cx, snapshot), before);
+        window
+            .update(cx, |view, _, _| assert!(view.media_import_task.is_none()))
+            .expect("cancelled import clears task");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn local_media_picker_preserves_invalid_video_trim(cx: &mut TestAppContext) {
+        assert_local_media_preserves_video_trim(cx, false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn local_media_delayed_completion_preserves_invalid_video_trim(cx: &mut TestAppContext) {
+        assert_local_media_preserves_video_trim(cx, true).await;
     }
 
     #[cfg(target_os = "macos")]
