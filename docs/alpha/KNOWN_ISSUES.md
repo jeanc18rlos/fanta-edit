@@ -116,11 +116,18 @@ actually driven. Nothing here claims more than that record supports.
   equally specific notice. Motion Path is hidden and unimplemented. Text on
   Path now has typed direction and path-length offset controls. Guarded Auto key
   works in Motion At playhead fields and has bounded Position X native evidence
-  at `12e2e4c`. The bounded canvas-selection attachment and Motion time comments are
-  implemented only in the current source line and have no native-artifact
-  evidence. Scale and Path Select are implemented and have focused native
+  at `12e2e4c`. Exact `f9a67f4` adds native TextPath and bounded page-selection
+  attachment evidence plus timed-comment creation, history, navigation, and
+  reopen. The remaining Motion matrix still needs native coverage. None
+  of these local bundles is the final signed installer. Scale and Path Select are implemented and have focused native
   history/reopen evidence; Image, Video, Vector, Masks, and Remove Background
   open their dedicated generation workspaces.
+- **Some fixed-width controls truncate at UI font size 20.** Exact `f9a67f4`
+  native One Light captures show clipped Canvas/Design switcher labels and a
+  truncated Fill opacity readout. TextPath direction and Start offset remain
+  usable through the inspector scroll area. Default-size dark-theme checks
+  do not establish full font-scale compatibility.
+
 - **Ask AI and text-oriented commands prepare Agent drafts, not automatic
   edits.** A typed Ask AI prompt and the Replace Content, Rewrite Text,
   Translate Text, and Rename Layers templates open a fresh Agent Panel draft
@@ -276,15 +283,16 @@ actually driven. Nothing here claims more than that record supports.
   unsaved-canvas cases pass. Exact `9d92b30` native QA exercised the success
   route and wrote a valid 418×354 `Shape@2x.png`; native failure feedback is
   still open.
-- **Auto-keyframe and Motion Path remain unfinished; time comments are
-  source-only.** Motion mode can create/select/rename clips, change duration,
+- **Direct-canvas auto-keyframe and Motion Path remain unfinished; time
+  comments have bounded native coverage.** Motion mode can create/select/rename
+  clips, change duration,
   add property tracks and keyframes, move/delete keyframes, edit
   interpolation/easing, apply entrance
   presets, play, loop, scrub, and zoom. The timeline-wide and contextual
   Keyframe menus now share the same seven-property catalog; a contextual choice
   adds or replaces one keyframe at the playhead in one undoable transaction.
   Animation Style applies an undoable preset and synchronizes the timeline, and
-  the contradictory primary Motion flyout is removed. The source-only Time
+  the contradictory primary Motion flyout is removed. The Time
   comment action captures the active page, clip, and exact integer-ms playhead,
   pauses, and arms canvas placement. Posting persists one `SetMeta` history
   operation, so one Undo removes the comment; FNX write/reopen preserves it.
@@ -296,11 +304,13 @@ actually driven. Nothing here claims more than that record supports.
   playback, scope, and source-lock changes clear unplaced intent. Time-comment
   arming, placement, and thread navigation refuse to replace an existing draft
   or unsent reply; unrelated mode and tool actions can still intentionally
-  cancel a placed draft. Auto-keyframe still declines explicitly, and Motion
-  Path remains hidden with no document implementation. Production uses
+  cancel a placed draft. Auto key works through Motion At playhead fields;
+  direct-canvas recording and Motion Path remain unimplemented. Production uses
   `fig_viewer::TimelineShell`; the reusable `fanta-gpui` timeline tests exercise
-  the pseudo editor, not the shipped timeline. None of the contextual keyframing
-  or time-comment work has native or final-artifact evidence.
+  the pseudo editor, not the shipped timeline. Exact `f9a67f4` passes native
+  comment creation at 1285 ms, one-step Undo/Redo, saved-thread navigation, and
+  reopen. The wider time-comment matrix, contextual keyframe chooser, and final
+  artifact remain unverified natively.
 - The Code tab is read-only by design. Edit `.fnx` in your own editor and the
   canvas follows the file. Note that with autosave on, `page.fnx`'s mtime moves
   about a second after any canvas edit — **an unchanged mtime is no longer a

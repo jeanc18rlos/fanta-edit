@@ -66,7 +66,10 @@ direct persistence, defer relevant external reconciliation, restore and
 reproject on cancellation or selection change, and resume persistence after
 completion. The current source adds typed direction and offset actions;
 returning to the rounded initial percentage preserves the exact stored start.
-Native validation of these new controls is pending.
+Exact `f9a67f4` passed native direction/offset, preview restoration, cancellation,
+history, text entry, and reopen checks in dark/light themes. See the September 13
+section of [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md) for the durable evidence
+and the remaining shared font-scale clipping issue.
 
 The toolbar attachment captures only selections wholly inside the active page
 or component root. Its immutable review-before-send resource carries exact node
@@ -102,8 +105,11 @@ intentionally cancel a placed draft. Direct-canvas auto-keying and Motion Path
 remain unimplemented. The exact `12e2e4c` local release build passed a bounded
 native Position X Auto key preview/restore/commit/Undo/reopen smoke. The
 intermediate disk states were observed during the run; the retained final file
-and reopen show the clip without tracks. The other current Motion behavior
-still lacks native and final-artifact evidence.
+and reopen show the clip without tracks. Exact `f9a67f4` also passed native
+time-comment creation at 1285 ms, one-step Undo/Redo, navigation from a different
+playhead, and saved-thread navigation after full reopen. The remaining Motion
+matrix and final artifact still lack native evidence. Both hosted `f9a67f4`
+source checks pass; the DMG build was still running at this checkpoint.
 
 The current coherent source gate passed all 737/737 viewer tests; 116
 `fanta-text` unit tests and one doctest, with one network test ignored; 21
@@ -530,7 +536,7 @@ The old `eca2b86` native candidate rendered/acquired curves and preserved author
 
 Commit `dcf27d6` records edited vectors with `NodeFlags::UNCLIPPED_VECTOR`, preserving opaque extension metadata and keeping canvas rendering and export bounds consistent after save/reopen. It supersedes the intermediate metadata-marker approach. The viewport revision passed 337 document tests with one benchmark ignored, 280 editing-tool tests, 6 viewport render tests, and 24 native toolbar adapter tests. Both GPUI pixel/save/reopen regressions passed 20 scheduler iterations each; the ordinary raster pixel guard passed once. These results cover the final flag-based source, not just the earlier candidate.
 
-The `dcf27d6` native viewport and K-shortcut checks passed after the 6m42s build. That candidate restored saved geometry correctly on Undo but left editing handles stale until pointer input. Commit `849685f` refreshes cached path-editing overlays after successful Undo/Redo through a read-only hook, without changing geometry, selection, gesture state, or history. Both NodeEdit and Path Selection regressions failed at exact overlay positions before the fix. The final 280 editing-tool tests and 26 toolbar adapter tests pass, and both new GPUI regressions pass 20 scheduler iterations each. The `849685f` build passed in 4m36s, followed by native immediate Undo/Redo handle alignment and save/reopen with an unchanged source hash. Text on Path was still a placeholder in that historical candidate; the later source-only implementation is summarized near the top of this document and has no native evidence. The full Sidebar suite passed all 143 tests, and six corrected fixtures each passed 20 scheduler iterations. Commit `ca56b0a` adds full Sidebar and toolbar CI coverage and passed actionlint; the fixture corrections add no Sidebar runtime change. Both hosted checks at `9ff7a77` passed for this editing batch, and published `12ad6d3` also passed both checks. The exact `12ad6d3` installer remained in progress at 05:26 UTC; final installer verification is pending.
+The `dcf27d6` native viewport and K-shortcut checks passed after the 6m42s build. That candidate restored saved geometry correctly on Undo but left editing handles stale until pointer input. Commit `849685f` refreshes cached path-editing overlays after successful Undo/Redo through a read-only hook, without changing geometry, selection, gesture state, or history. Both NodeEdit and Path Selection regressions failed at exact overlay positions before the fix. The final 280 editing-tool tests and 26 toolbar adapter tests pass, and both new GPUI regressions pass 20 scheduler iterations each. The `849685f` build passed in 4m36s, followed by native immediate Undo/Redo handle alignment and save/reopen with an unchanged source hash. Text on Path was still a placeholder in that historical candidate; the later implementation and its bounded `f9a67f4` native evidence are summarized near the top of this document. The full Sidebar suite passed all 143 tests, and six corrected fixtures each passed 20 scheduler iterations. Commit `ca56b0a` adds full Sidebar and toolbar CI coverage and passed actionlint; the fixture corrections add no Sidebar runtime change. Both hosted checks at `9ff7a77` passed for this editing batch, and published `12ad6d3` also passed both checks. The exact `12ad6d3` installer remained in progress at 05:26 UTC; final installer verification is pending.
 
 
 ## September 10 recovery and serialization checkpoint
