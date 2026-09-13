@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use editor::Editor;
 use fanta_doc::{DocId, NodeId};
 use glam::DVec2;
-use gpui::{AnyElement, App, Entity, Focusable as _, ObjectFit, SharedString, img};
+use gpui::{
+    AnyElement, App, Bounds, Entity, Focusable as _, ObjectFit, Pixels, Point, SharedString, Size,
+    Stateful, canvas, deferred, img, point,
+};
 use ui::prelude::*;
 use ui::{IconButton, IconButtonShape, Tooltip};
 use workspace::MultiWorkspace;
@@ -23,6 +26,80 @@ use crate::view::FigView;
 
 /// Screen-fixed pin size; must match `canvas::COMMENT_PIN_SIZE`.
 pub(crate) const PIN_SIZE: f64 = 30.0;
+
+fn comment_overlay_origin(
+    limits: Bounds<Pixels>,
+    pin: Bounds<Pixels>,
+    card_size: Size<Pixels>,
+    offset: Point<Pixels>,
+) -> Point<Pixels> {
+    let preferred_left = pin.right() + offset.x;
+    let flipped_left = pin.left() - offset.x - card_size.width;
+    let left = if preferred_left + card_size.width > limits.right() && flipped_left >= limits.left()
+    {
+        flipped_left
+    } else {
+        preferred_left
+    };
+    point(
+        left.clamp(
+            limits.left(),
+            (limits.right() - card_size.width).max(limits.left()),
+        ),
+        (pin.top() + offset.y).clamp(
+            limits.top(),
+            (limits.bottom() - card_size.height).max(limits.top()),
+        ),
+    )
+}
+
+fn comment_overlay(
+    world: DVec2,
+    viewport: fanta_doc::Viewport,
+    offset: Point<Pixels>,
+    card: Stateful<gpui::Div>,
+) -> AnyElement {
+    // Workspace tabs paint after the canvas's parent, so the card must be deferred
+    // to remain visible and interactive above both the tabs and canvas toolbar.
+    deferred(
+        canvas(
+            move |bounds, window, cx| {
+                let inset = px(8.)
+                    .min(bounds.size.width / 2.)
+                    .min(bounds.size.height / 2.);
+                let limits = bounds.inset(inset);
+                let mut card = card
+                    .max_w(limits.size.width)
+                    .max_h(limits.size.height)
+                    .overflow_y_scroll()
+                    .occlude()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .into_any_element();
+                // Measure after the canvas lays out: sidebar and window resizing can change
+                // these bounds without another render, and editor/picker heights vary.
+                let card_size = card.layout_as_root(limits.size.into(), window, cx);
+                let anchor = fanta_canvas::world_to_screen(
+                    world,
+                    &viewport,
+                    DVec2::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
+                );
+                let pin = Bounds::new(
+                    bounds.origin + point(px(anchor.x as f32), px((anchor.y - PIN_SIZE) as f32)),
+                    gpui::size(px(PIN_SIZE as f32), px(PIN_SIZE as f32)),
+                );
+                let origin = comment_overlay_origin(limits, pin, card_size, offset);
+                card.prepaint_at(origin, window, cx);
+                card
+            },
+            |_, mut card, window, cx| card.paint(window, cx),
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+    .into_any_element()
+}
 
 /// A comment being composed: the pin is placed but nothing is in the doc yet.
 pub(crate) struct CommentDraft {
@@ -1183,14 +1260,16 @@ impl FigView {
         draft: &CommentDraft,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (pin_min, _) = self.pin_screen_rect(draft.world)?;
+        let viewport = self.viewport?;
         let editor = draft.editor.clone();
         let context = self.render_comment_composer_context(CommentComposerTarget::Draft, cx);
-        Some(
+        Some(comment_overlay(
+            draft.world,
+            viewport,
+            point(px(12.), px(-4.)),
             v_flex()
-                .absolute()
-                .left(px((pin_min.x + PIN_SIZE + 12.0) as f32))
-                .top(px((pin_min.y - 4.0) as f32))
+                .id("fanta-comment-composer")
+                .debug_selector(|| "fanta-comment-composer".to_owned())
                 .w(px(300.))
                 .p_2p5()
                 .gap_2()
@@ -1206,11 +1285,13 @@ impl FigView {
                             .color(Color::Accent),
                     )
                 })
-                .child(div().child(editor))
+                .child(div().min_w_0().w_full().child(editor))
                 .children(context)
                 .child(
                     h_flex()
                         .justify_between()
+                        .flex_wrap()
+                        .gap_1()
                         .child(self.render_comment_composer_tools(CommentComposerTarget::Draft, cx))
                         .child(
                             IconButton::new("fanta-comment-send", IconName::ArrowUp)
@@ -1221,9 +1302,8 @@ impl FigView {
                                     this.post_comment_draft(window, cx);
                                 })),
                         ),
-                )
-                .into_any_element(),
-        )
+                ),
+        ))
     }
 
     fn render_comment_preview(
@@ -1232,16 +1312,18 @@ impl FigView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let world = DVec2::new(comment.world[0], comment.world[1]);
-        let (pin_min, _) = self.pin_screen_rect(world)?;
+        let viewport = self.viewport?;
         let author: SharedString = display_author(comment).into();
         let when: SharedString = relative_time(comment.created).into();
         let body: SharedString = comment.text.clone().into();
-        Some(
+        Some(comment_overlay(
+            world,
+            viewport,
+            point(px(6.), px(-30.)),
             v_flex()
-                .absolute()
-                .left(px((pin_min.x + PIN_SIZE * 0.6 + 18.0) as f32))
-                .top(px((pin_min.y - 30.0) as f32))
-                .max_w(px(300.))
+                .id("fanta-comment-preview")
+                .debug_selector(|| "fanta-comment-preview".to_owned())
+                .w(px(300.))
                 .p_3()
                 .gap_1()
                 .rounded_xl()
@@ -1251,6 +1333,7 @@ impl FigView {
                 .shadow_lg()
                 .child(
                     h_flex()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             Label::new(author)
@@ -1285,9 +1368,8 @@ impl FigView {
                     ))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
-                )
-                .into_any_element(),
-        )
+                ),
+        ))
     }
 
     fn render_comment_thread(
@@ -1296,7 +1378,7 @@ impl FigView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let world = DVec2::new(comment.world[0], comment.world[1]);
-        let (pin_min, _) = self.pin_screen_rect(world)?;
+        let viewport = self.viewport?;
         let resolve_id = comment.id.clone();
         let delete_id = comment.id.clone();
         let reply_id = comment.id.clone();
@@ -1333,11 +1415,13 @@ impl FigView {
         let reply_editor = self.comment_state.reply_editor.clone();
         let reply_context = self.render_comment_composer_context(CommentComposerTarget::Reply, cx);
         let reply_tools = self.render_comment_composer_tools(CommentComposerTarget::Reply, cx);
-        Some(
+        Some(comment_overlay(
+            world,
+            viewport,
+            point(px(12.), px(-8.)),
             v_flex()
-                .absolute()
-                .left(px((pin_min.x + PIN_SIZE + 12.0) as f32))
-                .top(px((pin_min.y - 8.0) as f32))
+                .id("fanta-comment-thread")
+                .debug_selector(|| "fanta-comment-thread".to_owned())
                 .w(px(300.))
                 .rounded_xl()
                 .bg(cx.theme().colors().elevated_surface_background)
@@ -1350,10 +1434,14 @@ impl FigView {
                         .py_2()
                         .justify_between()
                         .items_center()
+                        .flex_wrap()
+                        .gap_1()
                         .border_b_1()
                         .border_color(cx.theme().colors().border)
                         .child(
                             h_flex()
+                                .min_w_0()
+                                .flex_wrap()
                                 .gap_2()
                                 .child(
                                     Label::new("Comment")
@@ -1432,23 +1520,36 @@ impl FigView {
                             .gap_1p5()
                             .border_t_1()
                             .border_color(cx.theme().colors().border)
-                            .child(div().flex_1().child(editor))
+                            .child(div().min_w_0().w_full().child(editor))
                             .children(reply_context)
                             .child(
-                                h_flex().justify_between().child(reply_tools).child(
-                                    IconButton::new("fanta-comment-reply-send", IconName::ArrowUp)
+                                h_flex()
+                                    .justify_between()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .child(reply_tools)
+                                    .child(
+                                        IconButton::new(
+                                            "fanta-comment-reply-send",
+                                            IconName::ArrowUp,
+                                        )
                                         .shape(IconButtonShape::Square)
                                         .icon_size(IconSize::Small)
                                         .tooltip(Tooltip::text("Reply"))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.post_comment_reply(reply_id.clone(), window, cx);
-                                        })),
-                                ),
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.post_comment_reply(
+                                                    reply_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    ),
                             ),
                     )
-                })
-                .into_any_element(),
-        )
+                }),
+        ))
     }
 
     fn render_comment_composer_tools(
@@ -1815,6 +1916,7 @@ impl FigView {
             .gap_1()
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         Label::new(SharedString::from(author))
@@ -1893,6 +1995,233 @@ mod tests {
         CommentOrigin, CommentSkill, CommentState, CommentSubmitOutcome, SkillRouteNotice,
         document_has_comment_origin,
     };
+    use gpui::px;
+
+    #[gpui::test]
+    async fn comment_cards_fit_canvas_edges_after_resize_and_font_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{CommentDraft, FigView, comments};
+        use gpui::{AppContext as _, VisualTestContext, size};
+        use project::{FakeFs, Project};
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        document.apply(Operation::create_node(page)).expect("page");
+        document.add_page(page_id);
+        document.set_active_page(Some(page_id));
+        document.selection.select_only(page_id);
+        let (comment_id, operation) = comments::add_comment_op(
+            &document,
+            page_id,
+            [0., 0.],
+            "A comment with enough text to wrap onto several lines when the canvas gets narrower.",
+        )
+        .expect("comment");
+        document.apply(operation).expect("add comment");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Comment-layout.fig".into(),
+            document,
+            cx,
+        );
+        let before = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.scene.get(page_id).expect("page").meta.clone(),
+                document.doc.history.undo_depth(),
+                item.is_dirty(),
+            )
+        });
+        let window = cx.add_window({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        let view = window.entity(cx).expect("view");
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1_200.), px(800.)));
+        visual.update(|window, cx| window.draw(cx).clear());
+
+        for selector in [
+            "fanta-comment-composer",
+            "fanta-comment-thread",
+            "fanta-comment-preview",
+        ] {
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.comment_state = CommentState::default();
+                    let origin = view.active_comment_origin(cx).expect("origin");
+                    match selector {
+                        "fanta-comment-composer" => {
+                            let editor = cx.new(|cx| {
+                                let mut editor = editor::Editor::auto_height(1, 6, window, cx);
+                                editor.set_text(
+                                    "Draft that stays intact when resizing the canvas",
+                                    window,
+                                    cx,
+                                );
+                                editor
+                            });
+                            view.comment_state.draft = Some(CommentDraft {
+                                world: glam::DVec2::ZERO,
+                                editor,
+                                motion_anchor: None,
+                                composer_id: "layout-draft".to_owned(),
+                                origin,
+                            });
+                            view.comment_state.skill_picker = Some(CommentComposerTarget::Draft);
+                        }
+                        "fanta-comment-thread" => {
+                            view.open_comment_thread_for_origin(
+                                comment_id.clone(),
+                                origin,
+                                window,
+                                cx,
+                            );
+                        }
+                        _ => view.comment_state.hovered_pin = Some(comment_id.clone()),
+                    }
+                    cx.notify();
+                });
+            });
+            for font_size in [16., 24.] {
+                for window_size in [
+                    size(px(1_200.), px(800.)),
+                    size(px(900.), px(560.)),
+                    size(px(760.), px(420.)),
+                ] {
+                    visual.simulate_resize(window_size);
+                    visual.update(|window, cx| {
+                        window.set_rem_size(px(font_size));
+                        window.refresh();
+                        window.draw(cx).clear();
+                    });
+                    let canvas = visual.debug_bounds("fig-container").expect("canvas");
+                    let resized_card = visual.debug_bounds(selector).expect("resized comment card");
+                    assert!(
+                        resized_card.left() >= canvas.left()
+                            && resized_card.right() <= canvas.right(),
+                        "{selector} immediately after resize: {resized_card:?} outside {canvas:?}"
+                    );
+                    assert!(
+                        resized_card.top() >= canvas.top()
+                            && resized_card.bottom() <= canvas.bottom(),
+                        "{selector} immediately after resize: {resized_card:?} outside {canvas:?}"
+                    );
+                    for (horizontal, vertical) in [(0., 0.), (1., 0.), (0., 1.), (1., 1.)] {
+                        view.update(&mut visual, |view, cx| {
+                            view.viewport = Some(fanta_doc::Viewport {
+                                center: [
+                                    f64::from(canvas.size.width) * (0.5 - horizontal),
+                                    f64::from(canvas.size.height) * (0.5 - vertical),
+                                ],
+                                zoom: 1.,
+                            });
+                            cx.notify();
+                        });
+                        visual.update(|window, cx| window.draw(cx).clear());
+                        let card = visual.debug_bounds(selector).expect("comment card");
+                        assert!(card.size.width > px(0.) && card.size.height > px(0.));
+                        assert!(
+                            card.left() >= canvas.left() && card.right() <= canvas.right(),
+                            "{selector} at font {font_size}: {card:?} outside {canvas:?}"
+                        );
+                        assert!(
+                            card.top() >= canvas.top() && card.bottom() <= canvas.bottom(),
+                            "{selector} at font {font_size}: {card:?} outside {canvas:?}"
+                        );
+                    }
+                }
+            }
+            let card = visual.debug_bounds(selector).expect("comment card");
+            let viewport_before = view.read_with(&visual, |view, _| view.viewport);
+            let card_padding = gpui::point(card.right() - px(2.), card.top() + px(2.));
+            visual.simulate_click(card_padding, gpui::Modifiers::none());
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: card_padding,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-10_000.))),
+                ..Default::default()
+            });
+            visual.update(|window, cx| window.draw(cx).clear());
+            view.read_with(&visual, |view, _| {
+                assert_eq!(view.viewport, viewport_before)
+            });
+            item.read_with(&visual, |item, _| {
+                assert_eq!(
+                    item.document().expect("document").doc.selection.as_slice(),
+                    &[page_id]
+                );
+            });
+            if selector != "fanta-comment-preview" {
+                let send = visual
+                    .debug_bounds("ICON-ArrowUp")
+                    .expect("send button after scrolling");
+                assert!(
+                    send.left() >= card.left() && send.right() <= card.right(),
+                    "{selector} send button outside card: {send:?} outside {card:?}"
+                );
+                assert!(
+                    send.top() >= card.top() && send.bottom() <= card.bottom(),
+                    "{selector} send button unreachable after scrolling: {send:?} outside {card:?}"
+                );
+            }
+            if selector == "fanta-comment-composer" {
+                view.read_with(&visual, |view, cx| {
+                    assert_eq!(
+                        view.comment_state
+                            .draft
+                            .as_ref()
+                            .expect("draft")
+                            .editor
+                            .read(cx)
+                            .text(cx),
+                        "Draft that stays intact when resizing the canvas"
+                    );
+                });
+            }
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(canvas.left() + px(2.), canvas.top() + px(2.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20.))),
+                ..Default::default()
+            });
+            view.read_with(&visual, |view, _| {
+                assert_ne!(
+                    view.viewport, viewport_before,
+                    "canvas outside card still accepts wheel input"
+                );
+            });
+        }
+        let canvas = visual.debug_bounds("fig-container").expect("canvas");
+        visual.simulate_click(
+            gpui::point(canvas.left() + px(2.), canvas.top() + px(2.)),
+            gpui::Modifiers::none(),
+        );
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert!(
+                document.doc.selection.is_empty(),
+                "canvas outside card still accepts selection input"
+            );
+            assert_eq!(
+                document.doc.scene.get(page_id).expect("page").meta,
+                before.0
+            );
+            assert_eq!(document.doc.history.undo_depth(), before.1);
+            assert_eq!(item.is_dirty(), before.2);
+        });
+    }
 
     #[test]
     fn comment_origin_remains_bound_to_its_page_when_the_active_page_changes() {

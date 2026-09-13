@@ -1367,6 +1367,16 @@ impl Render for FantaMotionPanel {
         let root = v_flex()
             .key_context("FantaMotionPanel")
             .track_focus(&self.focus_handle)
+            .capture_action(
+                cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                    if this.editing_property.is_some() {
+                        cx.stop_propagation();
+                        this.cancel_numeric_property(window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .bg(cx.theme().colors().panel_background);
@@ -2136,6 +2146,155 @@ mod tests {
         })
         .expect("create animation clip");
         id
+    }
+
+    struct MotionKeyboardHost {
+        panel: Entity<FantaMotionPanel>,
+        cancelled_actions: usize,
+    }
+
+    impl Render for MotionKeyboardHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            v_flex()
+                .size_full()
+                .on_action(cx.listener(|this, _: &editor::actions::Cancel, _, _| {
+                    this.cancelled_actions += 1;
+                }))
+                .child(self.panel.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn numeric_auto_key_escape_precedes_ancestor_actions_with_shipped_keybindings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, VisualTestContext, size};
+        use project::{FakeFs, Project};
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("shipped keybindings");
+            cx.bind_keys(bindings);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut document, node) = document_with_selected_node();
+        document
+            .scene
+            .get_mut(node)
+            .expect("animated node")
+            .transform = Transform2D::translation(-160., 120.);
+        let clip = create_clip(&mut document, "Auto key keyboard");
+        document.history = Default::default();
+        let original_motion = document.motion.clone();
+        let original_node = document.scene.get(node).expect("animated node").clone();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Auto-key-keyboard.fig".into(),
+            document,
+            cx,
+        );
+        let window = cx.add_window({
+            let item = item.clone();
+            move |window, cx| {
+                let timeline = cx.new(|cx| {
+                    let mut timeline = TimelineShell::new();
+                    timeline.set_model(
+                        crate::timeline::TimelineViewModel::for_clip(
+                            "Auto key keyboard",
+                            2_000_000,
+                            Vec::new(),
+                        ),
+                        cx,
+                    );
+                    timeline.seek_to(1_287_000, cx);
+                    timeline
+                });
+                let panel = cx.new(|cx| {
+                    let mut panel = FantaMotionPanel::new(item, timeline, window, cx);
+                    panel.set_active_clip(Some(clip), cx);
+                    panel.set_auto_keyframe(true, cx);
+                    panel
+                });
+                MotionKeyboardHost {
+                    panel,
+                    cancelled_actions: 0,
+                }
+            }
+        });
+        let host = window.entity(cx).expect("keyboard host");
+        let panel = host.read_with(cx, |host, _| host.panel.clone());
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(360.), px(800.)));
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field");
+        visual.simulate_click(field.center(), Modifiers::none());
+        visual.simulate_input("42");
+        item.read_with(&visual, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(item.content_preview_active());
+            assert_eq!(document.history.undo_depth(), 0);
+            assert_eq!(
+                evaluated_motion_value(document, clip, node, TimelineProperty::PositionX, 1_287)
+                    .expect("preview value")
+                    .1,
+                ResolvedVarValue::Float { value: 42. }
+            );
+        });
+        visual.simulate_keystrokes("escape");
+        panel.read_with(&visual, |panel, _| {
+            assert!(panel.editing_property.is_none(), "Escape closes the field");
+            assert!(panel.property_edit.is_none());
+        });
+        host.read_with(&visual, |host, _| assert_eq!(host.cancelled_actions, 0));
+        item.read_with(&visual, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(!item.content_preview_active());
+            assert_eq!(document.motion, original_motion);
+            assert_eq!(document.scene.get(node), Some(&original_node));
+            assert_eq!(document.history.undo_depth(), 0);
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field");
+        visual.simulate_click(field.center(), Modifiers::none());
+        visual.simulate_input("42");
+        visual.simulate_keystrokes("enter");
+        item.read_with(&visual, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(!item.content_preview_active());
+            assert_eq!(document.history.undo_depth(), 1);
+            assert_eq!(
+                evaluated_motion_value(document, clip, node, TimelineProperty::PositionX, 1_287)
+                    .expect("committed value")
+                    .1,
+                ResolvedVarValue::Float { value: 42. }
+            );
+            assert_eq!(document.scene.get(node), Some(&original_node));
+        });
+        visual.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::Cancel), cx);
+        });
+        host.read_with(&visual, |host, _| assert_eq!(host.cancelled_actions, 1));
+        assert!(item.update(&mut visual, |item, cx| {
+            item.undo(cx).expect("undo Auto key")
+        }));
+        item.read_with(&visual, |item, _| {
+            assert_eq!(item.doc().expect("document").motion, original_motion)
+        });
     }
 
     #[test]
