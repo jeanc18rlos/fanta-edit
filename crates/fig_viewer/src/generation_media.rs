@@ -657,12 +657,28 @@ pub(crate) struct PreparedVideo {
     pub poster: Option<VideoPoster>,
 }
 
-pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
-    let metadata = mp4_metadata(&bytes)?;
+async fn video_metadata_for_preparation(bytes: &Arc<[u8]>) -> Result<VideoMetadata> {
+    let metadata = mp4_metadata(bytes)?;
     ensure!(
         u64::from(metadata.width) * u64::from(metadata.height) <= 32 * 1024 * 1024,
         "The video resolution is too large to preview. Save it to open it in a video player."
     );
+    #[cfg(target_os = "macos")]
+    let metadata = {
+        // Track durations can include samples excluded by an MP4 edit list.
+        // Placement and trimming must use the same timeline as the player.
+        let playback = media::video::prepare_video_playback(bytes.clone(), 1200)?.await?;
+        VideoMetadata {
+            duration_us: i64::try_from(playback.info().duration_us)
+                .context("The video playback duration is invalid.")?,
+            ..metadata
+        }
+    };
+    Ok(metadata)
+}
+
+pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
+    let metadata = video_metadata_for_preparation(&bytes).await?;
     #[cfg(target_os = "macos")]
     let poster = {
         let frame = media::video::video_frame(bytes.clone(), 1200)?.await?;
@@ -717,7 +733,7 @@ pub(crate) async fn prepare_video_trim(
     bytes: Arc<[u8]>,
     range_us: [i64; 2],
 ) -> Result<PreparedVideoTrim> {
-    let metadata = mp4_metadata(&bytes)?;
+    let metadata = video_metadata_for_preparation(&bytes).await?;
     validate_video_trim(range_us, metadata.duration_us)?;
     let frame = media::video::video_frame_at(bytes, 1200, u64::try_from(range_us[0])?)?.await?;
     let difference = (i64::from(frame.width) * i64::from(metadata.height)
@@ -1124,7 +1140,35 @@ mod tests {
         };
         assert_eq!(video.bytes.as_ref(), bytes);
         assert!(video.poster.is_some());
-        assert!(video.metadata.duration_us > 0);
+        let raw_metadata = mp4_metadata(bytes).expect("raw MP4 track metadata");
+        let playback = futures::executor::block_on(
+            media::video::prepare_video_playback(video.bytes.clone(), 1200)
+                .expect("native playback request"),
+        )
+        .expect("native playback metadata");
+        let playable_duration =
+            i64::try_from(playback.info().duration_us).expect("playback duration fits");
+        assert_eq!(raw_metadata.duration_us, 1_250_000);
+        assert_eq!(playable_duration, 1_000_000);
+        assert_eq!(video.metadata.duration_us, playable_duration);
+        let placed_video = video_node_data(&video, AssetId::new(), None);
+        assert_eq!(placed_video.time_range_us, [0, playable_duration]);
+        validate_video_trim(placed_video.time_range_us, playable_duration)
+            .expect("placed range fits the native playback timeline");
+        assert!(validate_video_trim([0, raw_metadata.duration_us], playable_duration).is_err());
+        let trim = futures::executor::block_on(prepare_video_trim(
+            video.bytes.clone(),
+            [250_000, playable_duration],
+        ))
+        .expect("trim within the playable timeline");
+        assert_eq!(trim.source_duration_us, playable_duration);
+        assert!(
+            futures::executor::block_on(prepare_video_trim(
+                video.bytes,
+                [0, raw_metadata.duration_us],
+            ))
+            .is_err()
+        );
         std::fs::write(
             &path,
             include_bytes!("../../media/test_fixtures/quadrants-corrupt.mp4"),
