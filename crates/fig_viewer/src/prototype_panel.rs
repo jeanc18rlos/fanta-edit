@@ -612,6 +612,10 @@ impl FantaPrototypePanel {
         true
     }
 
+    pub(crate) fn has_pending_parameter_edit(&self) -> bool {
+        self.editing_parameter.is_some()
+    }
+
     pub(crate) fn finish_parameter_edit(&mut self, cx: &mut Context<Self>) {
         if !self.commit_parameter_edit_value(cx) {
             self.abandon_parameter_edit(true, cx);
@@ -3297,6 +3301,7 @@ mod tests {
         .expect("draw prototype panel");
         panel
             .update(cx, |panel, window, cx| {
+                assert!(!panel.has_pending_parameter_edit());
                 panel.start_parameter_edit(
                     ReactionParameter {
                         node: first,
@@ -3324,6 +3329,11 @@ mod tests {
         .expect("type invalid delay");
         cx.run_until_parked();
 
+        assert!(
+            panel
+                .read_with(cx, |panel, _| panel.has_pending_parameter_edit())
+                .expect("invalid parameter remains pending")
+        );
         item.read_with(cx, |item, _| {
             assert_eq!(
                 reaction_by_id(
@@ -3342,7 +3352,7 @@ mod tests {
 
         assert!(
             panel
-                .read_with(cx, |panel, _| panel.editing_parameter.is_none())
+                .read_with(cx, |panel, _| !panel.has_pending_parameter_edit())
                 .expect("read prototype panel")
         );
         item.read_with(cx, |item, _| {

@@ -478,7 +478,7 @@ impl FantaMotionPanel {
         }
     }
 
-    fn has_continuous_edit(&self) -> bool {
+    pub(crate) fn has_continuous_edit(&self) -> bool {
         self.property_edit.is_some() || self.editing_property.is_some() || self.picker.is_some()
     }
 
