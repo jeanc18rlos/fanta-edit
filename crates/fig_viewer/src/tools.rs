@@ -197,7 +197,10 @@ impl ToolShell {
         self.kind = kind;
         self.tool = kind.build();
         self.tool.activate(ctx);
-        self.overlays.clear();
+        self.overlays = self
+            .tool
+            .overlays_after_document_change(ctx.doc)
+            .unwrap_or_default();
         self.cursor = None;
     }
 
@@ -221,7 +224,10 @@ impl ToolShell {
         self.kind = kind;
         self.tool = kind.build();
         self.tool.activate(ctx);
-        self.overlays.clear();
+        self.overlays = self
+            .tool
+            .overlays_after_document_change(ctx.doc)
+            .unwrap_or_default();
         self.cursor = None;
     }
 

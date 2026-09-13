@@ -680,6 +680,7 @@ impl FigView {
                     cx.notify();
                 }
                 FigItemEvent::SelectionChanged => {
+                    this.refresh_tool_overlays(cx);
                     // The cached handle belongs to the node that was
                     // selected; a resize cursor over a now-empty selection
                     // would promise a gesture the press would not start.
@@ -2524,6 +2525,28 @@ impl FigView {
                     return;
                 }
             }
+            let selected_vector = self
+                .item
+                .read(cx)
+                .doc()
+                .and_then(fanta_tools::NodeEditTool::selected_editable_vector);
+            if let Some(node) = selected_vector
+                && let Some(viewport) = self.viewport
+                && self.item.read(cx).doc().is_some_and(|doc| {
+                    let (width, height) = bounds_size(bounds);
+                    fanta_tools::NodeEditTool::vector_at_screen(
+                        doc,
+                        &viewport,
+                        DVec2::new(width, height),
+                        doc.active_page(),
+                        screen,
+                    ) == Some(node)
+                })
+            {
+                self.focus_handle.focus(window, cx);
+                self.activate_tool(ToolKind::NodeEdit, cx);
+                return;
+            }
         }
 
         self.focus_handle.focus(window, cx);
@@ -3103,6 +3126,19 @@ impl FigView {
             && let Some(node) = self.single_selected_text_node(cx)
         {
             self.open_text_edit(node, TextEditSeed::SelectAll, window, cx);
+            return;
+        }
+        if self.tools.kind() == ToolKind::Select
+            && self.editor_mode(cx) == EditorMode::Design
+            && self.is_editable(cx)
+            && self
+                .item
+                .read(cx)
+                .doc()
+                .and_then(fanta_tools::NodeEditTool::selected_editable_vector)
+                .is_some()
+        {
+            self.activate_tool(ToolKind::NodeEdit, cx);
             return;
         }
         if self.is_editable(cx) {

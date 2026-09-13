@@ -1401,6 +1401,347 @@ mod echo_tests {
         }
     }
 
+    async fn assert_path_edit_entry(cx: &mut TestAppContext, entry: &str) {
+        use gpui::{Focusable as _, InputEvent as _};
+
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            mut original,
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        let open_line = entry == "double-click-open-line";
+        if open_line {
+            original = fanta_doc::PathData::new();
+            original.move_to(0., 0.).line_to(100., 0.);
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let vector = document
+                        .doc
+                        .scene
+                        .get_mut(vector_id)
+                        .expect("line")
+                        .data
+                        .as_vector_mut()
+                        .expect("vector");
+                    vector.path = original.clone();
+                    vector.fills.clear();
+                    vector
+                        .strokes
+                        .push(fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 1.));
+                    ((), crate::document::DocChange::Content)
+                });
+            });
+            cx.run_until_parked();
+        }
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let expected_tool = if entry == "path-selection" {
+            ToolKind::PathSelect
+        } else {
+            ToolKind::NodeEdit
+        };
+        match entry {
+            "enter" => {
+                cx.update(|window, app| {
+                    let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                        settings::DEFAULT_KEYMAP_PATH,
+                        app,
+                    )
+                    .expect("shipped key bindings");
+                    app.bind_keys(bindings);
+                    view.read(app).focus_handle(app).focus(window, app);
+                });
+                cx.simulate_keystrokes("enter");
+            }
+            "double-click" | "double-click-open-line" => {
+                let position = if open_line {
+                    bounds.center() + point(px(0.), px(-47.))
+                } else {
+                    bounds.center()
+                };
+                cx.update(|window, app| {
+                    window.dispatch_event(
+                        gpui::MouseDownEvent {
+                            position,
+                            button: gpui::MouseButton::Left,
+                            modifiers: Modifiers::none(),
+                            click_count: 2,
+                            first_mouse: false,
+                        }
+                        .to_platform_input(),
+                        app,
+                    );
+                    window.dispatch_event(
+                        gpui::MouseUpEvent {
+                            position,
+                            button: gpui::MouseButton::Left,
+                            modifiers: Modifiers::none(),
+                            click_count: 2,
+                        }
+                        .to_platform_input(),
+                        app,
+                    );
+                });
+            }
+            _ => {
+                toolbar.update(&mut cx, |_, cx| {
+                    cx.emit(ToolbarAction::ToolChangeRequested {
+                        mode: ToolbarMode::Design,
+                        tool: toolbar_tool(expected_tool),
+                    });
+                });
+            }
+        }
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.active_tool(), expected_tool);
+            assert_eq!(
+                view.tools()
+                    .overlays
+                    .iter()
+                    .filter(|overlay| matches!(
+                        overlay,
+                        fanta_tools::ToolOverlay::PathAnchor { .. }
+                    ))
+                    .count(),
+                if open_line { 2 } else { 4 },
+                "entering a path tool must show anchors before any canvas hover or click"
+            );
+        });
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(
+                doc.scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path,
+                original
+            );
+        });
+        let start = bounds.center() + point(px(-50.), px(-50.));
+        let end = start + point(px(-20.), px(-30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            let actual = &doc
+                .scene
+                .get(vector_id)
+                .expect("vector")
+                .data
+                .as_vector()
+                .expect("path")
+                .path;
+            let mut expected = fanta_doc::PathData::new();
+            expected.move_to(-20., -30.).line_to(100., 0.);
+            if !open_line {
+                expected.line_to(100., 100.).line_to(0., 100.).close();
+            }
+            assert_eq!(actual, &expected);
+        });
+        toolbar.update(&mut cx, |_, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::Undo,
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path,
+                original
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_enter_shows_anchors_and_drags(cx: &mut TestAppContext) {
+        assert_path_edit_entry(cx, "enter").await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_double_click_shows_anchors_and_drags(cx: &mut TestAppContext) {
+        assert_path_edit_entry(cx, "double-click").await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_double_click_acquires_open_stroke_with_screen_tolerance(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_entry(cx, "double-click-open-line").await;
+    }
+
+    async fn assert_path_edit_layer_selection(cx: &mut TestAppContext, another_page: bool) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            original,
+        } = canvas_gesture_fixture(cx, ToolbarTool::NodeEdit).await;
+        let second = item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut vector = document
+                    .doc
+                    .scene
+                    .get(vector_id)
+                    .expect("first vector")
+                    .clone();
+                vector.id = fanta_doc::NodeId::new();
+                vector.transform = Transform2D::translation(200., 0.);
+                if another_page {
+                    let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                    let page_id = page.id;
+                    document
+                        .doc
+                        .apply(Operation::create_node(page))
+                        .expect("second page");
+                    document.doc.add_page(page_id);
+                    document.pages.push(crate::document::FigPage {
+                        root: Some(page_id),
+                        name: "Page 2".into(),
+                        bounds: crate::document::page_bounds(&document.doc, Some(page_id)),
+                        hidden: false,
+                    });
+                    vector.parent = Some(page_id);
+                }
+                let id = vector.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(vector))
+                    .expect("second vector");
+                document.doc.history = Default::default();
+                (id, crate::document::DocChange::Content)
+            })
+            .expect("document")
+        });
+        if another_page {
+            view.update(&mut cx, |view, cx| {
+                view.select_page(1, cx);
+                view.set_viewport_silent(Viewport {
+                    center: [50., 50.],
+                    zoom: 1.,
+                });
+            });
+        }
+        item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(second);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::NodeEdit);
+            let anchors = view
+                .tools()
+                .overlays
+                .iter()
+                .filter_map(|overlay| match overlay {
+                    fanta_tools::ToolOverlay::PathAnchor { world, selected } => {
+                        assert!(!selected);
+                        Some(*world)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                anchors,
+                vec![[200., 0.], [300., 0.], [300., 100.], [200., 100.]]
+            );
+        });
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center() + point(px(150.), px(-50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.scene
+                    .get(vector_id)
+                    .expect("first vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path,
+                original
+            );
+            assert_ne!(
+                doc.scene
+                    .get(second)
+                    .expect("second vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path,
+                original
+            );
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+        toolbar.update(&mut cx, |_, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::Undo,
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(second)
+                    .expect("second vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path,
+                original
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_layer_selection_updates_anchors_before_pointer_input(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_layer_selection(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_page_switch_updates_layer_anchors_before_pointer_input(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_layer_selection(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_toolbar_shows_anchors_and_drags(cx: &mut TestAppContext) {
+        assert_path_edit_entry(cx, "toolbar").await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_entry_path_selection_shows_anchors_and_drags(cx: &mut TestAppContext) {
+        assert_path_edit_entry(cx, "path-selection").await;
+    }
+
     #[gpui::test]
     async fn path_overlays_follow_keyboard_and_toolbar_history_in_path_selection(
         cx: &mut TestAppContext,
