@@ -1571,6 +1571,7 @@
       "r": "fig_viewer::ActivateRectangleTool",
       "o": "fig_viewer::ActivateEllipseTool",
       "l": "fig_viewer::ActivateLineTool",
+      "shift-l": "fig_viewer::ActivateArrowTool",
       "p": "fig_viewer::ActivatePenTool",
       "shift-p": "fig_viewer::ActivatePolygonTool",
       "a": "fig_viewer::ActivateNodeEditTool",

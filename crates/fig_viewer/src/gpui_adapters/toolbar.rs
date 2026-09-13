@@ -157,6 +157,7 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
         ToolKind::Rect => ToolbarTool::Rectangle,
         ToolKind::Ellipse => ToolbarTool::Ellipse,
         ToolKind::Line => ToolbarTool::Line,
+        ToolKind::Arrow => ToolbarTool::Arrow,
         ToolKind::Polygon => ToolbarTool::Polygon,
         ToolKind::Star => ToolbarTool::Star,
         ToolKind::Pen => ToolbarTool::Pen,
@@ -182,6 +183,7 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
         ToolbarTool::Rectangle => ToolKind::Rect,
         ToolbarTool::Ellipse => ToolKind::Ellipse,
         ToolbarTool::Line => ToolKind::Line,
+        ToolbarTool::Arrow => ToolKind::Arrow,
         ToolbarTool::Polygon => ToolKind::Polygon,
         ToolbarTool::Star => ToolKind::Star,
         ToolbarTool::Pen => ToolKind::Pen,
@@ -407,6 +409,7 @@ mod tests {
             ToolKind::Rect,
             ToolKind::Ellipse,
             ToolKind::Line,
+            ToolKind::Arrow,
             ToolKind::Polygon,
             ToolKind::Star,
             ToolKind::Pen,
@@ -439,7 +442,6 @@ mod tests {
         assert_eq!(
             unmapped,
             vec![
-                ToolbarTool::Arrow,
                 ToolbarTool::ImageVideo,
                 ToolbarTool::Annotation,
                 ToolbarTool::Measure,
@@ -701,6 +703,185 @@ mod echo_tests {
         });
         let cx = cx.clone();
         (view, toolbar, cx)
+    }
+
+    async fn assert_arrow_toolbar_route(cx: &mut TestAppContext, from_shortcut: bool) {
+        use gpui::Focusable as _;
+
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            original,
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        if from_shortcut {
+            cx.update(|window, app| {
+                let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                    settings::DEFAULT_KEYMAP_PATH,
+                    app,
+                )
+                .expect("shipped canvas key bindings");
+                app.bind_keys(bindings);
+                view.read(app).focus_handle(app).focus(window, app);
+            });
+            cx.simulate_keystrokes("shift-l");
+        } else {
+            let trigger = cx
+                .debug_bounds("toolbar-group-shape-tools-trigger")
+                .expect("shape tools menu");
+            cx.simulate_click(trigger.center(), Modifiers::none());
+            cx.run_until_parked();
+            let arrow = cx.debug_bounds("toolbar-flyout-arrow").expect("Arrow row");
+            cx.simulate_click(arrow.center(), Modifiers::none());
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Arrow
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
+            ToolbarTool::Arrow
+        );
+        let before_count = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 0, "choosing Arrow does not edit");
+            assert_eq!(doc.selection.as_slice(), &[vector_id]);
+            doc.scene.len()
+        });
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center() + point(px(-140.), px(-120.));
+        let end = start + point(px(150.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| {
+            assert_eq!(
+                view.tools()
+                    .overlays
+                    .iter()
+                    .filter(|overlay| matches!(
+                        overlay,
+                        fanta_tools::ToolOverlay::PreviewLine { .. }
+                    ))
+                    .count(),
+                3,
+                "the Arrow preview includes its shaft and both head edges"
+            );
+        });
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.len(), before_count);
+            assert_eq!(doc.history.undo_depth(), 0, "preview does not edit");
+        });
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let placed = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.len(), before_count + 1);
+            assert_eq!(doc.history.undo_depth(), 1);
+            let id = *doc.selection.as_slice().first().expect("selected Arrow");
+            assert_ne!(id, vector_id);
+            assert_eq!(doc.selection.as_slice(), &[id]);
+            let node = doc.scene.get(id).expect("created Arrow");
+            assert_eq!(node.name, "Arrow");
+            assert_eq!(node.parent, doc.active_page());
+            let vector = node.data.as_vector().expect("Arrow vector");
+            assert!(
+                vector.path.segments.len() > 2,
+                "Arrow must not be a plain line"
+            );
+            assert!(vector.fills.is_empty());
+            assert_eq!(vector.strokes.len(), 1);
+            let stroke = vector.strokes.first().expect("Arrow stroke");
+            assert_eq!(
+                stroke.paint,
+                fanta_doc::Fill::solid(fanta_doc::Color::BLACK)
+            );
+            assert_eq!(stroke.width, 2.);
+            assert_eq!(
+                doc.scene
+                    .get(vector_id)
+                    .expect("existing vector")
+                    .data
+                    .as_vector()
+                    .expect("vector")
+                    .path,
+                original,
+                "drawing Arrow preserves the previously selected vector"
+            );
+            node.clone()
+        });
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        for (command, exists) in [(ToolbarCommand::Undo, false), (ToolbarCommand::Redo, true)] {
+            toolbar.update(&mut cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command });
+            });
+            cx.run_until_parked();
+            item.read_with(&cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let actual = doc.scene.get(placed.id);
+                assert_eq!(actual.is_some(), exists);
+                assert_eq!(doc.scene.len(), before_count + usize::from(exists));
+                if exists {
+                    assert_eq!(actual, Some(&placed));
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn arrow_toolbar_menu_draws_with_preview_and_single_step_undo(cx: &mut TestAppContext) {
+        assert_arrow_toolbar_route(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn arrow_canvas_shortcut_draws_with_preview_and_single_step_undo(
+        cx: &mut TestAppContext,
+    ) {
+        assert_arrow_toolbar_route(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn arrow_canvas_shortcut_keeps_inline_text_input(cx: &mut TestAppContext) {
+        let (view, _, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let node = item.read_with(&cx, |item, _| {
+            *item
+                .doc()
+                .expect("document")
+                .selection
+                .as_slice()
+                .first()
+                .expect("selected text")
+        });
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped canvas key bindings");
+            app.bind_keys(bindings);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_text_edit(node, crate::view::TextEditSeed::SelectAll, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-l");
+        view.read_with(&cx, |view, _| {
+            assert_ne!(view.active_tool(), ToolKind::Arrow);
+            let edit = view.text_edit.as_ref().expect("text editor remains open");
+            assert_eq!(edit.session.node_id(), node);
+            assert_eq!(edit.session.buffer(), "L");
+        });
+        item.read_with(&cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+        });
     }
 
     fn local_media_png(directory: &std::path::Path) -> PathBuf {

@@ -43,6 +43,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
         ToolKind::Rect,
         ToolKind::Ellipse,
         ToolKind::Line,
+        ToolKind::Arrow,
         ToolKind::Polygon,
         ToolKind::Star,
     ],
@@ -76,6 +77,7 @@ pub enum ToolKind {
     Rect,
     Ellipse,
     Line,
+    Arrow,
     Polygon,
     Star,
     Pen,
@@ -99,6 +101,7 @@ impl ToolKind {
             Self::Rect => "Rectangle",
             Self::Ellipse => "Ellipse",
             Self::Line => "Line",
+            Self::Arrow => "Arrow",
             Self::Polygon => "Polygon",
             Self::Star => "Star",
             Self::Pen => "Pen",
@@ -122,6 +125,7 @@ impl ToolKind {
             Self::Rect => IconName::ToolRect,
             Self::Ellipse => IconName::ToolEllipse,
             Self::Line => IconName::ToolLine,
+            Self::Arrow => IconName::ArrowUpRight,
             Self::Polygon => IconName::ToolPolygon,
             Self::Star => IconName::ToolStar,
             Self::Pen => IconName::ToolPen,
@@ -145,6 +149,7 @@ impl ToolKind {
             Self::Rect => Box::new(RectTool::new()),
             Self::Ellipse => Box::new(EllipseTool::new()),
             Self::Line => Box::new(LineTool::new()),
+            Self::Arrow => Box::new(LineTool::arrow()),
             Self::Polygon => Box::new(PolygonTool::new()),
             Self::Star => Box::new(StarTool::new()),
             Self::Pen => Box::new(PenTool::new()),
@@ -296,7 +301,9 @@ pub fn tool_context<'a>(
 /// The fill a tool creates its node with.
 fn new_fill_for(kind: ToolKind) -> Color {
     match kind {
-        ToolKind::Text | ToolKind::Line | ToolKind::Pencil | ToolKind::Pen => NEW_MARK_FILL,
+        ToolKind::Text | ToolKind::Line | ToolKind::Arrow | ToolKind::Pencil | ToolKind::Pen => {
+            NEW_MARK_FILL
+        }
         _ => NEW_SHAPE_FILL,
     }
 }
@@ -381,6 +388,7 @@ mod tests {
         for kind in [
             ToolKind::Text,
             ToolKind::Line,
+            ToolKind::Arrow,
             ToolKind::Pencil,
             ToolKind::Pen,
         ] {

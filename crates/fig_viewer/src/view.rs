@@ -144,6 +144,8 @@ actions!(
         ActivateEllipseTool,
         /// Activate the line tool.
         ActivateLineTool,
+        /// Activate the arrow tool.
+        ActivateArrowTool,
         /// Activate the polygon tool.
         ActivatePolygonTool,
         /// Activate the star tool.
@@ -194,6 +196,7 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Rect => Box::new(ActivateRectangleTool),
         ToolKind::Ellipse => Box::new(ActivateEllipseTool),
         ToolKind::Line => Box::new(ActivateLineTool),
+        ToolKind::Arrow => Box::new(ActivateArrowTool),
         ToolKind::Polygon => Box::new(ActivatePolygonTool),
         ToolKind::Star => Box::new(ActivateStarTool),
         ToolKind::Pen => Box::new(ActivatePenTool),
@@ -5919,6 +5922,9 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivateLineTool, _, cx| {
                 this.activate_tool(ToolKind::Line, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateArrowTool, _, cx| {
+                this.activate_tool(ToolKind::Arrow, cx)
             }))
             .on_action(cx.listener(|this, _: &ActivatePolygonTool, _, cx| {
                 this.activate_tool(ToolKind::Polygon, cx)
