@@ -110,11 +110,13 @@ actually driven. Nothing here claims more than that record supports.
 
 - **Unfinished roadmap faces either decline explicitly or stay hidden.** Direct
   Image/Video placement, Arrow, Annotation, Measure, Dev mode/tools, arbitrary
-  toolbar file attachment and voice, auto-keyframe recording, page duplication,
+  toolbar file attachment and voice, direct-canvas auto-keyframe recording, page duplication,
   and page links are not implemented. Their visible
   handlers raise *"&lt;control&gt; is not available in the Fanta alpha yet."* or an
   equally specific notice. Motion Path is hidden and unimplemented. Text on
-  Path, the bounded canvas-selection attachment, and Motion time comments are
+  Path now has typed direction and path-length offset controls. Guarded Auto key
+  works in Motion At playhead fields and has bounded Position X native evidence
+  at `12e2e4c`. The bounded canvas-selection attachment and Motion time comments are
   implemented only in the current source line and have no native-artifact
   evidence. Scale and Path Select are implemented and have focused native
   history/reopen evidence; Image, Video, Vector, Masks, and Remove Background

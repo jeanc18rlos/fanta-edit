@@ -206,6 +206,7 @@ impl DesignPanel {
             | DesignPanelProperty::TextPathStartPosition => {
                 self.text_path_start_debug_controls_are_available()
             }
+            DesignPanelProperty::TextPathOffset => self.text_path_placement_is_available(),
             DesignPanelProperty::ComponentProperty(_)
             | DesignPanelProperty::SlotStretchChildOnInsert(_)
             | DesignPanelProperty::SlotDisplayEmpty(_)
@@ -535,6 +536,12 @@ impl DesignPanel {
             DesignPanelAction::TextPathFlipOrientationRequested { .. } => {
                 self.text_path_flip_is_available()
             }
+            DesignPanelAction::TextPathDirectionChangeRequested { .. } => {
+                self.text_path_direction_is_available()
+            }
+            DesignPanelAction::TextPathPlacementChangeRequested { .. } => {
+                self.text_path_placement_is_available()
+            }
             _ => true,
         }
     }
@@ -572,6 +579,7 @@ impl DesignPanel {
             | DesignPanelProperty::TextPathStartPosition => {
                 self.text_path_start_debug_controls_are_available()
             }
+            DesignPanelProperty::TextPathOffset => self.text_path_placement_is_available(),
             _ => true,
         };
         let vector_allows_property = match property {
@@ -1171,6 +1179,10 @@ impl DesignPanel {
         if self.emit_effect_edit(property, value.clone(), DesignPanelEditPhase::Commit, cx) {
             return;
         }
+        if property == DesignPanelProperty::TextPathOffset {
+            self.emit_text_path_placement(&value, DesignPanelEditPhase::Commit, cx);
+            return;
+        }
         if matches!(
             property,
             DesignPanelProperty::TextPathStartSegment | DesignPanelProperty::TextPathStartPosition
@@ -1307,6 +1319,10 @@ impl DesignPanel {
             return;
         }
         if self.emit_effect_edit(property, value.clone(), phase, cx) {
+            return;
+        }
+        if property == DesignPanelProperty::TextPathOffset {
+            self.emit_text_path_placement(&value, phase, cx);
             return;
         }
         if matches!(
@@ -2445,6 +2461,9 @@ impl DesignPanel {
             )),
             DesignPanelProperty::TextPathStartPosition => Some(DesignPanelValue::Ratio(
                 self.node.text_path_start_data?.position,
+            )),
+            DesignPanelProperty::TextPathOffset => Some(DesignPanelValue::Ratio(
+                self.node.text_path_placement?.offset,
             )),
             DesignPanelProperty::ComponentProperty(index) => Some(DesignPanelValue::Text(
                 self.node
@@ -4090,7 +4109,9 @@ impl DesignPanel {
                 (Some(1.), None)
             }
             DesignPanelProperty::TextPathStartSegment => (Some(0.), Some(f64::from(u32::MAX))),
-            DesignPanelProperty::TextPathStartPosition => (Some(0.), Some(1.)),
+            DesignPanelProperty::TextPathStartPosition | DesignPanelProperty::TextPathOffset => {
+                (Some(0.), Some(1.))
+            }
             DesignPanelProperty::SlotMinimumInstances(_)
             | DesignPanelProperty::SlotMaximumInstances(_) => (Some(0.), None),
             DesignPanelProperty::Width
@@ -4494,6 +4515,17 @@ impl DesignPanel {
     pub(super) fn parsed_property_draft(&self, cx: &App) -> Option<Result<DesignPanelValue, ()>> {
         let editor = self.property_editor.as_ref()?;
         let draft = self.property_input.read(cx).value();
+        if editor.property == DesignPanelProperty::TextPathOffset
+            && let DesignPanelValue::Ratio(offset) = editor.original
+            && draft
+                .trim()
+                .strip_suffix('%')
+                .unwrap_or(draft.trim())
+                .trim()
+                == format_number(offset * 100.)
+        {
+            return Some(Ok(editor.original.clone()));
+        }
         Some(match editor.kind {
             PropertyEditorKind::Shader { field, input } => {
                 let DesignPanelValue::ShaderProperty(original) = &editor.original else {

@@ -20,6 +20,25 @@ and bundled Git 2.53.0 passed non-launch inspection. The image was detached
 normally and the user's existing Fanta processes remained unchanged. Evidence:
 `/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
 
+## Text on Path direction and placement — September 13
+
+The current source adds explicit Forward/Reverse controls and a Start offset
+percentage measured along the current path. It keeps the existing raw segment
+API available to other component hosts but no longer exposes it in Fanta's
+inspector. Offset changes preserve path geometry, content, style runs,
+alignment, direction, and side; direction changes preserve offset and side.
+Disconnected paths cannot be switched with this control.
+
+Preview, cancel, commit, and Undo use the existing content-preview boundary.
+Returning to the rounded initial percentage restores the exact stored segment
+position before commit; accepting that original value produces no history.
+The source gate passes all 739 viewer tests, 596 shared UI tests, three
+architecture checks, and scoped `./script/clippy -p fanta-gpui -p fig_viewer`
+including Cargo Machete. Logs are under
+`/tmp/fanta-release-qa-20260913/text-path-controls`. Native validation is pending;
+this is not a release-artifact claim.
+
+
 ## Exact `9d92b30` toolbar milestone — September 10
 
 > **Evidence correction — September 12.** The retained
@@ -98,13 +117,13 @@ and empty-text carets have passing source regression coverage.
 The Design inspector identifies TextPath distinctly and permits document-backed
 edits for name; font family, Regular/Italic style, weight, size, line height,
 pixel letter spacing, start/center/end alignment, and underline/strikethrough;
-side/orientation; and validated API-debug start segment/position data. Its
+side/orientation; and, in the September 13 source, Forward/Reverse direction and Start offset
+as a percentage along the current path. Its
 single synthetic glyph Fill permits RGB and opacity edits only; add, style,
 visibility, remove, reorder, and forged non-color paint operations are gated.
 Supported typography and color changes update the base style and its runs, and
 flipping the side preserves direction. The shared typography UI still shows
-disabled non-applicable controls, and direction itself remains unexposed because
-the typed inspector has no direction action.
+disabled non-applicable controls, while the new direction and placement controls still need their native pass.
 
 A completed phased start interaction commits as one undo step. While any
 item-level content preview is active, autosave and direct persistence are

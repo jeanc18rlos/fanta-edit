@@ -59,12 +59,14 @@ and edit geometry fail closed rather than inventing a caret interval.
 
 The Design inspector permits TextPath edits for font family, Regular/Italic
 style, weight, size, line height, pixel letter spacing, start/center/end
-alignment, underline/strikethrough, side/orientation, and API-debug start
-segment/position. Its synthetic glyph Fill permits RGB and opacity only;
+alignment, underline/strikethrough, side/orientation, Forward/Reverse direction,
+and Start offset as a percentage along the current path. Its synthetic glyph Fill permits RGB and opacity only;
 structural paint actions are gated. Active content previews block autosave and
 direct persistence, defer relevant external reconciliation, restore and
 reproject on cancellation or selection change, and resume persistence after
-completion. Direction itself still has no typed UI control.
+completion. The current source adds typed direction and offset actions;
+returning to the rounded initial percentage preserves the exact stored start.
+Native validation of these new controls is pending.
 
 The toolbar attachment captures only selections wholly inside the active page
 or component root. Its immutable review-before-send resource carries exact node

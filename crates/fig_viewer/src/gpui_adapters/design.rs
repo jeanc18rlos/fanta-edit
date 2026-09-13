@@ -21,7 +21,7 @@ use fanta_doc::{
     BlendMode, Blur, BlurKind, BoundProp, Color as FantaColor, ComponentId, Doc, Fill, Gradient,
     GradientStop, LayoutMode, MaskType, MeasuredPath, NodeData, NodeFlags, NodeId, Operation,
     ParametricShape, Shadow, ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign,
-    TextAutoResize, TextPathAlignment, TextPathSide, TextPathStart, Transform2D,
+    TextAutoResize, TextPathAlignment, TextPathDirection, TextPathSide, TextPathStart, Transform2D,
     VAlign as TextVAlign, VarValue,
 };
 use fanta_gpui::design::{
@@ -40,10 +40,11 @@ use fanta_gpui::design::{
     DesignPanelTarget, DesignPanelValue, DesignSizingMode, DesignStroke, DesignStrokeAlign,
     DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeJoin,
     DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
-    DesignTextHorizontalAlignment, DesignTextPathOrientation, DesignTextPathStartData,
-    DesignTextPathViewData, DesignTextResize, DesignTextVerticalAlignment,
-    DesignTransformOperation, DesignTypography, DesignTypographyTarget,
-    DesignViewerPropertiesViewData, DesignViewerPropertyRow, DesignViewerPropertySection,
+    DesignTextHorizontalAlignment, DesignTextPathDirection, DesignTextPathOrientation,
+    DesignTextPathPlacement, DesignTextPathStartData, DesignTextPathViewData, DesignTextResize,
+    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
+    DesignTypographyTarget, DesignViewerPropertiesViewData, DesignViewerPropertyRow,
+    DesignViewerPropertySection,
 };
 use gpui::{AppContext as _, ClipboardItem, Context, Entity, SharedString, Subscription, Window};
 
@@ -606,6 +607,7 @@ pub(crate) fn design_node(
     out.typography = None;
     out.text_path = None;
     out.text_path_start_data = None;
+    out.text_path_placement = None;
     out.layout = None;
     out.fill_shows_in_exports = None;
 
@@ -698,12 +700,16 @@ pub(crate) fn design_node(
                 TextPathSide::Default => DesignTextPathOrientation::Default,
                 TextPathSide::Flipped => DesignTextPathOrientation::Flipped,
             })
-            .with_start_data_debug_controls(true),
+            .with_direction(match text_path.direction {
+                TextPathDirection::Forward => DesignTextPathDirection::Forward,
+                TextPathDirection::Reverse => DesignTextPathDirection::Reverse,
+            }),
         );
         out.text_path_start_data = Some(DesignTextPathStartData {
             segment: text_path.start.segment(),
             position: text_path.start.position() as f32,
         });
+        out.text_path_placement = design_text_path_placement(text_path);
     }
     out.is_mask = node.is_mask;
     out.mask_mode = match node.mask_type {
@@ -1603,7 +1609,46 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                self.handle_design_text_path_start(panel, id, *data, *phase, cx);
+                self.handle_design_text_path_start(
+                    panel,
+                    id,
+                    TextPathStartEdit::Segment(*data),
+                    *phase,
+                    cx,
+                );
+            }
+            DesignPanelAction::TextPathPlacementChangeRequested {
+                node_id: id,
+                placement,
+                phase,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_start(
+                    panel,
+                    id,
+                    TextPathStartEdit::Placement(*placement),
+                    *phase,
+                    cx,
+                );
+            }
+            DesignPanelAction::TextPathDirectionChangeRequested {
+                node_id: id,
+                direction,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                if !self.design_text_path_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale text-path direction target");
+                    return;
+                }
+                self.finish_document_edits_for_external_change(cx);
+                let operations = self.design_ops(cx, |doc| {
+                    text_path_direction_operations(doc, id, *direction)
+                });
+                self.design_apply_ops(operations, cx);
             }
             DesignPanelAction::TypographyPropertyChangeRequested {
                 node_id: id,
@@ -2266,7 +2311,7 @@ impl FigView {
         &mut self,
         panel: &Entity<DesignPanel>,
         id: NodeId,
-        data: DesignTextPathStartData,
+        data: TextPathStartEdit,
         phase: DesignPanelEditPhase,
         cx: &mut Context<Self>,
     ) {
@@ -2282,7 +2327,7 @@ impl FigView {
         let valid = {
             let item = self.item().read(cx);
             item.document().is_some_and(|document| {
-                text_path_start_operations(&document.doc, id, data).is_some()
+                text_path_start_edit_operations(&document.doc, id, data).is_some()
             })
         };
         if !valid {
@@ -2342,7 +2387,7 @@ impl FigView {
                             return ((), DocChange::None);
                         }
                         if let Some(operations) =
-                            text_path_start_operations(&document.doc, id, data)
+                            text_path_start_edit_operations(&document.doc, id, data)
                         {
                             for operation in &operations {
                                 apply_preview_operation(&mut document.doc, operation);
@@ -2383,7 +2428,7 @@ impl FigView {
                     return;
                 }
                 let operations = self.design_ops(cx, |doc| {
-                    text_path_start_operations(doc, id, data).unwrap_or_default()
+                    text_path_start_edit_operations(doc, id, data).unwrap_or_default()
                 });
                 let committed = self.design_apply_ops(operations, cx);
                 if session.is_some() {
@@ -3085,17 +3130,117 @@ fn set_text_path_line_height(style: &mut fanta_doc::TextStyle, line_height: Desi
     }
 }
 
+#[derive(Clone, Copy)]
+enum TextPathStartEdit {
+    Segment(DesignTextPathStartData),
+    Placement(DesignTextPathPlacement),
+}
+
+fn design_text_path_placement(
+    text_path: &fanta_doc::TextPathNode,
+) -> Option<DesignTextPathPlacement> {
+    let measured = MeasuredPath::new(&text_path.path);
+    let segment = usize::try_from(text_path.start.segment()).ok()?;
+    let contour_index = measured.segment(segment)?.contour_index();
+    let contour = measured
+        .contours()
+        .iter()
+        .find(|contour| contour.contour_index() == contour_index)?;
+    if !contour.length().is_finite() || contour.length() <= 1.0e-9 {
+        return None;
+    }
+    let distance = measured.distance_at_segment_position(segment, text_path.start.position())?
+        - contour.start_distance();
+    let offset = (distance / contour.length()) as f32;
+    if !offset.is_finite() || !(0. ..=1.).contains(&offset) {
+        return None;
+    }
+    Some(DesignTextPathPlacement {
+        contour: u32::try_from(contour_index).ok()?,
+        offset,
+    })
+}
+
+fn text_path_start_edit_operations(
+    doc: &Doc,
+    id: NodeId,
+    edit: TextPathStartEdit,
+) -> Option<Vec<Operation>> {
+    let placement = match edit {
+        TextPathStartEdit::Segment(data) => return text_path_start_operations(doc, id, data),
+        TextPathStartEdit::Placement(placement) => placement,
+    };
+    let Some(NodeData::TextPath(text_path)) = doc.scene.get(id).map(|node| &node.data) else {
+        return None;
+    };
+    let current = design_text_path_placement(text_path)?;
+    if placement.contour != current.contour
+        || !placement.offset.is_finite()
+        || !(0. ..=1.).contains(&placement.offset)
+    {
+        return None;
+    }
+    // A projected percentage has less precision than the stored segment position.
+    // Echoing it back must preserve the exact source, including during a preview reset.
+    if placement == current {
+        return Some(Vec::new());
+    }
+    let measured = MeasuredPath::new(&text_path.path);
+    let contour_index = usize::try_from(placement.contour).ok()?;
+    let contour = measured
+        .contours()
+        .iter()
+        .find(|contour| contour.contour_index() == contour_index)?;
+    let point = measured.point_tangent_on_contour(
+        contour_index,
+        f64::from(placement.offset) * contour.length(),
+    )?;
+    let start = TextPathStart::new(
+        u32::try_from(point.drawable_segment_index).ok()?,
+        point.segment_position,
+    )?;
+    text_path_exact_start_operations(doc, id, start)
+}
+
+fn text_path_direction_operations(
+    doc: &Doc,
+    id: NodeId,
+    direction: DesignTextPathDirection,
+) -> Vec<Operation> {
+    let direction = match direction {
+        DesignTextPathDirection::Forward => TextPathDirection::Forward,
+        DesignTextPathDirection::Reverse => TextPathDirection::Reverse,
+    };
+    if !matches!(doc.scene.get(id).map(|node| &node.data), Some(NodeData::TextPath(path)) if path.direction != direction)
+    {
+        return Vec::new();
+    }
+    replace_data_operation(doc, id, |data| {
+        if let NodeData::TextPath(text_path) = data {
+            text_path.direction = direction;
+        }
+    })
+}
+
 fn text_path_start_operations(
     doc: &Doc,
     id: NodeId,
     data: DesignTextPathStartData,
 ) -> Option<Vec<Operation>> {
+    let start = TextPathStart::new(data.segment, f64::from(data.position))?;
+    text_path_exact_start_operations(doc, id, start)
+}
+
+fn text_path_exact_start_operations(
+    doc: &Doc,
+    id: NodeId,
+    start: TextPathStart,
+) -> Option<Vec<Operation>> {
     let text_path = match doc.scene.get(id).map(|node| &node.data) {
         Some(NodeData::TextPath(text_path)) => text_path,
         _ => return None,
     };
-    let segment = usize::try_from(data.segment).ok()?;
-    let start = TextPathStart::new(data.segment, f64::from(data.position))?;
+    let segment = usize::try_from(start.segment()).ok()?;
     let measured = MeasuredPath::new(&text_path.path);
     let measured_segment = measured.segment(segment)?;
     let contour = measured
@@ -4642,6 +4787,175 @@ mod tests {
             .is_none(),
             "TextNode-only vertical alignment must remain unavailable"
         );
+    }
+
+    #[test]
+    fn text_path_offset_measures_the_whole_contour_and_rejects_invalid_targets() {
+        let (mut doc, _, id) = doc_with_text_path();
+        let original = text_path(&doc, id).clone();
+        let current = design_text_path_placement(&original).expect("valid placement");
+        let total_length = 80.0 + 40.0_f64.hypot(40.0);
+        assert!(
+            (f64::from(current.offset) - (80.0 + 0.25 * 40.0_f64.hypot(40.0)) / total_length).abs()
+                < 1.0e-6
+        );
+        assert!(
+            text_path_start_edit_operations(&doc, id, TextPathStartEdit::Placement(current))
+                .expect("no-op")
+                .is_empty()
+        );
+        for placement in [
+            DesignTextPathPlacement {
+                contour: 99,
+                offset: 0.5,
+            },
+            DesignTextPathPlacement {
+                contour: 0,
+                offset: f32::NAN,
+            },
+            DesignTextPathPlacement {
+                contour: 0,
+                offset: 1.1,
+            },
+            DesignTextPathPlacement {
+                contour: 0,
+                offset: -0.1,
+            },
+        ] {
+            assert!(
+                text_path_start_edit_operations(&doc, id, TextPathStartEdit::Placement(placement))
+                    .is_none()
+            );
+        }
+        for offset in [0.0, 0.5, 1.0] {
+            let operations = text_path_start_edit_operations(
+                &doc,
+                id,
+                TextPathStartEdit::Placement(DesignTextPathPlacement { contour: 0, offset }),
+            )
+            .expect("valid offset");
+            apply_operations(&mut doc, operations);
+            let changed = text_path(&doc, id);
+            let measured = MeasuredPath::new(&changed.path);
+            let distance = measured
+                .distance_at_segment_position(
+                    changed.start.segment() as usize,
+                    changed.start.position(),
+                )
+                .expect("valid start");
+            assert!((distance - f64::from(offset) * total_length).abs() < 1.0e-9);
+            let mut expected = original.clone();
+            expected.start = changed.start;
+            assert_eq!(changed, &expected);
+        }
+    }
+
+    #[gpui::test]
+    async fn text_path_offset_restores_exact_preview_and_direction_is_one_undo_step(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, id) = doc_with_text_path();
+        let Some(NodeData::TextPath(path)) = doc.scene.get_mut(id).map(|node| &mut node.data)
+        else {
+            panic!("fixture path");
+        };
+        path.start = TextPathStart::new(1, 0.123456789012345).expect("precise start");
+        let original = path.clone();
+        let placement = design_text_path_placement(&original).expect("placement");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let emit = |cx: &mut VisualTestContext, offset, phase| {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::TextPathPlacementChangeRequested {
+                    node_id: id.to_string().into(),
+                    placement: DesignTextPathPlacement {
+                        offset,
+                        ..placement
+                    },
+                    phase,
+                })
+            });
+            cx.run_until_parked();
+        };
+        emit(cx, placement.offset, DesignPanelEditPhase::Begin);
+        emit(cx, 0.1, DesignPanelEditPhase::Preview);
+        item.read_with(cx, |item, _| {
+            assert_ne!(
+                text_path(item.doc().expect("doc"), id).start,
+                original.start
+            );
+            assert!(
+                item.content_preview_active(),
+                "persistence waits for this preview"
+            );
+            assert!(!item.doc().expect("doc").history.can_undo());
+        });
+        emit(cx, placement.offset, DesignPanelEditPhase::Preview);
+        item.read_with(cx, |item, _| {
+            assert_eq!(text_path(item.doc().expect("doc"), id), &original)
+        });
+        emit(cx, placement.offset, DesignPanelEditPhase::Commit);
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.content_preview_active());
+            assert!(!item.doc().expect("doc").history.can_undo());
+        });
+        emit(cx, placement.offset, DesignPanelEditPhase::Begin);
+        emit(cx, 0.5, DesignPanelEditPhase::Preview);
+        emit(cx, 0.5, DesignPanelEditPhase::Cancel);
+        item.read_with(cx, |item, _| {
+            assert_eq!(text_path(item.doc().expect("doc"), id), &original)
+        });
+        emit(cx, 0.5, DesignPanelEditPhase::Commit);
+        item.update(cx, |item, cx| assert!(item.undo(cx).expect("undo offset")));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(text_path(item.doc().expect("doc"), id), &original);
+            assert!(!item.doc().expect("doc").history.can_undo());
+        });
+        let action = DesignPanelAction::TextPathDirectionChangeRequested {
+            node_id: id.to_string().into(),
+            direction: DesignTextPathDirection::Forward,
+        };
+        for _ in 0..2 {
+            panel.update_in(cx, |_, _, cx| cx.emit(action.clone()));
+            cx.run_until_parked();
+        }
+        item.read_with(cx, |item, _| {
+            let mut expected = original.clone();
+            expected.direction = TextPathDirection::Forward;
+            assert_eq!(text_path(item.doc().expect("doc"), id), &expected);
+        });
+        item.update(cx, |item, cx| {
+            assert!(item.undo(cx).expect("undo direction"))
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(text_path(item.doc().expect("doc"), id), &original);
+            assert!(!item.doc().expect("doc").history.can_undo());
+        });
+        set_viewer_permissions(&panel, DesignPanelPermissions::viewer(), cx);
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_action(&panel, &action, window, cx)
+        });
+        set_viewer_permissions(&panel, DesignPanelPermissions::editor(), cx);
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([page]);
+                ((), DocChange::Selection)
+            })
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_action(&panel, &action, window, cx)
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(text_path(item.doc().expect("doc"), id), &original);
+            assert!(!item.doc().expect("doc").history.can_undo());
+        });
     }
 
     #[test]

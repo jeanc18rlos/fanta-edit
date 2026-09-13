@@ -573,6 +573,7 @@ pub struct DesignPanelNode {
     pub text_path: Option<DesignTextPathViewData>,
     /// Present only for a TextPath node.
     pub text_path_start_data: Option<DesignTextPathStartData>,
+    pub text_path_placement: Option<DesignTextPathPlacement>,
     /// Present only while the host supplies Vector/TextPath sub-selection data.
     pub vector_edit: Option<DesignVectorEditViewData>,
     pub component_context: Option<DesignComponentContext>,
@@ -656,6 +657,7 @@ impl DesignPanelNode {
                 .then_some(DesignTextPathViewData::default()),
             text_path_start_data: (kind == DesignPanelNodeKind::TextPath)
                 .then_some(DesignTextPathStartData::DEFAULT),
+            text_path_placement: None,
             vector_edit: None,
             component_context: None,
             component_properties: Vec::new(),

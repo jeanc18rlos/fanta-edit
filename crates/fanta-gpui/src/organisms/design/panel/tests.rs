@@ -16318,6 +16318,119 @@ fn text_path_start_data_is_controlled_typed_and_node_gated(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn text_path_placement_and_direction_are_controlled_and_preserve_rounded_input(
+    cx: &mut TestAppContext,
+) {
+    let mut node = DesignPanelNode::new("path", "Curved title", DesignPanelNodeKind::TextPath);
+    node.capabilities = Some(
+        DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::TextPath)
+            .with_sections([DesignPanelSection::Typography]),
+    );
+    node.text_path = Some(
+        super::super::DesignTextPathViewData::default()
+            .with_direction(DesignTextPathDirection::Forward),
+    );
+    let original = 0.12345679;
+    node.text_path_placement = Some(DesignTextPathPlacement {
+        contour: 2,
+        offset: original,
+    });
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+    assert!(
+        visual_cx
+            .debug_bounds("design-text-path-start-segment")
+            .is_none()
+    );
+    let reverse = visual_cx
+        .debug_bounds("design-text-path-direction-Reverse")
+        .expect("reverse control")
+        .center();
+    visual_cx.simulate_click(reverse, Modifiers::none());
+    visual_cx.run_until_parked();
+    assert_eq!(
+        captured.borrow().as_slice(),
+        &[DesignPanelAction::TextPathDirectionChangeRequested {
+            node_id: "path".into(),
+            direction: DesignTextPathDirection::Reverse,
+        }]
+    );
+    panel.read_with(visual_cx, |panel, _| {
+        assert_eq!(panel.node.text_path, node.text_path)
+    });
+    captured.borrow_mut().clear();
+    visual_cx.simulate_keystrokes("enter");
+    visual_cx.run_until_parked();
+    assert_eq!(
+        captured.borrow().len(),
+        1,
+        "keyboard activation emits an intent until the host accepts"
+    );
+    captured.borrow_mut().clear();
+
+    panel.update_in(visual_cx, |panel, window, cx| {
+        panel.activate_property(
+            DesignPanelProperty::TextPathOffset,
+            DesignPanelValue::Ratio(original),
+            window,
+            cx,
+        );
+        assert_eq!(
+            panel.parsed_property_draft(cx),
+            Some(Ok(DesignPanelValue::Ratio(original)))
+        );
+        panel
+            .property_input
+            .update(cx, |input, cx| input.set_value("50", window, cx));
+    });
+    visual_cx.run_until_parked();
+    panel.update_in(visual_cx, |panel, window, cx| {
+        panel.property_input.update(cx, |input, cx| {
+            input.set_value(format_number(original * 100.), window, cx)
+        });
+    });
+    visual_cx.run_until_parked();
+    assert!(captured.borrow().iter().any(|action| matches!(action,
+        DesignPanelAction::TextPathPlacementChangeRequested {
+            placement: DesignTextPathPlacement { contour: 2, offset }, phase: DesignPanelEditPhase::Preview, ..
+        } if *offset == original
+    )), "returning to the display text previews the exact original percentage");
+    panel.update_in(visual_cx, |panel, window, cx| {
+        panel.finish_property_edit(true, window, cx)
+    });
+    visual_cx.run_until_parked();
+    assert!(
+        matches!(captured.borrow().last(), Some(DesignPanelAction::TextPathPlacementChangeRequested {
+        placement: DesignTextPathPlacement { contour: 2, offset }, phase: DesignPanelEditPhase::Commit, ..
+    }) if *offset == original)
+    );
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::single(
+                node,
+                DesignPanelParentLayout::Freeform,
+                DesignPanelPermissions::viewer(),
+            ),
+            cx,
+        )
+    });
+    captured.borrow_mut().clear();
+    panel.update(visual_cx, |panel, cx| {
+        panel.emit_text_path_direction(DesignTextPathDirection::Reverse, cx);
+        panel.emit_property_edit(
+            DesignPanelProperty::TextPathOffset,
+            DesignPanelValue::Ratio(0.5),
+            DesignPanelEditPhase::Commit,
+            cx,
+        );
+    });
+    visual_cx.run_until_parked();
+    assert!(captured.borrow().is_empty());
+}
+
+#[gpui::test]
 fn add_auto_layout_emits_exact_ordered_target_without_optimistic_mutation(cx: &mut TestAppContext) {
     let first = DesignPanelNode::new("first", "First", DesignPanelNodeKind::Group);
     let second = DesignPanelNode::new("second", "Second", DesignPanelNodeKind::Rectangle);
