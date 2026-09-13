@@ -35,13 +35,28 @@ rotated layers. The query walks the active subtree in paint order; a
 conservative local vector bound avoids constructing distant Skia paths. It
 reuses transient size/gap guides without storing measurements.
 
-Inspect source validation passes 793 viewer tests, 602 shared UI tests and
+Inspect source validation passes 815 viewer tests, 602 shared UI tests and
 three architecture checks, 282 renderer unit tests and 24 integration tests,
-and 23 legacy-inspector tests. Package-scoped Clippy and Cargo Machete pass.
+and 25 legacy-inspector tests. Package-scoped Clippy and Cargo Machete pass.
 Logs and later native evidence are recorded under
 `/tmp/fanta-release-qa-20260913/inspect-tool/`. Exact-source hosted CI, native
 QA, and the customer distribution artifact remain separate gates; source
 tests alone do not validate the released application.
+
+Native QA of the first Inspect source (`b5f7ef`) verified read-only selection,
+precise Arrow/thick-stroke/rounded-clip/rotated-image targeting, explicit Move
+exit with Undo, and all 20 geometry-fixture files unchanged after Save/reopen.
+It also found that opening the Move flyout could blur and clear a numeric draft
+before Inspect's entry guard. The follow-up preserves shared and legacy inputs
+while focus moves through either toolbar, then resumes ordinary blur when the
+user moves to another property control. Activated-window regressions cover
+valid/invalid drafts, correction/cancel retries, separate position/visibility
+Undo steps, and ordinary toolbar/keyboard Undo, Redo, Duplicate, nudge and tool
+transitions after a retained preview. Export preserves the draft and refuses
+to run until it is finished. The shipped keymap and an earlier history entry
+are exercised in activated-window regressions; all 51 Inspect-related cases
+pass, along with the full viewer/shared suite and 25 legacy cases. The follow-up's exact native candidate remains to be verified; the
+first build's successful checks do not waive that finding.
 
 ## Post-merge export and font-scale follow-up — September 13
 

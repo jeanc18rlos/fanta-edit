@@ -151,6 +151,7 @@ pub struct FantaPropertiesPanel {
     /// Reading the view just to recover its item in that path double-leases the
     /// entity and panics.
     pub(crate) active_item: Option<WeakEntity<FigItem>>,
+    draft_preserving_focus_scope: Option<FocusHandle>,
     inspecting: bool,
     _inspection_subscription: Option<Subscription>,
     pub(crate) width: Option<Pixels>,
@@ -308,14 +309,22 @@ impl FantaPropertiesPanel {
         subscriptions.push(cx.subscribe_in(
             &field_editor,
             window,
-            |this: &mut Self, _, event: &EditorEvent, _window, cx| match event {
-                EditorEvent::BufferEdited if this.editing_field.is_some() => {
-                    this.preview_editing(cx);
+            |this: &mut Self, _, event: &EditorEvent, window, cx| {
+                match event {
+                    EditorEvent::BufferEdited if this.editing_field.is_some() => {
+                        this.preview_editing(cx);
+                    }
+                    EditorEvent::Blurred if this.editing_field.is_some() => {
+                        if !this
+                            .draft_preserving_focus_scope
+                            .as_ref()
+                            .is_some_and(|scope| scope.contains_focused(window, cx))
+                        {
+                            this.commit_editing_value(cx);
+                        }
+                    }
+                    _ => {}
                 }
-                EditorEvent::Blurred if this.editing_field.is_some() => {
-                    this.commit_editing_value(cx);
-                }
-                _ => {}
             },
         ));
         let mut this = Self {
@@ -323,6 +332,7 @@ impl FantaPropertiesPanel {
             fs,
             active_view: None,
             active_item: None,
+            draft_preserving_focus_scope: None,
             inspecting: false,
             _inspection_subscription: None,
             width: None,
@@ -381,6 +391,8 @@ impl FantaPropertiesPanel {
                     // live X/Y during drags — but that render is O(selection),
                     // not O(document).
                     let item = view.read(cx).item().clone();
+                    self.draft_preserving_focus_scope =
+                        Some(view.read(cx).draft_preserving_toolbar_focus_scope(cx));
                     self.set_inspecting(view.read(cx).is_inspecting(), cx);
                     self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
                         this.set_inspecting(view.read(cx).is_inspecting(), cx);

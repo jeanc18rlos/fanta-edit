@@ -229,6 +229,7 @@ impl DesignPanel {
         {
             return;
         }
+        self.finish_preserved_property_draft(window, cx);
         if !self.begin_variable_font_axis_edit(tag, cx) {
             return;
         }
@@ -320,6 +321,16 @@ impl DesignPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.finish_variable_font_axis_edit_with_focus_restore(commit, true, window, cx);
+    }
+
+    pub(super) fn finish_variable_font_axis_edit_with_focus_restore(
+        &mut self,
+        commit: bool,
+        restore_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .variable_font_axis_scrub
             .as_ref()
@@ -345,7 +356,9 @@ impl DesignPanel {
                 (DesignPanelEditPhase::Commit, value)
             });
         self.emit_variable_font_axis_action(&editor, value, phase, cx);
-        self.type_settings_focus.focus(window, cx);
+        if restore_focus {
+            self.type_settings_focus.focus(window, cx);
+        }
         cx.notify();
     }
 

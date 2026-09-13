@@ -986,6 +986,9 @@ struct PropertyVariableButtonState {
 pub struct DesignPanel {
     id: SharedString,
     focus_handle: FocusHandle,
+    draft_preserving_focus_scope: Option<FocusHandle>,
+    draft_preserving_focus_subscription: Option<(FocusHandle, Subscription)>,
+    property_draft_preserved: bool,
     node: DesignPanelNode,
     inspection_context: DesignPanelInspectionContext,
     /// Last host echo for each mutually-exclusive permission surface set.
@@ -1178,13 +1181,21 @@ impl DesignPanel {
                     }
                 }
                 InputEvent::Blur => {
+                    if this
+                        .draft_preserving_focus_scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.contains_focused(window, cx))
+                    {
+                        this.property_draft_preserved = true;
+                        return;
+                    }
                     if this.variable_font_axis_editor.is_some() {
                         this.finish_variable_font_axis_edit(true, window, cx);
                     } else {
                         this.finish_property_edit_after_input_blur(true, window, cx);
                     }
                 }
-                InputEvent::Focus => {}
+                InputEvent::Focus => this.property_draft_preserved = false,
             },
         );
         let property_variable_search = cx.new(|cx| InputState::new(window, cx));
@@ -2022,6 +2033,9 @@ impl DesignPanel {
         Self {
             id,
             focus_handle: cx.focus_handle(),
+            draft_preserving_focus_scope: None,
+            draft_preserving_focus_subscription: None,
+            property_draft_preserved: false,
             node,
             inspection_context,
             editor_surface: DesignPanelSurface::Design,
@@ -2439,6 +2453,32 @@ impl DesignPanel {
             self.frame_preset_browser_open = false;
         }
         cx.notify();
+    }
+
+    /// Toolbar focus must not finish a draft before the host can reject an
+    /// action that requires the draft to be committed or cancelled first.
+    pub fn set_draft_preserving_focus_scope(&mut self, scope: Option<FocusHandle>) {
+        self.draft_preserving_focus_scope = scope;
+    }
+
+    /// Finish an input retained by the toolbar scope before a normal host
+    /// action. The host must let the emitted edit settle before that action.
+    pub fn finish_preserved_property_draft(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // The retained input is already blurred, so selecting another field
+        // cannot deliver the usual blur that balances its transaction.
+        if std::mem::take(&mut self.property_draft_preserved) {
+            if self.variable_font_axis_editor.is_some() {
+                self.finish_variable_font_axis_edit_with_focus_restore(true, false, window, cx);
+            } else {
+                self.finish_property_edit_after_input_blur(true, window, cx);
+            }
+            return true;
+        }
+        false
     }
 
     pub fn node(&self) -> &DesignPanelNode {
@@ -4000,6 +4040,22 @@ impl Focusable for DesignPanel {
 
 impl Render for DesignPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self
+            .draft_preserving_focus_subscription
+            .as_ref()
+            .map(|(scope, _)| scope)
+            != self.draft_preserving_focus_scope.as_ref()
+        {
+            self.draft_preserving_focus_subscription =
+                self.draft_preserving_focus_scope.clone().map(|scope| {
+                    let subscription = cx.on_focus_out(&scope, window, |this, _, window, cx| {
+                        if !this.property_input.focus_handle(cx).is_focused(window) {
+                            this.finish_preserved_property_draft(window, cx);
+                        }
+                    });
+                    (scope, subscription)
+                });
+        }
         if self.component_authoring_dialog_close_pending {
             self.component_authoring_dialog_close_pending = false;
             window.on_next_frame(|window, cx| {

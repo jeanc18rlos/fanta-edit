@@ -1211,6 +1211,12 @@ impl FigView {
         if self.gpui_design.is_none() {
             return;
         }
+        let draft_scope = Some(self.draft_preserving_toolbar_focus_scope(cx));
+        if let Some(adapter) = &self.gpui_design {
+            adapter.panel.update(cx, |panel, _| {
+                panel.set_draft_preserving_focus_scope(draft_scope)
+            });
+        }
         let item = self.item().clone();
         let page_index = self.selected_page_index();
         let built = {

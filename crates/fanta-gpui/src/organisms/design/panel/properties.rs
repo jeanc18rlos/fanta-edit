@@ -4372,6 +4372,7 @@ impl DesignPanel {
         {
             return;
         }
+        self.finish_preserved_property_draft(window, cx);
         let non_uniform = self
             .property_value_states
             .get(&property)

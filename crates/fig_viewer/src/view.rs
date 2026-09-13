@@ -256,10 +256,17 @@ impl Render for SidebarResizeDrag {
     }
 }
 
+#[cfg(test)]
+struct NativeToolbarMenuFocus(FocusHandle);
+
+#[cfg(test)]
+impl gpui::Global for NativeToolbarMenuFocus {}
+
 pub struct FigView {
     pub(crate) item: Entity<FigItem>,
     project: Entity<Project>,
     pub(crate) focus_handle: FocusHandle,
+    native_toolbar_focus: FocusHandle,
     editor_session: Entity<EditorSession>,
     layers_sidebar: Entity<FantaDesignPanel>,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
@@ -621,6 +628,7 @@ impl FigView {
             tools: ToolShell::new(),
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
+            native_toolbar_focus: cx.focus_handle(),
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                 .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
@@ -2375,6 +2383,56 @@ impl FigView {
         });
     }
 
+    fn defer_after_preserved_design_draft(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+        _resume: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if self.gpui_design.as_ref().is_some_and(|adapter| {
+            adapter.panel.update(_cx, |panel, cx| {
+                panel.finish_preserved_property_draft(_window, cx)
+            })
+        }) {
+            // The panel emits the commit; its host subscription must receive it
+            // before the next action closes the remaining document edit sessions.
+            _cx.defer_in(_window, _resume);
+            return true;
+        }
+        false
+    }
+
+    fn activate_tool_from_action(
+        &mut self,
+        kind: ToolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if kind != ToolKind::Inspect
+            && self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+                this.activate_tool(kind, cx);
+            })
+        {
+            return;
+        }
+        self.activate_tool(kind, cx);
+    }
+
+    fn set_editor_mode_from_action(
+        &mut self,
+        mode: EditorMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+            this.set_editor_mode(mode, cx);
+        }) {
+            return;
+        }
+        self.set_editor_mode(mode, cx);
+    }
+
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
         if kind == ToolKind::Inspect {
             if self.is_inspecting() {
@@ -3134,8 +3192,13 @@ impl FigView {
 
     // === Edit actions =====================================================
 
-    fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.undo(&Undo, window, cx);
+        }) {
             return;
         }
         self.finish_document_edits(cx);
@@ -3151,8 +3214,13 @@ impl FigView {
         }
     }
 
-    fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.redo(&Redo, window, cx);
+        }) {
             return;
         }
         self.finish_document_edits(cx);
@@ -3234,6 +3302,11 @@ impl FigView {
             self.trigger_prototype_key("enter", cx);
             return;
         }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.confirm(&Confirm, window, cx);
+        }) {
+            return;
+        }
         self.finish_panel_edits(cx);
         if self.text_edit.is_some() {
             self.commit_text_edit(cx);
@@ -3271,6 +3344,11 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.delete_selection(&DeleteSelection, window, cx);
+        }) {
+            return;
+        }
         if matches!(self.tools.kind(), ToolKind::NodeEdit | ToolKind::PathSelect) {
             if self.is_editable(cx) {
                 self.finish_document_edits(cx);
@@ -3281,33 +3359,53 @@ impl FigView {
         }
     }
 
-    fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.copy_selection(&CopySelection, window, cx);
+        }) {
+            return;
+        }
         self.copy_selected_nodes(cx);
     }
 
-    fn cut_selection(&mut self, _: &CutSelection, _window: &mut Window, cx: &mut Context<Self>) {
+    fn cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.cut_selection(&CutSelection, window, cx);
+        }) {
+            return;
+        }
         self.cut_selected_nodes(cx);
     }
 
-    fn paste_selection(
-        &mut self,
-        _: &PasteSelection,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn paste_selection(&mut self, _: &PasteSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.paste_selection(&PasteSelection, window, cx);
+        }) {
+            return;
+        }
         self.paste_selected_nodes(cx);
     }
 
     fn duplicate_selection(
         &mut self,
         _: &DuplicateSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.duplicate_selection(&DuplicateSelection, window, cx);
+        }) {
+            return;
+        }
         self.duplicate_selected_nodes(cx);
     }
 
     fn group_selection(&mut self, _: &GroupSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.group_selection(&GroupSelection, window, cx);
+        }) {
+            return;
+        }
         self.group_nodes(None, window, cx);
     }
 
@@ -3317,10 +3415,20 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.ungroup_selection(&UngroupSelection, window, cx);
+        }) {
+            return;
+        }
         self.ungroup_nodes(None, window, cx);
     }
 
     fn frame_selection(&mut self, _: &FrameSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.frame_selection(&FrameSelection, window, cx);
+        }) {
+            return;
+        }
         self.frame_nodes(None, window, cx);
     }
 
@@ -3430,10 +3538,15 @@ impl FigView {
     /// A document with no active page renders all of its roots, and
     /// `children_of(None)` would then hand back the pages themselves —
     /// selecting pages is not what "select all" means, so bail instead.
-    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
         // The inline text session owns its own selection; selecting canvas
         // nodes underneath it mid-typing is never what the user asked for.
         if self.text_edit.is_some() {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.select_all(&SelectAll, window, cx);
+        }) {
             return;
         }
         self.item.update(cx, |item, cx| {
@@ -3510,6 +3623,15 @@ impl FigView {
     #[cfg(test)]
     pub(crate) fn inspector_for_test(&self) -> Entity<FantaPropertiesPanel> {
         self.inspector_sidebar.clone()
+    }
+
+    pub(crate) fn draft_preserving_toolbar_focus_scope(&self, cx: &App) -> FocusHandle {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(toolbar) = &self.gpui_toolbar {
+            return toolbar.panel.focus_handle(cx);
+        }
+        let _ = cx;
+        self.native_toolbar_focus.clone()
     }
 
     fn invalidate_local_media_origin(&self) {
@@ -3936,8 +4058,17 @@ impl FigView {
             return;
         }
         if self.is_editable(cx) {
+            let modifiers = window.modifiers();
+            if self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+                if this.is_editable(cx) {
+                    this.finish_document_edits(cx);
+                    this.dispatch_tool_event(key_event(key, modifiers), cx);
+                }
+            }) {
+                return;
+            }
             self.finish_document_edits(cx);
-            self.dispatch_tool_event(key_event(key, window.modifiers()), cx);
+            self.dispatch_tool_event(key_event(key, modifiers), cx);
         }
     }
 
@@ -3947,6 +4078,11 @@ impl FigView {
 
     fn play_prototype(&mut self, _: &PlayPrototype, window: &mut Window, cx: &mut Context<Self>) {
         if self.prototype_player.is_some() {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.play_prototype(&PlayPrototype, window, cx);
+        }) {
             return;
         }
         self.finish_document_edits(cx);
@@ -4419,9 +4555,11 @@ impl FigView {
     fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.editor_mode(cx);
         let view = cx.weak_entity();
-        let tabs = EditorModeTabs::new(mode, move |mode, _, cx| {
-            view.update(cx, |view, cx| view.set_editor_mode(mode, cx))
-                .log_err();
+        let tabs = EditorModeTabs::new(mode, move |mode, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_editor_mode_from_action(mode, window, cx)
+            })
+            .log_err();
         });
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
@@ -4604,6 +4742,8 @@ impl FigView {
             .justify_center()
             .child(
                 h_flex()
+                    .id("fanta-native-tool-pill")
+                    .track_focus(&self.native_toolbar_focus)
                     .occlude()
                     .gap_1()
                     .px_1p5()
@@ -4648,8 +4788,8 @@ impl FigView {
                                 })
                                 .disabled(face_disabled)
                                 .tooltip(Tooltip::text(face_kind.label()))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.activate_tool(face_kind, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.activate_tool_from_action(face_kind, window, cx);
                                 }));
                                 if group.len() <= 1 {
                                     children.push(face_btn.into_any_element());
@@ -4669,7 +4809,7 @@ impl FigView {
                                     )
                                     .menu(move |window, cx| {
                                         let view = menu_view.clone();
-                                        Some(ContextMenu::build(
+                                        let menu = ContextMenu::build(
                                             window,
                                             cx,
                                             move |mut menu, _window, _cx| {
@@ -4687,10 +4827,10 @@ impl FigView {
                                                                 kind == active,
                                                             )
                                                             .action(action_for_kind(kind))
-                                                            .handler(move |_window, cx| {
+                                                            .handler(move |window, cx| {
                                                                 if let Err(error) =
                                                                     view.update(cx, |this, cx| {
-                                                                        this.activate_tool(kind, cx);
+                                                                        this.activate_tool_from_action(kind, window, cx);
                                                                     })
                                                                 {
                                                                     log::debug!(
@@ -4703,13 +4843,16 @@ impl FigView {
                                                 }
                                                 menu
                                             },
-                                        ))
+                                        );
+                                        #[cfg(test)]
+                                        cx.set_global(NativeToolbarMenuFocus(menu.focus_handle(cx)));
+                                        Some(menu)
                                     });
                                 children.push(
                                     h_flex()
                                         .items_center()
                                         .child(face_btn)
-                                        .child(caret)
+                                        .child(div().debug_selector(move || format!("native-tool-menu-{group_index}")).child(caret))
                                         .into_any_element(),
                                 );
                                 children
@@ -6028,67 +6171,65 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &NudgeDown, window, cx| {
                 this.nudge(LogicalKey::ArrowDown, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateSelectTool, _, cx| {
-                this.activate_tool(ToolKind::Select, cx)
+            .on_action(cx.listener(|this, _: &ActivateSelectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Select, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateInspectTool, _, cx| {
-                this.activate_tool(ToolKind::Inspect, cx)
+            .on_action(cx.listener(|this, _: &ActivateInspectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Inspect, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateHandTool, _, cx| {
-                this.activate_tool(ToolKind::Hand, cx)
+            .on_action(cx.listener(|this, _: &ActivateHandTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Hand, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateRectangleTool, _, cx| {
-                this.activate_tool(ToolKind::Rect, cx)
+            .on_action(cx.listener(|this, _: &ActivateRectangleTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Rect, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateEllipseTool, _, cx| {
-                this.activate_tool(ToolKind::Ellipse, cx)
+            .on_action(cx.listener(|this, _: &ActivateEllipseTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Ellipse, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateLineTool, _, cx| {
-                this.activate_tool(ToolKind::Line, cx)
+            .on_action(cx.listener(|this, _: &ActivateLineTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Line, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateArrowTool, _, cx| {
-                this.activate_tool(ToolKind::Arrow, cx)
+            .on_action(cx.listener(|this, _: &ActivateArrowTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Arrow, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivatePolygonTool, _, cx| {
-                this.activate_tool(ToolKind::Polygon, cx)
+            .on_action(cx.listener(|this, _: &ActivatePolygonTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Polygon, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateStarTool, _, cx| {
-                this.activate_tool(ToolKind::Star, cx)
+            .on_action(cx.listener(|this, _: &ActivateStarTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Star, window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &ActivatePenTool, _, cx| {
-                    this.activate_tool(ToolKind::Pen, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &ActivateNodeEditTool, _, cx| {
-                this.activate_tool(ToolKind::NodeEdit, cx)
+            .on_action(cx.listener(|this, _: &ActivatePenTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Pen, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateFrameTool, _, cx| {
-                this.activate_tool(ToolKind::Frame, cx)
+            .on_action(cx.listener(|this, _: &ActivateNodeEditTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::NodeEdit, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateTextTool, _, cx| {
-                this.activate_tool(ToolKind::Text, cx)
+            .on_action(cx.listener(|this, _: &ActivateFrameTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Frame, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivatePencilTool, _, cx| {
-                this.activate_tool(ToolKind::Pencil, cx)
+            .on_action(cx.listener(|this, _: &ActivateTextTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Text, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateSectionTool, _, cx| {
-                this.activate_tool(ToolKind::Section, cx)
+            .on_action(cx.listener(|this, _: &ActivatePencilTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Pencil, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateSliceTool, _, cx| {
-                this.activate_tool(ToolKind::Slice, cx)
+            .on_action(cx.listener(|this, _: &ActivateSectionTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Section, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateScaleTool, _, cx| {
-                this.activate_tool(ToolKind::Scale, cx)
+            .on_action(cx.listener(|this, _: &ActivateSliceTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Slice, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivatePathSelectTool, _, cx| {
-                this.activate_tool(ToolKind::PathSelect, cx)
+            .on_action(cx.listener(|this, _: &ActivateScaleTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Scale, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateCommentTool, _, cx| {
-                this.activate_tool(ToolKind::Comment, cx)
+            .on_action(cx.listener(|this, _: &ActivatePathSelectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::PathSelect, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateTextPathTool, _, cx| {
-                this.activate_tool(ToolKind::TextPath, cx)
+            .on_action(cx.listener(|this, _: &ActivateCommentTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Comment, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTextPathTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::TextPath, window, cx)
             }))
             .on_action(cx.listener(Self::toggle_layers_sidebar))
             .on_action(cx.listener(Self::toggle_inspector_sidebar))
@@ -6928,6 +7069,7 @@ impl Item for FigView {
                 tools: ToolShell::new(),
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
+                native_toolbar_focus: cx.focus_handle(),
                 #[cfg(feature = "fanta-gpui-ui")]
                 gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                     .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
@@ -8215,6 +8357,198 @@ mod tests {
             })
             .expect("leave inspect");
         assert_ne!(item.read_with(cx, snapshot), before);
+    }
+
+    async fn assert_native_inspect_menu_preserves_numeric_draft(
+        cx: &mut TestAppContext,
+        invalid: bool,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Native-inspect-draft.fig".into(),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        // Focus callbacks require an active platform window in GPUI tests.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| window.is_window_active()));
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        #[cfg(feature = "fanta-gpui-ui")]
+        view.read_with(cx, |view, _| {
+            assert!(view.gpui_toolbar.is_none());
+            assert!(view.gpui_design.is_none());
+        });
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        let snapshot = |item: &FigItem, _: &App| {
+            (
+                serde_json::to_value(item.doc().expect("document")).expect("snapshot"),
+                item.is_dirty(),
+            )
+        };
+        let original = item.read_with(cx, snapshot);
+        let field = cx.debug_bounds("scrub-fanta-x-0").expect("native X field");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.dispatch_action(editor::actions::SelectAll);
+        cx.simulate_input("55.5");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .transform
+                    .0
+                    .translation
+                    .x,
+                55.5
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+        });
+        if invalid {
+            cx.dispatch_action(editor::actions::SelectAll);
+            cx.simulate_input("invalid");
+            cx.run_until_parked();
+        }
+        let preview = item.read_with(cx, snapshot);
+        let preview_active = item.read_with(cx, |item, _| item.content_preview_active());
+        let trigger = cx
+            .debug_bounds("native-tool-menu-0")
+            .expect("native Move caret");
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        let focus_native_menu = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+                // TestWindow does not drive on_next_frame callbacks. Focus the
+                // actual mounted menu as PopoverMenu's platform callback does.
+                cx.global::<NativeToolbarMenuFocus>()
+                    .0
+                    .clone()
+                    .focus(window, cx);
+            });
+            cx.run_until_parked();
+        };
+        focus_native_menu(cx);
+        assert!(
+            cx.update(|window, cx| view
+                .read(cx)
+                .native_toolbar_focus
+                .contains_focused(window, cx)),
+            "the deferred native ContextMenu is inside the toolbar's focus scope"
+        );
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(crate::properties_snapshot::InspectorField::X(vector_id))
+            );
+            assert_eq!(
+                panel.field_editor.read(cx).text(cx),
+                if invalid { "invalid" } else { "55.5" }
+            );
+        });
+        assert_eq!(item.read_with(cx, snapshot), preview);
+        assert_eq!(
+            item.read_with(cx, |item, _| item.content_preview_active()),
+            preview_active
+        );
+        let inspect = cx
+            .debug_bounds("MENU_ITEM-Inspect")
+            .expect("native Inspect row");
+        cx.simulate_click(inspect.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(crate::properties_snapshot::InspectorField::X(vector_id))
+            );
+            assert_eq!(
+                panel.field_editor.read(cx).text(cx),
+                if invalid { "invalid" } else { "55.5" }
+            );
+        });
+        assert_eq!(item.read_with(cx, snapshot), preview);
+        assert_eq!(
+            item.read_with(cx, |item, _| item.content_preview_active()),
+            preview_active
+        );
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        if invalid {
+            cx.dispatch_action(editor::actions::SelectAll);
+            cx.simulate_input("72.5");
+            cx.simulate_keystrokes("enter");
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    doc.scene
+                        .get(vector_id)
+                        .expect("vector")
+                        .transform
+                        .0
+                        .translation
+                        .x,
+                    72.5
+                );
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+        } else {
+            cx.simulate_keystrokes("escape");
+            assert_eq!(item.read_with(cx, snapshot), original);
+        }
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("native-tool-menu-0")
+            .expect("native Move caret");
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        focus_native_menu(cx);
+        let inspect = cx
+            .debug_bounds("MENU_ITEM-Inspect")
+            .expect("native Inspect row");
+        cx.simulate_click(inspect.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Inspect
+        );
+    }
+
+    #[gpui::test]
+    async fn native_inspect_menu_preserves_invalid_numeric_draft_until_corrected(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_inspect_menu_preserves_numeric_draft(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn native_inspect_menu_preserves_live_numeric_preview_until_cancelled(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_inspect_menu_preserves_numeric_draft(cx, false).await;
     }
 
     #[gpui::test]
@@ -11729,7 +12063,7 @@ impl FigView {
             } => self.choose_local_media(cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    Some(kind) => self.activate_tool(kind, cx),
+                    Some(kind) => self.activate_tool_from_action(kind, window, cx),
                     None => notify_unavailable(tool.label(), window, cx),
                 }
             }
@@ -11737,8 +12071,12 @@ impl FigView {
                 self.handle_toolbar_chrome_control(id, window, cx);
             }
             ToolbarAction::ModeChangeRequested { mode } => match mode {
-                ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
-                ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
+                ToolbarMode::Design => {
+                    self.set_editor_mode_from_action(EditorMode::Design, window, cx)
+                }
+                ToolbarMode::Motion => {
+                    self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
+                }
                 ToolbarMode::Dev => notify_unavailable("Dev mode", window, cx),
             },
             // The +/- steppers, the zoom menu's percent entries, typed
@@ -11784,8 +12122,12 @@ impl FigView {
                 ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
                 ToolbarCommand::ZoomToSelection => self.zoom_to_selection(cx),
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
-                ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
-                ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
+                ToolbarCommand::OpenDesignMode => {
+                    self.set_editor_mode_from_action(EditorMode::Design, window, cx)
+                }
+                ToolbarCommand::OpenMotionMode => {
+                    self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
+                }
                 ToolbarCommand::Export => self.export_from_toolbar(window, cx),
                 ToolbarCommand::PlaceImageVideo => self.choose_local_media(cx),
                 ToolbarCommand::Group => self.group_selection(&GroupSelection, window, cx),

@@ -139,6 +139,12 @@ impl EditorToolbar {
                         self.id,
                         group.label().to_lowercase().replace(' ', "-")
                     )))
+                    .debug_selector(move || {
+                        format!(
+                            "toolbar-group-{}-main",
+                            group.label().to_lowercase().replace(' ', "-")
+                        )
+                    })
                     .key_context(CONTROL_KEY_CONTEXT)
                     .tab_index(0)
                     .size(px(TOOL_SIZE))
