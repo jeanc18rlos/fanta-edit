@@ -6,6 +6,14 @@ step: read the files here, or on GitHub.
 - [`alpha/`](./alpha) — what ships in the alpha: [`SMOKE.md`](./alpha/SMOKE.md)
   (the manual pass before a build goes out), [`RELEASE_NOTES.md`](./alpha/RELEASE_NOTES.md)
   and [`KNOWN_ISSUES.md`](./alpha/KNOWN_ISSUES.md).
+- [`alpha/LAUNCH.md`](./alpha/LAUNCH.md) — backend, billing, analytics, and
+  GitHub installer requirements for the first customer release.
+- [`alpha/PRICING_PROPOSAL.md`](./alpha/PRICING_PROPOSAL.md) — the reconciled,
+  unapproved launch catalog and its billing assumptions and activation gates.
+- [`alpha/CAPABILITY_INVENTORY.md`](./alpha/CAPABILITY_INVENTORY.md) — what is
+  implemented, tested, native-verified, production-verified, gated, or blocked.
+- [`alpha/RELEASE_VALIDATION.md`](./alpha/RELEASE_VALIDATION.md) — measured
+  performance, completed checks, and remaining release verification.
 - [`fanta/`](./fanta) — notes on the app itself, including
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
   the record of which inherited Zed services are switched off and why.

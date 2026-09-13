@@ -174,41 +174,73 @@ mod tests {
     use anyhow::Result;
     use clock::FakeSystemClock;
     use feature_flags::FeatureFlagAppExt as _;
-    use gpui::{AppContext as _, AsyncApp, BorrowAppContext as _};
+    use futures::{AsyncReadExt as _, StreamExt as _};
+    use gpui::{AppContext as _, AsyncApp, BorrowAppContext as _, TestAppContext};
     use http_client::FakeHttpClient;
-    use language_model::IconOrSvg;
+    use language_model::{
+        AuthenticateError, IconOrSvg, LanguageModelCompletionEvent, LanguageModelProvider as _,
+        LanguageModelRequest, LanguageModelRequestMessage, MessageContent, Role,
+    };
     use release_channel::AppVersion;
     use std::future::Future;
     use std::pin::Pin;
     use ui::IconName;
 
-    struct FakeCredentialsProvider;
+    #[derive(Default)]
+    struct FakeCredentialsProvider {
+        read_error: Option<&'static str>,
+        stored_credentials: Option<(String, String, Vec<u8>)>,
+        expected_storage_url: Option<&'static str>,
+    }
 
     impl CredentialsProvider for FakeCredentialsProvider {
         fn read_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-            Box::pin(async { Ok(None) })
+            Box::pin(async move {
+                if let Some(error) = self.read_error {
+                    anyhow::bail!(error);
+                }
+                if let Some(expected_url) = self.expected_storage_url {
+                    anyhow::ensure!(url == expected_url, "unexpected credential storage URL");
+                }
+                Ok(self
+                    .stored_credentials
+                    .as_ref()
+                    .and_then(|(stored_url, username, key)| {
+                        (stored_url == url).then(|| (username.clone(), key.clone()))
+                    }))
+            })
         }
 
         fn write_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _username: &'a str,
             _password: &'a [u8],
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                if let Some(expected_url) = self.expected_storage_url {
+                    assert_eq!(url, expected_url, "unexpected credential storage URL");
+                }
+                Ok(())
+            })
         }
 
         fn delete_credentials<'a>(
             &'a self,
-            _url: &'a str,
+            url: &'a str,
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                if let Some(expected_url) = self.expected_storage_url {
+                    assert_eq!(url, expected_url, "unexpected credential storage URL");
+                }
+                Ok(())
+            })
         }
     }
 
@@ -226,7 +258,7 @@ mod tests {
             FakeHttpClient::with_404_response(),
             cx,
         );
-        (client, Arc::new(FakeCredentialsProvider))
+        (client, Arc::new(FakeCredentialsProvider::default()))
     }
 
     fn update_compatible_provider_settings(
@@ -271,6 +303,179 @@ mod tests {
             .filter(|provider| provider.id().0.as_ref() == id)
             .map(|provider| provider.icon())
             .collect()
+    }
+
+    #[gpui::test]
+    async fn test_managed_provider_uses_account_token_for_streaming(cx: &mut TestAppContext) {
+        let (client, credentials_provider) = cx.update(init_test);
+        let provider = cx.update(|cx| {
+            AnthropicCompatibleLanguageModelProvider::new(
+                "Fanta".into(),
+                client.clone(),
+                credentials_provider,
+                cx,
+            )
+        });
+        assert!(matches!(
+            cx.update(|cx| provider.authenticate(cx)).await,
+            Err(AuthenticateError::CredentialsNotFound)
+        ));
+
+        client.override_authenticate(|_| {
+            gpui::Task::ready(Ok(client::Credentials {
+                user_id: 1,
+                access_token: "fnt_live_account_token".into(),
+            }))
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("test account sign-in failed");
+        cx.update(|cx| provider.authenticate(cx))
+            .await
+            .expect("account sign-in should authenticate managed AI");
+        assert!(cx.update(|cx| provider.is_authenticated(cx)));
+
+        client.http_client().as_fake().replace_handler(|_, mut request| async move {
+            assert_eq!(request.uri().to_string(), "https://api.fantaisa.net/v1/messages");
+            assert_eq!(request.headers().get("x-api-key").and_then(|value| value.to_str().ok()), Some("fnt_live_account_token"));
+            let mut body = String::new();
+            request.body_mut().read_to_string(&mut body).await?;
+            let body: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(body["model"], "claude-sonnet-5");
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["messages"][0]["content"][0]["text"], "Hello");
+            Ok(http_client::Response::builder().status(200).body(
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Connected\"}}\n\n".into(),
+            )?)
+        });
+
+        let model = cx
+            .update(|cx| provider.default_model(cx))
+            .expect("managed provider should have a default model");
+        let mut stream = model
+            .stream_completion(
+                LanguageModelRequest {
+                    messages: vec![LanguageModelRequestMessage {
+                        role: Role::User,
+                        content: vec![MessageContent::Text("Hello".into())],
+                        cache: false,
+                        reasoning_details: None,
+                    }],
+                    ..Default::default()
+                },
+                &cx.to_async(),
+            )
+            .await
+            .expect("managed request should stream through the backend");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(LanguageModelCompletionEvent::Text(text))) if text == "Connected"
+        ));
+
+        client.sign_out(&cx.to_async()).await;
+        assert!(!cx.update(|cx| provider.is_authenticated(cx)));
+        assert!(matches!(
+            model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await,
+            Err(language_model::LanguageModelCompletionError::NoApiKey { .. })
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_account_token_does_not_authenticate_external_provider(cx: &mut TestAppContext) {
+        let (client, credentials_provider) = cx.update(init_test);
+        cx.update(|cx| {
+            update_compatible_provider_settings(&[], &["external"], cx);
+        });
+        client.override_authenticate(|_| {
+            gpui::Task::ready(Ok(client::Credentials {
+                user_id: 1,
+                access_token: "fnt_live_account_token".into(),
+            }))
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("test account sign-in failed");
+        let provider = cx.update(|cx| {
+            AnthropicCompatibleLanguageModelProvider::new(
+                "external".into(),
+                client,
+                credentials_provider,
+                cx,
+            )
+        });
+        assert!(!cx.update(|cx| provider.is_authenticated(cx)));
+        assert!(matches!(
+            cx.update(|cx| provider.authenticate(cx)).await,
+            Err(AuthenticateError::CredentialsNotFound)
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_managed_provider_reports_credential_storage_errors(cx: &mut TestAppContext) {
+        let (client, _) = cx.update(init_test);
+        client.override_authenticate(|_| {
+            gpui::Task::ready(Ok(client::Credentials {
+                user_id: 1,
+                access_token: "fnt_live_account_token".into(),
+            }))
+        });
+        client
+            .sign_in(false, &cx.to_async())
+            .await
+            .expect("test account sign-in failed");
+        let provider = cx.update(|cx| {
+            AnthropicCompatibleLanguageModelProvider::new(
+                "Fanta".into(),
+                client,
+                Arc::new(FakeCredentialsProvider {
+                    read_error: Some("keychain unavailable"),
+                    ..Default::default()
+                }),
+                cx,
+            )
+        });
+        let result = cx.update(|cx| provider.authenticate(cx)).await;
+        assert!(
+            matches!(result, Err(AuthenticateError::Other(error)) if error.to_string() == "keychain unavailable")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_managed_provider_does_not_cache_stored_account_credentials(
+        cx: &mut TestAppContext,
+    ) {
+        let (client, _) = cx.update(init_test);
+        let provider = cx.update(|cx| {
+            AnthropicCompatibleLanguageModelProvider::new(
+                "Fanta".into(),
+                client.clone(),
+                Arc::new(FakeCredentialsProvider {
+                    expected_storage_url: Some("https://api.fantaisa.net/ai-api-key"),
+                    stored_credentials: Some((
+                        "https://api.fantaisa.net".into(),
+                        "1".into(),
+                        b"fnt_live_stored_account_token".to_vec(),
+                    )),
+                    ..Default::default()
+                }),
+                cx,
+            )
+        });
+        assert!(matches!(
+            cx.update(|cx| provider.authenticate(cx)).await,
+            Err(AuthenticateError::CredentialsNotFound)
+        ));
+        assert!(!cx.update(|cx| provider.is_authenticated(cx)));
+        cx.update(|cx| provider.set_api_key(Some("fnt_live_explicit_key".into()), cx))
+            .await
+            .expect("explicit keys should use their own credential storage slot");
+        cx.update(|cx| provider.set_api_key(None, cx))
+            .await
+            .expect("resetting a provider key must not delete account credentials");
     }
 
     #[gpui::test]

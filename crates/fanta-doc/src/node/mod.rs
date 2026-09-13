@@ -23,7 +23,7 @@
 //! so `crate::node::Foo` paths are unchanged:
 //!
 //! - [`variants`] — the concrete payloads ([`GroupNode`], [`VectorNode`],
-//!   [`TextNode`], media, [`NodeGraphNode`], [`Model3dNode`], [`AiArtifactNode`],
+//!   [`TextNode`], [`TextPathNode`], media, [`NodeGraphNode`], [`Model3dNode`], [`AiArtifactNode`],
 //!   [`EmbedNode`], …).
 //! - [`layout`] — the auto-layout ("stack"/flexbox) model ([`AutoLayout`],
 //!   [`LayoutChild`], and their enums).
@@ -69,7 +69,8 @@ pub use variants::{
     AiArtifactNode, AudioNode, BitmapNode, BooleanNode, BooleanOp, Camera3d, ConstraintH,
     ConstraintV, Constraints, EmbedNode, FontVariation, GenerationStatus, GroupNode, Link,
     Model3dNode, NodeGraph, NodeGraphNode, ParametricShape, ScrollBehavior, ScrollDirection,
-    TextAlign, TextAutoResize, TextNode, TextStyle, TextStyleRun, VAlign, VectorNode, VideoNode,
+    TextAlign, TextAutoResize, TextNode, TextPathAlignment, TextPathDirection, TextPathNode,
+    TextPathSide, TextPathStart, TextStyle, TextStyleRun, VAlign, VectorNode, VideoNode,
     WorkflowNode,
 };
 
@@ -270,6 +271,11 @@ impl CanvasNode {
                     .map(|b| [b.width(), b.height()])
                     .unwrap_or([50.0, 50.0])
             }),
+            NodeData::TextPath(text_path) => text_path
+                .path
+                .rough_bounds()
+                .map(|bounds| [bounds.width(), bounds.height()])
+                .unwrap_or([50.0, 50.0]),
             _ => [50.0, 50.0],
         };
         let comps = self.transform.to_components();
@@ -357,6 +363,9 @@ bitflags! {
         /// Excluded from automatic AI context (when an agent gets "everything
         /// on canvas," this node is omitted). Useful for sensitive layers.
         const EXCLUDE_FROM_AI = 1 << 3;
+        /// Edited vector paths may extend beyond an imported viewport. This
+        /// overrides `local_size` clipping and prevents legacy viewport backfill.
+        const UNCLIPPED_VECTOR = 1 << 4;
     }
 }
 
@@ -417,9 +426,10 @@ impl MaskType {
 /// 4. `fanta-fnx`'s `TYPE_TAGS` — the `.fnx` tag mapping.
 ///
 /// A variant with geometry outside the common box-shaped representation (like
-/// [`Vector`]'s path or [`Group`]'s clipping box) additionally needs arms in [`local_size`] /
-/// [`set_local_size`] / [`local_bounds`]; the accessors return the box-shaped
-/// default via the catch-all `data` arm, which the special cases override.
+/// [`Vector`]'s path or [`Group`]'s clipping box) additionally needs arms in
+/// [`local_size`] / [`set_local_size`] / [`local_bounds`]; the accessors return
+/// the box-shaped default via the catch-all `data` arm, which the special cases
+/// override.
 ///
 /// [`default_name`]: NodeData::default_name
 /// [`kind_tag`]: NodeData::kind_tag
@@ -443,6 +453,9 @@ pub enum NodeData {
     /// `fanta-render` converts it to `fanta-text`'s engine types to shape, wrap,
     /// and draw glyphs. This is what a Figma `TEXT` node imports to.
     Text(TextNode),
+
+    /// Styled text placed along an owned vector baseline.
+    TextPath(TextPathNode),
 
     /// Raster image (PNG/JPG/WebP). Asset stored externally; node references
     /// it by [`AssetId`](crate::id::AssetId) and declares the canvas-space
@@ -492,6 +505,7 @@ impl NodeData {
             Self::Group(_) => "Group",
             Self::Vector(_) => "Shape",
             Self::Text(_) => "Text",
+            Self::TextPath(_) => "Text on Path",
             Self::Bitmap(_) => "Image",
             Self::Video(_) => "Video",
             Self::Audio(_) => "Audio",
@@ -517,6 +531,7 @@ impl NodeData {
             }
             Self::Vector(_) => "vector",
             Self::Text(_) => "text",
+            Self::TextPath(_) => "text_path",
             Self::Bitmap(_) => "bitmap",
             Self::Video(_) => "video",
             Self::Audio(_) => "audio",
@@ -533,10 +548,12 @@ impl NodeData {
     /// non-clipping explicit box when present (frames still use `clip_size`), and
     /// `None` for a content-sized group. [`Vector`] also returns `None` because
     /// [`Vector`] (its box is the path's bounds; `VectorNode.local_size` is an
-    /// optional SVG-viewport *clip*, not the content box). Use
+    /// optional SVG-viewport *clip*, not the content box). A [`TextPath`]
+    /// likewise uses its owned baseline instead of a box. Use
     /// [`local_bounds`](Self::local_bounds) for the polymorphic answer.
     ///
     /// [`Group`]: NodeData::Group
+    /// [`TextPath`]: NodeData::TextPath
     /// [`Vector`]: NodeData::Vector
     pub fn local_size(&self) -> Option<[f64; 2]> {
         match self {
@@ -551,13 +568,13 @@ impl NodeData {
             Self::Instance(i) => Some(i.local_size),
             Self::Embed(e) => Some(e.local_size),
             // Vector's box is its path and Boolean's is folded operand geometry.
-            Self::Vector(_) | Self::Boolean(_) => None,
+            Self::Vector(_) | Self::TextPath(_) | Self::Boolean(_) => None,
         }
     }
 
     /// Overwrite the `local_size` box of a box-shaped variant. For a plain group
     /// this writes its non-clipping explicit box; frames continue to use
-    /// `clip_size`. Returns `false` for vectors and booleans.
+    /// `clip_size`. Returns `false` for vectors, text paths, and booleans.
     ///
     /// [`Group`]: NodeData::Group
     /// [`Vector`]: NodeData::Vector
@@ -574,7 +591,7 @@ impl NodeData {
             Self::AiArtifact(a) => a.local_size = [w, h],
             Self::Instance(i) => i.local_size = [w, h],
             Self::Embed(e) => e.local_size = [w, h],
-            Self::Vector(_) | Self::Boolean(_) => return false,
+            Self::Vector(_) | Self::TextPath(_) | Self::Boolean(_) => return false,
         }
         true
     }
@@ -582,8 +599,8 @@ impl NodeData {
     /// Intrinsic local-space bounds, independent of any scene index: a group's
     /// clipping or explicit non-clipping box when set (`None` otherwise — a
     /// sizeless group's content bounds require walking children, which only the
-    /// scene can do), a vector's path bounds, and the `local_size` box of
-    /// everything else.
+    /// scene can do), a vector's path bounds, a text path's owned baseline
+    /// bounds, and the `local_size` box of everything else.
     pub fn local_bounds(&self) -> Option<Bounds> {
         match self {
             Self::Group(g) => g
@@ -591,6 +608,36 @@ impl NodeData {
                 .or(g.local_size)
                 .map(|[w, h]| Bounds::from_xywh(0.0, 0.0, w, h)),
             Self::Vector(v) => v.path.rough_bounds(),
+            // The scene index cannot shape glyphs, but it must not exclude
+            // painted text before the renderer can perform an exact hit test.
+            // Font bounds can extend outside the em, so use a deliberately
+            // conservative band around the baseline here; renderer-facing
+            // selection/export bounds replace this with exact shaped ink.
+            Self::TextPath(text_path) => {
+                let bounds = text_path.path.rough_bounds()?;
+                let em = std::iter::once(&text_path.style)
+                    .chain(text_path.style_runs.iter().map(|run| &run.style))
+                    .filter_map(|style| {
+                        if !style.size_px.is_finite() || style.size_px <= 0.0 {
+                            return None;
+                        }
+                        let spacing = if style.letter_spacing.is_finite() {
+                            style.letter_spacing.abs()
+                        } else {
+                            0.0
+                        };
+                        Some(style.size_px + spacing)
+                    })
+                    .fold(0.0, f64::max);
+                let padding = (em * 4.0).max(1.0);
+                let expanded = Bounds {
+                    min_x: bounds.min_x - padding,
+                    min_y: bounds.min_y - padding,
+                    max_x: bounds.max_x + padding,
+                    max_y: bounds.max_y + padding,
+                };
+                expanded.is_finite().then_some(expanded).or(Some(bounds))
+            }
             data => data
                 .local_size()
                 .map(|[w, h]| Bounds::from_xywh(0.0, 0.0, w, h)),
@@ -656,6 +703,20 @@ impl NodeData {
     pub fn as_text_mut(&mut self) -> Option<&mut TextNode> {
         match self {
             Self::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn as_text_path(&self) -> Option<&TextPathNode> {
+        match self {
+            Self::TextPath(text_path) => Some(text_path),
+            _ => None,
+        }
+    }
+
+    pub fn as_text_path_mut(&mut self) -> Option<&mut TextPathNode> {
+        match self {
+            Self::TextPath(text_path) => Some(text_path),
             _ => None,
         }
     }

@@ -5,7 +5,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
 use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver, solve_scene_layout};
+use futures::FutureExt as _;
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
     SharedString, Subscription, Task, WeakEntity,
@@ -37,6 +38,143 @@ const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
 /// than it was given.
 pub(crate) const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Default)]
+struct ProjectWrites {
+    state: Mutex<ProjectWriteState>,
+    #[cfg(test)]
+    next_save_barrier: Mutex<Option<SaveTestBarrier>>,
+}
+
+#[cfg(test)]
+struct SaveTestBarrier {
+    reached: futures::channel::oneshot::Sender<()>,
+    resume: futures::channel::oneshot::Receiver<()>,
+    after_write: bool,
+}
+
+#[cfg(test)]
+impl SaveTestBarrier {
+    async fn wait(self) {
+        self.reached.send(()).expect("save test observes writer");
+        self.resume.await.expect("save test releases writer");
+    }
+}
+
+#[derive(Default)]
+struct ProjectWriteState {
+    active: usize,
+    changing_destination: bool,
+    quiet_until: Option<Instant>,
+    last_write: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
+}
+
+struct ProjectWriteLease {
+    writes: Arc<ProjectWrites>,
+    changing_destination: bool,
+    predecessor: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
+    completed: Option<futures::channel::oneshot::Sender<()>>,
+}
+
+impl ProjectWrites {
+    fn begin(self: &Arc<Self>) -> Arc<ProjectWriteLease> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        self.enqueue(&mut state, false)
+    }
+
+    fn begin_destination_change(self: &Arc<Self>) -> Result<Arc<ProjectWriteLease>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        anyhow::ensure!(
+            state.active == 0,
+            "A save is already running. Try Save As again when it finishes."
+        );
+        Ok(self.enqueue(&mut state, true))
+    }
+
+    fn enqueue(
+        self: &Arc<Self>,
+        state: &mut ProjectWriteState,
+        changing_destination: bool,
+    ) -> Arc<ProjectWriteLease> {
+        let predecessor = state.last_write.take();
+        let (completed, completion) = futures::channel::oneshot::channel();
+        // Reserve order when the snapshot is captured, not when its task is
+        // first polled. A canceled queued save must still wait for its
+        // predecessor before letting subsequent writers touch the tree.
+        state.last_write = Some(
+            {
+                let predecessor = predecessor.clone();
+                async move {
+                    if let Some(predecessor) = predecessor {
+                        predecessor.await;
+                    }
+                    if completion.await.is_err() {
+                        log::debug!("a project write lease ended without its completion signal");
+                    }
+                }
+            }
+            .boxed()
+            .shared(),
+        );
+        state.active += 1;
+        state.changing_destination |= changing_destination;
+        Arc::new(ProjectWriteLease {
+            writes: self.clone(),
+            changing_destination,
+            predecessor,
+            completed: Some(completed),
+        })
+    }
+
+    fn changing_destination(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .changing_destination
+    }
+
+    fn suppresses_watcher(&self, now: Instant) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active > 0 || state.quiet_until.is_some_and(|until| now < until)
+    }
+}
+
+impl ProjectWriteLease {
+    async fn wait_for_turn(&self) {
+        if let Some(predecessor) = self.predecessor.clone() {
+            predecessor.await;
+        }
+    }
+}
+
+impl Drop for ProjectWriteLease {
+    fn drop(&mut self) {
+        let mut state = self
+            .writes
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if self.changing_destination {
+            state.changing_destination = false;
+        }
+        if let Some(completed) = self.completed.take()
+            && completed.send(()).is_err()
+        {
+            log::debug!("project write completion no longer has a waiting queue");
+        }
+        if state.active == 0 {
+            state.last_write = None;
+        }
+        state.quiet_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ContentPreviewState {
+    owner: EntityId,
+    dirty_before: bool,
+}
+
 pub struct FigItem {
     pub(crate) path: ProjectPath,
     pub(crate) abs_path: PathBuf,
@@ -47,7 +185,11 @@ pub struct FigItem {
     /// Dirty state before the first transient preview frame. Cleared by a
     /// committed edit; canceling a preview restores it so opening and closing
     /// an inspector gesture without a change does not dirty the document.
-    preview_dirty_before: Option<bool>,
+    content_preview: Option<ContentPreviewState>,
+    /// A relevant worktree event arrived while transient content was live.
+    /// Reconciliation waits until that preview commits or rolls back so it
+    /// never adopts or merges a renderer-only intermediate frame.
+    external_change_pending: bool,
     /// The project changed on disk while the canvas had unsaved edits.
     conflict: bool,
     /// An open FNX buffer has edits that are not yet represented by the
@@ -59,6 +201,10 @@ pub struct FigItem {
     /// Ignore worktree events until this instant; set around our own project
     /// writes so saving from the canvas does not trigger a self-reload.
     suppress_watcher_until: Option<Instant>,
+    // A synchronous writer cannot be interrupted when its foreground task is
+    // canceled. Its shared lease keeps watcher suppression alive until both
+    // sides have released that save, including overlapping or failed saves.
+    project_writes: Arc<ProjectWrites>,
     /// The last document state both the canvas and the disk agreed on (as of
     /// the last load, reload, or save). The common ancestor for the
     /// three-way merge that reconciles concurrent canvas edits with external
@@ -160,15 +306,15 @@ pub enum FigItemEvent {
     /// changed, or its effective typography changed. This refreshes inspector
     /// values without changing which document node the inspector is bound to.
     TextSelectionChanged,
-    /// The document finished (re)loading, or an explicit save replaced its
+    /// The document finished (re)loading, or Save As replaced its
     /// persisted state. Listeners treat this as "the document may have been
     /// replaced": in-flight text sessions, inspector previews and rename
-    /// gestures are dropped. The debounced autosave deliberately emits
+    /// gestures are dropped. Ordinary persistence deliberately emits
     /// [`Saved`](Self::Saved) instead, so it never cancels what the user is
     /// doing.
     StateChanged,
-    /// The document was written to disk without being replaced: the dirty
-    /// flag cleared and nothing else about the in-memory state changed.
+    /// A document snapshot was written without replacing the live document.
+    /// Newer edits, if any, remain dirty and also emit [`Edited`](Self::Edited).
     Saved,
     /// The document was replaced by an external reload (`merged: false`) or by
     /// a clean three-way merge of the external edit into the canvas's unsaved
@@ -209,9 +355,8 @@ pub enum ScopeRequester {
 }
 
 /// Whether a save came from the user (Cmd-S, File > Save) or from the
-/// canvas's debounced autosave. Explicit saves announce
-/// [`FigItemEvent::StateChanged`]; autosaves announce
-/// [`FigItemEvent::Saved`], which listeners must not treat as a reload.
+/// canvas's debounced autosave. Both announce [`FigItemEvent::Saved`], which
+/// listeners must not treat as a reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaveKind {
     Explicit,
@@ -403,8 +548,14 @@ impl FigDocument {
         // renders it with a selected-page fallback — leaving it unset sends new
         // shapes/text/frames to the scene root where the page-scoped render
         // never paints them (invisible until a drag reparents them into the
-        // page). Default it to the page the canvas will show.
-        if doc.active_page().is_none() {
+        // page). Imports can instead arrive with a hidden library page active,
+        // because add_page activates the first root. Rendering that root hides
+        // every new shape even though the default viewport fits a visible page.
+        if doc.active_page().is_none_or(|active| {
+            pages
+                .iter()
+                .any(|page| page.root == Some(active) && page.hidden)
+        }) {
             doc.set_active_page(pages.get(default_page_index).and_then(|page| page.root));
         }
 
@@ -505,13 +656,19 @@ impl FigDocument {
         };
         for root in self.doc.scene.roots().to_vec() {
             for id in self.doc.scene.descendants_of(root) {
-                if let Some(node) = self.doc.scene.get(id)
-                    && let fanta_doc::NodeData::Text(text) = &node.data
-                {
-                    push(&text.style.font_family);
-                    for run in &text.style_runs {
-                        push(&run.style.font_family);
+                let Some(node) = self.doc.scene.get(id) else {
+                    continue;
+                };
+                let (style, style_runs) = match &node.data {
+                    fanta_doc::NodeData::Text(text) => (&text.style, &text.style_runs),
+                    fanta_doc::NodeData::TextPath(text_path) => {
+                        (&text_path.style, &text_path.style_runs)
                     }
+                    _ => continue,
+                };
+                push(&style.font_family);
+                for run in style_runs {
+                    push(&run.style.font_family);
                 }
             }
         }
@@ -957,10 +1114,12 @@ impl project::ProjectItem for FigItem {
                     },
                     project_root,
                     dirty: false,
-                    preview_dirty_before: None,
+                    content_preview: None,
+                    external_change_pending: false,
                     conflict: false,
                     source_edit_locked: false,
                     suppress_watcher_until: None,
+                    project_writes: Arc::default(),
                     merge_base: None,
                     pending_scope: initial_scope,
                     last_scope: None,
@@ -1021,6 +1180,14 @@ impl FigItem {
         self.document.ready().is_some() && !self.source_edit_locked
     }
 
+    pub(crate) fn can_preview_for_owner(&self, owner: EntityId) -> bool {
+        self.is_editable()
+            && !self.project_writes.changing_destination()
+            && self
+                .content_preview
+                .is_none_or(|preview| preview.owner == owner)
+    }
+
     pub fn has_ready_document(&self) -> bool {
         self.document.ready().is_some()
     }
@@ -1055,11 +1222,60 @@ impl FigItem {
         self.dirty
     }
 
+    pub(crate) fn content_preview_active(&self) -> bool {
+        self.content_preview.is_some()
+    }
+
+    pub(crate) fn external_reconciliation_pending(&self) -> bool {
+        self.external_change_pending
+    }
+
+    fn defer_external_change_for_preview(&mut self) -> bool {
+        if !self.content_preview_active() {
+            return false;
+        }
+        self.external_change_pending = true;
+        true
+    }
+
+    fn resume_external_change_after_preview(&mut self, cx: &mut Context<Self>) {
+        if self.external_change_pending {
+            self.schedule_resync(cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_save_for_test(
+        &self,
+        after_write: bool,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached, arrived) = futures::channel::oneshot::channel();
+        let (resume, wait) = futures::channel::oneshot::channel();
+        let previous = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save test barrier")
+            .replace(SaveTestBarrier {
+                reached,
+                resume: wait,
+                after_write,
+            });
+        assert!(previous.is_none(), "only one next-save barrier is armed");
+        (arrived, resume)
+    }
+
     pub fn has_conflict(&self) -> bool {
         self.conflict
     }
 
     fn set_conflict(&mut self, conflict: bool, cx: &mut Context<Self>) {
+        if conflict {
+            self.external_change_pending = false;
+        }
         if self.conflict != conflict {
             self.conflict = conflict;
             cx.emit(FigItemEvent::ConflictChanged);
@@ -1113,9 +1329,9 @@ impl FigItem {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        if self
-            .suppress_watcher_until
-            .is_some_and(|until| Instant::now() < until)
+        let now = Instant::now();
+        if self.project_writes.suppresses_watcher(now)
+            || self.suppress_watcher_until.is_some_and(|until| now < until)
         {
             return;
         }
@@ -1132,11 +1348,19 @@ impl FigItem {
         if !relevant {
             return;
         }
+        self.external_change_pending = true;
         if self.source_edit_locked {
             // A dirty FNX buffer owns its live preview; merging under it
             // would race the text the user is still editing.
             self.set_conflict(true, cx);
-        } else if self.dirty {
+            return;
+        }
+        if self.defer_external_change_for_preview() {
+            // The rollback snapshot and the transient document must stay in
+            // the same document generation until the preview ends.
+            return;
+        }
+        if self.dirty {
             // Unsaved canvas edits + external file edits: try a three-way
             // merge against the last agreed state instead of forcing the
             // binary Overwrite/Discard choice.
@@ -1151,6 +1375,10 @@ impl FigItem {
     /// merge is adopted silently (the canvas stays dirty — its half is not
     /// on disk yet); any real conflict falls back to the conflict banner.
     fn schedule_merge(&mut self, cx: &mut Context<Self>) {
+        if self.defer_external_change_for_preview() {
+            return;
+        }
+        self.external_change_pending = true;
         let Some(root) = self.project_root.clone() else {
             self.set_conflict(true, cx);
             return;
@@ -1178,7 +1406,9 @@ impl FigItem {
                     // Possibly a half-written batch; the next watcher event
                     // retries. Keep the canvas and flag the divergence.
                     if let Err(error) = this.update(cx, |this, cx| {
-                        if this.sync_epoch == epoch {
+                        if this.sync_epoch != epoch {
+                            this.schedule_resync(cx);
+                        } else if !this.defer_external_change_for_preview() {
                             this.set_conflict(true, cx);
                         }
                     }) {
@@ -1187,7 +1417,10 @@ impl FigItem {
                     return;
                 }
             };
-            let ours = this.read_with(cx, |this, _| {
+            let ours = this.update(cx, |this, _| {
+                if this.defer_external_change_for_preview() {
+                    return None;
+                }
                 this.document
                     .ready()
                     .map(|document| (document.doc.clone(), document.render_generation()))
@@ -1214,6 +1447,9 @@ impl FigItem {
                 }
                 if this.source_edit_locked {
                     this.set_conflict(true, cx);
+                    return;
+                }
+                if this.defer_external_change_for_preview() {
                     return;
                 }
                 if !this.dirty {
@@ -1305,9 +1541,11 @@ impl FigItem {
         self.document = FigDocumentState::Ready(document);
         self.merge_base = Some(disk.doc);
         self.write_cache = None;
+        self.external_change_pending = false;
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
+        cx.emit(FigItemEvent::Edited);
         cx.notify();
     }
 
@@ -1318,7 +1556,12 @@ impl FigItem {
     fn schedule_resync(&mut self, cx: &mut Context<Self>) {
         if self.source_edit_locked {
             self.set_conflict(true, cx);
-        } else if self.dirty {
+            return;
+        }
+        if self.defer_external_change_for_preview() {
+            return;
+        }
+        if self.dirty {
             self.schedule_merge(cx);
         } else {
             self.schedule_reload(cx);
@@ -1326,10 +1569,13 @@ impl FigItem {
     }
 
     /// Debounce disk changes, then reload the project in the background.
-    /// Content gestures dirty the item on their first preview frame, so a
-    /// mid-gesture reload can only interrupt selection-style gestures, which
-    /// tolerate having their selection reset.
+    /// Content previews are a document-identity boundary: watcher work is
+    /// deferred until the current preview commits or rolls back.
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
+        if self.defer_external_change_for_preview() {
+            return;
+        }
+        self.external_change_pending = true;
         let Some(root) = self.project_root.clone() else {
             return;
         };
@@ -1349,7 +1595,14 @@ impl FigItem {
                     this.schedule_resync(cx);
                     return;
                 }
-                if this.dirty || this.source_edit_locked {
+                if this.source_edit_locked {
+                    this.set_conflict(true, cx);
+                    return;
+                }
+                if this.defer_external_change_for_preview() {
+                    return;
+                }
+                if this.dirty {
                     // Canvas or FNX edits landed while the reload was in
                     // flight; keep them and flag the divergence.
                     this.set_conflict(true, cx);
@@ -1364,6 +1617,7 @@ impl FigItem {
                         log::error!(
                             "reloading Fanta project after a disk change failed: {error:#}"
                         );
+                        this.set_conflict(true, cx);
                         // Keep the last good document: the failure may be a
                         // half-written batch of files whose next watcher
                         // event will reload it in full.
@@ -1401,7 +1655,8 @@ impl FigItem {
         self.document = FigDocumentState::Ready(document);
         self.write_cache = None;
         self.dirty = false;
-        self.preview_dirty_before = None;
+        self.content_preview = None;
+        self.external_change_pending = false;
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
@@ -1428,6 +1683,11 @@ impl FigItem {
     }
 
     fn reload_from_disk_unchecked(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.content_preview_active() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "finish or cancel the active canvas preview before reloading"
+            )));
+        }
         let Some(root) = self.project_root.clone() else {
             return Task::ready(Ok(()));
         };
@@ -1514,8 +1774,32 @@ impl FigItem {
     /// Apply an undoable operation to the document, re-solve the affected
     /// page's layout, and mark the item dirty.
     pub fn apply(&mut self, operation: Operation, cx: &mut Context<Self>) -> Result<()> {
+        self.apply_for_owner(None, operation, cx)
+    }
+
+    pub(crate) fn apply_for_preview_owner(
+        &mut self,
+        owner: EntityId,
+        operation: Operation,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.apply_for_owner(Some(owner), operation, cx)
+    }
+
+    fn apply_for_owner(
+        &mut self,
+        owner: Option<EntityId>,
+        operation: Operation,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
         if self.source_edit_locked {
             anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
+        if self
+            .content_preview
+            .is_some_and(|preview| Some(preview.owner) != owner)
+        {
+            anyhow::bail!("another view has an active canvas preview");
         }
         let document = self
             .document
@@ -1541,8 +1825,11 @@ impl FigItem {
         document.resolve_after_edit(active_page);
         document.advance_render_generation();
         document.mark_variables_changed();
-        self.preview_dirty_before = None;
+        let finished_preview = self.content_preview.take().is_some();
         self.mark_edited(false, cx);
+        if finished_preview {
+            self.resume_external_change_after_preview(cx);
+        }
         Ok(())
     }
 
@@ -1554,8 +1841,45 @@ impl FigItem {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
     ) -> Option<R> {
+        self.with_document_for_owner_impl(None, cx, f)
+    }
+
+    pub(crate) fn with_document_for_owner<R>(
+        &mut self,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
+    ) -> Option<R> {
+        self.with_document_for_owner_impl(Some(owner), cx, f)
+    }
+
+    pub(crate) fn with_document_for_preview_owner<R>(
+        &mut self,
+        owner: EntityId,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
+    ) -> Option<R> {
+        if self.project_writes.changing_destination() {
+            return None;
+        }
+        self.with_document_for_owner_impl(Some(owner), cx, f)
+    }
+
+    fn with_document_for_owner_impl<R>(
+        &mut self,
+        owner: Option<EntityId>,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut FigDocument) -> (R, DocChange),
+    ) -> Option<R> {
+        if self
+            .content_preview
+            .is_some_and(|preview| Some(preview.owner) != owner)
+        {
+            return None;
+        }
         let document = self.document.ready_mut()?;
         let (result, change) = f(document);
+        let mut finished_preview = false;
         match change {
             DocChange::None => {}
             DocChange::Selection => {
@@ -1574,16 +1898,33 @@ impl FigItem {
                 document.resolve_after_edit(active_page);
                 document.advance_render_generation();
                 document.mark_variables_changed();
-                self.preview_dirty_before = None;
+                finished_preview = self.content_preview.take().is_some();
                 self.mark_edited(false, cx);
             }
             DocChange::ContentPreview => {
-                if self.preview_dirty_before.is_none() {
-                    self.preview_dirty_before = Some(self.dirty);
+                let Some(owner) = owner else {
+                    log::error!(
+                        "content preview used unowned document access; committing the mutation"
+                    );
+                    let active_page = document.doc.active_page();
+                    document.resolve_after_edit(active_page);
+                    document.advance_render_generation();
+                    document.mark_variables_changed();
+                    self.mark_edited(false, cx);
+                    return Some(result);
+                };
+                if self.content_preview.is_none() {
+                    self.content_preview = Some(ContentPreviewState {
+                        owner,
+                        dirty_before: self.dirty,
+                    });
                 }
                 document.advance_render_generation();
                 self.mark_edited(true, cx);
             }
+        }
+        if finished_preview {
+            self.resume_external_change_after_preview(cx);
         }
         Some(result)
     }
@@ -1591,6 +1932,9 @@ impl FigItem {
     pub fn undo(&mut self, cx: &mut Context<Self>) -> Result<bool> {
         if self.source_edit_locked {
             anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
+        if self.content_preview_active() {
+            anyhow::bail!("finish or cancel the active canvas preview before undoing");
         }
         let document = self
             .document
@@ -1610,7 +1954,6 @@ impl FigItem {
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
             document.mark_variables_changed();
-            self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
         Ok(did)
@@ -1619,6 +1962,9 @@ impl FigItem {
     pub fn redo(&mut self, cx: &mut Context<Self>) -> Result<bool> {
         if self.source_edit_locked {
             anyhow::bail!("save or discard the current FNX edit before editing the canvas");
+        }
+        if self.content_preview_active() {
+            anyhow::bail!("finish or cancel the active canvas preview before redoing");
         }
         let document = self
             .document
@@ -1638,7 +1984,6 @@ impl FigItem {
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
             document.mark_variables_changed();
-            self.preview_dirty_before = None;
             self.mark_edited(false, cx);
         }
         Ok(did)
@@ -1659,15 +2004,29 @@ impl FigItem {
         cx.notify();
     }
 
-    pub(crate) fn finish_content_preview(&mut self, committed: bool, cx: &mut Context<Self>) {
-        let Some(dirty_before) = self.preview_dirty_before.take() else {
-            return;
+    pub(crate) fn finish_content_preview(
+        &mut self,
+        owner: EntityId,
+        committed: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(preview) = self
+            .content_preview
+            .filter(|preview| preview.owner == owner)
+        else {
+            return false;
         };
-        if !committed && self.dirty != dirty_before {
-            self.dirty = dirty_before;
-            cx.emit(FigItemEvent::Edited);
-            cx.notify();
+        self.content_preview = None;
+        if !committed {
+            self.dirty = preview.dirty_before;
         }
+        // Preview frames deliberately suppress heavyweight listeners after
+        // the initial dirty transition. Announce the boundary even when the
+        // item was dirty beforehand so autosave and inspectors can resume.
+        cx.emit(FigItemEvent::Edited);
+        cx.notify();
+        self.resume_external_change_after_preview(cx);
+        true
     }
 
     /// Install the initial load's outcome: the parsed document and, for a bare
@@ -1727,16 +2086,37 @@ impl FigItem {
     /// creates it — so the view can add it to the workspace as a visible
     /// worktree — and `None` when the project already existed.
     ///
-    /// `kind` only picks the event announced on success: an explicit save
-    /// emits [`FigItemEvent::StateChanged`], which every listener reads as
-    /// "the document may have been replaced" and uses to drop in-flight
-    /// sessions; the debounced autosave emits [`FigItemEvent::Saved`] so a
-    /// rename or half-typed inspector value survives it.
+    /// A save persists its snapshot without replacing the live document.
+    /// Newer edits remain dirty and rearm autosave when the write completes.
     pub fn save(
         &mut self,
         kind: SaveKind,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
+        if self.project_writes.changing_destination() {
+            return Task::ready(match kind {
+                SaveKind::Auto => Ok(None),
+                SaveKind::Explicit => Err(anyhow::anyhow!(
+                    "Save As is still running. Wait for it to finish before saving again."
+                )),
+            });
+        }
+        if self.content_preview_active() {
+            return Task::ready(match kind {
+                SaveKind::Auto => Ok(None),
+                SaveKind::Explicit => Err(anyhow::anyhow!(
+                    "finish or cancel the active canvas preview before saving"
+                )),
+            });
+        }
+        if self.external_change_pending {
+            return Task::ready(match kind {
+                SaveKind::Auto => Ok(None),
+                SaveKind::Explicit => Err(anyhow::anyhow!(
+                    "external changes are still being reconciled; wait for the canvas to update"
+                )),
+            });
+        }
         if self.source_edit_locked {
             return Task::ready(Err(anyhow::anyhow!(
                 "the FNX source is dirty; save it through the code workspace before saving the canvas"
@@ -1751,48 +2131,75 @@ impl FigItem {
         // once per autosave was the save path's memory high-water mark.
         let doc = document.doc.clone_for_persist();
         let raw_assets = document.raw_assets.clone();
-        let existing_root = self.project_root.clone();
-        let materializing = existing_root.is_none();
-        // Materialize next to the `.fig` on the first save; reuse the existing
-        // project directory on every save after that.
-        let target = existing_root.unwrap_or_else(|| available_project_dir(&self.abs_path));
-        if materializing && fanta_format::is_project_dir(&target) {
-            // A Fanta project already exists at the destination that this
-            // in-memory `.fig` was never loaded from (it appeared after we
-            // opened). Materializing would full-overwrite newer on-disk content
-            // with a stale import — refuse rather than destroy it. Reopening the
-            // `.fig` will redirect to and load that project (see `try_open`).
-            return Task::ready(Err(anyhow::anyhow!(
-                "a Fanta project already exists at {}; open it directly instead of overwriting it with {}",
-                target.display(),
-                self.abs_path.display()
-            )));
-        }
+        let generation = document.render_generation();
         // Our own writes echo back through the worktree watcher; suppress it
         // both from save start (covers sub-second saves entirely) and again at
         // completion (covers watcher latency after longer saves). On the
         // materializing save this window also spans the moment the directory is
         // adopted as a worktree, so its initial scan does not bounce back as a
         // reload.
+        let write_lease = self.project_writes.begin();
         self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
         // A pending merge/reload holds a disk snapshot from before this save;
         // cancel it so it can't adopt that stale snapshot after the write
         // lands (silently reverting — and on the next save destroying — the
         // content saved here).
         self.reload_task = None;
-        // A save already in flight holds the cache; this one starts cold
-        // rather than waiting, and whichever finishes last keeps its memo.
-        let write_cache = self.write_cache.take().unwrap_or_default();
+        #[cfg(test)]
+        let save_barrier = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save test barrier")
+            .take();
         cx.spawn(async move |this, cx| {
+            write_lease.wait_for_turn().await;
+            let (target, materializing, write_cache) = this.update(cx, |this, _| {
+                anyhow::ensure!(
+                    !this.source_edit_locked,
+                    "the FNX source is dirty; save it through the code workspace before saving the canvas"
+                );
+                anyhow::ensure!(this.document.ready().is_some(), "the document is still loading");
+                let materializing = this.project_root.is_none();
+                // An earlier queued save may have just materialized the
+                // project. Resolve its adopted root only after that save ends.
+                let target = this
+                    .project_root
+                    .clone()
+                    .unwrap_or_else(|| available_project_dir(&this.abs_path));
+                anyhow::ensure!(
+                    !materializing || !fanta_format::is_project_dir(&target),
+                    "a Fanta project already exists at {}; open it directly instead of overwriting it with {}",
+                    target.display(),
+                    this.abs_path.display()
+                );
+                Ok::<_, anyhow::Error>((
+                    target,
+                    materializing,
+                    this.write_cache.take().unwrap_or_default(),
+                ))
+            })??;
             // The persisted clone travels through the write and comes back
             // to become the merge base — one clone per save, not two.
             let (result, saved_doc, write_cache) = cx
                 .background_spawn({
                     let target = target.clone();
+                    let write_lease = write_lease.clone();
                     async move {
+                        let _write_lease = write_lease;
                         let mut write_cache = write_cache;
+                        #[cfg(test)]
+                        let mut save_barrier = save_barrier;
+                        #[cfg(test)]
+                        if save_barrier.as_ref().is_some_and(|barrier| !barrier.after_write) {
+                            save_barrier.take().expect("before-write barrier").wait().await;
+                        }
                         let result =
                             write_project_cached(&target, &doc, &raw_assets, &mut write_cache);
+                        #[cfg(test)]
+                        if let Some(barrier) = save_barrier {
+                            barrier.wait().await;
+                        }
                         (result, doc, write_cache)
                     }
                 })
@@ -1803,16 +2210,20 @@ impl FigItem {
                     if materializing {
                         this.project_root = Some(target.clone());
                     }
-                    // Disk and canvas agree again — this is the new merge
-                    // ancestor for reconciling future concurrent edits.
+                    // The disk contains this snapshot even if the live
+                    // document advanced while the writer was running.
                     this.merge_base = Some(saved_doc);
-                    this.dirty = false;
-                    this.preview_dirty_before = None;
+                    this.dirty = this
+                        .document
+                        .ready()
+                        .is_none_or(|document| document.render_generation() != generation);
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
-                    match kind {
-                        SaveKind::Explicit => cx.emit(FigItemEvent::StateChanged),
-                        SaveKind::Auto => cx.emit(FigItemEvent::Saved),
+                    cx.emit(FigItemEvent::Saved);
+                    if this.dirty {
+                        // Other views may have consumed their debounce while
+                        // this snapshot was queued or writing.
+                        cx.emit(FigItemEvent::Edited);
                     }
                     cx.notify();
                 }
@@ -1823,7 +2234,176 @@ impl FigItem {
                     this.write_cache = Some(write_cache);
                 }
             })?;
+            drop(write_lease);
             result.map(|()| materializing.then_some(target))
+        })
+    }
+
+    pub(crate) fn save_as(
+        &mut self,
+        project: Entity<Project>,
+        destination: ProjectPath,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let preparation = (|| {
+            anyhow::ensure!(
+                !self.source_edit_locked,
+                "Save or discard the current FNX edit before using Save As."
+            );
+            anyhow::ensure!(
+                !self.content_preview_active(),
+                "Finish or cancel the active canvas preview before using Save As."
+            );
+            anyhow::ensure!(
+                !self.external_change_pending,
+                "Wait for external changes to finish reconciling before using Save As."
+            );
+            let document = self
+                .document
+                .ready()
+                .context("The design is still loading.")?;
+            let target = project
+                .read(cx)
+                .absolute_path(&destination, cx)
+                .context("Save As requires a local destination folder.")?;
+            let manifest_path = ProjectPath {
+                worktree_id: destination.worktree_id,
+                path: destination
+                    .path
+                    .join(util::rel_path::RelPath::unix("fanta.json")?),
+            };
+            let lease = self.project_writes.begin_destination_change()?;
+            Ok((
+                target,
+                manifest_path,
+                document.doc.clone_for_persist(),
+                document.raw_assets.clone(),
+                document.render_generation(),
+                lease,
+            ))
+        })();
+        let (target, manifest_path, document, assets, generation, lease) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                if self.dirty {
+                    cx.emit(FigItemEvent::Edited);
+                    cx.notify();
+                }
+                return Task::ready(Err(error));
+            }
+        };
+        let previous_root = self.project_root.clone();
+        self.reload_task = None;
+        self.sync_epoch += 1;
+        #[cfg(test)]
+        let save_barrier = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save test barrier")
+            .take();
+        cx.spawn(async move |this, cx| {
+            let result: Result<()> = async {
+                let (root, document, cache) = cx
+                    .background_spawn({
+                        let lease = lease.clone();
+                        async move {
+                            let _lease = lease;
+                            #[cfg(test)]
+                            let mut save_barrier = save_barrier;
+                            #[cfg(test)]
+                            if save_barrier
+                                .as_ref()
+                                .is_some_and(|barrier| !barrier.after_write)
+                            {
+                                save_barrier
+                                    .take()
+                                    .expect("before-write barrier")
+                                    .wait()
+                                    .await;
+                            }
+                            let result = write_project_copy(
+                                &target,
+                                previous_root.as_deref(),
+                                &document,
+                                &assets,
+                            );
+                            #[cfg(test)]
+                            if let Some(barrier) = save_barrier {
+                                barrier.wait().await;
+                            }
+                            let (root, cache) = result?;
+                            anyhow::Ok((root, document, cache))
+                        }
+                    })
+                    .await?;
+                let projects = this.update(cx, |this, cx| {
+                    this.entry_id = project
+                        .read(cx)
+                        .entry_for_path(&manifest_path, cx)
+                        .map(|entry| entry.id);
+                    this.path = manifest_path;
+                    this.abs_path = root.join("fanta.json");
+                    this.project_root = Some(root.clone());
+                    this.merge_base = Some(document);
+                    this.write_cache = Some(cache);
+                    this.dirty = this
+                        .document
+                        .ready()
+                        .is_none_or(|document| document.render_generation() != generation);
+                    this.sync_epoch += 1;
+                    this.set_conflict(false, cx);
+                    this.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+                    this.subscribe_to_project(&project, cx);
+                    // All split/scoped views share this document. Remove its old
+                    // lookup keys so reopening the original reads the original tree.
+                    let entity_id = cx.entity_id();
+                    cx.default_global::<SharedProjectItems>()
+                        .0
+                        .retain(|_, item| item.entity_id() != entity_id);
+                    let key = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    register_shared_project_item(key, &cx.entity(), cx);
+                    cx.emit(FigItemEvent::StateChanged);
+                    if this.dirty {
+                        cx.emit(FigItemEvent::Edited);
+                    }
+                    cx.notify();
+                    this.project_subscriptions
+                        .iter()
+                        .filter_map(|(project, _)| project.upgrade())
+                        .collect::<Vec<_>>()
+                })?;
+                drop(lease);
+                // Other windows sharing this document need a watcher for its new
+                // directory even after the window performing Save As closes.
+                for project in projects {
+                    let worktree = project.update(cx, |project, cx| {
+                        project.find_or_create_worktree(root.clone(), true, cx)
+                    });
+                    if let Err(error) = worktree.await {
+                        log::error!(
+                            "adding saved Fanta project {} to the workspace failed: {error:#}",
+                            root.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                // Save As consumed each view's autosave timer while it held
+                // the destination lease. Re-arm them after releasing it so
+                // a rejected copy does not silently disable normal saving.
+                if let Err(error) = this.update(cx, |this, cx| {
+                    if this.dirty {
+                        cx.emit(FigItemEvent::Edited);
+                        cx.notify();
+                    }
+                }) {
+                    log::debug!("the design closed before autosave could resume: {error:#}");
+                }
+            }
+            result
         })
     }
 }
@@ -1860,10 +2440,12 @@ pub(crate) fn ready_item_with_root_for_test(
         document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
         project_root,
         dirty: false,
-        preview_dirty_before: None,
+        content_preview: None,
+        external_change_pending: false,
         conflict: false,
         source_edit_locked: false,
         suppress_watcher_until: None,
+        project_writes: Arc::default(),
         merge_base: None,
         pending_scope: None,
         last_scope: None,
@@ -1963,6 +2545,71 @@ pub(crate) fn write_project(
     )
 }
 
+fn write_project_copy(
+    target: &Path,
+    source: Option<&Path>,
+    document: &Doc,
+    assets: &BTreeMap<AssetId, Vec<u8>>,
+) -> Result<(PathBuf, fanta_format::ProjectWriteCache)> {
+    let requested_target = target.to_path_buf();
+    let target = validate_project_copy_destination(target, source)?;
+    let parent = target
+        .parent()
+        .context("Choose a destination folder with a parent directory.")?;
+    // Publish only a complete project. A failed/cancelled background write
+    // must not leave a half-written fanta.json that future opens would adopt.
+    let staging = tempfile::Builder::new()
+        .prefix(".fanta-save-as-")
+        .tempdir_in(parent)?;
+    let mut cache = fanta_format::ProjectWriteCache::default();
+    write_project_cached(staging.path(), document, assets, &mut cache)?;
+    std::fs::rename(staging.path(), &target)
+        .with_context(|| format!("saving the copied design at {}", target.display()))?;
+    Ok((requested_target, cache))
+}
+
+pub(crate) fn validate_project_copy_destination(
+    target: &Path,
+    source: Option<&Path>,
+) -> Result<PathBuf> {
+    let parent = target
+        .parent()
+        .context("Choose a destination folder with a parent directory.")?
+        .canonicalize()?;
+    let target = parent.join(
+        target
+            .file_name()
+            .context("Choose a name for the copied design.")?,
+    );
+    if let Some(source) = source {
+        match source.canonicalize() {
+            Ok(source) => anyhow::ensure!(
+                !target.starts_with(&source),
+                "Choose a destination outside the original Fanta project."
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking the original project directory"),
+        }
+    }
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "{} already exists. Choose a new or empty folder.",
+                target.display()
+            );
+            anyhow::ensure!(
+                std::fs::read_dir(&target)?.next().is_none(),
+                "{} is not empty. Choose a new or empty folder.",
+                target.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("checking {}", target.display())),
+    }
+    Ok(target)
+}
+
 /// [`write_project`] reusing the per-design projection memoized in `cache`
 /// by the previous write of this document, so a save after a small edit
 /// re-prints only the designs that changed.
@@ -1993,12 +2640,14 @@ fn git_init_if_needed(root: &Path) {
     if root.ancestors().any(|dir| dir.join(".git").exists()) {
         return;
     }
-    // No `-b`: the branch name is the user's `init.defaultBranch` to pick.
+    let git_binary = project_git_binary(std::env::current_exe().ok().as_deref());
+    // The macOS system Git can be an Xcode installation shim. Prefer the
+    // bundled binary so a designer can create history without developer tools.
     #[allow(
         clippy::disallowed_methods,
         reason = "write_project is sync and only ever runs on background_spawn"
     )]
-    let result = util::command::new_std_command("git")
+    let result = util::command::new_std_command(git_binary)
         .args(["init", "-q"])
         .current_dir(root)
         .output();
@@ -2012,6 +2661,14 @@ fn git_init_if_needed(root: &Path) {
         ),
         Err(error) => log::warn!("running git init in {} failed: {error}", root.display()),
     }
+}
+
+fn project_git_binary(executable: Option<&Path>) -> PathBuf {
+    executable
+        .and_then(Path::parent)
+        .map(|directory| directory.join(if cfg!(windows) { "git.exe" } else { "git" }))
+        .filter(|binary| binary.is_file())
+        .unwrap_or_else(|| PathBuf::from("git"))
 }
 
 /// Pick a directory for a new project next to the source `.fig` file:
@@ -2284,7 +2941,7 @@ pub(crate) fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> fanta_doc::Bo
         .unwrap_or_else(|| fanta_doc::Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
 }
 
-fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bounds> {
+pub(crate) fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bounds> {
     let mut bounds: Option<fanta_doc::Bounds> = None;
     let mut include = |node_id| {
         if let Some(node_bounds) = doc.scene.world_bounds(node_id)
@@ -2402,6 +3059,7 @@ fn page_image_assets(doc: &Doc, page_root: NodeId) -> Vec<AssetId> {
                     }
                 }
                 NodeData::Text(_)
+                | NodeData::TextPath(_)
                 | NodeData::Audio(_)
                 | NodeData::NodeGraph(_)
                 | NodeData::Model3d(_)
@@ -2491,6 +3149,20 @@ pub(crate) fn fit_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_git_prefers_the_app_bundle_without_depending_on_system_tools() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("fanta");
+        let git = directory
+            .path()
+            .join(if cfg!(windows) { "git.exe" } else { "git" });
+        assert_eq!(project_git_binary(Some(&executable)), PathBuf::from("git"));
+        std::fs::write(&git, b"bundled git")?;
+        assert_eq!(project_git_binary(Some(&executable)), git);
+        assert_eq!(project_git_binary(None), PathBuf::from("git"));
+        Ok(())
+    }
 
     #[test]
     fn a_page_prewarm_stops_once_the_document_that_owns_its_resolver_is_gone() {
@@ -2730,6 +3402,314 @@ mod tests {
             document.gpui_images.contains_key(&asset_id),
             "from_doc precomputes the GPUI thumbnail during the background load"
         );
+    }
+
+    fn prepared_video_fixture() -> Result<crate::generation_media::PreparedVideo> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([34, 197, 94, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(crate::generation_media::PreparedVideo {
+            bytes: Arc::from(&b"exact video source bytes"[..]),
+            metadata: crate::generation_media::VideoMetadata {
+                width: 180,
+                height: 320,
+                duration_us: 2_000_000,
+            },
+            poster: Some(crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: 100_000,
+            }),
+        })
+    }
+
+    #[test]
+    fn generated_video_poster_survives_undo_redo_save_and_reopen() -> Result<()> {
+        let (doc, page, _, _) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        document.doc.set_active_page(Some(page));
+        let prepared = prepared_video_fixture()?;
+        let expected_png = prepared
+            .poster
+            .as_ref()
+            .context("fixture poster")?
+            .png
+            .clone();
+        let expected_video = prepared.bytes.clone();
+        let provenance = serde_json::json!({"generation_id":"video-poster-fixture"});
+        let (result, change) = crate::generation_media::place_video(
+            &mut document,
+            prepared,
+            24.,
+            48.,
+            Some(provenance.clone()),
+        );
+        result?;
+        assert!(matches!(change, DocChange::Content));
+        let node_id = *document
+            .doc
+            .scene
+            .children_of(Some(page))
+            .last()
+            .context("video node")?;
+        let node = document
+            .doc
+            .scene
+            .get(node_id)
+            .context("placed video")?
+            .clone();
+        let fanta_doc::NodeData::Video(video) = &node.data else {
+            anyhow::bail!("video node expected");
+        };
+        let poster_id = video.poster.context("placed poster")?;
+        assert_eq!(video.natural_size, [180, 320]);
+        assert_eq!(video.local_size, [180., 320.]);
+        assert_eq!(video.poster_frame_us, Some(100_000));
+        assert_eq!(
+            node.transform,
+            fanta_doc::Transform2D::translation(24., 48.)
+        );
+        assert_eq!(node.meta, provenance);
+        let pixels = document
+            .asset_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(poster_id))
+            .context("poster resolves immediately")?;
+        assert_eq!((pixels.width, pixels.height), (2, 3));
+        assert_eq!(pixels.pixels_rgba.as_slice(), [34, 197, 94, 255].repeat(6));
+        assert!(document.gpui_images.contains_key(&poster_id));
+        assert!(document.doc.undo()?);
+        assert!(!document.doc.scene.contains(node_id));
+        assert!(document.doc.redo()?);
+        assert_eq!(document.doc.scene.get(node_id), Some(&node));
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &document.doc, &document.raw_assets)?;
+        let reopened = load_project_document(directory.path())?;
+        let restored = reopened.doc.scene.get(node_id).context("reopened video")?;
+        assert_eq!(restored.data, node.data);
+        assert_eq!(restored.transform, node.transform);
+        assert_eq!(restored.meta, provenance);
+        assert_eq!(
+            reopened
+                .raw_assets
+                .get(&video.asset)
+                .context("saved MP4")?
+                .as_slice(),
+            expected_video.as_ref()
+        );
+        assert_eq!(
+            reopened
+                .raw_assets
+                .get(&poster_id)
+                .context("saved PNG")?
+                .as_slice(),
+            expected_png.as_ref()
+        );
+        let restored_pixels = reopened
+            .asset_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(poster_id))
+            .context("reopened poster")?;
+        assert_eq!(restored_pixels.pixels_rgba, pixels.pixels_rgba);
+        Ok(())
+    }
+
+    fn video_trim_fixture() -> Result<(FigDocument, NodeId, fanta_doc::VideoNode)> {
+        let (doc, page, _, _) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        document.doc.set_active_page(Some(page));
+        let (result, _) = crate::generation_media::place_video(
+            &mut document,
+            prepared_video_fixture()?,
+            24.,
+            48.,
+            Some(serde_json::json!({"keep":"source metadata"})),
+        );
+        result?;
+        let id = *document
+            .doc
+            .scene
+            .children_of(Some(page))
+            .last()
+            .context("video")?;
+        let fanta_doc::NodeData::Video(video) = &document.doc.scene.get(id).context("video")?.data
+        else {
+            anyhow::bail!("video expected");
+        };
+        let video = video.clone();
+        Ok((document, id, video))
+    }
+
+    fn video_trim_prepared_fixture() -> Result<crate::generation_media::PreparedVideoTrim> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([225, 0, 225, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(crate::generation_media::PreparedVideoTrim {
+            range_us: [500_000, 1_500_000],
+            source_duration_us: 2_000_000,
+            poster: crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: 500_000,
+            },
+        })
+    }
+
+    #[test]
+    fn video_trim_range_and_poster_are_one_undo_step_and_survive_reopen() -> Result<()> {
+        let (mut document, id, video) = video_trim_fixture()?;
+        let original = document.doc.scene.get(id).context("original")?.clone();
+        let original_assets = document.raw_assets.clone();
+        let depth = document.doc.history.undo_depth();
+        let prepared = video_trim_prepared_fixture()?;
+        let expected_png = prepared.poster.png.clone();
+        let (result, change) =
+            crate::generation_media::trim_video(&mut document, id, &video, prepared);
+        result?;
+        assert!(matches!(change, DocChange::Content));
+        assert_eq!(document.doc.history.undo_depth(), depth + 1);
+        let edited = document.doc.scene.get(id).context("edited")?.clone();
+        let fanta_doc::NodeData::Video(trimmed) = &edited.data else {
+            anyhow::bail!("video expected")
+        };
+        assert_eq!(trimmed.time_range_us, [500_000, 1_500_000]);
+        assert_eq!(trimmed.poster_frame_us, Some(500_000));
+        assert_ne!(trimmed.poster, video.poster);
+        let mut expected_video = video.clone();
+        expected_video.time_range_us = trimmed.time_range_us;
+        expected_video.poster_frame_us = trimmed.poster_frame_us;
+        expected_video.poster = trimmed.poster;
+        assert_eq!(
+            trimmed, &expected_video,
+            "speed, audio, dimensions and original asset remain exact"
+        );
+        assert_eq!(edited.meta, original.meta);
+        assert_eq!(edited.transform, original.transform);
+        assert_eq!(
+            document.raw_assets.get(&video.asset),
+            original_assets.get(&video.asset)
+        );
+        let poster_id = trimmed.poster.context("trimmed poster")?;
+        assert!(document.doc.undo()?);
+        assert_eq!(document.doc.scene.get(id), Some(&original));
+        assert!(document.doc.redo()?);
+        assert_eq!(document.doc.scene.get(id), Some(&edited));
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &document.doc, &document.raw_assets)?;
+        let reopened = load_project_document(directory.path())?;
+        assert_eq!(reopened.doc.scene.get(id), Some(&edited));
+        assert_eq!(
+            reopened.raw_assets.get(&video.asset),
+            original_assets.get(&video.asset)
+        );
+        assert_eq!(
+            reopened
+                .raw_assets
+                .get(&poster_id)
+                .context("saved poster")?
+                .as_slice(),
+            expected_png.as_ref()
+        );
+        let pixels = reopened
+            .asset_resolver
+            .as_ref()
+            .and_then(|resolver| resolver.resolve(poster_id))
+            .context("reopened poster")?;
+        assert_eq!(pixels.pixels_rgba.as_slice(), [225, 0, 225, 255].repeat(6));
+        fanta_format::write_project_tree(directory.path(), &reopened.doc, &reopened.raw_assets)?;
+        let reopened_again = load_project_document(directory.path())?;
+        assert_eq!(reopened_again.doc.scene.get(id), Some(&edited));
+        assert_eq!(
+            reopened_again.raw_assets.get(&video.asset),
+            original_assets.get(&video.asset)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_trim_rejections_and_noop_preserve_assets_and_history() -> Result<()> {
+        for case in [
+            "range",
+            "poster-position",
+            "corrupt-poster",
+            "stale",
+            "speed",
+            "locked",
+            "noop",
+        ] {
+            let (mut document, id, mut expected) = video_trim_fixture()?;
+            let mut prepared = video_trim_prepared_fixture()?;
+            match case {
+                "range" => prepared.range_us = [500_000, 2_000_001],
+                "poster-position" => prepared.poster.time_us = 0,
+                "corrupt-poster" => prepared.poster.png = Arc::from(&b"not a PNG"[..]),
+                "stale" => expected.volume = 0.25,
+                "speed" => {
+                    expected.speed = 2.;
+                    document.doc.scene.get_mut(id).context("video")?.data =
+                        fanta_doc::NodeData::Video(expected.clone());
+                }
+                "locked" => document
+                    .doc
+                    .scene
+                    .get_mut(id)
+                    .context("video")?
+                    .flags
+                    .insert(fanta_doc::NodeFlags::LOCKED),
+                "noop" => {
+                    prepared.range_us = expected.time_range_us;
+                    prepared.poster.time_us = expected.time_range_us[0];
+                }
+                _ => unreachable!(),
+            }
+            let node = document.doc.scene.get(id).context("video")?.clone();
+            let assets = document.raw_assets.clone();
+            let depth = document.doc.history.undo_depth();
+            let (result, change) =
+                crate::generation_media::trim_video(&mut document, id, &expected, prepared);
+            assert_eq!(result.is_ok(), case == "noop", "{case}");
+            assert!(matches!(change, DocChange::None), "{case}");
+            assert_eq!(document.doc.scene.get(id), Some(&node), "{case}");
+            assert_eq!(document.raw_assets, assets, "{case}");
+            assert_eq!(document.doc.history.undo_depth(), depth, "{case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_video_placement_removes_poster_from_asset_stores() -> Result<()> {
+        let mut document = FigDocument::from_doc(Doc::new(), BTreeMap::new());
+        // A stale page registry forces insertion to fail after adding the poster.
+        document.doc.add_page(NodeId::new());
+        let (result, change) = crate::generation_media::place_video(
+            &mut document,
+            prepared_video_fixture()?,
+            0.,
+            0.,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(matches!(change, DocChange::None));
+        assert!(document.doc.scene.is_empty());
+        assert!(document.raw_assets.is_empty());
+        assert!(document.gpui_images.is_empty());
+        assert!(
+            document
+                .agent_asset_overlay
+                .as_ref()
+                .context("poster overlay")?
+                .added
+                .read()
+                .expect("overlay lock")
+                .is_empty()
+        );
+        Ok(())
     }
 
     /// Prewarming decodes what a page's first frame will draw. Images that
@@ -3028,6 +4008,866 @@ mod tests {
         Project::test(fs, roots, cx).await
     }
 
+    struct SaveGenerationFixture {
+        _directory: tempfile::TempDir,
+        root: PathBuf,
+        item: Entity<FigItem>,
+        view: Entity<crate::FigView>,
+        window: gpui::WindowHandle<gpui::Empty>,
+        page: NodeId,
+        text: NodeId,
+    }
+
+    async fn save_generation_fixture(cx: &mut TestAppContext) -> SaveGenerationFixture {
+        let project = empty_project(cx).await;
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+        });
+        let directory = tempfile::tempdir().expect("temporary save project");
+        let root = directory.path().join("Design");
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut text = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Text(
+            fanta_doc::TextNode::new("Before saving", 180.0, 30.0),
+        ));
+        text.parent = Some(page);
+        let text_id = text.id;
+        doc.apply(Operation::create_node(text))
+            .expect("create text");
+        write_project(&root, &doc, &BTreeMap::new()).expect("write initial project");
+        let item = ready_item(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let view = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| crate::FigView::new(item.clone(), project, window, cx))
+            })
+            .expect("create autosaving view");
+        SaveGenerationFixture {
+            _directory: directory,
+            root,
+            item,
+            view,
+            window,
+            page,
+            text: text_id,
+        }
+    }
+
+    fn pause_next_save(
+        item: &Entity<FigItem>,
+        cx: &mut TestAppContext,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        pause_next_save_at(item, false, cx)
+    }
+
+    fn pause_next_save_at(
+        item: &Entity<FigItem>,
+        after_write: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached, arrived) = futures::channel::oneshot::channel();
+        let (resume, wait) = futures::channel::oneshot::channel();
+        item.read_with(cx, |item, _| {
+            let previous = item
+                .project_writes
+                .next_save_barrier
+                .lock()
+                .expect("save test barrier")
+                .replace(SaveTestBarrier {
+                    reached,
+                    resume: wait,
+                    after_write,
+                });
+            assert!(previous.is_none(), "only one next-save barrier is armed");
+        });
+        (arrived, resume)
+    }
+
+    fn rename_saved_page(fixture: &SaveGenerationFixture, name: &str, cx: &mut TestAppContext) {
+        fixture.item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(fixture.page)
+                .expect("page")
+                .name
+                .clone();
+            item.apply(
+                Operation::SetName {
+                    id: fixture.page,
+                    old,
+                    new: name.into(),
+                },
+                cx,
+            )
+            .expect("rename page");
+        });
+    }
+
+    fn place_image_during_save(
+        fixture: &SaveGenerationFixture,
+        cx: &mut TestAppContext,
+    ) -> (NodeId, AssetId, Vec<u8>) {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([34, 197, 94, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode image");
+        let (node, asset) = fixture.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (doc, mut assets) = document.doc_and_assets();
+                let (asset, natural_size) = assets.add_image(bytes.clone()).expect("ingest image");
+                let mut bitmap = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Bitmap(
+                    fanta_doc::BitmapNode {
+                        asset,
+                        natural_size,
+                        local_size: [24.0, 24.0],
+                        crop: None,
+                        fit: fanta_doc::ImageFitMode::Fill,
+                        tint: None,
+                    },
+                ));
+                bitmap.parent = Some(fixture.page);
+                let node = bitmap.id;
+                doc.apply(Operation::create_node(bitmap))
+                    .expect("place image");
+                ((node, asset), DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        (node, asset, bytes)
+    }
+
+    async fn assert_save_generation_preserves_later_media(kind: SaveKind, cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let save = fixture.item.update(cx, |item, cx| item.save(kind, cx));
+        arrived.await.expect("save reached background writer");
+        rename_saved_page(&fixture, "Newer edit B", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        resume.send(()).expect("resume first save");
+        save.await.expect("first save succeeds");
+        cx.run_until_parked();
+
+        fixture.item.read_with(cx, |item, _| {
+            assert!(
+                item.is_dirty(),
+                "an older snapshot cannot mark newer edits clean"
+            );
+            assert_eq!(
+                item.merge_base
+                    .as_ref()
+                    .expect("saved merge base")
+                    .scene
+                    .get(fixture.page)
+                    .expect("saved page")
+                    .name,
+                "Snapshot A"
+            );
+            assert_eq!(
+                item.document().expect("document").raw_assets.get(&asset),
+                Some(&bytes)
+            );
+        });
+        let (first, first_assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("first save");
+        assert_eq!(
+            first.scene.get(fixture.page).expect("page").name,
+            "Snapshot A"
+        );
+        assert!(!first.scene.contains(node));
+        assert!(!first_assets.contains_key(&asset));
+
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(
+            !fixture.item.read_with(cx, |item, _| item.is_dirty()),
+            "the real view must autosave the remaining edit"
+        );
+        let (reopened, assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen autosaved project");
+        assert_eq!(
+            reopened.scene.get(fixture.page).expect("page").name,
+            "Newer edit B"
+        );
+        let fanta_doc::NodeData::Bitmap(bitmap) =
+            &reopened.scene.get(node).expect("new image node").data
+        else {
+            panic!("placed image must reopen as a bitmap");
+        };
+        assert_eq!(bitmap.asset, asset);
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        let reopened = FigDocument::from_doc(reopened, assets);
+        assert!(
+            reopened.gpui_images.contains_key(&asset),
+            "reopened image is decodable"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_generation_explicit_preserves_later_edits_and_image_assets(
+        cx: &mut TestAppContext,
+    ) {
+        assert_save_generation_preserves_later_media(SaveKind::Explicit, cx).await;
+    }
+
+    #[gpui::test]
+    async fn save_generation_auto_preserves_later_edits_and_image_assets(cx: &mut TestAppContext) {
+        assert_save_generation_preserves_later_media(SaveKind::Auto, cx).await;
+    }
+
+    #[gpui::test]
+    async fn save_generation_preserves_text_input_started_after_its_snapshot(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let save = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("save reached background writer");
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                fixture.view.update(cx, |view, cx| {
+                    view.open_text_edit(
+                        fixture.text,
+                        crate::view::TextEditSeed::SelectAll,
+                        window,
+                        cx,
+                    );
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view,
+                        None,
+                        "Typed during save",
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .expect("edit text while saving");
+        resume.send(()).expect("resume save");
+        save.await.expect("save completes");
+        cx.run_until_parked();
+        fixture.view.read_with(cx, |view, _| {
+            let edit = view
+                .text_edit
+                .as_ref()
+                .expect("saving must not discard a newer text session");
+            assert_eq!(edit.session.buffer(), "Typed during save");
+        });
+        fixture
+            .view
+            .update(cx, |view, cx| view.commit_text_edit(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let (reopened, _) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen committed text");
+        assert_eq!(
+            reopened
+                .scene
+                .get(fixture.text)
+                .expect("text node")
+                .data
+                .as_text()
+                .expect("text")
+                .content,
+            "Typed during save"
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn save_generation_serializes_writers_and_rearms_newer_edits(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("first writer paused");
+        rename_saved_page(&fixture, "Snapshot B", cx);
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+        cx.run_until_parked();
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "overlapping saves must not write the same tree concurrently"
+        );
+        let (before, _) = fanta_format::read_project_tree(&fixture.root).expect("original tree");
+        assert_eq!(before.scene.get(fixture.page).expect("page").name, "Page 1");
+        rename_saved_page(&fixture, "Current edit C", cx);
+        resume.send(()).expect("release first writer");
+        first.await.expect("first save");
+        second.await.expect("second save");
+        cx.run_until_parked();
+        fixture.item.read_with(cx, |item, _| {
+            assert!(item.is_dirty(), "neither snapshot contains C");
+            assert_eq!(
+                item.merge_base
+                    .as_ref()
+                    .expect("base")
+                    .scene
+                    .get(fixture.page)
+                    .expect("page")
+                    .name,
+                "Snapshot B"
+            );
+        });
+        let (saved, _) = fanta_format::read_project_tree(&fixture.root).expect("second tree");
+        assert_eq!(
+            saved.scene.get(fixture.page).expect("page").name,
+            "Snapshot B"
+        );
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let (current, _) =
+            fanta_format::read_project_tree(&fixture.root).expect("current autosave");
+        assert_eq!(
+            current.scene.get(fixture.page).expect("page").name,
+            "Current edit C"
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn save_generation_queue_preserves_capture_order_when_polled_backwards(
+        _cx: &mut TestAppContext,
+    ) {
+        let writes = Arc::new(ProjectWrites::default());
+        let first = writes.begin();
+        let second = writes.begin();
+        let mut second_turn = Box::pin(second.wait_for_turn());
+        assert!(futures::poll!(&mut second_turn).is_pending());
+        first.wait_for_turn().await;
+        assert!(futures::poll!(&mut second_turn).is_pending());
+        drop(first);
+        second_turn.await;
+        drop(second);
+        let state = writes.state.lock().expect("write state");
+        assert_eq!(state.active, 0);
+        assert!(
+            state.last_write.is_none(),
+            "completed chains must not accumulate"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_generation_rechecks_source_lock_before_a_queued_write(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("first writer paused");
+        rename_saved_page(&fixture, "Newer edit B", cx);
+        let second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        fixture
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        resume.send(()).expect("release already started writer");
+        first.await.expect("first save");
+        let error = second
+            .await
+            .expect_err("queued canvas write must respect the new source lock");
+        assert!(error.to_string().contains("FNX source is dirty"));
+        let (saved, _) = fanta_format::read_project_tree(&fixture.root).expect("saved tree");
+        assert_eq!(
+            saved.scene.get(fixture.page).expect("page").name,
+            "Snapshot A"
+        );
+        assert!(fixture.item.read_with(cx, |item, _| item.is_dirty()));
+        fixture
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save after source lock released");
+        let (saved, _) = fanta_format::read_project_tree(&fixture.root).expect("current tree");
+        assert_eq!(
+            saved.scene.get(fixture.page).expect("page").name,
+            "Newer edit B"
+        );
+    }
+
+    #[gpui::test]
+    async fn save_generation_queue_waits_for_a_canceled_predecessors_worker(
+        _cx: &mut TestAppContext,
+    ) {
+        let writes = Arc::new(ProjectWrites::default());
+        let foreground = writes.begin();
+        let background = foreground.clone();
+        let canceled_queued = writes.begin();
+        let surviving = writes.begin();
+        let mut turn = Box::pin(surviving.wait_for_turn());
+        drop(foreground);
+        drop(canceled_queued);
+        assert!(
+            futures::poll!(&mut turn).is_pending(),
+            "canceling the middle save cannot bypass the first writer"
+        );
+        assert!(writes.suppresses_watcher(Instant::now() + Duration::from_secs(120)));
+        drop(background);
+        turn.await;
+        drop(surviving);
+        let state = writes.state.lock().expect("write state");
+        assert_eq!(state.active, 0);
+        assert!(state.last_write.is_none());
+    }
+
+    #[gpui::test]
+    async fn save_generation_overlapping_materialization_reuses_the_adopted_root(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        let source = fixture._directory.path().join("Imported.fig");
+        let root = fixture._directory.path().join("Imported");
+        let source_bytes = b"untouched original import";
+        std::fs::write(&source, source_bytes).expect("original source");
+        fixture.item.update(cx, |item, _| {
+            item.project_root = None;
+            item.abs_path = source.clone();
+        });
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save_at(&fixture.item, true, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived
+            .await
+            .expect("project written, adoption still paused");
+        assert!(fanta_format::is_project_dir(&root));
+        assert!(
+            fixture
+                .item
+                .read_with(cx, |item, _| item.project_root().is_none())
+        );
+        rename_saved_page(&fixture, "Newer edit B", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.run_until_parked();
+        assert!(
+            futures::poll!(&mut second).is_pending(),
+            "the second save must wait for adoption of the first root"
+        );
+        resume.send(()).expect("finish materialization");
+        assert_eq!(first.await.expect("first save"), Some(root.clone()));
+        assert_eq!(second.await.expect("second save"), None);
+        cx.run_until_parked();
+        assert_eq!(
+            fixture
+                .item
+                .read_with(cx, |item, _| item.project_root().map(Path::to_path_buf)),
+            Some(root.clone())
+        );
+        let (reopened, assets) =
+            fanta_format::read_project_tree(&root).expect("reopen adopted root");
+        assert_eq!(
+            reopened.scene.get(fixture.page).expect("page").name,
+            "Newer edit B"
+        );
+        assert!(reopened.scene.contains(node));
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        assert_eq!(
+            std::fs::read(&source).expect("original source"),
+            source_bytes
+        );
+        assert!(!fixture._directory.path().join("Imported-2").exists());
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn save_generation_canceled_materialization_refuses_to_overwrite_external_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        let source = fixture._directory.path().join("Imported.fig");
+        let root = fixture._directory.path().join("Imported");
+        let source_bytes = b"untouched original import";
+        std::fs::write(&source, source_bytes).expect("original source");
+        fixture.item.update(cx, |item, _| {
+            item.project_root = None;
+            item.abs_path = source.clone();
+        });
+        rename_saved_page(&fixture, "Snapshot A", cx);
+        let (arrived, resume) = pause_next_save_at(&fixture.item, true, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("write completed before cancellation");
+        rename_saved_page(&fixture, "Unsaved edit B", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        drop(first);
+        // The worker may already have observed cancellation; either outcome
+        // releases the test gate without letting its foreground adopt the root.
+        match resume.send(()) {
+            Ok(()) | Err(()) => {}
+        }
+        cx.run_until_parked();
+        let (mut external, assets) =
+            fanta_format::read_project_tree(&root).expect("completed tree");
+        external
+            .apply(Operation::SetName {
+                id: fixture.page,
+                old: "Snapshot A".into(),
+                new: "External edit".into(),
+            })
+            .expect("external edit");
+        write_project(&root, &external, &assets).expect("write external edit");
+        let error = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect_err("do not adopt an unverified foreign tree");
+        assert!(error.to_string().contains("already exists"));
+        fixture.item.read_with(cx, |item, _| {
+            assert!(item.is_dirty());
+            assert!(item.project_root().is_none());
+            assert!(item.doc().expect("document").scene.contains(node));
+            assert_eq!(
+                item.document().expect("document").raw_assets.get(&asset),
+                Some(&bytes)
+            );
+        });
+        let (unchanged, _) =
+            fanta_format::read_project_tree(&root).expect("external tree preserved");
+        assert_eq!(
+            unchanged.scene.get(fixture.page).expect("page").name,
+            "External edit"
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("original source"),
+            source_bytes
+        );
+    }
+
+    #[gpui::test]
+    async fn save_as_preserves_original_edits_assets_and_subsequent_destination(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let document = doc_with_one_page();
+            let page = document.active_page().context("active page")?;
+            write_project(&original, &document, &BTreeMap::new())?;
+            let original_source =
+                fanta_format::locate_page_source(&original, page).context("page source")?;
+            let original_bytes = std::fs::read(&original_source)?;
+            let original_manifest = std::fs::read(original.join("fanta.json"))?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("worktree")
+                    .read(cx)
+                    .id()
+            });
+            let item = ready_item(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let original_key = original.canonicalize()?;
+            cx.update(|cx| register_shared_project_item(original_key.clone(), &item, cx));
+            let asset = AssetId::new();
+            let bytes = b"encoded asset copied without conversion".to_vec();
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.clone());
+                    ((), DocChange::Content)
+                });
+                item.apply(
+                    Operation::SetName {
+                        id: page,
+                        old: "Page 1".into(),
+                        new: "Current edits".into(),
+                    },
+                    cx,
+                )
+            })?;
+            let destination = ProjectPath {
+                worktree_id,
+                path: util::rel_path::rel_path("Copy").into(),
+            };
+            let save_as = item.update(cx, |item, cx| {
+                item.save_as(project.clone(), destination, cx)
+            });
+            let preview_owner = cx.new(|_| ()).entity_id();
+            let preview_started = item.update(cx, |item, cx| {
+                item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                    ((), DocChange::ContentPreview)
+                })
+                .is_some()
+            });
+            assert!(
+                !preview_started && !item.read_with(cx, |item, _| item.content_preview_active()),
+                "Save As must not let a transient preview outlive its destination snapshot"
+            );
+            // Edits while the snapshot is being written must remain dirty and
+            // must never be autosaved back to the old project during the copy.
+            item.update(cx, |item, cx| {
+                item.apply(
+                    Operation::SetName {
+                        id: page,
+                        old: "Current edits".into(),
+                        new: "Edited during copy".into(),
+                    },
+                    cx,
+                )
+            })?;
+            assert!(
+                item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+                    .await?
+                    .is_none()
+            );
+            save_as.await?;
+            let (copied_document, copied_assets) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(
+                copied_document.scene.get(page).context("copied page")?.name,
+                "Current edits"
+            );
+            assert_eq!(copied_assets.get(&asset), Some(&bytes));
+            assert_eq!(std::fs::read(&original_source)?, original_bytes);
+            assert_eq!(
+                std::fs::read(original.join("fanta.json"))?,
+                original_manifest
+            );
+            item.read_with(cx, |item, cx| {
+                assert!(
+                    item.is_dirty(),
+                    "the newer edit is not part of the copied snapshot"
+                );
+                assert_eq!(item.project_root(), Some(copy.as_path()));
+                assert_eq!(item.abs_path(), copy.join("fanta.json"));
+                assert_eq!(
+                    project.read(cx).absolute_path(&item.path, cx),
+                    Some(copy.join("fanta.json"))
+                );
+                assert_eq!(item.title().as_ref(), "Copy");
+            });
+            cx.update(|cx| {
+                assert!(shared_project_item(&original_key, cx).is_none());
+                assert_eq!(
+                    shared_project_item(&copy.canonicalize().expect("saved copy"), cx)
+                        .map(|item| item.entity_id()),
+                    Some(item.entity_id())
+                );
+            });
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await?;
+            let (saved_again, saved_assets) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(
+                saved_again.scene.get(page).context("saved page")?.name,
+                "Edited during copy"
+            );
+            assert_eq!(saved_assets.get(&asset), Some(&bytes));
+            assert_eq!(std::fs::read(&original_source)?, original_bytes);
+            assert_eq!(
+                std::fs::read(original.join("fanta.json"))?,
+                original_manifest
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            Ok(())
+        }
+        .await;
+        result.expect(
+            "Save As preserves the original, copies edits/assets and retargets subsequent saves",
+        );
+    }
+
+    #[gpui::test]
+    async fn save_as_rejects_existing_content_without_retargeting(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let occupied = directory.path().join("Occupied");
+            let document = doc_with_one_page();
+            write_project(&original, &document, &BTreeMap::new())?;
+            std::fs::create_dir(&occupied)?;
+            std::fs::write(occupied.join("keep.txt"), "keep this file")?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {}, "Occupied": {}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .expect("worktree")
+                    .read(cx)
+                    .id()
+            });
+            let item = ready_item(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, _| item.dirty = true);
+            let destination = ProjectPath {
+                worktree_id,
+                path: util::rel_path::rel_path("Occupied").into(),
+            };
+            let result = item
+                .update(cx, |item, cx| {
+                    item.save_as(project.clone(), destination, cx)
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(occupied.join("keep.txt"))?,
+                "keep this file"
+            );
+            assert!(!occupied.join("fanta.json").exists());
+            item.read_with(cx, |item, _| {
+                assert_eq!(item.project_root(), Some(original.as_path()));
+                assert_eq!(item.abs_path(), original.join("fanta.json"));
+                assert!(item.is_dirty());
+                assert!(!item.project_writes.changing_destination());
+            });
+            Ok(())
+        }
+        .await;
+        result.expect("a failed Save As preserves the occupied destination and current design");
+    }
+
+    #[test]
+    fn save_as_recovers_when_original_folder_is_missing() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let original = directory.path().join("Original");
+        let copy = directory.path().join("Recovered");
+        let document = doc_with_one_page();
+        let page = document.active_page().context("active page")?;
+        write_project(&original, &document, &BTreeMap::new())?;
+        std::fs::remove_dir_all(&original)?;
+        write_project_copy(&copy, Some(&original), &document, &BTreeMap::new())?;
+        let (recovered, _) = fanta_format::read_project_tree(&copy)?;
+        assert!(recovered.scene.contains(page));
+        assert!(
+            !original.exists(),
+            "recovery must not recreate the original folder"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn save_as_rejects_nested_and_aliased_destinations() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let original = directory.path().join("Original");
+        let document = doc_with_one_page();
+        write_project(&original, &document, &BTreeMap::new())?;
+        assert!(
+            write_project_copy(&original, Some(&original), &document, &BTreeMap::new()).is_err()
+        );
+        assert!(
+            write_project_copy(
+                &original.join("Nested"),
+                Some(&original),
+                &document,
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(!original.join("Nested").exists());
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("Alias");
+            std::os::unix::fs::symlink(&original, &alias)?;
+            assert!(
+                write_project_copy(&alias, Some(&original), &document, &BTreeMap::new()).is_err()
+            );
+            assert!(
+                write_project_copy(
+                    &alias.join("Nested"),
+                    Some(&original),
+                    &document,
+                    &BTreeMap::new()
+                )
+                .is_err()
+            );
+        }
+        let empty = directory.path().join("Empty");
+        std::fs::create_dir(&empty)?;
+        write_project_copy(&empty, Some(&original), &document, &BTreeMap::new())?;
+        assert!(empty.join("fanta.json").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn save_as_write_lease_survives_foreground_cancellation() -> Result<()> {
+        let writes = Arc::new(ProjectWrites::default());
+        let save = writes.begin();
+        assert!(writes.begin_destination_change().is_err());
+        drop(save);
+        let foreground = writes.begin_destination_change()?;
+        let background = foreground.clone();
+        assert!(writes.changing_destination());
+        drop(foreground);
+        assert!(writes.changing_destination());
+        assert!(writes.begin_destination_change().is_err());
+        drop(background);
+        assert!(!writes.changing_destination());
+        assert!(writes.begin_destination_change().is_ok());
+        Ok(())
+    }
+
     /// A document with a single (empty) page, so a save writes a `pages/<id>/`
     /// subtree instead of pruning the empty `pages/` directory.
     fn doc_with_one_page() -> Doc {
@@ -3059,8 +4899,8 @@ mod tests {
         assert!(document.doc.active_page().is_some());
     }
 
-    /// An already-set active page (e.g. carried by a `.fig` import) wins over
-    /// the default.
+    /// An already-set visible active page (e.g. carried by a `.fig` import)
+    /// wins over the default.
     #[test]
     fn from_doc_keeps_an_existing_active_page() {
         use fanta_doc::{CanvasNode, GroupNode, NodeData};
@@ -3076,9 +4916,244 @@ mod tests {
         assert_eq!(document.doc.active_page(), Some(second_root));
     }
 
+    #[test]
+    fn from_doc_replaces_an_imported_hidden_active_page_with_the_visible_default() -> Result<()> {
+        use fanta_doc::{CanvasNode, Color, Fill, GroupNode, NodeData, NodeFlags, VectorNode};
+
+        let mut doc = Doc::new();
+        let mut hidden_page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        hidden_page.name = "Internal Only Canvas".to_owned();
+        hidden_page.flags.insert(NodeFlags::HIDDEN);
+        hidden_page.meta = serde_json::json!({"hidden_page": true});
+        let hidden_root = hidden_page.id;
+        doc.apply(Operation::create_node(hidden_page))?;
+        doc.add_page(hidden_root);
+
+        let mut visible_page = CanvasNode::new(NodeData::Group(GroupNode {
+            background: Some(Fill::solid(Color::WHITE)),
+            ..GroupNode::default()
+        }));
+        visible_page.name = "Design".to_owned();
+        let visible_root = visible_page.id;
+        doc.apply(Operation::create_node(visible_page))?;
+        doc.add_page(visible_root);
+        assert_eq!(doc.active_page(), Some(hidden_root));
+
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(document.doc.active_page(), Some(visible_root));
+        assert_eq!(
+            document.page(None).and_then(|page| page.root),
+            Some(visible_root)
+        );
+        assert!(
+            document
+                .pages
+                .iter()
+                .any(|page| page.root == Some(hidden_root) && page.hidden)
+        );
+        assert!(
+            document
+                .doc
+                .scene
+                .get(hidden_root)
+                .is_some_and(|node| node.flags.contains(NodeFlags::HIDDEN))
+        );
+
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -10.0,
+            -10.0,
+            20.0,
+            20.0,
+            Color::rgb(34, 197, 94),
+        )));
+        rectangle.parent = document.doc.active_page();
+        document.doc.apply(Operation::create_node(rectangle))?;
+        let mut renderer = fanta_render::RasterRenderer::new(64, 64)?;
+        renderer.render_page(
+            &document.doc.scene,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            document.doc.active_page(),
+        );
+        let pixels = renderer.copy_rgba();
+        assert_eq!(pixels.get(..4), Some([255, 255, 255, 255].as_slice()));
+        let center = (32 * 64 + 32) * 4;
+        assert_eq!(
+            pixels.get(center..center + 4),
+            Some([34, 197, 94, 255].as_slice())
+        );
+        Ok(())
+    }
+
     /// The load that materializes a bare `.fig` hands the item both the
     /// adopted root and the materializing write's memo; without the memo the
     /// first autosave starts cold and re-prints every page.
+    #[gpui::test]
+    async fn a_save_suppresses_its_watcher_after_the_initial_deadline_expires(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("Design");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&root, serde_json::json!({"fanta.json":"{}"}))
+            .await;
+        let project = Project::test(fs, [root.as_path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let item = ready_item(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(root),
+            doc_with_one_page(),
+            cx,
+        );
+        let changes: UpdatedEntriesSet = vec![(
+            util::rel_path::rel_path("pages/page-1/page.fnx").into(),
+            ProjectEntryId::from_proto(1),
+            PathChange::Updated,
+        )]
+        .into();
+        let save = item.update(cx, |item, cx| {
+            item.dirty = true;
+            let save = item.save(SaveKind::Explicit, cx);
+            // Model a writer still running after the old one-second deadline.
+            // Wall-clock Instant does not follow the GPUI test clock.
+            item.suppress_watcher_until = Some(Instant::now() - Duration::from_secs(2));
+            item.worktree_entries_updated(&project, worktree_id, &changes, cx);
+            assert!(
+                item.reload_task.is_none(),
+                "our own save must not start a reload or merge"
+            );
+            assert!(
+                !item.has_conflict(),
+                "our own save must not be treated as an external edit"
+            );
+            assert!(
+                item.project_writes
+                    .suppresses_watcher(Instant::now() + Duration::from_secs(2))
+            );
+            save
+        });
+        save.await.expect("save completes");
+        item.update(cx, |item, cx| {
+            assert_eq!(
+                item.project_writes
+                    .state
+                    .lock()
+                    .expect("write state")
+                    .active,
+                0
+            );
+            assert!(
+                item.project_writes.suppresses_watcher(Instant::now()),
+                "completion keeps the delivery cooldown"
+            );
+            item.suppress_watcher_until = None;
+            item.project_writes
+                .state
+                .lock()
+                .expect("write state")
+                .quiet_until = Some(Instant::now() - Duration::from_secs(1));
+            item.worktree_entries_updated(&project, worktree_id, &changes, cx);
+            assert!(
+                item.reload_task.is_some(),
+                "external edits still reload after the cooldown"
+            );
+            item.reload_task = None;
+        });
+    }
+
+    #[test]
+    fn write_leases_cover_cancellation_overlaps_and_background_completion() {
+        let writes = Arc::new(ProjectWrites::default());
+        let foreground = writes.begin();
+        let worker = foreground.clone();
+        let overlapping = writes.begin();
+        drop(foreground);
+        drop(overlapping);
+        assert!(
+            writes.suppresses_watcher(Instant::now() + Duration::from_secs(120)),
+            "a canceled foreground must not unprotect its still-running writer"
+        );
+        drop(worker);
+        assert!(!writes.suppresses_watcher(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW * 2));
+        assert!(
+            writes.suppresses_watcher(Instant::now()),
+            "even canceled writes get a completion cooldown"
+        );
+    }
+
+    #[gpui::test]
+    async fn failed_and_canceled_saves_release_their_write_leases(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("not-a-directory");
+        std::fs::write(&root, b"occupied").expect("block project directory creation");
+        let item = ready_item(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(root),
+            doc_with_one_page(),
+            cx,
+        );
+        let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        assert!(save.await.is_err());
+        let writes = item.read_with(cx, |item, _| item.project_writes.clone());
+        assert_eq!(
+            writes.state.lock().expect("write state").active,
+            0,
+            "a failed writer releases its lease"
+        );
+        let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        let overlapping = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        drop(save);
+        cx.run_until_parked();
+        drop(overlapping);
+        cx.run_until_parked();
+        assert_eq!(
+            writes.state.lock().expect("write state").active,
+            0,
+            "canceling queued or completed saves releases every lease"
+        );
+    }
+
+    #[gpui::test]
+    async fn closing_an_item_does_not_retain_its_document_entity_for_a_save(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let item = ready_item(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(directory.path().join("Design")),
+            doc_with_one_page(),
+            cx,
+        );
+        let weak_item = item.downgrade();
+        let writes = item.read_with(cx, |item, _| item.project_writes.clone());
+        let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.update(|_| drop(item));
+        assert!(
+            weak_item.upgrade().is_none(),
+            "the save captures a weak document entity"
+        );
+        assert!(
+            save.await.is_err(),
+            "the completed write cannot update a closed document"
+        );
+        assert_eq!(writes.state.lock().expect("write state").active, 0);
+    }
+
     #[gpui::test]
     async fn the_initial_load_adopts_the_materialized_root_and_its_write_cache(
         cx: &mut TestAppContext,
@@ -3161,10 +5236,12 @@ mod tests {
             document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
             project_root,
             dirty: false,
-            preview_dirty_before: None,
+            content_preview: None,
+            external_change_pending: false,
             conflict: false,
             source_edit_locked: false,
             suppress_watcher_until: None,
+            project_writes: Arc::default(),
             merge_base: None,
             pending_scope: None,
             last_scope: None,
@@ -3388,6 +5465,7 @@ mod tests {
     #[gpui::test]
     async fn render_generation_tracks_content_but_not_selection_changes(cx: &mut TestAppContext) {
         let project = empty_project(cx).await;
+        let preview_owner = cx.new(|_| ()).entity_id();
         let item = ready_item(
             &project,
             PathBuf::from("/tmp/nowhere/Design.fig"),
@@ -3414,7 +5492,9 @@ mod tests {
             0
         );
         item.update(cx, |item, cx| {
-            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+            item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                ((), DocChange::ContentPreview)
+            });
         });
         assert_eq!(
             item.read_with(cx, |item, _| item
@@ -3424,7 +5504,7 @@ mod tests {
             1
         );
         item.update(cx, |item, cx| {
-            item.with_document(cx, |_| ((), DocChange::Content));
+            item.with_document_for_owner(preview_owner, cx, |_| ((), DocChange::Content));
         });
         assert_eq!(
             item.read_with(cx, |item, _| item
@@ -3438,6 +5518,7 @@ mod tests {
     #[gpui::test]
     async fn canceling_a_content_preview_restores_the_prior_dirty_state(cx: &mut TestAppContext) {
         let project = empty_project(cx).await;
+        let preview_owner = cx.new(|_| ()).entity_id();
         let item = ready_item(
             &project,
             PathBuf::from("/tmp/nowhere/Design.fig"),
@@ -3447,16 +5528,228 @@ mod tests {
         );
 
         item.update(cx, |item, cx| {
-            item.with_document(cx, |_| ((), DocChange::ContentPreview));
+            item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                ((), DocChange::ContentPreview)
+            });
             assert!(item.dirty);
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
             assert!(!item.dirty);
 
             item.with_document(cx, |_| ((), DocChange::Content));
             assert!(item.dirty);
-            item.with_document(cx, |_| ((), DocChange::ContentPreview));
-            item.finish_content_preview(false, cx);
+            item.with_document_for_preview_owner(preview_owner, cx, |_| {
+                ((), DocChange::ContentPreview)
+            });
+            item.finish_content_preview(preview_owner, false, cx);
             assert!(item.dirty);
+        });
+    }
+
+    #[gpui::test]
+    async fn content_preview_owner_serializes_shared_item_mutations(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let owner = cx.new(|_| ()).entity_id();
+        let sibling = cx.new(|_| ()).entity_id();
+        let document = doc_with_one_page();
+        let page = document.active_page().expect("active page");
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            document,
+            cx,
+        );
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Transient".to_owned();
+                ((), DocChange::ContentPreview)
+            })
+            .expect("owner starts preview");
+
+            let sibling_preview = item.with_document_for_preview_owner(sibling, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Sibling preview".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+            assert!(sibling_preview.is_none());
+            assert!(
+                item.apply_for_preview_owner(
+                    sibling,
+                    Operation::SetName {
+                        id: page,
+                        old: "Transient".to_owned(),
+                        new: "Sibling commit".to_owned(),
+                    },
+                    cx,
+                )
+                .is_err()
+            );
+            assert!(!item.finish_content_preview(sibling, true, cx));
+            assert!(item.content_preview_active());
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Transient"
+            );
+
+            item.with_document_for_preview_owner(owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Page 1".to_owned();
+                ((), DocChange::ContentPreview)
+            })
+            .expect("owner restores preview");
+            assert!(item.finish_content_preview(owner, false, cx));
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn explicit_reload_rejects_an_active_content_preview(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let owner = cx.new(|_| ()).entity_id();
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/nowhere/Design.fig"),
+            None,
+            doc_with_one_page(),
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(owner, cx, |_| ((), DocChange::ContentPreview));
+        });
+
+        let result = item.update(cx, |item, cx| item.reload_from_disk(cx)).await;
+        assert!(result.is_err());
+        item.update(cx, |item, cx| {
+            assert!(item.finish_content_preview(owner, false, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn external_merge_waits_for_content_preview_to_finish(cx: &mut TestAppContext) {
+        use fanta_doc::{CanvasNode, Color, NodeData, VectorNode};
+
+        let project = empty_project(cx).await;
+        let preview_owner = cx.new(|_| ()).entity_id();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("Design");
+        let base = doc_with_one_page();
+        let page = base.active_page().expect("active page");
+        write_project(&root, &base, &BTreeMap::new()).expect("write baseline project");
+        let item = ready_item(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            base.clone(),
+            cx,
+        );
+        item.update(cx, |item, _| item.merge_base = Some(base.clone()));
+
+        let local = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    20.0,
+                    20.0,
+                    Color::BLACK,
+                )));
+                rectangle.name = "Local".to_owned();
+                rectangle.parent = Some(page);
+                let id = rectangle.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(rectangle))
+                    .expect("create local rectangle");
+                (id, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+
+        let mut external = base;
+        external
+            .apply(Operation::SetName {
+                id: page,
+                old: "Page 1".to_owned(),
+                new: "External".to_owned(),
+            })
+            .expect("rename page externally");
+        write_project(&root, &external, &BTreeMap::new()).expect("write external edit");
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(local)
+                    .expect("local rectangle")
+                    .name = "Transient".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+            item.schedule_merge(cx);
+            assert!(item.external_change_pending);
+            assert!(item.reload_task.is_none());
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(page).expect("page").name, "Page 1");
+            assert_eq!(
+                doc.scene.get(local).expect("local rectangle").name,
+                "Transient"
+            );
+        });
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_owner(preview_owner, cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(local)
+                    .expect("local rectangle")
+                    .name = "Committed local".to_owned();
+                ((), DocChange::Content)
+            });
+            item.finish_content_preview(preview_owner, true, cx);
+            assert!(item.external_change_pending);
+            assert!(item.reload_task.is_some());
+        });
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+                .await
+                .expect("pending autosave guard")
+                .is_none()
+        );
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .is_err(),
+            "an explicit save must not overwrite deferred external edits"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.external_change_pending);
+            assert!(item.reload_task.is_some());
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("merged document");
+            assert_eq!(doc.scene.get(page).expect("page").name, "External");
+            assert_eq!(
+                doc.scene.get(local).expect("local rectangle").name,
+                "Committed local"
+            );
+            assert!(item.is_dirty(), "the local half of the merge is unsaved");
+            assert!(!item.content_preview_active());
+            assert!(!item.external_change_pending);
         });
     }
 

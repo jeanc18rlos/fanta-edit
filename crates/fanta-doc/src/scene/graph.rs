@@ -16,6 +16,7 @@ use crate::transform::{Bounds, Transform2D};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 // =============================================================================
 // Change log
@@ -75,9 +76,10 @@ pub const SCENE_DELTA_MAX_NODES: usize = 2048;
 
 /// The scene graph. Owns nodes; offers traversal, ordering, and queries.
 ///
-/// `Scene` is `Clone` for cheap snapshotting in `fanta-doc::history`. The clone
-/// is O(n) in the node count — fine for design docs (single-digit ms at 10k
-/// nodes), and the history layer keeps deltas, not snapshots, on the hot path.
+/// Snapshots share unchanged nodes, copying a node only when it is edited.
+/// Cloning is O(n) in the node count, independent of the size of vector paths
+/// and other node payloads. This keeps render and save snapshots from each
+/// duplicating an imported document's geometry.
 /// `Clone` is implemented by hand (not derived) so a clone mints a fresh
 /// [`Scene::instance_id`] — see that field's docs for why two scene instances
 /// must never share one.
@@ -87,7 +89,7 @@ pub const SCENE_DELTA_MAX_NODES: usize = 2048;
 /// API — they were never part of it. External callers go through the methods.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Scene {
-    pub(crate) nodes: IdHashMap<NodeId, CanvasNode>,
+    pub(crate) nodes: IdHashMap<NodeId, Arc<CanvasNode>>,
     /// Children of each parent, sorted by `IndexKey`. `None` key holds root
     /// children. Maintained on every insert / remove / reparent / reorder.
     #[serde(skip)]
@@ -324,7 +326,7 @@ impl Scene {
     // ---- get -----------------------------------------------------------------
 
     pub fn get(&self, id: NodeId) -> Option<&CanvasNode> {
-        self.nodes.get(&id)
+        self.nodes.get(&id).map(Arc::as_ref)
     }
 
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut CanvasNode> {
@@ -349,7 +351,7 @@ impl Scene {
         self.clear_derived_caches();
         self.record_change(SceneChange::Node(id));
         self.touch_stamp(id);
-        self.nodes.get_mut(&id)
+        self.nodes.get_mut(&id).map(Arc::make_mut)
     }
 
     /// Replace `id`'s node with `node` — a copy's way of taking over an edit
@@ -372,7 +374,7 @@ impl Scene {
                 "patch_node {id}: parent or z-index differs from the stored node"
             )));
         }
-        self.nodes.insert(id, node);
+        self.nodes.insert(id, Arc::new(node));
         self.invalidate_node_edit(id);
         self.record_change(SceneChange::Node(id));
         self.node_stamps.insert(id, stamp);
@@ -403,7 +405,7 @@ impl Scene {
         let id = node.id;
         let parent_key = node.parent;
         let index = node.index;
-        self.nodes.insert(id, node);
+        self.nodes.insert(id, Arc::new(node));
         self.child_index_insert(parent_key, id, index);
         self.clear_derived_caches();
         self.record_change(SceneChange::Structural);
@@ -452,7 +454,7 @@ impl Scene {
                 continue;
             };
             let parent_node = match self.nodes.get(&parent) {
-                Some(existing) => existing,
+                Some(existing) => existing.as_ref(),
                 None => batch_position
                     .get(&parent)
                     .and_then(|position| batch.get(*position))
@@ -469,7 +471,7 @@ impl Scene {
         for node in batch {
             let id = node.id;
             new_children.entry(node.parent).or_default().push(id);
-            self.nodes.insert(id, node);
+            self.nodes.insert(id, Arc::new(node));
             inserted.push(id);
         }
         let mut touched_parents = Vec::with_capacity(new_children.len());
@@ -562,7 +564,7 @@ impl Scene {
                 self.child_index_remove(removed.parent, d);
                 self.node_stamps.remove(&d);
                 if d == id {
-                    root_removed = Some(removed);
+                    root_removed = Some(Arc::unwrap_or_clone(removed));
                 }
             }
         }
@@ -613,7 +615,11 @@ impl Scene {
         // with.
         let old_parent = self.nodes.get(&id).expect("just checked").parent;
         self.child_index_remove(old_parent, id);
-        let node = self.nodes.get_mut(&id).expect("just checked");
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .map(Arc::make_mut)
+            .ok_or(SceneError::NotFound(id))?;
         node.parent = new_parent;
         node.index = new_index;
         self.child_index_insert(new_parent, id, new_index);
@@ -637,7 +643,11 @@ impl Scene {
             (node.parent, node.index)
         };
         self.child_index_remove(parent, id);
-        let node = self.nodes.get_mut(&id).expect("just checked");
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .map(Arc::make_mut)
+            .ok_or(SceneError::NotFound(id))?;
         node.index = new_index;
         self.child_index_insert(parent, id, new_index);
         // Z-order does not affect world transforms, but `set_index` shares the
@@ -896,7 +906,11 @@ impl Scene {
         let in_boolean = self
             .ancestors_of(id)
             .any(|ancestor| matches!(ancestor.data, crate::node::NodeData::Boolean(_)));
-        let node = self.nodes.get_mut(&id).ok_or(SceneError::NotFound(id))?;
+        let node = self
+            .nodes
+            .get_mut(&id)
+            .map(Arc::make_mut)
+            .ok_or(SceneError::NotFound(id))?;
         node.transform = transform;
         self.invalidate_transform_edit(id);
         self.record_change(SceneChange::Transform(id));
@@ -1007,7 +1021,7 @@ impl Scene {
 /// process-random `HashMap` order and replay / snapshot diffs would be
 /// non-deterministic. A node missing from the map cannot occur for a bucket
 /// derived from it; it sorts first rather than panicking.
-fn sort_children(nodes: &IdHashMap<NodeId, CanvasNode>, bucket: &mut [NodeId]) {
+fn sort_children(nodes: &IdHashMap<NodeId, Arc<CanvasNode>>, bucket: &mut [NodeId]) {
     bucket.sort_by(|a, b| {
         let index_of = |id: &NodeId| nodes.get(id).map(|node| node.index);
         index_of(a).cmp(&index_of(b)).then_with(|| a.cmp(b))

@@ -1,8 +1,8 @@
 //! Print an [`FnxElement`] tree as React/TSX-style `.fnx` source.
 //!
-//! Deterministic: attributes come from a `BTreeMap` (sorted keys), values are
-//! rendered through `serde_json` (which itself sorts object keys), and indent
-//! is fixed. Identical input ⇒ identical bytes, so git diffs stay clean.
+//! Deterministic: attributes and embedded object keys are sorted explicitly,
+//! independent of `serde_json`'s feature-selected map order, and indent is fixed.
+//! Identical input ⇒ identical bytes, so git diffs stay clean.
 
 use crate::model::FnxElement;
 use crate::refs::RefTable;
@@ -108,8 +108,10 @@ fn render_value(value: &Value) -> String {
             if let Some(hex) = crate::color::color_obj_to_hex(obj) {
                 return format!("fnxColor({hex:?})");
             }
-            let parts: Vec<String> = obj
-                .iter()
+            let mut entries: Vec<_> = obj.iter().collect();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            let parts: Vec<String> = entries
+                .into_iter()
                 .map(|(k, v)| {
                     format!(
                         "{}: {}",

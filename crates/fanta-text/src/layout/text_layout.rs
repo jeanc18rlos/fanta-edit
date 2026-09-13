@@ -1,9 +1,12 @@
 //! The laid-out paragraph artifact: query geometry, hit-test, caret, paint.
 
 use skia_safe::{
-    Canvas,
-    textlayout::{RectHeightStyle, RectWidthStyle},
+    Canvas, Font,
+    textlayout::{Affinity, RectHeightStyle, RectWidthStyle, TextDirection},
 };
+use std::{collections::BTreeMap, ops::Range};
+use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Per-line geometry extracted from a laid-out paragraph.
 ///
@@ -27,6 +30,94 @@ pub struct LineMetrics {
     pub start_byte: usize,
     /// One-past-last byte offset on the line (including any trailing newline).
     pub end_byte: usize,
+}
+
+/// One glyph from Skia's fully shaped paragraph output.
+///
+/// The pen position and glyph bounds are relative to the owning
+/// [`ShapedGlyphRun`]'s baseline origin; `cluster_bounds` is paragraph-local.
+/// The UTF-8 range is the source cluster that produced the glyph; multiple
+/// glyphs may share a range, and one glyph may cover several code points after
+/// ligature shaping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapedGlyph {
+    pub glyph_id: u16,
+    /// HarfBuzz's pen position, relative to the owning run's baseline origin.
+    pub position: [f64; 2],
+    /// Glyph-positioning adjustment applied when Skia builds its paint blob.
+    ///
+    /// `position + offset` is the paint-ready position relative to the run
+    /// origin. Keeping the adjustment separate lets path renderers move an
+    /// entire cluster rigidly while retaining mark and cursive attachment.
+    pub offset: [f64; 2],
+    pub bounds: [f64; 4],
+    /// Stable source identity for the whole shaped cluster.
+    pub utf8_range: Range<usize>,
+    /// Paragraph-local visual bounds of the whole cluster.
+    pub cluster_bounds: [f64; 4],
+    /// Visual cluster advance, including shaping and letter spacing.
+    pub cluster_advance: f64,
+    /// Whether increasing source offsets run right-to-left in this cluster.
+    pub right_to_left: bool,
+}
+
+impl ShapedGlyph {
+    /// Paint-ready glyph position relative to the owning run's origin.
+    pub fn paint_position(&self) -> [f64; 2] {
+        [
+            self.position[0] + self.offset[0],
+            self.position[1] + self.offset[1],
+        ]
+    }
+}
+
+/// Failure to reconcile Skia's shaping and paint visitors.
+///
+/// Both visitors inspect the same already-shaped paragraph. A mismatch means
+/// the native paragraph cannot be represented without dropping positioning or
+/// source-cluster information, so callers should fail the render closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ShapedGlyphError {
+    #[error("Skia shaping and paint visitors returned different glyph sequences")]
+    VisitorMismatch,
+    #[error("Skia returned no source cluster for byte offset {byte}")]
+    MissingSourceCluster { byte: usize },
+    #[error("Skia returned invalid source-cluster geometry")]
+    InvalidCluster,
+}
+
+/// An owned snapshot of one visual font run from a shaped paragraph.
+///
+/// The resolved Skia font is retained so downstream renderers can draw the
+/// exact glyph IDs returned by shaping, including glyph-level fallback, rather
+/// than converting clusters back to text and shaping them a second time.
+#[derive(Debug, Clone)]
+pub struct ShapedGlyphRun {
+    pub line: usize,
+    pub origin: [f64; 2],
+    /// Skia visitor clip extent for this run, not a per-cluster text advance.
+    /// Use [`ShapedGlyph::cluster_advance`] for path placement.
+    pub advance: [f64; 2],
+    pub glyphs: Vec<ShapedGlyph>,
+    font: Font,
+}
+
+impl ShapedGlyphRun {
+    /// The resolved font that owns [`ShapedGlyph::glyph_id`] for this run.
+    pub fn font(&self) -> &Font {
+        &self.font
+    }
+}
+
+/// Geometry for one source cluster, including trailing whitespace that Skia's
+/// paint visitors omit because it has no ink.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapedTextCluster {
+    pub line: usize,
+    pub utf8_range: Range<usize>,
+    pub bounds: [f64; 4],
+    pub baseline: f64,
+    pub right_to_left: bool,
 }
 
 /// A laid-out paragraph: the shaped, line-broken result of running a
@@ -109,17 +200,319 @@ impl TextLayout {
                 baseline: lm.baseline,
                 height: lm.height,
                 width: lm.width,
-                start_byte: lm.start_index,
-                end_byte: lm.end_index,
+                start_byte: self.utf16_to_utf8(lm.start_index, false),
+                end_byte: self.utf16_to_utf8(lm.end_including_newline, true),
             })
             .collect()
+    }
+
+    /// Copy the paragraph's fully shaped visual runs into safe, owned data.
+    ///
+    /// Skia's visitor lends slices that are valid only during its callback.
+    /// Owning the glyph IDs, positions, bounds, source clusters, and resolved
+    /// font lets a renderer transform those glyphs after the callback without
+    /// retaining native pointers. This visits the paragraph that was already
+    /// shaped as a whole; it never reshapes individual graphemes.
+    pub fn shaped_glyph_runs(&mut self) -> Vec<ShapedGlyphRun> {
+        match self.try_shaped_glyph_runs() {
+            Ok(runs) => runs,
+            Err(error) => {
+                tracing::warn!(?error, "could not snapshot shaped paragraph glyphs");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Checked form of [`Self::shaped_glyph_runs`].
+    ///
+    /// Skia exposes pen positions and glyph bounds through `extended_visit`,
+    /// while its ordinary paint visitor exposes the final positions after
+    /// HarfBuzz offsets and justification. This reconciles those two views of
+    /// the same paragraph by glyph sequence; no text is reshaped.
+    pub fn try_shaped_glyph_runs(&mut self) -> Result<Vec<ShapedGlyphRun>, ShapedGlyphError> {
+        if self.text.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Skia's extended visitor reports a ghost glyph for whitespace-only
+        // paragraphs, while its paint visitor correctly reports no glyphs.
+        if self.text.chars().all(char::is_whitespace) {
+            return Ok(Vec::new());
+        }
+
+        let mut runs = Vec::new();
+        let mut glyph_order_by_line: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        let mut visitor_mismatch = false;
+        self.paragraph.extended_visit(|line, info| {
+            let Some(info) = info else {
+                return;
+            };
+            if info.glyphs().len() != info.positions().len()
+                || info.glyphs().len() != info.bounds().len()
+            {
+                visitor_mismatch = true;
+                return;
+            }
+            if info.glyphs().is_empty() {
+                return;
+            }
+            let glyphs = info
+                .glyphs()
+                .iter()
+                .copied()
+                .zip(info.positions().iter().copied())
+                .zip(info.bounds().iter().copied())
+                .map(|((glyph_id, position), bounds)| ShapedGlyph {
+                    glyph_id,
+                    position: [f64::from(position.x), f64::from(position.y)],
+                    offset: [0.0, 0.0],
+                    bounds: [
+                        f64::from(bounds.left),
+                        f64::from(bounds.top),
+                        f64::from(bounds.right),
+                        f64::from(bounds.bottom),
+                    ],
+                    utf8_range: 0..0,
+                    cluster_bounds: [0.0; 4],
+                    cluster_advance: 0.0,
+                    right_to_left: false,
+                })
+                .collect::<Vec<_>>();
+            let origin = info.origin();
+            let advance = info.advance();
+            let run_index = runs.len();
+            glyph_order_by_line
+                .entry(line)
+                .or_default()
+                .extend((0..glyphs.len()).map(|glyph_index| (run_index, glyph_index)));
+            runs.push(ShapedGlyphRun {
+                line,
+                origin: [f64::from(origin.x), f64::from(origin.y)],
+                advance: [f64::from(advance.width), f64::from(advance.height)],
+                glyphs,
+                font: info.font().clone(),
+            });
+        });
+        if visitor_mismatch {
+            return Err(ShapedGlyphError::VisitorMismatch);
+        }
+
+        struct PaintGlyph {
+            glyph_id: u16,
+            position: [f64; 2],
+            cluster_start: usize,
+            font: Font,
+        }
+
+        let mut paint_glyphs_by_line: BTreeMap<usize, Vec<PaintGlyph>> = BTreeMap::new();
+        self.paragraph.visit(|line, info| {
+            let Some(info) = info else {
+                return;
+            };
+            if info.glyphs().len() != info.positions().len() {
+                visitor_mismatch = true;
+                return;
+            }
+            if info.glyphs().is_empty() {
+                return;
+            }
+            if info.glyphs().len() + 1 != info.utf8_starts().len() {
+                visitor_mismatch = true;
+                return;
+            }
+            let origin = info.origin();
+            let paint_glyphs = paint_glyphs_by_line.entry(line).or_default();
+            for (index, (glyph_id, position)) in info
+                .glyphs()
+                .iter()
+                .copied()
+                .zip(info.positions().iter().copied())
+                .enumerate()
+            {
+                let Some(cluster_start) = info.utf8_starts().get(index).copied() else {
+                    visitor_mismatch = true;
+                    return;
+                };
+                paint_glyphs.push(PaintGlyph {
+                    glyph_id,
+                    position: [
+                        f64::from(origin.x + position.x),
+                        f64::from(origin.y + position.y),
+                    ],
+                    cluster_start: cluster_start as usize,
+                    font: info.font().clone(),
+                });
+            }
+        });
+        if visitor_mismatch {
+            return Err(ShapedGlyphError::VisitorMismatch);
+        }
+
+        #[derive(Clone)]
+        struct ClusterData {
+            utf8_range: Range<usize>,
+            bounds: [f64; 4],
+            advance: f64,
+            right_to_left: bool,
+        }
+
+        let mut clusters = BTreeMap::<usize, ClusterData>::new();
+        for paint_glyphs in paint_glyphs_by_line.values() {
+            for paint_glyph in paint_glyphs {
+                if clusters.contains_key(&paint_glyph.cluster_start) {
+                    continue;
+                }
+                let info = self
+                    .paragraph
+                    .get_glyph_cluster_at(paint_glyph.cluster_start)
+                    .ok_or(ShapedGlyphError::InvalidCluster)?;
+                let range = info.text_range.start..info.text_range.end;
+                let bounds = [
+                    f64::from(info.bounds.left),
+                    f64::from(info.bounds.top),
+                    f64::from(info.bounds.right),
+                    f64::from(info.bounds.bottom),
+                ];
+                if range.start > range.end
+                    || range.end > self.text.len()
+                    || !self.text.is_char_boundary(range.start)
+                    || !self.text.is_char_boundary(range.end)
+                    || bounds.iter().any(|value| !value.is_finite())
+                {
+                    return Err(ShapedGlyphError::InvalidCluster);
+                }
+                clusters.insert(
+                    paint_glyph.cluster_start,
+                    ClusterData {
+                        utf8_range: range,
+                        bounds,
+                        advance: (bounds[2] - bounds[0]).max(0.0),
+                        right_to_left: info.position == TextDirection::RTL,
+                    },
+                );
+            }
+        }
+
+        let shaped_glyph_count = glyph_order_by_line.values().map(Vec::len).sum::<usize>();
+        let paint_glyph_count = paint_glyphs_by_line.values().map(Vec::len).sum::<usize>();
+        if shaped_glyph_count != paint_glyph_count
+            || glyph_order_by_line.len() != paint_glyphs_by_line.len()
+        {
+            return Err(ShapedGlyphError::VisitorMismatch);
+        }
+
+        for (line, glyph_order) in glyph_order_by_line {
+            let Some(paint_glyphs) = paint_glyphs_by_line.get(&line) else {
+                return Err(ShapedGlyphError::VisitorMismatch);
+            };
+            if glyph_order.len() != paint_glyphs.len() {
+                return Err(ShapedGlyphError::VisitorMismatch);
+            }
+            for ((run_index, glyph_index), paint_glyph) in glyph_order.into_iter().zip(paint_glyphs)
+            {
+                let Some(run) = runs.get_mut(run_index) else {
+                    return Err(ShapedGlyphError::VisitorMismatch);
+                };
+                if run.font != paint_glyph.font {
+                    return Err(ShapedGlyphError::VisitorMismatch);
+                }
+                let run_origin = run.origin;
+                let Some(glyph) = run.glyphs.get_mut(glyph_index) else {
+                    return Err(ShapedGlyphError::VisitorMismatch);
+                };
+                if glyph.glyph_id != paint_glyph.glyph_id {
+                    return Err(ShapedGlyphError::VisitorMismatch);
+                }
+                let Some(cluster) = clusters.get(&paint_glyph.cluster_start) else {
+                    return Err(ShapedGlyphError::InvalidCluster);
+                };
+                let pen_position = [
+                    run_origin[0] + glyph.position[0],
+                    run_origin[1] + glyph.position[1],
+                ];
+                glyph.offset = [
+                    paint_glyph.position[0] - pen_position[0],
+                    paint_glyph.position[1] - pen_position[1],
+                ];
+                glyph.utf8_range = cluster.utf8_range.clone();
+                glyph.cluster_bounds = cluster.bounds;
+                glyph.cluster_advance = cluster.advance;
+                glyph.right_to_left = cluster.right_to_left;
+                if glyph.offset.iter().any(|value| !value.is_finite()) {
+                    return Err(ShapedGlyphError::InvalidCluster);
+                }
+            }
+        }
+
+        Ok(runs)
+    }
+
+    /// Copy source-cluster geometry, including glyphless trailing whitespace.
+    ///
+    /// Skia's glyph visitors do not provide reliable source data for trailing
+    /// "ghost" spaces. Its cluster query still walks `clustersWithSpaces`, so
+    /// querying each source character is the only way to retain their authored
+    /// advances for downstream path layout and caret placement. If Skia has no
+    /// laid-out cluster for a source byte, fail instead of silently producing a
+    /// snapshot with a hole in its caret mapping.
+    pub fn try_shaped_text_clusters(&self) -> Result<Vec<ShapedTextCluster>, ShapedGlyphError> {
+        if self.text.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut clusters = BTreeMap::new();
+        let mut byte = 0;
+        while byte < self.text.len() {
+            let next_character = self
+                .text
+                .get(byte..)
+                .and_then(|text| text.chars().next())
+                .map_or(self.text.len(), |character| byte + character.len_utf8());
+            let Some(info) = self.paragraph.get_glyph_cluster_at(byte) else {
+                return Err(ShapedGlyphError::MissingSourceCluster { byte });
+            };
+            let utf8_range = info.text_range.start..info.text_range.end;
+            let bounds = [
+                f64::from(info.bounds.left),
+                f64::from(info.bounds.top),
+                f64::from(info.bounds.right),
+                f64::from(info.bounds.bottom),
+            ];
+            let Some(line) = self.paragraph.get_line_number_at(byte) else {
+                return Err(ShapedGlyphError::InvalidCluster);
+            };
+            let Some(line_metrics) = self.paragraph.get_line_metrics_at(line) else {
+                return Err(ShapedGlyphError::InvalidCluster);
+            };
+            if utf8_range.start > byte
+                || byte >= utf8_range.end
+                || utf8_range.end > self.text.len()
+                || !self.text.is_char_boundary(utf8_range.start)
+                || !self.text.is_char_boundary(utf8_range.end)
+                || bounds.iter().any(|value| !value.is_finite())
+                || !line_metrics.baseline.is_finite()
+            {
+                return Err(ShapedGlyphError::InvalidCluster);
+            }
+            let next_cluster = utf8_range.end.max(next_character);
+            clusters
+                .entry((line, utf8_range.start, utf8_range.end))
+                .or_insert(ShapedTextCluster {
+                    line,
+                    utf8_range,
+                    bounds,
+                    baseline: line_metrics.baseline,
+                    right_to_left: info.position == TextDirection::RTL,
+                });
+            byte = next_cluster;
+        }
+        Ok(clusters.into_values().collect())
     }
 
     /// The byte offset nearest a point in paragraph-local coordinates.
     ///
     /// This is what turns a mouse click into a caret position. Skia reports the
-    /// glyph position at the coordinate as a UTF-8 index; we clamp it into range
-    /// and onto a `char` boundary so the result is always a valid caret for the
+    /// glyph position at the coordinate as a UTF-16 index; we convert it to the
+    /// source's UTF-8 byte space and onto a grapheme boundary so the result is a valid caret for the
     /// buffer. A click inside the first glyph therefore maps to byte 0, a click
     /// past the end maps to `len`.
     pub fn hit_test(&self, point: [f64; 2]) -> usize {
@@ -129,10 +522,8 @@ impl TextLayout {
         let pos = self
             .paragraph
             .get_glyph_position_at_coordinate((point[0] as f32, point[1] as f32));
-        // `position` is a UTF-8 code-unit (byte) index; it can be negative only
-        // in degenerate cases, so clamp through 0.
-        let raw = pos.position.max(0) as usize;
-        self.clamp_to_boundary(raw)
+        let utf16 = pos.position.max(0) as usize;
+        self.utf16_to_utf8(utf16, pos.affinity == Affinity::Downstream)
     }
 
     /// The caret rectangle `[x, y, width, height]` for the cursor sitting *at*
@@ -151,35 +542,45 @@ impl TextLayout {
             // editor overlays its own default-height caret for empty fields.
             return [0.0, 0.0, 0.0, 0.0];
         }
-        let byte = self.clamp_to_boundary(byte);
+        let byte = self.floor_grapheme_boundary(byte);
         let len = self.text.len();
 
         // For a caret before a glyph, query the rect of the single grapheme
         // starting at `byte`; the caret is its left edge.
         if byte < len {
-            let end = self.next_char_boundary(byte);
+            let end = self.next_grapheme_boundary(byte);
             let boxes = self.paragraph.get_rects_for_range(
-                byte..end,
+                self.utf8_to_utf16(byte)..self.utf8_to_utf16(end),
                 RectHeightStyle::Max,
                 RectWidthStyle::Tight,
             );
             if let Some(tb) = boxes.first() {
                 let r = tb.rect;
-                return [r.left as f64, r.top as f64, 0.0, (r.bottom - r.top) as f64];
+                let x = if tb.direct == TextDirection::RTL {
+                    r.right
+                } else {
+                    r.left
+                };
+                return [x as f64, r.top as f64, 0.0, (r.bottom - r.top) as f64];
             }
         }
 
         // End-of-text (or no box found): use the trailing edge of the last
         // grapheme so the caret lands after the final character.
-        let start = self.prev_char_boundary(len);
+        let start = self.prev_grapheme_boundary(len);
         let boxes = self.paragraph.get_rects_for_range(
-            start..len,
+            self.utf8_to_utf16(start)..self.utf8_to_utf16(len),
             RectHeightStyle::Max,
             RectWidthStyle::Tight,
         );
         if let Some(tb) = boxes.last() {
             let r = tb.rect;
-            return [r.right as f64, r.top as f64, 0.0, (r.bottom - r.top) as f64];
+            let x = if tb.direct == TextDirection::RTL {
+                r.left
+            } else {
+                r.right
+            };
+            return [x as f64, r.top as f64, 0.0, (r.bottom - r.top) as f64];
         }
         [0.0, 0.0, 0.0, 0.0]
     }
@@ -193,10 +594,14 @@ impl TextLayout {
         if self.text.is_empty() || lo >= hi {
             return Vec::new();
         }
-        let a = self.clamp_to_boundary(lo);
-        let b = self.clamp_to_boundary(hi);
+        let a = self.floor_grapheme_boundary(lo);
+        let b = self.ceil_grapheme_boundary(hi);
         self.paragraph
-            .get_rects_for_range(a..b, RectHeightStyle::Max, RectWidthStyle::Tight)
+            .get_rects_for_range(
+                self.utf8_to_utf16(a)..self.utf8_to_utf16(b),
+                RectHeightStyle::Max,
+                RectWidthStyle::Tight,
+            )
             .iter()
             .map(|tb| {
                 let r = tb.rect;
@@ -329,8 +734,9 @@ impl TextLayout {
     /// "convert text to path / outline text" primitive: it unions every line's
     /// filled glyph contours (Skia [`Paragraph::get_path_at`]) into one path so a
     /// text node can be replaced by an editable vector that renders pixel-identical
-    /// to the text. Returns `None` for empty text or when no glyph produced
-    /// geometry. `&mut self` because Skia builds the per-line path lazily.
+    /// to the text. Returns `None` for empty text, when no glyph produced
+    /// geometry, or when a color/bitmap glyph has no vector outline. `&mut self`
+    /// because Skia builds the per-line path lazily.
     pub fn outline(&mut self, offset: [f64; 2]) -> Option<fanta_doc::PathData> {
         self.outline_with_spacing_and_clip(offset, 0.0, None)
     }
@@ -355,7 +761,15 @@ impl TextLayout {
         let mut outline = skia_safe::Path::new();
         let line_count = self.paragraph.line_number();
         for line in 0..line_count {
-            let (_, path) = self.paragraph.get_path_at(line);
+            let (unconverted_glyphs, path) = self.paragraph.get_path_at(line);
+            if unconverted_glyphs > 0 {
+                tracing::warn!(
+                    line,
+                    unconverted_glyphs,
+                    "paragraph contains glyphs without vector outlines"
+                );
+                return None;
+            }
             if line == 0 {
                 outline.set_fill_type(path.fill_type());
             }
@@ -405,26 +819,83 @@ impl TextLayout {
         b
     }
 
-    /// Next `char` boundary strictly after `byte` (or `len`).
-    fn next_char_boundary(&self, byte: usize) -> usize {
-        let len = self.text.len();
-        let mut b = (byte + 1).min(len);
-        while b < len && !self.text.is_char_boundary(b) {
-            b += 1;
-        }
-        b
+    /// Next extended-grapheme boundary strictly after `byte` (or `len`).
+    fn next_grapheme_boundary(&self, byte: usize) -> usize {
+        let byte = self.clamp_to_boundary(byte);
+        self.text
+            .grapheme_indices(true)
+            .map(|(boundary, _)| boundary)
+            .find(|boundary| *boundary > byte)
+            .unwrap_or(self.text.len())
     }
 
-    /// Previous `char` boundary strictly before `byte` (or 0).
-    fn prev_char_boundary(&self, byte: usize) -> usize {
-        if byte == 0 {
-            return 0;
+    /// Previous extended-grapheme boundary strictly before `byte` (or 0).
+    fn prev_grapheme_boundary(&self, byte: usize) -> usize {
+        let byte = self.clamp_to_boundary(byte);
+        self.text
+            .grapheme_indices(true)
+            .map(|(boundary, _)| boundary)
+            .take_while(|boundary| *boundary < byte)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn floor_grapheme_boundary(&self, byte: usize) -> usize {
+        let byte = self.clamp_to_boundary(byte);
+        if byte == self.text.len() {
+            return byte;
         }
-        let mut b = byte - 1;
-        while b > 0 && !self.text.is_char_boundary(b) {
-            b -= 1;
+        self.text
+            .grapheme_indices(true)
+            .map(|(boundary, _)| boundary)
+            .take_while(|boundary| *boundary <= byte)
+            .last()
+            .unwrap_or(0)
+    }
+
+    fn ceil_grapheme_boundary(&self, byte: usize) -> usize {
+        let byte = byte.min(self.text.len());
+        self.text
+            .grapheme_indices(true)
+            .map(|(boundary, _)| boundary)
+            .find(|boundary| *boundary >= byte)
+            .unwrap_or(self.text.len())
+    }
+
+    fn utf8_to_utf16(&self, byte: usize) -> usize {
+        let byte = self.clamp_to_boundary(byte);
+        self.text
+            .get(..byte)
+            .map(|text| text.encode_utf16().count())
+            .unwrap_or(0)
+    }
+
+    fn utf16_to_utf8(&self, utf16: usize, downstream: bool) -> usize {
+        let mut code_units = 0;
+        for (byte, character) in self.text.char_indices() {
+            if utf16 <= code_units {
+                return if downstream {
+                    self.ceil_grapheme_boundary(byte)
+                } else {
+                    self.floor_grapheme_boundary(byte)
+                };
+            }
+            let next_code_units = code_units + character.len_utf16();
+            if utf16 < next_code_units {
+                let byte = if downstream {
+                    byte + character.len_utf8()
+                } else {
+                    byte
+                };
+                return if downstream {
+                    self.ceil_grapheme_boundary(byte)
+                } else {
+                    self.floor_grapheme_boundary(byte)
+                };
+            }
+            code_units = next_code_units;
         }
-        b
+        self.text.len()
     }
 }
 
@@ -490,8 +961,9 @@ fn path_data_from_sk_path(path: &skia_safe::Path) -> Option<fanta_doc::PathData>
 #[cfg(test)]
 mod tests {
     use crate::buffer::TextBuffer;
-    use crate::layout::{Align, LayoutEngine};
+    use crate::layout::{Align, LayoutEngine, LayoutOptions, ShapedGlyphError};
     use crate::style::TextStyle;
+    use std::collections::BTreeMap;
 
     fn body() -> TextStyle {
         TextStyle::default()
@@ -615,6 +1087,25 @@ mod tests {
     }
 
     #[test]
+    fn hit_caret_and_selection_convert_between_utf16_and_utf8() {
+        let engine = LayoutEngine::new();
+        let buffer = TextBuffer::from_str("a🦀e\u{301}z", body());
+        let layout = engine.layout(&buffer, 1000.0);
+
+        assert_eq!(layout.hit_test([10_000.0, 2.0]), buffer.len());
+        let before_emoji = layout.caret_rect(1);
+        let after_emoji = layout.caret_rect(5);
+        assert!(after_emoji[0] > before_emoji[0]);
+        let combining_start = buffer.text().find('e').expect("combining base");
+        let combining_end = combining_start + "e\u{301}".len();
+        assert!(
+            !layout
+                .selection_rects(combining_start, combining_end)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn hit_test_empty_text_is_zero() {
         let engine = LayoutEngine::new();
         let layout = engine.layout(&TextBuffer::new(), 200.0);
@@ -661,11 +1152,25 @@ mod tests {
         let buf = TextBuffer::from_str("Hi", body());
         let layout = engine.layout(&buf, 1000.0);
         let r_start = layout.caret_rect(0);
+        let r_last_start = layout.caret_rect(1);
         let r_end = layout.caret_rect(buf.len());
         assert!(
             r_end[0] > r_start[0],
             "end caret should be right of start caret"
         );
+        assert!(
+            r_end[0] > r_last_start[0],
+            "end caret should use the final glyph's trailing edge"
+        );
+    }
+
+    #[test]
+    fn caret_rect_at_end_of_one_grapheme_uses_its_trailing_edge() {
+        let engine = LayoutEngine::new();
+        let buffer = TextBuffer::from_str("🦀", body());
+        let layout = engine.layout(&buffer, 1000.0);
+
+        assert!(layout.caret_rect(buffer.len())[0] > layout.caret_rect(0)[0]);
     }
 
     #[test]
@@ -865,6 +1370,203 @@ mod tests {
         let layout = engine.layout(&buf, 2000.0);
         assert!(layout.height() > 0.0);
         assert!(layout.width() > 0.0);
+    }
+
+    #[test]
+    fn shaped_glyph_snapshot_keeps_clusters_and_resolved_fonts_owned() {
+        let engine = LayoutEngine::new();
+        let mut buf = TextBuffer::from_str("office 🦀", body());
+        buf.set_style(
+            0..6,
+            TextStyle::new("Source Serif 4", 28.0).with_color(fanta_doc::Color::rgb(200, 0, 0)),
+        )
+        .unwrap();
+        let mut layout = engine.layout(&buf, f64::INFINITY);
+        let runs = layout.shaped_glyph_runs();
+
+        assert!(!runs.is_empty());
+        assert!(
+            runs.iter().all(|run| run.font().size() > 0.0),
+            "every visitor run retains its resolved font"
+        );
+        let glyphs: Vec<_> = runs.iter().flat_map(|run| &run.glyphs).collect();
+        assert!(!glyphs.is_empty());
+        assert!(glyphs.iter().all(|glyph| {
+            glyph.utf8_range.start < glyph.utf8_range.end
+                && glyph.utf8_range.end <= buf.len()
+                && glyph.position.iter().all(|value| value.is_finite())
+                && glyph.offset.iter().all(|value| value.is_finite())
+                && glyph.paint_position().iter().all(|value| value.is_finite())
+                && glyph.bounds.iter().all(|value| value.is_finite())
+                && glyph.cluster_bounds.iter().all(|value| value.is_finite())
+                && glyph.cluster_advance.is_finite()
+                && glyph.cluster_advance >= 0.0
+        }));
+        let crab_start = buf.text().find('🦀').unwrap();
+        assert!(
+            glyphs.iter().any(|glyph| {
+                glyph.utf8_range.start <= crab_start && crab_start < glyph.utf8_range.end
+            }),
+            "fallback glyph keeps its source cluster"
+        );
+    }
+
+    #[test]
+    fn shaped_glyph_snapshot_of_empty_layout_is_empty() {
+        let engine = LayoutEngine::new();
+        let mut layout = engine.layout(&TextBuffer::new(), f64::INFINITY);
+        assert!(layout.shaped_glyph_runs().is_empty());
+        assert!(
+            layout
+                .try_shaped_glyph_runs()
+                .expect("empty snapshot succeeds")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shaped_glyph_snapshot_of_whitespace_layout_is_empty_but_clusters_survive() {
+        let engine = LayoutEngine::new();
+        let content = " \t ";
+        let buffer = TextBuffer::from_str(content, body());
+        let mut layout = engine.layout(&buffer, f64::INFINITY);
+        assert!(
+            layout
+                .try_shaped_glyph_runs()
+                .expect("whitespace snapshot succeeds")
+                .is_empty()
+        );
+        let clusters = layout
+            .try_shaped_text_clusters()
+            .expect("whitespace clusters survive");
+        assert_eq!(clusters.len(), 3);
+        assert_eq!(
+            clusters.first().map(|cluster| cluster.utf8_range.clone()),
+            Some(0..1)
+        );
+        assert_eq!(
+            clusters.last().map(|cluster| cluster.utf8_range.clone()),
+            Some(2..3)
+        );
+        assert!(content.char_indices().all(|(byte, _)| {
+            clusters
+                .iter()
+                .any(|cluster| cluster.utf8_range.contains(&byte))
+        }));
+    }
+
+    #[test]
+    fn shaped_cluster_snapshot_reports_source_omitted_by_line_clamping() {
+        let engine = LayoutEngine::new();
+        let content = "A\nB";
+        let buffer = TextBuffer::from_str(content, body());
+        let layout = engine.layout_with(
+            &buffer,
+            f64::INFINITY,
+            Align::Left,
+            &LayoutOptions {
+                max_lines: Some(1),
+                ..LayoutOptions::default()
+            },
+        );
+
+        assert_eq!(
+            layout.try_shaped_text_clusters(),
+            Err(ShapedGlyphError::MissingSourceCluster { byte: "A\n".len() })
+        );
+    }
+
+    #[test]
+    fn shaped_cluster_snapshot_never_silently_skips_a_default_ignorable() {
+        let engine = LayoutEngine::new();
+        let content = "A\u{2060}B";
+        let buffer = TextBuffer::from_str(content, body());
+        let layout = engine.layout(&buffer, f64::INFINITY);
+        let control_byte = content.find('\u{2060}').expect("word-joiner byte");
+
+        match layout.try_shaped_text_clusters() {
+            Ok(clusters) => assert!(content.char_indices().all(|(byte, _)| {
+                clusters
+                    .iter()
+                    .any(|cluster| cluster.utf8_range.contains(&byte))
+            })),
+            Err(ShapedGlyphError::MissingSourceCluster { byte }) => {
+                assert_eq!(byte, control_byte);
+            }
+            Err(error) => panic!("unexpected shaped-cluster error: {error}"),
+        }
+    }
+
+    #[test]
+    fn shaped_snapshot_matches_paint_positions_and_keeps_complex_clusters_whole() {
+        let engine = LayoutEngine::new();
+        let content = "a\u{301} שָׁלוֹם";
+        let buffer = TextBuffer::from_str(content, body());
+        let mut layout = engine.layout(&buffer, f64::INFINITY);
+        let runs = layout
+            .try_shaped_glyph_runs()
+            .expect("the two visitors describe the same shaped paragraph");
+
+        let shaped: Vec<_> = runs
+            .iter()
+            .flat_map(|run| {
+                run.glyphs.iter().map(|glyph| {
+                    let position = glyph.paint_position();
+                    (
+                        glyph.glyph_id,
+                        [run.origin[0] + position[0], run.origin[1] + position[1]],
+                    )
+                })
+            })
+            .collect();
+        let mut painted = Vec::new();
+        layout.paragraph.visit(|_, info| {
+            let Some(info) = info else {
+                return;
+            };
+            let origin = info.origin();
+            painted.extend(
+                info.glyphs()
+                    .iter()
+                    .copied()
+                    .zip(info.positions().iter().copied())
+                    .map(|(glyph_id, position)| {
+                        (
+                            glyph_id,
+                            [
+                                f64::from(origin.x + position.x),
+                                f64::from(origin.y + position.y),
+                            ],
+                        )
+                    }),
+            );
+        });
+        assert_eq!(shaped.len(), painted.len());
+        for ((shaped_id, shaped_position), (painted_id, painted_position)) in
+            shaped.iter().zip(&painted)
+        {
+            assert_eq!(shaped_id, painted_id);
+            assert!((shaped_position[0] - painted_position[0]).abs() < 1e-4);
+            assert!((shaped_position[1] - painted_position[1]).abs() < 1e-4);
+        }
+
+        let glyphs: Vec<_> = runs.iter().flat_map(|run| &run.glyphs).collect();
+        let accent = content.find('\u{301}').expect("combining mark byte");
+        assert!(
+            glyphs
+                .iter()
+                .any(|glyph| { glyph.utf8_range.start == 0 && glyph.utf8_range.end > accent })
+        );
+        assert!(glyphs.iter().any(|glyph| glyph.right_to_left));
+
+        let mut clusters = BTreeMap::<(usize, usize), ([f64; 4], f64)>::new();
+        for glyph in glyphs {
+            let geometry = (glyph.cluster_bounds, glyph.cluster_advance);
+            let key = (glyph.utf8_range.start, glyph.utf8_range.end);
+            if let Some(previous) = clusters.insert(key, geometry) {
+                assert_eq!(previous, geometry);
+            }
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use anyhow::Result;
 use client::{Client, ClientSettings};
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
-use gpui::{App, AppContext, AsyncApp, Entity, Task};
+use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelCompletionError,
@@ -14,8 +14,11 @@ use language_model::{
     SubPageProviderSettings,
 };
 use settings::Settings;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use ui::IconName;
+use ui::prelude::*;
+use util::ResultExt;
 
 use crate::provider::api_compatible::{
     ApiCompatibleProviderConfigurationView, ApiCompatibleProviderSettings,
@@ -47,10 +50,69 @@ pub struct AnthropicCompatibleLanguageModelProvider {
 /// the configuration the provider needs — no separate API key. Providers
 /// pointing anywhere else never see the account token.
 fn account_token_for(client: &Arc<Client>, api_url: &str, cx: &App) -> Option<Arc<str>> {
-    let server_url = &ClientSettings::get_global(cx).server_url;
-    (api_url.trim_end_matches('/') == server_url.trim_end_matches('/'))
+    is_account_provider(api_url, &ClientSettings::get_global(cx).server_url)
         .then(|| client.account_access_token())
         .flatten()
+}
+
+fn is_account_provider(api_url: &str, server_url: &str) -> bool {
+    !api_url.is_empty() && api_url.trim_end_matches('/') == server_url.trim_end_matches('/')
+}
+
+struct ProviderCredentials(Arc<dyn CredentialsProvider>);
+
+impl ProviderCredentials {
+    fn storage_url(url: &str, cx: &AsyncApp) -> String {
+        cx.update(|cx| {
+            if is_account_provider(url, &ClientSettings::get_global(cx).server_url) {
+                // Account credentials use the backend URL itself. A separate
+                // slot prevents caching them as API keys or overwriting sign-in.
+                format!("{}/ai-api-key", url.trim_end_matches('/'))
+            } else {
+                url.to_string()
+            }
+        })
+    }
+}
+
+impl CredentialsProvider for ProviderCredentials {
+    fn read_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+        Box::pin(async move {
+            self.0
+                .read_credentials(&Self::storage_url(url, cx), cx)
+                .await
+        })
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        username: &'a str,
+        password: &'a [u8],
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            self.0
+                .write_credentials(&Self::storage_url(url, cx), username, password, cx)
+                .await
+        })
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        Box::pin(async move {
+            self.0
+                .delete_credentials(&Self::storage_url(url, cx), cx)
+                .await
+        })
+    }
 }
 
 impl ApiCompatibleProviderSettings for AnthropicCompatibleSettings {
@@ -100,7 +162,7 @@ impl AnthropicCompatibleLanguageModelProvider {
     ) -> Self {
         let state = State::new(
             id.clone(),
-            credentials_provider,
+            Arc::new(ProviderCredentials(credentials_provider)),
             |id, cx| {
                 crate::AllLanguageModelSettings::get_global(cx)
                     .anthropic_compatible
@@ -218,20 +280,32 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
         // env var) is available to requests, where it wins over the account
         // token. For the managed (account-backed) provider a MISSING key is
         // not a failure — signing in already authenticates it — so the
-        // account token only masks the error, never skips the load.
+        // account token only masks missing credentials, never storage errors.
         let inner = self.state.update(cx, |state, cx| state.authenticate(cx));
         let api_url = self.state.read(cx).settings.api_url.clone();
         if account_token_for(&self.client, &api_url, cx).is_none() {
             return inner;
         }
-        cx.spawn(async move |_cx| {
-            inner.await.ok();
-            Ok(())
+        cx.spawn(async move |_cx| match inner.await {
+            Ok(()) | Err(AuthenticateError::CredentialsNotFound) => Ok(()),
+            Err(error) => Err(error),
         })
     }
 
-    fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
+    fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
         let state = self.state.clone();
+        if is_account_provider(
+            &state.read(cx).settings.api_url,
+            &ClientSettings::get_global(cx).server_url,
+        ) {
+            let client = self.client.clone();
+            return Some(ProviderSettingsView::SubPage(SubPageProviderSettings::new(
+                move |_window, cx| {
+                    cx.new(|cx| AccountConfigurationView::new(state.clone(), client.clone(), cx))
+                        .into()
+                },
+            )));
+        }
         Some(ProviderSettingsView::SubPage(SubPageProviderSettings::new(
             move |window, cx| {
                 cx.new(|cx| {
@@ -251,6 +325,77 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
     fn set_api_key(&self, api_key: Option<String>, cx: &mut App) -> Task<Result<()>> {
         self.state
             .update(cx, |state, cx| state.set_api_key(api_key, cx))
+    }
+}
+
+struct AccountConfigurationView {
+    state: Entity<State>,
+    client: Arc<Client>,
+    sign_in_task: Option<Task<()>>,
+    sign_in_error: Option<SharedString>,
+}
+
+impl AccountConfigurationView {
+    fn new(state: Entity<State>, client: Arc<Client>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        Self {
+            state,
+            client,
+            sign_in_task: None,
+            sign_in_error: None,
+        }
+    }
+
+    fn sign_in(&mut self, cx: &mut Context<Self>) {
+        if self.sign_in_task.is_some() {
+            return;
+        }
+        self.sign_in_error = None;
+        self.sign_in_task = Some(cx.spawn({
+            let client = self.client.clone();
+            async move |this, cx| {
+                let result = client.sign_in_with_optional_connect(true, cx).await;
+                this.update(cx, |this, cx| {
+                    this.sign_in_task = None;
+                    this.sign_in_error = result.err().map(|error| error.to_string().into());
+                    cx.notify();
+                })
+                .log_err();
+            }
+        }));
+        cx.notify();
+    }
+}
+
+impl Render for AccountConfigurationView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let signed_in =
+            account_token_for(&self.client, &self.state.read(cx).settings.api_url, cx).is_some();
+        let has_api_key = self.state.read(cx).is_authenticated();
+        v_flex()
+            .gap_4()
+            .child(Label::new(if signed_in {
+                "Your Fanta account is connected. AI usage is charged to your Fanta credits."
+            } else if has_api_key {
+                "A Fanta API key is configured. Sign in to manage your account and billing."
+            } else {
+                "Sign in to Fanta to use AI with your account credits."
+            }))
+            .when(!signed_in, |this| {
+                this.child(
+                    Button::new("fanta-sign-in", "Sign in to Fanta")
+                        .style(ButtonStyle::Filled)
+                        .disabled(self.sign_in_task.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.sign_in(cx))),
+                )
+            })
+            .when_some(self.sign_in_error.clone(), |this, error| {
+                this.child(Label::new(error).color(Color::Error))
+            })
+            .child(
+                Button::new("fanta-manage-account", "Manage account and billing")
+                    .on_click(|_, _, cx| cx.open_url(&client::zed_urls::account_url(cx))),
+            )
     }
 }
 

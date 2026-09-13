@@ -48,7 +48,7 @@ impl SelectTool {
         let parent_world_inverse = parent_world_transform.inverse();
         // The transformed local-box center is the center of the oriented box.
         // It also avoids treating an AABB from a skewed parent as node-local.
-        let pivot = super::resize::authored_resize_bounds(&ctx.doc.scene, node_id)
+        let pivot = super::resize::authored_resize_bounds(ctx, node_id)
             .map(|bounds| original_world_transform.transform_point(bounds.center()))
             .unwrap_or_else(|| original_world.center());
         let press_world =

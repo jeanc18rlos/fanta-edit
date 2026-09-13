@@ -65,6 +65,58 @@ fn rect_bounds_are_tight() {
 }
 
 #[test]
+fn rough_bounds_contains_quadratic_and_cubic_curve_bodies() {
+    for cubic in [false, true] {
+        let mut path = PathData::new();
+        path.move_to(0., 0.);
+        if cubic {
+            path.cubic_to(-40., 120., 140., -80., 100., 0.);
+        } else {
+            path.quad_to(50., 80., 100., 0.);
+        }
+        let bounds = path.rough_bounds().expect("curve bounds");
+        assert_eq!(
+            bounds,
+            if cubic {
+                crate::Bounds::from_xywh(-40., -80., 180., 200.)
+            } else {
+                crate::Bounds::from_xywh(0., 0., 100., 80.)
+            }
+        );
+        for sample in 0..=32 {
+            let t = sample as f64 / 32.;
+            let u = 1. - t;
+            let point = if cubic {
+                glam::DVec2::new(-40., 120.) * (3. * u * u * t)
+                    + glam::DVec2::new(140., -80.) * (3. * u * t * t)
+                    + glam::DVec2::new(100., 0.) * (t * t * t)
+            } else {
+                glam::DVec2::new(50., 80.) * (2. * u * t) + glam::DVec2::new(100., 0.) * (t * t)
+            };
+            assert!(bounds.contains_point(point), "curve body {point:?}");
+        }
+    }
+}
+
+#[test]
+fn rough_bounds_filters_non_finite_curve_controls() {
+    let mut path = PathData::new();
+    path.move_to(f64::NAN, 0.)
+        .quad_to(10., 20., 30., f64::INFINITY)
+        .cubic_to(f64::NEG_INFINITY, 10., -5., -8., 0., 0.);
+    assert_eq!(
+        path.rough_bounds(),
+        Some(crate::Bounds::from_xywh(-5., -8., 15., 28.))
+    );
+    let mut invalid = PathData::new();
+    invalid
+        .move_to(f64::NAN, 0.)
+        .quad_to(f64::NAN, 0., 0., f64::INFINITY)
+        .cubic_to(f64::INFINITY, 0., 0., f64::NEG_INFINITY, f64::NAN, 0.);
+    assert!(invalid.rough_bounds().is_none());
+}
+
+#[test]
 fn rough_bounds_ignores_non_finite_points() {
     let mut p = PathData::new();
     p.move_to(f64::NAN, 0.0)
@@ -352,4 +404,140 @@ fn subpath_rules_round_trip_and_default_empty() {
     let j = serde_json::to_string(&mixed).unwrap();
     let back: PathData = serde_json::from_str(&j).unwrap();
     assert_eq!(back, mixed);
+}
+
+fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "expected {expected} ± {tolerance}, got {actual}"
+    );
+}
+
+#[test]
+fn measured_path_reports_source_segment_indexes_and_cumulative_lengths() {
+    let mut path = PathData::new();
+    path.move_to(0.0, 0.0).line_to(3.0, 4.0).line_to(6.0, 4.0);
+
+    let measured = MeasuredPath::new(&path);
+    assert_close(measured.total_length(), 8.0, 1e-12);
+    let first = measured.segments().first().expect("first line");
+    let second = measured.segments().get(1).expect("second line");
+    assert_eq!(first.drawable_segment_index(), 0);
+    assert_eq!(second.drawable_segment_index(), 1);
+    assert_eq!(first.path_segment_index(), 1, "Move keeps source index 0");
+    assert_eq!(second.path_segment_index(), 2);
+    assert_close(first.start_distance(), 0.0, 1e-12);
+    assert_close(first.end_distance(), 5.0, 1e-12);
+    assert_close(second.start_distance(), 5.0, 1e-12);
+    assert_close(
+        measured
+            .distance_at_segment_position(1, 0.5)
+            .expect("midpoint distance"),
+        6.5,
+        1e-12,
+    );
+
+    let sample = measured
+        .point_tangent_at_distance(6.5)
+        .expect("point on second line");
+    assert_eq!(sample.path_segment_index, 2);
+    assert_close(sample.point[0], 4.5, 1e-12);
+    assert_close(sample.point[1], 4.0, 1e-12);
+    assert_close(sample.tangent[0], 1.0, 1e-12);
+    assert_close(sample.tangent[1], 0.0, 1e-12);
+}
+
+#[test]
+fn measured_path_maps_nonlinear_quadratic_parameter_to_arc_distance() {
+    // Geometrically straight but non-uniform in t: x(t) = 10t². A flatness-only
+    // subdivision would incorrectly place half-distance at x=2.5.
+    let mut path = PathData::new();
+    path.move_to(0.0, 0.0).quad_to(0.0, 0.0, 10.0, 0.0);
+    let measured = MeasuredPath::with_tolerance(&path, 1e-5);
+
+    assert_close(measured.total_length(), 10.0, 1e-9);
+    assert_close(
+        measured
+            .distance_at_segment_position(0, 0.5)
+            .expect("quadratic position"),
+        2.5,
+        0.001,
+    );
+    let halfway = measured
+        .point_tangent_at_distance(5.0)
+        .expect("quadratic midpoint by length");
+    assert_close(halfway.point[0], 5.0, 0.001);
+    assert_close(halfway.point[1], 0.0, 1e-12);
+    assert_close(halfway.tangent[0], 1.0, 1e-12);
+}
+
+#[test]
+fn measured_path_handles_cubic_curvature() {
+    let mut path = PathData::new();
+    path.move_to(0.0, 0.0)
+        .cubic_to(0.0, 10.0, 10.0, 10.0, 10.0, 0.0);
+    let measured = MeasuredPath::with_tolerance(&path, 0.0001);
+    let halfway = measured
+        .point_tangent_at_distance(measured.total_length() * 0.5)
+        .expect("cubic midpoint");
+
+    assert_close(measured.total_length(), 20.0, 0.001);
+    assert_close(halfway.point[0], 5.0, 0.001);
+    assert_close(halfway.point[1], 7.5, 0.001);
+    assert_close(halfway.tangent[0], 1.0, 0.001);
+    assert_close(halfway.tangent[1], 0.0, 0.001);
+}
+
+#[test]
+fn measured_path_keeps_close_and_multiple_contours_distinct() {
+    let mut path = PathData::rect(0.0, 0.0, 10.0, 10.0);
+    path.move_to(100.0, 20.0).line_to(103.0, 24.0);
+    let measured = MeasuredPath::new(&path);
+
+    assert_close(measured.total_length(), 45.0, 1e-12);
+    let first = measured.contours().first().expect("closed contour");
+    let second = measured.contours().get(1).expect("open contour");
+    assert!(first.is_closed());
+    assert!(!second.is_closed());
+    assert_close(first.length(), 40.0, 1e-12);
+    assert_close(second.start_distance(), 40.0, 1e-12);
+    assert_close(second.length(), 5.0, 1e-12);
+    assert_eq!(first.measured_segment_range(), 0..4);
+    assert_eq!(second.measured_segment_range(), 4..5);
+
+    let sample = measured
+        .point_tangent_on_contour(second.contour_index(), 2.5)
+        .expect("point on second contour");
+    assert_close(sample.point[0], 101.5, 1e-12);
+    assert_close(sample.point[1], 22.0, 1e-12);
+    assert_close(sample.distance, 42.5, 1e-12);
+}
+
+#[test]
+fn measured_path_is_non_panicking_for_zero_length_and_nonfinite_input() {
+    let mut path = PathData::new();
+    path.move_to(0.0, 0.0)
+        .line_to(0.0, 0.0)
+        .cubic_to(f64::NAN, 1.0, 2.0, 3.0, 4.0, 5.0);
+    path.move_to(10.0, 10.0).line_to(13.0, 14.0);
+
+    let measured = MeasuredPath::with_tolerance(&path, f64::NAN);
+    assert_close(measured.total_length(), 5.0, 1e-12);
+    assert!(measured.segment(1).is_none(), "nonfinite cubic is skipped");
+    assert!(measured.segment_for_path_segment(2).is_none());
+    assert_close(
+        measured
+            .distance_at_segment_position(0, 0.5)
+            .expect("zero-length segment retains its start distance"),
+        0.0,
+        1e-12,
+    );
+    assert!(measured.distance_at_segment_position(2, f64::NAN).is_none());
+    assert!(measured.point_tangent_at_distance(f64::INFINITY).is_none());
+
+    let mut zero = PathData::new();
+    zero.move_to(1.0, 1.0).line_to(1.0, 1.0).close();
+    let zero = MeasuredPath::new(&zero);
+    assert_eq!(zero.total_length(), 0.0);
+    assert!(zero.point_tangent_at_distance(0.0).is_none());
 }

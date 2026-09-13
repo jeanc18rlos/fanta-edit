@@ -649,7 +649,10 @@ pub(crate) fn read_manifest(dir: &Path) -> Result<ProjectManifest> {
 /// and is part of the byte-determinism contract; every JSON file the writer
 /// projects goes through this one function.
 pub(crate) fn json_bytes(value: &Value) -> Result<Vec<u8>> {
-    let mut text = serde_json::to_string_pretty(value)?;
+    // The full app enables `preserve_order`; standalone format tools may not.
+    let mut value = value.clone();
+    value.sort_all_objects();
+    let mut text = serde_json::to_string_pretty(&value)?;
     text.push('\n');
     Ok(text.into_bytes())
 }
@@ -761,6 +764,47 @@ fn unix_seconds_now() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn projected_json_is_identical_across_insertion_orders() {
+        let unsorted: Value = serde_json::from_str(
+            r#"{"z":[{"z":9,"a":"$Colors/Accent"},null,3,false],"a":{"z":21.762165069580078,"a":"literal reference"}}"#,
+        )
+        .expect("unsorted metadata");
+        let sorted: Value = serde_json::from_str(
+            r#"{"a":{"a":"literal reference","z":21.762165069580078},"z":[{"a":"$Colors/Accent","z":9},null,3,false]}"#,
+        )
+        .expect("sorted metadata");
+        let original = serde_json::to_string(&unsorted).expect("original metadata");
+        let expected = br#"{
+  "a": {
+    "a": "literal reference",
+    "z": 21.762165069580078
+  },
+  "z": [
+    {
+      "a": "$Colors/Accent",
+      "z": 9
+    },
+    null,
+    3,
+    false
+  ]
+}
+"#;
+        let bytes = json_bytes(&unsorted).expect("projected metadata");
+        assert_eq!(bytes.as_slice(), expected);
+        assert_eq!(json_bytes(&sorted).expect("reordered metadata"), bytes);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).expect("reloaded metadata"),
+            unsorted
+        );
+        assert_eq!(
+            serde_json::to_string(&unsorted).expect("metadata after projection"),
+            original,
+            "projection must not reorder the caller's opaque metadata"
+        );
+    }
 
     #[test]
     fn scaffold_creates_skeleton_and_manifest() {

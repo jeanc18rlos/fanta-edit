@@ -105,7 +105,7 @@ pub(crate) fn layers_kind(
                 }
             }
         },
-        NodeData::Text(_) => LayersPanelNodeKind::Text,
+        NodeData::Text(_) | NodeData::TextPath(_) => LayersPanelNodeKind::Text,
         NodeData::Bitmap(_) => LayersPanelNodeKind::Image,
         NodeData::Video(_) => LayersPanelNodeKind::Video,
         NodeData::Instance(_) => LayersPanelNodeKind::Instance,

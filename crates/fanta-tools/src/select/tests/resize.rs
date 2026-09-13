@@ -19,6 +19,46 @@ fn press_on_se_handle_of_single_selection_enters_resize() {
 }
 
 #[test]
+fn host_interaction_bounds_define_the_resize_handles() {
+    fn narrowed_bounds(_scene: &fanta_doc::Scene, _id: NodeId) -> Option<Bounds> {
+        Some(Bounds::from_xywh(-10.0, -10.0, 20.0, 20.0))
+    }
+
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let id = rect_at_origin(&mut doc, 60.0, 60.0);
+    doc.selection.select_only(id);
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size)
+        .with_interaction_bounds_resolver(narrowed_bounds);
+
+    let mut tool = SelectTool::new();
+    let stale_handle = screen_for_world(DVec2::new(29.0, 29.0), ctx.viewport, ctx.screen_size);
+    tool.handle_event(&mut ctx, pe_press(stale_handle, ModifierKeys::empty()));
+    assert!(!tool.is_resizing());
+    tool.handle_event(&mut ctx, pe_release(stale_handle, ModifierKeys::empty()));
+
+    let visible_handle = screen_for_world(DVec2::new(10.0, 10.0), ctx.viewport, ctx.screen_size);
+    assert_eq!(
+        ctx.interaction_bounds(id),
+        Some(Bounds::from_xywh(-10.0, -10.0, 20.0, 20.0))
+    );
+    assert_eq!(
+        fanta_canvas::hit_test_resize_handle_oriented(
+            ctx.interaction_bounds(id).expect("interaction bounds"),
+            &ctx.doc.scene.world_transform(id).expect("world transform"),
+            DVec2::from(visible_handle),
+            ctx.viewport,
+            ctx.screen_size,
+            fanta_canvas::DEFAULT_HANDLE_THRESHOLD,
+        ),
+        Some(fanta_canvas::ResizeHandle::SouthEast)
+    );
+    tool.handle_event(&mut ctx, pe_press(visible_handle, ModifierKeys::empty()));
+    assert!(tool.is_resizing(), "phase: {:?}", tool.phase);
+}
+
+#[test]
 fn drag_se_handle_grows_node_world_bounds() {
     let size = DVec2::new(800.0, 600.0);
     let mut doc = Doc::new();

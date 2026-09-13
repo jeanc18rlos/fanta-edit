@@ -165,6 +165,7 @@ impl MentionSet {
                 "Untitled buffer selection mentions are not supported for paste"
             ))),
             MentionUri::PastedImage { .. }
+            | MentionUri::CanvasSelection { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::MergeConflict { .. }
             | MentionUri::Rule { .. } => {
@@ -331,6 +332,12 @@ impl MentionSet {
                 debug_panic!("pasted image URI should not be included in completions");
                 Task::ready(Err(anyhow!(
                     "pasted imaged URI should not be included in completions"
+                )))
+            }
+            MentionUri::CanvasSelection { .. } => {
+                debug_panic!("canvas selection URI should not be included in completions");
+                Task::ready(Err(anyhow!(
+                    "canvas selection URI should not be included in completions"
                 )))
             }
             MentionUri::Selection { .. } => {

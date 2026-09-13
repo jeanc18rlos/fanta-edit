@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 2 || $# -gt 3 || "$2" != *.app || ! -d "$2/Contents" ]]; then
+    echo "Usage: script/bundle-git <target-triple> <app-path> [signing-identity]" >&2
+    exit 1
+fi
+
+target_triple="$1"
+app_path="$2"
+signing_identity="${3:--}"
+git_version="v2.53.0"
+git_release="v2.53.0-4"
+git_revision="4098283"
+case "$target_triple" in
+    aarch64-apple-darwin)
+        architecture=arm64
+        archive_sha256=f9dc64635a5b62fbd7ad95db73268bbb8912255ac516d65d37bf7af22fcb8ffe
+        ;;
+    x86_64-apple-darwin)
+        architecture=x64
+        archive_sha256=ae6686718aa34f4140424db16b92a47dcffd6d1f312eb8b5f3b267f7404e2680
+        ;;
+    *)
+        echo "Unsupported Git architecture: $target_triple" >&2
+        exit 1
+        ;;
+esac
+
+temporary_directory=$(mktemp -d)
+trap 'rm -rf "$temporary_directory"' EXIT
+archive_path="${FANTA_GIT_ARCHIVE:-$temporary_directory/git.tar.gz}"
+if [[ -z "${FANTA_GIT_ARCHIVE:-}" ]]; then
+    curl --fail --silent --show-error --location --proto '=https' \
+        "https://github.com/desktop/dugite-native/releases/download/${git_release}/dugite-native-${git_version}-${git_revision}-macOS-${architecture}.tar.gz" \
+        -o "$archive_path"
+fi
+
+actual_sha256=$(shasum -a 256 "$archive_path" | cut -d ' ' -f 1)
+if [[ "$actual_sha256" != "$archive_sha256" ]]; then
+    echo "The downloaded Git archive failed its SHA-256 check." >&2
+    exit 1
+fi
+
+mkdir -p "$temporary_directory/git"
+tar -xzf "$archive_path" -C "$temporary_directory/git"
+for executable in bin/git libexec/git-core/git-remote-http libexec/git-core/git-remote-https libexec/git-core/git-upload-pack libexec/git-core/git-receive-pack; do
+    if [[ ! -x "$temporary_directory/git/$executable" ]]; then
+        echo "The Git archive is missing $executable." >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$app_path/Contents/Resources" "$app_path/Contents/MacOS"
+rm -rf "$app_path/Contents/Resources/git"
+mv "$temporary_directory/git" "$app_path/Contents/Resources/git"
+cp "$app_path/Contents/Resources/git/bin/git" "$app_path/Contents/MacOS/git"
+
+# Git Credential Manager uses .NET's JIT; the other Git executables do not need it.
+cat > "$temporary_directory/credential-manager.entitlements" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>com.apple.security.cs.allow-jit</key><true/>
+<key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+</dict></plist>
+PLIST
+
+# The distribution has hard-linked builtins and native .NET libraries. Sign each
+# inode once, including libraries without the executable bit, before sealing the app.
+python3 - "$app_path" > "$temporary_directory/native-files" <<'PYTHON'
+import os
+from pathlib import Path
+import stat
+import sys
+
+app = Path(sys.argv[1])
+paths = sorted((app / "Contents/Resources/git").rglob("*"))
+paths.append(app / "Contents/MacOS/git")
+seen = set()
+magic_numbers = {
+    bytes.fromhex(value)
+    for value in ("feedface", "cefaedfe", "feedfacf", "cffaedfe", "cafebabe", "bebafeca", "cafebabf", "bfbafeca")
+}
+for path in paths:
+    metadata = path.lstat()
+    identity = (metadata.st_dev, metadata.st_ino)
+    if not stat.S_ISREG(metadata.st_mode) or identity in seen:
+        continue
+    seen.add(identity)
+    with path.open("rb") as source:
+        if source.read(4) in magic_numbers:
+            sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+PYTHON
+
+signing_options=(--force --sign "$signing_identity")
+if [[ "$signing_identity" != - ]]; then
+    signing_options+=(--timestamp --options runtime)
+fi
+while IFS= read -r -d '' executable; do
+    executable_signing_options=("${signing_options[@]}")
+    if [[ "$executable" == */git-credential-manager ]]; then
+        executable_signing_options+=(--entitlements "$temporary_directory/credential-manager.entitlements")
+    fi
+    /usr/bin/codesign "${executable_signing_options[@]}" "$executable"
+    /usr/bin/codesign --verify --strict "$executable"
+done < "$temporary_directory/native-files"
+
+echo "Bundled complete Git ${git_version#v} for $architecture (SHA-256 verified)."

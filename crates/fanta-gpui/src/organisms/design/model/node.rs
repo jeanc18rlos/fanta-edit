@@ -573,6 +573,7 @@ pub struct DesignPanelNode {
     pub text_path: Option<DesignTextPathViewData>,
     /// Present only for a TextPath node.
     pub text_path_start_data: Option<DesignTextPathStartData>,
+    pub text_path_placement: Option<DesignTextPathPlacement>,
     /// Present only while the host supplies Vector/TextPath sub-selection data.
     pub vector_edit: Option<DesignVectorEditViewData>,
     pub component_context: Option<DesignComponentContext>,
@@ -656,6 +657,7 @@ impl DesignPanelNode {
                 .then_some(DesignTextPathViewData::default()),
             text_path_start_data: (kind == DesignPanelNodeKind::TextPath)
                 .then_some(DesignTextPathStartData::DEFAULT),
+            text_path_placement: None,
             vector_edit: None,
             component_context: None,
             component_properties: Vec::new(),
@@ -1248,6 +1250,24 @@ impl DesignPanelNode {
             .map_or_else(|| self.kind.supports_fill(), |value| value.fill)
     }
 
+    pub fn paint_collection_edit_mode(
+        &self,
+        collection: DesignPanelCollection,
+    ) -> DesignPaintCollectionEditMode {
+        match collection {
+            DesignPanelCollection::Fill => self
+                .capabilities
+                .as_ref()
+                .map_or(DesignPaintCollectionEditMode::Full, |capabilities| {
+                    capabilities.fill_edit_mode
+                }),
+            DesignPanelCollection::Stroke
+            | DesignPanelCollection::Effect
+            | DesignPanelCollection::LayoutGrid
+            | DesignPanelCollection::Export => DesignPaintCollectionEditMode::Full,
+        }
+    }
+
     pub fn supports_stroke(&self) -> bool {
         self.capabilities
             .as_ref()
@@ -1495,6 +1515,7 @@ pub struct DesignPanelNodeCapabilities {
     pub resize_to_fit: bool,
     pub clip_content: bool,
     pub fill: bool,
+    pub fill_edit_mode: DesignPaintCollectionEditMode,
     pub stroke: bool,
     pub layer_appearance: bool,
     pub pass_through_blend: bool,
@@ -1594,6 +1615,7 @@ impl DesignPanelNodeCapabilities {
             resize_to_fit: kind.supports_resize_to_fit(),
             clip_content: kind.supports_clip_content(),
             fill,
+            fill_edit_mode: DesignPaintCollectionEditMode::Full,
             stroke,
             layer_appearance,
             pass_through_blend: kind.supports_pass_through_blend(),
@@ -1673,6 +1695,11 @@ impl DesignPanelNodeCapabilities {
         self
     }
 
+    pub const fn with_fill_edit_mode(mut self, edit_mode: DesignPaintCollectionEditMode) -> Self {
+        self.fill_edit_mode = edit_mode;
+        self
+    }
+
     pub const fn with_stroke(mut self, supported: bool) -> Self {
         self.stroke = supported;
         self
@@ -1701,6 +1728,31 @@ impl DesignPanelNodeCapabilities {
     pub const fn with_layout_guides(mut self, supported: bool) -> Self {
         self.layout_guides = supported;
         self
+    }
+}
+
+/// Host-authored editing surface for one paint collection.
+///
+/// `ColorAndOpacityOnly` is intended for synthetic solid paints whose host
+/// data has no corresponding paint-stack structure or visibility state.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum DesignPaintCollectionEditMode {
+    #[default]
+    Full,
+    ColorAndOpacityOnly,
+}
+
+impl DesignPaintCollectionEditMode {
+    pub const fn allows_full_controls(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    pub const fn allows_property(self, property: &DesignPaintProperty) -> bool {
+        self.allows_full_controls()
+            || matches!(
+                property,
+                DesignPaintProperty::Color | DesignPaintProperty::Opacity
+            )
     }
 }
 

@@ -10,6 +10,7 @@
 //! margin), so blocking is invisible. A pan into new content therefore never
 //! waits for a raster, however heavy the page.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
@@ -29,9 +30,11 @@ use core_foundation::{
 };
 #[cfg(target_os = "macos")]
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture,
+    metal_texture::{CVMetalTexture, CVMetalTextureGetTexture},
     metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::{CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA},
+    pixel_buffer::{
+        CVPixelBuffer, CVPixelBufferKeys, kCVPixelBufferLock_ReadOnly, kCVPixelFormatType_32BGRA,
+    },
 };
 use fanta_canvas::ResizeHandle;
 #[cfg(target_os = "macos")]
@@ -44,7 +47,7 @@ use fanta_doc::{
 };
 #[cfg(target_os = "macos")]
 use fanta_render::AssetResolver;
-use fanta_render::{RasterRenderer, RenderInputs};
+use fanta_render::{MediaPlayback, RasterRenderer, RenderInputs};
 use fanta_tools::{SnapGuideAxis, ToolOverlay};
 #[cfg(target_os = "macos")]
 use foreign_types::ForeignType;
@@ -60,8 +63,8 @@ use gpui::{Context, Task};
 use image::{Frame, RgbaImage};
 #[cfg(target_os = "macos")]
 use skia_safe::{
-    ColorType,
-    gpu::{self, SurfaceOrigin, backend_render_targets, direct_contexts, mtl},
+    AlphaType, ColorType,
+    gpu::{self, SurfaceOrigin, backend_render_targets, backend_textures, direct_contexts, mtl},
 };
 use smallvec::SmallVec;
 use ui::prelude::*;
@@ -115,6 +118,59 @@ pub(crate) struct RenderedCanvas {
     revision: u64,
     motion_frame: Option<MotionFrameKey>,
     page_root: Option<NodeId>,
+    #[cfg(target_os = "macos")]
+    video_frame: Option<VideoFrameKey>,
+    #[cfg(target_os = "macos")]
+    video_image: Option<skia_safe::Image>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct CanvasVideoFrame {
+    pub node_id: NodeId,
+    pub buffer: CVPixelBuffer,
+    pub progress: f32,
+    pub session_revision: u64,
+    pub revision: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VideoFrameKey {
+    node_id: NodeId,
+    session_revision: u64,
+    revision: u64,
+    progress_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl From<&CanvasVideoFrame> for VideoFrameKey {
+    fn from(frame: &CanvasVideoFrame) -> Self {
+        Self {
+            node_id: frame.node_id,
+            session_revision: frame.session_revision,
+            revision: frame.revision,
+            progress_bits: video_progress(frame.progress).to_bits(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl VideoFrameKey {
+    fn same_pixels(self, other: Self) -> bool {
+        self.node_id == other.node_id
+            && self.session_revision == other.session_revision
+            && self.revision == other.revision
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn video_progress(progress: f32) -> f32 {
+    if progress.is_finite() {
+        progress.clamp(0., 1.)
+    } else {
+        0.
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +244,7 @@ struct SurfaceKey {
     /// Canvas-side invalidations ([`FigView::invalidate_canvas_cache`]).
     epoch: u64,
     motion_frame: Option<MotionFrameKey>,
+    video_frame: Option<VideoFrameKey>,
 }
 
 #[cfg(target_os = "macos")]
@@ -201,6 +258,7 @@ impl SurfaceKey {
             && self.scene == other.scene
             && self.epoch == other.epoch
             && self.motion_frame == other.motion_frame
+            && self.video_frame == other.video_frame
     }
 
     /// Whether two keys show the same page of the same scene instance — the
@@ -820,13 +878,42 @@ impl LiveInputs {
 
 /// A CoreVideo pixel buffer crossing threads. CF objects are thread-safe to
 /// retain/release, and the buffer's pixels are only ever written by the render
-/// thread and read by the window server, so moving the handle is sound.
+/// thread and read by the window server, or retained decoded frames are
+/// immutable while sampled by the render thread, so moving the handle is sound.
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
 struct SendBuffer(CVPixelBuffer);
 
 // SAFETY: see the type docs — a retained CFTypeRef with no thread affinity.
 #[cfg(target_os = "macos")]
 unsafe impl Send for SendBuffer {}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct RenderVideoFrame {
+    node_id: NodeId,
+    buffer: SendBuffer,
+    progress: f32,
+}
+
+#[cfg(target_os = "macos")]
+impl From<CanvasVideoFrame> for RenderVideoFrame {
+    fn from(frame: CanvasVideoFrame) -> Self {
+        Self {
+            node_id: frame.node_id,
+            buffer: SendBuffer(frame.buffer),
+            progress: video_progress(frame.progress),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ImportedVideoFrame {
+    // Skia 0.84 has no borrowed-texture release callback. Field order keeps
+    // the image's texture reference from outliving the CoreVideo lease.
+    image: skia_safe::Image,
+    _texture: CVMetalTexture,
+}
 
 /// What to render one frame from.
 #[cfg(target_os = "macos")]
@@ -848,6 +935,7 @@ struct RenderRequest {
     key: SurfaceKey,
     scale_factor: f32,
     motion: Option<MotionEvaluation>,
+    video: Option<RenderVideoFrame>,
     /// `RenderInputs::mode_generation` for this frame: the variables/modes
     /// half of the document's [`InputsFingerprint`].
     mode_generation: u64,
@@ -1120,6 +1208,50 @@ impl MacGpuRenderer {
         create_bgra_pixel_buffer(size.0, size.1)
     }
 
+    fn import_video_frame(&mut self, frame: &RenderVideoFrame) -> Result<ImportedVideoFrame> {
+        let buffer = &frame.buffer.0;
+        let (width, height) = video_buffer_dimensions(buffer)?;
+        let texture = self
+            .texture_cache
+            .create_texture_from_image(
+                buffer.as_concrete_TypeRef(),
+                None,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                width as usize,
+                height as usize,
+                0,
+            )
+            .map_err(|status| anyhow!("creating video Metal texture failed: {status}"))?;
+        let handle = unsafe { CVMetalTextureGetTexture(texture.as_concrete_TypeRef()) };
+        if handle.is_null() {
+            return Err(anyhow!("CoreVideo returned a null video texture"));
+        }
+        // CoreVideo owns this texture. Borrow it only on the owning Skia
+        // context, retaining both its lease and source buffer through the flush.
+        let texture_info = unsafe { mtl::TextureInfo::new(handle as mtl::Handle) };
+        let backend_texture = unsafe {
+            backend_textures::make_mtl(
+                (width, height),
+                gpu::Mipmapped::No,
+                &texture_info,
+                "Fanta video frame",
+            )
+        };
+        let image = gpu::images::borrow_texture_from(
+            &mut self.direct_context,
+            &backend_texture,
+            SurfaceOrigin::TopLeft,
+            ColorType::BGRA8888,
+            AlphaType::Premul,
+            None,
+        )
+        .ok_or_else(|| anyhow!("wrapping video Metal texture as Skia image failed"))?;
+        Ok(ImportedVideoFrame {
+            image,
+            _texture: texture,
+        })
+    }
+
     /// Render one frame for `request` from `inputs` into a pooled buffer.
     /// Returns the buffer with its GPU work complete (the compositor samples
     /// the IOSurface as soon as it is presented) and the wall time it took.
@@ -1134,6 +1266,26 @@ impl MacGpuRenderer {
             self.raster_renderer
                 .set_asset_resolver(asset_resolver.clone());
         }
+
+        let video_image = request
+            .video
+            .as_ref()
+            .map(|frame| self.import_video_frame(frame))
+            .transpose()?;
+        let playback = request
+            .video
+            .as_ref()
+            .zip(video_image.as_ref())
+            .map(|(frame, imported)| {
+                HashMap::from([(
+                    frame.node_id,
+                    MediaPlayback {
+                        progress: frame.progress,
+                        frame: None,
+                        decoded_frame: Some(imported.image.clone()),
+                    },
+                )])
+            });
 
         let pixel_buffer = self.take_buffer(size)?;
         let color_texture = self
@@ -1176,7 +1328,7 @@ impl MacGpuRenderer {
             active_modes: inputs.active_modes,
             mode_generation: request.mode_generation,
             motion: request.motion.as_ref(),
-            playback: None,
+            playback: playback.as_ref(),
             dark_ui: false,
         };
         let render_started = Instant::now();
@@ -1193,6 +1345,8 @@ impl MacGpuRenderer {
         // `paint_surface`, so the GPU work must be complete by then.
         self.direct_context.flush_submit_and_sync_cpu();
         drop(surface);
+        drop(playback);
+        drop(video_image);
         // Walk + flush + GPU sync: the whole cost of a fresh frame, measured
         // on the render thread.
         let duration = render_started.elapsed();
@@ -1547,6 +1701,7 @@ impl GpuCanvas {
         viewport: Viewport,
         scale_factor: f32,
         motion: Option<MotionEvaluation>,
+        video: Option<CanvasVideoFrame>,
     ) -> Result<(Option<GpuFrame>, bool)> {
         self.pump_replies();
         if let Some(reason) = &self.failed {
@@ -1564,6 +1719,7 @@ impl GpuCanvas {
             ),
             epoch: self.epoch,
             motion_frame: motion.as_ref().map(MotionFrameKey::from),
+            video_frame: video.as_ref().map(VideoFrameKey::from),
         };
         let within_render_interval = self
             .last_render_at
@@ -1586,6 +1742,7 @@ impl GpuCanvas {
                     key,
                     scale_factor,
                     motion,
+                    video: video.map(RenderVideoFrame::from),
                     mode_generation: self.inputs_fingerprint(document).variables,
                 };
                 self.render_blocking(LiveInputs::of(document), request)?;
@@ -1597,6 +1754,7 @@ impl GpuCanvas {
                     key,
                     scale_factor,
                     motion,
+                    video: video.map(RenderVideoFrame::from),
                     mode_generation: fingerprint.variables,
                 };
                 let source = self.snapshot_source(document, stamp, fingerprint);
@@ -1704,6 +1862,66 @@ fn create_bgra_pixel_buffer(width: u32, height: u32) -> Result<CVPixelBuffer> {
     .map_err(|status| anyhow!("creating BGRA CVPixelBuffer failed: {status}"))
 }
 
+#[cfg(target_os = "macos")]
+fn video_buffer_dimensions(buffer: &CVPixelBuffer) -> Result<(i32, i32)> {
+    if buffer.get_pixel_format() != kCVPixelFormatType_32BGRA || buffer.is_planar() {
+        return Err(anyhow!("Video playback requires a non-planar BGRA frame"));
+    }
+    let width = i32::try_from(buffer.get_width()).context("video frame width is too large")?;
+    let height = i32::try_from(buffer.get_height()).context("video frame height is too large")?;
+    if width <= 0 || height <= 0 {
+        return Err(anyhow!("Video playback returned an empty frame"));
+    }
+    Ok((width, height))
+}
+
+#[cfg(target_os = "macos")]
+fn copy_video_frame(buffer: &CVPixelBuffer) -> Result<skia_safe::Image> {
+    let (width, height) = video_buffer_dimensions(buffer)?;
+    let lock_status = buffer.lock_base_address(kCVPixelBufferLock_ReadOnly);
+    if lock_status != 0 {
+        return Err(anyhow!("locking video pixels failed: {lock_status}"));
+    }
+    let copied = (|| {
+        let row_bytes = buffer.get_bytes_per_row();
+        let minimum_row = (width as usize)
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("video frame row is too large"))?;
+        if row_bytes < minimum_row {
+            return Err(anyhow!("Video playback returned a short pixel row"));
+        }
+        let length = row_bytes
+            .checked_mul(height as usize - 1)
+            .and_then(|length| length.checked_add(minimum_row))
+            .ok_or_else(|| anyhow!("video frame buffer is too large"))?;
+        let address = unsafe { buffer.get_base_address() };
+        if address.is_null() || length > buffer.get_data_size() || length > isize::MAX as usize {
+            return Err(anyhow!("Video playback returned inaccessible pixels"));
+        }
+        // The read-only lock covers padded CoreVideo rows. Skia owns this
+        // copy before unlocking, so later decoder reuse cannot change it.
+        let pixels = unsafe { std::slice::from_raw_parts(address.cast::<u8>(), length) };
+        let data = skia_safe::Data::new_copy(pixels);
+        let info = skia_safe::ImageInfo::new(
+            (width, height),
+            ColorType::BGRA8888,
+            AlphaType::Premul,
+            None,
+        );
+        skia_safe::images::raster_from_data(&info, data, row_bytes)
+            .ok_or_else(|| anyhow!("creating CPU video frame failed"))
+    })();
+    let unlock_status = buffer.unlock_base_address(kCVPixelBufferLock_ReadOnly);
+    if unlock_status != 0 {
+        if copied.is_err() {
+            log::warn!("unlocking video pixels after a copy failure also failed: {unlock_status}");
+        } else {
+            return Err(anyhow!("unlocking video pixels failed: {unlock_status}"));
+        }
+    }
+    copied
+}
+
 fn render_fig_canvas(
     document: &FigDocument,
     page_root: Option<NodeId>,
@@ -1712,6 +1930,7 @@ fn render_fig_canvas(
     viewport: Viewport,
     scale_factor: f32,
     motion: Option<&MotionEvaluation>,
+    playback: Option<&HashMap<NodeId, MediaPlayback>>,
 ) -> Result<Arc<RenderImage>> {
     let mut renderer =
         RasterRenderer::new(width, height).context("creating Skia raster surface")?;
@@ -1731,7 +1950,7 @@ fn render_fig_canvas(
         active_modes: &document.doc.active_modes,
         mode_generation: InputsFingerprint::of(&document.doc).variables,
         motion,
-        playback: None,
+        playback,
         dark_ui: false,
     };
     renderer.render_page_with(&document.doc.scene, &render_viewport, page_root, &inputs);
@@ -1763,18 +1982,57 @@ impl FigView {
         viewport: Viewport,
         scale_factor: f32,
         motion: Option<&MotionEvaluation>,
+        #[cfg(target_os = "macos")] video: Option<&CanvasVideoFrame>,
     ) -> Result<Arc<RenderImage>> {
         let revision = document.render_generation();
         let motion_frame = motion.map(MotionFrameKey::from);
+        #[cfg(target_os = "macos")]
+        let video_frame = video.map(VideoFrameKey::from);
+        #[cfg(target_os = "macos")]
+        let video_matches = self
+            .rendered_canvas
+            .as_ref()
+            .is_some_and(|rendered| rendered.video_frame == video_frame);
+        #[cfg(not(target_os = "macos"))]
+        let video_matches = true;
         if let Some(rendered) = &self.rendered_canvas
             && rendered.size == size
             && rendered.page_root == page_root
             && rendered.revision == revision
             && rendered.motion_frame == motion_frame
+            && video_matches
             && same_viewport(rendered.viewport, viewport)
         {
             return Ok(rendered.image.clone());
         }
+
+        #[cfg(target_os = "macos")]
+        let video_image = video
+            .map(|frame| {
+                let cached = self.rendered_canvas.as_ref().and_then(|rendered| {
+                    rendered
+                        .video_frame
+                        .filter(|key| key.same_pixels(VideoFrameKey::from(frame)))?;
+                    rendered.video_image.clone()
+                });
+                cached
+                    .map(Ok)
+                    .unwrap_or_else(|| copy_video_frame(&frame.buffer))
+            })
+            .transpose()?;
+        #[cfg(target_os = "macos")]
+        let playback = video.zip(video_image.as_ref()).map(|(frame, image)| {
+            HashMap::from([(
+                frame.node_id,
+                MediaPlayback {
+                    progress: video_progress(frame.progress),
+                    frame: None,
+                    decoded_frame: Some(image.clone()),
+                },
+            )])
+        });
+        #[cfg(not(target_os = "macos"))]
+        let playback = None;
 
         let image = render_fig_canvas(
             document,
@@ -1784,6 +2042,7 @@ impl FigView {
             viewport,
             scale_factor,
             motion,
+            playback.as_ref(),
         )?;
         self.rendered_canvas = Some(RenderedCanvas {
             image: image.clone(),
@@ -1792,6 +2051,10 @@ impl FigView {
             revision,
             motion_frame,
             page_root,
+            #[cfg(target_os = "macos")]
+            video_frame,
+            #[cfg(target_os = "macos")]
+            video_image,
         });
         Ok(image)
     }
@@ -1809,7 +2072,6 @@ impl IntoElement for CanvasElement {
 /// gestures currently in flight.
 pub(crate) struct DragListeners {
     panning: bool,
-    primary_drag: bool,
 }
 
 impl Element for CanvasElement {
@@ -1857,10 +2119,7 @@ impl Element for CanvasElement {
             self.view.update(cx, |this, _| {
                 this.set_container_bounds(bounds);
             });
-            return Some(DragListeners {
-                panning: false,
-                primary_drag: false,
-            });
+            return Some(DragListeners { panning: false });
         }
         let logical_size = bounds_size(bounds);
         let (viewport, drag_listeners) = {
@@ -1875,26 +2134,30 @@ impl Element for CanvasElement {
             // A component-scoped view renders a master root that is not a
             // listed page; the initial fit must frame the master's own bounds,
             // not the fallback page the paint path never shows.
-            let fit = document
-                .doc
-                .active_page()
-                .filter(|root| document.doc.is_component_root(*root))
-                .map(|root| crate::document::page_bounds(&document.doc, Some(root)))
-                .unwrap_or(page.bounds);
             let viewport = view.viewport().unwrap_or_else(|| {
-                crate::document::fit_bounds(
-                    fit,
-                    logical_size,
-                    crate::view::RENDER_PADDING,
-                    crate::view::MIN_ZOOM,
-                    crate::view::MAX_ZOOM,
-                )
+                let root = document
+                    .doc
+                    .active_page()
+                    .filter(|root| document.doc.is_component_root(*root))
+                    .or(page.root);
+                crate::document::try_page_bounds(&document.doc, root)
+                    .map(|bounds| {
+                        crate::document::fit_bounds(
+                            bounds,
+                            logical_size,
+                            crate::view::RENDER_PADDING,
+                            crate::view::MIN_ZOOM,
+                            crate::view::MAX_ZOOM,
+                        )
+                    })
+                    // An empty canvas has nothing to fit. Start at actual size
+                    // instead of shrinking a fictitious page to a narrow pane.
+                    .unwrap_or_default()
             });
             (
                 viewport,
                 DragListeners {
                     panning: view.is_panning(),
-                    primary_drag: view.primary_pressed(),
                 },
             )
         };
@@ -1958,31 +2221,30 @@ impl Element for CanvasElement {
             });
         }
 
-        // While a primary drag is live, window-level listeners own the
-        // move/release stream: element listeners stop firing once the cursor
-        // leaves the canvas, which would strand the tool mid-gesture.
-        if listeners.primary_drag {
-            let view = self.view.downgrade();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && let Some(view) = view.upgrade()
-                {
-                    view.update(cx, |this, cx| {
-                        this.handle_window_mouse_move(event, cx);
-                    });
-                }
-            });
-            let view = self.view.downgrade();
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && let Some(view) = view.upgrade()
-                {
-                    view.update(cx, |this, cx| {
-                        this.handle_window_mouse_up(event, cx);
-                    });
-                }
-            });
-        }
+        // A press, move and release can arrive before the next paint. Install
+        // these ahead of the press and consult live gesture state, including
+        // when the pointer has left the canvas.
+        let view = self.view.downgrade();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble
+                && let Some(view) = view.upgrade()
+                && view.read(cx).primary_pressed()
+            {
+                view.update(cx, |this, cx| {
+                    this.handle_window_mouse_move(event, cx);
+                });
+            }
+        });
+        let view = self.view.downgrade();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble
+                && let Some(view) = view.upgrade()
+            {
+                view.update(cx, |this, cx| {
+                    this.handle_window_mouse_up(event, cx);
+                });
+            }
+        });
 
         let scale_factor = window.scale_factor();
         // The GPU frame is rendered with a margin beyond the element so
@@ -2003,6 +2265,8 @@ impl Element for CanvasElement {
         let render_size = render_size_for_bounds(frame_bounds, scale_factor);
         let paint_started = std::time::Instant::now();
         let paint_canvas = self.view.update(cx, |this, cx| {
+            #[cfg(target_os = "macos")]
+            let video = this.canvas_video_frame(cx);
             let viewport = this
                 .viewport()
                 .ok_or_else(|| anyhow!("Figma canvas viewport was not initialized"))?;
@@ -2044,6 +2308,7 @@ impl Element for CanvasElement {
                     viewport,
                     scale_factor,
                     motion.clone(),
+                    video.clone(),
                 ) {
                     Ok((frame, repaint)) => {
                         this.clear_rendered_canvas();
@@ -2064,6 +2329,8 @@ impl Element for CanvasElement {
                 viewport,
                 scale_factor,
                 motion.as_ref(),
+                #[cfg(target_os = "macos")]
+                video.as_ref(),
             )
             .map(|image| (PaintCanvas::Image(image), false))
         });
@@ -2155,6 +2422,11 @@ pub(crate) fn evaluated_world_bounds(
     let node = scene.get(id)?;
     if let Some(motion) = motion {
         let evaluated = motion.apply_to_node(node);
+        if let fanta_doc::NodeData::TextPath(text_path) = &evaluated.data
+            && let Some(local) = fanta_render::text_path_visual_bounds(text_path)
+        {
+            return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
+        }
         if let Some(local) = evaluated.data.local_bounds() {
             return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
         }
@@ -2178,6 +2450,14 @@ pub(crate) fn evaluated_world_bounds(
             // LOCAL space, which differs from the world-space union below
             // under rotation. Keep the world-space union for parity.
             fanta_doc::NodeData::Boolean(_) => {}
+            fanta_doc::NodeData::TextPath(text_path) => {
+                if let Some(local) = fanta_render::text_path_visual_bounds(text_path) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+                if let Some(local) = scene.local_bounds(id) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+            }
             // For every other kind the scene's local bounds ARE
             // `data.local_bounds()` — memoized, so a vector's path walk runs
             // once per edit instead of once per call.
@@ -2213,6 +2493,81 @@ pub(crate) fn evaluated_hit_test_screen(
 ) -> Option<NodeId> {
     let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
     evaluated_hit_test(scene, motion, world_point, precision, active_page)
+}
+
+pub(crate) fn precise_hit_test_screen(
+    scene: &fanta_doc::Scene,
+    viewport: &Viewport,
+    screen_size: DVec2,
+    screen_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
+    precise_hit_test(scene, world_point, precision, active_page)
+}
+
+fn precise_hit_test(
+    scene: &fanta_doc::Scene,
+    world_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    fanta_canvas::hit_test_deep(scene, world_point, precision, active_page)
+        .into_iter()
+        .find(|&id| accepts_precise_hit(scene, id, world_point))
+}
+
+pub(crate) fn accepts_precise_hit(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    world_point: DVec2,
+) -> bool {
+    let Some(node) = scene.get(id) else {
+        return false;
+    };
+    let fanta_doc::NodeData::TextPath(text_path) = &node.data else {
+        return true;
+    };
+    scene
+        .world_transform(id)
+        .is_some_and(|transform| text_path_contains_world_point(text_path, transform, world_point))
+}
+
+fn text_path_contains_world_point(
+    text_path: &fanta_doc::TextPathNode,
+    transform: fanta_doc::Transform2D,
+    world_point: DVec2,
+) -> bool {
+    let [a, b, c, d, _, _] = transform.to_components();
+    let determinant = a * d - b * c;
+    if !transform.is_finite()
+        || !world_point.x.is_finite()
+        || !world_point.y.is_finite()
+        || !determinant.is_finite()
+        || determinant.abs() <= f64::EPSILON
+    {
+        return false;
+    }
+    let local_point = transform.inverse().transform_point(world_point);
+    if text_path.content.is_empty() {
+        let Some(caret) = fanta_render::text_path_caret_segment(text_path, 0) else {
+            return false;
+        };
+        let start = DVec2::from(caret.start);
+        let end = DVec2::from(caret.end);
+        let segment = end - start;
+        let segment_length_squared = segment.length_squared();
+        if !segment_length_squared.is_finite() || segment_length_squared <= f64::EPSILON {
+            return false;
+        }
+        let position =
+            ((local_point - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0);
+        let closest = start + segment * position;
+        let tolerance = (text_path.style.size_px * 0.15).clamp(3.0, 12.0);
+        return local_point.distance(closest) <= tolerance;
+    }
+    fanta_render::text_path_contains_point(text_path, local_point.to_array())
 }
 
 fn evaluated_hit_test(
@@ -2276,17 +2631,27 @@ fn evaluated_hit_test_subtree(
     if let fanta_doc::NodeData::Group(group) = &node.data {
         return group.is_frame_surface().then_some(id);
     }
-    if precision == fanta_canvas::HitPrecision::Path
-        && let fanta_doc::NodeData::Vector(vector) = &node.data
-    {
+    if let fanta_doc::NodeData::TextPath(text_path) = &node.data {
         let transform = evaluated_world_transform(scene, id, Some(motion))?;
-        let [a, b, c, d, _, _] = transform.to_components();
-        let determinant = a * d - b * c;
-        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
-            return None;
+        return text_path_contains_world_point(text_path, transform, world_point).then_some(id);
+    }
+    if precision == fanta_canvas::HitPrecision::Path {
+        let transform = evaluated_world_transform(scene, id, Some(motion))?;
+        match &node.data {
+            fanta_doc::NodeData::Vector(vector) => {
+                let [a, b, c, d, _, _] = transform.to_components();
+                let determinant = a * d - b * c;
+                if !transform.is_finite()
+                    || !determinant.is_finite()
+                    || determinant.abs() <= f64::EPSILON
+                {
+                    return None;
+                }
+                let local_point = transform.inverse().transform_point(world_point);
+                return fanta_canvas::point_in_path(&vector.path, local_point).then_some(id);
+            }
+            _ => {}
         }
-        let local_point = transform.inverse().transform_point(world_point);
-        return fanta_canvas::point_in_path(&vector.path, local_point).then_some(id);
     }
     Some(id)
 }
@@ -2368,16 +2733,26 @@ fn oriented_selection(
     OrientedSelection { corners, handles }
 }
 
-fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
-    let node = doc.scene.get(id)?;
+pub(crate) fn authored_local_bounds(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+) -> Option<fanta_doc::Bounds> {
+    let node = scene.get(id)?;
     match &node.data {
         fanta_doc::NodeData::Group(group) => group
             .clip_size
             .or(group.local_size)
             .map(|[width, height]| fanta_doc::Bounds::from_xywh(0.0, 0.0, width, height))
-            .or_else(|| doc.scene.local_bounds(id)),
-        _ => doc.scene.local_bounds(id),
+            .or_else(|| scene.local_bounds(id)),
+        fanta_doc::NodeData::TextPath(text_path) => {
+            fanta_render::text_path_visual_bounds(text_path).or_else(|| scene.local_bounds(id))
+        }
+        _ => scene.local_bounds(id),
     }
+}
+
+fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
+    authored_local_bounds(&doc.scene, id)
 }
 
 /// Prepaint snapshot of one comment pin (owned, so paint holds no doc borrow).
@@ -2528,12 +2903,22 @@ impl CanvasElement {
                 });
             }
         }
-        if let &[id] = doc.selection.as_slice()
-            && let (Some(local), Some(transform)) = (
-                authored_selection_bounds(doc, id),
-                evaluated_world_transform(&doc.scene, id, motion.as_ref()),
+        let selection_frame = if view.tools().kind() == crate::tools::ToolKind::Scale {
+            fanta_tools::ScaleTool::selection_frame_with_resolver(
+                doc,
+                doc.active_page(),
+                Some(authored_local_bounds),
             )
-        {
+        } else if let &[id] = doc.selection.as_slice() {
+            authored_selection_bounds(doc, id).zip(evaluated_world_transform(
+                &doc.scene,
+                id,
+                motion.as_ref(),
+            ))
+        } else {
+            None
+        };
+        if let Some((local, transform)) = selection_frame {
             let oriented = oriented_selection(local, transform);
             data.selection_size = Some((
                 (oriented.corners[1] - oriented.corners[0]).length(),
@@ -2552,8 +2937,13 @@ impl CanvasElement {
         // Comment pins for the active page (annotation overlay, not scene
         // content, so they paint above the rendered canvas like the badges).
         if let Some(page) = doc.active_page() {
+            let active_motion_clip = (view.editor_mode(cx) == EditorMode::Motion)
+                .then(|| view.active_motion_clip_id())
+                .flatten()
+                .filter(|clip| doc.motion.clip(*clip).is_some());
             data.comment_pins = crate::comments::read_comments(doc, page)
                 .into_iter()
+                .filter(|comment| crate::comments::comment_is_visible(comment, active_motion_clip))
                 .map(|comment| CommentPin {
                     world: DVec2::new(comment.world[0], comment.world[1]),
                     author: comment.author.clone(),
@@ -2753,9 +3143,10 @@ impl CanvasElement {
                 ));
             }
 
-            // Resize handles on the selection box, Figma-style, only for the
-            // select tool.
-            if view.tools().kind() == crate::tools::ToolKind::Select {
+            if matches!(
+                view.tools().kind(),
+                crate::tools::ToolKind::Select | crate::tools::ToolKind::Scale
+            ) {
                 let handle_px = px(HANDLE_SIZE);
                 let handles = overlay_data
                     .oriented_selection
@@ -3422,7 +3813,8 @@ mod geometry_tests {
     use super::*;
     use fanta_doc::{
         AnimationClipId, Bounds as WorldBounds, CanvasNode, Color, GroupNode, MotionProperty,
-        MotionTarget, NodeData, ResolvedVarValue, Scene, Transform2D, VectorNode,
+        MotionTarget, NodeData, PathData, ResolvedVarValue, Scene, TextPathNode, Transform2D,
+        VectorNode,
     };
     use std::collections::BTreeMap;
 
@@ -3779,6 +4171,156 @@ mod geometry_tests {
             Some(WorldBounds::from_xywh(0.0, 0.0, 110.0, 20.0))
         );
     }
+
+    #[test]
+    fn text_path_selection_and_world_bounds_use_shaped_glyph_geometry() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "Tight");
+        text_path.style.size_px = 28.0;
+        let exact = fanta_render::text_path_visual_bounds(&text_path)
+            .expect("text path should have shaped visual bounds");
+
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.transform = Transform2D::translation(30.0, -12.0);
+        let node_id = node.id;
+        let mut doc = fanta_doc::Doc::new();
+        doc.scene.insert(node).expect("insert text path");
+
+        assert_eq!(authored_selection_bounds(&doc, node_id), Some(exact));
+        assert_ne!(doc.scene.local_bounds(node_id), Some(exact));
+        assert_eq!(
+            evaluated_world_bounds(&doc.scene, node_id, None),
+            exact.try_transformed(&Transform2D::translation(30.0, -12.0))
+        );
+    }
+
+    #[test]
+    fn text_path_hit_testing_rejects_empty_space_inside_conservative_bounds() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "Tight");
+        text_path.style.size_px = 28.0;
+        let exact = fanta_render::text_path_visual_bounds(&text_path)
+            .expect("text path should have shaped visual bounds");
+        let broad = NodeData::TextPath(text_path.clone())
+            .local_bounds()
+            .expect("text path should have conservative bounds");
+        let broad_only = DVec2::new(broad.center().x, broad.max_y - 1.0);
+        assert!(broad.contains_point(broad_only));
+        assert!(!fanta_render::text_path_contains_point(
+            &text_path,
+            broad_only.to_array()
+        ));
+
+        let mut exact_gap = None;
+        for y_step in 1..20 {
+            for x_step in 1..20 {
+                let point = DVec2::new(
+                    exact.min_x + exact.width() * f64::from(x_step) / 20.0,
+                    exact.min_y + exact.height() * f64::from(y_step) / 20.0,
+                );
+                if !fanta_render::text_path_contains_point(&text_path, point.to_array()) {
+                    exact_gap = Some(point);
+                    break;
+                }
+            }
+            if exact_gap.is_some() {
+                break;
+            }
+        }
+        let exact_gap = exact_gap.expect("visual bounds should include space outside glyph ink");
+
+        let mut scene = Scene::new();
+        let lower = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            broad.min_x - 10.0,
+            broad.min_y - 10.0,
+            broad.width() + 20.0,
+            broad.height() + 20.0,
+            Color::BLACK,
+        )));
+        let lower_id = lower.id;
+        scene.insert(lower).expect("insert lower node");
+
+        let mut upper = CanvasNode::new(NodeData::TextPath(text_path));
+        upper.index = scene.next_root_index();
+        let upper_id = upper.id;
+        scene.insert(upper).expect("insert text path");
+
+        assert_eq!(
+            fanta_canvas::hit_test(&scene, broad_only, fanta_canvas::HitPrecision::Path, None,),
+            Some(upper_id)
+        );
+        assert_eq!(
+            precise_hit_test(&scene, broad_only, fanta_canvas::HitPrecision::Path, None,),
+            Some(lower_id)
+        );
+
+        let motion = MotionEvaluation {
+            clip: AnimationClipId::from_u128(2),
+            playhead_ms: 0,
+            overrides: BTreeMap::new(),
+        };
+        assert_eq!(
+            evaluated_hit_test(
+                &scene,
+                &motion,
+                exact_gap,
+                fanta_canvas::HitPrecision::Bounds,
+                None,
+            ),
+            Some(lower_id)
+        );
+    }
+
+    #[test]
+    fn empty_text_path_keeps_a_small_caret_hit_target() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "");
+        text_path.style.size_px = 28.0;
+        let broad = NodeData::TextPath(text_path.clone())
+            .local_bounds()
+            .expect("empty text path should retain authoring bounds");
+        let caret = fanta_render::text_path_caret_segment(&text_path, 0)
+            .expect("empty text path should expose a fallback caret");
+        let caret_midpoint = (DVec2::from(caret.start) + DVec2::from(caret.end)) * 0.5;
+        let far_from_caret = DVec2::new(broad.max_x - 1.0, broad.max_y - 1.0);
+
+        let mut scene = Scene::new();
+        let lower = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            broad.min_x - 10.0,
+            broad.min_y - 10.0,
+            broad.width() + 20.0,
+            broad.height() + 20.0,
+            Color::BLACK,
+        )));
+        let lower_id = lower.id;
+        scene.insert(lower).expect("insert lower node");
+        let mut upper = CanvasNode::new(NodeData::TextPath(text_path));
+        upper.index = scene.next_root_index();
+        let upper_id = upper.id;
+        scene.insert(upper).expect("insert empty text path");
+
+        assert_eq!(
+            precise_hit_test(
+                &scene,
+                caret_midpoint,
+                fanta_canvas::HitPrecision::Path,
+                None,
+            ),
+            Some(upper_id)
+        );
+        assert_eq!(
+            precise_hit_test(
+                &scene,
+                far_from_caret,
+                fanta_canvas::HitPrecision::Path,
+                None,
+            ),
+            Some(lower_id)
+        );
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -3829,6 +4371,7 @@ mod tests {
             scene: (1, 0),
             epoch: 0,
             motion_frame: None,
+            video_frame: None,
         }
     }
 
@@ -3874,6 +4417,124 @@ mod tests {
         assert_eq!(
             frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::RenderFresh
+        );
+    }
+
+    #[test]
+    fn video_frames_invalidate_pixels_without_recopying_the_document() {
+        let mut scene = Scene::new();
+        let node_id = scene.insert(rect(0., 0.)).expect("scene node");
+        let worker = worker(&scene, 7);
+        let before = serde_json::to_value(&scene).expect("scene before playback");
+        let frame = CanvasVideoFrame {
+            node_id,
+            buffer: create_bgra_pixel_buffer(2, 2).expect("video buffer"),
+            progress: 0.25,
+            session_revision: 3,
+            revision: 10,
+        };
+        let mut cached = surface_key([0., 0.], 1., 7);
+        cached.scene = (scene.instance_id(), scene.revision());
+        cached.video_frame = Some(VideoFrameKey::from(&frame));
+        assert_eq!(
+            frame_decision(&cached, &cached, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::ReuseCached
+        );
+
+        let mut next_pixels = frame.clone();
+        next_pixels.revision += 1;
+        let mut next_progress = frame.clone();
+        next_progress.progress = 0.5;
+        let mut replacement_session = frame.clone();
+        replacement_session.session_revision += 1;
+        let mut other_node = frame;
+        other_node.node_id = NodeId::from_u128(98);
+        for next in [
+            Some(next_pixels),
+            Some(next_progress),
+            Some(replacement_session),
+            Some(other_node),
+            None,
+        ] {
+            let mut requested = cached;
+            requested.video_frame = next.as_ref().map(VideoFrameKey::from);
+            assert_eq!(
+                frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+                FrameDecision::RenderFresh,
+                "a paused frame, progress tick, replaced session or cleared player cannot reuse stale pixels"
+            );
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &requested,
+                    false,
+                    RenderCost::Expensive,
+                    true
+                ),
+                PaintPlan::PresentAndRender
+            );
+            assert_eq!(
+                plan_snapshot_sync(
+                    Some(&worker),
+                    stamp_of(&scene, 7),
+                    worker.fingerprint,
+                    &scene,
+                ),
+                SnapshotSync::Reuse,
+                "playback must not copy the scene for each frame"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&scene).expect("scene after playback"),
+            before
+        );
+    }
+
+    #[test]
+    fn cpu_video_copy_honors_padded_rows_and_owns_its_pixels() {
+        extern "C" fn borrowed_pixels_finished(
+            _context: *mut std::ffi::c_void,
+            _address: *const *const std::ffi::c_void,
+        ) {
+        }
+        let mut pixels: Vec<u8> = vec![
+            0, 0, 255, 255, 0, 255, 0, 255, 19, 23, 29, 31, 37, 41, 43, 47, 255, 0, 0, 255, 255,
+            255, 255, 255, 53, 59, 61, 67, 71, 73, 79, 83,
+        ];
+        // The test owns the backing allocation until this buffer is dropped.
+        // Non-image padding makes a tight-row copy produce different pixels.
+        let buffer = unsafe {
+            CVPixelBuffer::new_with_bytes(
+                kCVPixelFormatType_32BGRA,
+                2,
+                2,
+                pixels.as_mut_ptr().cast(),
+                16,
+                borrowed_pixels_finished,
+                std::ptr::null_mut(),
+                None,
+            )
+        }
+        .expect("padded video buffer");
+        let image = copy_video_frame(&buffer).expect("copy decoded video pixels");
+        drop(buffer);
+        pixels.fill(0);
+        drop(pixels);
+        let info =
+            skia_safe::ImageInfo::new((2, 2), ColorType::RGBA8888, AlphaType::Unpremul, None);
+        let mut actual = [0u8; 16];
+        assert!(image.read_pixels(
+            &info,
+            &mut actual,
+            8,
+            (0, 0),
+            skia_safe::image::CachingHint::Disallow,
+        ));
+        assert_eq!(
+            actual,
+            [
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255
+            ]
         );
     }
 

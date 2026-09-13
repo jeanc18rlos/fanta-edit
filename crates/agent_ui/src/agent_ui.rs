@@ -40,6 +40,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ::ui::IconName;
+use acp_thread::MentionUri;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{AgentProfileId, AgentSettings};
 use command_palette_hooks::CommandPaletteFilter;
@@ -118,6 +119,78 @@ pub fn open_external_prompt_for_review(
     panel.update(cx, |panel, cx| {
         panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
     });
+    workspace.update(cx, |workspace, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    Ok(())
+}
+
+/// Reveals the Agent Panel's current draft and opens its existing Add Context
+/// menu. The toolbar can hand control to the Agent composer without creating a
+/// second attachment store or sending anything on the user's behalf.
+pub fn open_agent_add_context_menu(
+    workspace: Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    if workspace.read(cx).root_paths(cx).is_empty() {
+        return Err(anyhow::anyhow!(
+            "the Agent Panel needs an open project before it can attach context"
+        ));
+    }
+    let panel = workspace
+        .read(cx)
+        .panel::<AgentPanel>(cx)
+        .ok_or_else(|| anyhow::anyhow!("the Agent Panel is not available in this workspace"))?;
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.reveal_panel::<AgentPanel>(window, cx);
+    });
+    panel.update(cx, |panel, cx| {
+        panel.activate_draft_and_open_add_context_menu(window, cx)
+    })?;
+    workspace.update(cx, |workspace, cx| {
+        workspace.focus_panel::<AgentPanel>(window, cx);
+    });
+    Ok(())
+}
+
+/// Attaches an immutable canvas-selection snapshot to the current Agent draft.
+/// The user can inspect/remove the mention and must still send the draft
+/// explicitly.
+pub fn attach_canvas_selection_for_review(
+    workspace: Entity<Workspace>,
+    name: String,
+    content: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    if content.trim().is_empty() {
+        return Err(anyhow::anyhow!("the canvas selection snapshot was empty"));
+    }
+    if workspace.read(cx).root_paths(cx).is_empty() {
+        return Err(anyhow::anyhow!(
+            "the Agent Panel needs an open project before it can attach context"
+        ));
+    }
+    let panel = workspace
+        .read(cx)
+        .panel::<AgentPanel>(cx)
+        .ok_or_else(|| anyhow::anyhow!("the Agent Panel is not available in this workspace"))?;
+    let mention = MentionUri::CanvasSelection { name };
+    let block = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+        acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+            content,
+            mention.to_uri().to_string(),
+        )),
+    ));
+
+    workspace.update(cx, |workspace, cx| {
+        workspace.reveal_panel::<AgentPanel>(window, cx);
+    });
+    panel.update(cx, |panel, cx| {
+        panel.activate_draft_and_insert_external_context(vec![block], window, cx)
+    })?;
     workspace.update(cx, |workspace, cx| {
         workspace.focus_panel::<AgentPanel>(window, cx);
     });

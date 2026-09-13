@@ -469,6 +469,7 @@ pub(crate) struct CommentSnapshot {
     pub(crate) mentions: usize,
     pub(crate) skill: Option<SharedString>,
     pub(crate) resolved: bool,
+    pub(crate) motion_label: Option<SharedString>,
 }
 
 pub(crate) enum PageBackgroundValue {
@@ -864,6 +865,9 @@ pub(crate) fn page_section(
                         .or_else(|| comment.replies.iter().rev().find_map(|reply| reply.skill))
                         .map(|skill| skill.label().into()),
                     resolved: comment.resolved,
+                    motion_label: comment
+                        .motion_anchor
+                        .map(|anchor| crate::comments::motion_comment_label(doc, anchor).into()),
                 })
                 .collect()
         })
@@ -1784,7 +1788,7 @@ pub(crate) fn overlay_selection_typography(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use fanta_doc::{GroupNode, Stroke};
+    use fanta_doc::{GroupNode, PathData, Stroke, TextPathNode};
 
     use super::*;
 
@@ -1988,6 +1992,36 @@ pub(crate) mod tests {
             doc.scene.insert(node).expect("insert rect");
         }
         (doc, ids)
+    }
+
+    #[test]
+    fn text_path_snapshot_size_uses_shaped_glyph_bounds() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "Tight");
+        text_path.style.size_px = 28.0;
+        let exact = fanta_render::text_path_visual_bounds(&text_path)
+            .expect("text path should have shaped visual bounds");
+        let conservative = NodeData::TextPath(text_path.clone())
+            .local_bounds()
+            .expect("text path should have conservative document bounds");
+        assert_ne!(exact, conservative);
+
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.transform =
+            Transform2D::scale_xy(1.5, 0.75).then(&Transform2D::translation(30.0, -12.0));
+        let id = node.id;
+        let mut doc = Doc::new();
+        doc.scene.insert(node).expect("insert text path");
+
+        let masters = HashMap::new();
+        let section = node_section(&doc, id, &masters).expect("text path snapshot");
+        assert!((section.width - exact.width() * 1.5).abs() < 1.0e-9);
+        assert!((section.height - exact.height() * 0.75).abs() < 1.0e-9);
+
+        let multi = multi_section(&doc, &[id], &masters);
+        assert_eq!(multi.width, Some(section.width));
+        assert_eq!(multi.height, Some(section.height));
     }
 
     #[test]

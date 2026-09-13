@@ -1,0 +1,165 @@
+name: Build macOS release
+
+on:
+  push:
+    tags: ['v*']
+    branches: ['codex-release-backend-gateway']
+    paths:
+      - '.github/workflows/release-macos.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'assets/**'
+      - 'script/**'
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Sign and notarize for customer distribution (requires Apple secrets)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  FANTA_RELEASE_CHANNEL: stable
+  FANTA_REQUIRE_NOTARIZATION: ${{ startsWith(github.ref, 'refs/tags/') || inputs.signed || false }}
+
+jobs:
+  build:
+    name: Build Apple Silicon DMG
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/zed/Cargo.toml)
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "::error::Release tag must match crates/zed/Cargo.toml: v${version}"
+            exit 1
+          fi
+
+      - name: Check distribution credentials
+        if: env.FANTA_REQUIRE_NOTARIZATION == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ secrets.APPLE_NOTARIZATION_ISSUER_ID }}
+        run: |
+          for name in MACOS_CERTIFICATE MACOS_CERTIFICATE_PASSWORD APPLE_NOTARIZATION_KEY APPLE_NOTARIZATION_KEY_ID APPLE_NOTARIZATION_ISSUER_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Configure the ${name} repository secret before building for distribution."
+              exit 1
+            fi
+          done
+
+      - name: Install the repository Rust toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          rustup show active-toolchain
+          xcodebuild -version
+          xcrun -sdk macosx --find metal
+          xcrun -sdk macosx --find metallib
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-release-aarch64
+          cache-all-crates: true
+
+      - name: Check licenses
+        run: ./script/check-licenses
+
+      - name: Build and package Fanta
+        env:
+          FANTA_CLIENT_CHECKSUM_SEED: ${{ secrets.FANTA_CLIENT_CHECKSUM_SEED }}
+          MACOS_CERTIFICATE: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.MACOS_CERTIFICATE || '' }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
+          MACOS_SIGNING_IDENTITY: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.MACOS_SIGNING_IDENTITY || '' }}
+          APPLE_NOTARIZATION_KEY: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.APPLE_NOTARIZATION_KEY || '' }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.APPLE_NOTARIZATION_KEY_ID || '' }}
+          APPLE_NOTARIZATION_ISSUER_ID: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.APPLE_NOTARIZATION_ISSUER_ID || '' }}
+        run: |
+          if [[ -n "$FANTA_CLIENT_CHECKSUM_SEED" ]]; then
+            export ZED_CLIENT_CHECKSUM_SEED="$FANTA_CLIENT_CHECKSUM_SEED"
+          fi
+          ./script/bundle-mac aarch64-apple-darwin
+
+      - name: Verify app bundle and record checksums
+        run: |
+          app_path=target/aarch64-apple-darwin/release/dmg/Fanta.app
+          ./script/verify-macos-document-icon "$app_path"
+          ./script/verify-bundled-git "$app_path" --network
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes' "$app_path/Contents/Info.plist" | grep -q fanta
+          cd target/aarch64-apple-darwin/release
+          shasum -a 256 Fanta-aarch64.dmg > SHA256SUMS.txt
+
+      - name: Verify Apple notarization
+        if: env.FANTA_REQUIRE_NOTARIZATION == 'true'
+        run: xcrun stapler validate target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
+
+      - name: Upload installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-macos-aarch64-${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && 'notarized' || 'test-only' }}
+          path: |
+            target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
+            target/aarch64-apple-darwin/release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload crash symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-symbols-aarch64-${{ github.sha }}
+          path: target/aarch64-apple-darwin/release/fanta.dwarf
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize build
+        env:
+          SIGNING_STATUS: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && 'Signed and notarized for distribution.' || 'Ad-hoc signed test build. macOS will block first launch; build with signing enabled before distributing to customers.' }}
+        run: |
+          printf '### Fanta for Apple Silicon\n\n%s\n\nCommit: `%s`\n\nDownload the DMG and checksum from this run’s installer artifact. Crash symbols are stored separately.\n' "$SIGNING_STATUS" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  draft-release:
+    name: Prepare draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-macos-aarch64-notarized
+          path: release
+
+      - name: Create draft with verified installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" release/Fanta-aarch64.dmg release/SHA256SUMS.txt \
+            --draft --verify-tag --generate-notes --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"

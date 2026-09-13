@@ -104,8 +104,8 @@ use super::{
     DesignStrokeCap, DesignStrokeDashMode, DesignStrokeEndpointControl, DesignStrokeJoin,
     DesignStrokeType, DesignStrokeWeightMode, DesignTextCase, DesignTextDecoration,
     DesignTextDecorationColor, DesignTextDecorationMetric, DesignTextDecorationStyle,
-    DesignTextHorizontalAlignment, DesignTextLeadingTrim, DesignTextList,
-    DesignTextPathOrientation, DesignTextPathStartData, DesignTextResize,
+    DesignTextHorizontalAlignment, DesignTextLeadingTrim, DesignTextList, DesignTextPathDirection,
+    DesignTextPathOrientation, DesignTextPathPlacement, DesignTextPathStartData, DesignTextResize,
     DesignTextVerticalAlignment, DesignTransformModifierChange, DesignTransformOperation,
     DesignTransformUnit, DesignTypographyStyleBinding, DesignTypographyStyleViewData,
     DesignTypographyTarget, DesignVariable, DesignVariableImportState, DesignVariableModeViewData,
@@ -1134,6 +1134,9 @@ trait DesignPanelActionEmitter {
 
 impl DesignPanelActionEmitter for Context<'_, DesignPanel> {
     fn emit_design_panel_action(&mut self, panel: &DesignPanel, mut action: DesignPanelAction) {
+        if action.paint_target().is_some() && !panel.node_capability_allows_action(&action) {
+            return;
+        }
         if panel.inspection_context.selection().kind() == DesignPanelSelectionKind::Multiple
             && action.legacy_node_id_mut().is_some()
         {
@@ -3806,7 +3809,12 @@ impl DesignPanel {
             _ => false,
         };
         let can_add = add.is_some_and(|collection| {
-            if !self.collection_is_supported(collection) {
+            if !self.collection_is_supported(collection)
+                || !self
+                    .node
+                    .paint_collection_edit_mode(collection)
+                    .allows_full_controls()
+            {
                 false
             } else if collection == DesignPanelCollection::Export {
                 self.can_export()

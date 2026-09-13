@@ -63,6 +63,50 @@ fn full_subtree_round_trips_losslessly() {
 }
 
 #[test]
+fn embedded_objects_print_identically_across_insertion_orders() {
+    let unsorted = r#"{"z":[{"z":9,"a":"$Colors/Accent"},null,3,false],"a":{"z":21.762165069580078,"a":"literal reference"}}"#;
+    let sorted = r#"{"a":{"a":"literal reference","z":21.762165069580078},"z":[{"a":"$Colors/Accent","z":9},null,3,false]}"#;
+    let mut root = FnxElement::new("Frame");
+    root.attrs.insert(
+        "meta".to_owned(),
+        serde_json::from_str(unsorted).expect("unsorted metadata"),
+    );
+    root.attrs.insert(
+        "background".to_owned(),
+        serde_json::from_str(r#"{"kind":"solid","color":{"r":37,"g":99,"b":235,"a":255}}"#)
+            .expect("solid fill"),
+    );
+    let mut instance = FnxElement::new("Instance");
+    instance.attrs.insert(
+        "component".to_owned(),
+        Value::String("COMP0000000000000000000000".to_owned()),
+    );
+    root.children.push(instance);
+    let original_metadata = serde_json::to_string(&root.attrs["meta"]).expect("original metadata");
+    let source = print_doc("Ordering", &root);
+    assert_eq!(parse_doc(&source).expect("printed source parses"), root);
+    assert_eq!(
+        serde_json::to_string(&root.attrs["meta"]).expect("metadata after print"),
+        original_metadata,
+        "printing must not reorder the caller's opaque metadata"
+    );
+    assert!(source.contains(r##"background={{"color": fnxColor("#2563EB"), "kind": "solid"}}"##));
+    assert!(source.contains(r#"meta={{"a": {"a": "literal reference", "z": 21.762165069580078}, "z": [{"a": "$Colors/Accent", "z": 9}, null, 3, false]}}"#));
+    assert!(source.contains(r#"component="COMP0000000000000000000000""#));
+
+    root.attrs.insert(
+        "meta".to_owned(),
+        serde_json::from_str(sorted).expect("sorted metadata"),
+    );
+    root.attrs.insert(
+        "background".to_owned(),
+        serde_json::from_str(r#"{"color":{"a":255,"b":235,"g":99,"r":37},"kind":"solid"}"#)
+            .expect("reordered solid fill"),
+    );
+    assert_eq!(print_doc("Ordering", &root), source);
+}
+
+#[test]
 fn duplicate_node_ids_are_rejected_before_tree_indexing() {
     let mut nodes = sample();
     let duplicate = nodes[0]["id"].clone();
@@ -79,7 +123,7 @@ fn printed_source_looks_like_react() {
     let tree = tree_from_nodes(&nodes).unwrap();
     let text = print_doc("Card", &tree.root);
     assert!(text.starts_with(
-        "/** @jsxRuntime classic */\n/** @jsx fnxElement */\nimport { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, Vector, Video } from \"../../fnx\";\n"
+        "/** @jsxRuntime classic */\n/** @jsx fnxElement */\nimport { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, TextPath, Vector, Video } from \"../../fnx\";\n"
     ));
     assert!(text.contains("export default function Card()"));
     assert!(text.contains("<Frame"));
@@ -350,9 +394,9 @@ fn sidecar_reconciliation_assigns_ids_and_source_order_to_added_elements() {
     assert_eq!(reconciled.ids[0].id, "ROOT0000000000000000000000");
     assert_eq!(reconciled.ids[0].index, json!(7.0));
     assert_eq!(reconciled.ids[1].id, "OLD00000000000000000000000");
-    assert_eq!(reconciled.ids[1].index, json!(1));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
     assert_eq!(reconciled.ids[2].id, "NEW00000000000000000000000");
-    assert_eq!(reconciled.ids[2].index, json!(2));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
 
     let decoded = decode_subtree(&source, &reconciled).unwrap();
     assert_eq!(
@@ -383,6 +427,54 @@ fn reconcile_fixture() -> (String, FnxSidecar) {
         }),
     ];
     encode_subtree(&nodes, "Page").expect("encode fixture")
+}
+
+#[test]
+fn reconciled_sidecar_indices_match_document_index_serialization() {
+    let (source, sidecar) = reconcile_fixture();
+    let edited = source.replace(
+        "<Vector name=\"A\" />",
+        "<Vector name=\"A\" />\n      <Vector name=\"Added\" />",
+    );
+    assert_ne!(edited, source);
+    let reconciled =
+        reconcile_sidecar(&edited, &sidecar, sequential_minter()).expect("reconcile inserted node");
+    assert_eq!(reconciled.ids.len(), sidecar.ids.len() + 1);
+    for (position, entry) in reconciled.ids.iter().skip(1).enumerate() {
+        let native_index = fanta_doc::IndexKey::from_raw(position as f64 + 1.0);
+        assert_eq!(
+            serde_json::to_vec(&entry.index).expect("sidecar index bytes"),
+            serde_json::to_vec(&native_index).expect("document index bytes"),
+            "a reconciled index must survive materialization and ordinary Save byte-identically"
+        );
+    }
+}
+
+#[test]
+fn sidecar_attribute_edit_preserves_fractional_index_bytes() {
+    let (source, mut sidecar) = reconcile_fixture();
+    for (entry, index) in sidecar
+        .ids
+        .iter_mut()
+        .zip([7.125, 0.125, 1.0000000000000002, 9.75])
+    {
+        entry.index = json!(index);
+    }
+    let original_bytes = serde_json::to_vec(&sidecar).expect("fractional sidecar bytes");
+    let edited = source.replacen("name=\"Page\"", "name=\"Page\" opacity={0.75}", 1);
+    assert_ne!(edited, source);
+    let mut minted = false;
+    let reconciled = reconcile_sidecar(&edited, &sidecar, || {
+        minted = true;
+        "unexpected new identity".to_owned()
+    })
+    .expect("reconcile attribute edit");
+    assert!(!minted);
+    assert_eq!(reconciled, sidecar);
+    assert_eq!(
+        serde_json::to_vec(&reconciled).expect("unchanged fractional sidecar bytes"),
+        original_bytes
+    );
 }
 
 fn sequential_minter() -> impl FnMut() -> String {
@@ -457,10 +549,10 @@ fn inserting_a_mid_tree_element_keeps_every_existing_id() {
     );
     // Indices are normalized to source order on structural change.
     assert_eq!(reconciled.ids[0].index, json!(7.0));
-    assert_eq!(reconciled.ids[1].index, json!(1));
-    assert_eq!(reconciled.ids[2].index, json!(2));
-    assert_eq!(reconciled.ids[3].index, json!(3));
-    assert_eq!(reconciled.ids[4].index, json!(4));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
+    assert_eq!(reconciled.ids[3].index, json!(3.0));
+    assert_eq!(reconciled.ids[4].index, json!(4.0));
 
     // Fingerprints stay in the sidecar only — decoded nodes carry none of them.
     let decoded = decode_subtree(&edited, &reconciled).unwrap();
@@ -616,8 +708,8 @@ fn preorder_preserving_reparent_normalizes_indices_and_keeps_ids() {
     );
     // Sibling indices are normalized to source order (A before B under the
     // page), so the decoded z-order matches the edited source.
-    assert_eq!(reconciled.ids[1].index, json!(1));
-    assert_eq!(reconciled.ids[2].index, json!(2));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
     assert_eq!(reconciled.ids[1].parent_index, Some(0));
     assert_eq!(reconciled.ids[2].parent_index, Some(0));
 }
@@ -738,7 +830,7 @@ fn replacing_the_root_tag_keeps_the_pinned_id_but_rebuilds_the_sidecar() {
         Some("Boolean"),
         "the persisted root fingerprint must track the new tag"
     );
-    assert_eq!(reconciled.ids[1].index, json!(1));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
 }
 
 #[test]
@@ -802,6 +894,7 @@ fn every_nodedata_variant_has_a_tag() {
             Group(_) => "group",
             Vector(_) => "vector",
             Text(_) => "text",
+            TextPath(_) => "text_path",
             Bitmap(_) => "bitmap",
             Video(_) => "video",
             Audio(_) => "audio",
@@ -818,6 +911,7 @@ fn every_nodedata_variant_has_a_tag() {
         "group",
         "vector",
         "text",
+        "text_path",
         "bitmap",
         "video",
         "audio",
@@ -838,6 +932,7 @@ fn tag_type_bijection_covers_all_variants() {
         "group",
         "vector",
         "text",
+        "text_path",
         "bitmap",
         "video",
         "audio",
@@ -869,7 +964,9 @@ fn string_attr_with_special_chars_round_trips() {
 #[test]
 fn real_doc_node_projection_round_trips() {
     use fanta_doc::{
-        CanvasNode, Color, Doc, GroupNode, NodeData, Operation, Stroke, TextNode, VectorNode,
+        CanvasNode, Color, Doc, GroupNode, NodeData, Operation, PathData, Stroke, TextNode,
+        TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide, TextPathStart,
+        VectorNode,
     };
 
     let mut doc = Doc::new();
@@ -897,6 +994,17 @@ fn real_doc_node_projection_round_trips() {
     text.parent = Some(root_id);
     doc.apply(Operation::create_node(text)).unwrap();
 
+    let mut baseline = PathData::new();
+    baseline.move_to(2.0, 3.0).quad_to(20.0, -4.0, 38.0, 3.0);
+    let mut text_path = TextPathNode::new(baseline, "Around the bend");
+    text_path.start = TextPathStart::new(0, 0.25).expect("valid start");
+    text_path.alignment = TextPathAlignment::Center;
+    text_path.direction = TextPathDirection::Reverse;
+    text_path.side = TextPathSide::Flipped;
+    let mut text_path = CanvasNode::new(NodeData::TextPath(text_path));
+    text_path.parent = Some(root_id);
+    doc.apply(Operation::create_node(text_path)).unwrap();
+
     // Pull the per-node Values exactly as write_project_tree does.
     let doc_val = serde_json::to_value(&doc).unwrap();
     let nodes: Vec<Value> = doc_val["scene"]["nodes"]
@@ -905,7 +1013,7 @@ fn real_doc_node_projection_round_trips() {
         .values()
         .cloned()
         .collect();
-    assert_eq!(nodes.len(), 3);
+    assert_eq!(nodes.len(), 4);
 
     let back = round_trip(&nodes);
     assert_same_nodes(&nodes, &back);
@@ -1594,27 +1702,30 @@ fn path_edit_on_authored_rect_falls_back_to_canonical_vector() {
     assert!(patched.contains("<Frame name=\"Card\">"));
 }
 
-/// A legacy generated file whose import line byte-equals a previous printer's
-/// output upgrades to the current import (which names the sugar tags), so a
-/// hand-added `<Rect>` in an old file is not a TypeScript error.
+/// Legacy generated imports upgrade one generation at a time, keeping newly
+/// persisted tags available to TypeScript tooling without duplicating imports.
 #[test]
 fn canonicalizer_upgrades_the_legacy_import_line_in_place() {
-    let legacy_import = "import { AiArtifact, Audio, Boolean, Embed, Frame, Image, Instance, Model3D, NodeGraph, Text, Vector, Video } from \"../../fnx\";";
-    let legacy_source = format!(
-        "{}\n{}\n{legacy_import}\n// @generated fanta source\nexport default () => <Frame name=\"Card\" />;\n",
-        crate::canonicalize::JSX_RUNTIME_PRAGMA,
-        crate::canonicalize::JSX_FACTORY_PRAGMA,
-    );
+    for legacy_import in [
+        "import { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, Vector, Video } from \"../../fnx\";",
+        "import { AiArtifact, Audio, Boolean, Embed, Frame, Image, Instance, Model3D, NodeGraph, Text, Vector, Video } from \"../../fnx\";",
+    ] {
+        let legacy_source = format!(
+            "{}\n{}\n{legacy_import}\n// @generated fanta source\nexport default () => <Frame name=\"Card\" />;\n",
+            crate::canonicalize::JSX_RUNTIME_PRAGMA,
+            crate::canonicalize::JSX_FACTORY_PRAGMA,
+        );
 
-    let upgraded =
-        canonicalize_legacy_source(&legacy_source).expect("legacy import line should upgrade");
-    assert!(upgraded.contains(crate::canonicalize::FNX_TAG_IMPORT));
-    assert!(
-        !upgraded.contains(legacy_import),
-        "old import replaced, not duplicated:\n{upgraded}"
-    );
-    assert_eq!(upgraded.matches("from \"../../fnx\"").count(), 1);
-    assert_eq!(canonicalize_legacy_source(&upgraded), None, "idempotent");
+        let upgraded =
+            canonicalize_legacy_source(&legacy_source).expect("legacy import line should upgrade");
+        assert!(upgraded.contains(crate::canonicalize::FNX_TAG_IMPORT));
+        assert!(
+            !upgraded.contains(legacy_import),
+            "old import replaced, not duplicated:\n{upgraded}"
+        );
+        assert_eq!(upgraded.matches("from \"../../fnx\"").count(), 1);
+        assert_eq!(canonicalize_legacy_source(&upgraded), None, "idempotent");
+    }
 }
 
 #[test]

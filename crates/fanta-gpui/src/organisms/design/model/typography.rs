@@ -863,6 +863,27 @@ impl Default for DesignTextPathStartData {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesignTextPathDirection {
+    Forward,
+    Reverse,
+}
+
+impl DesignTextPathDirection {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Forward => "Forward",
+            Self::Reverse => "Reverse",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DesignTextPathPlacement {
+    pub contour: u32,
+    pub offset: f32,
+}
+
 /// Host-owned projection of which side of a path currently carries its text.
 ///
 /// Figma exposes a native "Flip text orientation" command in the Typography
@@ -901,6 +922,7 @@ impl DesignTextPathOrientation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DesignTextPathViewData {
     pub orientation: DesignTextPathOrientation,
+    pub direction: Option<DesignTextPathDirection>,
     pub can_flip_orientation: bool,
     pub show_start_data_debug_controls: bool,
 }
@@ -909,9 +931,15 @@ impl DesignTextPathViewData {
     pub const fn new(orientation: DesignTextPathOrientation) -> Self {
         Self {
             orientation,
+            direction: None,
             can_flip_orientation: true,
             show_start_data_debug_controls: false,
         }
+    }
+
+    pub const fn with_direction(mut self, direction: DesignTextPathDirection) -> Self {
+        self.direction = Some(direction);
+        self
     }
 
     pub const fn flippable(mut self, can_flip_orientation: bool) -> Self {

@@ -1,6 +1,7 @@
 use fanta_doc::{Bounds, NodeData, NodeFlags, NodeId, Scene, StrokeAlign, StrokeJoin};
 
 use crate::raster::shadow_expanded_local_bounds;
+use crate::raster::text_path_bounds;
 
 /// Conservative world-space bounds of everything that can paint in `root`'s
 /// subtree, including outside/center strokes, drop shadows, and layer blurs.
@@ -47,7 +48,12 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
                 .data
                 .local_bounds()
                 .map(|bounds| expand_for_strokes(bounds, &vector.strokes, vector.path.is_rect()));
-            let own = match (own, vector.local_size) {
+            let viewport = if node.flags.contains(NodeFlags::UNCLIPPED_VECTOR) {
+                None
+            } else {
+                vector.local_size
+            };
+            let own = match (own, viewport) {
                 (Some(bounds), Some([width, height])) => {
                     intersect_bounds(bounds, Bounds::from_xywh(0.0, 0.0, width, height))
                 }
@@ -62,6 +68,7 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
                 .map(|bounds| expand_for_strokes(bounds, &boolean.strokes, false)),
             true,
         ),
+        NodeData::TextPath(text_path) => (text_path_bounds(text_path), false),
         _ => (node.data.local_bounds(), false),
     };
     if !skip_children {
@@ -302,6 +309,25 @@ mod tests {
         assert_eq!(
             visual_world_bounds(&doc.scene, vector, 0.0),
             Some(Bounds::from_xywh(0.0, 0.0, 20.0, 10.0))
+        );
+    }
+
+    #[test]
+    fn path_edit_viewport_flag_preserves_geometry_and_stroke_visual_bounds() {
+        let mut doc = Doc::new();
+        let mut node = rectangle();
+        let vector = node.data.as_vector_mut().expect("vector fixture");
+        vector.path = VectorNode::rect_solid(0., 0., 100., 50., Color::WHITE).path;
+        vector.local_size = Some([20., 10.]);
+        let mut stroke = Stroke::solid(Color::BLACK, 8.);
+        stroke.align = StrokeAlign::Outside;
+        vector.strokes.push(stroke);
+        node.flags.insert(NodeFlags::UNCLIPPED_VECTOR);
+        let id = insert(&mut doc, node);
+        assert_eq!(
+            visual_world_bounds(&doc.scene, id, 0.),
+            Some(Bounds::from_xywh(-8., -8., 116., 66.)),
+            "explicitly unclipped vectors need their full export bounds, even with a remaining box"
         );
     }
 

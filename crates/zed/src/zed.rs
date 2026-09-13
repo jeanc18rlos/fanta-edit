@@ -941,11 +941,19 @@ fn show_software_emulation_warning_if_needed(
 
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
-        // Fanta ships one dock surface: the agent panel. The IDE panels
-        // (project, outline, terminal, git, collab, debug) are not loaded.
-        initialize_agent_panel(workspace_handle, cx.clone())
+        initialize_agent_panel(workspace_handle.clone(), cx.clone())
             .await
             .log_err();
+
+        // Commit, staging, and push actions depend on a mounted GitPanel even
+        // when its dock is closed. Registering their actions alone is not enough.
+        let git_panel =
+            git_ui::git_panel::GitPanel::load(workspace_handle.clone(), cx.clone()).await?;
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            if workspace.panel::<git_ui::git_panel::GitPanel>(cx).is_none() {
+                workspace.add_panel(git_panel, window, cx);
+            }
+        })?;
 
         anyhow::Ok(())
     })

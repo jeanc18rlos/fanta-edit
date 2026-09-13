@@ -33,15 +33,7 @@ pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217)
 pub(crate) const DEFAULT_PAGE_BACKGROUND: FantaColor = FantaColor::rgb(245, 245, 245);
 
 fn inspector_local_bounds(doc: &Doc, id: NodeId) -> Option<FantaBounds> {
-    let node = doc.scene.get(id)?;
-    match &node.data {
-        NodeData::Group(group) => group
-            .clip_size
-            .or(group.local_size)
-            .map(|[width, height]| FantaBounds::from_xywh(0.0, 0.0, width, height))
-            .or_else(|| doc.scene.local_bounds(id)),
-        _ => doc.scene.local_bounds(id),
-    }
+    crate::canvas::authored_local_bounds(&doc.scene, id)
 }
 
 pub(crate) fn inspector_world_size(doc: &Doc, id: NodeId) -> Option<(f64, f64)> {
@@ -996,7 +988,7 @@ pub(crate) fn resize_operations(
     let Some(node) = scene.get(id) else {
         return Vec::new();
     };
-    let Some(scene_local) = scene.local_bounds(id) else {
+    let Some(scene_local) = inspector_local_bounds(doc, id) else {
         return Vec::new();
     };
     let Some(scene_world_transform) = scene.world_transform(id) else {
@@ -1556,7 +1548,9 @@ pub(crate) fn fanta_color_rgba(color: FantaColor) -> Rgba {
 mod tests {
     use super::*;
 
-    use fanta_doc::{ComponentDef, ComponentPropKind, ImageFitMode, InstanceNode};
+    use fanta_doc::{
+        ComponentDef, ComponentPropKind, ImageFitMode, InstanceNode, PathData, TextPathNode,
+    };
 
     use crate::color_picker::GradientKind;
     use crate::properties_snapshot::tests::{frame_group, text_node, vector_with_fill};
@@ -1766,6 +1760,79 @@ mod tests {
             panic!("expected text data");
         };
         text
+    }
+
+    fn text_path_with_exact_bounds() -> (TextPathNode, FantaBounds) {
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0).line_to(240.0, 20.0);
+        let mut text_path = TextPathNode::new(path, "Tight");
+        text_path.style.size_px = 28.0;
+        let exact = fanta_render::text_path_visual_bounds(&text_path)
+            .expect("text path should have shaped visual bounds");
+        let conservative = NodeData::TextPath(text_path.clone())
+            .local_bounds()
+            .expect("text path should have conservative document bounds");
+        assert_ne!(exact, conservative);
+        (text_path, exact)
+    }
+
+    #[test]
+    fn text_path_width_resize_uses_shaped_bounds_and_pins_the_opposite_handle() {
+        let (text_path, exact) = text_path_with_exact_bounds();
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        let angle = 0.35;
+        node.transform = Transform2D::rotation(angle).then(&Transform2D::translation(30.0, -12.0));
+        let id = node.id;
+        let original_data = node.data.clone();
+        let original_transform = node.transform;
+        let mut doc = Doc::new();
+        doc.scene.insert(node).expect("insert text path");
+
+        let fixed_handle = DVec2::new(exact.min_x, exact.center().y);
+        let fixed_world = original_transform.transform_point(fixed_handle);
+        let target_width = exact.width() * 1.6;
+        let operations = resize_operations(&doc, id, target_width, true);
+        assert_eq!(operations.len(), 1);
+        assert!(matches!(
+            operations.first(),
+            Some(Operation::SetTransform { .. })
+        ));
+        for operation in operations {
+            doc.apply(operation).expect("resize text path");
+        }
+
+        let resized = doc.scene.get(id).expect("resized text path");
+        assert_eq!(resized.data, original_data);
+        assert!((transform_angle(&resized.transform) - angle).abs() < 1.0e-9);
+        let resized_fixed_world = resized.transform.transform_point(fixed_handle);
+        assert!((resized_fixed_world - fixed_world).length() < 1.0e-9);
+        let (width, _) = inspector_world_size(&doc, id).expect("text path inspector size");
+        assert!((width - target_width).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn text_path_rotation_uses_the_shaped_glyph_center_as_its_pivot() {
+        let (text_path, exact) = text_path_with_exact_bounds();
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.transform = Transform2D::translation(30.0, -12.0);
+        let id = node.id;
+        let original_data = node.data.clone();
+        let original_transform = node.transform;
+        let pivot = original_transform.transform_point(exact.center());
+        let mut doc = Doc::new();
+        doc.scene.insert(node).expect("insert text path");
+
+        let operations = rotation_operations(&doc, id, 90.0);
+        assert_eq!(operations.len(), 1);
+        for operation in operations {
+            doc.apply(operation).expect("rotate text path");
+        }
+
+        let rotated = doc.scene.get(id).expect("rotated text path");
+        assert_eq!(rotated.data, original_data);
+        assert!((transform_angle(&rotated.transform).to_degrees() - 90.0).abs() < 1.0e-9);
+        let rotated_pivot = rotated.transform.transform_point(exact.center());
+        assert!((rotated_pivot - pivot).length() < 1.0e-9);
     }
 
     #[test]

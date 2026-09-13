@@ -10,7 +10,7 @@ use crate::node::layout::AutoLayout;
 use crate::path::PathData;
 use crate::serde_util::is_false;
 use crate::style::{Fill, Stroke};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
@@ -605,6 +605,172 @@ impl TextNode {
             truncate: false,
             paragraph_spacing: 0.0,
             paragraph_indent: 0.0,
+        }
+    }
+
+    pub fn set_glyph_color(&mut self, color: Color) {
+        self.style.color = color;
+        for run in &mut self.style_runs {
+            run.style.color = color;
+        }
+    }
+}
+
+/// A validated position on one drawable segment of a text path.
+///
+/// `segment` is the zero-based index among drawable commands
+/// (`Line`/`Quad`/`Cubic`/`Close`), excluding `Move`. It is an internal Fanta
+/// index, not a Figma vector-network segment number. `position` is the
+/// normalized curve parameter on that segment, not a second path-distance
+/// representation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextPathStart {
+    segment: u32,
+    #[serde(deserialize_with = "deserialize_text_path_position")]
+    position: f64,
+}
+
+impl TextPathStart {
+    pub const DEFAULT: Self = Self {
+        segment: 0,
+        position: 0.0,
+    };
+
+    /// Construct a start location when `position` is finite and in `0..=1`.
+    pub fn new(segment: u32, position: f64) -> Option<Self> {
+        (position.is_finite() && (0.0..=1.0).contains(&position))
+            .then_some(Self { segment, position })
+    }
+
+    pub const fn segment(self) -> u32 {
+        self.segment
+    }
+
+    pub const fn position(self) -> f64 {
+        self.position
+    }
+
+    pub const fn with_segment(self, segment: u32) -> Self {
+        Self { segment, ..self }
+    }
+
+    pub fn with_position(self, position: f64) -> Option<Self> {
+        Self::new(self.segment, position)
+    }
+
+    fn is_default(value: &Self) -> bool {
+        *value == Self::DEFAULT
+    }
+}
+
+impl Default for TextPathStart {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+fn deserialize_text_path_position<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let position = f64::deserialize(deserializer)?;
+    if position.is_finite() && (0.0..=1.0).contains(&position) {
+        Ok(position)
+    } else {
+        Err(serde::de::Error::custom(
+            "text path position must be finite and in 0..=1",
+        ))
+    }
+}
+
+/// How the shaped text run is anchored to [`TextPathNode::start`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPathAlignment {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl TextPathAlignment {
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
+}
+
+/// Which way distance advances through a text path's baseline geometry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPathDirection {
+    #[default]
+    Forward,
+    Reverse,
+}
+
+impl TextPathDirection {
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
+}
+
+/// Which side of the baseline carries the glyphs.
+///
+/// This is intentionally independent from [`TextPathDirection`]: flipping the
+/// side must not reverse the string's traversal order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPathSide {
+    #[default]
+    Default,
+    Flipped,
+}
+
+impl TextPathSide {
+    fn is_default(value: &Self) -> bool {
+        *value == Self::default()
+    }
+}
+
+/// Editable styled text whose baseline is an owned vector path.
+///
+/// Owning the path avoids a dangling cross-node association when the source
+/// vector is deleted or reordered. A future creation tool can replace a
+/// selected vector's [`NodeData`](crate::node::NodeData) in place, retaining
+/// the wrapper's identity, hierarchy, transform, and effects. This model does
+/// not silently translate a vector's fill/stroke stack into glyph styling:
+/// that conversion remains explicit until fixture-backed import semantics are
+/// defined, and `.fig` `TEXT_PATH` import remains unsupported.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextPathNode {
+    pub path: PathData,
+    pub content: String,
+    #[serde(default)]
+    pub style: TextStyle,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub style_runs: Vec<TextStyleRun>,
+    #[serde(default, skip_serializing_if = "TextPathStart::is_default")]
+    pub start: TextPathStart,
+    #[serde(default, skip_serializing_if = "TextPathAlignment::is_default")]
+    pub alignment: TextPathAlignment,
+    #[serde(default, skip_serializing_if = "TextPathDirection::is_default")]
+    pub direction: TextPathDirection,
+    #[serde(default, skip_serializing_if = "TextPathSide::is_default")]
+    pub side: TextPathSide,
+}
+
+impl TextPathNode {
+    pub fn new(path: PathData, content: impl Into<String>) -> Self {
+        Self {
+            path,
+            content: content.into(),
+            style: TextStyle::default(),
+            style_runs: Vec::new(),
+            start: TextPathStart::default(),
+            alignment: TextPathAlignment::default(),
+            direction: TextPathDirection::default(),
+            side: TextPathSide::default(),
         }
     }
 

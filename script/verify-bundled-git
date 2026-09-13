@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 1 || $# -gt 2 || ( $# -eq 2 && "$2" != --network ) ]]; then
+    echo "Usage: script/verify-bundled-git <app-path> [--network]" >&2
+    exit 1
+fi
+
+app_path=$(cd "$1" && pwd)
+git_binary="$app_path/Contents/MacOS/git"
+git_runtime="$app_path/Contents/Resources/git"
+for executable in "$git_binary" "$git_runtime/libexec/git-core/git-remote-http" "$git_runtime/libexec/git-core/git-remote-https" "$git_runtime/libexec/git-core/git-upload-pack" "$git_runtime/libexec/git-core/git-receive-pack"; do
+    test -x "$executable" || { echo "Missing bundled Git executable: $executable" >&2; exit 1; }
+done
+test -d "$git_runtime/share/git-core/templates"
+
+temporary_directory=$(mktemp -d)
+trap 'rm -rf "$temporary_directory"' EXIT
+mkdir "$temporary_directory/empty-path"
+git_environment=(
+    /usr/bin/env -i
+    "PATH=$temporary_directory/empty-path"
+    "GIT_EXEC_PATH=$git_runtime/libexec/git-core"
+    "GIT_TEMPLATE_DIR=$git_runtime/share/git-core/templates"
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_CONFIG_GLOBAL=/dev/null
+    GIT_TERMINAL_PROMPT=0
+)
+
+"${git_environment[@]}" "$git_binary" --version
+"${git_environment[@]}" "$git_binary" init --quiet --bare "$temporary_directory/remote.git"
+"${git_environment[@]}" "$git_binary" -c init.defaultBranch=main init --quiet "$temporary_directory/worktree"
+"${git_environment[@]}" "$git_binary" -C "$temporary_directory/worktree" \
+    -c user.name='Fanta package verification' -c user.email=package-verification@example.invalid \
+    commit --quiet --allow-empty -m 'Verify bundled Git'
+"${git_environment[@]}" "$git_binary" -C "$temporary_directory/worktree" \
+    push --quiet "$temporary_directory/remote.git" HEAD:refs/heads/main
+"${git_environment[@]}" "$git_binary" -C "$temporary_directory/worktree" \
+    fetch --quiet "$temporary_directory/remote.git" main
+echo "Bundled Git can initialize, commit, push, and fetch with an empty PATH."
+
+if [[ "${2:-}" == --network ]]; then
+    "${git_environment[@]}" "$git_binary" -c credential.helper= \
+        ls-remote https://github.com/desktop/dugite-native.git HEAD
+    echo "Bundled Git HTTPS transport works with an empty PATH and no user credentials."
+fi

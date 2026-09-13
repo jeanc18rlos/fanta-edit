@@ -110,6 +110,7 @@ pub enum DesignPanelProperty {
     TextList,
     TextPathStartSegment,
     TextPathStartPosition,
+    TextPathOffset,
     ComponentProperty(usize),
     SlotStretchChildOnInsert(usize),
     SlotDisplayEmpty(usize),

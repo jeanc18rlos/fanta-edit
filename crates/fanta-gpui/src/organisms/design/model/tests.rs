@@ -1285,6 +1285,30 @@ fn exact_node_capabilities_override_the_other_kind_fallback() {
 }
 
 #[test]
+fn exact_fill_edit_mode_keeps_color_and_opacity_without_paint_structure() {
+    let mut node = DesignPanelNode::new("synthetic", "Synthetic", DesignPanelNodeKind::Rectangle);
+    assert_eq!(
+        node.paint_collection_edit_mode(DesignPanelCollection::Fill),
+        DesignPaintCollectionEditMode::Full
+    );
+
+    node.capabilities = Some(
+        DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::Rectangle)
+            .with_fill_edit_mode(DesignPaintCollectionEditMode::ColorAndOpacityOnly),
+    );
+    let edit_mode = node.paint_collection_edit_mode(DesignPanelCollection::Fill);
+    assert!(edit_mode.allows_property(&DesignPaintProperty::Color));
+    assert!(edit_mode.allows_property(&DesignPaintProperty::Opacity));
+    assert!(!edit_mode.allows_property(&DesignPaintProperty::Visible));
+    assert!(!edit_mode.allows_property(&DesignPaintProperty::Payload));
+    assert_eq!(
+        node.paint_collection_edit_mode(DesignPanelCollection::Stroke),
+        DesignPaintCollectionEditMode::Full,
+        "the exact Fill mode must not narrow other collections"
+    );
+}
+
+#[test]
 fn frame_fill_export_visibility_is_an_explicit_host_capability() {
     assert_eq!(
         DesignPanelNode::new("frame", "Frame", DesignPanelNodeKind::Frame).fill_shows_in_exports,

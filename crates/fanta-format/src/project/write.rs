@@ -3,8 +3,8 @@
 //! The projection is computed **in memory** as a pure function of the doc —
 //! every file the tree should contain, byte-exact — and then applied to disk
 //! as a **diff**: a file is written only when its bytes differ (assets, being
-//! content-addressed, only when missing), and files under the managed
-//! subtrees (`doc/`, `pages/`, `components/`, `assets/`) that the projection
+//! content-addressed, only when missing or incomplete), and files under the
+//! managed subtrees (`doc/`, `pages/`, `components/`, `assets/`) that the projection
 //! no longer contains are pruned, so a deleted node or page leaves no stale
 //! file behind. The net disk state is identical to a full overwrite, but an
 //! edit to one component touches only that component's files — file watchers
@@ -38,6 +38,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -103,8 +104,8 @@ impl ProjectWriteCache {
 /// in-memory projection — only differing files are written, only stale files
 /// are removed; ensures `previews/` and `exports/` exist (their contents are
 /// left alone). Asset files are content-addressed (the id in the filename
-/// names the bytes), so an asset that already exists on disk is never
-/// rewritten.
+/// names the bytes), so an asset already on disk with the expected length is
+/// not rewritten.
 ///
 /// Projects from scratch; a caller that saves the same document repeatedly
 /// should use [`write_project_tree_cached`].
@@ -848,22 +849,89 @@ fn write_if_changed(project_dir: &Path, relative: &Path, bytes: &[u8]) -> Result
     Ok(true)
 }
 
-/// Write `relative` only when nothing exists there. Content-addressed assets
-/// never change under the same filename, so existence is the whole diff — no
-/// need to read large binaries back.
+/// Content-addressed assets never change under the same filename. Checking
+/// length also repairs partial files left by older non-atomic writers without
+/// rereading every large binary; same-length corruption is not detected here.
 fn write_if_missing(project_dir: &Path, relative: &Path, bytes: &[u8]) -> Result<bool> {
+    write_if_missing_with(project_dir, relative, bytes.len(), |file| {
+        file.write_all(bytes)
+    })
+}
+
+fn write_if_missing_with(
+    project_dir: &Path,
+    relative: &Path,
+    expected_length: usize,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<bool> {
     let path = project_dir.join(relative);
-    if path.is_file() {
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.is_file() && metadata.len() == expected_length as u64)
+    {
         return Ok(false);
     }
-    if path.is_dir() {
+    if metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
         fs::remove_dir_all(&path)?;
     }
-    write_with_parents(&path, bytes)?;
+    write_with_parents_with(&path, write)?;
     Ok(true)
 }
 
 fn write_with_parents(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_with_parents_with(path, |file| file.write_all(bytes))
+}
+
+fn write_with_parents_with(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    ensure_parent_directories(path)?;
+    let permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let result = (|| {
+        if let Some(permissions) = permissions {
+            temporary.as_file().set_permissions(permissions)?;
+        }
+        write(temporary.as_file_mut())?;
+        temporary.as_file().sync_all()
+    })();
+    if let Err(error) = result {
+        return Err(discard_project_temporary(temporary, error).into());
+    }
+    if let Err(error) = temporary.persist(path) {
+        return Err(discard_project_temporary(error.file, error.error).into());
+    }
+    Ok(())
+}
+
+fn discard_project_temporary(
+    temporary: tempfile::NamedTempFile,
+    primary: std::io::Error,
+) -> std::io::Error {
+    match temporary.close() {
+        Ok(()) => primary,
+        Err(cleanup) => std::io::Error::new(
+            primary.kind(),
+            format!("{primary}; also failed to remove the temporary project file: {cleanup}"),
+        ),
+    }
+}
+
+fn ensure_parent_directories(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         // A stale regular file can occupy an ancestor directory slot (the old
         // full overwrite bulldozed these); clear the blockers and retry so the
@@ -873,7 +941,6 @@ fn write_with_parents(path: &Path, bytes: &[u8]) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
     }
-    fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -1103,6 +1170,137 @@ fn prune_stale(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn assert_project_source_write_preserves_previous_bytes(name: &str, original: &[u8]) {
+        let directory = tempfile::tempdir().expect("project directory");
+        let destination = directory.path().join(name);
+        write_with_parents(&destination, original).expect("existing project source");
+
+        let error = write_with_parents_with(&destination, |file| {
+            file.write_all(b"incomplete new source")?;
+            Err(std::io::Error::other("injected source write failure"))
+        })
+        .expect_err("partial source write must fail");
+
+        assert!(error.to_string().contains("injected source write failure"));
+        assert_eq!(
+            fs::read(&destination).expect("previous source remains readable"),
+            original
+        );
+        assert_eq!(
+            fs::read_dir(destination.parent().expect("source parent"))
+                .expect("source directory")
+                .count(),
+            1,
+            "failed writes must not leave temporary sources"
+        );
+    }
+
+    #[test]
+    fn project_source_partial_write_failure_preserves_existing_fnx() {
+        assert_project_source_write_preserves_previous_bytes(
+            "pages/home/page.fnx",
+            b"export default <Frame name=\"Preserved design\" />;\n",
+        );
+    }
+
+    #[test]
+    fn project_source_partial_write_failure_preserves_existing_json() {
+        assert_project_source_write_preserves_previous_bytes(
+            "doc/metadata.json",
+            b"{\"name\":\"Preserved design\",\"schema_version\":1}\n",
+        );
+    }
+
+    #[test]
+    fn asset_partial_write_failure_leaves_no_destination() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let relative = Path::new("assets/video/clip.mp4");
+        let error = write_if_missing_with(directory.path(), relative, 64, |file| {
+            file.write_all(b"partial video")?;
+            Err(std::io::Error::other("injected asset write failure"))
+        })
+        .expect_err("partial asset write must fail");
+
+        assert!(error.to_string().contains("injected asset write failure"));
+        assert!(
+            !directory.path().join(relative).exists(),
+            "a failed write must not publish an incomplete asset"
+        );
+        assert_eq!(
+            fs::read_dir(directory.path().join("assets/video"))
+                .expect("asset directory")
+                .count(),
+            0,
+            "failed writes must clean up their temporary files"
+        );
+    }
+
+    #[test]
+    fn asset_partial_write_retry_round_trips_exact_bytes() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let bytes = b"\0\0\0\x18ftypisomcomplete generated video".to_vec();
+        let asset = crate::asset_id_for_bytes(&bytes);
+        let relative = PathBuf::from(format!("assets/video/{asset}.mp4"));
+        let error = write_if_missing_with(directory.path(), &relative, bytes.len(), |file| {
+            file.write_all(&bytes[..12])?;
+            Err(std::io::Error::other("injected asset write failure"))
+        })
+        .expect_err("partial asset write must fail");
+        assert!(error.to_string().contains("injected asset write failure"));
+
+        let assets = BTreeMap::from([(asset, bytes)]);
+        write_project_tree(directory.path(), &Doc::new(), &assets).expect("retry project save");
+        let (_, reopened_assets) =
+            super::super::read_project_tree(directory.path()).expect("reopen saved project");
+        assert_eq!(
+            reopened_assets, assets,
+            "retry must retain the complete media"
+        );
+    }
+
+    #[test]
+    fn asset_short_existing_file_is_repaired_before_reopen() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let bytes = b"\x89PNG\r\n\x1a\ncomplete generated image".to_vec();
+        let asset = crate::asset_id_for_bytes(&bytes);
+        let relative = PathBuf::from(format!("assets/images/{asset}.png"));
+        let assets = BTreeMap::from([(asset, bytes.clone())]);
+        write_project_tree(directory.path(), &Doc::new(), &assets).expect("initial project save");
+        fs::write(directory.path().join(&relative), &bytes[..8])
+            .expect("simulate an interrupted write from an older app version");
+
+        let report = write_project_tree(directory.path(), &Doc::new(), &assets)
+            .expect("repair project save");
+        let (_, reopened_assets) =
+            super::super::read_project_tree(directory.path()).expect("reopen repaired project");
+        assert_eq!(
+            reopened_assets, assets,
+            "repair must restore all media bytes"
+        );
+        assert!(report.written.contains(&relative));
+    }
+
+    #[test]
+    fn asset_complete_existing_file_keeps_the_fast_path() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let relative = Path::new("assets/video/clip.mp4");
+        let bytes = b"complete video";
+        assert!(write_if_missing(directory.path(), relative, bytes).expect("initial asset save"));
+
+        let rewritten = write_if_missing_with(directory.path(), relative, bytes.len(), |_| {
+            Err(std::io::Error::other(
+                "a complete asset must not be rewritten",
+            ))
+        })
+        .expect("unchanged asset save");
+
+        assert!(!rewritten);
+        assert_eq!(
+            fs::read(directory.path().join(relative)).expect("asset"),
+            bytes
+        );
+    }
 
     #[test]
     fn design_slugs_suffix_collisions_in_id_order() {

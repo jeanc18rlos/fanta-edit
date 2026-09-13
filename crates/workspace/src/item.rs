@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -191,6 +191,10 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         self.tab_content_text(0, cx)
     }
 
+    fn suggested_save_as_directory(&self, _cx: &App) -> Option<PathBuf> {
+        None
+    }
+
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         None
     }
@@ -320,6 +324,9 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         unimplemented!("save() must be implemented if can_save() returns true")
+    }
+    fn validate_save_as(&self, _path: PathBuf, _cx: &App) -> Task<Result<()>> {
+        Task::ready(Ok(()))
     }
     fn save_as(
         &mut self,
@@ -501,6 +508,7 @@ pub trait ItemHandle: 'static + Send {
     fn tab_content(&self, params: TabContentParams, window: &Window, cx: &App) -> AnyElement;
     fn tab_content_text(&self, detail: usize, cx: &App) -> SharedString;
     fn suggested_filename(&self, cx: &App) -> SharedString;
+    fn suggested_save_as_directory(&self, cx: &App) -> Option<PathBuf>;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent>;
@@ -556,6 +564,7 @@ pub trait ItemHandle: 'static + Send {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>>;
+    fn validate_save_as(&self, path: PathBuf, cx: &App) -> Task<Result<()>>;
     fn save_as(
         &self,
         project: Entity<Project>,
@@ -652,6 +661,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn suggested_filename(&self, cx: &App) -> SharedString {
         self.read(cx).suggested_filename(cx)
+    }
+
+    fn suggested_save_as_directory(&self, cx: &App) -> Option<PathBuf> {
+        self.read(cx).suggested_save_as_directory(cx)
     }
 
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon> {
@@ -1084,6 +1097,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         cx: &mut App,
     ) -> Task<Result<()>> {
         self.update(cx, |item, cx| item.save(options, project, window, cx))
+    }
+
+    fn validate_save_as(&self, path: PathBuf, cx: &App) -> Task<Result<()>> {
+        self.read(cx).validate_save_as(path, cx)
     }
 
     fn save_as(

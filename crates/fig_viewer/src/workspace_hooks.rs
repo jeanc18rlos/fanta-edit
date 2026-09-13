@@ -37,6 +37,7 @@ pub fn init(cx: &mut App) {
             return;
         };
         crate::new_design::register(workspace);
+        crate::generation_workspace::register(workspace);
         crate::live_mcp::register(workspace);
 
         let project = workspace.project().clone();

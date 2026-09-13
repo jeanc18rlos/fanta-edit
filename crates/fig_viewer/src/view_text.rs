@@ -6,15 +6,16 @@ use std::ops::Range;
 
 use fanta_canvas::HitPrecision;
 use fanta_doc::{NodeData, NodeId};
+use fanta_render::TextPathVisualDirection;
 use glam::DVec2;
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, ContentMask, Context, ElementInputHandler,
     EntityInputHandler, KeyDownEvent, MouseDownEvent, PathBuilder, Pixels, Point, UTF16Selection,
-    Window, canvas, fill, point, px, size,
+    Window, canvas, point, px,
 };
 use ui::prelude::*;
 
-use crate::canvas::{bounds_size, screen_position_in_bounds};
+use crate::canvas::{bounds_size, precise_hit_test_screen, screen_position_in_bounds};
 use crate::document::DocChange;
 use crate::instance_text;
 use crate::text_edit::{self, CARET_BLINK_INTERVAL, CanvasTextEdit, TextEditSession};
@@ -28,45 +29,47 @@ impl FigView {
         let bounds = self.container_bounds?;
         let viewport = self.viewport?;
         let (width, height) = bounds_size(bounds);
+        let screen_size = DVec2::new(width, height);
         let item = self.item.read(cx);
         let document = item.document()?;
         let doc = &document.doc;
-        let hit = fanta_canvas::hit_test_screen(
+        let world_point = fanta_canvas::screen_to_world(screen, &viewport, screen_size);
+        let hits = fanta_canvas::hit_test_deep(
             &doc.scene,
-            &viewport,
-            DVec2::new(width, height),
-            screen,
+            world_point,
             HitPrecision::Path,
             doc.active_page(),
-        )?;
-        if matches!(doc.scene.get(hit)?.data, NodeData::Text(_)) {
-            return Some(hit);
-        }
-        // Check ancestors (e.g. text containing other hittable nodes)
-        if let Some(text) = doc
-            .scene
-            .ancestors_of(hit)
-            .find(|node| matches!(node.data, NodeData::Text(_)))
-            .map(|node| node.id)
-        {
-            return Some(text);
-        }
-        // Also search descendants: text nodes inside a frame/group that was hit
-        // (common case: artboard frame containing text layers). We pick the
-        // first Text descendant whose world bounds contain the click point.
-        for desc_id in doc.scene.descendants_of(hit) {
-            if let Some(node) = doc.scene.get(desc_id) {
-                if matches!(node.data, NodeData::Text(_)) {
-                    let contains = text_edit::node_contains_screen(
+        );
+        for hit in hits {
+            if matches!(
+                doc.scene.get(hit)?.data,
+                NodeData::Text(_) | NodeData::TextPath(_)
+            ) && text_edit::node_contains_screen(doc, hit, screen, &viewport, screen_size)
+            {
+                return Some(hit);
+            }
+            // Check ancestors (e.g. text containing other hittable nodes).
+            if let Some(text) = doc.scene.ancestors_of(hit).find(|node| {
+                matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
+                    && text_edit::node_contains_screen(doc, node.id, screen, &viewport, screen_size)
+            }) {
+                return Some(text.id);
+            }
+            // Also search descendants: text nodes inside a frame/group that was
+            // hit. The renderer-backed predicate rejects empty areas inside a
+            // curved text layer's conservative spatial-index bounds.
+            for descendant_id in doc.scene.descendants_of(hit) {
+                if let Some(node) = doc.scene.get(descendant_id)
+                    && matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
+                    && text_edit::node_contains_screen(
                         doc,
-                        desc_id,
+                        descendant_id,
                         screen,
                         &viewport,
-                        DVec2::new(width, height),
-                    );
-                    if contains {
-                        return Some(desc_id);
-                    }
+                        screen_size,
+                    )
+                {
+                    return Some(descendant_id);
                 }
             }
         }
@@ -89,7 +92,7 @@ impl FigView {
         let item = self.item.read(cx);
         let document = item.document()?;
         let doc = &document.doc;
-        let hit = fanta_canvas::hit_test_screen(
+        let hit = precise_hit_test_screen(
             &doc.scene,
             &viewport,
             screen_size,
@@ -116,7 +119,11 @@ impl FigView {
         let item = self.item.read(cx);
         let document = item.document()?;
         let anchor = document.doc.selection.anchor()?;
-        matches!(document.doc.scene.get(anchor)?.data, NodeData::Text(_)).then_some(anchor)
+        matches!(
+            document.doc.scene.get(anchor)?.data,
+            NodeData::Text(_) | NodeData::TextPath(_)
+        )
+        .then_some(anchor)
     }
 
     /// The single selected node, when it is a text node — the target for
@@ -127,7 +134,11 @@ impl FigView {
         let &[node] = document.doc.selection.as_slice() else {
             return None;
         };
-        matches!(document.doc.scene.get(node)?.data, NodeData::Text(_)).then_some(node)
+        matches!(
+            document.doc.scene.get(node)?.data,
+            NodeData::Text(_) | NodeData::TextPath(_)
+        )
+        .then_some(node)
     }
 
     /// Open an in-place editing session on `node`, committing any session
@@ -139,7 +150,7 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_editable(cx) {
+        if !self.text_preview_mutation_allowed(cx) {
             return;
         }
         if let Some(edit) = self.text_edit.as_ref() {
@@ -148,16 +159,18 @@ impl FigView {
             }
             self.commit_text_edit(cx);
         }
-        let text = self.item.read(cx).document().and_then(|document| {
+        let session = self.item.read(cx).document().and_then(|document| {
             match &document.doc.scene.get(node)?.data {
-                NodeData::Text(text) => Some(text.clone()),
+                NodeData::Text(text) => Some(TextEditSession::new(node, text)),
+                NodeData::TextPath(text_path) => {
+                    Some(TextEditSession::new_text_path(node, text_path))
+                }
                 _ => None,
             }
         });
-        let Some(text) = text else {
+        let Some(mut session) = session else {
             return;
         };
-        let mut session = TextEditSession::new(node, &text);
         self.seed_session(&mut session, seed, cx);
         self.install_text_session(session, window, cx);
     }
@@ -173,7 +186,7 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_editable(cx) {
+        if !self.text_preview_mutation_allowed(cx) {
             return;
         }
         if let Some(edit) = self.text_edit.as_ref() {
@@ -232,6 +245,17 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(error) = session.invalid_style_run() {
+            log::error!("refusing to edit text with invalid saved formatting: {error}");
+            crate::view::show_canvas_notice(
+                format!(
+                    "This text cannot be edited because its saved formatting is invalid: {error}"
+                ),
+                window,
+                cx,
+            );
+            return;
+        }
         let select_id = session.node_id();
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
@@ -265,18 +289,22 @@ impl FigView {
     /// like the select tool's drag: rewind to the pre-edit data, then apply
     /// `ReplaceData { old: original, new: final }` through history.
     pub(crate) fn commit_text_edit(&mut self, cx: &mut Context<Self>) {
+        if self.text_edit.is_none() {
+            return;
+        }
+        let preview_owner = cx.entity_id();
+        if !self.item.read(cx).can_preview_for_owner(preview_owner) {
+            return;
+        }
         let Some(edit) = self.text_edit.take() else {
             return;
         };
         cx.notify();
-        if !self.is_editable(cx) {
-            return;
-        }
         let session = edit.session;
         let operations = self
             .item
             .update(cx, |item, cx| {
-                item.with_document(cx, |document| {
+                item.with_document_for_owner(preview_owner, cx, |document| {
                     text_edit::rewind_preview(&mut document.doc, &session);
                     let operations = text_edit::commit_ops(&document.doc, &session);
                     // The rewind never reaches the screen: the apply below
@@ -286,14 +314,22 @@ impl FigView {
             })
             .unwrap_or_default();
         if operations.is_empty() {
+            self.item.update(cx, |item, cx| {
+                item.finish_content_preview(preview_owner, false, cx);
+            });
             return;
         }
         self.item.update(cx, |item, cx| {
+            let mut committed = false;
             for operation in operations {
-                if let Err(error) = item.apply(operation, cx) {
-                    log::error!("fig_viewer text edit failed to commit: {error:#}");
+                match item.apply_for_preview_owner(preview_owner, operation, cx) {
+                    Ok(()) => committed = true,
+                    Err(error) => {
+                        log::error!("fig_viewer text edit failed to commit: {error:#}")
+                    }
                 }
             }
+            item.finish_content_preview(preview_owner, committed, cx);
         });
     }
 
@@ -310,7 +346,7 @@ impl FigView {
                 .doc
                 .scene
                 .get(edit.session.node_id())
-                .is_some_and(|node| is_instance || matches!(node.data, NodeData::Text(_)))
+                .is_some_and(|node| is_instance || edit.session.matches_node_data(&node.data))
         });
         if !target_exists {
             // The node (and with it the preview content) is gone; there is
@@ -337,7 +373,7 @@ impl FigView {
         let (width, height) = bounds_size(bounds);
         let screen_size = DVec2::new(width, height);
         let screen = screen_position_in_bounds(event.position, bounds);
-        let byte = {
+        let position = {
             let Some(document) = self.item.read(cx).document() else {
                 return false;
             };
@@ -346,20 +382,20 @@ impl FigView {
                 return false;
             };
             if text_edit::session_contains_screen(doc, session, screen, &viewport, screen_size) {
-                text_edit::session_byte_at_screen(doc, session, screen, &viewport, screen_size)
+                text_edit::session_position_at_screen(doc, session, screen, &viewport, screen_size)
             } else {
                 None
             }
         };
-        let Some(byte) = byte else {
+        let Some(position) = position else {
             self.commit_text_edit(cx);
             return false;
         };
         if let Some(edit) = self.text_edit.as_mut() {
             if event.click_count >= 2 {
-                edit.session.select_word_at(byte);
+                edit.session.select_word_at(position.byte);
             } else {
-                edit.session.click(byte, event.modifiers.shift);
+                edit.session.click_position(position, event.modifiers.shift);
             }
             edit.session.dragging = true;
         }
@@ -385,7 +421,7 @@ impl FigView {
         };
         let (width, height) = bounds_size(bounds);
         let screen_size = DVec2::new(width, height);
-        let (inside, byte) = {
+        let (inside, position) = {
             let Some(document) = self.item.read(cx).document() else {
                 return false;
             };
@@ -395,12 +431,12 @@ impl FigView {
             };
             let inside =
                 text_edit::session_contains_screen(doc, session, screen, &viewport, screen_size);
-            let byte = if dragging {
-                text_edit::session_byte_at_screen(doc, session, screen, &viewport, screen_size)
+            let position = if dragging {
+                text_edit::session_position_at_screen(doc, session, screen, &viewport, screen_size)
             } else {
                 None
             };
-            (inside, byte)
+            (inside, position)
         };
         let Some(edit) = self.text_edit.as_mut() else {
             return false;
@@ -412,8 +448,8 @@ impl FigView {
         if !dragging {
             return false;
         }
-        if let Some(byte) = byte {
-            edit.session.drag_to(byte);
+        if let Some(position) = position {
+            edit.session.drag_to_position(position);
             self.reset_caret_blink(cx);
             self.notify_text_selection_changed(cx);
             cx.notify();
@@ -429,6 +465,9 @@ impl FigView {
         cx: &mut Context<Self>,
         edit_session: impl FnOnce(&mut TextEditSession),
     ) {
+        if !self.text_preview_mutation_allowed(cx) {
+            return;
+        }
         {
             let Some(edit) = self.text_edit.as_mut() else {
                 return;
@@ -467,10 +506,14 @@ impl FigView {
     }
 
     fn sync_text_preview(&mut self, cx: &mut Context<Self>) {
+        if !self.text_preview_mutation_allowed(cx) {
+            return;
+        }
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         if let Some(edit) = self.text_edit.as_ref() {
             item.update(cx, |item, cx| {
-                item.with_document(cx, |document| {
+                item.with_document_for_preview_owner(preview_owner, cx, |document| {
                     text_edit::apply_preview(&mut document.doc, &edit.session);
                     ((), DocChange::ContentPreview)
                 });
@@ -527,6 +570,9 @@ impl FigView {
         buffer: fanta_text::TextBuffer,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.text_preview_mutation_allowed(cx) {
+            return false;
+        }
         let Some(edit) = self.text_edit.as_mut() else {
             return false;
         };
@@ -547,6 +593,9 @@ impl FigView {
         cx: &mut Context<Self>,
         patch: impl Fn(&mut fanta_text::TextStyle),
     ) -> bool {
+        if !self.text_preview_mutation_allowed(cx) {
+            return false;
+        }
         if let Some(edit) = self.text_edit.as_mut() {
             if let Err(error) = edit.session.patch_style_to_selection(patch) {
                 log::error!("fig_viewer failed to style the text selection: {error}");
@@ -556,6 +605,14 @@ impl FigView {
             return true;
         }
         false
+    }
+
+    pub(crate) fn has_active_text_edit(&self) -> bool {
+        self.text_edit.is_some()
+    }
+
+    fn text_preview_mutation_allowed(&self, cx: &Context<Self>) -> bool {
+        self.item.read(cx).can_preview_for_owner(cx.entity_id())
     }
 
     fn text_edit_insert(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -579,6 +636,75 @@ impl FigView {
         };
         if let Some(target) = target {
             self.with_text_session_move(cx, |session| session.move_to(target, extend));
+        }
+    }
+
+    fn text_edit_horizontal_move(
+        &mut self,
+        direction: TextPathVisualDirection,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let is_text_path = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|edit| edit.session.is_text_path());
+        if !is_text_path {
+            self.with_text_session_move(cx, |session| match direction {
+                TextPathVisualDirection::Previous => session.move_left(extend),
+                TextPathVisualDirection::Next => session.move_right(extend),
+            });
+            return;
+        }
+
+        let target = {
+            let Some(edit) = self.text_edit.as_ref() else {
+                return;
+            };
+            let Some(document) = self.item.read(cx).document() else {
+                return;
+            };
+            text_edit::session_text_path_horizontal_target(
+                &document.doc,
+                &edit.session,
+                direction,
+                extend,
+            )
+        };
+        if let Some(target) = target {
+            self.with_text_session_move(cx, |session| session.move_to_position(target, extend));
+        }
+    }
+
+    fn text_edit_line_edge(
+        &mut self,
+        direction: TextPathVisualDirection,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let is_text_path = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|edit| edit.session.is_text_path());
+        if !is_text_path {
+            self.with_text_session_move(cx, |session| match direction {
+                TextPathVisualDirection::Previous => session.move_line_start(extend),
+                TextPathVisualDirection::Next => session.move_line_end(extend),
+            });
+            return;
+        }
+
+        let target = {
+            let Some(edit) = self.text_edit.as_ref() else {
+                return;
+            };
+            let Some(document) = self.item.read(cx).document() else {
+                return;
+            };
+            text_edit::session_text_path_visual_line_edge(&document.doc, &edit.session, direction)
+        };
+        if let Some(target) = target {
+            self.with_text_session_move(cx, |session| session.move_to_position(target, extend));
         }
     }
 
@@ -688,27 +814,27 @@ impl FigView {
                 true
             }
             "left" if command => {
-                self.with_text_session_move(cx, |session| session.move_line_start(shift));
+                self.text_edit_line_edge(TextPathVisualDirection::Previous, shift, cx);
                 true
             }
             "right" if command => {
-                self.with_text_session_move(cx, |session| session.move_line_end(shift));
+                self.text_edit_line_edge(TextPathVisualDirection::Next, shift, cx);
                 true
             }
             "home" => {
-                self.with_text_session_move(cx, |session| session.move_line_start(shift));
+                self.text_edit_line_edge(TextPathVisualDirection::Previous, shift, cx);
                 true
             }
             "end" => {
-                self.with_text_session_move(cx, |session| session.move_line_end(shift));
+                self.text_edit_line_edge(TextPathVisualDirection::Next, shift, cx);
                 true
             }
             "left" => {
-                self.with_text_session_move(cx, |session| session.move_left(shift));
+                self.text_edit_horizontal_move(TextPathVisualDirection::Previous, shift, cx);
                 true
             }
             "right" => {
-                self.with_text_session_move(cx, |session| session.move_right(shift));
+                self.text_edit_horizontal_move(TextPathVisualDirection::Next, shift, cx);
                 true
             }
             "up" if command => {
@@ -784,20 +910,14 @@ impl FigView {
         let selection_color = gpui::hsla(0.6, 0.85, 0.55, 0.45);
         let caret_color = cx.theme().players().local().cursor.alpha(1.0);
 
-        let to_bounds = |[x, y, w, h]: [f64; 4]| Bounds {
-            origin: point(px(x as f32), px(y as f32)),
-            size: size(px(w as f32), px(h as f32)),
-        };
-        let selection_rects: Vec<Bounds<Pixels>> = text_edit::session_selection_rects(
+        let selection_quads = text_edit::session_selection_quads(
             doc,
             session,
             session.selected_range(),
             &viewport,
             screen_size,
-        )
-        .into_iter()
-        .map(to_bounds)
-        .collect();
+        );
+        let caret_width = (viewport.zoom * 1.5).clamp(1.0, 3.0);
         let caret = edit
             .caret_visible()
             .then(|| {
@@ -809,17 +929,7 @@ impl FigView {
                     screen_size,
                 )
             })
-            .flatten()
-            .map(|(top, bottom)| {
-                // A hairline bar that thickens slightly with zoom, like Figma.
-                let caret_width = (viewport.zoom * 1.5).clamp(1.0, 3.0);
-                to_bounds([
-                    top.x - caret_width * 0.5,
-                    top.y.min(bottom.y),
-                    caret_width,
-                    (bottom.y - top.y).abs().max(1.0),
-                ])
-            });
+            .flatten();
         let baseline = text_edit::session_baseline_segment(doc, session, &viewport, screen_size);
 
         // The selection/caret rects from the helpers are in "viewport screen"
@@ -866,19 +976,45 @@ impl FigView {
                                     }
                                 }
                             }
-                            for rect in selection_rects {
-                                let rect = Bounds {
-                                    origin: offset + rect.origin,
-                                    size: rect.size,
+                            for quad in selection_quads {
+                                let mut builder = PathBuilder::fill();
+                                let mut points = quad.into_iter().map(|screen_point| {
+                                    point(
+                                        offset.x + px(screen_point.x as f32),
+                                        offset.y + px(screen_point.y as f32),
+                                    )
+                                });
+                                let Some(first) = points.next() else {
+                                    continue;
                                 };
-                                window.paint_quad(fill(rect, selection_color));
+                                builder.move_to(first);
+                                for point in points {
+                                    builder.line_to(point);
+                                }
+                                builder.close();
+                                match builder.build() {
+                                    Ok(path) => window.paint_path(path, selection_color),
+                                    Err(error) => log::warn!(
+                                        "failed to build text selection highlight: {error:#}"
+                                    ),
+                                }
                             }
-                            if let Some(rect) = caret {
-                                let rect = Bounds {
-                                    origin: offset + rect.origin,
-                                    size: rect.size,
-                                };
-                                window.paint_quad(fill(rect, caret_color));
+                            if let Some((start, end)) = caret {
+                                let mut builder = PathBuilder::stroke(px(caret_width as f32));
+                                builder.move_to(point(
+                                    offset.x + px(start.x as f32),
+                                    offset.y + px(start.y as f32),
+                                ));
+                                builder.line_to(point(
+                                    offset.x + px(end.x as f32),
+                                    offset.y + px(end.y as f32),
+                                ));
+                                match builder.build() {
+                                    Ok(path) => window.paint_path(path, caret_color),
+                                    Err(error) => {
+                                        log::warn!("failed to build text caret: {error:#}")
+                                    }
+                                }
                             }
                         },
                     );
@@ -954,6 +1090,9 @@ impl EntityInputHandler for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.text_preview_mutation_allowed(cx) {
+            return;
+        }
         {
             let Some(edit) = self.text_edit.as_mut() else {
                 return;
@@ -975,6 +1114,9 @@ impl EntityInputHandler for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.text_preview_mutation_allowed(cx) {
+            return;
+        }
         {
             let Some(edit) = self.text_edit.as_mut() else {
                 return;
@@ -1016,14 +1158,18 @@ impl EntityInputHandler for FigView {
             &viewport,
             DVec2::new(width, height),
         )?;
+        let min_x = top.x.min(bottom.x);
+        let max_x = top.x.max(bottom.x);
+        let min_y = top.y.min(bottom.y);
+        let max_y = top.y.max(bottom.y);
         Some(Bounds::from_corners(
             point(
-                element_bounds.origin.x + px(top.x as f32),
-                element_bounds.origin.y + px(top.y.min(bottom.y) as f32),
+                element_bounds.origin.x + px(min_x as f32),
+                element_bounds.origin.y + px(min_y as f32),
             ),
             point(
-                element_bounds.origin.x + px(top.x as f32 + 2.0),
-                element_bounds.origin.y + px(top.y.max(bottom.y) as f32),
+                element_bounds.origin.x + px(max_x as f32 + 2.0),
+                element_bounds.origin.y + px(max_y as f32),
             ),
         ))
     }

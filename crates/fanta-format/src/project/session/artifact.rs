@@ -653,9 +653,9 @@ impl ArtifactSession {
                 let mut files = Vec::new();
                 let (fnx_name, ids_name, header_name) = file_names(self.kind);
                 files.push((fnx_name.to_owned(), source.as_bytes().to_vec()));
-                let mut sidecar_bytes = serde_json::to_vec_pretty(&reconciled)
+                let sidecar_value = serde_json::to_value(&reconciled)
                     .map_err(|e| SessionError::other(e.to_string()))?;
-                sidecar_bytes.push(b'\n');
+                let sidecar_bytes = json_bytes(&sidecar_value)?;
                 files.push((ids_name.to_owned(), sidecar_bytes));
                 let header = self.base_nodes.header.clone();
                 files.push((
@@ -682,9 +682,9 @@ impl ArtifactSession {
         let (fnx_name, ids_name, header_name) = file_names(self.kind);
         let mut files = Vec::new();
         files.push((fnx_name.to_owned(), text.into_bytes()));
-        let mut sidecar_bytes = serde_json::to_vec_pretty(ir.sidecar())
-            .map_err(|e| SessionError::other(e.to_string()))?;
-        sidecar_bytes.push(b'\n');
+        let sidecar_value =
+            serde_json::to_value(ir.sidecar()).map_err(|e| SessionError::other(e.to_string()))?;
+        let sidecar_bytes = json_bytes(&sidecar_value)?;
         files.push((ids_name.to_owned(), sidecar_bytes));
         files.push((
             header_name.to_owned(),

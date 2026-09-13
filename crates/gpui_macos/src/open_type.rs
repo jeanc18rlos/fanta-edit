@@ -79,10 +79,9 @@ fn generate_feature_array(features: &FontFeatures) -> CFMutableArrayRef {
         let feature_array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         for (tag, value) in features.tag_value_list() {
             let keys = [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue];
-            let values = [
-                CFString::new(tag).as_CFTypeRef(),
-                CFNumber::from(*value as i32).as_CFTypeRef(),
-            ];
+            let tag = CFString::new(tag);
+            let value = CFNumber::from(*value as i32);
+            let values = [tag.as_CFTypeRef(), value.as_CFTypeRef()];
             let dict = CFDictionaryCreate(
                 kCFAllocatorDefault,
                 &keys as *const _ as _,
@@ -91,7 +90,6 @@ fn generate_feature_array(features: &FontFeatures) -> CFMutableArrayRef {
                 &kCFTypeDictionaryKeyCallBacks,
                 &kCFTypeDictionaryValueCallBacks,
             );
-            values.into_iter().for_each(|value| CFRelease(value));
             CFArrayAppendValue(feature_array, dict as _);
             CFRelease(dict as _);
         }
@@ -188,4 +186,64 @@ unsafe extern "C" {
         font: CTFontRef,
         languagePrefList: CFArrayRef,
     ) -> CFArrayRef;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use core_foundation::{base::CFType, dictionary::CFDictionary as FoundationDictionary};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_feature_array_retains_tag_and_value_owners() -> anyhow::Result<()> {
+        let expected = [("calt", 0), ("liga", 1), ("cv01", 65535)];
+        let features = FontFeatures(Arc::new(
+            expected
+                .iter()
+                .map(|(tag, value)| (tag.to_string(), *value))
+                .collect(),
+        ));
+        let array: CFArray<FoundationDictionary<CFType, CFType>> = unsafe {
+            CFArray::wrap_under_create_rule(generate_feature_array(&features) as CFArrayRef)
+        };
+        drop(features);
+        assert_eq!(array.len(), expected.len() as isize);
+        let tag_key = unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureTag) };
+        let value_key = unsafe { CFString::wrap_under_get_rule(kCTFontOpenTypeFeatureValue) };
+        for (dictionary, (expected_tag, expected_value)) in array.iter().zip(expected) {
+            let tag = dictionary
+                .find(tag_key.as_CFTypeRef())
+                .context("retained feature tag")?
+                .downcast::<CFString>()
+                .context("feature tag is a string")?;
+            let value = dictionary
+                .find(value_key.as_CFTypeRef())
+                .context("retained feature value")?
+                .downcast::<CFNumber>()
+                .context("feature value is a number")?;
+            assert_eq!(tag.to_string(), expected_tag);
+            assert_eq!(value.to_i32(), Some(expected_value as i32));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_applying_features_preserves_usable_font() -> anyhow::Result<()> {
+        let native = core_text::font::new_from_name("Helvetica", 16.0)
+            .map_err(|()| anyhow::anyhow!("load Helvetica"))?;
+        let mut font = unsafe { FontKitFont::from_core_text_font_no_path(native) };
+        let original_name = font.postscript_name();
+        let original_glyph = font.glyph_for_char('m');
+        let features = FontFeatures(Arc::new(vec![("calt".into(), 0), ("liga".into(), 1)]));
+        apply_features_and_fallbacks(&mut font, &features, None)?;
+        drop(features);
+        assert_eq!(font.postscript_name(), original_name);
+        assert_eq!(font.glyph_for_char('m'), original_glyph);
+        let glyph = font.glyph_for_char('m').context("usable m glyph")?;
+        let advance = font.advance(glyph)?;
+        assert!(advance.x().is_finite() && advance.x() > 0.0);
+        assert!(font.metrics().units_per_em > 0);
+        Ok(())
+    }
 }

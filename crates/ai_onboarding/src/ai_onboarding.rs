@@ -102,15 +102,38 @@ impl ZedAiOnboarding {
     }
 
     fn render_model_setup(&self) -> AnyElement {
+        let (headline, description, button_label, callback) = match self.sign_in_status {
+            SignInStatus::SignedOut => (
+                "Create with Fanta AI",
+                "Sign in to use your Fanta plan and credits for design assistance and generation.",
+                "Sign in to Fanta",
+                self.sign_in.clone(),
+            ),
+            SignInStatus::SigningIn => (
+                "Connect your Fanta account",
+                "Finish signing in in your browser to return to your design.",
+                "Signing in…",
+                self.sign_in.clone(),
+            ),
+            SignInStatus::SignedIn => (
+                "Your Fanta account",
+                "Use your Fanta plan and credits to work with AI in this project.",
+                "Continue with Fanta",
+                self.continue_with_zed_ai.clone(),
+            ),
+        };
         v_flex()
             .w_full()
             .relative()
             .gap_1()
-            .child(Headline::new("Connect a Model"))
+            .child(Headline::new(headline))
+            .child(Label::new(description).color(Color::Muted).mb_2())
             .child(
-                Label::new("The agent panel runs on your own API key. No account is required.")
-                    .color(Color::Muted)
-                    .mb_2(),
+                Button::new("connect-fanta-account", button_label)
+                    .full_width()
+                    .style(ButtonStyle::Filled)
+                    .disabled(self.sign_in_status == SignInStatus::SigningIn)
+                    .on_click(move |_, window, cx| callback(window, cx)),
             )
             .children(self.render_dismiss_button())
             .into_any_element()
@@ -119,8 +142,6 @@ impl ZedAiOnboarding {
 
 impl RenderOnce for ZedAiOnboarding {
     fn render(self, _window: &mut ui::Window, _cx: &mut App) -> impl IntoElement {
-        // Fanta has no subscription of its own to sell, so this surface points at
-        // provider setup instead of the plan states this component used to render.
         self.render_model_setup()
     }
 }
@@ -135,9 +156,7 @@ impl Component for ZedAiOnboarding {
     }
 
     fn description() -> &'static str {
-        "The onboarding surface shown to new agent panel users, \
-        pointing them at the model provider setup they need \
-        before they can start using the agent."
+        "Connect a Fanta account to use managed AI with a subscription and credits."
     }
 
     fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {

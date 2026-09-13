@@ -761,7 +761,7 @@ fn draw_device_scale(
 /// rect — the fit then runs against the frame's SWAPPED dimensions for 90/270°
 /// so cover/contain crops exactly like Figma's rotated fill.
 #[allow(clippy::too_many_arguments)]
-fn blit_sk_image(
+pub(crate) fn blit_sk_image(
     canvas: &Canvas,
     sk_image: &skia_safe::Image,
     nat_w: u32,

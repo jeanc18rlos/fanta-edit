@@ -15,6 +15,7 @@ fanta-doc.workspace = true
 # resulting `TextLayout` straight onto the scene canvas.
 fanta-text.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 # Skia (skia-safe). Prebuilt binaries via skia-binaries (the default) avoid a
 # 10–30 min source build. The `textlayout` feature pulls in HarfBuzz / ICU /
@@ -26,6 +27,7 @@ skia-safe.workspace = true
 # stable serde projection. Already in the build graph (fanta-doc uses it), so
 # this adds no new compile cost.
 serde_json = "1"
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 serde_json = "1"

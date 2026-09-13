@@ -24,7 +24,7 @@
 use crate::context::ToolContext;
 use crate::event::ToolEvent;
 use fanta_canvas::{SnapCandidates, SnapResult};
-use fanta_doc::{Bounds, NodeId};
+use fanta_doc::{Bounds, Doc, NodeId};
 use glam::DVec2;
 use smallvec::SmallVec;
 
@@ -209,6 +209,12 @@ pub trait Tool {
     /// Process one event. Mutate the [`ToolContext`] in-place (via
     /// `ctx.doc.apply`, `ctx.viewport`, etc.) and return rendering hints.
     fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse;
+
+    /// History changes the document without a pointer event. Rebuild document-
+    /// derived hints without replaying input or changing a gesture's selection.
+    fn overlays_after_document_change(&self, _doc: &Doc) -> Option<Vec<ToolOverlay>> {
+        None
+    }
 
     /// Hook called when the tool becomes active. Defaults to no-op. Tools that
     /// must reset internal state on (re-)activation override this.

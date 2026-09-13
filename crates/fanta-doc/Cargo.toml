@@ -21,7 +21,7 @@ glam.workspace = true
 kurbo.workspace = true
 
 # Serialization. The canonical `.fant.json` projection is what AI reads and writes.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 
 # Containers. SmallVec for short inline lists (selection, small children lists);

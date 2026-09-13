@@ -497,11 +497,12 @@ impl FantaPrototypePanel {
                 return;
             }
         };
+        let preview_owner = cx.entity_id();
         let preview_result = self.item.update(cx, |item, cx| {
             if !item.is_editable() {
                 return None;
             }
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let result = replace_reaction_preview_if_current(
                     &mut document.doc,
                     parameter.node,
@@ -602,8 +603,9 @@ impl FantaPrototypePanel {
             cx,
         );
         if previewed {
+            let preview_owner = cx.entity_id();
             self.item.update(cx, |item, cx| {
-                item.finish_content_preview(committed, cx);
+                item.finish_content_preview(preview_owner, committed, cx);
             });
         }
         cx.notify();
@@ -624,8 +626,9 @@ impl FantaPrototypePanel {
         ) else {
             return false;
         };
+        let preview_owner = cx.entity_id();
         let result = self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let result = replace_reaction_preview_if_current(
                     &mut document.doc,
                     parameter.node,
@@ -661,8 +664,9 @@ impl FantaPrototypePanel {
         self.parameter_edit_previewed = false;
         self.parameter_error = None;
         if previewed {
+            let preview_owner = cx.entity_id();
             self.item.update(cx, |item, cx| {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
             });
         }
         cx.notify();
@@ -767,14 +771,16 @@ impl FantaPrototypePanel {
         let Some(operation) = operation else {
             return false;
         };
-        self.item
-            .update(cx, |item, cx| match item.apply(operation, cx) {
+        let preview_owner = cx.entity_id();
+        self.item.update(cx, |item, cx| {
+            match item.apply_for_preview_owner(preview_owner, operation, cx) {
                 Ok(()) => true,
                 Err(error) => {
                     log::error!("Fanta prototype panel failed to apply operation: {error:#}");
                     false
                 }
-            })
+            }
+        })
     }
 
     fn add_interaction(&mut self, node: NodeId, cx: &mut Context<Self>) {
