@@ -282,6 +282,24 @@ declare global {
     paragraph_indent?: number;
   }
 
+  interface FnxTextPathStart {
+    /** Zero-based drawable-segment index; `move` commands do not count. */
+    segment: number;
+    /** Normalized curve parameter in the inclusive range 0..1. */
+    position: number;
+  }
+
+  interface FnxTextPathProps extends FnxNodeProps {
+    path: FnxPathData;
+    content: string;
+    style?: FnxTextStyle;
+    style_runs?: readonly FnxTextStyleRun[];
+    start?: FnxTextPathStart;
+    alignment?: "start" | "center" | "end";
+    direction?: "forward" | "reverse";
+    side?: "default" | "flipped";
+  }
+
   interface FnxVectorProps extends FnxNodeProps {
     path?: FnxPathData;
     local_size?: FnxSize;
@@ -321,6 +339,7 @@ export function Rect(props: FnxShapeSugarProps): JSX.Element;
 export function Ellipse(props: FnxShapeSugarProps): JSX.Element;
 export function Vector(props: FnxVectorProps): JSX.Element;
 export function Text(props: FnxTextProps): JSX.Element;
+export function TextPath(props: FnxTextPathProps): JSX.Element;
 export function Image(props: FnxMediaProps): JSX.Element;
 export function Video(props: FnxMediaProps): JSX.Element;
 export function Audio(props: FnxMediaProps): JSX.Element;

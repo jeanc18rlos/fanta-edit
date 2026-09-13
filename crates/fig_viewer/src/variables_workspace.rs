@@ -241,7 +241,10 @@ impl FantaVariablesWorkspace {
     }
 
     fn apply_operation(&mut self, operation: Operation, cx: &mut Context<Self>) -> bool {
-        let result = self.item.update(cx, |item, cx| item.apply(operation, cx));
+        let preview_owner = cx.entity_id();
+        let result = self.item.update(cx, |item, cx| {
+            item.apply_for_preview_owner(preview_owner, operation, cx)
+        });
         match result {
             Ok(()) => {
                 self.error_message = None;
@@ -308,8 +311,9 @@ impl FantaVariablesWorkspace {
     }
 
     fn finish_content_preview(&self, committed: bool, cx: &mut Context<Self>) {
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.finish_content_preview(committed, cx);
+            item.finish_content_preview(preview_owner, committed, cx);
         });
     }
 
@@ -510,8 +514,9 @@ impl FantaVariablesWorkspace {
                 return;
             }
         };
+        let preview_owner = cx.entity_id();
         let result = self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let result = preview_variable_value(&mut document.doc, cell, value);
                 let change = match result {
                     Ok(true) => {
@@ -548,8 +553,9 @@ impl FantaVariablesWorkspace {
         notify: bool,
         cx: &mut Context<Self>,
     ) {
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let changed = restore_variable_value(&mut document.doc, cell, baseline);
                 if changed {
                     document.mark_variables_changed();

@@ -11,9 +11,9 @@ use crate::context::ToolContext;
 use crate::event::{Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 use crate::tool::{CursorHint, Tool, ToolResponse, bounds_from_corners};
 use fanta_canvas::{
-    DEFAULT_HANDLE_THRESHOLD, DEFAULT_ROTATE_THRESHOLD, HitPrecision, hit_test_deep,
-    hit_test_resize_handle, hit_test_resize_handle_oriented, hit_test_rotate_handle,
-    hit_test_rotate_handle_oriented, hit_test_within_screen, transform_angle,
+    DEFAULT_HANDLE_THRESHOLD, DEFAULT_ROTATE_THRESHOLD, HitPrecision, hit_test_resize_handle,
+    hit_test_resize_handle_oriented, hit_test_rotate_handle, hit_test_rotate_handle_oriented,
+    transform_angle,
 };
 use fanta_doc::{NodeId, Operation, Scene, Transform2D};
 use glam::DVec2;
@@ -111,7 +111,7 @@ impl SelectTool {
         if !modifiers.extend_selection() && ctx.doc.selection.len() == 1 {
             if let Some(&id) = ctx.doc.selection.iter().next() {
                 if let Some((local, world_transform)) =
-                    super::resize::authored_resize_bounds(&ctx.doc.scene, id)
+                    super::resize::authored_resize_bounds(ctx, id)
                         .zip(ctx.doc.scene.world_transform(id))
                     && let Some(world) = local.try_transformed(&world_transform)
                 {
@@ -166,16 +166,14 @@ impl SelectTool {
             }
         }
 
-        // Container-first selection (Figma). `hit_test_deep` returns every hit
-        // top-z first; `deep[0]` is what a naive topmost pick would grab (the
-        // deepest frame/leaf under the cursor). We then walk up to the outermost
+        // Container-first selection (Figma). The topmost accepted hit is the
+        // deepest frame/leaf under the cursor. We then walk up to the outermost
         // descendant of the current scope, so a click *anywhere* inside a frame
         // selects the frame — even when its body is fully covered by children.
         // Double-click drills one level deeper, tracked by `self.scope`.
         let world = ctx.screen_to_world(screen);
         let scope_page = ctx.scope();
-        let deep = hit_test_deep(&ctx.doc.scene, world, HitPrecision::Path, scope_page);
-        let Some(&leaf) = deep.first() else {
+        let Some(leaf) = ctx.hit_test(world, HitPrecision::Path) else {
             // Empty canvas: exit any entered scope; release will clear/marquee.
             self.scope = None;
             self.phase = Phase::PressedOnEmpty {
@@ -291,14 +289,7 @@ impl SelectTool {
                 screen_press, mode, ..
             } => {
                 let screen_rect = bounds_from_corners(screen_press, screen);
-                let hits = hit_test_within_screen(
-                    &ctx.doc.scene,
-                    ctx.viewport,
-                    ctx.screen_size,
-                    screen_rect,
-                    mode,
-                    ctx.doc.active_page(),
-                );
+                let hits = ctx.hit_test_within_screen(screen_rect, mode);
                 if modifiers.extend_selection() {
                     for id in hits {
                         ctx.doc.selection.add(id);

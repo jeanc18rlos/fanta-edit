@@ -379,7 +379,6 @@ const MOTION_LAYOUT: &[ToolbarItem] = &[
     ToolbarItem::Group(ToolbarToolGroup::Creation),
     ToolbarItem::Tool(ToolbarTool::Text),
     ToolbarItem::Group(ToolbarToolGroup::Feedback),
-    ToolbarItem::Group(ToolbarToolGroup::MotionTimeline),
     ToolbarItem::Tool(ToolbarTool::Actions),
 ];
 
@@ -443,9 +442,13 @@ pub struct MotionToolbarOptions {
     pub playing: bool,
     pub looping: bool,
     pub auto_keyframe: bool,
+    pub time_comment_armed: bool,
     pub current_time_ms: u32,
     pub duration_ms: u32,
     pub animation_style: SharedString,
+    /// Properties offered by the add-keyframe menu; the toolbar never
+    /// invents a property outside this host-supplied catalog.
+    pub available_keyframe_properties: Vec<SharedString>,
     /// Preset styles offered by the animation-style menu; the toolbar never
     /// invents a style outside this host-supplied catalog.
     pub available_animation_styles: Vec<SharedString>,
@@ -457,9 +460,22 @@ impl Default for MotionToolbarOptions {
             playing: false,
             looping: true,
             auto_keyframe: false,
+            time_comment_armed: false,
             current_time_ms: 0,
             duration_ms: 2_000,
             animation_style: "Fade in".into(),
+            available_keyframe_properties: [
+                "Position X",
+                "Position Y",
+                "Rotation",
+                "Scale X",
+                "Scale Y",
+                "Opacity",
+                "Fill color",
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
             available_animation_styles: ["Fade in", "Spring", "Slide up", "Pop"]
                 .into_iter()
                 .map(Into::into)
@@ -635,6 +651,9 @@ pub enum ToolbarCommand {
     RenameLayers,
     RemoveBackground,
     GenerateImage,
+    GenerateVideo,
+    GenerateVector,
+    GenerateMasks,
     MakePrototype,
     OpenDesignMode,
     OpenMotionMode,
@@ -652,6 +671,9 @@ impl ToolbarCommand {
         Self::GenerateDesign,
         Self::ReplaceContent,
         Self::GenerateImage,
+        Self::GenerateVideo,
+        Self::GenerateVector,
+        Self::GenerateMasks,
         Self::MakePrototype,
         Self::RenameLayers,
         Self::RemoveBackground,
@@ -739,6 +761,9 @@ impl ToolbarCommand {
             Self::RenameLayers => "Rename layers",
             Self::RemoveBackground => "Remove background",
             Self::GenerateImage => "Generate an image",
+            Self::GenerateVideo => "Generate a video",
+            Self::GenerateVector => "Generate vectors",
+            Self::GenerateMasks => "Generate masks",
             Self::MakePrototype => "Make a prototype",
             Self::OpenDesignMode => "Switch to Design",
             Self::OpenMotionMode => "Switch to Motion",
@@ -761,6 +786,9 @@ impl ToolbarCommand {
             | Self::RenameLayers
             | Self::RemoveBackground
             | Self::GenerateImage
+            | Self::GenerateVideo
+            | Self::GenerateVector
+            | Self::GenerateMasks
             | Self::MakePrototype => "AI",
             Self::OpenResources | Self::OpenPlugins | Self::OpenWidgets | Self::OpenVariables => {
                 "Resources"
@@ -788,9 +816,12 @@ impl ToolbarCommand {
 
     pub const fn description(self) -> &'static str {
         match self {
-            Self::GenerateDesign => "Create editable layers with Figma Agent",
+            Self::GenerateDesign => "Create editable frames, text, and shapes with Fanta",
             Self::ReplaceContent => "Generate replacement copy for selected layers",
-            Self::GenerateImage => "Create an image from a prompt",
+            Self::GenerateImage => "Create and refine images in a generation tab",
+            Self::GenerateVideo => "Create a video or animate a source image",
+            Self::GenerateVector => "Create SVG artwork or vectorize an image",
+            Self::GenerateMasks => "Select objects and edit masked areas of an image",
             Self::MakePrototype => "Connect selected frames into a prototype",
             Self::OpenPlugins => "Run a plugin from the Community",
             Self::OpenResources => "Search components, libraries, and assets",
@@ -929,24 +960,34 @@ mod tests {
     }
 
     #[test]
-    fn specialist_modes_expose_their_flyout_groups() {
-        assert!(
-            ToolbarMode::Motion
-                .layout()
-                .contains(&ToolbarItem::Group(ToolbarToolGroup::MotionTimeline))
-        );
-        assert!(ToolbarTool::MotionPath.is_available_in(ToolbarMode::Motion));
-        assert!(!ToolbarTool::MotionPath.is_available_in(ToolbarMode::Design));
+    fn motion_mode_uses_contextual_controls_instead_of_the_legacy_primary_group() {
+        for mode in ToolbarMode::ALL {
+            assert!(
+                !mode
+                    .layout()
+                    .contains(&ToolbarItem::Group(ToolbarToolGroup::MotionTimeline))
+            );
+        }
+        for tool in ToolbarToolGroup::MotionTimeline.tools() {
+            assert!(
+                !ToolbarMode::ALL
+                    .iter()
+                    .any(|mode| tool.is_available_in(*mode)),
+                "{} should stay out of the primary toolbar",
+                tool.label()
+            );
+        }
+        assert!(ToolbarTool::Move.is_available_in(ToolbarMode::Motion));
     }
 
     #[test]
-    fn mode_tray_is_design_motion_dev() {
+    fn mode_tray_and_tool_catalog_cover_design_motion_dev() {
         assert_eq!(
             ToolbarMode::ALL,
             &[ToolbarMode::Design, ToolbarMode::Motion, ToolbarMode::Dev]
         );
-        // Every catalogued tool is reachable from at least one mode layout
-        // or a flyout group, so no tool exists solely for a retired mode.
+        // Legacy roadmap faces stay catalogued in their semantic group even
+        // while contextual controls replace that group in the visible layout.
         for tool in ToolbarTool::ALL {
             let in_layout = ToolbarMode::ALL
                 .iter()
@@ -985,6 +1026,15 @@ mod tests {
     #[test]
     fn default_option_candidates_contain_the_accepted_values() {
         let motion = MotionToolbarOptions::default();
+        assert_eq!(motion.available_keyframe_properties.len(), 7);
+        assert_eq!(
+            motion
+                .available_keyframe_properties
+                .iter()
+                .collect::<HashSet<_>>()
+                .len(),
+            motion.available_keyframe_properties.len()
+        );
         assert!(
             motion
                 .available_animation_styles

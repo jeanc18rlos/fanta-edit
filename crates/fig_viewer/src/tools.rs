@@ -8,8 +8,8 @@ use fanta_doc::{Color, Doc, Viewport};
 use fanta_tools::{
     Button, CursorHint, EllipseTool, FrameTool, HandTool, KeyEvent, LineTool, LogicalKey,
     ModifierKeys, NodeEditTool, PathSelectTool, PenTool, PencilTool, PointerEvent, PolygonTool,
-    RectTool, ScaleTool, SectionTool, SelectTool, SliceTool, StarTool, TextPathTool, TextTool,
-    Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
+    RectTool, ScaleTool, SectionTool, SelectTool, SliceTool, StarTool, TextTool, Tool, ToolContext,
+    ToolEvent, ToolOverlay, ToolResponse,
 };
 use glam::DVec2;
 use gpui::{CursorStyle, Modifiers, MouseButton};
@@ -135,18 +135,6 @@ impl ToolKind {
         }
     }
 
-    /// Placeholder tools that appear in the toolbar but have no behavior yet
-    /// (Scale, direct path-selection, text-on-path).
-    ///
-    /// The legacy native tool pill renders these with a "soon" hint. The
-    /// default fanta-gpui toolbar has no host-side API to hide or disable a
-    /// tool face, so `FigView::handle_toolbar_action` refuses to arm them and
-    /// says so in a notice instead — arming a tool that swallows every drag
-    /// reads as a frozen canvas.
-    pub fn is_stub(self) -> bool {
-        matches!(self, Self::Scale | Self::PathSelect | Self::TextPath)
-    }
-
     fn build(self) -> Box<dyn Tool> {
         match self {
             Self::Select => Box::new(SelectTool::new()),
@@ -165,7 +153,10 @@ impl ToolKind {
             Self::Section => Box::new(SectionTool::new()),
             Self::Slice => Box::new(SliceTool::new()),
             Self::Text => Box::new(TextTool::new()),
-            Self::TextPath => Box::new(TextPathTool::new()),
+            // TextPath is a one-shot conversion command in FigView. A Select
+            // fallback keeps a missed host route interactive instead of
+            // swallowing pointer events in a dead mode.
+            Self::TextPath => Box::new(SelectTool::new()),
             // Comment mode is handled by the shell (click-to-pin); the select
             // tool backs it so unconsumed events stay harmless.
             Self::Comment => Box::new(SelectTool::new()),
@@ -245,6 +236,17 @@ impl ToolShell {
         response
     }
 
+    pub fn refresh_overlays(&mut self, doc: &Doc) -> bool {
+        let Some(overlays) = self.tool.overlays_after_document_change(doc) else {
+            return false;
+        };
+        if self.overlays == overlays {
+            return false;
+        }
+        self.overlays = overlays;
+        true
+    }
+
     pub fn cursor_style(&self, dragging_canvas: bool) -> CursorStyle {
         if dragging_canvas {
             return CursorStyle::ClosedHand;
@@ -257,7 +259,7 @@ impl ToolShell {
             Some(CursorHint::Move) | Some(CursorHint::Default) => CursorStyle::Arrow,
             None => match self.kind {
                 ToolKind::Hand => CursorStyle::OpenHand,
-                ToolKind::Select => CursorStyle::Arrow,
+                ToolKind::Select | ToolKind::PathSelect | ToolKind::Scale => CursorStyle::Arrow,
                 ToolKind::Text => CursorStyle::IBeam,
                 _ => CursorStyle::Crosshair,
             },
@@ -279,7 +281,10 @@ pub fn tool_context<'a>(
         zoom: viewport.zoom,
         ..Default::default()
     };
-    ToolContext::new(doc, viewport, snap, screen_size).with_new_shape_fill(new_fill_for(kind))
+    ToolContext::new(doc, viewport, snap, screen_size)
+        .with_new_shape_fill(new_fill_for(kind))
+        .with_hit_test_refiner(crate::canvas::accepts_precise_hit)
+        .with_interaction_bounds_resolver(crate::canvas::authored_local_bounds)
 }
 
 /// The fill a tool creates its node with.

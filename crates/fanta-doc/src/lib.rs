@@ -60,8 +60,8 @@ pub use component::{
     ComponentSet, ComponentSetMembership, PropBindingTarget, VariantAxis,
 };
 pub use doc::{
-    Doc, DocLoadError, DocMetadata, Flow, PresentationConfig, SCHEMA_VERSION, Viewport,
-    migrate_doc_json,
+    Doc, DocLoadError, DocMetadata, DocMigrationError, Flow, PresentationConfig, SCHEMA_VERSION,
+    Viewport, migrate_doc_json, migrate_doc_json_to,
 };
 pub use history::{History, Transaction};
 pub use id::{
@@ -87,11 +87,15 @@ pub use node::{
     LayoutChild, LayoutMode, Link, MaskType, Model3dNode, NodeData, NodeFlags, NodeGraph,
     NodeGraphNode, OverlayPosition, OverlaySettings, Override, OverridePath, OverrideValue,
     ParametricShape, PrimaryAlign, PrototypeAnimation, Reaction, ScrollBehavior, ScrollDirection,
-    TextAlign, TextAutoResize, TextNode, TextStyle, TextStyleRun, Transition, TransitionStyle,
-    Trigger, VAlign, VectorNode, VideoNode, WorkflowNode, spring_progress,
+    TextAlign, TextAutoResize, TextNode, TextPathAlignment, TextPathDirection, TextPathNode,
+    TextPathSide, TextPathStart, TextStyle, TextStyleRun, Transition, TransitionStyle, Trigger,
+    VAlign, VectorNode, VideoNode, WorkflowNode, spring_progress,
 };
 pub use op::{ModeScope, OpCtx, Operation};
-pub use path::{FillRule, PathData, PathSegment, SvgPathError};
+pub use path::{
+    FillRule, MeasuredPath, MeasuredPathContour, MeasuredPathPoint, MeasuredPathSegment, PathData,
+    PathSegment, SvgPathError,
+};
 pub use replay::{Divergence, ReplayResult, diff_snapshots, replay_ops};
 pub use resolve::{
     ExpandedNode, InstanceExpansionContext, ResolvedComponentDefRef, backfill_vector_viewports,

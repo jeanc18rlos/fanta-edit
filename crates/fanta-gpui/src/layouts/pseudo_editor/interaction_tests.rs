@@ -167,6 +167,30 @@ fn rails_hold_their_design_widths_on_comfortable_windows(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn floating_toolbar_is_centered_in_the_canvas_above_the_timeline(cx: &mut TestAppContext) {
+    let (_host, _actions, cx) = mount(cx);
+    let canvas = cx
+        .debug_bounds("pseudo-editor-canvas")
+        .expect("the canvas should render");
+    let surface = cx
+        .debug_bounds("editor-toolbar-surface")
+        .expect("the floating toolbar should render");
+    let timeline = cx
+        .debug_bounds("pseudo-editor-timeline-strip")
+        .expect("the timeline should render");
+
+    assert!(
+        (f32::from(surface.center().x) - f32::from(canvas.center().x)).abs() <= 0.5,
+        "toolbar should be centered in its canvas: {surface:?} vs {canvas:?}"
+    );
+    assert!(surface.is_contained_within(&canvas));
+    assert!(
+        surface.bottom() + px(12.) <= timeline.top(),
+        "the 12 px canvas inset should keep the toolbar above the timeline"
+    );
+}
+
+#[gpui::test]
 fn canvas_keeps_positive_size_at_the_shell_minimum_window(cx: &mut TestAppContext) {
     let (_host, _actions, cx) = mount(cx);
 

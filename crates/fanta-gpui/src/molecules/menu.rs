@@ -11,7 +11,7 @@
 
 use gpui::{
     App, Div, ElementId, InteractiveElement as _, Pixels, Point, Size, Stateful,
-    StatefulInteractiveElement as _, Styled as _, point, px,
+    StatefulInteractiveElement as _, Styled as _, point, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{ActiveTheme as _, h_flex, v_flex};
 
@@ -63,7 +63,7 @@ pub fn menu_surface(
         .border_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().popover)
-        .shadow_lg()
+        .when(cx.theme().shadow, |surface| surface.shadow_sm())
 }
 
 /// Menu-row baseline.

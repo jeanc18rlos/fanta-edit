@@ -5,6 +5,7 @@ use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,
     base::{CFRange, CFType, TCFType},
+    dictionary::CFDictionary,
     number::CFNumber,
     string::CFString,
 };
@@ -16,7 +17,7 @@ use core_graphics::{
 };
 use core_text::{
     font::CTFont,
-    font_collection::CTFontCollectionRef,
+    font_collection::{CTFontCollection, CTFontCollectionRef},
     font_descriptor::{
         CTFontDescriptor, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
         kCTFontWidthTrait,
@@ -25,12 +26,13 @@ use core_text::{
     string_attributes::kCTFontAttributeName,
 };
 use font_kit::{
+    error::SelectionError,
+    family_handle::FamilyHandle,
     font::Font as FontKitFont,
     handle::Handle,
     hinting::HintingOptions,
     metrics::Metrics,
     properties::{Style as FontkitStyle, Weight as FontkitWeight},
-    source::SystemSource,
     sources::mem::MemSource,
 };
 use gpui::{
@@ -65,7 +67,6 @@ struct FontKey {
 
 struct MacTextSystemState {
     memory_source: MemSource,
-    system_source: SystemSource,
     fonts: Vec<FontKitFont>,
     font_selections: HashMap<Font, FontId>,
     font_ids_by_postscript_name: HashMap<String, FontId>,
@@ -78,7 +79,6 @@ impl MacTextSystem {
     pub fn new() -> Self {
         Self(RwLock::new(MacTextSystemState {
             memory_source: MemSource::empty(),
-            system_source: SystemSource::new(),
             fonts: Vec::new(),
             font_selections: HashMap::default(),
             font_ids_by_postscript_name: HashMap::default(),
@@ -102,26 +102,7 @@ impl PlatformTextSystem for MacTextSystem {
     fn all_font_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         let collection = core_text::font_collection::create_for_all_families();
-        // NOTE: We intentionally avoid using `collection.get_descriptors()` here because
-        // it has a memory leak bug in core-text v21.0.0. The upstream code uses
-        // `wrap_under_get_rule` but `CTFontCollectionCreateMatchingFontDescriptors`
-        // follows the Create Rule (caller owns the result), so it should use
-        // `wrap_under_create_rule`. We call the function directly with correct memory management.
-        unsafe extern "C" {
-            fn CTFontCollectionCreateMatchingFontDescriptors(
-                collection: CTFontCollectionRef,
-            ) -> CFArrayRef;
-        }
-        let descriptors: Option<CFArray<CTFontDescriptor>> = unsafe {
-            let array_ref =
-                CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
-            if array_ref.is_null() {
-                None
-            } else {
-                Some(CFArray::wrap_under_create_rule(array_ref))
-            }
-        };
-        let Some(descriptors) = descriptors else {
+        let Some(descriptors) = matching_font_descriptors(&collection) else {
             return names;
         };
         for descriptor in descriptors.into_iter() {
@@ -229,6 +210,47 @@ impl PlatformTextSystem for MacTextSystem {
     }
 }
 
+fn matching_font_descriptors(collection: &CTFontCollection) -> Option<CFArray<CTFontDescriptor>> {
+    // core-text 21's get_descriptors adds a retain to this Create-rule result,
+    // leaving one array behind per query. Both enumeration and family lookup
+    // must adopt the existing ownership instead.
+    unsafe extern "C" {
+        fn CTFontCollectionCreateMatchingFontDescriptors(
+            collection: CTFontCollectionRef,
+        ) -> CFArrayRef;
+    }
+    unsafe {
+        let array = CTFontCollectionCreateMatchingFontDescriptors(collection.as_concrete_TypeRef());
+        if array.is_null() {
+            None
+        } else {
+            Some(CFArray::wrap_under_create_rule(array))
+        }
+    }
+}
+
+fn select_system_family_by_name(name: &str) -> std::result::Result<FamilyHandle, SelectionError> {
+    let attributes: CFDictionary<CFString, CFType> = CFDictionary::from_CFType_pairs(&[(
+        CFString::new("NSFontFamilyAttribute"),
+        CFString::new(name).as_CFType(),
+    )]);
+    let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
+    let query = CFArray::from_CFTypes(&[descriptor]);
+    let collection = core_text::font_collection::new_from_descriptors(&query);
+    let descriptors = matching_font_descriptors(&collection).ok_or(SelectionError::NotFound)?;
+    let mut family = FamilyHandle::new();
+    for descriptor in descriptors.iter() {
+        let native = core_text::font::new_from_descriptor(&descriptor, 16.0);
+        let font = unsafe { FontKitFont::from_core_text_font_no_path(native) };
+        family.push(Handle::from_native(&font));
+    }
+    if family.is_empty() {
+        Err(SelectionError::NotFound)
+    } else {
+        Ok(family)
+    }
+}
+
 fn font_smoothing_allowed_by_user() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     *ALLOWED.get_or_init(|| {
@@ -285,7 +307,7 @@ impl MacTextSystemState {
         let family = self
             .memory_source
             .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
+            .or_else(|_| select_system_family_by_name(name))?;
         for font in family.fonts() {
             let mut font = font.load()?;
 
@@ -742,8 +764,75 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
+    use super::select_system_family_by_name;
     use crate::MacTextSystem;
+    use font_kit::{error::SelectionError, handle::Handle, source::SystemSource};
     use gpui::{FontRun, GlyphId, PlatformTextSystem, font, px};
+
+    #[test]
+    fn test_system_font_families_preserve_font_kit_face_order() -> anyhow::Result<()> {
+        for name in ["Helvetica", "Times", ".AppleSystemUIFont"] {
+            let previous = SystemSource::new().select_family_by_name(name)?;
+            let family = select_system_family_by_name(name)?;
+            assert!(!family.is_empty(), "{name}");
+            assert_eq!(family.fonts().len(), previous.fonts().len(), "{name}");
+            for (handle, previous_handle) in family.fonts().iter().zip(previous.fonts()) {
+                assert!(matches!(handle, Handle::Native { .. }), "{name}");
+                let font = handle.load()?;
+                let previous_font = previous_handle.load()?;
+                assert_eq!(
+                    font.postscript_name(),
+                    previous_font.postscript_name(),
+                    "{name}"
+                );
+                assert_eq!(font.properties(), previous_font.properties(), "{name}");
+                assert_eq!(
+                    font.glyph_for_char('m'),
+                    previous_font.glyph_for_char('m'),
+                    "{name}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_system_font_family_preserves_missing_result() {
+        let name = "__Fanta_Missing_Font_84fe51a1__";
+        assert_eq!(
+            SystemSource::new()
+                .select_family_by_name(name)
+                .expect_err("missing family"),
+            SelectionError::NotFound
+        );
+        assert_eq!(
+            select_system_family_by_name(name).expect_err("missing family"),
+            SelectionError::NotFound
+        );
+    }
+
+    #[test]
+    fn test_system_font_family_preserves_virtual_name_and_cached_selection() -> anyhow::Result<()> {
+        let fonts = MacTextSystem::new();
+        let virtual_font = font(".SystemUIFont");
+        let font_id = fonts.font_id(&virtual_font)?;
+        let native_font_id = fonts.font_id(&font(".AppleSystemUIFont"))?;
+        let state = fonts.0.read();
+        let virtual_face = state.fonts.get(font_id.0).expect("resolved virtual face");
+        let native_face = state
+            .fonts
+            .get(native_font_id.0)
+            .expect("resolved native face");
+        assert_eq!(
+            virtual_face.postscript_name(),
+            native_face.postscript_name()
+        );
+        let loaded_count = state.fonts.len();
+        drop(state);
+        assert_eq!(fonts.font_id(&virtual_font)?, font_id);
+        assert_eq!(fonts.0.read().fonts.len(), loaded_count);
+        Ok(())
+    }
 
     #[test]
     fn test_layout_line_bom_char() {

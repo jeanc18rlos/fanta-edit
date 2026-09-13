@@ -1,24 +1,29 @@
 //! Language registration for Fanta.
 //!
 //! Fanta is a design canvas, not an editor: the only source it ever shows is
-//! the read-only FNX behind a design plus the odd JSON file. So this crate
-//! registers syntax highlighting for exactly those languages and nothing else —
-//! no LSP adapters, no toolchain listers, no task context providers — which is
+//! the read-only FNX behind a design plus the odd JSON file and Git commit
+//! message. This crate registers the languages those views need, without
+//! LSP adapters, toolchain listers, or task context providers, which is
 //! what keeps the app from trying to download Node and start a TypeScript
 //! server when a design is opened.
 
 use std::sync::Arc;
 
-use language::{LanguageRegistry, LoadedLanguage};
+use language::{Language, LanguageRegistry, LoadedLanguage};
 
 /// Languages Fanta registers. FNX reuses the TSX grammar and queries (see
-/// `grammars::load_queries`), so the whole set needs only two parser crates.
+/// `grammars::load_queries`).
 // `regex` is here because the buffer search bar highlights its own query
 // field with it; without it search logs an error on every window.
 const LANGUAGES: &[&str] = &["fnx", "tsx", "typescript", "json", "jsonc", "regex"];
 
 pub fn init(languages: Arc<LanguageRegistry>) {
     languages.register_native_grammars(grammars::fanta_native_grammars());
+
+    // Git panels require this language to load commit buffers, even without a parser.
+    let mut git_commit_config = grammars::load_config("gitcommit");
+    git_commit_config.grammar = None;
+    languages.add(Arc::new(Language::new(git_commit_config, None)));
 
     for name in LANGUAGES {
         let name = *name;
@@ -46,6 +51,27 @@ pub fn init(languages: Arc<LanguageRegistry>) {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[gpui::test]
+    async fn git_commit_is_registered_without_a_parser_or_language_server(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let languages = Arc::new(LanguageRegistry::new(cx.executor()));
+        init(languages.clone());
+
+        let git_commit = languages
+            .language_for_name("Git Commit")
+            .await
+            .expect("Git panels must be able to load their commit buffers");
+        assert!(git_commit.grammar().is_none());
+        assert!(git_commit.config().grammar.is_none());
+        assert!(languages.lsp_adapters(&git_commit.name()).is_empty());
+
+        let available = languages
+            .language_for_file_path(Path::new("/designs/.git/COMMIT_EDITMSG"))
+            .expect("Git commit files resolve to the same registered language");
+        assert_eq!(available.name(), git_commit.name());
+    }
 
     #[gpui::test]
     async fn fnx_uses_the_tsx_grammar_and_no_language_servers(cx: &mut gpui::TestAppContext) {

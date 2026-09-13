@@ -243,6 +243,15 @@ pub enum DesignPanelAction {
     TextPathFlipOrientationRequested {
         node_id: SharedString,
     },
+    TextPathDirectionChangeRequested {
+        node_id: SharedString,
+        direction: DesignTextPathDirection,
+    },
+    TextPathPlacementChangeRequested {
+        node_id: SharedString,
+        placement: DesignTextPathPlacement,
+        phase: DesignPanelEditPhase,
+    },
     /// Replaces the complete `TextPathNode.textPathStartData` record.
     TextPathStartChangeRequested {
         node_id: SharedString,
@@ -1455,6 +1464,8 @@ impl DesignPanelAction {
             | Self::TypographyFontImportRequested { node_id, .. }
             | Self::TypographyOpenTypeFeatureChangeRequested { node_id, .. }
             | Self::TextPathFlipOrientationRequested { node_id }
+            | Self::TextPathDirectionChangeRequested { node_id, .. }
+            | Self::TextPathPlacementChangeRequested { node_id, .. }
             | Self::TextPathStartChangeRequested { node_id, .. }
             | Self::VectorVertexSelectionEditRequested { node_id, .. }
             | Self::VectorVertexPositionEditRequested { node_id, .. }

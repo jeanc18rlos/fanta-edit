@@ -49,7 +49,7 @@ pub fn popup_surface(id: impl Into<ElementId>, radius: Pixels, cx: &App) -> Stat
         .border_color(cx.theme().border)
         .bg(cx.theme().popover)
         .text_color(cx.theme().popover_foreground)
-        .when(cx.theme().shadow, |surface| surface.shadow_lg())
+        .when(cx.theme().shadow, |surface| surface.shadow_sm())
         .overflow_y_scroll()
 }
 

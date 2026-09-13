@@ -70,6 +70,38 @@ fn click_outside_with_shift_preserves_selection() {
     assert_eq!(ctx.doc.selection.as_slice(), &[id]);
 }
 
+#[test]
+fn host_hit_refiner_falls_through_to_the_next_candidate() {
+    fn reject_named_node(scene: &fanta_doc::Scene, id: NodeId, _point: DVec2) -> bool {
+        scene.get(id).is_some_and(|node| node.name != "Reject hit")
+    }
+
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let lower_id = rect_at_origin(&mut doc, 60.0, 60.0);
+    let mut upper = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        -30.0,
+        -30.0,
+        60.0,
+        60.0,
+        Color::BLACK,
+    )));
+    upper.name = "Reject hit".to_owned();
+    upper.index = IndexKey::after(IndexKey::FIRST);
+    doc.apply(Operation::create_node(upper))
+        .expect("create upper node");
+
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size)
+        .with_hit_test_refiner(reject_named_node);
+    let mut tool = SelectTool::new();
+    let center = screen_center(size);
+    tool.handle_event(&mut ctx, pe_press(center, ModifierKeys::empty()));
+    tool.handle_event(&mut ctx, pe_release(center, ModifierKeys::empty()));
+
+    assert_eq!(ctx.doc.selection.as_slice(), &[lower_id]);
+}
+
 // -------------------------------------------------------------------------
 // Active-page scoping (BUG 1)
 // -------------------------------------------------------------------------

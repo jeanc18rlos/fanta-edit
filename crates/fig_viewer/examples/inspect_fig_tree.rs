@@ -358,6 +358,7 @@ fn node_kind(node: &CanvasNode) -> &'static str {
         NodeData::Group(_) => "group",
         NodeData::Vector(_) => "vector",
         NodeData::Text(_) => "text",
+        NodeData::TextPath(_) => "text_path",
         NodeData::Instance(_) => "instance",
         NodeData::Bitmap(_) => "bitmap",
         NodeData::Video(_) => "video",

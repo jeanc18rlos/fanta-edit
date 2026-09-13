@@ -13,16 +13,27 @@ workspace = true
 path = "src/media.rs"
 doctest = false
 
+[[test]]
+name = "video_playback"
+path = "tests/video_playback.rs"
+harness = false
+
 [dependencies]
 anyhow.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
 core-foundation.workspace = true
 ctor.workspace = true
 foreign-types = "0.5"
 metal.workspace = true
 core-video.workspace = true
 objc.workspace = true
+futures.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+smol.workspace = true
 
 [build-dependencies]
 bindgen = "0.71"

@@ -10,6 +10,7 @@ use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window}
 use gpui_component::IconName;
 
 use crate::editor_session::EditorMode;
+use crate::timeline::TimelineProperty;
 use crate::tools::ToolKind;
 use crate::view::FigView;
 
@@ -34,24 +35,44 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Duplicate,
     ToolbarCommand::Delete,
     ToolbarCommand::SelectAll,
+    ToolbarCommand::Group,
+    ToolbarCommand::Ungroup,
+    ToolbarCommand::FrameSelection,
     ToolbarCommand::ZoomToFit,
     ToolbarCommand::ZoomToSelection,
     ToolbarCommand::Export,
     ToolbarCommand::Present,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::GenerateImage,
+    ToolbarCommand::GenerateVideo,
+    ToolbarCommand::GenerateVector,
+    ToolbarCommand::GenerateDesign,
+    ToolbarCommand::GenerateMasks,
+    ToolbarCommand::ReplaceContent,
+    ToolbarCommand::RewriteText,
+    ToolbarCommand::TranslateText,
+    ToolbarCommand::RenameLayers,
+    ToolbarCommand::RemoveBackground,
 ];
 
 /// The entrance presets fig_viewer's Motion inspector can author — the same
 /// catalog as `motion_panel.rs`'s `AnimationProperty` preset labels (Position,
 /// Scale, Rotation, Size, Opacity). The document has no per-clip style field
 /// yet, so this single host-side list feeds both the toolbar's read model and
-/// the accepted-style echo; the `Path` preset is excluded because it needs an
+/// the applied-style echo; the `Path` preset is excluded because it needs an
 /// authored motion path and cannot be applied as a one-click style.
 pub(crate) fn motion_animation_styles() -> Vec<SharedString> {
-    ["Slide in", "Scale in", "Rotate in", "Grow", "Fade in"]
-        .into_iter()
-        .map(Into::into)
+    crate::motion_panel::TOOLBAR_ANIMATION_STYLE_PRESETS
+        .iter()
+        .map(|(label, _)| SharedString::from(*label))
+        .collect()
+}
+
+pub(crate) fn motion_keyframe_properties() -> Vec<SharedString> {
+    TimelineProperty::ALL
+        .iter()
+        .map(|property| SharedString::from(property.label()))
         .collect()
 }
 
@@ -60,6 +81,8 @@ pub(crate) fn motion_animation_styles() -> Vec<SharedString> {
 pub(crate) struct ToolbarOptionInputs {
     pub playing: bool,
     pub looping: bool,
+    pub auto_keyframe: bool,
+    pub time_comment_armed: bool,
     pub current_time_ms: u32,
     /// Duration of the active motion clip; `None` when the document has none.
     pub duration_ms: Option<u32>,
@@ -194,10 +217,10 @@ pub(crate) struct ToolbarAdapter {
     last_pushed_dev: Option<DevToolbarOptions>,
     last_pushed_agent: Option<AgentToolbarOptions>,
     last_pushed_chrome: Option<Vec<ToolbarChromeControl>>,
-    /// The accepted Motion animation style. Host-side UI state held on the
-    /// adapter because the document model has no per-clip style field yet;
-    /// `ControlChangeRequested` updates it and the render-time refresh echoes
-    /// it back through `set_motion_options`.
+    /// The most recently applied Motion animation style. Host-side UI state
+    /// held on the adapter because the document model has no per-clip style
+    /// field yet; a successful document mutation updates it and the
+    /// render-time refresh echoes it back through `set_motion_options`.
     animation_style: SharedString,
     /// Test-only: how many option-model pushes reached the panel, so the
     /// echo tests can prove the diff guard instead of counting notifies.
@@ -253,10 +276,10 @@ impl ToolbarAdapter {
     #[cfg(not(test))]
     fn record_option_push(&self) {}
 
-    /// Accepts a `MotionAnimationStyle` control change when the candidate is
-    /// in the host catalog. Returns whether the accepted style changed; the
+    /// Remembers a successfully applied animation style when it belongs to the
+    /// host catalog. Returns whether the remembered style changed; the
     /// echo happens on the next render-time [`Self::refresh`].
-    pub(crate) fn accept_animation_style(&mut self, style: &SharedString) -> bool {
+    pub(crate) fn remember_animation_style(&mut self, style: &SharedString) -> bool {
         if self.animation_style == *style || !motion_animation_styles().contains(style) {
             return false;
         }
@@ -265,7 +288,7 @@ impl ToolbarAdapter {
     }
 
     #[cfg(test)]
-    pub(crate) fn accepted_animation_style(&self) -> &SharedString {
+    pub(crate) fn remembered_animation_style(&self) -> &SharedString {
         &self.animation_style
     }
 
@@ -300,14 +323,14 @@ impl ToolbarAdapter {
         let motion = MotionToolbarOptions {
             playing: options.playing,
             looping: options.looping,
-            // fig_viewer has no keyframe-recording mode; the toggle stays off
-            // and its intents are logged in `handle_toolbar_control_change`.
-            auto_keyframe: false,
+            auto_keyframe: options.auto_keyframe,
+            time_comment_armed: options.time_comment_armed,
             current_time_ms: options.current_time_ms,
             // No clip means nothing can play: report a zero-length transport
             // instead of inventing a duration.
             duration_ms: options.duration_ms.unwrap_or(0),
             animation_style: self.animation_style.clone(),
+            available_keyframe_properties: motion_keyframe_properties(),
             available_animation_styles: motion_animation_styles(),
         };
         if self.last_pushed_motion.as_ref() != Some(&motion) {
@@ -543,6 +566,35 @@ mod tests {
         assert!(IMPLEMENTED_COMMANDS.contains(&ToolbarCommand::SelectAll));
     }
 
+    #[test]
+    fn implemented_commands_are_unique_and_include_existing_structure_and_text_ai_actions() {
+        let unique: std::collections::HashSet<_> = IMPLEMENTED_COMMANDS.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            IMPLEMENTED_COMMANDS.len(),
+            "the host command registry must not contain duplicate actions"
+        );
+
+        for command in [
+            ToolbarCommand::Group,
+            ToolbarCommand::Ungroup,
+            ToolbarCommand::FrameSelection,
+            ToolbarCommand::ReplaceContent,
+            ToolbarCommand::RewriteText,
+            ToolbarCommand::TranslateText,
+            ToolbarCommand::RenameLayers,
+        ] {
+            assert_eq!(
+                IMPLEMENTED_COMMANDS
+                    .iter()
+                    .filter(|registered| **registered == command)
+                    .count(),
+                1,
+                "{command:?} must be advertised exactly once"
+            );
+        }
+    }
+
     /// The style catalog mirrors motion_panel.rs's entrance presets (minus
     /// Path, which needs an authored motion path). A new preset lands in both
     /// places or this fails.
@@ -563,10 +615,11 @@ mod tests {
 
 #[cfg(test)]
 mod echo_tests {
-    use std::path::PathBuf;
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use fanta_doc::{
-        AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, Operation, TextNode,
+        AnimationClip, AnimationClipId, BoundProp, CanvasNode, ComponentDef, ComponentId, Doc,
+        GroupNode, MotionProperty, MotionTarget, NodeData, Operation, ResolvedVarValue, TextNode,
         Transform2D, Viewport,
     };
     use fanta_gpui::toolbar::{ToolbarAction, ToolbarControlValue, ToolbarSecondaryControl};
@@ -652,6 +705,1244 @@ mod echo_tests {
     }
 
     #[gpui::test]
+    async fn path_selection_toolbar_drag_edits_segment_endpoints_and_undoes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = test_doc();
+        let mut original = fanta_doc::PathData::new();
+        original
+            .move_to(0., 0.)
+            .line_to(100., 0.)
+            .line_to(100., 100.);
+        let mut vector = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: original.clone(),
+            fills: Default::default(),
+            strokes: [fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 2.)]
+                .into_iter()
+                .collect(),
+            corner_radius: None,
+            corner_radii: None,
+            corner_smoothing: 0.,
+            local_size: None,
+            parametric: None,
+        }));
+        vector.parent = doc.active_page();
+        vector.transform = Transform2D::translation(-100., 100.);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create editable path");
+        doc.selection.clear();
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Path-selection.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::PathSelect,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::PathSelect
+        );
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [-50., 150.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center() + point(px(0.), px(-50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let edited = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.contains(vector_id));
+            assert_eq!(doc.history.undo_depth(), 1);
+            let path = &doc
+                .scene
+                .get(vector_id)
+                .expect("vector")
+                .data
+                .as_vector()
+                .expect("path")
+                .path;
+            let mut expected = fanta_doc::PathData::new();
+            expected
+                .move_to(20., 30.)
+                .line_to(120., 30.)
+                .line_to(100., 100.);
+            assert_eq!(path, &expected);
+            path.clone()
+        });
+        for (command, expected) in [
+            (ToolbarCommand::Undo, original),
+            (ToolbarCommand::Redo, edited),
+        ] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let actual = &item
+                    .doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path;
+                assert_eq!(actual, &expected);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn toolbar_scale_resizes_text_contents_with_undo_redo_and_escape(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut text = TextNode::new("Scale this text", 100., 50.);
+        text.style.size_px = 20.;
+        let mut layer = CanvasNode::new(NodeData::Text(text));
+        layer.parent = Some(page_id);
+        let text_id = layer.id;
+        doc.apply(Operation::create_node(layer))
+            .expect("create text");
+        doc.selection.select_only(text_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Scale-tool.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::Scale,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Scale
+        );
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [50., 25.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let original_handle = bounds.center() + point(px(50.), px(25.));
+        let scaled_handle = original_handle + point(px(100.), px(50.));
+        cx.simulate_mouse_down(original_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_id).expect("text layer").data else {
+                panic!("text remains editable text");
+            };
+            assert_eq!(text.local_size, [200., 100.]);
+            assert_eq!(
+                text.style.size_px, 40.,
+                "Scale changes font size as well as its box"
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        cx.simulate_mouse_up(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 1);
+        });
+        for (command, expected_size, expected_font) in [
+            (ToolbarCommand::Undo, [100., 50.], 20.),
+            (ToolbarCommand::Redo, [200., 100.], 40.),
+        ] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(text_id).expect("text layer");
+                let NodeData::Text(text) = &node.data else {
+                    panic!("text remains text")
+                };
+                assert_eq!(text.local_size, expected_size);
+                assert_eq!(text.style.size_px, expected_font);
+                assert_eq!(node.transform, Transform2D::IDENTITY);
+            });
+        }
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load shipped keymap");
+            app.bind_keys(bindings);
+        });
+        let enlarged_handle = scaled_handle + point(px(100.), px(50.));
+        cx.simulate_mouse_down(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(enlarged_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("document")
+                .scene
+                .get(text_id)
+                .expect("text")
+                .data
+            else {
+                panic!("text remains text")
+            };
+            assert_eq!(text.style.size_px, 60.);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.simulate_mouse_up(enlarged_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_id).expect("text").data else {
+                panic!("text remains text")
+            };
+            assert_eq!(text.local_size, [200., 100.]);
+            assert_eq!(text.style.size_px, 40.);
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "cancelled drag creates no undo step"
+            );
+        });
+    }
+
+    async fn assert_path_edit_viewport_pixels(cx: &mut TestAppContext, delta: f32) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut path = fanta_doc::PathData::new();
+        path.move_to(0., 160.).quad_to(100., 0., 200., 160.);
+        let mut curve = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path,
+            local_size: Some([200., 160.]),
+            strokes: [fanta_doc::Stroke::solid(
+                fanta_doc::Color::rgb(46, 125, 255),
+                6.,
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        curve.meta = if delta > 0. {
+            serde_json::json!(["opaque", 42])
+        } else {
+            serde_json::json!("opaque extension")
+        };
+        curve.parent = Some(page_id);
+        curve.transform = Transform2D::translation(60., 60.);
+        let curve_id = curve.id;
+        let original = curve.clone();
+        doc.apply(Operation::create_node(curve))
+            .expect("create imported curve");
+        doc.selection.select_only(curve_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Path-viewport.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::PathSelect,
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [160., 140.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center();
+        let end = start + point(px(delta), px(delta));
+        let mut renderer = fanta_render::RasterRenderer::new(400, 400).expect("CPU renderer");
+        // At t=0.1, the shifted curve is outside the old viewport: below it for
+        // +40 and left of it for -40. A geometry-only assertion misses this clip.
+        let samples = if delta > 0. {
+            [(120_usize, 231_usize), (298, 260)]
+        } else {
+            [(40, 151), (218, 180)]
+        };
+        let assert_pixel = |item: &Entity<crate::document::FigItem>,
+                            cx: &VisualTestContext,
+                            renderer: &mut fanta_render::RasterRenderer,
+                            painted: bool| {
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                renderer.render_page(
+                    &doc.scene,
+                    &Viewport {
+                        center: [200., 200.],
+                        zoom: 1.,
+                    },
+                    doc.active_page(),
+                );
+                let pixels = renderer.copy_rgba();
+                for sample in samples {
+                    let offset = (sample.1 * 400 + sample.0) * 4;
+                    let pixel = pixels.get(offset..offset + 4).expect("sample pixel");
+                    let blue = pixel[0] < 100
+                        && pixel[1] > 80
+                        && pixel[1] < 180
+                        && pixel[2] > 220
+                        && pixel[3] > 200;
+                    assert_eq!(
+                        blue, painted,
+                        "curve pixel at {sample:?}, delta {delta}: {pixel:?}"
+                    );
+                }
+            });
+        };
+        assert_pixel(&item, cx, &mut renderer, false);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        assert_pixel(&item, cx, &mut renderer, true);
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        assert_pixel(&item, cx, &mut renderer, true);
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let curve = doc.scene.get(curve_id).expect("curve");
+            assert_eq!(curve.transform, original.transform);
+            assert_eq!(curve.meta, original.meta);
+            assert_eq!(
+                curve.flags,
+                original.flags | fanta_doc::NodeFlags::UNCLIPPED_VECTOR
+            );
+            assert_eq!(curve.data.as_vector().expect("vector").local_size, None);
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+        for (command, painted) in [(ToolbarCommand::Undo, false), (ToolbarCommand::Redo, true)] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            assert_pixel(&item, cx, &mut renderer, painted);
+            if !painted {
+                item.read_with(cx, |item, _| {
+                    let node = item
+                        .doc()
+                        .expect("document")
+                        .scene
+                        .get(curve_id)
+                        .expect("restored curve");
+                    assert_eq!(node.data, original.data);
+                    assert_eq!(node.meta, original.meta);
+                    assert_eq!(node.flags, original.flags);
+                    assert_eq!(node.transform, original.transform);
+                });
+            }
+        }
+
+        let saved_doc = item.read_with(cx, |item, _| item.doc().expect("saved doc").clone());
+        let saved_curve = saved_doc.scene.get(curve_id).expect("saved curve").clone();
+        let temporary = tempfile::tempdir().expect("temporary project");
+        crate::document::write_project(temporary.path(), &saved_doc, &Default::default())
+            .expect("write edited FNX project");
+        let (reopened_doc, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("read edited FNX project");
+        assert!(assets.is_empty());
+        let reopened_item = crate::document::ready_item_for_test(
+            &project,
+            temporary.path().join("page.fnx"),
+            reopened_doc,
+            cx,
+        );
+        reopened_item.read_with(cx, |item, _| {
+            let node = item
+                .doc()
+                .expect("reopened document")
+                .scene
+                .get(curve_id)
+                .expect("reopened curve");
+            assert_eq!(
+                node.data.as_vector().expect("vector").local_size,
+                None,
+                "FigDocument load must not backfill an explicitly edited viewport"
+            );
+            assert_eq!(node.data, saved_curve.data);
+            assert_eq!(node.meta, original.meta);
+            assert_eq!(node.meta, saved_curve.meta);
+            assert_eq!(node.flags, saved_curve.flags);
+            assert!(node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR));
+            assert_eq!(node.transform, saved_curve.transform);
+        });
+        assert_pixel(&reopened_item, cx, &mut renderer, true);
+    }
+
+    #[gpui::test]
+    async fn path_edit_viewport_positive_segment_drag_renders_outside_old_clip(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_viewport_pixels(cx, 40.).await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_viewport_negative_segment_drag_renders_outside_old_clip(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_viewport_pixels(cx, -40.).await;
+    }
+
+    #[test]
+    fn path_edit_viewport_explicit_flag_overrides_a_remaining_box() {
+        let mut doc = Doc::new();
+        let mut node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: fanta_doc::PathData::rect(0., 0., 20., 20.),
+            local_size: Some([20., 20.]),
+            strokes: [fanta_doc::Stroke::solid(
+                fanta_doc::Color::rgb(0, 0, 255),
+                16.,
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        node.flags.insert(fanta_doc::NodeFlags::UNCLIPPED_VECTOR);
+        doc.apply(Operation::create_node(node))
+            .expect("create flagged SVG viewport");
+        let mut renderer = fanta_render::RasterRenderer::new(64, 64).expect("CPU renderer");
+        renderer.render(&doc.scene, &doc.viewport);
+        let pixels = renderer.copy_rgba();
+        let offset = (42 * 64 + 56) * 4;
+        let pixel = pixels
+            .get(offset..offset + 4)
+            .expect("stroke outside viewport");
+        assert!(
+            pixel[2] > 200 && pixel[3] > 200,
+            "explicit flag must override its remaining viewport: {pixel:?}"
+        );
+    }
+
+    struct CanvasGestureFixture {
+        view: Entity<FigView>,
+        item: Entity<crate::document::FigItem>,
+        toolbar: Entity<EditorToolbar>,
+        cx: VisualTestContext,
+        vector_id: fanta_doc::NodeId,
+        original: fanta_doc::PathData,
+    }
+
+    async fn canvas_gesture_fixture(
+        cx: &mut TestAppContext,
+        tool: ToolbarTool,
+    ) -> CanvasGestureFixture {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut original = fanta_doc::PathData::new();
+        original
+            .move_to(0., 0.)
+            .line_to(100., 0.)
+            .line_to(100., 100.)
+            .line_to(0., 100.)
+            .close();
+        let mut vector = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: original.clone(),
+            fills: [fanta_doc::Fill::solid(fanta_doc::Color::BLACK)]
+                .into_iter()
+                .collect(),
+            strokes: Default::default(),
+            corner_radius: None,
+            corner_radii: None,
+            corner_smoothing: 0.,
+            local_size: None,
+            parametric: None,
+        }));
+        vector.parent = Some(page_id);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Canvas-gesture.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool,
+            });
+        });
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [50., 50.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            cx: cx.clone(),
+            vector_id,
+            original,
+        }
+    }
+
+    async fn assert_path_overlays_follow_history(cx: &mut TestAppContext, tool: ToolbarTool) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            ..
+        } = canvas_gesture_fixture(cx, tool).await;
+        let original = item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let node = document
+                    .doc
+                    .scene
+                    .get_mut(vector_id)
+                    .expect("curve fixture");
+                let vector = node.data.as_vector_mut().expect("vector fixture");
+                let mut path = fanta_doc::PathData::new();
+                path.move_to(0., 100.).quad_to(50., 0., 100., 100.);
+                vector.path = path;
+                vector.local_size = Some([100., 100.]);
+                node.transform = Transform2D::translation(20., 30.);
+                node.meta = serde_json::json!(["preserve", 42]);
+                let original = node.clone();
+                document.doc.history = Default::default();
+                (original, crate::document::DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        view.update(&mut cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [70., 80.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped key bindings");
+            app.bind_keys(bindings);
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas"));
+        let start = bounds.center() + point(px(-50.), px(50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        let edited = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            let node = doc.scene.get(vector_id).expect("edited curve");
+            assert_ne!(node.data, original.data);
+            node.clone()
+        });
+        let assert_overlays = |cx: &VisualTestContext| {
+            let expected = item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(vector_id).expect("curve");
+                let anchors = fanta_tools::node_math::enumerate_anchors(
+                    &node.data.as_vector().expect("vector").path,
+                );
+                assert_eq!(anchors.len(), 2);
+                let transform = doc
+                    .scene
+                    .world_transform(vector_id)
+                    .expect("world transform");
+                let mut expected = Vec::new();
+                for anchor in &anchors {
+                    for control in [anchor.ctrl_in, anchor.ctrl_out].into_iter().flatten() {
+                        expected.push(fanta_tools::ToolOverlay::PathHandle {
+                            world_anchor: transform.transform_point(anchor.pos).to_array(),
+                            world_ctrl: transform.transform_point(control).to_array(),
+                        });
+                    }
+                }
+                for (index, anchor) in anchors.iter().enumerate() {
+                    expected.push(fanta_tools::ToolOverlay::PathAnchor {
+                        world: transform.transform_point(anchor.pos).to_array(),
+                        selected: index == 0,
+                    });
+                }
+                expected
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.tools().overlays, expected,
+                    "every anchor/control overlay must follow document history without pointer input");
+            });
+        };
+        assert_overlays(&cx);
+        for from_toolbar in [false, true] {
+            for (command, expected_node, expected_depth) in [
+                (ToolbarCommand::Undo, &original, 0),
+                (ToolbarCommand::Redo, &edited, 1),
+            ] {
+                if from_toolbar {
+                    toolbar.update(&mut cx, |_, cx| {
+                        cx.emit(ToolbarAction::CommandInvoked { command });
+                    });
+                    cx.run_until_parked();
+                } else {
+                    cx.simulate_keystrokes(match command {
+                        ToolbarCommand::Undo => "secondary-z",
+                        ToolbarCommand::Redo => "secondary-shift-z",
+                        _ => unreachable!(),
+                    });
+                }
+                item.read_with(&cx, |item, _| {
+                    let doc = item.doc().expect("document");
+                    let node = doc.scene.get(vector_id).expect("restored curve");
+                    assert_eq!(node.data, expected_node.data);
+                    assert_eq!(node.flags, expected_node.flags);
+                    assert_eq!(node.meta, original.meta);
+                    assert_eq!(node.transform, original.transform);
+                    assert_eq!(doc.history.undo_depth(), expected_depth);
+                    assert_eq!(doc.selection.len(), 1);
+                    assert!(doc.selection.contains(vector_id));
+                });
+                assert_overlays(&cx);
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn path_overlays_follow_keyboard_and_toolbar_history_in_path_selection(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_overlays_follow_history(cx, ToolbarTool::PathSelect).await;
+    }
+
+    #[gpui::test]
+    async fn path_overlays_follow_keyboard_and_toolbar_history_in_node_edit(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_overlays_follow_history(cx, ToolbarTool::NodeEdit).await;
+    }
+
+    async fn assert_fast_canvas_drag(
+        cx: &mut TestAppContext,
+        tool: ToolbarTool,
+        release_outside: bool,
+    ) {
+        use gpui::InputEvent as _;
+
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            original,
+        } = canvas_gesture_fixture(cx, tool).await;
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = if tool == ToolbarTool::PathSelect {
+            bounds.center() + point(px(0.), px(-50.))
+        } else {
+            bounds.center()
+        };
+        let delta = if release_outside {
+            point(bounds.right() - start.x + px(20.), px(30.))
+        } else {
+            point(px(20.), px(30.))
+        };
+        let end = start + delta;
+        assert_eq!(bounds.contains(&end), !release_outside);
+        // simulate_mouse_* pumps the executor after every event, hiding a listener
+        // installed only by the repaint following the press.
+        cx.update(|window, app| {
+            window.dispatch_event(
+                gpui::MouseDownEvent {
+                    position: start,
+                    button: gpui::MouseButton::Left,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                app,
+            );
+            window.dispatch_event(
+                gpui::MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(gpui::MouseButton::Left),
+                    modifiers: Modifiers::none(),
+                }
+                .to_platform_input(),
+                app,
+            );
+            window.dispatch_event(
+                gpui::MouseUpEvent {
+                    position: end,
+                    button: gpui::MouseButton::Left,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                app,
+            );
+        });
+        cx.run_until_parked();
+        let edited = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.scene.get(vector_id).expect("dragged vector");
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "one drag must commit one undo entry"
+            );
+            if tool == ToolbarTool::PathSelect {
+                let mut expected = fanta_doc::PathData::new();
+                expected
+                    .move_to(20., 30.)
+                    .line_to(120., 30.)
+                    .line_to(100., 100.)
+                    .line_to(0., 100.)
+                    .close();
+                assert_eq!(node.data.as_vector().expect("vector").path, expected);
+                assert_eq!(node.transform, Transform2D::IDENTITY);
+            } else {
+                assert_eq!(node.data.as_vector().expect("vector").path, original);
+                assert_eq!(
+                    node.transform,
+                    Transform2D::translation(
+                        f64::from(f32::from(delta.x)),
+                        f64::from(f32::from(delta.y))
+                    )
+                );
+            }
+            node.clone()
+        });
+        cx.simulate_mouse_move(
+            bounds.center() + point(px(-30.), px(20.)),
+            None,
+            Modifiers::none(),
+        );
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector"),
+                &edited,
+                "the release must end the gesture, including outside the canvas"
+            );
+        });
+        toolbar.update(&mut cx, |_, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::Undo,
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let node = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(vector_id)
+                .expect("vector");
+            assert_eq!(node.transform, Transform2D::IDENTITY);
+            assert_eq!(node.data.as_vector().expect("vector").path, original);
+        });
+    }
+
+    #[gpui::test]
+    async fn fast_drag_without_repaint_moves_selected_layer(cx: &mut TestAppContext) {
+        assert_fast_canvas_drag(cx, ToolbarTool::Move, false).await;
+    }
+
+    #[gpui::test]
+    async fn fast_drag_without_repaint_moves_path_segment(cx: &mut TestAppContext) {
+        assert_fast_canvas_drag(cx, ToolbarTool::PathSelect, false).await;
+    }
+
+    #[gpui::test]
+    async fn fast_drag_without_repaint_releases_outside_canvas(cx: &mut TestAppContext) {
+        assert_fast_canvas_drag(cx, ToolbarTool::Move, true).await;
+    }
+
+    async fn assert_anchor_delete_uses_editing_tool(cx: &mut TestAppContext, tool: ToolbarTool) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            original,
+        } = canvas_gesture_fixture(cx, tool).await;
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load the shipped key bindings");
+            app.bind_keys(bindings);
+        });
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let anchor = bounds.center() + point(px(-50.), px(-50.));
+        for from_toolbar in [false, true] {
+            cx.simulate_click(anchor, Modifiers::none());
+            view.read_with(&cx, |view, _| {
+                assert_eq!(
+                    view.tools()
+                        .overlays
+                        .iter()
+                        .filter(|overlay| matches!(
+                            overlay,
+                            fanta_tools::ToolOverlay::PathAnchor { selected: true, .. }
+                        ))
+                        .count(),
+                    1,
+                    "click must select exactly one anchor"
+                );
+            });
+            if from_toolbar {
+                toolbar.update(&mut cx, |_, cx| {
+                    cx.emit(ToolbarAction::CommandInvoked {
+                        command: ToolbarCommand::Delete,
+                    });
+                });
+                cx.run_until_parked();
+            } else {
+                cx.simulate_keystrokes("backspace");
+            }
+            item.read_with(&cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc
+                    .scene
+                    .get(vector_id)
+                    .expect("anchor deletion must preserve the layer");
+                let anchors = fanta_tools::node_math::enumerate_anchors(
+                    &node.data.as_vector().expect("vector").path,
+                );
+                assert_eq!(anchors.len(), 3);
+                assert!(anchors.iter().all(|anchor| anchor.pos != glam::DVec2::ZERO));
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+            view.read_with(&cx, |view, _| {
+                let anchors = view
+                    .tools()
+                    .overlays
+                    .iter()
+                    .filter_map(|overlay| match overlay {
+                        fanta_tools::ToolOverlay::PathAnchor { world, selected } => {
+                            Some((world, selected))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    anchors.len(),
+                    3,
+                    "deleted anchor must disappear from overlays"
+                );
+                assert!(
+                    anchors
+                        .iter()
+                        .all(|(world, selected)| **world != [0., 0.] && !**selected)
+                );
+            });
+            cx.simulate_keystrokes("secondary-z");
+            item.read_with(&cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(vector_id).expect("restored vector");
+                assert_eq!(node.data.as_vector().expect("vector").path, original);
+                assert_eq!(doc.history.undo_depth(), 0);
+            });
+        }
+        view.update(&mut cx, |view, cx| view.delete_selected_nodes(cx));
+        item.read_with(&cx, |item, _| {
+            assert!(
+                item.doc().expect("document").scene.get(vector_id).is_none(),
+                "explicit layer deletion must retain its object-level meaning"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn anchor_delete_keymap_and_toolbar_preserve_path_selection_layer(
+        cx: &mut TestAppContext,
+    ) {
+        assert_anchor_delete_uses_editing_tool(cx, ToolbarTool::PathSelect).await;
+    }
+
+    #[gpui::test]
+    async fn anchor_delete_keymap_and_toolbar_preserve_node_edit_layer(cx: &mut TestAppContext) {
+        assert_anchor_delete_uses_editing_tool(cx, ToolbarTool::NodeEdit).await;
+    }
+
+    #[gpui::test]
+    async fn toolbar_actions_query_keeps_text_input_with_canvas_keybindings(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let query = Rc::new(RefCell::new(gpui::SharedString::default()));
+        let query_changes = query.clone();
+        let _subscription = cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load the app's default key bindings");
+            app.bind_keys(bindings);
+            app.subscribe(&toolbar, move |_, action: &ToolbarAction, _| {
+                if let ToolbarAction::CommandQueryChanged { query } = action {
+                    *query_changes.borrow_mut() = query.clone();
+                }
+            })
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("toolbar-tool-actions")
+            .expect("the Actions trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("g e n e r a t e space i m a g e");
+        cx.run_until_parked();
+
+        assert_eq!(query.borrow().as_ref(), "generate image");
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Select
+        );
+
+        let palette = cx
+            .debug_bounds("toolbar-actions-palette")
+            .expect("typing must keep the palette open");
+        cx.simulate_click(
+            point(palette.left() + px(100.), palette.top() + px(27.)),
+            Modifiers::none(),
+        );
+        cx.simulate_keystrokes("secondary-a r e c t a n g l e");
+        cx.run_until_parked();
+        assert_eq!(query.borrow().as_ref(), "rectangle");
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Select
+        );
+
+        cx.simulate_keystrokes("escape r");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_none());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Rect
+        );
+    }
+
+    #[gpui::test]
+    async fn generation_actions_are_searchable_and_open_native_workspace_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("default key bindings");
+            cx.bind_keys(bindings);
+        });
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Generation-toolbar.fig"),
+            test_doc(),
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item, project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter()
+                .expect("canvas toolbar")
+                .panel
+                .clone()
+        });
+        let invoked = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let invoked = invoked.clone();
+            cx.subscribe(&toolbar, move |_, event: &ToolbarAction, _| {
+                if let ToolbarAction::CommandInvoked { command } = event {
+                    invoked.borrow_mut().push(*command);
+                }
+            })
+        });
+        for (query, command, selector, expected_tab) in [
+            (
+                "generate image",
+                ToolbarCommand::GenerateImage,
+                "toolbar-command-generate-an-image",
+                "AI · Image",
+            ),
+            (
+                "GENERATE VIDEO",
+                ToolbarCommand::GenerateVideo,
+                "toolbar-command-generate-a-video",
+                "AI · Video",
+            ),
+            (
+                "generate vector",
+                ToolbarCommand::GenerateVector,
+                "toolbar-command-generate-vectors",
+                "AI · Create from prompt",
+            ),
+            (
+                "generate design",
+                ToolbarCommand::GenerateDesign,
+                "toolbar-command-generate-a-design",
+                "AI · Design",
+            ),
+            (
+                "generate masks",
+                ToolbarCommand::GenerateMasks,
+                "toolbar-command-generate-masks",
+                "AI · Masks",
+            ),
+            (
+                "remove background",
+                ToolbarCommand::RemoveBackground,
+                "toolbar-command-remove-background",
+                "AI · Masks",
+            ),
+        ] {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(&view, true, true, window, cx));
+                });
+            });
+            cx.run_until_parked();
+            let trigger = cx
+                .debug_bounds("toolbar-tool-actions")
+                .expect("Actions trigger");
+            cx.simulate_click(trigger.center(), Modifiers::none());
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+            let result = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("'{query}' must offer {command:?}"));
+            if command == ToolbarCommand::GenerateImage {
+                cx.simulate_keystrokes("enter");
+            } else {
+                cx.simulate_click(result.center(), Modifiers::none());
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                invoked.borrow().last().copied(),
+                Some(command),
+                "activate the matching result"
+            );
+            workspace.read_with(cx, |workspace, cx| {
+                let item = workspace.active_item(cx).expect("generation tab");
+                assert_eq!(
+                    item.tab_content_text(0, cx).as_ref(),
+                    expected_tab,
+                    "'{query}' opens the corresponding native tab"
+                );
+                assert_ne!(item.item_id(), view.entity_id());
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn structure_and_text_ai_commands_are_searchable_and_emit_their_host_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let (_view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let invoked = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let invoked = invoked.clone();
+            cx.subscribe(&toolbar, move |_, action: &ToolbarAction, _| {
+                if let ToolbarAction::CommandInvoked { command } = action {
+                    invoked.borrow_mut().push(*command);
+                }
+            })
+        });
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        cx.run_until_parked();
+
+        let commands = [
+            (
+                "group selection",
+                "toolbar-command-group-selection",
+                ToolbarCommand::Group,
+            ),
+            (
+                "ungroup selection",
+                "toolbar-command-ungroup-selection",
+                ToolbarCommand::Ungroup,
+            ),
+            (
+                "frame selection",
+                "toolbar-command-frame-selection",
+                ToolbarCommand::FrameSelection,
+            ),
+            (
+                "replace content",
+                "toolbar-command-replace-content",
+                ToolbarCommand::ReplaceContent,
+            ),
+            (
+                "rewrite text",
+                "toolbar-command-rewrite-text",
+                ToolbarCommand::RewriteText,
+            ),
+            (
+                "translate text",
+                "toolbar-command-translate-text",
+                ToolbarCommand::TranslateText,
+            ),
+            (
+                "rename layers",
+                "toolbar-command-rename-layers",
+                ToolbarCommand::RenameLayers,
+            ),
+        ];
+        for (query, selector, command) in commands {
+            let trigger = cx
+                .debug_bounds("toolbar-tool-actions")
+                .expect("Actions trigger");
+            cx.simulate_click(trigger.center(), Modifiers::none());
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+
+            let result = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("'{query}' must expose {command:?}"));
+            cx.simulate_click(result.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(
+                invoked.borrow().last().copied(),
+                Some(command),
+                "'{query}' must emit its implemented host action"
+            );
+        }
+
+        assert_eq!(
+            invoked.borrow().as_slice(),
+            commands.map(|(_, _, command)| command).as_slice(),
+            "each newly exposed command must emit once in registry order"
+        );
+    }
+
+    #[gpui::test]
     async fn option_models_reach_the_panel_and_pushes_are_diff_guarded(cx: &mut TestAppContext) {
         let (view, toolbar, mut cx) = setup(cx).await;
         let cx = &mut cx;
@@ -664,11 +1955,31 @@ mod echo_tests {
             assert!(!motion.playing);
             assert!(!motion.looping);
             assert!(!motion.auto_keyframe);
+            assert!(!motion.time_comment_armed);
+            assert_eq!(
+                motion.available_keyframe_properties,
+                motion_keyframe_properties()
+            );
             assert_eq!(motion.available_animation_styles, motion_animation_styles());
             assert_eq!(motion.animation_style, "Slide in");
             // No active clip yet: a zero-length transport, not an invented one.
             assert_eq!(motion.duration_ms, 0);
         });
+
+        // Auto key cannot be enabled outside the Motion canvas. This request
+        // is rejected even though handling it completes the initial clip sync.
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAutoKeyframe,
+                value: ToolbarControlValue::Toggle(true),
+            });
+        });
+        cx.run_until_parked();
+        assert!(
+            !toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().auto_keyframe),
+            "a pre-Motion Auto key request must be rejected"
+        );
 
         // Entering Motion mode adopts the document's clip; its real duration
         // reaches the transport read model.
@@ -724,14 +2035,1275 @@ mod echo_tests {
             baseline + 1,
             "one change, one push"
         );
+
+        // In Motion, the same request is accepted and the next host render
+        // echoes the new value through exactly one options push.
+        let before_accepted_auto_key = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter()
+                .expect("adapter")
+                .option_push_count()
+        });
+        toolbar.update_in(cx, |toolbar, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAutoKeyframe,
+                value: ToolbarControlValue::Toggle(true),
+            });
+            assert!(
+                !toolbar.motion_options().auto_keyframe,
+                "the controlled toggle must wait for the host echo"
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().auto_keyframe),
+            "the accepted auto-keyframe value must round-trip into the echoed options"
+        );
+        assert_eq!(
+            view.read_with(cx, |view, _| {
+                view.gpui_toolbar_adapter()
+                    .expect("adapter")
+                    .option_push_count()
+            }),
+            before_accepted_auto_key + 1,
+            "one accepted Auto key change, one options push"
+        );
     }
 
     #[gpui::test]
-    async fn animation_style_choice_round_trips_and_unknown_candidates_are_refused(
+    async fn time_comment_toolbar_flow_persists_exact_anchor_and_undoes(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        let clip = AnimationClipId::from_u128(7);
+        view.update_in(cx, |view, window, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx);
+            view.navigate_to_motion_comment(
+                crate::comments::MotionCommentAnchor { clip, time_ms: 875 },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionPlayPause,
+                value: ToolbarControlValue::Toggle(true),
+            });
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Comment);
+            assert!(view.comment_state.motion_time_comment_active());
+        });
+        toolbar.read_with(cx, |toolbar, _| {
+            let motion = toolbar.motion_options();
+            assert!(!motion.playing, "arming a time comment must pause playback");
+            assert_eq!(motion.current_time_ms, 875);
+            assert!(motion.time_comment_armed);
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+
+        view.update(cx, |view, cx| {
+            assert!(view.cancel_comment_draft(cx));
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Select);
+            assert!(!view.comment_state.motion_time_comment_active());
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Motion,
+                tool: ToolbarTool::Comment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Comment);
+            assert!(
+                !view.comment_state.motion_time_comment_active(),
+                "the primary Comment tool must remain a static comment"
+            );
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+
+        let canvas = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+        let editor = view.read_with(cx, |view, _| {
+            let draft = view.comment_state.draft.as_ref().expect("comment draft");
+            assert_eq!(
+                draft.motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+            draft.editor.clone()
+        });
+        view.update_in(cx, |view, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("Discard this draft", window, cx)
+            });
+            assert!(view.cancel_comment_draft(cx));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Select);
+            assert!(!view.comment_state.motion_time_comment_active());
+            assert!(view.comment_state.draft.is_none());
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+        let (editor, world) = view.read_with(cx, |view, _| {
+            let draft = view.comment_state.draft.as_ref().expect("comment draft");
+            assert_eq!(
+                draft.motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+            (draft.editor.clone(), [draft.world.x, draft.world.y])
+        });
+        view.update_in(cx, |view, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("Check this transition", window, cx)
+            });
+            view.post_comment_draft(window, cx);
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            let page = document.active_page().expect("page");
+            let comments = crate::comments::read_comments(document, page);
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].world, world);
+            assert_eq!(
+                comments[0].motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+            assert_eq!(document.history.undo_depth(), 1);
+        });
+        toolbar.read_with(cx, |toolbar, _| {
+            assert!(!toolbar.motion_options().time_comment_armed)
+        });
+
+        assert!(item.update(cx, |item, cx| item.undo(cx).expect("undo")));
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(
+                crate::comments::read_comments(document, document.active_page().expect("page"))
+                    .is_empty()
+            );
+        });
+        assert!(item.update(cx, |item, cx| item.redo(cx).expect("redo")));
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert_eq!(
+                crate::comments::read_comments(document, document.active_page().expect("page"))[0]
+                    .motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn time_comment_visibility_navigation_and_reply_draft_follow_the_exact_clip(
         cx: &mut TestAppContext,
     ) {
         let (view, toolbar, mut cx) = setup(cx).await;
         let cx = &mut cx;
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        let first_clip = AnimationClipId::from_u128(7);
+        let second_clip = AnimationClipId::from_u128(8);
+        let (static_id, first_id, second_id) = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let page = document.doc.active_page().expect("page");
+                    document
+                        .doc
+                        .motion
+                        .clips
+                        .insert(second_clip, AnimationClip::new(second_clip, "Exit", 2_000));
+                    let (static_id, operation) = crate::comments::add_comment_op(
+                        &document.doc,
+                        page,
+                        [-200.0, 0.0],
+                        "Static",
+                    )
+                    .expect("static comment");
+                    document.doc.apply(operation).expect("add static comment");
+                    let (first_id, operation) = crate::comments::add_comment_full_op(
+                        &document.doc,
+                        page,
+                        [0.0, 0.0],
+                        "Entrance moment",
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(crate::comments::MotionCommentAnchor {
+                            clip: first_clip,
+                            time_ms: 875,
+                        }),
+                    )
+                    .expect("first timed comment");
+                    document.doc.apply(operation).expect("add first comment");
+                    let (second_id, operation) = crate::comments::add_comment_full_op(
+                        &document.doc,
+                        page,
+                        [200.0, 0.0],
+                        "Exit moment",
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(crate::comments::MotionCommentAnchor {
+                            clip: second_clip,
+                            time_ms: 1_250,
+                        }),
+                    )
+                    .expect("second timed comment");
+                    document.doc.apply(operation).expect("add second comment");
+                    document.doc.history = Default::default();
+                    (
+                        (static_id, first_id, second_id),
+                        crate::document::DocChange::Content,
+                    )
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            });
+            view.set_editor_mode(crate::editor_session::EditorMode::Design, cx);
+            view.show_comment_thread(static_id.clone(), window, cx);
+            assert_eq!(
+                view.editor_mode(cx),
+                crate::editor_session::EditorMode::Design
+            );
+            assert_eq!(
+                view.editor_workspace(cx),
+                crate::editor_session::EditorWorkspace::Canvas
+            );
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Comments, cx);
+            view.set_editor_workspace(crate::editor_session::EditorWorkspace::Variables, cx);
+            view.show_comment_thread(first_id.clone(), window, cx);
+            assert_eq!(
+                view.editor_mode(cx),
+                crate::editor_session::EditorMode::Motion
+            );
+            assert_eq!(
+                view.editor_workspace(cx),
+                crate::editor_session::EditorWorkspace::Canvas
+            );
+            assert_eq!(view.active_motion_clip_id(), Some(first_clip));
+        });
+        cx.run_until_parked();
+        toolbar.read_with(cx, |toolbar, _| {
+            assert_eq!(toolbar.motion_options().current_time_ms, 875);
+            assert!(!toolbar.motion_options().playing);
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+
+        let (bounds, viewport) = view.read_with(cx, |view, _| {
+            (
+                view.container_bounds.expect("canvas bounds"),
+                view.viewport().expect("viewport"),
+            )
+        });
+        let screen_for = |world: glam::DVec2| {
+            fanta_canvas::world_to_screen(
+                world,
+                &viewport,
+                glam::DVec2::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
+            ) + glam::DVec2::new(15.0, -15.0)
+        };
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.comment_pin_at(screen_for(glam::DVec2::new(-200.0, 0.0)), cx),
+                Some(static_id.clone())
+            );
+            assert_eq!(
+                view.comment_pin_at(screen_for(glam::DVec2::ZERO), cx),
+                Some(first_id.clone())
+            );
+            assert_eq!(
+                view.comment_pin_at(screen_for(glam::DVec2::new(200.0, 0.0)), cx),
+                None
+            );
+        });
+
+        let reply_editor = view.read_with(cx, |view, _| {
+            view.comment_state
+                .reply_editor
+                .clone()
+                .expect("reply editor")
+        });
+        view.update_in(cx, |_, window, cx| {
+            reply_editor.update(cx, |editor, cx| editor.set_text("Unsent reply", window, cx));
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.comment_state.open_thread.as_deref(),
+                Some(first_id.as_str())
+            );
+            assert_eq!(view.comment_state.pending_motion_anchor(), None);
+        });
+        reply_editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), "Unsent reply"));
+        view.update_in(cx, |view, window, cx| {
+            view.navigate_to_motion_comment(
+                crate::comments::MotionCommentAnchor {
+                    clip: second_clip,
+                    time_ms: 1_250,
+                },
+                window,
+                cx,
+            );
+            assert!(view.render_comment_overlay(cx).is_none());
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.comment_pin_at(screen_for(glam::DVec2::ZERO), cx), None);
+            assert_eq!(
+                view.comment_pin_at(screen_for(glam::DVec2::new(200.0, 0.0)), cx),
+                Some(second_id.clone())
+            );
+        });
+
+        view.update_in(cx, |view, window, cx| {
+            view.show_comment_thread(first_id.clone(), window, cx);
+            assert_eq!(view.active_motion_clip_id(), Some(first_clip));
+            assert!(view.render_comment_overlay(cx).is_some());
+        });
+        reply_editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), "Unsent reply"));
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+
+        assert!(
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document
+                        .doc
+                        .motion
+                        .clips
+                        .get_mut(&first_clip)
+                        .expect("first clip")
+                        .duration_ms = 500;
+                    document.doc.history = Default::default();
+                    ((), crate::document::DocChange::Content)
+                })
+            })
+            .is_some()
+        );
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.show_comment_thread(first_id.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        toolbar.read_with(cx, |toolbar, _| {
+            assert_eq!(toolbar.motion_options().current_time_ms, 500)
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            let page = document.active_page().expect("page");
+            let comment = crate::comments::read_comments(document, page)
+                .into_iter()
+                .find(|comment| comment.id == first_id)
+                .expect("first comment");
+            assert_eq!(
+                comment.motion_anchor,
+                Some(crate::comments::MotionCommentAnchor {
+                    clip: first_clip,
+                    time_ms: 875,
+                }),
+                "navigation clamps without rewriting the authored anchor"
+            );
+            assert_eq!(document.history.undo_depth(), 0);
+        });
+
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Comments, cx);
+            view.set_editor_workspace(crate::editor_session::EditorWorkspace::Variables, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.motion.clips.remove(&first_clip);
+                    document.doc.history = Default::default();
+                    ((), crate::document::DocChange::Content)
+                })
+            })
+            .is_some()
+        );
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.active_motion_clip_id(), Some(second_clip));
+            view.show_comment_thread(first_id.clone(), window, cx);
+            assert_eq!(view.active_motion_clip_id(), Some(second_clip));
+            assert_eq!(
+                view.editor_mode(cx),
+                crate::editor_session::EditorMode::Comments
+            );
+            assert_eq!(
+                view.editor_workspace(cx),
+                crate::editor_session::EditorWorkspace::Canvas
+            );
+            assert!(
+                view.render_comment_overlay(cx).is_some(),
+                "an orphaned timed thread stays accessible from the comments UI"
+            );
+        });
+        reply_editor.read_with(cx, |editor, cx| assert_eq!(editor.text(cx), "Unsent reply"));
+    }
+
+    #[gpui::test]
+    async fn time_comment_draft_survives_preview_refusal_and_clip_deletion(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        let clip = AnimationClipId::from_u128(7);
+        view.update_in(cx, |view, window, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx);
+            view.navigate_to_motion_comment(
+                crate::comments::MotionCommentAnchor { clip, time_ms: 875 },
+                window,
+                cx,
+            );
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        let canvas = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+        let editor = view.read_with(cx, |view, _| {
+            view.comment_state
+                .draft
+                .as_ref()
+                .expect("draft")
+                .editor
+                .clone()
+        });
+        view.update_in(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_text("Keep this draft", window, cx)
+            });
+        });
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let draft = view.comment_state.draft.as_ref().expect("draft is kept");
+            assert_eq!(draft.editor.read(cx).text(cx), "Keep this draft");
+            assert_eq!(
+                draft.motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+            assert_eq!(view.comment_state.pending_motion_anchor(), None);
+        });
+
+        let sibling_owner = toolbar.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(sibling_owner, cx, |_| {
+                ((), crate::document::DocChange::ContentPreview)
+            })
+            .expect("foreign preview starts");
+        });
+        view.update_in(cx, |view, window, cx| view.post_comment_draft(window, cx));
+        view.read_with(cx, |view, cx| {
+            let draft = view.comment_state.draft.as_ref().expect("draft is kept");
+            assert_eq!(draft.editor.read(cx).text(cx), "Keep this draft");
+            assert_eq!(
+                draft.motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(item.content_preview_active());
+            assert!(
+                crate::comments::read_comments(document, document.active_page().expect("page"))
+                    .is_empty()
+            );
+        });
+        item.update(cx, |item, cx| {
+            assert!(item.finish_content_preview(sibling_owner, false, cx));
+        });
+
+        assert!(
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.motion.clips.remove(&clip);
+                    document.doc.history = Default::default();
+                    ((), crate::document::DocChange::Content)
+                })
+            })
+            .is_some()
+        );
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.post_comment_draft(window, cx));
+        view.read_with(cx, |view, cx| {
+            let draft = view
+                .comment_state
+                .draft
+                .as_ref()
+                .expect("orphan draft is kept");
+            assert_eq!(draft.editor.read(cx).text(cx), "Keep this draft");
+            assert_eq!(
+                draft.motion_anchor,
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 })
+            );
+        });
+
+        assert!(
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document
+                        .doc
+                        .motion
+                        .clips
+                        .insert(clip, AnimationClip::new(clip, "Entrance", 1_500));
+                    document.doc.history = Default::default();
+                    ((), crate::document::DocChange::Content)
+                })
+            })
+            .is_some()
+        );
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.post_comment_draft(window, cx));
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            let comments =
+                crate::comments::read_comments(document, document.active_page().expect("page"));
+            assert_eq!(comments.len(), 1);
+            assert_eq!(comments[0].text, "Keep this draft");
+            assert_eq!(document.history.undo_depth(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn time_comment_placement_preserves_a_reply_started_after_arming(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        let clip = AnimationClipId::from_u128(7);
+        let existing_id = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let page = document.doc.active_page().expect("page");
+                    let (id, operation) = crate::comments::add_comment_op(
+                        &document.doc,
+                        page,
+                        [-200.0, 0.0],
+                        "Existing thread",
+                    )
+                    .expect("comment");
+                    document.doc.apply(operation).expect("add comment");
+                    document.doc.history = Default::default();
+                    (id, crate::document::DocChange::Content)
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        view.update_in(cx, |view, window, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            });
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx);
+            view.show_comment_thread(existing_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+        let reply_editor = view.read_with(cx, |view, _| {
+            view.comment_state
+                .reply_editor
+                .clone()
+                .expect("empty reply editor")
+        });
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 0 })
+            );
+        });
+
+        view.update_in(cx, |_, window, cx| {
+            reply_editor.update(cx, |editor, cx| {
+                editor.set_text("Reply typed after arming", window, cx)
+            });
+        });
+        let (canvas, existing_pin) = view.read_with(cx, |view, _| {
+            let bounds = view.container_bounds.expect("canvas bounds");
+            let viewport = view.viewport().expect("viewport");
+            let local = fanta_canvas::world_to_screen(
+                glam::DVec2::new(-200.0, 0.0),
+                &viewport,
+                glam::DVec2::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
+            ) + glam::DVec2::new(15.0, -15.0);
+            (
+                bounds,
+                point(
+                    bounds.origin.x + px(local.x as f32),
+                    bounds.origin.y + px(local.y as f32),
+                ),
+            )
+        });
+        cx.simulate_click(existing_pin, Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.comment_state.draft.is_none());
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 0 })
+            );
+            assert_eq!(
+                view.comment_state.open_thread.as_deref(),
+                Some(existing_id.as_str())
+            );
+            assert_eq!(reply_editor.read(cx).text(cx), "Reply typed after arming");
+        });
+
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert!(view.comment_state.draft.is_none());
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(crate::comments::MotionCommentAnchor { clip, time_ms: 0 })
+            );
+            assert_eq!(
+                view.comment_state.open_thread.as_deref(),
+                Some(existing_id.as_str())
+            );
+            assert_eq!(reply_editor.read(cx).text(cx), "Reply typed after arming");
+        });
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionPlayPause,
+                value: ToolbarControlValue::Toggle(true),
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.comment_state.pending_motion_anchor(), None)
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionPlayPause,
+                value: ToolbarControlValue::Toggle(false),
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert!(view.comment_state.draft.is_none());
+            assert_eq!(view.comment_state.pending_motion_anchor(), None);
+            assert_eq!(
+                view.comment_state.open_thread.as_deref(),
+                Some(existing_id.as_str())
+            );
+            assert_eq!(reply_editor.read(cx).text(cx), "Reply typed after arming");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            let page = document.active_page().expect("page");
+            let comments = crate::comments::read_comments(document, page);
+            assert_eq!(comments.len(), 1);
+            assert!(comments[0].replies.is_empty());
+            assert_eq!(document.history.undo_depth(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn time_comment_thread_navigation_preserves_an_open_comment_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        let clip = AnimationClipId::from_u128(7);
+        let (static_id, timed_id) = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let page = document.doc.active_page().expect("page");
+                    let (static_id, operation) = crate::comments::add_comment_op(
+                        &document.doc,
+                        page,
+                        [-200.0, 0.0],
+                        "Existing static thread",
+                    )
+                    .expect("static comment");
+                    document.doc.apply(operation).expect("add static comment");
+                    let (timed_id, operation) = crate::comments::add_comment_full_op(
+                        &document.doc,
+                        page,
+                        [200.0, 0.0],
+                        "Existing timed thread",
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 }),
+                    )
+                    .expect("timed comment");
+                    document.doc.apply(operation).expect("add timed comment");
+                    document.doc.history = Default::default();
+                    ((static_id, timed_id), crate::document::DocChange::Content)
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            });
+            view.set_editor_mode(crate::editor_session::EditorMode::Design, cx);
+            view.activate_tool(crate::tools::ToolKind::Comment, cx);
+        });
+        let (canvas, static_pin) = view.read_with(cx, |view, _| {
+            let bounds = view.container_bounds.expect("canvas bounds");
+            let viewport = view.viewport().expect("viewport");
+            let local = fanta_canvas::world_to_screen(
+                glam::DVec2::new(-200.0, 0.0),
+                &viewport,
+                glam::DVec2::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
+            ) + glam::DVec2::new(15.0, -15.0);
+            (
+                bounds,
+                point(
+                    bounds.origin.x + px(local.x as f32),
+                    bounds.origin.y + px(local.y as f32),
+                ),
+            )
+        });
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+        let draft_editor = view.read_with(cx, |view, _| {
+            view.comment_state
+                .draft
+                .as_ref()
+                .expect("draft")
+                .editor
+                .clone()
+        });
+        view.update_in(cx, |_, window, cx| {
+            draft_editor.update(cx, |editor, cx| {
+                editor.set_text("Keep this comment draft", window, cx)
+            });
+        });
+
+        cx.simulate_click(static_pin, Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.show_comment_thread(timed_id.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            let draft = view.comment_state.draft.as_ref().expect("draft is kept");
+            assert_eq!(draft.editor.read(cx).text(cx), "Keep this comment draft");
+            assert_eq!(view.comment_state.open_thread, None);
+            assert_eq!(
+                view.editor_mode(cx),
+                crate::editor_session::EditorMode::Design
+            );
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Comment);
+            assert_eq!(view.comment_state.pending_motion_anchor(), None);
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            let page = document.active_page().expect("page");
+            let comments = crate::comments::read_comments(document, page);
+            assert_eq!(comments.len(), 2);
+            assert!(comments.iter().any(|comment| comment.id == static_id));
+            assert!(comments.iter().any(|comment| comment.id == timed_id));
+            assert_eq!(document.history.undo_depth(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn cross_page_time_comment_navigation_preserves_visible_composers(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, _toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1_200.), px(900.)));
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        let clip = AnimationClipId::from_u128(7);
+        let (first_page, second_page, first_id, timed_id) = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let first_page = document.doc.active_page().expect("first page");
+                    let (first_id, operation) = crate::comments::add_comment_op(
+                        &document.doc,
+                        first_page,
+                        [-200.0, 0.0],
+                        "First-page thread",
+                    )
+                    .expect("first-page comment");
+                    document
+                        .doc
+                        .apply(operation)
+                        .expect("add first-page comment");
+
+                    let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                    page.name = "Page 2".to_owned();
+                    let second_page = page.id;
+                    document
+                        .doc
+                        .apply(Operation::create_node(page))
+                        .expect("create second page");
+                    document.doc.add_page(second_page);
+                    document.pages.push(crate::document::FigPage {
+                        root: Some(second_page),
+                        name: "Page 2".into(),
+                        bounds: crate::document::page_bounds(&document.doc, Some(second_page)),
+                        hidden: false,
+                    });
+                    let (timed_id, operation) = crate::comments::add_comment_full_op(
+                        &document.doc,
+                        second_page,
+                        [200.0, 0.0],
+                        "Second-page timed thread",
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(crate::comments::MotionCommentAnchor { clip, time_ms: 875 }),
+                    )
+                    .expect("second-page time comment");
+                    document
+                        .doc
+                        .apply(operation)
+                        .expect("add second-page comment");
+                    document.doc.history = Default::default();
+                    (
+                        (first_page, second_page, first_id, timed_id),
+                        crate::document::DocChange::Content,
+                    )
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            });
+            view.set_editor_mode(crate::editor_session::EditorMode::Design, cx);
+            view.activate_tool(crate::tools::ToolKind::Comment, cx);
+        });
+        let canvas = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        cx.simulate_click(canvas.center(), Modifiers::none());
+        cx.run_until_parked();
+        let draft_editor = view.read_with(cx, |view, _| {
+            view.comment_state
+                .draft
+                .as_ref()
+                .expect("comment draft")
+                .editor
+                .clone()
+        });
+        view.update_in(cx, |_, window, cx| {
+            draft_editor.update(cx, |editor, cx| {
+                editor.set_text("Keep first-page draft", window, cx);
+            });
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.show_comment_thread_on_page(second_page, timed_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.item
+                    .read(cx)
+                    .doc()
+                    .and_then(|document| document.active_page()),
+                Some(first_page)
+            );
+            let draft = view.comment_state.draft.as_ref().expect("draft is kept");
+            assert_eq!(draft.editor.read(cx).text(cx), "Keep first-page draft");
+            assert!(view.comment_state.open_thread.is_none());
+        });
+
+        view.update(cx, |view, cx| {
+            assert!(view.cancel_comment_draft(cx));
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.show_comment_thread(first_id.clone(), window, cx);
+        });
+        let reply_editor = view.read_with(cx, |view, _| {
+            view.comment_state
+                .reply_editor
+                .clone()
+                .expect("reply editor")
+        });
+        view.update_in(cx, |_, window, cx| {
+            reply_editor.update(cx, |editor, cx| {
+                editor.set_text("Keep first-page reply", window, cx);
+            });
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.show_comment_thread_on_page(second_page, timed_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.item
+                    .read(cx)
+                    .doc()
+                    .and_then(|document| document.active_page()),
+                Some(first_page)
+            );
+            assert_eq!(
+                view.comment_state.open_thread.as_deref(),
+                Some(first_id.as_str())
+            );
+            assert_eq!(reply_editor.read(cx).text(cx), "Keep first-page reply");
+            assert!(view.has_unsent_comment_reply(cx));
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert_eq!(document.history.undo_depth(), 0);
+            assert_eq!(
+                crate::comments::read_comments(document, second_page).len(),
+                1
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn time_comment_arm_refuses_source_lock_and_missing_clip(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Comment);
+            assert!(view.comment_state.motion_time_comment_active());
+        });
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.tools().kind(), crate::tools::ToolKind::Select);
+            assert!(!view.comment_state.motion_time_comment_active());
+        });
+        toolbar.read_with(cx, |toolbar, _| {
+            assert!(!toolbar.motion_options().time_comment_armed)
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.comment_state.motion_time_comment_active())
+        });
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        assert!(
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.motion.clips.clear();
+                    document.doc.history = Default::default();
+                    ((), crate::document::DocChange::Content)
+                })
+            })
+            .is_some()
+        );
+        cx.run_until_parked();
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.comment_state.motion_time_comment_active())
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+    }
+
+    #[gpui::test]
+    async fn time_comment_arm_refuses_a_non_page_scope(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        let scope_root = item
+            .update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let scope = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                    let scope_root = scope.id;
+                    document
+                        .doc
+                        .apply(Operation::create_node(scope))
+                        .expect("create component scope");
+                    let component = ComponentId::new();
+                    document
+                        .doc
+                        .apply(Operation::DefineComponent {
+                            def: Box::new(ComponentDef::new(
+                                component,
+                                scope_root,
+                                "Component scope",
+                            )),
+                        })
+                        .expect("define component scope");
+                    assert!(document.doc.set_active_page(Some(scope_root)));
+                    document.doc.history = Default::default();
+                    (scope_root, crate::document::DocChange::Content)
+                })
+            })
+            .expect("ready document");
+        cx.run_until_parked();
+
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionTimeComment,
+            });
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.comment_state.motion_time_comment_active())
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert!(!document.pages.contains(&scope_root));
+            assert!(crate::comments::read_comments(document, scope_root).is_empty());
+            assert_eq!(document.history.undo_depth(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn keyframe_choice_creates_one_undoable_property_track(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+                value: ToolbarControlValue::Choice("Opacity".into()),
+            });
+        });
+        cx.run_until_parked();
+
+        let before_invalid = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            let track = clip
+                .track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .expect("opacity track");
+            assert_eq!(track.keyframes.len(), 1);
+            let keyframe = track.keyframes.values().next().expect("opacity keyframe");
+            assert_eq!(keyframe.time_ms, 0);
+            assert_eq!(keyframe.value, ResolvedVarValue::Float { value: 1.0 });
+            assert_eq!(doc.history.undo_depth(), 1);
+            doc.motion.clone()
+        });
+
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+                value: ToolbarControlValue::Choice("Width".into()),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.motion, before_invalid);
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+
+        assert!(item.update(cx, |item, cx| item.undo(cx).expect("undo keyframe")));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            assert!(
+                clip.track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .is_none()
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+
+        let sibling_owner = toolbar.entity_id();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(sibling_owner, cx, |_| {
+                ((), crate::document::DocChange::ContentPreview)
+            })
+            .expect("sibling preview starts");
+        });
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+                value: ToolbarControlValue::Choice("Opacity".into()),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            assert!(
+                clip.track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .is_none()
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+        });
+        item.update(cx, |item, cx| {
+            assert!(item.finish_content_preview(sibling_owner, false, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn animation_style_choice_creates_one_undoable_fade_and_syncs_the_timeline(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        assert!(item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.motion.clips.clear();
+                document.doc.history = Default::default();
+                ((), crate::document::DocChange::Content)
+            })
+            .is_some()
+        }));
+        cx.run_until_parked();
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().duration_ms),
+            0
+        );
 
         toolbar.update_in(cx, |_, _, cx| {
             cx.emit(ToolbarAction::ControlChangeRequested {
@@ -741,16 +3313,126 @@ mod echo_tests {
             });
         });
         cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.selection.iter().copied().next().expect("selection");
+            assert_eq!(doc.motion.clips.len(), 1);
+            let clip = doc.motion.clips.values().next().expect("created clip");
+            assert_eq!(clip.duration_ms, 2_000);
+            let track = clip
+                .track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .expect("Fade in opacity track");
+            assert_eq!(track.keyframes.len(), 2);
+            let mut keyframes = track.keyframes.values().collect::<Vec<_>>();
+            keyframes.sort_by_key(|keyframe| (keyframe.time_ms, keyframe.id));
+            assert_eq!(keyframes[0].time_ms, 0);
+            assert_eq!(keyframes[0].value, ResolvedVarValue::Float { value: 0.0 });
+            assert_eq!(keyframes[1].time_ms, 500);
+            assert_eq!(keyframes[1].value, ResolvedVarValue::Float { value: 1.0 });
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
         toolbar.read_with(cx, |toolbar, _| {
             assert_eq!(toolbar.motion_options().animation_style, "Fade in");
+            assert_eq!(toolbar.motion_options().duration_ms, 2_000);
         });
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.gpui_toolbar_adapter()
                     .expect("adapter")
-                    .accepted_animation_style(),
+                    .remembered_animation_style(),
                 &SharedString::from("Fade in"),
             );
+        });
+
+        assert!(item.update(cx, |item, cx| {
+            item.undo(cx).expect("undo toolbar animation style")
+        }));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.motion.clips.is_empty());
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        assert_eq!(
+            toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().duration_ms),
+            0,
+            "undo must immediately clear the echoed timeline model"
+        );
+    }
+
+    #[gpui::test]
+    async fn same_animation_style_applies_to_a_new_selection_and_failures_do_not_echo(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let (first_node, second_node) = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let first_node = doc.selection.iter().copied().next().expect("selection");
+            let second_node = doc
+                .scene
+                .children_of(doc.active_page())
+                .iter()
+                .copied()
+                .find(|node| *node != first_node)
+                .expect("second layer");
+            (first_node, second_node)
+        });
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(crate::editor_session::EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+
+        for node in [first_node, second_node] {
+            if node == second_node {
+                assert!(item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(node);
+                        ((), crate::document::DocChange::Selection)
+                    })
+                    .is_some()
+                }));
+                cx.run_until_parked();
+            }
+            toolbar.update_in(cx, |_, _, cx| {
+                cx.emit(ToolbarAction::ControlChangeRequested {
+                    mode: ToolbarMode::Motion,
+                    control: ToolbarSecondaryControl::MotionAnimationStyle,
+                    value: ToolbarControlValue::Choice("Slide in".into()),
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let clip = doc.motion.clips.values().next().expect("active clip");
+            for node in [first_node, second_node] {
+                assert!(
+                    clip.track_for_target(MotionTarget::new(node, MotionProperty::PositionX))
+                        .is_some(),
+                    "the unchanged Slide in choice must apply to layer {node}"
+                );
+            }
+            assert_eq!(doc.history.undo_depth(), 2);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.gpui_toolbar_adapter()
+                    .expect("adapter")
+                    .remembered_animation_style(),
+                &SharedString::from("Slide in"),
+            );
+        });
+
+        let before_failure = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            (doc.motion.clone(), doc.history.undo_depth())
         });
 
         // A candidate outside the host catalog is refused, not echoed.
@@ -763,7 +3445,31 @@ mod echo_tests {
         });
         cx.run_until_parked();
         toolbar.read_with(cx, |toolbar, _| {
-            assert_eq!(toolbar.motion_options().animation_style, "Fade in");
+            assert_eq!(toolbar.motion_options().animation_style, "Slide in");
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.motion, before_failure.0);
+            assert_eq!(doc.history.undo_depth(), before_failure.1);
+        });
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAnimationStyle,
+                value: ToolbarControlValue::Choice("Fade in".into()),
+            });
+        });
+        cx.run_until_parked();
+        toolbar.read_with(cx, |toolbar, _| {
+            assert_eq!(toolbar.motion_options().animation_style, "Slide in");
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.motion, before_failure.0);
+            assert_eq!(doc.history.undo_depth(), before_failure.1);
         });
     }
 

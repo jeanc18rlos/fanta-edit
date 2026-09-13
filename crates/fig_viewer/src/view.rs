@@ -8,10 +8,8 @@ use std::collections::HashSet;
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, BoundProp,
-    CanvasNode, Doc, Easing, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
-    MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue,
-    Transaction, Viewport,
+    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, IndexKey,
+    Interpolation, MotionEvaluation, MotionProperty, NodeData, NodeId, Operation, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -35,14 +33,15 @@ use workspace::{
 };
 
 use crate::canvas::{
-    CanvasElement, RenderedCanvas, bounds_size, evaluated_hit_test_screen,
-    screen_position_in_bounds,
+    CanvasElement, RenderedCanvas, authored_local_bounds, bounds_size, evaluated_hit_test_screen,
+    precise_hit_test_screen, screen_position_in_bounds,
 };
 use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
     create_operations, delete_operations,
 };
 use crate::code_workspace::FantaCodeWorkspace;
+use crate::comments::MotionCommentAnchor;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::FantaDesignPanel;
 use crate::document::{
@@ -53,9 +52,9 @@ use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
 use crate::motion_edit::{
-    MotionKeyframeDragSession, delete_keyframe_operation, rename_clip_operation,
-    set_clip_duration_operation, set_keyframe_easing_operation,
-    set_keyframe_interpolation_operation,
+    MotionKeyframeDragSession, delete_keyframe_operation, evaluated_motion_value,
+    rename_clip_operation, set_clip_duration_operation, set_keyframe_easing_operation,
+    set_keyframe_interpolation_operation, upsert_motion_keyframe_operation,
 };
 use crate::motion_panel::{FantaMotionPanel, MotionPanelEvent};
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
@@ -63,10 +62,11 @@ use crate::properties_panel::FantaPropertiesPanel;
 use crate::prototype_panel::FantaPrototypePanel;
 use crate::prototype_player::PrototypePlayerState;
 use crate::text_edit::CanvasTextEdit;
+#[cfg(test)]
+use crate::timeline::TIMELINE_HEIGHT;
 use crate::timeline::{
-    TIMELINE_HEIGHT, TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection,
-    TimelineKeyframeViewModel, TimelineProperty, TimelineShell, TimelineTrackViewModel,
-    TimelineViewModel,
+    TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection, TimelineKeyframeViewModel,
+    TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
 };
 use crate::tools::{
     TOOLBAR_GROUPS, ToolKind, ToolShell, key_event, move_event, pointer_button, press_event,
@@ -75,7 +75,9 @@ use crate::tools::{
 use crate::variables_workspace::FantaVariablesWorkspace;
 
 #[cfg(target_os = "macos")]
-use crate::canvas::GpuCanvas;
+use crate::canvas::{CanvasVideoFrame, GpuCanvas};
+#[cfg(target_os = "macos")]
+use crate::video_playback::VideoPlaybackView;
 
 actions!(
     fig_viewer,
@@ -158,11 +160,11 @@ actions!(
         ActivateSectionTool,
         /// Activate the slice tool.
         ActivateSliceTool,
-        /// Activate the scale tool (placeholder).
+        /// Proportionally scale selected objects and their contents.
         ActivateScaleTool,
-        /// Activate the direct path-selection tool (placeholder).
+        /// Activate direct selection of vector anchors and segments.
         ActivatePathSelectTool,
-        /// Activate the text-on-path tool (placeholder).
+        /// Convert the selected vector to editable text on its path.
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
         ActivateCommentTool,
@@ -248,6 +250,7 @@ pub struct FigView {
     code_workspace: Entity<FantaCodeWorkspace>,
     timeline_shell: Entity<TimelineShell>,
     active_motion_clip: Option<AnimationClipId>,
+    motion_auto_keyframe: bool,
     motion_keyframe_drag: Option<MotionKeyframeDragSession>,
     layers_sidebar_visible: bool,
     inspector_sidebar_visible: bool,
@@ -302,6 +305,14 @@ pub struct FigView {
     /// `pub(crate)` because the canvas element drives it during paint.
     #[cfg(target_os = "macos")]
     pub(crate) gpu_canvas: Option<GpuCanvas>,
+    #[cfg(target_os = "macos")]
+    canvas_video: Option<CanvasVideoSession>,
+    #[cfg(target_os = "macos")]
+    canvas_video_generation: u64,
+    #[cfg(target_os = "macos")]
+    canvas_video_removed: std::cell::Cell<bool>,
+    #[cfg(target_os = "macos")]
+    canvas_video_active: std::cell::Cell<bool>,
     pub(crate) tools: ToolShell,
     pub(crate) comment_state: crate::comments_ui::CommentState,
     /// The last-used tool per toolbar group, so each group's button keeps
@@ -343,6 +354,42 @@ pub struct FigView {
 pub enum FigViewEvent {
     Edited,
     TitleChanged,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanvasVideoSource {
+    scene: u64,
+    node: NodeId,
+    asset: AssetId,
+    assets_identity: usize,
+    bytes_identity: Option<(usize, usize)>,
+    time_range_us: [i64; 2],
+    speed_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasVideoSession {
+    source: CanvasVideoSource,
+    loading: Option<Task<()>>,
+    playback: Option<Entity<VideoPlaybackView>>,
+    observation: Option<Subscription>,
+    error: Option<SharedString>,
+    audio: (bool, u32),
+    bytes: Option<std::sync::Arc<[u8]>>,
+    trim: Option<CanvasVideoTrim>,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasVideoTrim {
+    source: CanvasVideoSource,
+    expected: fanta_doc::VideoNode,
+    start: Entity<ui_input::InputField>,
+    end: Entity<ui_input::InputField>,
+    duration_us: u64,
+    task: std::cell::RefCell<Option<Task<()>>>,
+    cancelled: std::cell::Cell<bool>,
+    error: Option<SharedString>,
 }
 
 struct PrototypeRenderCache {
@@ -440,7 +487,13 @@ impl FigView {
         let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
         let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-        let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
+        let timeline_shell = cx.new(|cx| {
+            let mut timeline = TimelineShell::new();
+            timeline.set_authoring_enabled(false, cx);
+            timeline
+        });
+        let motion_sidebar =
+            cx.new(|cx| FantaMotionPanel::new(item.clone(), timeline_shell.clone(), window, cx));
         let motion_sidebar_subscription =
             cx.subscribe(&motion_sidebar, |_this, _, event: &MotionPanelEvent, cx| {
                 let event = *event;
@@ -454,11 +507,6 @@ impl FigView {
             cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
         let code_workspace =
             cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-        let timeline_shell = cx.new(|cx| {
-            let mut timeline = TimelineShell::new();
-            timeline.set_authoring_enabled(false, cx);
-            timeline
-        });
         let timeline_subscription =
             cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
                 this.handle_timeline_event(event.clone(), cx);
@@ -515,6 +563,7 @@ impl FigView {
             code_workspace,
             timeline_shell,
             active_motion_clip: None,
+            motion_auto_keyframe: false,
             motion_keyframe_drag: None,
             layers_sidebar_visible,
             inspector_sidebar_visible,
@@ -538,6 +587,14 @@ impl FigView {
             chrome_cache: std::cell::RefCell::new(None),
             #[cfg(target_os = "macos")]
             gpu_canvas: None,
+            #[cfg(target_os = "macos")]
+            canvas_video: None,
+            #[cfg(target_os = "macos")]
+            canvas_video_generation: 0,
+            #[cfg(target_os = "macos")]
+            canvas_video_removed: std::cell::Cell::new(false),
+            #[cfg(target_os = "macos")]
+            canvas_video_active: std::cell::Cell::new(true),
             tools: ToolShell::new(),
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
@@ -568,12 +625,35 @@ impl FigView {
         }
     }
 
+    fn reconcile_opened_entry_with_project_root(&mut self, cx: &App) {
+        if let Some(root) = self.item.read(cx).project_root() {
+            self.opened_entry_id = self.opened_entry_id.filter(|entry_id| {
+                let project = self.project.read(cx);
+                project
+                    .path_for_entry(*entry_id, cx)
+                    .and_then(|path| project.absolute_path(&path, cx))
+                    .is_some_and(|path| path.starts_with(root))
+            });
+        }
+    }
+
     fn subscribe_to_item(item: &Entity<FigItem>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(item, |this, _, event: &FigItemEvent, cx| {
+            #[cfg(target_os = "macos")]
+            if this.canvas_video.as_ref().is_some_and(|session| {
+                this.selected_canvas_video_source(cx).map(|source| source.0)
+                    != Some(session.source)
+            }) {
+                this.clear_canvas_video(cx);
+            }
             // Echo document state into the DesignPanel inspector. Preview
             // frames are skipped (the panel re-echoes on the committing
             // event); selection and text-selection changes must refresh even
             // though the native panels ignore them.
+            #[cfg(feature = "fanta-gpui-ui")]
+            if matches!(event, FigItemEvent::StateChanged) {
+                this.discard_gpui_design_edits();
+            }
             #[cfg(feature = "fanta-gpui-ui")]
             if !matches!(event, FigItemEvent::EditedTransient) {
                 this.refresh_gpui_design(cx);
@@ -602,17 +682,38 @@ impl FigView {
                     // selected; a resize cursor over a now-empty selection
                     // would promise a gesture the press would not start.
                     this.hover_resize_handle = None;
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    {
+                        // Panel and workspace selection changes can arrive
+                        // while the item is already updating. Restore the
+                        // property preview after that update releases its
+                        // entity borrow, while leaving the new selection intact.
+                        let view = cx.weak_entity();
+                        cx.defer(move |cx| {
+                            view.update(cx, |view, cx| {
+                                view.finish_gpui_design_edits(cx);
+                                // An already-dirty preview only emitted
+                                // EditedTransient, so its rollback has no
+                                // later heavyweight event to refresh the panel.
+                                view.refresh_gpui_design(cx);
+                            })
+                            .log_err();
+                        });
+                    }
                 }
                 FigItemEvent::TextSelectionChanged => {}
-                // An autosave wrote the document without replacing it, so
+                // A save wrote the document without replacing it, so
                 // nothing view-side is stale: only the tab's dirty mark
                 // changes. Deliberately NOT `StateChanged`, which every
                 // listener reads as a reload and answers by dropping
                 // in-flight sessions.
                 FigItemEvent::Saved => {
+                    this.reconcile_opened_entry_with_project_root(cx);
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::StateChanged => {
+                    this.reconcile_opened_entry_with_project_root(cx);
+                    this.comment_state.clear_pending_motion_anchor();
                     // A reload replaces the document while prototype state
                     // contains node/variable IDs from the previous tree. Drop
                     // the session locally without trying to update the item
@@ -636,6 +737,9 @@ impl FigView {
                     // counter, so cached frames keyed by revision must go.
                     this.invalidate_canvas_cache();
                     this.motion_keyframe_drag = None;
+                    this.motion_auto_keyframe = false;
+                    this.motion_sidebar
+                        .update(cx, |panel, cx| panel.discard_continuous_edits(cx));
                     this.timeline_shell
                         .update(cx, |timeline, cx| timeline.cancel_authoring_gestures(cx));
                     this.active_motion_clip = None;
@@ -722,6 +826,7 @@ impl FigView {
                         .and_then(|document| document.doc.active_page());
                     if follows && this.last_seen_root != root {
                         this.last_seen_root = root;
+                        this.comment_state.clear_pending_motion_anchor();
                         match scope {
                             FigScope::Variables => {
                                 this.set_editor_workspace(EditorWorkspace::Variables, cx);
@@ -786,6 +891,12 @@ impl FigView {
             return;
         }
 
+        self.comment_state.clear_pending_motion_anchor();
+        #[cfg(feature = "fanta-gpui-ui")]
+        self.finish_gpui_design_edits(cx);
+        self.motion_sidebar
+            .update(cx, |panel, cx| panel.cancel_continuous_edits(cx));
+        self.set_motion_auto_keyframe_state(false, cx);
         self.cancel_motion_keyframe_drag(cx);
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.set_authoring_enabled(false, cx));
@@ -798,8 +909,9 @@ impl FigView {
             DVec2::new(width, height)
         });
         let tools = &mut self.tools;
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let revision_before = document.doc.scene.revision();
                 if let Some(session) = text_session.as_ref() {
                     crate::text_edit::rewind_preview(&mut document.doc, session);
@@ -818,7 +930,7 @@ impl FigView {
                 };
                 ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
         });
         self.viewport = viewport;
         self.remember_tool_face(ToolKind::Select);
@@ -858,6 +970,8 @@ impl FigView {
     fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
         self.inspector_sidebar
             .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+        self.motion_sidebar
+            .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
         self.variables_workspace
             .update(cx, |workspace, cx| workspace.finish_value_edit(cx));
         self.prototype_sidebar
@@ -867,6 +981,7 @@ impl FigView {
     }
 
     fn finish_document_edits(&mut self, cx: &mut Context<Self>) {
+        self.commit_text_edit(cx);
         self.finish_panel_edits(cx);
         self.commit_text_edit(cx);
         let clip_edit = self
@@ -906,7 +1021,57 @@ impl FigView {
         }
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.reset_keyframe_drag(cx));
+        self.cancel_tool_preview_if_active(cx);
         self.sync_motion_timeline(cx);
+    }
+
+    fn cancel_tool_preview_if_active(&mut self, cx: &mut Context<Self>) {
+        if !self.item.read(cx).content_preview_active() {
+            return;
+        }
+        let preview_owner = cx.entity_id();
+        let mut viewport = self.viewport;
+        let screen_size = self.container_bounds.map(|bounds| {
+            let (width, height) = bounds_size(bounds);
+            DVec2::new(width, height)
+        });
+        let tools = &mut self.tools;
+        let restored = self.item.update(cx, |item, cx| {
+            let restored = item
+                .with_document_for_preview_owner(preview_owner, cx, |document| {
+                    let revision_before = document.doc.scene.revision();
+                    if let (Some(viewport), Some(screen_size)) = (viewport.as_mut(), screen_size) {
+                        let mut tool_context = tool_context(
+                            &mut document.doc,
+                            viewport,
+                            screen_size,
+                            ToolKind::Select,
+                        );
+                        tools.cancel_and_activate(ToolKind::Select, &mut tool_context);
+                    } else {
+                        tools.activate_without_context(ToolKind::Select);
+                    }
+                    let change = if document.doc.scene.revision() != revision_before {
+                        DocChange::ContentPreview
+                    } else {
+                        DocChange::None
+                    };
+                    ((), change)
+                })
+                .is_some();
+            if restored {
+                item.finish_content_preview(preview_owner, false, cx);
+            }
+            restored
+        });
+        if restored {
+            self.viewport = viewport;
+            self.primary_pressed = false;
+            self.canvas_pointer_down = false;
+            self.remember_tool_face(ToolKind::Select);
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
     }
 
     pub(crate) fn finish_document_edits_for_external_change(&mut self, cx: &mut Context<Self>) {
@@ -917,11 +1082,13 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
+        self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && workspace != EditorWorkspace::Canvas {
             self.exit_prototype_session(cx);
         }
         self.finish_document_edits(cx);
         if workspace != EditorWorkspace::Canvas {
+            self.set_motion_auto_keyframe_state(false, cx);
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
@@ -936,11 +1103,13 @@ impl FigView {
         if self.editor_mode(cx) == mode {
             return;
         }
+        self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && mode != EditorMode::Prototype {
             self.exit_prototype_session(cx);
         }
         self.finish_document_edits(cx);
         if mode != EditorMode::Motion {
+            self.set_motion_auto_keyframe_state(false, cx);
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
@@ -952,6 +1121,64 @@ impl FigView {
         self.sync_motion_timeline(cx);
         self.invalidate_canvas_cache();
         cx.notify();
+    }
+
+    fn set_motion_auto_keyframe_state(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let changed = self.motion_auto_keyframe != enabled;
+        self.motion_auto_keyframe = enabled;
+        self.motion_sidebar
+            .update(cx, |panel, cx| panel.set_auto_keyframe(enabled, cx));
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn set_motion_auto_keyframe(&mut self, enabled: bool, cx: &mut Context<Self>) -> Result<()> {
+        if !enabled {
+            self.motion_sidebar
+                .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+            self.set_motion_auto_keyframe_state(false, cx);
+            return Ok(());
+        }
+        if self.motion_auto_keyframe {
+            return Ok(());
+        }
+
+        self.finish_document_edits(cx);
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas
+                && self.editor_mode(cx) == EditorMode::Motion,
+            "open the Motion canvas first"
+        );
+        let active_clip = self
+            .active_motion_clip
+            .context("create an animation clip first")?;
+        let panel_owner = self.motion_sidebar.entity_id();
+        {
+            let item = self.item.read(cx);
+            anyhow::ensure!(item.is_editable(), "the canvas is read-only");
+            anyhow::ensure!(
+                item.can_preview_for_owner(panel_owner) && !item.content_preview_active(),
+                "finish the active canvas preview first"
+            );
+            let document = item.document().context("the document is still loading")?;
+            anyhow::ensure!(
+                document.doc.motion.clip(active_clip).is_some(),
+                "the active animation no longer exists"
+            );
+            let node = single_selection(&document.doc)
+                .context("select one layer before turning on Auto key")?;
+            anyhow::ensure!(
+                document.doc.scene.get(node).is_some(),
+                "the selected layer no longer exists"
+            );
+        }
+
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.pause(cx));
+        self.set_motion_auto_keyframe_state(true, cx);
+        self.sync_motion_timeline(cx);
+        Ok(())
     }
 
     pub(crate) fn motion_evaluation(
@@ -975,9 +1202,165 @@ impl FigView {
         document.doc.motion.evaluate(clip, playhead_ms)
     }
 
+    pub(crate) fn active_motion_comment_clip(&self, cx: &App) -> Option<AnimationClipId> {
+        if self.editor_mode(cx) != EditorMode::Motion {
+            return None;
+        }
+        let clip = self.active_motion_clip?;
+        self.item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.motion.clip(clip))
+            .map(|_| clip)
+    }
+
+    pub(crate) fn active_motion_clip_id(&self) -> Option<AnimationClipId> {
+        self.active_motion_clip
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn arm_motion_time_comment(&mut self, cx: &mut Context<Self>) -> Result<u32> {
+        self.finish_document_edits(cx);
+        if self.comment_state.draft.is_some() {
+            anyhow::bail!("send or cancel the current comment draft before starting another one");
+        }
+        if self.has_unsent_comment_reply(cx) {
+            anyhow::bail!("send or clear the current reply before starting a time comment");
+        }
+        if self.editor_workspace(cx) != EditorWorkspace::Canvas
+            || self.editor_mode(cx) != EditorMode::Motion
+        {
+            anyhow::bail!("open the Motion canvas before adding a time comment");
+        }
+
+        let preview_owner = cx.entity_id();
+        let (clip, time_ms) = {
+            let item = self.item.read(cx);
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                anyhow::bail!(
+                    "finish the current Save As operation or canvas preview before adding a time comment"
+                );
+            }
+            let document = item.document().context("the document is still loading")?;
+            let page = document
+                .doc
+                .active_page()
+                .context("open a page before adding a time comment")?;
+            if !document.doc.pages.contains(&page) {
+                anyhow::bail!("open a page before adding a time comment");
+            }
+            let clip = self
+                .active_motion_clip
+                .context("create an animation before adding a time comment")?;
+            let duration_ms = document
+                .doc
+                .motion
+                .clip(clip)
+                .context("the active animation no longer exists")?
+                .duration_ms;
+            let time_ms = self
+                .timeline_shell
+                .read(cx)
+                .playhead_us()
+                .max(0)
+                .div_euclid(1_000)
+                .min(i64::from(duration_ms)) as u32;
+            (clip, time_ms)
+        };
+
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.pause(cx));
+        self.activate_tool(ToolKind::Comment, cx);
+        if !self.arm_motion_comment_anchor(MotionCommentAnchor { clip, time_ms }, cx) {
+            self.activate_tool(ToolKind::Select, cx);
+            anyhow::bail!("open a page before adding a time comment");
+        }
+        cx.notify();
+        Ok(time_ms)
+    }
+
+    pub(crate) fn navigate_to_motion_comment(
+        &mut self,
+        anchor: MotionCommentAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_document_edits(cx);
+        self.comment_state.clear_pending_motion_anchor();
+        let Some(duration_ms) = self.item.read(cx).document().and_then(|document| {
+            document
+                .doc
+                .motion
+                .clip(anchor.clip)
+                .map(|clip| clip.duration_ms)
+        }) else {
+            self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+            self.hovered_node = None;
+            self.comment_state.hovered_pin = None;
+            self.invalidate_canvas_cache();
+            cx.notify();
+            show_canvas_notice(
+                "This comment's animation is no longer available.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+
+        self.active_motion_clip = Some(anchor.clip);
+        self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+        self.set_editor_mode(EditorMode::Motion, cx);
+        self.sync_motion_timeline(cx);
+        self.timeline_shell.update(cx, |timeline, cx| {
+            timeline.seek_to(i64::from(anchor.time_ms).saturating_mul(1_000), cx)
+        });
+        self.hovered_node = None;
+        self.comment_state.hovered_pin = None;
+        self.invalidate_canvas_cache();
+        cx.notify();
+
+        if anchor.time_ms > duration_ms {
+            show_canvas_notice(
+                format!(
+                    "This comment was anchored at {}; the animation now ends at {}, so the timeline moved to its end.",
+                    crate::comments::motion_comment_time_label(anchor.time_ms),
+                    crate::comments::motion_comment_time_label(duration_ms)
+                ),
+                window,
+                cx,
+            );
+        }
+    }
+
     fn handle_timeline_event(&mut self, event: TimelineEvent, cx: &mut Context<Self>) {
         match event {
-            TimelineEvent::PlayheadChanged(_) | TimelineEvent::PlaybackChanged(_) => {
+            TimelineEvent::PlayheadChanged(_) => {
+                let current_anchor =
+                    self.comment_state
+                        .pending_motion_anchor()
+                        .is_some_and(|anchor| {
+                            let current_time_ms = self
+                                .timeline_shell
+                                .read(cx)
+                                .playhead_us()
+                                .max(0)
+                                .div_euclid(1_000)
+                                .min(i64::from(u32::MAX))
+                                as u32;
+                            self.active_motion_clip == Some(anchor.clip)
+                                && current_time_ms == anchor.time_ms
+                        });
+                if !current_anchor {
+                    self.comment_state.clear_pending_motion_anchor();
+                }
+                self.invalidate_canvas_cache();
+            }
+            TimelineEvent::PlaybackChanged(playing) => {
+                if playing && self.timeline_shell.read(cx).is_playing() {
+                    self.motion_sidebar
+                        .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+                    self.comment_state.clear_pending_motion_anchor();
+                }
                 self.invalidate_canvas_cache();
             }
             TimelineEvent::CreateClip => {
@@ -990,8 +1373,13 @@ impl FigView {
             TimelineEvent::AddKeyframe(property) => {
                 let view = cx.weak_entity();
                 cx.defer(move |cx| {
-                    view.update(cx, |view, cx| view.add_motion_keyframe(property, cx))
-                        .log_err();
+                    if let Err(error) = view
+                        .update(cx, |view, cx| view.add_motion_keyframe(property, cx))
+                        .and_then(|result| result)
+                    {
+                        log::error!("adding motion keyframe failed: {error:#}");
+                        show_canvas_notice_deferred(format!("Could not add keyframe: {error}"), cx);
+                    }
                 });
             }
             TimelineEvent::KeyframeSelectionChanged(_) => {}
@@ -1081,8 +1469,10 @@ impl FigView {
                     return;
                 }
                 self.finish_document_edits(cx);
+                self.comment_state.clear_pending_motion_anchor();
                 self.active_motion_clip = Some(clip);
                 self.sync_motion_timeline(cx);
+                self.comment_state.hovered_pin = None;
                 self.invalidate_canvas_cache();
                 cx.notify();
             }
@@ -1110,6 +1500,7 @@ impl FigView {
         interpolation: Interpolation,
         cx: &mut Context<Self>,
     ) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1129,6 +1520,7 @@ impl FigView {
         easing: Easing,
         cx: &mut Context<Self>,
     ) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1189,6 +1581,7 @@ impl FigView {
             return;
         }
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         let Some(session) = self
             .motion_keyframe_drag
             .as_mut()
@@ -1197,7 +1590,7 @@ impl FigView {
             return;
         };
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.preview(&mut document.doc, time_us) {
                     DocChange::ContentPreview
                 } else {
@@ -1219,6 +1612,7 @@ impl FigView {
             return;
         }
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         let Some(session) = self
             .motion_keyframe_drag
             .as_mut()
@@ -1227,7 +1621,7 @@ impl FigView {
             return;
         };
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.preview_easing(&mut document.doc, easing) {
                     DocChange::ContentPreview
                 } else {
@@ -1251,8 +1645,9 @@ impl FigView {
             self.restore_motion_keyframe_drag(session, cx);
             return;
         }
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 session.preview(&mut document.doc, time_us);
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
@@ -1262,11 +1657,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
                 log::error!("moving motion keyframe failed: {error:#}");
             }
         });
@@ -1285,8 +1680,9 @@ impl FigView {
             self.restore_motion_keyframe_drag(session, cx);
             return;
         }
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 session.preview_easing(&mut document.doc, easing);
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
@@ -1296,11 +1692,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
                 log::error!("editing motion keyframe easing failed: {error:#}");
             }
         });
@@ -1314,8 +1710,9 @@ impl FigView {
             self.restore_motion_keyframe_drag(session, cx);
             return;
         }
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
                 } else {
@@ -1324,11 +1721,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(preview_owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
                 log::error!("finishing motion keyframe drag failed: {error:#}");
             }
         });
@@ -1346,8 +1743,9 @@ impl FigView {
         session: MotionKeyframeDragSession,
         cx: &mut Context<Self>,
     ) {
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
                 } else {
@@ -1355,7 +1753,7 @@ impl FigView {
                 };
                 ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(preview_owner, false, cx);
         });
     }
 
@@ -1368,8 +1766,9 @@ impl FigView {
         let Some(operation) = operation else {
             return;
         };
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            if let Err(error) = item.apply(operation, cx) {
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
                 log::error!("{action} failed: {error:#}");
             }
         });
@@ -1380,6 +1779,7 @@ impl FigView {
         keyframe: TimelineKeyframeSelection,
         cx: &mut Context<Self>,
     ) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1396,6 +1796,7 @@ impl FigView {
     }
 
     fn rename_motion_clip(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1412,6 +1813,7 @@ impl FigView {
     }
 
     fn set_motion_clip_duration(&mut self, duration_us: i64, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
@@ -1427,13 +1829,18 @@ impl FigView {
     }
 
     fn create_motion_clip(&mut self, cx: &mut Context<Self>) {
+        self.finish_panel_edits(cx);
+        self.finish_motion_keyframe_drag(cx);
         if !self.is_editable(cx) {
             return;
         }
         let clip_id = AnimationClipId::new();
+        self.comment_state.clear_pending_motion_anchor();
         self.active_motion_clip = Some(clip_id);
+        let preview_owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            if let Err(error) = item.apply(
+            if let Err(error) = item.apply_for_preview_owner(
+                preview_owner,
                 Operation::CreateAnimationClip {
                     clip: Box::new(AnimationClip::new(clip_id, "Animation 1", 5_000)),
                 },
@@ -1445,13 +1852,21 @@ impl FigView {
         self.sync_motion_timeline(cx);
     }
 
-    fn add_motion_keyframe(&mut self, property: TimelineProperty, cx: &mut Context<Self>) {
+    fn add_motion_keyframe(
+        &mut self,
+        property: TimelineProperty,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        self.finish_document_edits(cx);
         if !self.is_editable(cx) {
-            return;
+            anyhow::bail!("the canvas is not editable while another edit is active");
         }
-        let Some(clip_id) = self.active_motion_clip else {
-            return;
-        };
+        if self.item.read(cx).content_preview_active() {
+            anyhow::bail!("finish or cancel the active canvas preview before adding a keyframe");
+        }
+        let clip_id = self
+            .active_motion_clip
+            .context("create an animation before adding a keyframe")?;
         let playhead_ms = self
             .timeline_shell
             .read(cx)
@@ -1459,77 +1874,58 @@ impl FigView {
             .max(0)
             .div_euclid(1_000)
             .min(i64::from(u32::MAX)) as u32;
-        self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                let Some(node_id) = single_selection(&document.doc) else {
-                    return ((), DocChange::None);
-                };
-                let Some(node) = motion_source_node(&document.doc, node_id) else {
-                    return ((), DocChange::None);
-                };
-                let motion_property = motion_property(property);
-                let Some(value) = motion_value(&node, motion_property) else {
-                    return ((), DocChange::None);
-                };
-                let target = MotionTarget::new(node_id, motion_property);
-                let Some(clip) = document.doc.motion.clip(clip_id) else {
-                    return ((), DocChange::None);
-                };
-                let time_ms = playhead_ms.min(clip.duration_ms);
-                let mut transaction = Transaction::new("Add Keyframe");
-                let track_id = if let Some(track) = clip.track_for_target(target) {
-                    track.id
-                } else {
-                    let track_id = AnimationTrackId::new();
-                    transaction.push(Operation::SetAnimationTrack {
-                        clip: clip_id,
-                        track: track_id,
-                        old: None,
-                        new: Some(Box::new(AnimationTrack::new(track_id, target))),
-                    });
-                    track_id
-                };
-                let existing = clip
-                    .tracks
-                    .get(&track_id)
-                    .and_then(|track| {
-                        track
-                            .keyframes
-                            .values()
-                            .find(|keyframe| keyframe.time_ms == time_ms)
-                    })
-                    .cloned();
-                let keyframe_id = existing
-                    .as_ref()
-                    .map(|keyframe| keyframe.id)
-                    .unwrap_or_else(KeyframeId::new);
-                transaction.push(Operation::SetKeyframe {
-                    clip: clip_id,
-                    track: track_id,
-                    target,
-                    keyframe: keyframe_id,
-                    old: existing,
-                    new: Some(Keyframe {
-                        id: keyframe_id,
-                        time_ms,
+        let preview_owner = cx.entity_id();
+        let result = self.item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let result: Result<bool> = (|| {
+                    let node_id = single_selection(&document.doc)
+                        .context("select one layer before adding a keyframe")?;
+                    let (_, value) = evaluated_motion_value(
+                        &document.doc,
+                        clip_id,
+                        node_id,
+                        property,
+                        playhead_ms,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "{} is not available for the selected layer",
+                            property.label()
+                        )
+                    })?;
+                    let Some(operation) = upsert_motion_keyframe_operation(
+                        &document.doc,
+                        clip_id,
+                        node_id,
+                        property,
+                        playhead_ms,
                         value,
-                        interpolation: Interpolation::Linear,
-                        easing: Easing::EaseInOut,
-                    }),
-                });
-                match document.doc.apply_transaction(transaction) {
-                    Ok(()) => ((), DocChange::Content),
-                    Err(error) => {
-                        log::error!("adding motion keyframe failed: {error:#}");
-                        ((), DocChange::None)
-                    }
-                }
-            });
+                    ) else {
+                        return Ok(false);
+                    };
+                    document
+                        .doc
+                        .apply(operation)
+                        .context("applying the keyframe")?;
+                    Ok(true)
+                })();
+                let change = if result.as_ref().is_ok_and(|changed| *changed) {
+                    DocChange::Content
+                } else {
+                    DocChange::None
+                };
+                (result, change)
+            })
         });
+        result.context(
+            "finish the current Save As operation or canvas preview before adding a keyframe",
+        )??;
         self.sync_motion_timeline(cx);
+        Ok(())
     }
 
     fn sync_motion_timeline(&mut self, cx: &mut Context<Self>) {
+        let previous_clip = self.active_motion_clip;
         let authoring_enabled = self.is_editable(cx)
             && self.editor_workspace(cx) == EditorWorkspace::Canvas
             && self.editor_mode(cx) == EditorMode::Motion;
@@ -1545,6 +1941,13 @@ impl FigView {
             self.active_motion_clip = None;
             TimelineViewModel::empty()
         };
+        if !authoring_enabled || self.active_motion_clip.is_none() {
+            self.motion_auto_keyframe = false;
+        }
+        if self.active_motion_clip != previous_clip {
+            self.comment_state.clear_pending_motion_anchor();
+            self.comment_state.hovered_pin = None;
+        }
         self.timeline_shell.update(cx, |timeline, cx| {
             if timeline.authoring_enabled() != authoring_enabled {
                 timeline.set_authoring_enabled(authoring_enabled, cx);
@@ -1552,10 +1955,14 @@ impl FigView {
             timeline.set_model(model, cx);
         });
         let active_clip = self.active_motion_clip;
+        let auto_keyframe = self.motion_auto_keyframe;
         let motion_sidebar = self.motion_sidebar.downgrade();
         cx.defer(move |cx| {
             motion_sidebar
-                .update(cx, |panel, cx| panel.set_active_clip(active_clip, cx))
+                .update(cx, |panel, cx| {
+                    panel.set_active_clip(active_clip, cx);
+                    panel.set_auto_keyframe(auto_keyframe, cx);
+                })
                 .log_err();
         });
     }
@@ -1742,8 +2149,9 @@ impl FigView {
         let mut wants_exit = false;
         let mut content_changed = false;
         let item = self.item.clone();
+        let preview_owner = cx.entity_id();
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            let handle_event = |document: &mut FigDocument| {
                 let revision_before = document.doc.scene.revision();
                 let selection_before: Vec<NodeId> =
                     document.doc.selection.iter().copied().collect();
@@ -1773,7 +2181,12 @@ impl FigView {
                     DocChange::None
                 };
                 ((), change)
-            });
+            };
+            if is_preview_move {
+                item.with_document_for_preview_owner(preview_owner, cx, handle_event);
+            } else {
+                item.with_document_for_owner(preview_owner, cx, handle_event);
+            }
         });
 
         self.viewport = Some(viewport);
@@ -1885,7 +2298,7 @@ impl FigView {
 
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let hit = fanta_canvas::hit_test_screen(
+                let hit = precise_hit_test_screen(
                     &document.doc.scene,
                     &viewport,
                     screen_size,
@@ -1905,6 +2318,7 @@ impl FigView {
     }
 
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        self.comment_state.clear_pending_motion_anchor();
         if kind.requires_editing() && !self.is_editable(cx) {
             return;
         }
@@ -1915,9 +2329,17 @@ impl FigView {
         // Switching tools is a document edit boundary for every inspector and
         // inline session, not only text.
         self.finish_document_edits(cx);
+        let activated_kind = if kind == ToolKind::TextPath {
+            ToolKind::Select
+        } else {
+            kind
+        };
         let Some((bounds, viewport)) = self.container_bounds.zip(self.viewport) else {
-            self.tools.activate_without_context(kind);
+            self.tools.activate_without_context(activated_kind);
             self.remember_tool_face(kind);
+            if kind == ToolKind::TextPath {
+                self.convert_selection_to_text_path(cx);
+            }
             cx.notify();
             return;
         };
@@ -1930,8 +2352,13 @@ impl FigView {
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let revision_before = document.doc.scene.revision();
-                let mut ctx = tool_context(&mut document.doc, &mut viewport, screen_size, kind);
-                tools.activate(kind, &mut ctx);
+                let mut ctx = tool_context(
+                    &mut document.doc,
+                    &mut viewport,
+                    screen_size,
+                    activated_kind,
+                );
+                tools.activate(activated_kind, &mut ctx);
                 let change = if document.doc.scene.revision() != revision_before {
                     DocChange::Content
                 } else {
@@ -1942,7 +2369,45 @@ impl FigView {
         });
         self.remember_tool_face(kind);
         self.viewport = Some(viewport);
+        if kind == ToolKind::TextPath {
+            self.convert_selection_to_text_path(cx);
+        }
         cx.notify();
+    }
+
+    fn convert_selection_to_text_path(&mut self, cx: &mut Context<Self>) {
+        let conversion = self
+            .item
+            .read(cx)
+            .document()
+            .map(|document| fanta_tools::text_path_conversion(&document.doc));
+        let Some(conversion) = conversion else {
+            show_canvas_notice_deferred("The document is still loading.".to_owned(), cx);
+            return;
+        };
+        let (node_id, operation) = match conversion {
+            Ok(conversion) => conversion,
+            Err(error) => {
+                show_canvas_notice_deferred(error.to_string(), cx);
+                return;
+            }
+        };
+        let preview_owner = cx.entity_id();
+        let result = self.item.update(cx, |item, cx| {
+            item.apply_for_preview_owner(preview_owner, operation, cx)
+        });
+        match result {
+            Ok(()) => {
+                self.pending_text_edit = Some(node_id);
+                self.invalidate_canvas_cache();
+            }
+            Err(error) => {
+                show_canvas_notice_deferred(
+                    format!("Text on Path could not be created: {error:#}"),
+                    cx,
+                );
+            }
+        }
     }
 
     fn remember_tool_face(&mut self, kind: ToolKind) {
@@ -2167,19 +2632,13 @@ impl FigView {
         {
             edit.session.dragging = false;
         }
-        // Primary releases are normally handled by the window-level listener
-        // the canvas installs while a drag is live — but that listener only
-        // exists after the paint FOLLOWING the press. A fast click can
-        // release before that paint, which would strand `primary_pressed`
-        // and turn every later hover move into a drag. Both paths funnel
-        // through `handle_window_mouse_up`, which no-ops once the flag is
-        // cleared, so a release never dispatches twice.
+        // The canvas and window listeners share an idempotent release path:
+        // whichever runs first ends the gesture, so it never dispatches twice.
         self.handle_window_mouse_up(event, cx);
     }
 
-    /// Window-level fallback installed by the canvas while a primary drag is
-    /// in flight: element listeners stop firing once the cursor leaves the
-    /// canvas, which would strand the tool mid-gesture.
+    /// Element listeners stop firing once the cursor leaves the canvas, so
+    /// the window listener must also be able to end an active gesture.
     pub(crate) fn handle_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if event.button != MouseButton::Left {
             return;
@@ -2227,10 +2686,8 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Self-heal the gesture flag. The window-level release listener only
-        // exists while a TOOL drag is live, so a release outside the canvas
-        // during a text-selection or comment gesture is never delivered; a
-        // hover move with no button held proves the pointer came up.
+        // A hover with no button held also recovers a release missed while
+        // the window was inactive.
         if event.pressed_button.is_none() {
             self.canvas_pointer_down = false;
         }
@@ -2291,6 +2748,13 @@ impl FigView {
     }
 
     fn update_hover(&mut self, screen: DVec2, cx: &mut Context<Self>) {
+        if self.tools.kind() == ToolKind::Scale {
+            self.update_hover_resize_handle(screen, cx);
+            if self.hovered_node.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         if self.tools.kind() != ToolKind::Select {
             let had_handle = self.hover_resize_handle.take().is_some();
             if self.hovered_node.take().is_some() || had_handle {
@@ -2320,7 +2784,7 @@ impl FigView {
                         document.doc.active_page(),
                     )
                 } else {
-                    fanta_canvas::hit_test_screen(
+                    precise_hit_test_screen(
                         &document.doc.scene,
                         &viewport,
                         DVec2::new(width, height),
@@ -2356,6 +2820,21 @@ impl FigView {
         let bounds = self.container_bounds?;
         let (width, height) = bounds_size(bounds);
         let document = self.item.read(cx).document()?;
+        if self.tools.kind() == ToolKind::Scale {
+            let (local, world) = fanta_tools::ScaleTool::selection_frame_with_resolver(
+                &document.doc,
+                document.doc.active_page(),
+                Some(authored_local_bounds),
+            )?;
+            return fanta_canvas::handles::hit_test_resize_handle_oriented(
+                local,
+                &world,
+                screen,
+                &viewport,
+                DVec2::new(width, height),
+                fanta_canvas::handles::DEFAULT_HANDLE_THRESHOLD,
+            );
+        }
         let selection = document.doc.selection.as_slice();
         let [id] = selection else {
             return None;
@@ -2364,7 +2843,8 @@ impl FigView {
         if fanta_canvas::handles::transform_angle(&world_transform).abs() > 1e-4 {
             return None;
         }
-        let world = document.doc.scene.world_bounds(*id)?;
+        let local = authored_local_bounds(&document.doc.scene, *id)?;
+        let world = local.try_transformed(&world_transform)?;
         fanta_canvas::handles::hit_test_resize_handle_screen(
             world,
             screen,
@@ -2518,11 +2998,16 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.undo(cx) {
+        let changed = self.item.update(cx, |item, cx| match item.undo(cx) {
+            Ok(changed) => changed,
+            Err(error) => {
                 log::error!("fig_viewer undo failed: {error:#}");
+                false
             }
         });
+        if changed {
+            self.refresh_tool_overlays(cx);
+        }
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2530,14 +3015,36 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.redo(cx) {
+        let changed = self.item.update(cx, |item, cx| match item.redo(cx) {
+            Ok(changed) => changed,
+            Err(error) => {
                 log::error!("fig_viewer redo failed: {error:#}");
+                false
             }
         });
+        if changed {
+            self.refresh_tool_overlays(cx);
+        }
+    }
+
+    fn refresh_tool_overlays(&mut self, cx: &mut Context<Self>) {
+        if let Some(doc) = self.item.read(cx).doc()
+            && self.tools.refresh_overlays(doc)
+        {
+            cx.notify();
+        }
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self
+            .canvas_video
+            .as_ref()
+            .is_some_and(|session| session.trim.is_some())
+        {
+            self.cancel_video_trim(cx);
+            return;
+        }
         if self.prototype_player.is_some() {
             self.exit_prototype_session(cx);
             return;
@@ -2548,8 +3055,7 @@ impl FigView {
             return;
         }
         if self.comment_state.open_thread.is_some() {
-            self.comment_state.open_thread = None;
-            self.comment_state.reply_editor = None;
+            self.comment_state.close_thread();
             cx.notify();
             return;
         }
@@ -2605,10 +3111,17 @@ impl FigView {
     fn delete_selection(
         &mut self,
         _: &DeleteSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.delete_selected_nodes(cx);
+        if matches!(self.tools.kind(), ToolKind::NodeEdit | ToolKind::PathSelect) {
+            if self.is_editable(cx) {
+                self.finish_document_edits(cx);
+                self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
+            }
+        } else {
+            self.delete_selected_nodes(cx);
+        }
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3312,13 +3825,16 @@ impl FigView {
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
+        self.comment_state.clear_pending_motion_anchor();
         let (root, prewarm) = self
             .item
             .update(cx, |item, cx| {
                 item.with_document(cx, |document| {
                     document.ensure_page_solved(index);
                     let root = document.pages.get(index).and_then(|page| page.root);
-                    document.doc.set_active_page(root);
+                    if document.doc.set_active_page(root) {
+                        document.doc.selection.clear();
+                    }
                     let prewarm = root.and_then(|root| document.take_page_prewarm(root));
                     ((root, prewarm), DocChange::Selection)
                 })
@@ -3367,6 +3883,10 @@ impl FigView {
             && item.is_dirty()
             && !item.has_conflict()
             && !item.source_edit_locked()
+            && !item.external_reconciliation_pending()
+            // Native and GPUI inspectors share this item-level preview flag.
+            // Neither canvas focus nor pointer state covers sidebar scrubs.
+            && !item.content_preview_active()
             // An open text session, a running prototype, or a keyframe drag
             // each hold document state that a write would freeze mid-gesture.
             && self.text_edit.is_none()
@@ -3571,12 +4091,9 @@ impl FigView {
             .map(|document| document_comment_rows(&document.doc, &document.pages))
             .unwrap_or_default();
         let view = cx.weak_entity();
-        FantaCommentsPanel::new(rows, move |page_index, comment_id, window, cx| {
+        FantaCommentsPanel::new(rows, move |page_root, comment_id, window, cx| {
             view.update(cx, |view, cx| {
-                view.select_page(page_index, cx);
-                if view.comment_state.open_thread.as_deref() != Some(comment_id.as_str()) {
-                    view.toggle_comment_thread(comment_id, window, cx);
-                }
+                view.show_comment_thread_on_page(page_root, comment_id, window, cx);
             })
             .log_err();
         })
@@ -3682,14 +4199,12 @@ impl FigView {
         let view = cx.weak_entity();
 
         h_flex()
+            .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
-                TIMELINE_HEIGHT + px(16.)
-            } else {
-                px(16.)
-            })
+            .bottom(px(12.))
             .left_0()
             .right_0()
+            .px_3()
             .justify_center()
             .child(
                 h_flex()
@@ -3764,10 +4279,7 @@ impl FigView {
                                             move |mut menu, _window, _cx| {
                                                 for kind in group.iter().copied() {
                                                     let view = view.clone();
-                                                    let mut label = kind.label().to_string();
-                                                    if kind.is_stub() {
-                                                        label.push_str("  ·  soon");
-                                                    }
+                                                    let label = kind.label().to_string();
                                                     let disabled =
                                                         kind.requires_editing() && !editable;
                                                     menu = menu.item(
@@ -4281,6 +4793,676 @@ impl FigView {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl FigView {
+    fn selected_canvas_video_source(&self, cx: &App) -> Option<(CanvasVideoSource, bool, f32)> {
+        let document = self.item.read(cx).document()?;
+        let node = single_selection(&document.doc)?;
+        if !crate::clipboard::node_is_on_active_page(&document.doc, node) {
+            return None;
+        }
+        let NodeData::Video(video) = &document.doc.scene.get(node)?.data else {
+            return None;
+        };
+        Some((
+            CanvasVideoSource {
+                scene: document.doc.scene.instance_id(),
+                node,
+                asset: video.asset,
+                assets_identity: std::sync::Arc::as_ptr(&document.raw_assets) as usize,
+                bytes_identity: document
+                    .raw_assets
+                    .get(&video.asset)
+                    .map(|bytes| (bytes.as_ptr() as usize, bytes.len())),
+                time_range_us: video.time_range_us,
+                speed_bits: video.speed.to_bits(),
+            },
+            video.muted,
+            video.volume,
+        ))
+    }
+
+    fn clear_canvas_video(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_video.take() {
+            if let Some(playback) = session.playback {
+                playback.update(cx, |playback, cx| playback.close(cx));
+            }
+            self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+            self.rendered_canvas = None;
+            cx.notify();
+        }
+    }
+
+    fn set_canvas_video_active(&self, active: bool, cx: &mut Context<Self>) {
+        self.canvas_video_active.set(active);
+        if !active {
+            self.cancel_pending_video_trim();
+        }
+        if let Some(playback) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.playback.as_ref())
+        {
+            playback.update(cx, |playback, cx| playback.set_active(active, cx));
+        }
+    }
+
+    fn sync_canvas_video(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        if self.canvas_video_removed.get()
+            || self.prototype_player.is_some()
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+        {
+            self.set_canvas_video_active(false, cx);
+            return;
+        }
+        let source = self.selected_canvas_video_source(cx);
+        if self.canvas_video.as_ref().map(|session| session.source) != source.map(|source| source.0)
+        {
+            self.clear_canvas_video(cx);
+        }
+        let Some((source, muted, volume)) = source else {
+            return;
+        };
+        self.canvas_video_active.set(window_active);
+        if let Some(session) = self.canvas_video.as_mut() {
+            if session.audio != (muted, volume.to_bits()) {
+                session.audio = (muted, volume.to_bits());
+                if let Some(playback) = session.playback.as_ref() {
+                    playback.update(cx, |playback, cx| playback.set_audio(muted, volume, cx));
+                }
+            }
+            self.set_canvas_video_active(window_active, cx);
+            return;
+        }
+        let unsupported = source.time_range_us[0] < 0
+            || source.time_range_us[1] <= source.time_range_us[0]
+            || source.speed_bits != 1_f32.to_bits();
+        self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+        let generation = self.canvas_video_generation;
+        self.canvas_video = Some(CanvasVideoSession {
+            source,
+            loading: None,
+            playback: None,
+            observation: None,
+            error: unsupported.then(|| "Inline playback and trimming support normal-speed video with a valid source range.".into()),
+            audio: (muted, volume.to_bits()),
+            bytes: None,
+            trim: None,
+        });
+        if unsupported {
+            return;
+        }
+        let Some(document) = self.item.read(cx).document() else {
+            return;
+        };
+        let raw_assets = document.raw_assets.clone();
+        let resolver = document.asset_resolver.clone();
+        // Newly placed videos live in raw_assets before the load-time resolver
+        // knows about them. Copy the bounded source on a worker, not each paint.
+        let loading = cx.background_spawn(async move {
+            let resolved;
+            let bytes = if let Some(bytes) = raw_assets.get(&source.asset) {
+                bytes.as_slice()
+            } else {
+                resolved = resolver
+                    .as_ref()
+                    .and_then(|resolver| resolver.resolve_bytes(source.asset))
+                    .context("The video source is missing from this project.")?;
+                resolved.as_slice()
+            };
+            anyhow::ensure!(
+                !bytes.is_empty() && bytes.len() <= 100 * 1024 * 1024,
+                "The video must be nonempty and no larger than 100 MiB."
+            );
+            Ok(std::sync::Arc::<[u8]>::from(bytes))
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = loading.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.finish_canvas_video_load(source, generation, result, cx);
+            }) {
+                log::debug!("Canvas video owner was released: {error}");
+            }
+        });
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.loading = Some(task);
+        }
+    }
+
+    fn finish_canvas_video_load(
+        &mut self,
+        source: CanvasVideoSource,
+        generation: u64,
+        result: Result<std::sync::Arc<[u8]>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.canvas_video_removed.get()
+            || self.canvas_video_generation != generation
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(source)
+            || self.canvas_video.as_ref().map(|session| session.source) != Some(source)
+        {
+            return;
+        }
+        let playback = match result {
+            Ok(bytes) => {
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.bytes = Some(bytes.clone());
+                }
+                Some(cx.new(|cx| {
+                    VideoPlaybackView::new_with_range(
+                        bytes,
+                        2048,
+                        [
+                            source.time_range_us[0] as u64,
+                            source.time_range_us[1] as u64,
+                        ],
+                        cx,
+                    )
+                }))
+            }
+            Err(error) => {
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.loading = None;
+                    session.error = Some(format!("Could not load video: {error:#}").into());
+                }
+                cx.notify();
+                None
+            }
+        };
+        let Some(playback) = playback else {
+            return;
+        };
+        playback.update(cx, |playback, cx| {
+            playback.set_active(
+                self.canvas_video_active.get()
+                    && self.editor_workspace(cx) == EditorWorkspace::Canvas
+                    && self.prototype_player.is_none(),
+                cx,
+            )
+        });
+        let observation = cx.observe(&playback, |_, _, cx| cx.notify());
+        if let Some(session) = self.canvas_video.as_mut() {
+            let (muted, volume) = session.audio;
+            playback.update(cx, |playback, cx| {
+                playback.set_audio(muted, f32::from_bits(volume), cx)
+            });
+            session.loading = None;
+            session.playback = Some(playback);
+            session.observation = Some(observation);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn canvas_video_frame(&self, cx: &App) -> Option<CanvasVideoFrame> {
+        let session = self.canvas_video.as_ref()?;
+        if self.canvas_video_removed.get()
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(session.source)
+        {
+            return None;
+        }
+        let playback = session.playback.as_ref()?.read(cx);
+        let status = playback.status();
+        if !canvas_video_duration_supported(
+            session.source.time_range_us,
+            playback.source_duration_us(),
+        ) {
+            return None;
+        }
+        Some(CanvasVideoFrame {
+            node_id: session.source.node,
+            buffer: playback.frame()?,
+            progress: status.current_time_us as f32 / status.duration_us as f32,
+            revision: playback.frame_revision(),
+            session_revision: self.canvas_video_generation,
+        })
+    }
+
+    fn cancel_pending_video_trim(&self) {
+        if let Some(trim) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.trim.as_ref())
+        {
+            trim.cancelled.set(true);
+            trim.task.borrow_mut().take();
+        }
+    }
+
+    fn begin_video_trim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) || self.canvas_video_removed.get() {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let Some(session) = self.canvas_video.as_ref() else {
+            return;
+        };
+        let Some(playback) = session.playback.clone() else {
+            return;
+        };
+        let duration_us = playback.read(cx).source_duration_us();
+        if duration_us == 0
+            || session.bytes.is_none()
+            || session.source.speed_bits != 1_f32.to_bits()
+        {
+            return;
+        }
+        let source = session.source;
+        let Some(NodeData::Video(expected)) = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(source.node))
+            .map(|node| &node.data)
+        else {
+            return;
+        };
+        let expected = expected.clone();
+        let start = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "0")
+                .label("Start (seconds)")
+                .label_min_width(px(0.))
+        });
+        let end = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "0")
+                .label("End (seconds)")
+                .label_min_width(px(0.))
+        });
+        start.update(cx, |input, cx| {
+            input.set_text(&video_trim_time_text(expected.time_range_us[0]), window, cx)
+        });
+        end.update(cx, |input, cx| {
+            input.set_text(&video_trim_time_text(expected.time_range_us[1]), window, cx)
+        });
+        playback.update(cx, |playback, cx| playback.pause(cx));
+        self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.trim = Some(CanvasVideoTrim {
+                source,
+                expected,
+                start,
+                end,
+                duration_us,
+                task: Default::default(),
+                cancelled: std::cell::Cell::new(false),
+                error: None,
+            });
+        }
+        cx.notify();
+    }
+
+    fn cancel_video_trim(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.trim = None;
+        }
+        cx.notify();
+    }
+
+    fn apply_video_trim(&mut self, cx: &mut Context<Self>) {
+        self.apply_video_trim_with(
+            |bytes, range| Box::pin(crate::generation_media::prepare_video_trim(bytes, range)),
+            cx,
+        );
+    }
+
+    fn apply_video_trim_with(
+        &mut self,
+        prepare: impl FnOnce(
+            std::sync::Arc<[u8]>,
+            [i64; 2],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::generation_media::PreparedVideoTrim>>
+                    + Send,
+            >,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx)
+            || self.canvas_video_removed.get()
+            || !self.canvas_video_active.get()
+        {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let Some(session) = self.canvas_video.as_ref() else {
+            return;
+        };
+        let Some(trim) = session.trim.as_ref() else {
+            return;
+        };
+        if trim.task.borrow().is_some() {
+            return;
+        }
+        let parsed = (|| {
+            let range = [
+                parse_video_trim_time(&trim.start.read(cx).text(cx))?,
+                parse_video_trim_time(&trim.end.read(cx).text(cx))?,
+            ];
+            crate::generation_media::validate_video_trim(range, i64::try_from(trim.duration_us)?)?;
+            Ok::<_, anyhow::Error>(range)
+        })();
+        let range = match parsed {
+            Ok(range) => range,
+            Err(error) => {
+                if let Some(trim) = self
+                    .canvas_video
+                    .as_mut()
+                    .and_then(|session| session.trim.as_mut())
+                {
+                    trim.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if range == trim.expected.time_range_us {
+            self.cancel_video_trim(cx);
+            return;
+        }
+        let Some(bytes) = session.bytes.clone() else {
+            return;
+        };
+        let source = trim.source;
+        let generation = self.canvas_video_generation;
+        let expected = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(source.node))
+            .and_then(|node| match &node.data {
+                NodeData::Video(video) => Some(video.clone()),
+                _ => None,
+            });
+        let Some(expected) = expected else { return };
+        if let Some(trim) = self
+            .canvas_video
+            .as_mut()
+            .and_then(|session| session.trim.as_mut())
+        {
+            trim.expected = expected;
+            trim.cancelled.set(false);
+        }
+        let work = cx.background_spawn(prepare(bytes, range));
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(20));
+        let task = cx.spawn(async move |this, cx| {
+            let result = match futures::future::select(work, timer).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+                    "Preparing the trim preview took too long. The video was not changed."
+                )),
+            };
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.finish_video_trim(source, generation, result, cx)
+            }) {
+                log::debug!("Video trim owner was released: {error}");
+            }
+        });
+        if let Some(trim) = self
+            .canvas_video
+            .as_mut()
+            .and_then(|session| session.trim.as_mut())
+        {
+            trim.error = None;
+            *trim.task.borrow_mut() = Some(task);
+        }
+        cx.notify();
+    }
+
+    fn finish_video_trim(
+        &mut self,
+        source: CanvasVideoSource,
+        generation: u64,
+        result: Result<crate::generation_media::PreparedVideoTrim>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.canvas_video_removed.get()
+            || !self.canvas_video_active.get()
+            || generation != self.canvas_video_generation
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(source)
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+        {
+            return;
+        }
+        let Some(trim) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.trim.as_ref())
+        else {
+            return;
+        };
+        if trim.cancelled.get() || trim.source != source {
+            return;
+        }
+        trim.task.borrow_mut().take();
+        let expected = trim.expected.clone();
+        let requested_range = (|| {
+            Ok::<_, anyhow::Error>([
+                parse_video_trim_time(&trim.start.read(cx).text(cx))?,
+                parse_video_trim_time(&trim.end.read(cx).text(cx))?,
+            ])
+        })();
+        let result = result.and_then(|prepared| {
+            anyhow::ensure!(
+                requested_range? == prepared.range_us,
+                "The trim times changed while the preview was loading. Apply the trim again."
+            );
+            anyhow::ensure!(
+                self.is_editable(cx),
+                "This document is currently read-only."
+            );
+            self.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    crate::generation_media::trim_video(document, source.node, &expected, prepared)
+                })
+                .context("The video document was closed.")?
+            })
+        });
+        match result {
+            Ok(()) => {
+                self.clear_canvas_video(cx);
+                self.invalidate_canvas_cache();
+            }
+            Err(error) => {
+                if let Some(trim) = self
+                    .canvas_video
+                    .as_mut()
+                    .and_then(|session| session.trim.as_mut())
+                {
+                    trim.error = Some(format!("Could not trim video: {error:#}").into());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_video_trim_controls(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = self.canvas_video.as_ref()?;
+        if let Some(trim) = session.trim.as_ref() {
+            let busy = trim.task.borrow().is_some();
+            let error = trim.error.clone();
+            return Some(
+                v_flex()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        Label::new(format!(
+                            "Trim original video · {} seconds",
+                            video_trim_time_text(trim.duration_us as i64)
+                        ))
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .w_full()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .debug_selector(|| "video-trim-start".to_owned())
+                                    .child(trim.start.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .debug_selector(|| "video-trim-end".to_owned())
+                                    .child(trim.end.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new(
+                                    "video-trim-apply",
+                                    if busy {
+                                        "Preparing preview…"
+                                    } else {
+                                        "Apply trim"
+                                    },
+                                )
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_video_trim(cx))),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "video-trim-cancel-target".to_owned())
+                                    .child(Button::new("video-trim-cancel", "Cancel").on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_video_trim(cx)),
+                                    )),
+                            ),
+                    )
+                    .when_some(error, |element, error| {
+                        element.child(Label::new(error).color(Color::Error))
+                    })
+                    .into_any_element(),
+            );
+        }
+        let enabled = self.is_editable(cx)
+            && session.bytes.is_some()
+            && session.source.speed_bits == 1_f32.to_bits()
+            && session.playback.as_ref().is_some_and(|playback| {
+                playback.read(cx).source_duration_us() > 0 && playback.read(cx).error().is_none()
+            });
+        Some(
+            div()
+                .debug_selector(|| "video-trim-open-target".to_owned())
+                .child(
+                    Button::new("video-trim", "Trim video")
+                        .disabled(!enabled)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.begin_video_trim(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_canvas_video_controls(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = self.canvas_video.as_ref()?;
+        let playback = session.playback.clone();
+        let mut error = session.error.clone();
+        let range = session.source.time_range_us;
+        let mut controls = None;
+        if let Some(playback) = playback {
+            let rendered = playback.update(cx, |playback, cx| playback.render_controls(window, cx));
+            let duration = playback.read(cx).source_duration_us();
+            if duration > 0 && !canvas_video_duration_supported(range, duration) {
+                playback.update(cx, |playback, cx| playback.close(cx));
+                error =
+                    Some("This video range extends beyond the original source duration.".into());
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.error = error.clone();
+                    session.playback = None;
+                    session.observation = None;
+                }
+            } else {
+                controls = Some(rendered);
+            }
+        }
+        let trim_controls = self.render_video_trim_controls(window, cx);
+        Some(
+            v_flex()
+                .id("canvas-video-controls")
+                .debug_selector(|| "canvas-video-controls".to_owned())
+                .w_full()
+                .flex_none()
+                .min_w_0()
+                .p_2()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().panel_background)
+                .children(controls)
+                .children(trim_controls)
+                .when_some(error, |element, error| {
+                    element.child(Label::new(error).color(Color::Error))
+                })
+                .when(
+                    self.canvas_video
+                        .as_ref()
+                        .is_some_and(|session| session.loading.is_some()),
+                    |element| element.child(Label::new("Loading video…").color(Color::Muted)),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_video_trim_time(text: &str) -> Result<i64> {
+    let (seconds, fraction) = text.trim().split_once('.').unwrap_or((text.trim(), ""));
+    anyhow::ensure!(
+        !seconds.is_empty()
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.len() <= 6
+            && fraction.bytes().all(|byte| byte.is_ascii_digit()),
+        "Enter seconds with up to six decimal places, such as 1.25."
+    );
+    let seconds: i64 = seconds.parse().context("The time is too large.")?;
+    let fraction: i64 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i64>()? * 10_i64.pow(6 - fraction.len() as u32)
+    };
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|time| time.checked_add(fraction))
+        .context("The time is too large.")
+}
+
+#[cfg(target_os = "macos")]
+fn video_trim_time_text(time: i64) -> String {
+    if time % 1_000_000 == 0 {
+        return (time / 1_000_000).to_string();
+    }
+    format!("{}.{:06}", time / 1_000_000, time % 1_000_000)
+        .trim_end_matches('0')
+        .to_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn canvas_video_duration_supported(range: [i64; 2], duration: u64) -> bool {
+    range[0] >= 0
+        && range[0] < range[1]
+        && duration > 0
+        && u64::try_from(range[1]).is_ok_and(|end| end <= duration)
+}
+
 impl Render for FigView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Deferred open from the text tool's commit, which arrives through a
@@ -4301,6 +5483,8 @@ impl Render for FigView {
         let is_loading = snapshot.loading_message.is_some();
         let editor_mode = self.editor_mode(cx);
         let editor_workspace = self.editor_workspace(cx);
+        #[cfg(target_os = "macos")]
+        self.sync_canvas_video(window.is_window_active(), cx);
         #[cfg(feature = "fanta-gpui-ui")]
         {
             let tool = self.tools.kind();
@@ -4665,8 +5849,21 @@ impl Render for FigView {
                                                                 c.push(render_empty_page_hint(cx));
                                                             }
                                                             c
-                                                        }),
-                                                ),
+                                                        })
+                                                        .child(self.render_toolbar_slot(cx)),
+                                                )
+                                                .children({
+                                                    #[cfg(target_os = "macos")]
+                                                    {
+                                                        self.render_canvas_video_controls(
+                                                            window, cx,
+                                                        )
+                                                    }
+                                                    #[cfg(not(target_os = "macos"))]
+                                                    {
+                                                        None::<AnyElement>
+                                                    }
+                                                }),
                                         )
                                         .children(
                                             self.inspector_sidebar_visible
@@ -4678,7 +5875,6 @@ impl Render for FigView {
                                         .then(|| self.timeline_shell.clone()),
                                 ),
                         )
-                        .child(self.render_toolbar_slot(cx))
                         .children(
                             self.item
                                 .read(cx)
@@ -4701,7 +5897,7 @@ fn single_selection(doc: &fanta_doc::Doc) -> Option<NodeId> {
 
 /// The layers a structural command (group, frame, ungroup) acts on: the
 /// selection, unless the command came from a layer row that is not part of
-/// it, in which case only that row's node. Switching pages keeps the
+/// it, in which case only that row's node. Scoped navigation can retain the
 /// selection, so layers left behind on another page are dropped here — a
 /// group built from them would land out of view, or pull them onto this page.
 fn structure_targets(doc: &Doc, clicked: Option<NodeId>) -> Vec<NodeId> {
@@ -4852,59 +6048,6 @@ fn place_ingested_images(
     Ok(placed)
 }
 
-fn motion_property(property: TimelineProperty) -> MotionProperty {
-    match property {
-        TimelineProperty::PositionX => MotionProperty::PositionX,
-        TimelineProperty::PositionY => MotionProperty::PositionY,
-        TimelineProperty::Rotation => MotionProperty::Rotation,
-        TimelineProperty::ScaleX => MotionProperty::ScaleX,
-        TimelineProperty::ScaleY => MotionProperty::ScaleY,
-        TimelineProperty::Opacity => MotionProperty::bound(BoundProp::Opacity),
-        TimelineProperty::FillColor => MotionProperty::bound(BoundProp::FillColor { index: 0 }),
-    }
-}
-
-fn motion_value(
-    node: &fanta_doc::CanvasNode,
-    property: MotionProperty,
-) -> Option<ResolvedVarValue> {
-    match property {
-        MotionProperty::Bound { prop } => prop.read_resolved(node),
-        MotionProperty::PositionX
-        | MotionProperty::PositionY
-        | MotionProperty::Rotation
-        | MotionProperty::ScaleX
-        | MotionProperty::ScaleY => {
-            let transform = MotionTransform::decompose(node.transform)?;
-            let value = match property {
-                MotionProperty::PositionX => transform.position[0],
-                MotionProperty::PositionY => transform.position[1],
-                MotionProperty::Rotation => transform.rotation_radians,
-                MotionProperty::ScaleX => transform.scale[0],
-                MotionProperty::ScaleY => transform.scale[1],
-                MotionProperty::Bound { .. } => return None,
-            };
-            Some(ResolvedVarValue::Float { value })
-        }
-    }
-}
-
-fn motion_source_node(doc: &fanta_doc::Doc, node_id: NodeId) -> Option<fanta_doc::CanvasNode> {
-    let mut node = doc.scene.get(node_id)?.clone();
-    for (property, variable) in node.bindings.clone() {
-        if let Some(value) = fanta_doc::resolve_bound_value(
-            &doc.variables,
-            &doc.scene,
-            node_id,
-            &doc.active_modes,
-            variable,
-        ) {
-            property.apply_resolved(&mut node, value);
-        }
-    }
-    Some(node)
-}
-
 fn motion_property_label(property: MotionProperty) -> &'static str {
     match property {
         MotionProperty::PositionX => "Position X",
@@ -4983,6 +6126,45 @@ fn motion_timeline_model(
 impl Item for FigView {
     type Event = FigViewEvent;
 
+    fn added_to_workspace(
+        &mut self,
+        _: &mut workspace::Workspace,
+        _: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        if self.canvas_video_removed.replace(false) {
+            self.clear_canvas_video(_cx);
+        }
+    }
+
+    fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_document_edits(cx);
+        #[cfg(target_os = "macos")]
+        self.set_canvas_video_active(false, cx);
+    }
+
+    fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_document_edits(cx);
+        #[cfg(target_os = "macos")]
+        self.set_canvas_video_active(false, cx);
+    }
+
+    fn on_removed(&self, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.canvas_video_removed.set(true);
+            self.cancel_pending_video_trim();
+            if let Some(playback) = self
+                .canvas_video
+                .as_ref()
+                .and_then(|session| session.playback.as_ref())
+            {
+                playback.update(_cx, |playback, cx| playback.close(cx));
+            }
+        }
+    }
+
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         match event {
             FigViewEvent::Edited => {
@@ -5010,9 +6192,16 @@ impl Item for FigView {
         // the entry this view was actually opened from instead.
         match self.opened_entry_id {
             Some(entry_id) => [entry_id].into_iter().collect(),
-            None => project::ProjectItem::entry_id(self.item.read(cx), cx)
-                .into_iter()
-                .collect(),
+            None => {
+                let project = self.project.read(cx);
+                project
+                    .find_project_path(self.item.read(cx).abs_path(), cx)
+                    .and_then(|path| project.entry_for_path(&path, cx))
+                    .map(|entry| entry.id)
+                    .or_else(|| project::ProjectItem::entry_id(self.item.read(cx), cx))
+                    .into_iter()
+                    .collect()
+            }
         }
     }
 
@@ -5064,6 +6253,50 @@ impl Item for FigView {
 
     fn can_save(&self, cx: &App) -> bool {
         self.item.read(cx).has_ready_document()
+    }
+
+    fn can_save_as(&self, cx: &App) -> bool {
+        self.item.read(cx).has_ready_document() && self.project.read(cx).is_local()
+    }
+
+    fn suggested_filename(&self, cx: &App) -> SharedString {
+        format!("{} Copy", self.item.read(cx).title()).into()
+    }
+
+    fn suggested_save_as_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let item = self.item.read(cx);
+        item.project_root()
+            .unwrap_or_else(|| item.abs_path())
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    }
+
+    fn validate_save_as(&self, path: std::path::PathBuf, cx: &App) -> Task<Result<()>> {
+        let source = self
+            .item
+            .read(cx)
+            .project_root()
+            .map(std::path::Path::to_path_buf);
+        cx.background_spawn(async move {
+            crate::document::validate_project_copy_destination(&path, source.as_deref())?;
+            Ok(())
+        })
+    }
+
+    fn save_as(
+        &mut self,
+        project: Entity<Project>,
+        path: project::ProjectPath,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+        }
+        self.finish_document_edits(cx);
+        self.autosave_task = None;
+        self.item
+            .update(cx, |item, cx| item.save_as(project, path, cx))
     }
 
     fn save(
@@ -5210,7 +6443,14 @@ impl Item for FigView {
             let (layers_sidebar, inspector_sidebar) =
                 Self::new_embedded_sidebars(&project, window, cx);
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-            let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
+            let timeline_shell = cx.new(|cx| {
+                let mut timeline = TimelineShell::new();
+                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
+                timeline.set_model(timeline_model, cx);
+                timeline
+            });
+            let motion_sidebar = cx
+                .new(|cx| FantaMotionPanel::new(item.clone(), timeline_shell.clone(), window, cx));
             motion_sidebar.update(cx, |panel, cx| {
                 panel.set_active_clip(active_motion_clip, cx)
             });
@@ -5227,12 +6467,6 @@ impl Item for FigView {
                 cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
             let code_workspace =
                 cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-            let timeline_shell = cx.new(|cx| {
-                let mut timeline = TimelineShell::new();
-                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
-                timeline.set_model(timeline_model, cx);
-                timeline
-            });
             let timeline_subscription =
                 cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
                     this.handle_timeline_event(event.clone(), cx);
@@ -5250,6 +6484,7 @@ impl Item for FigView {
                 code_workspace,
                 timeline_shell,
                 active_motion_clip,
+                motion_auto_keyframe: false,
                 motion_keyframe_drag: None,
                 layers_sidebar_visible,
                 inspector_sidebar_visible,
@@ -5273,6 +6508,14 @@ impl Item for FigView {
                 chrome_cache: std::cell::RefCell::new(None),
                 #[cfg(target_os = "macos")]
                 gpu_canvas: None,
+                #[cfg(target_os = "macos")]
+                canvas_video: None,
+                #[cfg(target_os = "macos")]
+                canvas_video_generation: 0,
+                #[cfg(target_os = "macos")]
+                canvas_video_removed: std::cell::Cell::new(false),
+                #[cfg(target_os = "macos")]
+                canvas_video_active: std::cell::Cell::new(true),
                 tools: ToolShell::new(),
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
@@ -5388,13 +6631,695 @@ mod tests {
     use std::collections::BTreeMap;
 
     use fanta_doc::{
-        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, TextNode, Transform2D,
-        VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
-        VectorNode,
+        AnimationTrack, AnimationTrackId, CanvasNode, Color, GroupNode, Keyframe, KeyframeId, Mode,
+        ModeId, MotionTarget, NodeData, Operation, PathData, ResolvedVarValue, Stroke, TextNode,
+        Transform2D, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
+        VariableType, VectorNode,
     };
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
+
+    use crate::motion_edit::{motion_property, motion_value};
+
+    #[cfg(target_os = "macos")]
+    async fn canvas_video_fixture(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<FigItem>, Entity<FigView>) {
+        let (directory, _, item, view) = autosave_fixture(cx).await;
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut video = CanvasNode::new(NodeData::Video(fanta_doc::VideoNode {
+                    asset: AssetId::new(),
+                    natural_size: [16, 16],
+                    local_size: [80., 80.],
+                    time_range_us: [0, 3_000_000],
+                    speed: 1.,
+                    muted: true,
+                    volume: 1.,
+                    poster_frame_us: None,
+                    poster: None,
+                    fit: fanta_doc::ImageFitMode::Fit,
+                }));
+                video.parent = document.doc.active_page();
+                let node = video.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(video))
+                    .expect("create video");
+                document.doc.selection.replace_with([node]);
+                ((), DocChange::Selection)
+            });
+        });
+        (directory, item, view)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn video_trim_view_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<FigItem>,
+        gpui::WindowHandle<FigView>,
+    ) {
+        let (directory, item, previous_view) = canvas_video_fixture(cx).await;
+        let project = previous_view.read_with(cx, |view, _| view.project.clone());
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        let window = cx.add_window(|window, cx| FigView::new(item.clone(), project, window, cx));
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .expect("activate trim window");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                playback.update(cx, |playback, cx| playback.tick(window, cx));
+                let (source, muted, volume) = view.selected_canvas_video_source(cx).expect("video");
+                view.canvas_video = Some(CanvasVideoSession {
+                    source,
+                    loading: None,
+                    playback: Some(playback),
+                    observation: None,
+                    error: None,
+                    audio: (muted, volume.to_bits()),
+                    bytes: Some(std::sync::Arc::from(&b"original MP4 bytes"[..])),
+                    trim: None,
+                });
+                view.begin_video_trim(window, cx);
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("trim controls");
+                trim.start
+                    .update(cx, |input, cx| input.set_text("0.5", window, cx));
+                trim.end
+                    .update(cx, |input, cx| input.set_text("2", window, cx));
+            })
+            .expect("trim controls");
+        (directory, item, window)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_trim_for_view(range_us: [i64; 2]) -> crate::generation_media::PreparedVideoTrim {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([225, 0, 225, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("poster");
+        crate::generation_media::PreparedVideoTrim {
+            range_us,
+            source_duration_us: 3_000_000,
+            poster: crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: range_us[0],
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_apply_waits_for_poster_and_commits_one_history_step(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            let id = single_selection(doc).expect("video");
+            (
+                id,
+                doc.scene.get(id).expect("video").clone(),
+                doc.history.undo_depth(),
+            )
+        });
+        let (send, receive) = futures::channel::oneshot::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.apply_video_trim_with(
+                    |bytes, range| {
+                        assert_eq!(bytes.as_ref(), b"original MP4 bytes");
+                        assert_eq!(range, [500_000, 2_000_000]);
+                        Box::pin(async move { receive.await.context("poster response")? })
+                    },
+                    cx,
+                )
+            })
+            .expect("apply");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            assert_eq!(
+                doc.scene.get(before.0),
+                Some(&before.1),
+                "no partial range mutation before the poster"
+            );
+            assert_eq!(doc.history.undo_depth(), before.2);
+        });
+        send.send(Ok(prepared_trim_for_view([500_000, 2_000_000])))
+            .unwrap_or_else(|_| panic!("pending poster"));
+        cx.run_until_parked();
+        item.update(cx, |item, cx| {
+            let doc = &item.document().expect("document").doc;
+            let NodeData::Video(video) = &doc.scene.get(before.0).expect("video").data else {
+                panic!("video")
+            };
+            assert_eq!(video.time_range_us, [500_000, 2_000_000]);
+            assert_eq!(video.poster_frame_us, Some(500_000));
+            assert!(video.poster.is_some());
+            assert_eq!(doc.history.undo_depth(), before.2 + 1);
+            assert!(item.undo(cx).expect("undo trim"));
+            assert_eq!(
+                item.document().expect("document").doc.scene.get(before.0),
+                Some(&before.1)
+            );
+            assert!(item.redo(cx).expect("redo trim"));
+            assert!(item.is_dirty());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_cancel_error_timeout_and_stale_target_preserve_document(
+        cx: &mut TestAppContext,
+    ) {
+        for case in [
+            "cancel",
+            "error",
+            "timeout",
+            "deactivate",
+            "remove",
+            "source-change",
+            "input-change",
+        ] {
+            let (_directory, item, window) = video_trim_view_fixture(cx).await;
+            let before = item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                let id = single_selection(&document.doc).expect("video");
+                (
+                    id,
+                    document.doc.scene.get(id).expect("video").clone(),
+                    document.raw_assets.clone(),
+                    document.doc.history.undo_depth(),
+                )
+            });
+            let (send, receive) = futures::channel::oneshot::channel::<
+                Result<crate::generation_media::PreparedVideoTrim>,
+            >();
+            let (source, generation) = window
+                .update(cx, |view, _, cx| {
+                    view.apply_video_trim_with(
+                        |_, _| Box::pin(async move { receive.await.context("poster response")? }),
+                        cx,
+                    );
+                    (
+                        view.canvas_video.as_ref().expect("session").source,
+                        view.canvas_video_generation,
+                    )
+                })
+                .expect("apply");
+            cx.run_until_parked();
+            match case {
+                "cancel" => window
+                    .update(cx, |view, _, cx| view.cancel_video_trim(cx))
+                    .expect("cancel"),
+                "deactivate" => window
+                    .update(cx, |view, _, cx| view.set_canvas_video_active(false, cx))
+                    .expect("deactivate"),
+                "remove" => window
+                    .update(cx, |view, _, cx| Item::on_removed(view, cx))
+                    .expect("remove"),
+                "timeout" => {
+                    cx.executor()
+                        .advance_clock(std::time::Duration::from_secs(21));
+                    cx.run_until_parked();
+                }
+                "input-change" => window
+                    .update(cx, |view, window, cx| {
+                        let trim = view
+                            .canvas_video
+                            .as_ref()
+                            .and_then(|session| session.trim.as_ref())
+                            .expect("trim");
+                        trim.start
+                            .update(cx, |input, cx| input.set_text("1", window, cx));
+                    })
+                    .expect("new trim time"),
+                "source-change" => item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.clear();
+                        ((), DocChange::Selection)
+                    });
+                }),
+                "error" => {
+                    send.send(Err(anyhow::anyhow!("injected poster decode failure")))
+                        .unwrap_or_else(|_| panic!("pending poster"));
+                    cx.run_until_parked();
+                }
+                _ => unreachable!(),
+            }
+            if case != "error" && case != "timeout" {
+                // Even an already queued completion must not mutate a cancelled or rebound view.
+                window
+                    .update(cx, |view, _, cx| {
+                        view.finish_video_trim(
+                            source,
+                            generation,
+                            Ok(prepared_trim_for_view([500_000, 2_000_000])),
+                            cx,
+                        )
+                    })
+                    .expect("late completion");
+            }
+            if matches!(case, "error" | "timeout" | "input-change") {
+                window
+                    .update(cx, |view, _, _| {
+                        let trim = view
+                            .canvas_video
+                            .as_ref()
+                            .and_then(|session| session.trim.as_ref())
+                            .expect("retryable trim inputs");
+                        assert!(trim.error.is_some(), "{case}");
+                        assert!(trim.task.borrow().is_none(), "{case}");
+                    })
+                    .expect("visible failure");
+            }
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(document.doc.scene.get(before.0), Some(&before.1), "{case}");
+                assert_eq!(document.raw_assets, before.2, "{case}");
+                assert_eq!(document.doc.history.undo_depth(), before.3, "{case}");
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_controls_open_cancel_and_fit_the_canvas_footer(cx: &mut TestAppContext) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let view = window.entity(cx).expect("view");
+        let depth = item.read_with(cx, |item, _| {
+            item.document().expect("document").doc.history.undo_depth()
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [1_000., 1_200.] {
+            visual.simulate_resize(size(px(width), px(900.)));
+            visual.update(|window, cx| window.draw(cx).clear());
+            let footer = visual
+                .debug_bounds("canvas-video-controls")
+                .expect("video controls");
+            for selector in [
+                "video-trim-start",
+                "video-trim-end",
+                "video-trim-cancel-target",
+            ] {
+                let bounds = visual.debug_bounds(selector).expect("visible trim control");
+                assert!(
+                    bounds.left() >= footer.left() && bounds.right() <= footer.right(),
+                    "{selector}: {bounds:?} outside {footer:?}"
+                );
+                assert!(
+                    bounds.top() >= footer.top() && bounds.bottom() <= footer.bottom(),
+                    "{selector}"
+                );
+            }
+        }
+        let cancel = visual
+            .debug_bounds("video-trim-cancel-target")
+            .expect("cancel");
+        visual.simulate_click(cancel.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(&visual, |view, _| {
+            assert!(view.canvas_video.as_ref().expect("session").trim.is_none())
+        });
+        let open = visual
+            .debug_bounds("video-trim-open-target")
+            .expect("trim button");
+        visual.simulate_click(open.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("video-trim-start").is_some());
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.document().expect("document").doc.history.undo_depth(),
+                depth
+            )
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_invalid_input_never_starts_preparation(cx: &mut TestAppContext) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            item.document().expect("document").doc.history.undo_depth()
+        });
+        for (start, end) in [
+            ("NaN", "2"),
+            ("-1", "2"),
+            ("2", "2"),
+            ("2", "1"),
+            ("0", "11"),
+        ] {
+            window
+                .update(cx, |view, window, cx| {
+                    let trim = view
+                        .canvas_video
+                        .as_ref()
+                        .and_then(|session| session.trim.as_ref())
+                        .expect("trim");
+                    trim.start
+                        .update(cx, |input, cx| input.set_text(start, window, cx));
+                    trim.end
+                        .update(cx, |input, cx| input.set_text(end, window, cx));
+                    view.apply_video_trim_with(|_, _| panic!("invalid input reached decoder"), cx);
+                    let trim = view
+                        .canvas_video
+                        .as_ref()
+                        .and_then(|session| session.trim.as_ref())
+                        .expect("trim");
+                    assert!(trim.error.is_some());
+                    assert!(trim.task.borrow().is_none());
+                })
+                .expect("validate input");
+        }
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("document")
+                .doc
+                .history
+                .undo_depth()),
+            before
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_trim_decimal_times_preserve_microseconds_without_float_rounding() {
+        for (text, expected) in [
+            ("0", 0),
+            ("1.25", 1_250_000),
+            ("0.000001", 1),
+            ("9223372036854.775807", i64::MAX),
+        ] {
+            assert_eq!(parse_video_trim_time(text).expect("valid time"), expected);
+            assert_eq!(
+                parse_video_trim_time(&video_trim_time_text(expected)).expect("round trip"),
+                expected
+            );
+        }
+        for text in ["NaN", "-0.1", "1e3", "1.0000001", "9223372036854.775808"] {
+            assert!(parse_video_trim_time(text).is_err(), "{text}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_authored_range_starts_canvas_loading(cx: &mut TestAppContext) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let id = single_selection(&document.doc).expect("selected video");
+                let old = document.doc.scene.get(id).expect("video").data.clone();
+                let mut new = old.clone();
+                let NodeData::Video(video) = &mut new else {
+                    panic!("video")
+                };
+                video.time_range_us = [500_000, 2_000_000];
+                document
+                    .doc
+                    .apply(Operation::ReplaceData {
+                        id,
+                        old: Box::new(old),
+                        new: Box::new(new),
+                    })
+                    .expect("author source range");
+                ((), DocChange::Content)
+            });
+        });
+        view.update(cx, |view, cx| {
+            view.sync_canvas_video(true, cx);
+            let session = view.canvas_video.as_ref().expect("video session");
+            assert!(
+                session.error.is_none(),
+                "valid authored trim must be playable"
+            );
+            assert!(
+                session.loading.is_some(),
+                "load the original source without rewriting it"
+            );
+            view.clear_canvas_video(cx);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_controls_remain_below_the_design_toolbar(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        #[cfg(feature = "fanta-gpui-ui")]
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        let mut video = CanvasNode::new(NodeData::Video(fanta_doc::VideoNode {
+            asset: AssetId::new(),
+            natural_size: [16, 16],
+            local_size: [80., 80.],
+            time_range_us: [0, 10_000_000],
+            speed: 1.,
+            muted: true,
+            volume: 1.,
+            poster_frame_us: None,
+            poster: None,
+            fit: fanta_doc::ImageFitMode::Fit,
+        }));
+        video.parent = document.active_page();
+        let node = video.id;
+        document
+            .apply(Operation::create_node(video))
+            .expect("video");
+        document.selection.replace_with([node]);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Video-layout.fig"),
+            document,
+            cx,
+        );
+        let window = cx.add_window(move |window, cx| FigView::new(item, project, window, cx));
+        let view = window.entity(cx).expect("fig view");
+        #[cfg(feature = "fanta-gpui-ui")]
+        assert!(view.read_with(cx, |view, _| view.gpui_toolbar.is_some()));
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let (source, muted, volume) = view.selected_canvas_video_source(cx).expect("video");
+            view.canvas_video = Some(CanvasVideoSession {
+                source,
+                loading: None,
+                playback: Some(playback),
+                observation: None,
+                error: None,
+                audio: (muted, volume.to_bits()),
+                bytes: None,
+                trim: None,
+            });
+        });
+        let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [1_000., 1_400.] {
+            visual_context.simulate_resize(size(px(width), px(800.)));
+            visual_context.update(|window, cx| window.draw(cx).clear());
+            let canvas = visual_context
+                .debug_bounds("fig-container")
+                .expect("canvas");
+            let controls = visual_context
+                .debug_bounds("canvas-video-controls")
+                .expect("controls");
+            let toolbar = visual_context
+                .debug_bounds("fanta-canvas-toolbar")
+                .expect("toolbar");
+            assert!(
+                toolbar.bottom() <= canvas.bottom(),
+                "toolbar must stay in the canvas: {toolbar:?} vs {canvas:?}"
+            );
+            assert!(
+                toolbar.bottom() < controls.top(),
+                "toolbar covers video controls: {toolbar:?} vs {controls:?}"
+            );
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                let surface = visual_context
+                    .debug_bounds("editor-toolbar-surface")
+                    .expect("compact toolbar surface");
+                assert!(surface.is_contained_within(&canvas));
+                assert!(
+                    (f32::from(surface.center().x) - f32::from(canvas.center().x)).abs() <= 0.5,
+                    "toolbar surface must stay centered in the canvas: {surface:?} vs {canvas:?}"
+                );
+                assert!(
+                    surface.bottom() + px(12.) <= controls.top(),
+                    "canvas inset must keep the surface clear of video controls: {surface:?} vs {controls:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_rejects_late_loading_and_reports_missing_sources(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        let (source, generation) = view.update(cx, |view, cx| {
+            view.sync_canvas_video(true, cx);
+            (
+                view.canvas_video.as_ref().expect("loading video").source,
+                view.canvas_video_generation,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let session = view.canvas_video.as_ref().expect("failed video");
+            assert!(session.playback.is_none());
+            assert!(session.loading.is_none());
+            assert!(
+                session
+                    .error
+                    .as_ref()
+                    .expect("visible error")
+                    .contains("missing")
+            );
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.canvas_video.is_none());
+            view.finish_canvas_video_load(
+                source,
+                generation,
+                Ok(std::sync::Arc::from([1_u8].as_slice())),
+                cx,
+            );
+            assert!(
+                view.canvas_video.is_none(),
+                "old source cannot install after deselection"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_removal_closes_retained_player_without_editing_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        let before = item.read_with(cx, |item, _cx| {
+            (
+                serde_json::to_value(&item.document().expect("document").doc).expect("serialize"),
+                item.is_dirty(),
+            )
+        });
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        let original_revision = playback.read_with(cx, |playback, _| playback.frame_revision());
+        view.update(cx, |view, cx| {
+            let (source, muted, volume) = view
+                .selected_canvas_video_source(cx)
+                .expect("selected video");
+            view.canvas_video = Some(CanvasVideoSession {
+                source,
+                loading: None,
+                playback: Some(playback.clone()),
+                observation: None,
+                error: None,
+                audio: (muted, volume.to_bits()),
+                bytes: None,
+                trim: None,
+            });
+            Item::on_removed(view, cx);
+            assert!(view.canvas_video_frame(cx).is_none());
+            view.finish_canvas_video_load(
+                source,
+                view.canvas_video_generation,
+                Ok(std::sync::Arc::from([1_u8].as_slice())),
+                cx,
+            );
+            assert_eq!(
+                view.canvas_video
+                    .as_ref()
+                    .and_then(|session| session.playback.as_ref())
+                    .map(Entity::entity_id),
+                Some(playback.entity_id())
+            );
+        });
+        playback.read_with(cx, |playback, _| {
+            assert!(playback.frame().is_none());
+            assert!(
+                playback.frame_revision() > original_revision,
+                "retained player was closed"
+            );
+        });
+        let project = view.read_with(cx, |view, _| view.project.clone());
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        scratch
+            .update(cx, |_, window, cx| {
+                let workspace = cx.new(|cx| workspace::Workspace::test_new(project, window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    view.update(cx, |view, cx| {
+                        Item::added_to_workspace(view, workspace, window, cx);
+                        assert!(
+                            view.canvas_video.is_none(),
+                            "moving a tab must discard its closed player"
+                        );
+                        assert!(!view.canvas_video_removed.get());
+                        view.sync_canvas_video(true, cx);
+                        assert!(
+                            view.canvas_video
+                                .as_ref()
+                                .is_some_and(|session| session.loading.is_some()),
+                            "re-added tab can prepare the selected source again"
+                        );
+                    });
+                });
+            })
+            .expect("re-add the same canvas tab");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                serde_json::to_value(&item.document().expect("document").doc).expect("serialize"),
+                before.0
+            );
+            assert_eq!(item.is_dirty(), before.1);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_trim_source_validation_accepts_bounded_ranges_and_rejects_unknown_duration() {
+        assert!(canvas_video_duration_supported([0, 3_000_000], 3_000_000));
+        assert!(canvas_video_duration_supported(
+            [1_000_000, 3_000_000],
+            3_000_000
+        ));
+        assert!(canvas_video_duration_supported([0, 2_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported([0, 4_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported([-1, 2_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported(
+            [2_000_000, 2_000_000],
+            3_000_000
+        ));
+        assert!(!canvas_video_duration_supported([0, -1], 3_000_000));
+        assert!(!canvas_video_duration_supported([0, 3_000_000], 0));
+    }
 
     #[test]
     fn prototype_links_allow_web_urls_and_block_local_or_executable_schemes() {
@@ -5449,6 +7374,46 @@ mod tests {
         doc.add_page(root);
         doc.set_active_page(Some(root));
         doc
+    }
+
+    fn doc_with_auto_key_target(position_x: f64) -> (fanta_doc::Doc, NodeId, AnimationClipId) {
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            40.0,
+            Color::BLACK,
+        )));
+        rectangle.name = "Animated layer".to_owned();
+        rectangle.parent = Some(page);
+        rectangle.transform = Transform2D::translation(position_x, 34.0);
+        let node = rectangle.id;
+        doc.apply(Operation::create_node(rectangle))
+            .expect("create animated layer");
+        doc.selection.replace_with([node]);
+        let clip = AnimationClipId::from_u128(0xA170);
+        doc.motion
+            .clips
+            .insert(clip, AnimationClip::new(clip, "Auto key", 1_000));
+        doc.history = Default::default();
+        (doc, node, clip)
+    }
+
+    fn evaluated_position_x(
+        doc: &fanta_doc::Doc,
+        clip: AnimationClipId,
+        node: NodeId,
+        time_ms: u32,
+    ) -> f64 {
+        let (_, value) =
+            evaluated_motion_value(doc, clip, node, TimelineProperty::PositionX, time_ms)
+                .expect("position X evaluates");
+        let ResolvedVarValue::Float { value } = value else {
+            panic!("position X must evaluate to a float");
+        };
+        value
     }
 
     fn text_selection_doc(wrapped: bool) -> (fanta_doc::Doc, NodeId, Option<NodeId>) {
@@ -5525,7 +7490,7 @@ mod tests {
         Entity<FigItem>,
         Entity<FigView>,
     ) {
-        init_test(cx);
+        init_visual_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("Design");
@@ -5566,6 +7531,569 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn toolbar_export_writes_the_default_preset_and_shows_canvas_feedback(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let directory = tempfile::tempdir().expect("temporary export directory");
+        let project_root = directory.path().join("Design");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(project_root.clone()),
+            doc_with_one_page(),
+            cx,
+        );
+        add_rect(&item, cx);
+
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let view = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create canvas in workspace window");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                view.update(cx, |view, cx| {
+                    view.inspector_sidebar_visible = false;
+                    view.export_from_toolbar(window, cx);
+                });
+            })
+            .expect("invoke toolbar export");
+        cx.run_until_parked();
+
+        assert!(project_root.join("exports/Page 1@2x.png").is_file());
+        assert!(!view.read_with(cx, |view, _| view.inspector_sidebar_visible));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace window remains open");
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids()),
+            [NotificationId::named(CANVAS_NOTICE_ID.into())]
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn toolbar_export_reports_an_unsaved_canvas_on_the_canvas_surface(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Unsaved-export.fig"),
+            doc_with_one_page(),
+            cx,
+        );
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let view = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create unsaved canvas in workspace window");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, cx| {
+                window.activate_window();
+                view.update(cx, |view, cx| {
+                    view.inspector_sidebar_visible = false;
+                    view.export_from_toolbar(window, cx);
+                });
+            })
+            .expect("invoke toolbar export");
+        cx.run_until_parked();
+
+        assert!(!view.read_with(cx, |view, _| view.inspector_sidebar_visible));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("workspace window remains open");
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.notification_ids()),
+            [NotificationId::named(CANVAS_NOTICE_ID.into())]
+        );
+    }
+
+    #[gpui::test]
+    async fn save_as_updates_shared_views_and_their_project_entries(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system.clone(), [directory.path()], cx).await;
+            let original_entry = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path(original.join("fanta.json"), cx)
+                    .expect("original path");
+                project
+                    .entry_for_path(&path, cx)
+                    .expect("original entry")
+                    .id
+            });
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&copy, cx))
+                .context("copy path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let views = scratch.update(cx, |_, window, cx| {
+                (0..2)
+                    .map(|_| {
+                        cx.new(|cx| {
+                            let mut view = FigView::new(item.clone(), project.clone(), window, cx);
+                            view.opened_entry_id = Some(original_entry);
+                            view
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            let view = views.first().context("first view")?;
+            view.read_with(cx, |view, cx| {
+                assert!(view.can_save_as(cx));
+                assert_eq!(view.suggested_filename(cx).as_ref(), "Original Copy");
+            });
+            add_rect(&item, cx);
+            scratch
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        Item::save_as(view, project.clone(), destination, window, cx)
+                    })
+                })?
+                .await?;
+            file_system
+                .insert_tree(&copy, serde_json::json!({"fanta.json": "{}"}))
+                .await;
+            cx.run_until_parked();
+            let copied_entry = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path(copy.join("fanta.json"), cx)
+                    .expect("copied path");
+                project.entry_for_path(&path, cx).expect("copied entry").id
+            });
+            for view in &views {
+                view.read_with(cx, |view, cx| {
+                    assert_eq!(view.tab_content_text(0, cx).as_ref(), "Copy");
+                    assert_eq!(view.item.entity_id(), item.entity_id());
+                    assert_eq!(view.project_entry_ids(cx).as_slice(), &[copied_entry]);
+                    assert_ne!(copied_entry, original_entry);
+                    assert!(!view.is_dirty(cx));
+                });
+            }
+            let (original_document, _) = fanta_format::read_project_tree(&original)?;
+            let (copied_document, _) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(original_document.scene.len(), 1);
+            assert_eq!(copied_document.scene.len(), 2);
+            Ok(())
+        }
+        .await;
+        result.expect("Save As updates shared views and their project entries");
+    }
+
+    #[gpui::test]
+    async fn text_input_is_blocked_while_save_as_changes_destination(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let (document, text, _) = text_selection_doc(false);
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&copy, cx))
+                .context("copy path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let view = scratch.update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })?;
+            scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_text_edit(text, TextEditSeed::SelectAll, window, cx);
+                });
+            })?;
+
+            let (arrived, resume) =
+                item.read_with(cx, |item, _| item.pause_next_save_for_test(false));
+            let save_as = item.update(cx, |item, cx| {
+                item.save_as(project.clone(), destination, cx)
+            });
+            arrived.await.expect("Save As reached its writer");
+            assert!(!item.read_with(cx, |item, _| {
+                item.can_preview_for_owner(view.entity_id())
+            }));
+
+            scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view,
+                        None,
+                        "Input during Save As",
+                        window,
+                        cx,
+                    );
+                });
+            })?;
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.text_edit
+                        .as_ref()
+                        .expect("text session")
+                        .session
+                        .buffer(),
+                    "Hello world"
+                );
+            });
+            item.read_with(cx, |item, _| {
+                assert!(!item.content_preview_active());
+                assert_eq!(
+                    item.doc()
+                        .expect("document")
+                        .scene
+                        .get(text)
+                        .expect("text node")
+                        .data
+                        .as_text()
+                        .expect("text data")
+                        .content,
+                    "Hello world"
+                );
+            });
+
+            resume.send(()).expect("resume Save As");
+            save_as.await?;
+            cx.run_until_parked();
+            assert!(!view.read_with(cx, |view, _| view.has_active_text_edit()));
+            let (copied, _) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(
+                copied
+                    .scene
+                    .get(text)
+                    .context("copied text node")?
+                    .data
+                    .as_text()
+                    .context("copied text data")?
+                    .content,
+                "Hello world"
+            );
+            Ok(())
+        }
+        .await;
+        result.expect("Save As blocks text input until the destination changes");
+    }
+
+    #[gpui::test]
+    async fn save_as_native_picker_starts_beside_the_original_project(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(&original, serde_json::json!({"fanta.json": "{}"}))
+                .await;
+            let project = Project::test(file_system, [original.as_path()], cx).await;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, cx| {
+                item.path = project
+                    .read(cx)
+                    .find_project_path(item.abs_path(), cx)
+                    .expect("original path");
+            });
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let (workspace, view) = scratch.update(cx, |_, window, cx| {
+                let workspace =
+                    cx.new(|cx| workspace::Workspace::test_new(project.clone(), window, cx));
+                let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    )
+                });
+                (workspace, view)
+            })?;
+            assert_eq!(
+                view.read_with(cx, |view, cx| view.suggested_filename(cx)),
+                "Original Copy"
+            );
+            let save = scratch.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::SaveAs, window, cx)
+                })
+            })?;
+            cx.run_until_parked();
+            assert!(
+                cx.did_prompt_for_new_path(),
+                "Save As reaches the native path prompt"
+            );
+            cx.simulate_new_path_selection(|initial_directory| {
+                assert_eq!(
+                    initial_directory,
+                    directory.path(),
+                    "a copied design belongs beside its original, not inside it"
+                );
+                None
+            });
+            save.await?;
+            assert_eq!(
+                item.read_with(cx, |item, _| item
+                    .project_root()
+                    .map(std::path::Path::to_path_buf)),
+                Some(original)
+            );
+            assert!(
+                !directory.path().join("Original Copy").exists(),
+                "cancel does not create a copy"
+            );
+            Ok(())
+        }
+        .await;
+        result.expect("Save As uses the project parent as its native initial directory");
+    }
+
+    #[gpui::test]
+    async fn save_as_rejects_existing_design_before_opening_its_worktree(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| {
+                workspace::register_project_item::<FigView>(cx);
+                crate::workspace_hooks::init(cx);
+            });
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Original Copy");
+            let document = doc_with_one_page();
+            let page = document.active_page().context("active page")?;
+            for root in [&original, &copy] {
+                crate::document::write_project(root, &document, &BTreeMap::new())?;
+            }
+            let original_manifest = std::fs::read(original.join("fanta.json"))?;
+            let original_source =
+                fanta_format::locate_page_source(&original, page).context("original page")?;
+            let original_bytes = std::fs::read(&original_source)?;
+            let copy_source =
+                fanta_format::locate_page_source(&copy, page).context("copied page")?;
+            let copy_bytes = std::fs::read(&copy_source)?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({
+                        "Original": {"fanta.json": std::fs::read_to_string(original.join("fanta.json"))?},
+                        "Original Copy": {"fanta.json": std::fs::read_to_string(copy.join("fanta.json"))?},
+                    }),
+                )
+                .await;
+            let project = Project::test(file_system, [copy.as_path()], cx).await;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                copy.join("fanta.json"),
+                Some(copy.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, cx| {
+                item.path = project
+                    .read(cx)
+                    .find_project_path(item.abs_path(), cx)
+                    .expect("copied design path");
+            });
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let (workspace, view) = scratch.update(cx, |_, window, cx| {
+                let workspace =
+                    cx.new(|cx| workspace::Workspace::test_new(project.clone(), window, cx));
+                let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                (workspace, view)
+            })?;
+            cx.run_until_parked();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project.worktrees(cx).count()),
+                1
+            );
+            assert_eq!(
+                workspace.read_with(cx, |workspace, cx| workspace.items_of_type::<FigView>(cx).count()),
+                1
+            );
+            add_rect(&item, cx);
+            let save = scratch.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::SaveAs, window, cx)
+                })
+            })?;
+            cx.run_until_parked();
+            assert!(cx.did_prompt_for_new_path());
+            cx.simulate_new_path_selection(|_| Some(original.clone()));
+            let error = save.await.expect_err("an existing design rejects Save As");
+            assert!(error.to_string().contains("is not empty"));
+            cx.run_until_parked();
+            project.read_with(cx, |project, cx| {
+                assert_eq!(
+                    project.worktrees(cx).count(),
+                    1,
+                    "a rejected destination must not become a worktree"
+                );
+                assert!(project.find_project_path(&original, cx).is_none());
+            });
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.items_of_type::<FigView>(cx).count(),
+                    1,
+                    "the destination must not open a tab"
+                );
+                assert_eq!(
+                    workspace.active_item(cx).map(|item| item.item_id()),
+                    Some(view.entity_id())
+                );
+            });
+            assert_eq!(std::fs::read(original.join("fanta.json"))?, original_manifest);
+            assert_eq!(std::fs::read(original_source)?, original_bytes);
+            assert_eq!(std::fs::read(copy_source)?, copy_bytes);
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.item.read(cx).project_root(), Some(copy.as_path()));
+                assert!(view.is_dirty(cx));
+                assert!(view.autosave_task.is_some());
+            });
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            assert_eq!(fanta_format::read_project_tree(&copy)?.0.scene.len(), 2);
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 1);
+            Ok(())
+        }
+        .await;
+        result
+            .expect("rejected Save As preserves the active design without opening its destination");
+    }
+
+    #[gpui::test]
+    async fn save_as_failure_resumes_autosave_on_the_original_design(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let occupied = directory.path().join("Occupied");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            std::fs::create_dir(&occupied)?;
+            std::fs::write(occupied.join("keep.txt"), "untouched")?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}, "Occupied": {}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&occupied, cx))
+                .context("occupied path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let view = scratch.update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })?;
+            add_rect(&item, cx);
+            let save_as = scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    Item::save_as(view, project, destination, window, cx)
+                })
+            })?;
+            assert!(
+                save_as.await.is_err(),
+                "the occupied destination must reject Save As"
+            );
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert!(
+                    view.autosave_task.is_some(),
+                    "the failed copy re-arms autosave"
+                );
+                assert!(view.is_dirty(cx));
+                assert_eq!(view.item.read(cx).project_root(), Some(original.as_path()));
+            });
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 1);
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 2);
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(
+                std::fs::read_to_string(occupied.join("keep.txt"))?,
+                "untouched"
+            );
+            assert!(!occupied.join("fanta.json").exists());
+            Ok(())
+        }
+        .await;
+        result.expect("a failed Save As must not disable autosaving the original design");
+    }
+
     /// The hero promise: an edit reaches the project tree on its own, so
     /// `git diff` shows it without the user pressing cmd-s.
     #[gpui::test]
@@ -5588,6 +8116,291 @@ mod tests {
             "the project tree was written to disk"
         );
         view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+    }
+
+    #[gpui::test]
+    async fn autosave_never_persists_an_active_preview_and_rearms_after_cancel(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, root, item, view) = autosave_fixture(cx).await;
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("write the baseline project");
+        let page = item.read_with(cx, |item, _| {
+            item.doc()
+                .and_then(|doc| doc.active_page())
+                .expect("active page")
+        });
+        let preview_owner = view.entity_id();
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Page 1".to_owned(),
+                    new: "Committed".to_owned(),
+                },
+                cx,
+            )
+            .expect("rename page");
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Transient".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+        });
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .is_err(),
+            "an explicit item save must refuse an active preview"
+        );
+        assert!(
+            item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
+                .await
+                .expect("autosave preview guard")
+                .is_none(),
+            "an autosave must quietly skip an active preview"
+        );
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let (during_preview, _) =
+            fanta_format::read_project_tree(&root).expect("read baseline during preview");
+        assert_eq!(
+            during_preview.scene.get(page).expect("saved page").name,
+            "Page 1",
+            "the debounce must not persist an intermediate preview frame"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.is_dirty());
+            assert!(item.content_preview_active());
+        });
+        view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Committed".to_owned();
+                ((), DocChange::ContentPreview)
+            });
+            item.finish_content_preview(preview_owner, false, cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.autosave_task.is_some(),
+                "ending an already-dirty preview must rearm autosave"
+            );
+        });
+
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let (after_cancel, _) =
+            fanta_format::read_project_tree(&root).expect("read project after cancel");
+        assert_eq!(
+            after_cancel.scene.get(page).expect("saved page").name,
+            "Committed"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.content_preview_active());
+        });
+    }
+
+    #[gpui::test]
+    async fn deactivation_restores_an_owned_canvas_preview(cx: &mut TestAppContext) {
+        let (_directory, _root, item, view) = autosave_fixture(cx).await;
+        let rectangle = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let page = document.doc.active_page().expect("active page");
+                let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    10.0,
+                    10.0,
+                    Color::BLACK,
+                )));
+                rectangle.parent = Some(page);
+                let id = rectangle.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(rectangle))
+                    .expect("create rectangle");
+                document.doc.selection.select_only(id);
+                (id, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save baseline");
+        let original = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(rectangle)
+                .expect("rectangle")
+                .transform
+        });
+
+        view.update(cx, |view, cx| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+            view.dispatch_tool_event(
+                press_event(
+                    DVec2::new(405.0, 305.0),
+                    ToolButton::Primary,
+                    gpui::Modifiers::default(),
+                    1,
+                ),
+                cx,
+            );
+            view.dispatch_tool_event(
+                move_event(DVec2::new(455.0, 355.0), gpui::Modifiers::default()),
+                cx,
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert_ne!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(rectangle)
+                    .expect("rectangle")
+                    .transform,
+                original
+            );
+        });
+
+        let deactivation_window = cx.add_window(|_, _| gpui::Empty);
+        deactivation_window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| Item::deactivated(view, window, cx));
+            })
+            .expect("deactivate view");
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(rectangle)
+                    .expect("rectangle")
+                    .transform,
+                original
+            );
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn selection_rollback_refreshes_gpui_design_when_already_dirty(cx: &mut TestAppContext) {
+        use fanta_gpui::design::{
+            DesignPanelAction, DesignPanelEditPhase, DesignPanelProperty, DesignPanelValue,
+        };
+
+        init_visual_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        let page = document.active_page().expect("active page");
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            100.0,
+            50.0,
+            Color::BLACK,
+        )));
+        rectangle.parent = Some(page);
+        let rectangle_id = rectangle.id;
+        document
+            .apply(Operation::create_node(rectangle))
+            .expect("create rectangle");
+        document.selection.select_only(rectangle_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Selection-preview.fig"),
+            document,
+            cx,
+        );
+        let view_item = item.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| FigView::new(item, project, window, cx));
+        cx.run_until_parked();
+        let panel = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("design panel mounted")
+                .panel
+                .clone()
+        });
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        view_item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Page 1".to_owned(),
+                    new: "Dirty page".to_owned(),
+                },
+                cx,
+            )
+            .expect("make the item dirty");
+        });
+        cx.run_until_parked();
+        for (value, phase) in [
+            (100.0, DesignPanelEditPhase::Begin),
+            (25.0, DesignPanelEditPhase::Preview),
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PropertyEditRequested {
+                    node_id: SharedString::from(rectangle_id.to_string()),
+                    property: DesignPanelProperty::Opacity,
+                    value: DesignPanelValue::Number(value),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        }
+
+        let preview_owner = view.entity_id();
+        view_item.update(cx, |item, cx| {
+            item.with_document_for_owner(preview_owner, cx, |document| {
+                document.doc.selection.select_only(rectangle_id);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+
+        view_item.read_with(cx, |item, _| {
+            let node = item
+                .doc()
+                .and_then(|doc| doc.scene.get(rectangle_id))
+                .expect("rectangle");
+            assert!((node.opacity.get() - 1.0).abs() < 1e-6);
+            assert!(item.is_dirty(), "rollback preserves the prior dirty state");
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                (panel.node().opacity - 100.0).abs() < 1e-3,
+                "the panel must echo the restored value after deferred rollback"
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.session.as_ref())
+                    .is_none()
+            );
+        });
     }
 
     /// A drag longer than the debounce must not have an intermediate position
@@ -5905,6 +8718,13 @@ mod tests {
         )));
         node.transform = fanta_doc::Transform2D::translation(12.0, 34.0);
 
+        for property in TimelineProperty::ALL {
+            assert_eq!(
+                motion_property_label(motion_property(*property)),
+                property.label()
+            );
+        }
+
         assert_eq!(
             motion_value(&node, MotionProperty::PositionX),
             Some(ResolvedVarValue::Float { value: 12.0 })
@@ -5976,15 +8796,19 @@ mod tests {
         doc.apply(Operation::create_node(node))
             .expect("create bound node");
 
-        let resolved = motion_source_node(&doc, node_id).expect("resolved node");
+        let clip_id = AnimationClipId::new();
+        doc.motion.clips.insert(
+            clip_id,
+            AnimationClip::new(clip_id, "Variable sampling", 1_000),
+        );
+        let (_, resolved) =
+            evaluated_motion_value(&doc, clip_id, node_id, TimelineProperty::FillColor, 0)
+                .expect("resolved value");
         assert_eq!(
-            motion_value(
-                &resolved,
-                MotionProperty::bound(BoundProp::FillColor { index: 0 })
-            ),
-            Some(ResolvedVarValue::Color {
+            resolved,
+            ResolvedVarValue::Color {
                 value: Color::rgb(255, 0, 0)
-            })
+            }
         );
     }
 
@@ -6251,6 +9075,273 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn motion_auto_key_previews_live_commits_once_and_only_then_autosaves(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let directory = tempfile::tempdir().expect("temporary auto-key project");
+        let root = directory.path().join("Design");
+        let (doc, node, clip) = doc_with_auto_key_target(1.234_567);
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            directory.path().join("Design.fig"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("write the baseline project");
+        let item_for_window = item.clone();
+        let window =
+            cx.add_window(move |window, cx| FigView::new(item_for_window, project, window, cx));
+        let view = window.entity(cx).expect("auto-key canvas");
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("enable Auto key");
+        });
+        cx.run_until_parked();
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1_200.), px(800.)));
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.run_until_parked();
+
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.motion.clips[&clip].tracks.is_empty());
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 1.234_567).abs() < 1e-12);
+        });
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field after untouched edit");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_input("42");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 42.0).abs() < 1e-12);
+        });
+
+        visual.update(|window, cx| {
+            window.dispatch_action(Box::new(editor::actions::SelectAll), cx);
+        });
+        visual.simulate_input(&crate::properties_ops::format_number(1.234_567));
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.motion.clips[&clip].tracks.is_empty());
+            assert!(item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 1.234_567).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_none()));
+        visual.cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        visual.run_until_parked();
+        let (during_restored_preview, _) =
+            fanta_format::read_project_tree(&root).expect("read baseline during restored preview");
+        assert!(
+            during_restored_preview.motion.clips[&clip]
+                .tracks
+                .is_empty()
+        );
+
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.motion.clips[&clip].tracks.is_empty());
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 1.234_567).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_none()));
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field after restored edit");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_input("42");
+        visual.run_until_parked();
+
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 42.0).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_none()));
+        visual.cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        visual.run_until_parked();
+        let (during_preview, _) =
+            fanta_format::read_project_tree(&root).expect("read project during preview");
+        assert!(during_preview.motion.clips[&clip].tracks.is_empty());
+
+        visual.simulate_keystrokes("enter");
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 42.0).abs() < 1e-12);
+        });
+        view.read_with(&visual.cx, |view, _| assert!(view.autosave_task.is_some()));
+
+        visual.cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        visual.run_until_parked();
+        let (saved, _) = fanta_format::read_project_tree(&root).expect("read saved auto key");
+        assert!((evaluated_position_x(&saved, clip, node, 0) - 42.0).abs() < 1e-12);
+
+        visual.update(|window, cx| window.draw(cx).clear());
+        let field = visual
+            .debug_bounds("fanta-motion-property-position-x")
+            .expect("position X field after commit");
+        visual.simulate_click(field.center(), gpui::Modifiers::default());
+        visual.simulate_input("55");
+        let timeline = view.read_with(&visual.cx, |view, _| view.timeline_shell.clone());
+        timeline.update(&mut visual.cx, |timeline, cx| timeline.seek_to(500_000, cx));
+        visual.run_until_parked();
+        item.read_with(&visual.cx, |item, _| {
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.history.undo_depth(), 2);
+            assert!(!item.content_preview_active());
+            assert!((evaluated_position_x(doc, clip, node, 0) - 55.0).abs() < 1e-12);
+        });
+    }
+
+    #[gpui::test]
+    async fn motion_auto_key_is_gated_and_disarms_at_context_boundaries(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, node, clip) = doc_with_auto_key_target(12.0);
+        let page = doc.active_page().expect("active page");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Auto-key-lifecycle.fig"),
+            doc,
+            cx,
+        );
+        let item_for_window = item.clone();
+        let window =
+            cx.add_window(move |window, cx| FigView::new(item_for_window, project, window, cx));
+        let view = window.entity(cx).expect("auto-key lifecycle canvas");
+
+        view.update(cx, |view, cx| {
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+            assert!(!view.motion_auto_keyframe);
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("enable Auto key in Motion");
+            assert!(view.motion_auto_keyframe);
+        });
+        cx.run_until_parked();
+
+        let split = window
+            .update(cx, |view, window, cx| view.clone_on_split(None, window, cx))
+            .expect("clone view")
+            .await
+            .expect("split view");
+        view.read_with(cx, |view, _| assert!(view.motion_auto_keyframe));
+        split.read_with(cx, |view, _| assert!(!view.motion_auto_keyframe));
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Design, cx);
+            assert!(!view.motion_auto_keyframe);
+            view.set_editor_mode(EditorMode::Motion, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key");
+            view.set_editor_workspace(EditorWorkspace::Variables, cx);
+            assert!(!view.motion_auto_keyframe);
+            view.set_editor_workspace(EditorWorkspace::Canvas, cx);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key on canvas");
+        });
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.motion_auto_keyframe);
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        cx.run_until_parked();
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([node, page]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([node]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key after valid selection");
+        });
+
+        item.update(cx, |_, cx| cx.emit(FigItemEvent::StateChanged));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.motion_auto_keyframe);
+            view.set_motion_auto_keyframe(true, cx)
+                .expect("re-enable Auto key after state refresh");
+        });
+
+        let clip_snapshot = item.read_with(cx, |item, _| {
+            item.doc().expect("ready document").motion.clips[&clip].clone()
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::DeleteAnimationClip {
+                    id: clip,
+                    clip: Box::new(clip_snapshot),
+                },
+                cx,
+            )
+            .expect("delete active clip");
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(!view.motion_auto_keyframe);
+            assert!(view.set_motion_auto_keyframe(true, cx).is_err());
+        });
+    }
+
+    #[gpui::test]
     async fn motion_panel_clip_selection_synchronizes_the_timeline(cx: &mut TestAppContext) {
         init_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
@@ -6294,6 +9385,112 @@ mod tests {
                 Some("Exit")
             );
         });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn creating_motion_clip_clears_armed_time_comment(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let first_clip = AnimationClipId::from_u128(100);
+        doc.motion.clips.insert(
+            first_clip,
+            AnimationClip::new(first_clip, "Entrance", 1_000),
+        );
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project, window, cx))
+            })
+            .expect("scratch window");
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            assert_eq!(view.active_motion_clip, Some(first_clip));
+            assert_eq!(view.arm_motion_time_comment(cx).expect("arm comment"), 0);
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(MotionCommentAnchor {
+                    clip: first_clip,
+                    time_ms: 0,
+                })
+            );
+            view.create_motion_clip(cx);
+            assert_ne!(view.active_motion_clip, Some(first_clip));
+            assert_eq!(view.comment_state.pending_motion_anchor(), None);
+            assert!(!view.comment_state.motion_time_comment_active());
+        });
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("ready document");
+            assert_eq!(document.motion.clips.len(), 2);
+            assert_eq!(document.history.undo_depth(), 1);
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn timeline_changes_clear_armed_time_comment(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let clip = AnimationClipId::from_u128(100);
+        doc.motion
+            .clips
+            .insert(clip, AnimationClip::new(clip, "Entrance", 1_000));
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("scratch window");
+        let timeline = view.read_with(cx, |view, _| view.timeline_shell.clone());
+
+        view.update(cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+            let timeline = view.timeline_shell.clone();
+            timeline.update(cx, |timeline, cx| timeline.seek_to(250_000, cx));
+            assert_eq!(view.arm_motion_time_comment(cx).expect("arm comment"), 250);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.comment_state.pending_motion_anchor(),
+                Some(MotionCommentAnchor { clip, time_ms: 250 })
+            )
+        });
+        timeline.update(cx, |timeline, cx| timeline.seek_to(500_000, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.comment_state.pending_motion_anchor(), None)
+        });
+
+        view.update(cx, |view, cx| {
+            assert_eq!(
+                view.arm_motion_time_comment(cx).expect("re-arm comment"),
+                500
+            );
+        });
+        timeline.update(cx, |timeline, cx| timeline.set_playing(true, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.comment_state.pending_motion_anchor(), None)
+        });
+        timeline.update(cx, |timeline, cx| timeline.pause(cx));
     }
 
     #[gpui::test]
@@ -6986,6 +10183,430 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn text_path_command_converts_in_place_and_queues_inline_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut path = PathData::new();
+        path.move_to(0.0, 20.0)
+            .cubic_to(40.0, -10.0, 80.0, 50.0, 120.0, 20.0);
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path: path.clone(),
+            strokes: smallvec::smallvec![Stroke::solid(Color::rgb(10, 20, 30), 2.0)],
+            ..VectorNode::default()
+        }));
+        vector.parent = doc.active_page();
+        vector.name = "Orbit".to_owned();
+        vector.transform = Transform2D::translation(30.0, 40.0);
+        let vector_id = vector.id;
+        let wrapper_before = vector.clone();
+        doc.apply(Operation::create_node(vector))
+            .expect("create vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/TextPath.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        view.update(cx, |view, cx| {
+            view.activate_tool(ToolKind::TextPath, cx);
+            assert_eq!(view.active_tool(), ToolKind::Select);
+            assert_eq!(view.pending_text_edit, Some(vector_id));
+        });
+
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.selection.as_slice(), [vector_id]);
+            assert_eq!(doc.history.undo_depth(), 1);
+            let converted = doc.scene.get(vector_id).expect("same layer");
+            assert_eq!(converted.id, wrapper_before.id);
+            assert_eq!(converted.name, wrapper_before.name);
+            assert_eq!(converted.transform, wrapper_before.transform);
+            let NodeData::TextPath(text_path) = &converted.data else {
+                panic!("expected text path");
+            };
+            assert_eq!(text_path.path, path);
+            assert_eq!(text_path.content, fanta_tools::text::PLACEHOLDER);
+            assert_eq!(text_path.style.color, Color::rgb(10, 20, 30));
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_is_an_immutable_bounded_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let document_id = doc.id.to_string();
+        let page_root = doc.active_page().expect("active page");
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            10.0,
+            20.0,
+            80.0,
+            40.0,
+            Color::rgb(20, 40, 60),
+        )));
+        vector.parent = doc.active_page();
+        vector.name = "Card".to_owned();
+        let node_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create selected layer");
+        doc.selection.select_only(node_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/CanvasAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        let (label, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        assert!(label.contains("1 layer"));
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert_eq!(value["selected_count"], 1);
+        assert_eq!(value["included_count"], 1);
+        assert_eq!(
+            value["source"]["document_path"],
+            "/tmp/CanvasAttachment.fig"
+        );
+        assert_eq!(value["source"]["document_id"], document_id);
+        assert_eq!(value["source"]["active_root_id"], page_root.to_string());
+        assert_eq!(value["source"]["scope_kind"], "page");
+        assert_eq!(value["source"]["scope_name"], "Page 1");
+        assert_eq!(value["scope"]["kind"], "page");
+        assert_eq!(value["scope"]["name"], "Page 1");
+        assert_eq!(value["nodes"][0]["id"], node_id.to_string());
+        assert_eq!(value["nodes"][0]["name"], "Card");
+        assert!(content.len() <= AGENT_ATTACHMENT_MAX_BYTES);
+
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .and_then(|doc| doc.scene.get(node_id))
+                .map(|node| node.name.clone())
+                .expect("selected layer");
+            item.apply(
+                Operation::SetName {
+                    id: node_id,
+                    old,
+                    new: "Renamed later".to_owned(),
+                },
+                cx,
+            )
+            .expect("rename layer");
+        });
+        let captured: serde_json::Value =
+            serde_json::from_str(&content).expect("captured JSON stays valid");
+        assert_eq!(captured["nodes"][0]["name"], "Card");
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_uses_the_live_page_name(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page_root = doc.active_page().expect("active page");
+        let mut child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        child.parent = Some(page_root);
+        let child_id = child.id;
+        doc.apply(Operation::create_node(child))
+            .expect("create selected layer");
+        doc.selection.select_only(child_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/RenamedPageAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .and_then(|doc| doc.scene.get(page_root))
+                .map(|node| node.name.clone())
+                .expect("page root");
+            item.apply(
+                Operation::SetName {
+                    id: page_root,
+                    old,
+                    new: "Renamed page".to_owned(),
+                },
+                cx,
+            )
+            .expect("rename page");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            assert_eq!(
+                document
+                    .pages
+                    .iter()
+                    .find(|page| page.root == Some(page_root))
+                    .expect("cached page")
+                    .name
+                    .as_ref(),
+                "Page 1",
+                "the fixture must exercise the stale page metadata cache"
+            );
+        });
+
+        let (label, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert!(label.contains("Renamed page"));
+        assert_eq!(value["source"]["scope_name"], "Renamed page");
+        assert_eq!(value["scope"]["name"], "Renamed page");
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_uses_the_active_component_scope(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.name = "Button master".to_owned();
+        let master_root = master.id;
+        doc.apply(Operation::create_node(master))
+            .expect("create component master");
+        let component_id = fanta_doc::ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(fanta_doc::ComponentDef::new(
+                component_id,
+                master_root,
+                "Button",
+            )),
+        })
+        .expect("define component");
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            32.0,
+            Color::rgb(20, 40, 60),
+        )));
+        child.parent = Some(master_root);
+        child.name = "Label background".to_owned();
+        let child_id = child.id;
+        doc.apply(Operation::create_node(child))
+            .expect("create component child");
+        assert!(doc.set_active_page(Some(master_root)));
+        doc.selection.select_only(child_id);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/ComponentAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let (label, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert!(label.contains("Button"));
+        assert_eq!(value["source"]["active_root_id"], master_root.to_string());
+        assert_eq!(value["source"]["scope_kind"], "component");
+        assert_eq!(value["source"]["scope_name"], "Button");
+        assert_eq!(value["nodes"][0]["id"], child_id.to_string());
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_rejects_nodes_outside_the_active_root(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let active_root = doc.active_page().expect("active page");
+        let mut other_page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        other_page.name = "Other page".to_owned();
+        let other_root = other_page.id;
+        doc.apply(Operation::create_node(other_page))
+            .expect("create other page");
+        doc.add_page(other_root);
+        let make_child = |parent: NodeId, name: &str| {
+            let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                20.0,
+                20.0,
+                Color::BLACK,
+            )));
+            child.parent = Some(parent);
+            child.name = name.to_owned();
+            child
+        };
+        let active_child = make_child(active_root, "Active child");
+        let active_child_id = active_child.id;
+        doc.apply(Operation::create_node(active_child))
+            .expect("create active child");
+        let other_child = make_child(other_root, "Other child");
+        let other_child_id = other_child.id;
+        doc.apply(Operation::create_node(other_child))
+            .expect("create other child");
+        doc.set_active_page(Some(active_root));
+        doc.selection
+            .replace_with([active_child_id, other_child_id]);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/MixedAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let error = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect_err("mixed-root selection must be rejected")
+        });
+        assert!(error.to_string().contains("outside the active page root"));
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_caps_nodes_and_serialized_bytes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let root = doc.active_page().expect("active page");
+        let selected_count = AGENT_ATTACHMENT_CONTEXT_LAYERS + 6;
+        let mut selected = Vec::with_capacity(selected_count);
+        for index in 0..selected_count {
+            let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                index as f64,
+                0.0,
+                10.0,
+                10.0,
+                Color::BLACK,
+            )));
+            node.parent = Some(root);
+            node.name = format!("Layer {index} {}", "x".repeat(400));
+            selected.push(node.id);
+            doc.apply(Operation::create_node(node))
+                .expect("create selected node");
+        }
+        doc.selection.replace_with(selected);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/BoundedAttachment.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let (_, content) = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect("snapshot")
+                .expect("selected content")
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&content).expect("snapshot is valid JSON");
+        assert_eq!(value["selected_count"], selected_count);
+        assert_eq!(value["included_count"], AGENT_ATTACHMENT_CONTEXT_LAYERS);
+        assert_eq!(value["omitted_count"], 6);
+        assert!(content.len() <= AGENT_ATTACHMENT_MAX_BYTES);
+        assert!(
+            value["nodes"]
+                .as_array()
+                .expect("node summaries")
+                .iter()
+                .all(|node| node["name"]
+                    .as_str()
+                    .is_some_and(|name| name.chars().count()
+                        <= crate::agent_surface::SUMMARY_LABEL_CHARS + 1))
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn canvas_selection_attachment_rejects_oversized_identity_metadata(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::BLACK,
+        )));
+        node.parent = doc.active_page();
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create selected node");
+        doc.selection.select_only(node_id);
+        let oversized_path = std::path::PathBuf::from(format!(
+            "/tmp/{}.fig",
+            "x".repeat(AGENT_ATTACHMENT_MAX_BYTES)
+        ));
+        let item = crate::document::ready_item_for_test(&project, oversized_path, doc, cx);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("create fig view");
+
+        let error = view.read_with(cx, |view, cx| {
+            view.agent_canvas_selection_snapshot(cx)
+                .expect_err("oversized fixed metadata must be rejected")
+        });
+        assert!(error.to_string().contains("attachment limit"));
+    }
+
+    #[gpui::test]
     async fn canvas_create_rectangle_and_undo_restores_state(cx: &mut TestAppContext) {
         // Covers core BDD scenarios: create shapes, undo across visual ops.
         init_visual_test(cx);
@@ -7099,6 +10720,8 @@ impl FigView {
         crate::gpui_adapters::toolbar::ToolbarOptionInputs {
             playing: timeline.is_playing(),
             looping: timeline.loop_playback_enabled(),
+            auto_keyframe: self.motion_auto_keyframe,
+            time_comment_armed: self.comment_state.motion_time_comment_active(),
             current_time_ms,
             duration_ms,
             agent_context_label: self.toolbar_agent_context_label(cx),
@@ -7215,14 +10838,12 @@ impl FigView {
             return self.render_tool_pill(cx);
         };
         h_flex()
+            .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
-                TIMELINE_HEIGHT + px(16.)
-            } else {
-                px(16.)
-            })
+            .bottom(px(12.))
             .left_0()
             .right_0()
+            .px_3()
             .justify_center()
             .child(adapter.panel.clone())
             .into_any_element()
@@ -7284,12 +10905,6 @@ impl FigView {
             } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    // Scale, path-selection and text-on-path have a canvas
-                    // tool object but no behavior, so activating them would
-                    // arm a face that silently swallows every drag. The
-                    // vendored toolbar has no host-side API to hide a tool
-                    // (see `EditorToolbar`'s setters), so say so instead.
-                    Some(kind) if kind.is_stub() => notify_unavailable(tool.label(), window, cx),
                     Some(kind) => self.activate_tool(kind, cx),
                     None => notify_unavailable(tool.label(), window, cx),
                 }
@@ -7309,6 +10924,29 @@ impl FigView {
                 self.zoom_to_percent(*percent, cx);
             }
             ToolbarAction::CommandInvoked { command } => match command {
+                ToolbarCommand::GenerateImage
+                | ToolbarCommand::GenerateVideo
+                | ToolbarCommand::GenerateVector
+                | ToolbarCommand::GenerateMasks
+                | ToolbarCommand::RemoveBackground
+                | ToolbarCommand::GenerateDesign => {
+                    use crate::generation_workspace::GenerationMode;
+                    let mode = match command {
+                        ToolbarCommand::GenerateVideo => GenerationMode::Video,
+                        ToolbarCommand::GenerateVector => GenerationMode::Vector,
+                        ToolbarCommand::GenerateMasks | ToolbarCommand::RemoveBackground => {
+                            GenerationMode::Masks
+                        }
+                        ToolbarCommand::GenerateDesign => GenerationMode::Design,
+                        _ => GenerationMode::Image,
+                    };
+                    crate::generation_workspace::open_from_canvas(
+                        mode,
+                        self.item.downgrade(),
+                        window,
+                        cx,
+                    );
+                }
                 ToolbarCommand::Undo => self.undo(&Undo, window, cx),
                 ToolbarCommand::Redo => self.redo(&Redo, window, cx),
                 ToolbarCommand::Cut => self.cut_selection(&CutSelection, window, cx),
@@ -7343,7 +10981,7 @@ impl FigView {
                 self.route_toolbar_agent_prompt(prompt.as_ref(), window, cx);
             }
             ToolbarAction::AgentAttachmentRequested => {
-                notify_unavailable("Attaching a file to the Agent from the toolbar", window, cx)
+                self.open_toolbar_agent_attachment(window, cx)
             }
             ToolbarAction::AgentVoiceInputRequested => {
                 notify_unavailable("Voice input", window, cx)
@@ -7356,22 +10994,21 @@ impl FigView {
     }
 
     /// The toolbar's Export command runs the inspector's export flow — the
-    /// same presets, the same `exports/` destination, the same in-panel
-    /// feedback — rather than a second, divergent export path. Deferred
-    /// because that flow reads this view, which is leased for the duration of
-    /// the toolbar event.
+    /// same presets and the same `exports/` destination — rather than a second,
+    /// divergent export path. Deferred because that flow reads this view,
+    /// which is leased for the duration of the toolbar event.
     #[cfg(feature = "fanta-gpui-ui")]
-    fn export_from_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The flow reports progress, the written paths, and every failure
-        // (unsaved project, unexportable bounds) as inspector feedback, so the
-        // panel has to be on screen or the command looks like it did nothing.
-        if !self.inspector_sidebar_visible {
-            self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
-        }
+    fn export_from_toolbar(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        // The shipped Design inspector replaces the legacy panel that owns
+        // the export engine. Mirror its status to canvas notices so progress,
+        // written paths, and failures remain visible without changing the
+        // user's sidebar layout.
         let inspector = self.inspector_sidebar.downgrade();
         cx.defer(move |cx| {
             inspector
-                .update(cx, |inspector, cx| inspector.export_selection(cx))
+                .update(cx, |inspector, cx| {
+                    inspector.export_selection_with_canvas_feedback(cx)
+                })
                 .log_err();
         });
     }
@@ -7414,6 +11051,174 @@ impl FigView {
                 cx,
             );
         }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn open_toolbar_agent_attachment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let workspace = window
+            .root::<MultiWorkspace>()
+            .flatten()
+            .map(|multi_workspace| multi_workspace.read(cx).workspace().clone());
+        let Some(workspace) = workspace else {
+            show_canvas_notice(
+                "This window has no workspace for the Agent Panel.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+        match self.agent_canvas_selection_snapshot(cx) {
+            Ok(Some((name, content))) => {
+                if let Err(error) = agent_ui::attach_canvas_selection_for_review(
+                    workspace, name, content, window, cx,
+                ) {
+                    log::error!("attaching the canvas selection failed: {error:#}");
+                    show_canvas_notice(
+                        format!("The canvas selection could not be attached: {error:#}"),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Ok(None) => {
+                if let Err(error) = agent_ui::open_agent_add_context_menu(workspace, window, cx) {
+                    log::error!("opening the toolbar Agent attachment workflow failed: {error:#}");
+                    show_canvas_notice(
+                        format!("The Agent attachment workflow could not be opened: {error:#}"),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            Err(error) => {
+                log::error!("snapshotting the canvas selection failed: {error:#}");
+                show_canvas_notice(
+                    format!("The canvas selection could not be attached: {error:#}"),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn agent_canvas_selection_snapshot(
+        &self,
+        cx: &App,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        let item = self.item.read(cx);
+        let Some(document) = item.document() else {
+            return Ok(None);
+        };
+        let doc = &document.doc;
+        if doc.selection.is_empty() {
+            return Ok(None);
+        }
+        let active_root = doc
+            .active_page()
+            .context("the canvas has no active page or component root")?;
+        let active_root_node = doc
+            .scene
+            .get(active_root)
+            .with_context(|| format!("the active canvas root {active_root} no longer exists"))?;
+        let (scope_kind, scope_name) = if let Some(page) = document
+            .pages
+            .iter()
+            .find(|page| page.root == Some(active_root))
+        {
+            let live_name = active_root_node.name.as_str();
+            (
+                "page",
+                if live_name.is_empty() {
+                    page.name.as_ref()
+                } else {
+                    live_name
+                },
+            )
+        } else if let Some(component) = doc
+            .components
+            .defs
+            .values()
+            .find(|component| component.root == active_root)
+        {
+            ("component", component.name.as_str())
+        } else {
+            anyhow::bail!(
+                "the active canvas root {active_root} is not a document page or component"
+            );
+        };
+        let scope_name = crate::agent_surface::truncate_summary_string(
+            if scope_name.is_empty() {
+                "Untitled"
+            } else {
+                scope_name
+            },
+            crate::agent_surface::SUMMARY_LABEL_CHARS,
+        );
+        for node_id in doc.selection.iter().copied() {
+            if doc.scene.get(node_id).is_none() {
+                anyhow::bail!("selected node {node_id} no longer exists");
+            }
+            let inside_active_root = node_id == active_root
+                || doc
+                    .scene
+                    .ancestors_of(node_id)
+                    .any(|ancestor| ancestor.id == active_root);
+            if !inside_active_root {
+                anyhow::bail!(
+                    "selected node {node_id} is outside the active {scope_kind} root {active_root}"
+                );
+            }
+        }
+        let item_title = item.title();
+        let source = serde_json::json!({
+            "item_title": crate::agent_surface::truncate_summary_string(
+                item_title.as_ref(),
+                crate::agent_surface::SUMMARY_LABEL_CHARS,
+            ),
+            "document_id": doc.id.to_string(),
+            "document_path": item.abs_path().display().to_string(),
+            "project_root": item.project_root().map(|root| root.display().to_string()),
+            "active_root_id": active_root.to_string(),
+            "scope_kind": scope_kind,
+            "scope_name": scope_name,
+        });
+        let mut nodes: Vec<_> = doc
+            .selection
+            .iter()
+            .take(AGENT_ATTACHMENT_CONTEXT_LAYERS)
+            .map(|node_id| crate::agent_surface::node_summary(doc, *node_id, Some(0), true))
+            .collect();
+        let selected_count = doc.selection.len();
+        let content = loop {
+            let included_count = nodes.len();
+            let snapshot = serde_json::json!({
+                "kind": "fanta_canvas_selection",
+                "source": &source,
+                "scope": { "kind": scope_kind, "name": &scope_name },
+                "selected_count": selected_count,
+                "included_count": included_count,
+                "omitted_count": selected_count.saturating_sub(included_count),
+                "nodes": &nodes,
+                "usage": "This is an immutable attach-time snapshot. Before using its node ids with live design tools, call design_state and verify document_id, document_path, project_root, and active_root_id against source. If any differ, ask the user to focus the source canvas; never apply these ids to another document or canvas root.",
+            });
+            let content = serde_json::to_string_pretty(&snapshot)?;
+            if content.len() <= AGENT_ATTACHMENT_MAX_BYTES {
+                break content;
+            }
+            if nodes.pop().is_none() {
+                anyhow::bail!(
+                    "the canvas selection metadata exceeds the {AGENT_ATTACHMENT_MAX_BYTES}-byte attachment limit"
+                );
+            }
+        };
+        let noun = if selected_count == 1 {
+            "layer"
+        } else {
+            "layers"
+        };
+        let name = format!("Canvas selection — {scope_name} ({selected_count} {noun})");
+        Ok(Some((name, content)))
     }
 
     /// The "what the user is looking at" header prefixed onto a toolbar
@@ -7491,6 +11296,10 @@ impl FigView {
         use fanta_gpui::toolbar::{ToolbarControlValue, ToolbarSecondaryControl};
         match (control, value) {
             (ToolbarSecondaryControl::MotionPlayPause, ToolbarControlValue::Toggle(playing)) => {
+                if *playing {
+                    self.motion_sidebar
+                        .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+                }
                 self.timeline_shell
                     .update(cx, |timeline, cx| timeline.set_playing(*playing, cx));
                 cx.notify();
@@ -7500,17 +11309,52 @@ impl FigView {
                     .update(cx, |timeline, cx| timeline.set_loop_playback(*looping, cx));
                 cx.notify();
             }
-            (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
-                if let Some(adapter) = self.gpui_toolbar.as_mut()
-                    && adapter.accept_animation_style(style)
-                {
-                    cx.notify();
+            (
+                ToolbarSecondaryControl::MotionAddKeyframe,
+                ToolbarControlValue::Choice(property_label),
+            ) => {
+                let Some(property) = TimelineProperty::from_label(property_label.as_ref()) else {
+                    show_canvas_notice(
+                        "Choose a keyframe property from the toolbar menu.".to_string(),
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                match self.add_motion_keyframe(property, cx) {
+                    Ok(()) => show_canvas_notice(
+                        format!("{} keyframe added.", property.label()),
+                        window,
+                        cx,
+                    ),
+                    Err(error) => show_canvas_notice(
+                        format!("Could not add {} keyframe: {error}", property.label()),
+                        window,
+                        cx,
+                    ),
                 }
             }
-            (ToolbarSecondaryControl::MotionAutoKeyframe, _) => {
-                // Echoing "recording" without a recorder would lie; leave the
-                // chip off until a keyframe-recording mode exists.
-                notify_unavailable("Auto keyframe recording", window, cx);
+            (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
+                let active_clip = self.active_motion_clip;
+                let result = self.motion_sidebar.update(cx, |panel, cx| {
+                    panel.apply_toolbar_animation_style(active_clip, style, cx)
+                });
+                match result {
+                    Ok(_) => {
+                        if let Some(adapter) = self.gpui_toolbar.as_mut() {
+                            adapter.remember_animation_style(style);
+                        }
+                        self.sync_motion_timeline(cx);
+                        show_canvas_notice(format!("{style} animation added."), window, cx);
+                        cx.notify();
+                    }
+                    Err(error) => show_canvas_notice(error.user_message(style), window, cx),
+                }
+            }
+            (ToolbarSecondaryControl::MotionAutoKeyframe, ToolbarControlValue::Toggle(enabled)) => {
+                if let Err(error) = self.set_motion_auto_keyframe(*enabled, cx) {
+                    show_canvas_notice(format!("Could not turn on Auto key: {error}"), window, cx);
+                }
             }
             (ToolbarSecondaryControl::DevReadyForDevelopment, _) => {
                 notify_unavailable("Marking a design ready for dev", window, cx);
@@ -7536,13 +11380,8 @@ impl FigView {
         use fanta_gpui::toolbar::ToolbarSecondaryControl;
         match control {
             ToolbarSecondaryControl::MotionAddKeyframe => {
-                // `add_motion_keyframe` needs a `TimelineProperty`; the chip
-                // carries none, and inventing one would author a keyframe the
-                // user did not ask for. The timeline's per-track controls own
-                // that flow.
                 show_canvas_notice(
-                    "Add keyframe needs a track: use the timeline's per-track controls."
-                        .to_string(),
+                    "Choose a keyframe property from the toolbar menu.".to_string(),
                     window,
                     cx,
                 );
@@ -7554,9 +11393,19 @@ impl FigView {
                     cx,
                 );
             }
-            ToolbarSecondaryControl::MotionTimeComment => {
-                notify_unavailable("Time-anchored comments", window, cx);
-            }
+            ToolbarSecondaryControl::MotionTimeComment => match self.arm_motion_time_comment(cx) {
+                Ok(time_ms) => show_canvas_notice(
+                    format!(
+                        "Click the canvas to place a comment at {}.",
+                        crate::comments::motion_comment_time_label(time_ms)
+                    ),
+                    window,
+                    cx,
+                ),
+                Err(error) => {
+                    show_canvas_notice(format!("Could not add time comment: {error}"), window, cx)
+                }
+            },
             ToolbarSecondaryControl::DevInspect
             | ToolbarSecondaryControl::DevAnnotate
             | ToolbarSecondaryControl::DevMeasure => {
@@ -7587,10 +11436,12 @@ const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
 const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
+const AGENT_ATTACHMENT_CONTEXT_LAYERS: usize = 64;
+const AGENT_ATTACHMENT_MAX_BYTES: usize = 128 * 1024;
 
-/// The draft prompt a toolbar AI command opens in the Agent Panel for the
-/// user to complete and review. Media commands stay `None`: there is no image
-/// backend to hand them to, so they are declined by name instead.
+/// The draft prompt a text-oriented toolbar AI command opens in the Agent Panel
+/// for the user to complete and review. Media and Design commands are routed to
+/// their dedicated generation workspaces before this helper is reached.
 #[cfg(feature = "fanta-gpui-ui")]
 fn toolbar_agent_prompt_template(
     command: fanta_gpui::toolbar::ToolbarCommand,
@@ -7644,10 +11495,9 @@ pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut 
     });
 }
 
-/// Show a canvas notice from a place that holds no `Window` — an item event
-/// subscription. The notice lands on the active window at the next effect
-/// flush, which is also when the reload it announces has finished applying.
-fn show_canvas_notice_deferred(message: String, cx: &mut App) {
+/// Show a canvas notice from a path that holds no `Window`. The notice lands
+/// on the active window at the next effect flush.
+pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
     cx.defer(move |cx| {
         let Some(window) = cx.active_window() else {
             log::warn!("fanta: no active window to show a canvas notice in: {message}");

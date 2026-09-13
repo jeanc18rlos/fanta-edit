@@ -4,6 +4,9 @@
 mod bindings;
 
 #[cfg(target_os = "macos")]
+pub mod video;
+
+#[cfg(target_os = "macos")]
 pub mod core_media {
     #![allow(non_snake_case)]
 

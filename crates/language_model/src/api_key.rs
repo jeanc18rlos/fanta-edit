@@ -195,10 +195,12 @@ impl ApiKeyState {
         cx.spawn(async move |ent, cx| {
             task.await;
             ent.update(cx, |ent, _cx| {
-                get_this(ent).load_status.clone().into_authenticate_result()
-            })
-            .ok();
-            Ok(())
+                get_this(ent)
+                    .load_status
+                    .clone()
+                    .into_authenticate_result()
+                    .map(|_| ())
+            })?
         })
     }
 

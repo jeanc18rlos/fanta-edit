@@ -10,7 +10,7 @@ use super::{
     RenderMetrics, Scene, Transform2D, apply_background_blur, draw_inner_shadows,
     effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect, paint_node_content,
     paint_node_foreground, render_instance, resolve_bound_value, shadow_expanded_local_bounds,
-    to_sk_matrix, visible_effects,
+    text_path_bounds, to_sk_matrix, visible_effects,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,14 +130,21 @@ fn resolved_world_transform(ctx: &mut RenderCtx, id: NodeId) -> Option<Transform
 
 /// Node-local subtree bounds matching the values and transforms that will be
 /// painted for the current motion sample. Intrinsic nodes use their resolved
-/// geometry directly; unclipped groups union resolved children. Boolean
-/// operands remain authored until the path-fold renderer can consume overlays.
+/// geometry directly; text paths substitute their shaped glyph bounds;
+/// unclipped groups union resolved children. Boolean operands remain authored
+/// until the path-fold renderer can consume overlays.
 fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
-    if ctx.inputs.motion.is_none() {
-        return ctx.scene.local_bounds(id);
-    }
     if let Some(bounds) = ctx.resolved_local_bounds.get(&id) {
         return *bounds;
+    }
+
+    if ctx.inputs.motion.is_none() {
+        let node = ctx.scene.get(id)?;
+        match &node.data {
+            NodeData::TextPath(_) => {}
+            NodeData::Group(group) if !group_clips_children(node, group) => {}
+            _ => return ctx.scene.local_bounds(id),
+        }
     }
 
     let (union_children, mut computed) = {
@@ -161,6 +168,7 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
                 )
             }
             NodeData::Boolean(_) => (false, ctx.scene.local_bounds(id)),
+            NodeData::TextPath(text_path) => (false, text_path_bounds(text_path)),
             data => (false, data.local_bounds()),
         }
     };

@@ -87,6 +87,74 @@ fn filter_pages(pages: Vec<PageEntry>, query: Option<&str>) -> Vec<PageEntry> {
     }
 }
 
+fn replace_text_data_matches(
+    data: &NodeData,
+    query: &str,
+    replacement: &str,
+    match_case: bool,
+    whole_words: bool,
+) -> Result<Option<NodeData>> {
+    match data {
+        NodeData::Text(text) => {
+            let ranges = crate::gpui_adapters::pages::matching_ranges(
+                &text.content,
+                query,
+                match_case,
+                whole_words,
+            );
+            if ranges.is_empty() {
+                return Ok(None);
+            }
+            if ranges
+                .iter()
+                .all(|range| text.content.get(range.clone()) == Some(replacement))
+            {
+                return Ok(None);
+            }
+            let (content, style_runs) = crate::text_edit::replace_styled_text_ranges(
+                &text.content,
+                &text.style,
+                &text.style_runs,
+                &ranges,
+                replacement,
+            )?;
+            let mut updated = text.clone();
+            updated.content = content;
+            updated.style_runs = style_runs;
+            Ok(Some(NodeData::Text(updated)))
+        }
+        NodeData::TextPath(text_path) => {
+            let ranges = crate::gpui_adapters::pages::matching_ranges(
+                &text_path.content,
+                query,
+                match_case,
+                whole_words,
+            );
+            if ranges.is_empty() {
+                return Ok(None);
+            }
+            if ranges
+                .iter()
+                .all(|range| text_path.content.get(range.clone()) == Some(replacement))
+            {
+                return Ok(None);
+            }
+            let (content, style_runs) = crate::text_edit::replace_styled_text_ranges(
+                &text_path.content,
+                &text_path.style,
+                &text_path.style_runs,
+                &ranges,
+                replacement,
+            )?;
+            let mut updated = text_path.clone();
+            updated.content = content;
+            updated.style_runs = style_runs;
+            Ok(Some(NodeData::TextPath(updated)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The draggable boundary between sidebar sections. It resizes the
 /// fixed-height Pages section above it while Layers (`flex_1`) absorbs the
 /// remaining space.
@@ -1857,7 +1925,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use fanta_doc::{ComponentDef, ComponentId, InstanceNode, Transform2D, VectorNode};
+    use fanta_doc::{
+        ComponentDef, ComponentId, InstanceNode, PathData, TextPathNode, TextStyleRun, Transform2D,
+        VectorNode,
+    };
     use gpui::TestAppContext;
     use project::FakeFs;
 
@@ -2268,6 +2339,42 @@ mod tests {
 
         // A non-matching query yields the empty-state list.
         assert!(filter_pages(pages, Some("zzz")).is_empty());
+    }
+
+    #[test]
+    fn text_replace_remaps_text_path_style_runs_and_rejects_invalid_input() {
+        let mut text_path = TextPathNode::new(PathData::new(), "AB");
+        let mut emphasized = text_path.style.clone();
+        emphasized.weight = 700;
+        text_path.style_runs.push(TextStyleRun {
+            start: 1,
+            end: 2,
+            style: emphasized.clone(),
+        });
+        let data = NodeData::TextPath(text_path.clone());
+
+        let replaced = replace_text_data_matches(&data, "A", "", true, false)
+            .expect("valid rich text replacement")
+            .expect("the query matches");
+        let NodeData::TextPath(replaced) = replaced else {
+            panic!("expected TextPath replacement");
+        };
+        assert_eq!(replaced.content, "B");
+        assert_eq!(replaced.style_runs.len(), 1);
+        assert_eq!(replaced.style_runs[0].start, 0);
+        assert_eq!(replaced.style_runs[0].end, 1);
+        assert_eq!(replaced.style_runs[0].style, emphasized);
+
+        text_path.content = "B".to_owned();
+        let malformed = NodeData::TextPath(text_path);
+        assert!(
+            replace_text_data_matches(&malformed, "B", "B", true, false)
+                .expect("an exact no-op does not touch malformed saved formatting")
+                .is_none()
+        );
+        let error = replace_text_data_matches(&malformed, "B", "C", true, false)
+            .expect_err("a stale out-of-bounds run must reject replacement");
+        assert!(error.to_string().contains("style run 0 (1..2) is invalid"));
     }
 }
 
@@ -3399,6 +3506,7 @@ impl FantaDesignPanel {
         });
         let query = request.query.to_string();
         let match_case = request.match_case;
+        let whole_words = request.whole_words;
         let hits = hits.to_vec();
         let replacement = replacement.to_string();
         let result: Option<anyhow::Result<()>> = item.update(cx, |item, cx| {
@@ -3412,7 +3520,13 @@ impl FantaDesignPanel {
                     match hit.field {
                         HitField::Name => {
                             let old = node.name.clone();
-                            let new = replace_matches(&old, &query, &replacement, match_case);
+                            let new = replace_matches(
+                                &old,
+                                &query,
+                                &replacement,
+                                match_case,
+                                whole_words,
+                            );
                             if new != old {
                                 operations.push(Operation::SetName {
                                     id: hit.node,
@@ -3422,21 +3536,30 @@ impl FantaDesignPanel {
                             }
                         }
                         HitField::TextContent => {
-                            if let NodeData::Text(text) = &node.data {
-                                let mut updated = text.clone();
-                                updated.content = replace_matches(
-                                    &text.content,
-                                    &query,
-                                    &replacement,
-                                    match_case,
-                                );
-                                if updated.content != text.content {
-                                    operations.push(Operation::ReplaceData {
-                                        id: hit.node,
-                                        old: Box::new(node.data.clone()),
-                                        new: Box::new(NodeData::Text(updated)),
-                                    });
+                            let replacement_data = match replace_text_data_matches(
+                                &node.data,
+                                &query,
+                                &replacement,
+                                match_case,
+                                whole_words,
+                            ) {
+                                Ok(replacement_data) => replacement_data,
+                                Err(error) => {
+                                    return (
+                                        Err(anyhow::anyhow!(
+                                            "replacing text in node {}: {error:#}",
+                                            hit.node
+                                        )),
+                                        DocChange::None,
+                                    );
                                 }
+                            };
+                            if let Some(new) = replacement_data {
+                                operations.push(Operation::ReplaceData {
+                                    id: hit.node,
+                                    old: Box::new(node.data.clone()),
+                                    new: Box::new(new),
+                                });
                             }
                         }
                     }
@@ -3463,6 +3586,7 @@ impl FantaDesignPanel {
         });
         if let Some(Err(error)) = result {
             log::error!("fanta-gpui pages: {label} failed: {error:#}");
+            crate::view::show_canvas_notice_deferred(format!("{label} failed: {error:#}"), cx);
         }
         // The Edited echo refreshes rows; re-run the search so result rows
         // reflect the replacement immediately.

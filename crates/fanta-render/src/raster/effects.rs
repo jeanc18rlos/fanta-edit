@@ -6,8 +6,8 @@ use super::boolean::fold_operands;
 use super::{
     BlendMode, Blur, BlurKind, Bounds, Canvas, CanvasNode, Fill, GroupNode, NodeData, NodeFlags,
     NodeId, Paint, RenderCtx, Scene, Shadow, ShadowKind, bounds_to_f32, frame_box_bounds,
-    path_is_rect, rounded_rect_path, text_node_outline, to_sk_blend_mode, to_sk_color,
-    to_sk_fill_path,
+    path_is_rect, rounded_rect_path, text_node_outline, text_path_bounds, text_path_outline,
+    to_sk_blend_mode, to_sk_color, to_sk_fill_path,
 };
 
 /// Which of a node's authored effects actually PAINT at the frame's
@@ -386,9 +386,9 @@ pub(crate) const LAYER_BOUNDS_PAD_DEVICE_PX: f64 = 32.0;
 /// slower). Priority order:
 /// - a clipped frame's `clip_size` box — overlay-accurate (a binding can
 ///   resize the clip, and descendants are clipped to it anyway);
-/// - the node's own intrinsic geometry (vector path bounds, text/bitmap/media
-///   `local_size`) — also valid for TRANSIENT instance-expansion clones that
-///   have no scene entry;
+/// - the node's own intrinsic geometry (vector path bounds, shaped text-path
+///   glyph bounds, or text/bitmap/media `local_size`) — also valid for
+///   TRANSIENT instance-expansion clones that have no scene entry;
 /// - the scene's memoized subtree `local_bounds` for a live unclipped group
 ///   (a TRANSIENT unclipped group resolves to `None` here; the instance walk
 ///   falls back to the union of its transient children).
@@ -404,6 +404,7 @@ pub(crate) fn effects_layer_bounds(
         NodeData::Group(group) if !group_clips_children(node, group) => {
             scene_id.and_then(|id| scene.local_bounds(id))
         }
+        NodeData::TextPath(text_path) => text_path_bounds(text_path),
         data => data.local_bounds(),
     }
 }
@@ -1072,8 +1073,8 @@ fn spread_morphology_filter(spread: f64, invert: bool) -> Option<skia_safe::Imag
 ///   vector path.
 /// - **Group / frame**: the rounded box of the frame's `clip_size`, else the
 ///   scene-computed content bounds for a background/border-only group.
-/// - **Text**: the shaped glyph outlines, preserving counters while leaving
-///   whitespace transparent, so inner shadows follow glyph alpha.
+/// - **Text / text path**: the shaped glyph outlines, preserving counters while
+///   leaving whitespace transparent, so inner shadows follow glyph alpha.
 /// - **Boolean**: the folded operand path, matching the geometry actually drawn.
 /// - **Instance / Bitmap / Video / media**: the node's `local_size` box — the
 ///   same box `effects_layer_bounds` uses. A degenerate box yields `None`.
@@ -1093,6 +1094,7 @@ pub(crate) fn node_silhouette_path(
             })
         }
         NodeData::Text(text) => text_node_outline(text).map(|path| to_sk_fill_path(&path)),
+        NodeData::TextPath(text_path) => text_path_outline(text_path).into_exact(),
         NodeData::Boolean(boolean) => fold_operands(scene, scene_id?, boolean.op),
         NodeData::Group(g) => frame_box_bounds(g, scene_id, scene).map(|b| {
             rounded_rect_path(

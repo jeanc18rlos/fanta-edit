@@ -150,7 +150,7 @@ impl ScreenCaptureSource for MacScreenCaptureSource {
                 }
             });
             let handler = handler.copy();
-            let _: () = msg_send![stream, startCaptureWithCompletionHandler:handler];
+            let _: () = msg_send![stream, startCaptureWithCompletionHandler:&*handler];
             rx
         }
     }
@@ -187,7 +187,7 @@ impl Drop for MacScreenCaptureStream {
                 }
             });
             let block = handler.copy();
-            let _: () = msg_send![self.sc_stream, stopCaptureWithCompletionHandler:block];
+            let _: () = msg_send![self.sc_stream, stopCaptureWithCompletionHandler:&*block];
             let _: () = msg_send![self.sc_stream, release];
             let _: () = msg_send![self.sc_stream_output, release];
         }
@@ -279,7 +279,7 @@ pub(crate) fn get_sources() -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCapture
             class!(SCShareableContent),
             getShareableContentExcludingDesktopWindows:YES
                                    onScreenWindowsOnly:YES
-                                     completionHandler:block];
+                                     completionHandler:&*block];
         rx
     }
 }

@@ -244,8 +244,8 @@ impl PseudoEditor {
                     .absolute()
                     .left_0()
                     .right_0()
-                    .bottom(px(18.))
-                    .px_4()
+                    .bottom(px(12.))
+                    .px_3()
                     .justify_center()
                     .child(self.children.toolbar.clone()),
             )

@@ -58,4 +58,6 @@ mod text_layout;
 
 pub use align::Align;
 pub use engine::{LayoutEngine, LayoutOptions};
-pub use text_layout::{LineMetrics, TextLayout};
+pub use text_layout::{
+    LineMetrics, ShapedGlyph, ShapedGlyphError, ShapedGlyphRun, ShapedTextCluster, TextLayout,
+};

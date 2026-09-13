@@ -17,7 +17,6 @@ use gpui::ReadGlobal as _;
 use gpui::SharedString;
 #[cfg(unix)]
 use std::ffi::CString;
-use util::command::new_command;
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
@@ -510,6 +509,15 @@ impl RealFs {
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
             is_case_sensitive: Default::default(),
         }
+    }
+
+    async fn git_binary_path(&self) -> Result<PathBuf> {
+        let bundled_git = self.bundled_git_binary_path.clone();
+        self.executor
+            .spawn(async move {
+                git::executable::select_git(git::executable::find_system_git(), bundled_git)
+            })
+            .await
     }
 
     #[cfg(target_os = "windows")]
@@ -1134,7 +1142,8 @@ impl Fs for RealFs {
         abs_work_directory_path: &Path,
         fallback_branch_name: String,
     ) -> Result<()> {
-        let result = new_command("git")
+        let git_binary = self.git_binary_path().await?;
+        let result = git::executable::command(&git_binary)
             .current_dir(abs_work_directory_path)
             .args(&["config", "--global", "--get", "init.defaultBranch"])
             .output()
@@ -1148,12 +1157,18 @@ impl Fs for RealFs {
             _ => fallback_branch_name,
         };
 
-        new_command("git")
+        let output = git::executable::command(&git_binary)
             .current_dir(abs_work_directory_path)
             .args(&["init", "-b"])
             .arg(branch_name.trim())
             .output()
             .await?;
+
+        anyhow::ensure!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         Ok(())
     }
@@ -1168,7 +1183,8 @@ impl Fs for RealFs {
 
         let _job_tracker = JobTracker::new(job_info, self.job_event_subscribers.clone());
 
-        let output = new_command("git")
+        let git_binary = self.git_binary_path().await?;
+        let output = git::executable::command(&git_binary)
             .current_dir(abs_work_directory)
             .args(&["clone", repo_url])
             .output()
@@ -1188,7 +1204,8 @@ impl Fs for RealFs {
     /// Will return `Ok` if the commands exit status is `0`, with the stdout
     /// contents. Otherwise returns `Err` with the stderr contents.
     async fn git_config(&self, abs_work_directory: &Path, args: Vec<String>) -> Result<String> {
-        let output = new_command("git")
+        let git_binary = self.git_binary_path().await?;
+        let output = git::executable::command(&git_binary)
             .current_dir(abs_work_directory)
             .args([String::from("config")].into_iter().chain(args))
             .output()

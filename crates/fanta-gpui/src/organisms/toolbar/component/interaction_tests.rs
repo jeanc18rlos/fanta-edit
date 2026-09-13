@@ -74,9 +74,9 @@ impl Render for TestHost {
                     .absolute()
                     .left_0()
                     .right_0()
-                    .bottom(px(18.))
+                    .bottom(px(12.))
                     .flex()
-                    .px_4()
+                    .px_3()
                     .gap(px(8.))
                     .justify_center()
                     .child(self.toolbar.clone())
@@ -373,11 +373,15 @@ fn dock_contains_every_persistent_toolbar_surface(cx: &mut TestAppContext) {
         let surface = cx
             .debug_bounds("editor-toolbar-surface")
             .expect("toolbar dock should render");
+        let primary_dock_row = cx
+            .debug_bounds("toolbar-primary-dock-row")
+            .expect("compact primary row should render");
 
         assert_eq!(
             surface, root,
             "root should adopt the dock's intrinsic bounds"
         );
+        assert!(primary_dock_row.is_contained_within(&surface));
         for selector in [
             "toolbar-primary-row",
             "toolbar-utility-row",
@@ -392,21 +396,44 @@ fn dock_contains_every_persistent_toolbar_surface(cx: &mut TestAppContext) {
                 "{mode:?} {selector} {bounds:?} escaped dock {surface:?}"
             );
         }
+        let tool_row = cx
+            .debug_bounds("toolbar-primary-row")
+            .expect("tool row should render");
+        let utility_row = cx
+            .debug_bounds("toolbar-utility-row")
+            .expect("utility row should render");
+        assert_eq!(
+            tool_row.origin.y, utility_row.origin.y,
+            "persistent controls should share one compact row"
+        );
+        assert_eq!(tool_row.size.height, px(40.));
+        assert_eq!(utility_row.size.height, px(40.));
         assert!(
             cx.debug_bounds("toolbar-zoom-out").is_some()
                 && cx.debug_bounds("toolbar-zoom-in").is_some(),
             "a wide {mode:?} dock should keep the full zoom cluster"
         );
 
-        assert!(
-            root.size.height < px(170.),
-            "the intrinsic {mode:?} dock should not expand into a canvas overlay: {root:?}"
-        );
+        if *mode == ToolbarMode::Design {
+            assert_eq!(root.size.height, px(50.));
+            assert!(
+                cx.debug_bounds("toolbar-secondary-viewport").is_none(),
+                "Design should contain only the persistent primary row"
+            );
+        } else {
+            let secondary = cx
+                .debug_bounds("toolbar-secondary-viewport")
+                .expect("specialized modes should render one contextual strip");
+            assert!(secondary.is_contained_within(&surface));
+            assert!(secondary.bottom() <= primary_dock_row.top());
+            assert_eq!(root.size.height, px(94.));
+        }
         assert!(root.size.width < px(900.));
     }
 
-    // 380 px leaves the dock 268 px (a 258 px utility row): the full zoom
-    // row (273 px) no longer fits but the percent-only row (223 px) does.
+    // At this width the two primary segments both compress. Their independent
+    // scroll handles keep every persistent control reachable without making
+    // the dock wider than its host.
     cx.simulate_resize(size(px(380.), px(700.)));
     cx.update(|_, app| {
         toolbar.update(app, |toolbar, cx| toolbar.set_mode(ToolbarMode::Motion, cx));
@@ -419,7 +446,7 @@ fn dock_contains_every_persistent_toolbar_surface(cx: &mut TestAppContext) {
         .debug_bounds("toolbar-primary-viewport")
         .expect("narrow primary viewport should render");
     assert!(
-        root.size.width <= px(268.),
+        root.size.width <= px(276.),
         "narrow dock escaped its host wrapper: {root:?}"
     );
     assert!(primary_viewport.is_contained_within(&root));
@@ -431,16 +458,7 @@ fn dock_contains_every_persistent_toolbar_surface(cx: &mut TestAppContext) {
         .expect("narrow utility row should render");
     assert!(utility_viewport.is_contained_within(&root));
     let utility_scroll = cx.read(|app| toolbar.read(app).utility_scroll_handle.clone());
-    assert!(
-        cx.debug_bounds("toolbar-zoom-out").is_none()
-            && cx.debug_bounds("toolbar-zoom-in").is_none(),
-        "a narrow dock should shed the zoom steppers before scrolling its utility row"
-    );
-    assert!(
-        cx.debug_bounds("toolbar-zoom-menu-trigger").is_some(),
-        "the collapsed zoom cluster should keep its percent menu trigger"
-    );
-    for selector in ["toolbar-zoom-control", "toolbar-agent-launcher"] {
+    for selector in ["toolbar-mode-design", "toolbar-agent-launcher"] {
         let bounds = cx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("{selector} should render at a narrow width"));
@@ -480,79 +498,102 @@ fn dock_contains_every_persistent_toolbar_surface(cx: &mut TestAppContext) {
         cx.debug_bounds("toolbar-agent-launcher")
             .expect("Agent target should remain measurable")
             .size,
-        size(px(36.), px(36.))
+        size(px(AGENT_LAUNCHER_WIDTH), px(32.))
+    );
+    let label = cx
+        .debug_bounds("toolbar-agent-label")
+        .expect("the AI action should keep an explicit label");
+    assert!(
+        label.is_contained_within(
+            &cx.debug_bounds("toolbar-agent-launcher")
+                .expect("AI action should render")
+        ),
+        "the explicit label should remain inside its action"
     );
 }
 
 #[gpui::test]
-fn collapsed_zoom_cluster_keeps_its_menu_and_fits_without_scrolling(cx: &mut TestAppContext) {
+fn zoom_tiers_preserve_the_percent_trigger_before_hiding(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     let toolbar = cx.read(|app| host.read(app).toolbar.clone());
-    let actions = cx.read(|app| host.read(app).actions.clone());
-    cx.simulate_resize(size(px(380.), px(700.)));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-out").is_none()
-            && cx.debug_bounds("toolbar-zoom-in").is_none(),
-        "a 258 px utility row should ride the percent-only tier"
-    );
 
-    // In the percent-only tier the whole utility row reflows into its
-    // viewport: collapse, not scrolling, absorbs the lost width.
-    let viewport = cx
-        .debug_bounds("toolbar-utility-viewport")
-        .expect("utility viewport should render");
-    for selector in [
-        "toolbar-zoom-control",
-        "toolbar-agent-launcher",
-        "toolbar-mode-design",
+    for (window_width, expected) in [
+        (900., ZoomClusterTier::Full),
+        (700., ZoomClusterTier::PercentOnly),
+        (600., ZoomClusterTier::Hidden),
     ] {
-        let bounds = cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("{selector} should render"));
+        cx.simulate_resize(size(px(window_width), px(700.)));
+        cx.run_until_parked();
+        let measured = cx.read(|app| {
+            let toolbar = toolbar.read(app);
+            assert_eq!(toolbar.zoom_cluster_tier(), expected);
+            toolbar
+                .utility_width
+                .expect("the real utility segment should be measured")
+        });
+        match expected {
+            ZoomClusterTier::Full => {
+                assert!(cx.debug_bounds("toolbar-zoom-out").is_some());
+                assert!(cx.debug_bounds("toolbar-zoom-in").is_some());
+            }
+            ZoomClusterTier::PercentOnly => {
+                assert!(cx.debug_bounds("toolbar-zoom-out").is_none());
+                assert!(cx.debug_bounds("toolbar-zoom-in").is_none());
+                assert!(cx.debug_bounds("toolbar-zoom-menu-trigger").is_some());
+            }
+            ZoomClusterTier::Hidden => {
+                assert!(cx.debug_bounds("toolbar-zoom-control").is_none());
+            }
+        }
+        let root = cx.debug_bounds("editor-toolbar").expect("toolbar root");
+        let viewport = cx
+            .debug_bounds("toolbar-utility-viewport")
+            .expect("utility viewport");
+        let primary_viewport = cx
+            .debug_bounds("toolbar-primary-viewport")
+            .expect("primary viewport");
+        let row = cx.debug_bounds("toolbar-utility-row").expect("utility row");
+        assert!(viewport.is_contained_within(&root));
         assert!(
-            bounds.is_contained_within(&viewport),
-            "{selector} {bounds:?} should fit the collapsed row viewport {viewport:?}"
+            primary_viewport.right() <= viewport.left(),
+            "the two shrinkable primary segments must not overlap"
+        );
+        let scroll = cx.read(|app| toolbar.read(app).utility_scroll_handle.clone());
+        for selector in ["toolbar-mode-design", "toolbar-agent-launcher"] {
+            let control = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} should render at {window_width}px"));
+            assert!(control.is_contained_within(&row));
+            assert!(
+                scroll.max_offset().x >= control.right() - viewport.right(),
+                "{selector} should stay reachable at {window_width}px with a {measured}px utility segment"
+            );
+        }
+        let mode = cx
+            .debug_bounds("toolbar-mode-design")
+            .expect("Design mode should render");
+        let agent = cx
+            .debug_bounds("toolbar-agent-launcher")
+            .expect("AI action should render");
+        assert!(
+            mode.right() <= agent.left(),
+            "utility controls must not overlap"
         );
     }
-    let utility_scroll = cx.read(|app| toolbar.read(app).utility_scroll_handle.clone());
-    assert_eq!(
-        f32::from(utility_scroll.max_offset().x),
-        0.,
-        "the collapsed utility row must not need to scroll"
-    );
 
-    // The percent trigger keeps the full zoom menu.
-    let trigger = cx
-        .debug_bounds("toolbar-zoom-menu-trigger")
-        .expect("percent trigger should render");
-    cx.simulate_click(trigger.center(), Modifiers::none());
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-flyout").is_some(),
-        "the percent trigger should still open the zoom menu"
-    );
-    actions.borrow_mut().clear();
-    let fit = cx
-        .debug_bounds("toolbar-zoom-entry-zoom-to-fit")
-        .expect("Zoom to fit should render");
-    cx.simulate_click(fit.center(), Modifiers::none());
-    cx.run_until_parked();
-    assert_eq!(
-        actions.borrow().as_slice(),
-        &[ToolbarAction::CommandInvoked {
-            command: ToolbarCommand::ZoomToFit,
-        }]
-    );
-
-    // Re-widening the host restores the steppers.
-    cx.simulate_resize(size(px(900.), px(700.)));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-out").is_some()
-            && cx.debug_bounds("toolbar-zoom-in").is_some(),
-        "a re-widened dock should restore the zoom steppers"
-    );
+    // The half-pixel tolerance retains each tier at its exact named floor.
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, _| {
+            toolbar.utility_width = Some(TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH);
+            assert_eq!(toolbar.zoom_cluster_tier(), ZoomClusterTier::Full);
+            toolbar.utility_width = Some(TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH - 1.);
+            assert_eq!(toolbar.zoom_cluster_tier(), ZoomClusterTier::PercentOnly);
+            toolbar.utility_width = Some(TOOLBAR_ZOOM_CLUSTER_MIN_WIDTH);
+            assert_eq!(toolbar.zoom_cluster_tier(), ZoomClusterTier::PercentOnly);
+            toolbar.utility_width = Some(TOOLBAR_ZOOM_CLUSTER_MIN_WIDTH - 1.);
+            assert_eq!(toolbar.zoom_cluster_tier(), ZoomClusterTier::Hidden);
+        });
+    });
 }
 
 #[gpui::test]
@@ -624,6 +665,41 @@ fn tool_menu_is_anchored_to_its_own_caret(cx: &mut TestAppContext) {
     assert_eq!(menu.bottom() + px(POPOVER_GAP), trigger.top());
     assert!(menu.left() <= trigger.left());
     assert!(menu.right() >= trigger.right());
+}
+
+#[gpui::test]
+fn text_entry_triggers_transfer_pointer_focus_to_their_input(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    cx.simulate_resize(size(px(900.), px(700.)));
+    cx.run_until_parked();
+
+    for (selector, agent) in [
+        ("toolbar-tool-actions", false),
+        ("toolbar-agent-launcher", true),
+    ] {
+        let trigger = cx
+            .debug_bounds(selector)
+            .expect("the text-entry trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        let input = cx.read(|app| {
+            let toolbar = toolbar.read(app);
+            if agent {
+                toolbar.ai_input.clone()
+            } else {
+                toolbar.command_input.clone()
+            }
+        });
+        assert!(
+            cx.update(|window, app| input.focus_handle(app).is_focused(window)),
+            "the trigger's default pointer focus must not replace the input focus"
+        );
+        cx.simulate_keystrokes("r e c t a n g l e");
+        assert_eq!(cx.read(|app| input.read(app).value()), "rectangle");
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    }
 }
 
 #[gpui::test]
@@ -1113,6 +1189,98 @@ fn motion_style_chip_offers_host_candidates(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn motion_keyframe_chip_offers_host_candidates(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_mode(ToolbarMode::Motion, cx);
+            toolbar.set_motion_options(
+                MotionToolbarOptions {
+                    available_keyframe_properties: vec!["Rotation".into(), "Opacity".into()],
+                    ..MotionToolbarOptions::default()
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    let chip = cx
+        .debug_bounds("toolbar-secondary-motion-keyframe")
+        .expect("keyframe chip should render");
+    cx.simulate_click(chip.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("toolbar-motion-keyframe-editor").is_some(),
+        "the keyframe chip should open a property menu"
+    );
+
+    actions.borrow_mut().clear();
+    let candidate = cx
+        .debug_bounds("toolbar-motion-keyframe-option-opacity")
+        .expect("host-supplied property should render");
+    cx.simulate_click(candidate.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[ToolbarAction::ControlChangeRequested {
+            mode: ToolbarMode::Motion,
+            control: ToolbarSecondaryControl::MotionAddKeyframe,
+            value: ToolbarControlValue::Choice("Opacity".into()),
+        }]
+    );
+    assert!(
+        cx.debug_bounds("toolbar-motion-keyframe-editor").is_none(),
+        "choosing a property should close the editor"
+    );
+}
+
+#[gpui::test]
+fn motion_time_comment_emits_one_typed_intent_and_echoes_armed_state(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(900.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| toolbar.set_mode(ToolbarMode::Motion, cx));
+    });
+    cx.run_until_parked();
+
+    let comment = cx
+        .debug_bounds("toolbar-secondary-motion-time-comment")
+        .expect("time comment control should render");
+    cx.simulate_click(comment.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[ToolbarAction::SecondaryControlInvoked {
+            mode: ToolbarMode::Motion,
+            control: ToolbarSecondaryControl::MotionTimeComment,
+        }]
+    );
+
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_motion_options(
+                MotionToolbarOptions {
+                    time_comment_armed: true,
+                    ..MotionToolbarOptions::default()
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    toolbar.read_with(cx, |toolbar, _| {
+        assert!(toolbar.motion_options().time_comment_armed)
+    });
+}
+
+#[gpui::test]
 fn motion_style_editor_arrows_move_the_highlight_and_enter_commits(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     cx.simulate_resize(size(px(900.), px(700.)));
@@ -1479,13 +1647,13 @@ fn chrome_controls_render_in_the_dock_and_emit_typed_intents(cx: &mut TestAppCon
 fn chrome_capsule_makes_the_zoom_cluster_reflow_earlier(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     let toolbar = cx.read(|app| host.read(app).toolbar.clone());
-    cx.simulate_resize(size(px(420.), px(700.)));
+    cx.simulate_resize(size(px(800.), px(700.)));
     cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-out").is_some()
-            && cx.debug_bounds("toolbar-zoom-in").is_some(),
-        "without chrome the 298 px utility row keeps the full zoom cluster"
+    assert_eq!(
+        cx.read(|app| toolbar.read(app).zoom_cluster_tier()),
+        ZoomClusterTier::Full
     );
+    assert!(cx.debug_bounds("toolbar-zoom-out").is_some());
 
     cx.update(|_, app| {
         toolbar.update(app, |toolbar, cx| {
@@ -1493,94 +1661,30 @@ fn chrome_capsule_makes_the_zoom_cluster_reflow_earlier(cx: &mut TestAppContext)
         });
     });
     cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-control").is_none(),
-        "the chrome capsule claims the width the zoom cluster would need"
+    assert_eq!(
+        cx.read(|app| toolbar.read(app).zoom_cluster_tier()),
+        ZoomClusterTier::PercentOnly,
+        "host chrome should be deducted before choosing the zoom tier"
     );
+    assert!(cx.debug_bounds("toolbar-zoom-out").is_none());
+    assert!(cx.debug_bounds("toolbar-zoom-in").is_none());
+    assert!(cx.debug_bounds("toolbar-zoom-menu-trigger").is_some());
+
     let viewport = cx
         .debug_bounds("toolbar-utility-viewport")
         .expect("utility viewport should render");
+    let scroll = cx.read(|app| toolbar.read(app).utility_scroll_handle.clone());
     for selector in [
-        "toolbar-chrome-cluster",
-        "toolbar-agent-launcher",
         "toolbar-mode-design",
+        "toolbar-agent-launcher",
+        "toolbar-chrome-cluster",
     ] {
-        let bounds = cx
+        let control = cx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("{selector} should render"));
         assert!(
-            bounds.is_contained_within(&viewport),
-            "{selector} {bounds:?} should fit the collapsed row viewport {viewport:?}"
+            scroll.max_offset().x >= control.right() - viewport.right(),
+            "{selector} should remain reachable after chrome reflows zoom"
         );
     }
-    let utility_scroll = cx.read(|app| toolbar.read(app).utility_scroll_handle.clone());
-    assert_eq!(
-        f32::from(utility_scroll.max_offset().x),
-        0.,
-        "the collapsed utility row must not need to scroll"
-    );
-}
-
-#[gpui::test]
-fn zoom_tiers_switch_exactly_where_the_row_stops_fitting(cx: &mut TestAppContext) {
-    let (host, cx) = setup(cx);
-    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
-    // The test host wraps the dock in 16 px side padding, an 8 px gap, and a
-    // 72 px trailing block; the dock's 1 px border and 4 px padding on each
-    // side leave a utility row 122 px narrower than the window.
-    let host_chrome = 122.;
-    let scroll = cx.read(|app| toolbar.read(app).utility_scroll_handle.clone());
-    let overflow = |cx: &mut VisualTestContext| {
-        cx.run_until_parked();
-        f32::from(scroll.max_offset().x)
-    };
-
-    cx.simulate_resize(size(
-        px(TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH + host_chrome),
-        px(700.),
-    ));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-out").is_some(),
-        "at the steppers floor the full row still fits"
-    );
-    assert_eq!(overflow(cx), 0., "the full row must fit without scrolling");
-
-    cx.simulate_resize(size(
-        px(TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH + host_chrome - 1.),
-        px(700.),
-    ));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-out").is_none()
-            && cx.debug_bounds("toolbar-zoom-menu-trigger").is_some(),
-        "one pixel below the steppers floor the steppers shed"
-    );
-    assert_eq!(overflow(cx), 0., "the percent-only row must fit");
-
-    cx.simulate_resize(size(
-        px(TOOLBAR_ZOOM_CLUSTER_MIN_WIDTH + host_chrome),
-        px(700.),
-    ));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-menu-trigger").is_some(),
-        "at the cluster floor the percent-only row still fits"
-    );
-    assert_eq!(overflow(cx), 0.);
-
-    cx.simulate_resize(size(
-        px(TOOLBAR_ZOOM_CLUSTER_MIN_WIDTH + host_chrome - 1.),
-        px(700.),
-    ));
-    cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("toolbar-zoom-control").is_none(),
-        "one pixel below the cluster floor the zoom cluster hides"
-    );
-    assert_eq!(
-        overflow(cx),
-        0.,
-        "the mode tray and Agent launcher must fit"
-    );
 }

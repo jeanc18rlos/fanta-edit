@@ -135,14 +135,18 @@ meet first:
 
 - Parts of the toolbar and inspector are visible but not wired up. They say so
   when clicked rather than failing silently.
-- Grid auto-layout, three blend modes, and most effect kinds beyond shadows and
-  blurs do nothing.
+- Grid auto-layout, unsupported effect families, Pattern/Image/Video/Shader
+  paints, bound or unsupported gradients, Linear Burn, and Linear Dodge are
+  explicitly unavailable; shadow blend is read-only. Fill/stroke visibility,
+  supported solid and finite unbound identity-transform gradient payloads, and
+  per-paint blend-mode changes now produce undoable edits in the current
+  candidate, with exact-artifact native coverage still outstanding.
 - Canvas copy and paste works within one document only. Pasting an image works;
   pasting any other kind of file still does nothing.
-- Nothing in this build has been clicked. The agent operations behind Group,
-  Ungroup, align, components and the rest were driven over MCP against a release
-  build on 2026-09-09 and worked; the keyboard shortcuts, the toolbar, image
-  paste and dragging on the canvas have only been exercised by unit tests.
+- The complete manual smoke checklist has not passed against one artifact.
+  Focused native fixtures have exercised Scale, Path Select, generation and
+  restart recovery; other pointer-only surfaces remain source or automated-test
+  evidence until the final packaged-app pass.
 - Memory is high. A large document settles at about 2 GiB, and the first edit
   plus its autosave took that to 5.8 GiB on a 128 MB file — about 3.8 GiB for
   one rectangle — before later autosaves brought it back to about 5 GiB.

@@ -1659,6 +1659,7 @@ impl PresentSession {
                         fanta_render::MediaPlayback {
                             progress,
                             frame: None,
+                            decoded_frame: None,
                         },
                     );
                 } else if let NodeData::Audio(a) = &node.data {
@@ -1676,6 +1677,7 @@ impl PresentSession {
                         fanta_render::MediaPlayback {
                             progress,
                             frame: None,
+                            decoded_frame: None,
                         },
                     );
                 }

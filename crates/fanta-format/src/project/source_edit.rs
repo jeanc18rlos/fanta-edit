@@ -139,8 +139,7 @@ pub fn apply_project_source_edit_with_diagnostics(
     }
 
     if sidecar_changed {
-        let mut sidecar_bytes = serde_json::to_vec_pretty(&sidecar)?;
-        sidecar_bytes.push(b'\n');
+        let sidecar_bytes = super::layout::json_bytes(&serde_json::to_value(&sidecar)?)?;
         atomic_write(&checked_sidecar_path, &sidecar_bytes)?;
     }
     if source_changed && let Err(source_error) = atomic_write(&edit.source_path, source.as_bytes())
@@ -387,6 +386,39 @@ mod tests {
         let (removed_document, _) = super::super::read::read_project_tree(directory.path())
             .expect("read project after removing vector");
         assert!(removed_document.scene.children_of(Some(page_id)).is_empty());
+    }
+
+    #[test]
+    fn source_edit_sidecar_stays_canonical_across_full_project_saves() {
+        let (directory, source_path) = project();
+        let original = fs::read_to_string(&source_path).expect("read source");
+        let added = original.replace(
+            " />\n  );\n}",
+            ">\n      <Vector name=\"Added\" path={{\"segments\": []}} />\n    </Frame>\n  );\n}",
+        );
+        assert_ne!(added, original);
+        let ids_path = sidecar_path(&source_path).expect("sidecar path");
+        for (source, expected_count) in [(&added, 2), (&original, 1)] {
+            let edit = apply_project_source_edit(directory.path(), &source_path, source)
+                .expect("apply structural source edit");
+            let bytes = fs::read(&ids_path).expect("edited sidecar");
+            let value: serde_json::Value = serde_json::from_slice(&bytes).expect("sidecar JSON");
+            let sidecar: fanta_fnx::FnxSidecar =
+                serde_json::from_slice(&bytes).expect("sidecar identity");
+            assert_eq!(sidecar.ids.len(), expected_count);
+            assert_eq!(
+                bytes,
+                super::super::layout::json_bytes(&value).expect("canonical sidecar"),
+                "code edits must use the same JSON ordering as full project saves"
+            );
+            assert_eq!(
+                fs::read_to_string(&source_path).expect("authored source"),
+                *source
+            );
+            super::super::write::write_project_tree(directory.path(), &edit.document, &edit.assets)
+                .expect("save regenerated document");
+            assert_eq!(fs::read(&ids_path).expect("saved sidecar"), bytes);
+        }
     }
 
     #[test]

@@ -1,21 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use editor::{Editor, EditorEvent, actions::SelectAll};
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp, Doc, Easing,
-    Interpolation, Keyframe, KeyframeId, MotionProperty, MotionTarget, MotionTransform, NodeId,
-    Operation, ResolvedVarValue, Transaction,
+    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, BoundProp,
+    Color as FantaColor, Doc, Easing, Interpolation, Keyframe, KeyframeId, MotionProperty,
+    MotionTarget, MotionTransform, NodeId, Operation, ResolvedVarValue, Transaction,
 };
 use fanta_ui::animation_panel::{AnimationDetailHeader, AnimationProperty, AnimationPropertyRow};
 use fanta_ui::inspector::{InspectorEmptyState, InspectorFieldRow, InspectorSection};
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
-    Subscription, Window,
+    Anchor, AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
+    MouseButton, Render, SharedString, Subscription, Window, anchored, deferred, point, px,
 };
 use ui::prelude::*;
 use ui::{ContextMenu, ContextMenuEntry, DropdownMenu, DropdownStyle, IconPosition, Tooltip};
 use util::ResultExt;
 
+use crate::color_picker::{ColorPicker, ColorPickerEvent};
 use crate::document::{DocChange, FigItem, FigItemEvent};
+use crate::motion_edit::{MotionPropertyEditSession, evaluated_motion_value};
+use crate::properties_ops::{fanta_color_rgba, format_number};
+use crate::timeline::{TimelineEvent, TimelineProperty, TimelineShell};
 
 const DEFAULT_CLIP_DURATION_MS: u32 = 2_000;
 const DEFAULT_ANIMATION_DURATION_MS: u32 = 500;
@@ -109,6 +114,58 @@ impl AnimationSettings {
     }
 }
 
+pub(crate) const TOOLBAR_ANIMATION_STYLE_PRESETS: [(&str, AnimationProperty); 5] = [
+    ("Slide in", AnimationProperty::Position),
+    ("Scale in", AnimationProperty::Scale),
+    ("Rotate in", AnimationProperty::Rotation),
+    ("Grow", AnimationProperty::Size),
+    ("Fade in", AnimationProperty::Opacity),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolbarAnimationStyleError {
+    UnknownStyle,
+    DocumentUnavailable,
+    ReadOnly,
+    NoSelection,
+    MultipleSelection,
+    MissingSelection,
+    MissingActiveClip,
+    AlreadyAnimated,
+    UnsupportedLayer,
+    ApplyFailed(String),
+}
+
+impl ToolbarAnimationStyleError {
+    pub(crate) fn user_message(&self, style: &str) -> String {
+        match self {
+            Self::UnknownStyle => format!("{style} is not an available animation style."),
+            Self::DocumentUnavailable => "The design is not ready for animation yet.".to_string(),
+            Self::ReadOnly => "This design is read-only.".to_string(),
+            Self::NoSelection => format!("Select one layer to apply {style}."),
+            Self::MultipleSelection => format!("Select only one layer to apply {style}."),
+            Self::MissingSelection => {
+                "The selected layer no longer exists in this design.".to_string()
+            }
+            Self::MissingActiveClip => {
+                "The active animation clip no longer exists in this design.".to_string()
+            }
+            Self::AlreadyAnimated => {
+                "This layer already has an animation for that property in the active clip."
+                    .to_string()
+            }
+            Self::UnsupportedLayer => format!("{style} cannot be applied to this layer."),
+            Self::ApplyFailed(error) => format!("Applying {style} failed: {error}"),
+        }
+    }
+}
+
+fn toolbar_animation_property(style: &str) -> Option<AnimationProperty> {
+    TOOLBAR_ANIMATION_STYLE_PRESETS
+        .iter()
+        .find_map(|(label, property)| (*label == style).then_some(*property))
+}
+
 #[derive(Clone)]
 struct AnimationSummary {
     property: AnimationProperty,
@@ -119,6 +176,75 @@ struct AnimationSummary {
 struct MotionClipChoice {
     id: AnimationClipId,
     name: SharedString,
+}
+
+#[derive(Clone)]
+struct MotionPropertySnapshot {
+    property: TimelineProperty,
+    value: Option<ResolvedVarValue>,
+}
+
+struct MotionColorPickerSession {
+    original: FantaColor,
+    changed: bool,
+    picker: Entity<ColorPicker>,
+    _subscription: Subscription,
+}
+
+fn motion_property_id(property: TimelineProperty) -> &'static str {
+    match property {
+        TimelineProperty::PositionX => "position-x",
+        TimelineProperty::PositionY => "position-y",
+        TimelineProperty::Rotation => "rotation",
+        TimelineProperty::ScaleX => "scale-x",
+        TimelineProperty::ScaleY => "scale-y",
+        TimelineProperty::Opacity => "opacity",
+        TimelineProperty::FillColor => "fill-color",
+    }
+}
+
+fn motion_property_suffix(property: TimelineProperty) -> Option<&'static str> {
+    match property {
+        TimelineProperty::Rotation => Some("°"),
+        TimelineProperty::ScaleX | TimelineProperty::ScaleY | TimelineProperty::Opacity => {
+            Some("%")
+        }
+        TimelineProperty::PositionX | TimelineProperty::PositionY | TimelineProperty::FillColor => {
+            None
+        }
+    }
+}
+
+fn motion_numeric_value(property: TimelineProperty, value: &ResolvedVarValue) -> Option<f64> {
+    let ResolvedVarValue::Float { value } = value else {
+        return None;
+    };
+    if !value.is_finite() {
+        return None;
+    }
+    Some(match property {
+        TimelineProperty::PositionX | TimelineProperty::PositionY => *value,
+        TimelineProperty::Rotation => value.to_degrees(),
+        TimelineProperty::ScaleX | TimelineProperty::ScaleY | TimelineProperty::Opacity => {
+            value * 100.0
+        }
+        TimelineProperty::FillColor => return None,
+    })
+}
+
+fn parse_motion_numeric_value(property: TimelineProperty, text: &str) -> Option<ResolvedVarValue> {
+    let value = text.trim().parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let value = match property {
+        TimelineProperty::PositionX | TimelineProperty::PositionY => value,
+        TimelineProperty::Rotation => value.to_radians(),
+        TimelineProperty::ScaleX | TimelineProperty::ScaleY => value / 100.0,
+        TimelineProperty::Opacity => value.clamp(0.0, 100.0) / 100.0,
+        TimelineProperty::FillColor => return None,
+    };
+    Some(ResolvedVarValue::Float { value })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,22 +262,43 @@ enum MotionPanelSnapshot {
         active_clip: Option<AnimationClipId>,
         clips: Vec<MotionClipChoice>,
         animations: Vec<AnimationSummary>,
+        properties: Vec<MotionPropertySnapshot>,
+        auto_keyframe: bool,
+        playing: bool,
         can_add_size: bool,
     },
 }
 
 pub struct FantaMotionPanel {
     item: Entity<FigItem>,
+    timeline: Entity<TimelineShell>,
     focus_handle: FocusHandle,
     active_clip: Option<AnimationClipId>,
+    auto_keyframe: bool,
     selected_property: Option<AnimationProperty>,
+    field_editor: Entity<Editor>,
+    editing_property: Option<TimelineProperty>,
+    property_edit: Option<MotionPropertyEditSession>,
+    suppress_field_editor_events: bool,
+    numeric_field_edited: bool,
+    numeric_initial_text: Option<String>,
+    picker: Option<MotionColorPickerSession>,
+    swatch_press_dismissed: bool,
     _item_subscription: Subscription,
+    _timeline_subscription: Subscription,
+    _field_editor_subscription: Subscription,
 }
 
 impl FantaMotionPanel {
-    pub fn new(item: Entity<FigItem>, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.subscribe(&item, |this, _, event: &FigItemEvent, cx| {
+    pub fn new(
+        item: Entity<FigItem>,
+        timeline: Entity<TimelineShell>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscription = cx.subscribe(&item, |this, item, event: &FigItemEvent, cx| {
             if matches!(event, FigItemEvent::StateChanged) {
+                this.discard_continuous_edits(cx);
                 let selected_still_exists = this
                     .selected_property
                     .is_none_or(|property| this.snapshot(cx).has_property(property));
@@ -159,14 +306,83 @@ impl FantaMotionPanel {
                     this.selected_property = None;
                 }
             }
+            let own_preview = item.read(cx).content_preview_active()
+                && item.read(cx).can_preview_for_owner(cx.entity_id());
+            if matches!(event, FigItemEvent::SelectionChanged | FigItemEvent::Edited)
+                && this.has_continuous_edit()
+                && !own_preview
+            {
+                let panel = cx.weak_entity();
+                cx.defer(move |cx| {
+                    panel
+                        .update(cx, |panel, cx| panel.cancel_continuous_edits(cx))
+                        .log_err();
+                });
+            }
+            if matches!(event, FigItemEvent::EditedTransient) && this.picker.is_some() {
+                return;
+            }
             cx.notify();
         });
+        let timeline_subscription =
+            cx.subscribe(&timeline, |this, _, event: &TimelineEvent, cx| {
+                if matches!(event, TimelineEvent::PlayheadChanged(_)) && this.has_continuous_edit()
+                {
+                    let panel = cx.weak_entity();
+                    cx.defer(move |cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.finish_continuous_edits(cx))
+                            .log_err();
+                    });
+                }
+                if matches!(
+                    event,
+                    TimelineEvent::PlayheadChanged(_) | TimelineEvent::PlaybackChanged(_)
+                ) {
+                    cx.notify();
+                }
+            });
+        let field_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let field_editor_subscription = cx.subscribe_in(
+            &field_editor,
+            window,
+            |this, editor, event: &EditorEvent, _, cx| match event {
+                EditorEvent::BufferEdited
+                    if this.editing_property.is_some() && !this.suppress_field_editor_events =>
+                {
+                    let text = editor.read(cx).text(cx);
+                    this.numeric_field_edited =
+                        this.numeric_initial_text.as_deref() != Some(text.as_ref());
+                    if this.numeric_field_edited {
+                        this.preview_numeric_property(cx);
+                    } else {
+                        this.preview_original_numeric_property(cx);
+                    }
+                }
+                EditorEvent::Blurred if this.editing_property.is_some() => {
+                    this.commit_numeric_property(cx);
+                }
+                _ => {}
+            },
+        );
         Self {
             item,
+            timeline,
             focus_handle: cx.focus_handle(),
             active_clip: None,
+            auto_keyframe: false,
             selected_property: None,
+            field_editor,
+            editing_property: None,
+            property_edit: None,
+            suppress_field_editor_events: false,
+            numeric_field_edited: false,
+            numeric_initial_text: None,
+            picker: None,
+            swatch_press_dismissed: false,
             _item_subscription: subscription,
+            _timeline_subscription: timeline_subscription,
+            _field_editor_subscription: field_editor_subscription,
         }
     }
 
@@ -180,6 +396,14 @@ impl FantaMotionPanel {
         }
         self.active_clip = active_clip;
         self.selected_property = None;
+        cx.notify();
+    }
+
+    pub(crate) fn set_auto_keyframe(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.auto_keyframe == enabled {
+            return;
+        }
+        self.auto_keyframe = enabled;
         cx.notify();
     }
 
@@ -210,8 +434,28 @@ impl FantaMotionPanel {
             .map(|clip| animation_summaries(doc, clip, node))
             .unwrap_or_default();
         let clip_name = clip.map(|clip| clip.name.clone().into());
-        let active_clip = clip.map(|clip| clip.id);
         let clips = clip_choices(doc);
+        let timeline = self.timeline.read(cx);
+        let playing = timeline.is_playing();
+        let playhead_ms = timeline
+            .playhead_us()
+            .max(0)
+            .div_euclid(1_000)
+            .min(i64::from(u32::MAX)) as u32;
+        let active_clip = self
+            .active_clip
+            .filter(|clip| doc.motion.clip(*clip).is_some());
+        let properties = TimelineProperty::ALL
+            .iter()
+            .copied()
+            .map(|property| MotionPropertySnapshot {
+                property,
+                value: active_clip.and_then(|clip| {
+                    evaluated_motion_value(doc, clip, node, property, playhead_ms)
+                        .map(|(_, value)| value)
+                }),
+            })
+            .collect();
         MotionPanelSnapshot::Selection {
             editable: item.is_editable(),
             node,
@@ -224,10 +468,324 @@ impl FantaMotionPanel {
             active_clip,
             clips,
             animations,
+            properties,
+            auto_keyframe: self.auto_keyframe,
+            playing,
             can_add_size: bound_float(canvas_node, BoundProp::ClipWidth)
                 .is_some_and(|width| width > f64::EPSILON)
                 && bound_float(canvas_node, BoundProp::ClipHeight)
                     .is_some_and(|height| height > f64::EPSILON),
+        }
+    }
+
+    fn has_continuous_edit(&self) -> bool {
+        self.property_edit.is_some() || self.editing_property.is_some() || self.picker.is_some()
+    }
+
+    pub(crate) fn finish_continuous_edits(&mut self, cx: &mut Context<Self>) {
+        if self.editing_property.is_some() {
+            self.commit_numeric_property(cx);
+        } else if self.picker.is_some() {
+            self.close_color_picker(true, cx);
+        } else if let Some(session) = self.property_edit.take() {
+            self.finish_property_edit(session, false, cx);
+        }
+    }
+
+    pub(crate) fn cancel_continuous_edits(&mut self, cx: &mut Context<Self>) {
+        self.editing_property = None;
+        self.numeric_field_edited = false;
+        self.numeric_initial_text = None;
+        self.picker = None;
+        self.swatch_press_dismissed = false;
+        if let Some(session) = self.property_edit.take() {
+            self.finish_property_edit(session, false, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn discard_continuous_edits(&mut self, cx: &mut Context<Self>) {
+        self.editing_property = None;
+        self.numeric_field_edited = false;
+        self.numeric_initial_text = None;
+        self.property_edit = None;
+        self.picker = None;
+        self.swatch_press_dismissed = false;
+        cx.notify();
+    }
+
+    fn begin_property_edit(
+        &self,
+        property: TimelineProperty,
+        cx: &mut Context<Self>,
+    ) -> Option<MotionPropertyEditSession> {
+        if !self.auto_keyframe || self.timeline.read(cx).is_playing() {
+            return None;
+        }
+        let clip = self.active_clip?;
+        let playhead_ms = self
+            .timeline
+            .read(cx)
+            .playhead_us()
+            .max(0)
+            .div_euclid(1_000)
+            .min(i64::from(u32::MAX)) as u32;
+        let item = self.item.read(cx);
+        let preview_owner = cx.entity_id();
+        if !item.is_editable()
+            || !item.can_preview_for_owner(preview_owner)
+            || item.content_preview_active()
+        {
+            return None;
+        }
+        let document = item.document()?;
+        let mut selection = document.doc.selection.iter().copied();
+        let node = selection.next()?;
+        if selection.next().is_some() {
+            return None;
+        }
+        MotionPropertyEditSession::begin(&document.doc, clip, node, property, playhead_ms)
+    }
+
+    fn start_numeric_property(
+        &mut self,
+        property: TimelineProperty,
+        value: ResolvedVarValue,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(initial) = motion_numeric_value(property, &value) else {
+            return;
+        };
+        self.finish_continuous_edits(cx);
+        let Some(session) = self.begin_property_edit(property, cx) else {
+            return;
+        };
+        let initial_text = format_number(initial);
+        self.numeric_initial_text = Some(initial_text.clone());
+        self.suppress_field_editor_events = true;
+        self.field_editor.update(cx, |editor, cx| {
+            editor.set_text(initial_text, window, cx);
+            editor.select_all(&SelectAll, window, cx);
+        });
+        self.suppress_field_editor_events = false;
+        self.editing_property = Some(property);
+        self.numeric_field_edited = false;
+        self.property_edit = Some(session);
+        self.field_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn preview_numeric_property(&mut self, cx: &mut Context<Self>) {
+        if self.suppress_field_editor_events {
+            return;
+        }
+        let Some(property) = self.editing_property else {
+            return;
+        };
+        let text = self.field_editor.read(cx).text(cx);
+        let Some(value) = parse_motion_numeric_value(property, text.trim()) else {
+            return;
+        };
+        self.preview_property_value(value, cx);
+    }
+
+    fn preview_property_value(&mut self, value: ResolvedVarValue, cx: &mut Context<Self>) {
+        let Some(session) = self.property_edit.as_mut() else {
+            return;
+        };
+        let preview_owner = cx.entity_id();
+        let item = self.item.clone();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let change = if session.preview(&mut document.doc, value) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+        });
+    }
+
+    fn preview_original_numeric_property(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.property_edit.as_mut() else {
+            return;
+        };
+        let preview_owner = cx.entity_id();
+        let item = self.item.clone();
+        item.update(cx, |item, cx| {
+            item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let change = if session.preview_original(&mut document.doc) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+        });
+    }
+
+    fn commit_numeric_property(&mut self, cx: &mut Context<Self>) {
+        let Some(property) = self.editing_property.take() else {
+            return;
+        };
+        let edited = std::mem::take(&mut self.numeric_field_edited);
+        self.numeric_initial_text = None;
+        let text = self.field_editor.read(cx).text(cx);
+        let value = edited
+            .then(|| parse_motion_numeric_value(property, text.trim()))
+            .flatten();
+        if let Some(value) = value.clone() {
+            self.preview_property_value(value, cx);
+        }
+        if let Some(session) = self.property_edit.take() {
+            self.finish_property_edit(session, value.is_some(), cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_numeric_property(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_property = None;
+        self.numeric_field_edited = false;
+        self.numeric_initial_text = None;
+        if let Some(session) = self.property_edit.take() {
+            self.finish_property_edit(session, false, cx);
+        }
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn finish_property_edit(
+        &self,
+        session: MotionPropertyEditSession,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let preview_owner = cx.entity_id();
+        self.item.update(cx, |item, cx| {
+            let restored = item.with_document_for_preview_owner(preview_owner, cx, |document| {
+                let change = if session.restore(&mut document.doc) {
+                    DocChange::ContentPreview
+                } else {
+                    DocChange::None
+                };
+                ((), change)
+            });
+            if restored.is_none() {
+                item.finish_content_preview(preview_owner, false, cx);
+                return;
+            }
+            let operation = if commit { session.operation() } else { None };
+            let Some(operation) = operation else {
+                item.finish_content_preview(preview_owner, false, cx);
+                return;
+            };
+            if let Err(error) = item.apply_for_preview_owner(preview_owner, operation, cx) {
+                item.finish_content_preview(preview_owner, false, cx);
+                log::error!("committing an Auto key property failed: {error:#}");
+            }
+        });
+    }
+
+    fn toggle_fill_color_picker(
+        &mut self,
+        color: FantaColor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.picker.is_some() {
+            self.close_color_picker(true, cx);
+            return;
+        }
+        self.finish_continuous_edits(cx);
+        let Some(session) = self.begin_property_edit(TimelineProperty::FillColor, cx) else {
+            return;
+        };
+        let picker = cx.new(|cx| ColorPicker::new(color, window, cx));
+        let subscription =
+            cx.subscribe(
+                &picker,
+                |this, picker, event: &ColorPickerEvent, cx| match event {
+                    ColorPickerEvent::Changed(color) => this.preview_picker_color(*color, cx),
+                    ColorPickerEvent::Commit => this.defer_close_color_picker(picker, true, cx),
+                    ColorPickerEvent::Cancel => this.defer_close_color_picker(picker, false, cx),
+                },
+            );
+        picker.read(cx).focus_handle(cx).focus(window, cx);
+        self.property_edit = Some(session);
+        self.picker = Some(MotionColorPickerSession {
+            original: color,
+            changed: false,
+            picker,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn preview_picker_color(&mut self, color: FantaColor, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        picker.changed = true;
+        self.preview_property_value(ResolvedVarValue::Color { value: color }, cx);
+    }
+
+    fn defer_close_color_picker(
+        &self,
+        closing_picker: Entity<ColorPicker>,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            panel
+                .update(cx, |panel, cx| {
+                    if panel.picker.as_ref().is_some_and(|session| {
+                        session.picker.entity_id() == closing_picker.entity_id()
+                    }) {
+                        panel.close_color_picker(commit, cx);
+                    }
+                })
+                .log_err();
+        });
+    }
+
+    fn close_color_picker(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(picker) = self.picker.take() else {
+            return;
+        };
+        let final_color = picker.picker.read(cx).color();
+        if picker.changed {
+            self.preview_property_value(ResolvedVarValue::Color { value: final_color }, cx);
+        }
+        if let Some(session) = self.property_edit.take() {
+            self.finish_property_edit(session, commit && final_color != picker.original, cx);
+        }
+        self.swatch_press_dismissed = false;
+        cx.notify();
+    }
+
+    fn handle_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing_property.is_none() {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                cx.stop_propagation();
+                self.commit_numeric_property(cx);
+                self.focus_handle.focus(window, cx);
+            }
+            "escape" => {
+                cx.stop_propagation();
+                self.cancel_numeric_property(window, cx);
+            }
+            _ => {}
         }
     }
 
@@ -250,6 +808,48 @@ impl FantaMotionPanel {
             self.selected_property = Some(property);
             cx.notify();
         }
+    }
+
+    pub(crate) fn apply_toolbar_animation_style(
+        &mut self,
+        active_clip: Option<AnimationClipId>,
+        style: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<AnimationProperty, ToolbarAnimationStyleError> {
+        self.finish_continuous_edits(cx);
+        let (property, mut transaction) = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document() else {
+                return Err(ToolbarAnimationStyleError::DocumentUnavailable);
+            };
+            toolbar_animation_style_transaction(
+                &document.doc,
+                item.is_editable(),
+                active_clip,
+                style,
+            )?
+        };
+        transaction.label = "Add Animation".to_string();
+        let applied = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                match document.doc.apply_transaction(transaction) {
+                    Ok(()) => (Ok(()), DocChange::Content),
+                    Err(error) => {
+                        let error = error.to_string();
+                        log::error!("applying toolbar animation style failed: {error}");
+                        (
+                            Err(ToolbarAnimationStyleError::ApplyFailed(error)),
+                            DocChange::None,
+                        )
+                    }
+                }
+            })
+            .unwrap_or(Err(ToolbarAnimationStyleError::DocumentUnavailable))
+        });
+        applied?;
+        self.selected_property = Some(property);
+        cx.notify();
+        Ok(property)
     }
 
     fn remove_animation(
@@ -291,6 +891,7 @@ impl FantaMotionPanel {
         build: impl FnOnce(&Doc) -> Option<Transaction>,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.finish_continuous_edits(cx);
         let transaction = {
             let item = self.item.read(cx);
             if !item.is_editable() {
@@ -367,6 +968,175 @@ impl FantaMotionPanel {
             .border_color(gpui::transparent_black())
             .child(Label::new(label).size(LabelSize::Small))
             .into_any_element()
+    }
+
+    fn render_numeric_property(
+        &self,
+        property: TimelineProperty,
+        value: Option<ResolvedVarValue>,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let numeric = value
+            .as_ref()
+            .and_then(|value| motion_numeric_value(property, value));
+        let editing = self.editing_property == Some(property);
+        let colors = cx.theme().colors().clone();
+        let cell = h_flex()
+            .id(format!(
+                "fanta-motion-property-{}",
+                motion_property_id(property)
+            ))
+            .h_7()
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .gap_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(if editing {
+                colors.border_focused
+            } else {
+                colors.border_variant
+            })
+            .bg(colors.editor_background);
+        #[cfg(test)]
+        let cell = cell.debug_selector({
+            let property = motion_property_id(property);
+            move || format!("fanta-motion-property-{property}")
+        });
+        let mut cell = if editing {
+            cell.child(div().flex_1().min_w_0().child(self.field_editor.clone()))
+        } else {
+            let display: SharedString = numeric
+                .map(format_number)
+                .unwrap_or_else(|| "Unavailable".to_string())
+                .into();
+            cell.child(
+                div().flex_1().min_w_0().overflow_hidden().child(
+                    Label::new(display)
+                        .size(LabelSize::Small)
+                        .color(if editable && numeric.is_some() {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
+                        .single_line(),
+                ),
+            )
+        };
+        if !editing && let Some(suffix) = motion_property_suffix(property) {
+            cell = cell.child(
+                Label::new(suffix)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            );
+        }
+        if editable && let (Some(value), Some(_)) = (value, numeric) {
+            cell = cell
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_numeric_property(property, value.clone(), window, cx);
+                }));
+        }
+        cell.into_any_element()
+    }
+
+    fn render_fill_property(
+        &self,
+        value: Option<ResolvedVarValue>,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let color = match value {
+            Some(ResolvedVarValue::Color { value }) => Some(value),
+            _ => None,
+        };
+        let colors = cx.theme().colors().clone();
+        let mut swatch = div()
+            .id("fanta-motion-property-fill-swatch")
+            .relative()
+            .size(px(18.))
+            .flex_none()
+            .rounded_sm()
+            .border_1()
+            .border_color(colors.border);
+        swatch = if let Some(color) = color {
+            swatch.bg(fanta_color_rgba(color))
+        } else {
+            swatch.bg(colors.element_background)
+        };
+        if editable && let Some(color) = color {
+            swatch = swatch
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.swatch_press_dismissed = this.picker.is_some();
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if std::mem::take(&mut this.swatch_press_dismissed) {
+                        return;
+                    }
+                    this.toggle_fill_color_picker(color, window, cx);
+                }));
+        }
+        if let Some(session) = &self.picker {
+            swatch = swatch.child(
+                div().absolute().left_0().bottom_0().size_0().child(
+                    deferred(
+                        anchored()
+                            .anchor(Anchor::TopLeft)
+                            .snap_to_window_with_margin(px(8.))
+                            .offset(point(px(0.), px(4.)))
+                            .child(session.picker.clone()),
+                    )
+                    .with_priority(1),
+                ),
+            );
+        }
+        h_flex()
+            .id("fanta-motion-property-fill-color")
+            .h_7()
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .gap_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .child(swatch)
+            .child(
+                Label::new(
+                    color
+                        .map(FantaColor::to_hex)
+                        .unwrap_or_else(|| "Unavailable".to_string()),
+                )
+                .size(LabelSize::Small)
+                .color(if editable && color.is_some() {
+                    Color::Default
+                } else {
+                    Color::Muted
+                })
+                .single_line(),
+            )
+            .into_any_element()
+    }
+
+    fn render_motion_property(
+        &self,
+        snapshot: MotionPropertySnapshot,
+        editable: bool,
+        cx: &mut Context<Self>,
+    ) -> InspectorFieldRow {
+        let value = if snapshot.property == TimelineProperty::FillColor {
+            self.render_fill_property(snapshot.value, editable, cx)
+        } else {
+            self.render_numeric_property(snapshot.property, snapshot.value, editable, cx)
+        };
+        InspectorFieldRow::new(snapshot.property.label(), value)
     }
 
     fn render_detail(
@@ -595,7 +1365,9 @@ impl MotionPanelSnapshot {
 impl Render for FantaMotionPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root = v_flex()
+            .key_context("FantaMotionPanel")
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .bg(cx.theme().colors().panel_background);
         #[cfg(test)]
@@ -612,6 +1384,9 @@ impl Render for FantaMotionPanel {
                 active_clip,
                 clips,
                 animations,
+                properties,
+                auto_keyframe,
+                playing,
                 can_add_size,
             } => {
                 if self.selected_property.is_some_and(|property| {
@@ -693,6 +1468,24 @@ impl Render for FantaMotionPanel {
                 if let Some(add_button) = add_button {
                     animation_section = animation_section.action(add_button);
                 }
+                let property_editable =
+                    editable && auto_keyframe && !playing && active_clip.is_some();
+                let property_section =
+                    InspectorSection::new("fanta-motion-playhead-properties", "At playhead")
+                        .children(properties.into_iter().map(|property| {
+                            self.render_motion_property(property, property_editable, cx)
+                        }));
+                let property_hint = if active_clip.is_none() {
+                    "Create or select an animation clip to edit properties."
+                } else if playing {
+                    "Pause playback to edit properties at the playhead."
+                } else if !auto_keyframe {
+                    "Turn on Auto key to edit properties at the playhead."
+                } else if !editable {
+                    "This animation is read-only."
+                } else {
+                    "Edits preview live and commit as one keyframe change."
+                };
                 let clip_control = if clips.len() > 1 {
                     let panel = cx.weak_entity();
                     let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
@@ -739,6 +1532,14 @@ impl Render for FantaMotionPanel {
                             .gap_1()
                             .child(Label::new(node_name).single_line())
                             .child(clip_control),
+                    )
+                    .child(property_section)
+                    .child(
+                        div().px_3().pb_2().child(
+                            Label::new(property_hint)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
                     )
                     .child(animation_section);
                 if animations.is_empty() {
@@ -1051,6 +1852,49 @@ fn percentage_amount(value: f64) -> Option<f64> {
     (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value / 100.0)
 }
 
+fn toolbar_animation_style_transaction(
+    doc: &Doc,
+    editable: bool,
+    active_clip: Option<AnimationClipId>,
+    style: &str,
+) -> Result<(AnimationProperty, Transaction), ToolbarAnimationStyleError> {
+    let property =
+        toolbar_animation_property(style).ok_or(ToolbarAnimationStyleError::UnknownStyle)?;
+    if !editable {
+        return Err(ToolbarAnimationStyleError::ReadOnly);
+    }
+    let mut selection = doc.selection.iter().copied();
+    let node = selection
+        .next()
+        .ok_or(ToolbarAnimationStyleError::NoSelection)?;
+    if selection.next().is_some() {
+        return Err(ToolbarAnimationStyleError::MultipleSelection);
+    }
+    if doc.scene.get(node).is_none() {
+        return Err(ToolbarAnimationStyleError::MissingSelection);
+    }
+    if active_clip.is_some_and(|clip| doc.motion.clip(clip).is_none()) {
+        return Err(ToolbarAnimationStyleError::MissingActiveClip);
+    }
+    if resolved_clip(doc, active_clip).is_some_and(|clip| {
+        clip.tracks.values().any(|track| {
+            track.target.node == node
+                && property_for_target(track.target.property) == Some(property)
+        })
+    }) {
+        return Err(ToolbarAnimationStyleError::AlreadyAnimated);
+    }
+    let transaction = build_animation_transaction(
+        doc,
+        active_clip,
+        node,
+        property,
+        AnimationSettings::for_property(property),
+    )
+    .ok_or(ToolbarAnimationStyleError::UnsupportedLayer)?;
+    Ok((property, transaction))
+}
+
 fn build_animation_transaction(
     doc: &Doc,
     active_clip: Option<AnimationClipId>,
@@ -1292,6 +2136,231 @@ mod tests {
         })
         .expect("create animation clip");
         id
+    }
+
+    #[test]
+    fn motion_numeric_values_use_editor_units_and_reject_invalid_input() {
+        let float = |value: Option<ResolvedVarValue>| match value {
+            Some(ResolvedVarValue::Float { value }) => value,
+            value => panic!("expected a float value, got {value:?}"),
+        };
+
+        assert_eq!(
+            motion_numeric_value(
+                TimelineProperty::PositionX,
+                &ResolvedVarValue::Float { value: -12.5 }
+            ),
+            Some(-12.5)
+        );
+        assert!(
+            (motion_numeric_value(
+                TimelineProperty::Rotation,
+                &ResolvedVarValue::Float {
+                    value: std::f64::consts::PI,
+                },
+            )
+            .expect("rotation display")
+                - 180.0)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            motion_numeric_value(
+                TimelineProperty::ScaleX,
+                &ResolvedVarValue::Float { value: 1.25 }
+            ),
+            Some(125.0)
+        );
+        assert_eq!(
+            motion_numeric_value(
+                TimelineProperty::Opacity,
+                &ResolvedVarValue::Float { value: 0.42 }
+            ),
+            Some(42.0)
+        );
+
+        assert!(
+            (float(parse_motion_numeric_value(
+                TimelineProperty::Rotation,
+                "180"
+            )) - std::f64::consts::PI)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(
+            float(parse_motion_numeric_value(TimelineProperty::ScaleY, "-50")),
+            -0.5
+        );
+        assert_eq!(
+            float(parse_motion_numeric_value(TimelineProperty::Opacity, "-1")),
+            0.0
+        );
+        assert_eq!(
+            float(parse_motion_numeric_value(TimelineProperty::Opacity, "125")),
+            1.0
+        );
+        assert!(parse_motion_numeric_value(TimelineProperty::FillColor, "10").is_none());
+        assert!(parse_motion_numeric_value(TimelineProperty::PositionY, "NaN").is_none());
+        assert!(parse_motion_numeric_value(TimelineProperty::PositionY, "nope").is_none());
+        assert!(
+            motion_numeric_value(
+                TimelineProperty::PositionY,
+                &ResolvedVarValue::Float {
+                    value: f64::INFINITY
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn toolbar_animation_style_validation_has_explicit_outcomes() {
+        let (mut doc, node) = document_with_selected_node();
+
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Bounce"),
+            Err(ToolbarAnimationStyleError::UnknownStyle)
+        ));
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, false, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::ReadOnly)
+        ));
+
+        doc.selection.clear();
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::NoSelection)
+        ));
+
+        doc.selection.select_only(node);
+        doc.selection.add(NodeId::new());
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::MultipleSelection)
+        ));
+
+        doc.selection.select_only(NodeId::new());
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Fade in"),
+            Err(ToolbarAnimationStyleError::MissingSelection)
+        ));
+
+        doc.selection.select_only(node);
+        let before = doc.motion.clone();
+        assert!(matches!(
+            toolbar_animation_style_transaction(
+                &doc,
+                true,
+                Some(AnimationClipId::new()),
+                "Fade in"
+            ),
+            Err(ToolbarAnimationStyleError::MissingActiveClip)
+        ));
+        assert_eq!(doc.motion, before);
+
+        doc.scene
+            .get_mut(node)
+            .expect("selected group")
+            .data
+            .as_group_mut()
+            .expect("group data")
+            .clip_size = Some([0.0, 40.0]);
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, None, "Grow"),
+            Err(ToolbarAnimationStyleError::UnsupportedLayer)
+        ));
+        assert_eq!(
+            ToolbarAnimationStyleError::ReadOnly.user_message("Fade in"),
+            "This design is read-only."
+        );
+    }
+
+    #[test]
+    fn toolbar_animation_style_targets_only_the_active_clip() {
+        let (mut doc, node) = document_with_selected_node();
+        let first = create_clip(&mut doc, "First");
+        let second = create_clip(&mut doc, "Second");
+        let first_before = doc.motion.clips[&first].clone();
+        doc.history = Default::default();
+
+        let (_, transaction) =
+            toolbar_animation_style_transaction(&doc, true, Some(second), "Fade in")
+                .expect("Fade in should build for the active clip");
+        doc.apply_transaction(transaction)
+            .expect("apply toolbar animation style");
+
+        assert_eq!(doc.motion.clips[&first], first_before);
+        let target = MotionTarget::new(node, MotionProperty::bound(BoundProp::Opacity));
+        assert!(doc.motion.clips[&second].track_for_target(target).is_some());
+        assert_eq!(doc.history.undo_depth(), 1);
+    }
+
+    #[test]
+    fn toolbar_animation_style_preserves_existing_custom_animation() {
+        let (mut doc, node) = document_with_selected_node();
+        let transaction = build_animation_transaction(
+            &doc,
+            None,
+            node,
+            AnimationProperty::Position,
+            AnimationSettings::default(),
+        )
+        .expect("position animation");
+        doc.apply_transaction(transaction)
+            .expect("apply position animation");
+        let clip_id = first_clip(&doc).expect("created clip").id;
+        let target = MotionTarget::new(node, MotionProperty::PositionX);
+        let track_id = doc.motion.clips[&clip_id]
+            .track_for_target(target)
+            .expect("position track")
+            .id;
+        let custom_id = KeyframeId::new();
+        doc.motion
+            .clips
+            .get_mut(&clip_id)
+            .and_then(|clip| clip.tracks.get_mut(&track_id))
+            .expect("position track remains")
+            .keyframes
+            .insert(
+                custom_id,
+                Keyframe::new(custom_id, 250, ResolvedVarValue::Float { value: 200.0 }),
+            );
+        let custom_position = doc.motion.clips[&clip_id]
+            .track_for_target(target)
+            .expect("custom position track")
+            .clone();
+        doc.history = Default::default();
+
+        let (_, fade_transaction) =
+            toolbar_animation_style_transaction(&doc, true, Some(clip_id), "Fade in")
+                .expect("a different property preset should remain available");
+        doc.apply_transaction(fade_transaction)
+            .expect("apply Fade in alongside custom position");
+        assert_eq!(
+            doc.motion.clips[&clip_id]
+                .track_for_target(target)
+                .expect("custom position track remains"),
+            &custom_position
+        );
+        assert!(
+            doc.motion.clips[&clip_id]
+                .track_for_target(MotionTarget::new(
+                    node,
+                    MotionProperty::bound(BoundProp::Opacity),
+                ))
+                .is_some()
+        );
+        assert_eq!(doc.history.undo_depth(), 1);
+
+        let before = doc.motion.clone();
+        doc.history = Default::default();
+
+        assert!(matches!(
+            toolbar_animation_style_transaction(&doc, true, Some(clip_id), "Slide in"),
+            Err(ToolbarAnimationStyleError::AlreadyAnimated)
+        ));
+        assert_eq!(doc.motion, before);
+        assert_eq!(doc.history.undo_depth(), 0);
     }
 
     fn assert_preset_round_trip(

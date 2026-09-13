@@ -4,7 +4,7 @@ use gpui::{
     Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _,
+    ActiveTheme as _, h_flex,
     input::{InputEvent, InputState},
     v_flex,
 };
@@ -30,24 +30,27 @@ mod state;
 
 const TOOL_SIZE: f32 = 32.;
 const POPOVER_GAP: f32 = 8.;
+/// Width of the explicit AI action in the compact primary row. Keeping this
+/// fixed also gives the anchored composer a stable right edge.
+const AGENT_LAUNCHER_WIDTH: f32 = 72.;
 /// Square size of one host chrome control in the utility row's trailing
 /// capsule; the capsule adds `px_1` around them and 2 px between them.
 const CHROME_CONTROL_SIZE: f32 = 28.;
 
 /// Utility-row width the full row needs, excluding any host chrome capsule:
 /// the three-tile mode tray, the − / + steppers, the percent trigger, and
-/// the Agent launcher with their dividers, gaps, and row padding. Below it
-/// the zoom cluster sheds its steppers (50 px) so the dock reflows before
-/// its bottom row has to scroll. The dock is intrinsic, so an unconstrained
-/// host always meets this; only a host narrower than the dock's natural
-/// width triggers the reflow.
-pub const TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH: f32 = 281.;
+/// the explicit AI action with their dividers, gaps, and row padding. Below
+/// it the zoom cluster sheds its steppers (50 px) so the dock reflows before
+/// its utility segment has to scroll. The dock is intrinsic, so an
+/// unconstrained host always meets this; only a host narrower than the dock's
+/// natural width triggers the reflow.
+pub const TOOLBAR_ZOOM_STEPPERS_MIN_WIDTH: f32 = 317.;
 /// Utility-row width the percent-only row needs, excluding any host chrome
 /// capsule. Below it the zoom cluster collapses entirely, leaving the mode
-/// tray and Agent launcher (156 px). Zoom stays reachable through the
+/// tray and explicit AI action (192 px). Zoom stays reachable through the
 /// Actions palette, the shift-zoom shortcuts, and the host; below this the
 /// row's overflow scroll is the last resort.
-pub const TOOLBAR_ZOOM_CLUSTER_MIN_WIDTH: f32 = 231.;
+pub const TOOLBAR_ZOOM_CLUSTER_MIN_WIDTH: f32 = 267.;
 
 /// How much of the zoom cluster the utility row presents, derived from the
 /// measured dock width so narrow hosts reflow instead of overflowing.
@@ -165,7 +168,7 @@ pub struct EditorToolbar {
     dev_options: DevToolbarOptions,
     motion_options: MotionToolbarOptions,
     agent_options: AgentToolbarOptions,
-    /// Host chrome rendered in the utility row's trailing capsule (§12: the
+    /// Host chrome rendered in the utility segment's trailing capsule (§12: the
     /// host owns chrome, the toolbar owns the dock).
     chrome_controls: Vec<ToolbarChromeControl>,
     commands: Vec<ToolbarCommand>,
@@ -177,7 +180,7 @@ pub struct EditorToolbar {
     ai_input: Entity<InputState>,
     menu_cursor: usize,
     menu_scroll_handle: ScrollHandle,
-    /// Measured inner width of the dock's utility row; the zoom cluster
+    /// Measured inner width of the dock's utility segment; the zoom cluster
     /// derives its collapse tier from it so the dock reflows on narrow
     /// hosts instead of overflowing.
     utility_width: Option<f32>,
@@ -437,15 +440,25 @@ impl Render for EditorToolbar {
                     .max_w_full()
                     .p_1()
                     .gap_1()
-                    .rounded(px(16.))
+                    .rounded(px(12.))
                     .border_1()
                     .border_color(cx.theme().border)
                     .bg(cx.theme().popover)
                     .text_color(cx.theme().popover_foreground)
-                    .when(cx.theme().shadow, |surface| surface.shadow_lg())
-                    .child(self.render_secondary_toolbar(window, cx))
-                    .child(self.render_main_toolbar(window, cx))
-                    .child(self.render_utility_toolbar(window, cx)),
+                    .when(cx.theme().shadow, |surface| surface.shadow_sm())
+                    .when(self.mode != ToolbarMode::Design, |surface| {
+                        surface.child(self.render_secondary_toolbar(window, cx))
+                    })
+                    .child(
+                        h_flex()
+                            .debug_selector(|| "toolbar-primary-dock-row".to_owned())
+                            .h(px(40.))
+                            .max_w_full()
+                            .min_w(px(0.))
+                            .child(self.render_main_toolbar(window, cx))
+                            .child(div().w(px(1.)).h(px(24.)).flex_none().bg(cx.theme().border))
+                            .child(self.render_utility_toolbar(window, cx)),
+                    ),
             )
     }
 }

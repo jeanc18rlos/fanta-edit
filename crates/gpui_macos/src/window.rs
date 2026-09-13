@@ -1421,7 +1421,7 @@ impl PlatformWindow for MacWindow {
                         let _: () = msg_send![
                             alert,
                             beginSheetModalForWindow: native_window
-                            completionHandler: block
+                            completionHandler: &*block
                         ];
                     } else {
                         let _: () = msg_send![alert, release];

@@ -93,6 +93,7 @@ mod layer_cache;
 mod media;
 mod renderer;
 mod text;
+mod text_path;
 mod vector;
 mod walk;
 
@@ -109,6 +110,13 @@ pub use renderer::{
 pub use text::{
     text_caret_rect, text_first_baseline, text_hit_test, text_line_height, text_node_outline,
     text_selection_rects,
+};
+pub use text_path::{
+    TextPathAffinity, TextPathCaretSegment, TextPathPosition, TextPathSelectionQuad,
+    TextPathVisualDirection, text_path_caret_segment, text_path_caret_segment_at,
+    text_path_contains_point, text_path_hit_test, text_path_hit_test_position,
+    text_path_selection_quads, text_path_visual_bounds, text_path_visual_line_edge,
+    text_path_visual_neighbor, text_path_visual_selection_edge,
 };
 pub use vector::vector_outline_sk_path; // track svg-prod
 
@@ -130,6 +138,7 @@ pub(crate) use renderer::{
     BooleanCache, CachedVectorPaths, InstanceCache, InstanceCacheKey, PathCache,
 };
 pub(crate) use text::{draw_text_node, with_shaped_layout};
+pub(crate) use text_path::{draw_text_path_node, text_path_bounds, text_path_outline};
 pub(crate) use vector::{
     bounds_to_f32, draw_placeholder, draw_unresolved_outline, draw_vector, path_is_rect,
     rounded_rect_path, stroke_box_path,

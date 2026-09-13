@@ -135,6 +135,37 @@ pub enum TimelineProperty {
     FillColor,
 }
 
+impl TimelineProperty {
+    pub const ALL: &'static [Self] = &[
+        Self::PositionX,
+        Self::PositionY,
+        Self::Rotation,
+        Self::ScaleX,
+        Self::ScaleY,
+        Self::Opacity,
+        Self::FillColor,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PositionX => "Position X",
+            Self::PositionY => "Position Y",
+            Self::Rotation => "Rotation",
+            Self::ScaleX => "Scale X",
+            Self::ScaleY => "Scale Y",
+            Self::Opacity => "Opacity",
+            Self::FillColor => "Fill color",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|property| property.label() == label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TimelineKeyframeDrag {
     keyframe: TimelineKeyframeSelection,
@@ -250,6 +281,14 @@ impl TimelineShell {
 
     pub fn playhead_us(&self) -> i64 {
         self.playhead_us
+    }
+
+    /// Navigate to an authored moment without leaving playback running past
+    /// the comment the user explicitly opened. The existing setter owns the
+    /// clip-boundary clamp and emits the normal playhead event.
+    pub(crate) fn seek_to(&mut self, playhead_us: i64, cx: &mut Context<Self>) {
+        self.pause(cx);
+        self.set_playhead(playhead_us, cx);
     }
 
     pub fn selected_keyframe(&self) -> Option<&TimelineKeyframeSelection> {
@@ -1694,15 +1733,8 @@ impl TimelineShell {
 
         let timeline = cx.weak_entity();
         let keyframe_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            for (property, label) in [
-                (TimelineProperty::PositionX, "Position X"),
-                (TimelineProperty::PositionY, "Position Y"),
-                (TimelineProperty::Rotation, "Rotation"),
-                (TimelineProperty::ScaleX, "Scale X"),
-                (TimelineProperty::ScaleY, "Scale Y"),
-                (TimelineProperty::Opacity, "Opacity"),
-                (TimelineProperty::FillColor, "Fill color"),
-            ] {
+            for property in TimelineProperty::ALL.iter().copied() {
+                let label = property.label();
                 let timeline = timeline.clone();
                 menu.push_item(ContextMenuEntry::new(label).handler(move |_, cx| {
                     timeline
@@ -2242,6 +2274,18 @@ mod tests {
         assert_eq!(playhead_for_x(-20.0, 0.0, 100.0, 4_000_000), 0);
         assert_eq!(playhead_for_x(120.0, 0.0, 100.0, 4_000_000), 4_000_000);
         assert_eq!(playhead_for_x(50.0, 0.0, 0.0, 4_000_000), 0);
+    }
+
+    #[test]
+    fn timeline_property_labels_round_trip() {
+        assert_eq!(TimelineProperty::ALL.len(), 7);
+        for property in TimelineProperty::ALL {
+            assert_eq!(
+                TimelineProperty::from_label(property.label()),
+                Some(*property)
+            );
+        }
+        assert_eq!(TimelineProperty::from_label("Width"), None);
     }
 
     #[test]
@@ -2872,6 +2916,26 @@ mod tests {
             assert!(!timeline.playing);
             assert_eq!(timeline.view_model().duration_us, 1);
             assert!(timeline.playback_task.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn controlled_seek_pauses_and_clamps_to_the_active_clip(cx: &mut TestAppContext) {
+        let timeline = cx.new(|_| TimelineShell::new());
+        timeline.update(cx, |timeline, cx| {
+            timeline.set_model(
+                TimelineViewModel::for_clip("Entrance", 1_500_000, Vec::new()),
+                cx,
+            );
+            timeline.toggle_playback(cx);
+            assert!(timeline.is_playing());
+
+            timeline.seek_to(875_000, cx);
+            assert!(!timeline.is_playing());
+            assert_eq!(timeline.playhead_us(), 875_000);
+
+            timeline.seek_to(9_000_000, cx);
+            assert_eq!(timeline.playhead_us(), 1_500_000);
         });
     }
 }

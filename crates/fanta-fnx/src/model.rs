@@ -68,6 +68,7 @@ const TYPE_TAGS: &[(&str, &str)] = &[
     ("group", "Frame"),
     ("vector", "Vector"),
     ("text", "Text"),
+    ("text_path", "TextPath"),
     ("bitmap", "Image"),
     ("video", "Video"),
     ("audio", "Audio"),

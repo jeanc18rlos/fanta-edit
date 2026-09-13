@@ -2,7 +2,7 @@
 //! maps its typed intents onto the existing page operations, and owns the
 //! host-side search index (the engine has no page-search concept — G20).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 use fanta_doc::{NodeData, NodeId};
 use fanta_gpui::pages::{
@@ -95,7 +95,7 @@ pub(crate) fn element_kind(
     component_roots: &std::collections::HashSet<NodeId>,
 ) -> PagesPanelElementKind {
     match data {
-        NodeData::Text(_) => PagesPanelElementKind::Text,
+        NodeData::Text(_) | NodeData::TextPath(_) => PagesPanelElementKind::Text,
         NodeData::Instance(_) => PagesPanelElementKind::Instance,
         NodeData::Group(_) if component_roots.contains(&id) => PagesPanelElementKind::Component,
         NodeData::Group(_) => PagesPanelElementKind::FrameGroup,
@@ -110,40 +110,85 @@ pub(crate) fn element_kind(
 }
 
 fn matches_query(haystack: &str, query: &str, match_case: bool, whole_words: bool) -> bool {
+    !matching_ranges(haystack, query, match_case, whole_words).is_empty()
+}
+
+/// Non-overlapping UTF-8 byte ranges matched by the Pages panel's text search.
+/// Case-insensitive matching tracks folded characters back to their source
+/// spans because Unicode lowercase mappings can change byte length.
+pub(crate) fn matching_ranges(
+    text: &str,
+    query: &str,
+    match_case: bool,
+    whole_words: bool,
+) -> Vec<Range<usize>> {
     if query.is_empty() {
-        return false;
+        return Vec::new();
     }
-    let (haystack_cmp, query_cmp);
-    let (haystack_ref, query_ref) = if match_case {
-        (haystack, query)
+    let ranges = if match_case {
+        text.match_indices(query)
+            .map(|(start, matched)| start..start + matched.len())
+            .collect()
     } else {
-        haystack_cmp = haystack.to_lowercase();
-        query_cmp = query.to_lowercase();
-        (haystack_cmp.as_str(), query_cmp.as_str())
+        let folded_query = query.to_lowercase();
+        if folded_query.is_empty() {
+            return Vec::new();
+        }
+        let folded_text = text.to_lowercase();
+        let mut folded_to_source = Vec::with_capacity(text.chars().count());
+        let mut folded_offset = 0;
+        for (source_start, character) in text.char_indices() {
+            let folded_start = folded_offset;
+            folded_offset += character.to_lowercase().map(char::len_utf8).sum::<usize>();
+            folded_to_source.push((
+                folded_start..folded_offset,
+                source_start..source_start + character.len_utf8(),
+            ));
+        }
+
+        let mut ranges = Vec::new();
+        let mut folded_cursor = 0;
+        let mut source_cursor = 0;
+        while let Some(relative_start) = folded_text[folded_cursor..].find(&folded_query) {
+            let folded_start = folded_cursor + relative_start;
+            let folded_end = folded_start + folded_query.len();
+            let source_start = folded_to_source
+                .iter()
+                .find(|(folded, _)| folded.start <= folded_start && folded_start < folded.end)
+                .map(|(_, source)| source.start);
+            let source_end = folded_to_source
+                .iter()
+                .find(|(folded, _)| folded.start < folded_end && folded_end <= folded.end)
+                .map(|(_, source)| source.end);
+            if let (Some(source_start), Some(source_end)) = (source_start, source_end)
+                && source_start >= source_cursor
+            {
+                ranges.push(source_start..source_end);
+                source_cursor = source_end;
+            }
+            folded_cursor = folded_end;
+        }
+        ranges
     };
     if !whole_words {
-        return haystack_ref.contains(query_ref);
+        return ranges;
     }
-    let mut start = 0;
-    while let Some(pos) = haystack_ref[start..].find(query_ref) {
-        let begin = start + pos;
-        let end = begin + query_ref.len();
-        let boundary_before = begin == 0
-            || !haystack_ref[..begin]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_alphanumeric);
-        let boundary_after = end == haystack_ref.len()
-            || !haystack_ref[end..]
-                .chars()
-                .next()
-                .is_some_and(char::is_alphanumeric);
-        if boundary_before && boundary_after {
-            return true;
-        }
-        start = end;
-    }
-    false
+    ranges
+        .into_iter()
+        .filter(|range| {
+            let boundary_before = range.start == 0
+                || !text[..range.start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric);
+            let boundary_after = range.end == text.len()
+                || !text[range.end..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric);
+            boundary_before && boundary_after
+        })
+        .collect()
 }
 
 /// Replace every match of `query` in `text`, honoring `match_case`.
@@ -152,22 +197,15 @@ pub(crate) fn replace_matches(
     query: &str,
     replacement: &str,
     match_case: bool,
+    whole_words: bool,
 ) -> String {
-    if query.is_empty() {
-        return text.to_string();
-    }
-    if match_case {
-        return text.replace(query, replacement);
-    }
-    let lower = text.to_lowercase();
-    let query = query.to_lowercase();
+    let ranges = matching_ranges(text, query, match_case, whole_words);
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
-    while let Some(pos) = lower[cursor..].find(&query) {
-        let begin = cursor + pos;
-        out.push_str(&text[cursor..begin]);
+    for range in ranges {
+        out.push_str(&text[cursor..range.start]);
         out.push_str(replacement);
-        cursor = begin + query.len();
+        cursor = range.end;
     }
     out.push_str(&text[cursor..]);
     out
@@ -238,15 +276,19 @@ pub(crate) fn search_pages(
                 request.match_case,
                 request.whole_words,
             );
-            let text_hit = match &node.data {
-                NodeData::Text(text) => matches_query(
-                    &text.content,
+            let text_content = match &node.data {
+                NodeData::Text(text) => Some(text.content.as_str()),
+                NodeData::TextPath(text_path) => Some(text_path.content.as_str()),
+                _ => None,
+            };
+            let text_hit = text_content.is_some_and(|content| {
+                matches_query(
+                    content,
                     &request.query,
                     request.match_case,
                     request.whole_words,
-                ),
-                _ => false,
-            };
+                )
+            });
             if !name_hit && !text_hit {
                 continue;
             }
@@ -259,8 +301,8 @@ pub(crate) fn search_pages(
             let result_id = SharedString::from(id.to_string());
             let title = if name_hit || node.name.is_empty() {
                 SharedString::from(node.name.clone())
-            } else if let NodeData::Text(text) = &node.data {
-                SharedString::from(text.content.clone())
+            } else if let Some(content) = text_content {
+                SharedString::from(content.to_string())
             } else {
                 SharedString::from(node.name.clone())
             };
@@ -328,13 +370,23 @@ mod tests {
     #[test]
     fn replace_matches_is_case_aware() {
         assert_eq!(
-            replace_matches("Hello hello HELLO", "hello", "hi", false),
+            replace_matches("Hello hello HELLO", "hello", "hi", false, false),
             "hi hi hi"
         );
         assert_eq!(
-            replace_matches("Hello hello", "hello", "hi", true),
+            replace_matches("Hello hello", "hello", "hi", true, false),
             "Hello hi"
         );
-        assert_eq!(replace_matches("untouched", "", "x", false), "untouched");
+        assert_eq!(
+            replace_matches("untouched", "", "x", false, false),
+            "untouched"
+        );
+        assert_eq!(replace_matches("İx", "x", "y", false, false), "İy");
+        assert_eq!(replace_matches("İ", "i", "x", false, false), "x");
+        assert_eq!(replace_matches("ΟΣ", "ΟΣ", "x", false, false), "x");
+        assert_eq!(
+            replace_matches("cat catalog", "cat", "dog", true, true),
+            "dog catalog"
+        );
     }
 }

@@ -516,6 +516,62 @@ pub fn eval_segment(path: &PathData, seg_index: usize, t: f64) -> Option<DVec2> 
     }
 }
 
+pub(crate) fn segment_anchors(path: &PathData, segment_index: usize) -> Option<[AnchorId; 2]> {
+    let subpaths = decompose(path);
+    let mut subpath_index: Option<usize> = None;
+    let mut anchor_index = 0;
+    for (index, segment) in path.segments.iter().enumerate() {
+        match segment {
+            PathSegment::Move { .. } => {
+                subpath_index = Some(subpath_index.map_or(0, |index| index + 1));
+                anchor_index = 0;
+                if index == segment_index {
+                    return None;
+                }
+            }
+            _ => {
+                let subpath = subpath_index?;
+                let anchors = subpaths.get(subpath)?;
+                let start = anchor_index;
+                let end = if matches!(segment, PathSegment::Close) {
+                    0
+                } else {
+                    anchor_index + 1
+                };
+                if index == segment_index {
+                    // Decomposition folds an explicit closing endpoint into anchor zero.
+                    let end = if end == anchors.anchors.len()
+                        && anchors.closed
+                        && matches!(path.segments.get(index + 1), Some(PathSegment::Close))
+                    {
+                        0
+                    } else {
+                        end
+                    };
+                    if start >= anchors.anchors.len()
+                        || end >= anchors.anchors.len()
+                        || start == end
+                    {
+                        return None;
+                    }
+                    return Some([
+                        AnchorId {
+                            subpath,
+                            index: start,
+                        },
+                        AnchorId {
+                            subpath,
+                            index: end,
+                        },
+                    ]);
+                }
+                anchor_index = end;
+            }
+        }
+    }
+    None
+}
+
 /// The current point just BEFORE `seg_index`, and the start point of its
 /// subpath (the closing-line target). `None` when the index is out of range
 /// or no current point exists (e.g. the segment IS the first `Move`).

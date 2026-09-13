@@ -13,9 +13,16 @@
 //! [`Doc::apply`] is the single chokepoint for undo + history + modified-time
 //! bookkeeping. Tools never reach past it.
 
-use fanta_canvas::{SnapEngine, screen_to_world, world_to_screen};
-use fanta_doc::{CanvasNode, Color, Doc, NodeId, Transform2D, Viewport};
+use fanta_canvas::{
+    HitPrecision, MarqueeMode, SnapEngine, hit_test_deep, hit_test_within_screen, screen_to_world,
+    world_to_screen,
+};
+use fanta_doc::{Bounds, CanvasNode, Color, Doc, NodeId, Scene, Transform2D, Viewport};
 use glam::DVec2;
+use smallvec::SmallVec;
+
+pub type HitTestRefiner = fn(&Scene, NodeId, DVec2) -> bool;
+pub type InteractionBoundsResolver = fn(&Scene, NodeId) -> Option<Bounds>;
 
 /// Neutral fill a shape-creation tool uses when the shell doesn't specify one
 /// (e.g. in unit tests that call [`ToolContext::new`] directly).
@@ -64,6 +71,13 @@ pub struct ToolContext<'a> {
     /// the component master instead of the page. `None` falls back to
     /// `doc.active_page()` — identical to the project tab's behavior.
     pub scope_root: Option<NodeId>,
+
+    /// Renderer-backed refinement for node kinds whose exact painted shape is
+    /// unavailable to the renderer-agnostic canvas crate.
+    pub hit_test_refiner: Option<HitTestRefiner>,
+
+    /// Host-provided local bounds used for authoring handles and pivots.
+    pub interaction_bounds_resolver: Option<InteractionBoundsResolver>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -82,6 +96,8 @@ impl<'a> ToolContext<'a> {
             screen_size,
             new_shape_fill: DEFAULT_NEW_SHAPE_FILL,
             scope_root: None,
+            hit_test_refiner: None,
+            interaction_bounds_resolver: None,
         }
     }
 
@@ -101,10 +117,80 @@ impl<'a> ToolContext<'a> {
         self
     }
 
+    pub fn with_hit_test_refiner(mut self, refiner: HitTestRefiner) -> Self {
+        self.hit_test_refiner = Some(refiner);
+        self
+    }
+
+    pub fn with_interaction_bounds_resolver(mut self, resolver: InteractionBoundsResolver) -> Self {
+        self.interaction_bounds_resolver = Some(resolver);
+        self
+    }
+
     /// The subtree root the gesture is scoped to: the explicit `scope_root`, else
     /// the document's active page (legacy/project behavior).
     pub fn scope(&self) -> Option<NodeId> {
         self.scope_root.or_else(|| self.doc.active_page())
+    }
+
+    pub fn hit_test(&self, world_point: DVec2, precision: HitPrecision) -> Option<NodeId> {
+        hit_test_deep(&self.doc.scene, world_point, precision, self.scope())
+            .into_iter()
+            .find(|&id| {
+                self.hit_test_refiner
+                    .is_none_or(|refiner| refiner(&self.doc.scene, id, world_point))
+            })
+    }
+
+    pub fn interaction_bounds(&self, id: NodeId) -> Option<Bounds> {
+        self.interaction_bounds_resolver.map_or_else(
+            || self.doc.scene.local_bounds(id),
+            |resolver| resolver(&self.doc.scene, id),
+        )
+    }
+
+    pub fn hit_test_within_screen(
+        &self,
+        screen_rect: Bounds,
+        mode: MarqueeMode,
+    ) -> SmallVec<[NodeId; 16]> {
+        let query_mode = if self.interaction_bounds_resolver.is_some() {
+            MarqueeMode::Intersects
+        } else {
+            mode
+        };
+        let hits = hit_test_within_screen(
+            &self.doc.scene,
+            self.viewport,
+            self.screen_size,
+            screen_rect,
+            query_mode,
+            self.scope(),
+        );
+        if self.interaction_bounds_resolver.is_none() {
+            return hits;
+        }
+        let first = self.screen_to_world(DVec2::new(screen_rect.min_x, screen_rect.min_y));
+        let second = self.screen_to_world(DVec2::new(screen_rect.max_x, screen_rect.max_y));
+        let world_rect = Bounds::from_min_max(first.min(second), first.max(second));
+        hits.into_iter()
+            .filter(|&id| {
+                let Some(bounds) = self.interaction_bounds(id).and_then(|bounds| {
+                    bounds.try_transformed(&self.doc.scene.world_transform(id)?)
+                }) else {
+                    return false;
+                };
+                match mode {
+                    MarqueeMode::Contains => {
+                        bounds.min_x >= world_rect.min_x
+                            && bounds.min_y >= world_rect.min_y
+                            && bounds.max_x <= world_rect.max_x
+                            && bounds.max_y <= world_rect.max_y
+                    }
+                    MarqueeMode::Intersects => bounds.intersects(&world_rect),
+                }
+            })
+            .collect()
     }
 
     /// Map a screen-pixel position into world space at the current viewport.

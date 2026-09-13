@@ -407,8 +407,8 @@ pub fn backfill_vector_viewports(scene: &mut Scene) {
     for id in &all_ids {
         let Some(node) = scene.get(*id) else { continue };
         if let NodeData::Vector(v) = &node.data {
-            if v.local_size.is_some() {
-                continue; // already has a viewport — decide each vector on its own
+            if v.local_size.is_some() || node.flags.contains(crate::NodeFlags::UNCLIPPED_VECTOR) {
+                continue;
             }
             let Some(b) = v.path.rough_bounds() else {
                 continue;
@@ -1095,3 +1095,84 @@ fn apply_field_override(node: &mut CanvasNode, patch: &serde_json::Value) {
 #[cfg(test)]
 #[path = "instance_tests/mod.rs"]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn path_edit_viewport_backfill_respects_explicit_unclipped_vectors() {
+    let mut doc = crate::Doc::new();
+    let mut expected_sizes = Vec::new();
+    for (meta, local_size, flags, origin, expected) in [
+        (
+            serde_json::Value::Null,
+            None,
+            crate::NodeFlags::empty(),
+            0.,
+            Some([40., 30.]),
+        ),
+        (
+            serde_json::json!({ "clip_content": true }),
+            None,
+            crate::NodeFlags::empty(),
+            0.,
+            Some([40., 30.]),
+        ),
+        (
+            serde_json::Value::Null,
+            None,
+            crate::NodeFlags::UNCLIPPED_VECTOR,
+            0.,
+            None,
+        ),
+        (
+            serde_json::json!({ "clip_content": false }),
+            None,
+            crate::NodeFlags::empty(),
+            0.,
+            Some([40., 30.]),
+        ),
+        (
+            serde_json::Value::Null,
+            Some([80., 70.]),
+            crate::NodeFlags::empty(),
+            0.,
+            Some([80., 70.]),
+        ),
+        (
+            serde_json::Value::Null,
+            None,
+            crate::NodeFlags::empty(),
+            -0.25,
+            Some([39.75, 29.75]),
+        ),
+        (
+            serde_json::json!(["opaque", 42]),
+            None,
+            crate::NodeFlags::UNCLIPPED_VECTOR,
+            -0.25,
+            None,
+        ),
+        (
+            serde_json::Value::Null,
+            Some([80., 70.]),
+            crate::NodeFlags::UNCLIPPED_VECTOR,
+            0.,
+            Some([80., 70.]),
+        ),
+    ] {
+        let mut node = crate::CanvasNode::new(crate::NodeData::Vector(crate::VectorNode {
+            path: crate::PathData::rect(origin, origin, 40., 30.),
+            local_size,
+            ..Default::default()
+        }));
+        node.meta = meta;
+        node.flags = flags;
+        expected_sizes.push((node.id, expected));
+        doc.apply(crate::Operation::create_node(node))
+            .expect("create viewport fixture");
+    }
+    backfill_vector_viewports(&mut doc.scene);
+    for (id, expected) in expected_sizes {
+        let node = doc.scene.get(id).expect("vector");
+        assert_eq!(node.data.as_vector().expect("vector").local_size, expected);
+    }
+}

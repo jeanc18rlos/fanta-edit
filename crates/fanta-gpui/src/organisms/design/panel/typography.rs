@@ -1,6 +1,71 @@
 use super::*;
 
 impl DesignPanel {
+    pub(super) fn text_path_direction_is_available(&self) -> bool {
+        self.node.kind == DesignPanelNodeKind::TextPath
+            && self.node.supports_section(DesignPanelSection::Typography)
+            && self
+                .node
+                .text_path
+                .is_some_and(|path| path.direction.is_some())
+    }
+
+    pub(super) fn text_path_placement_is_available(&self) -> bool {
+        self.node.kind == DesignPanelNodeKind::TextPath
+            && self.node.supports_section(DesignPanelSection::Typography)
+            && self.node.text_path_placement.is_some_and(|placement| {
+                placement.offset.is_finite() && (0. ..=1.).contains(&placement.offset)
+            })
+    }
+
+    pub(super) fn emit_text_path_placement(
+        &self,
+        value: &DesignPanelValue,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.node.text_path_placement else {
+            return;
+        };
+        let DesignPanelValue::Ratio(offset) = value else {
+            return;
+        };
+        if !offset.is_finite() || !(0. ..=1.).contains(offset) {
+            return;
+        }
+        cx.emit_design_panel_action(
+            self,
+            DesignPanelAction::TextPathPlacementChangeRequested {
+                node_id: self.node.id.clone(),
+                placement: DesignTextPathPlacement {
+                    offset: *offset,
+                    ..current
+                },
+                phase,
+            },
+        );
+    }
+
+    pub(super) fn emit_text_path_direction(
+        &self,
+        direction: DesignTextPathDirection,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit()
+            || !self.text_path_direction_is_available()
+            || self.node.text_path.and_then(|path| path.direction) == Some(direction)
+        {
+            return;
+        }
+        cx.emit_design_panel_action(
+            self,
+            DesignPanelAction::TextPathDirectionChangeRequested {
+                node_id: self.node.id.clone(),
+                direction,
+            },
+        );
+    }
+
     pub(super) fn text_path_flip_is_available(&self) -> bool {
         self.node.kind == DesignPanelNodeKind::TextPath
             && self.node.supports_section(DesignPanelSection::Typography)
@@ -2573,6 +2638,65 @@ impl DesignPanel {
         )
     }
 
+    fn render_text_path_direction_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let current = self.node.text_path?.direction?;
+        let enabled = self.can_edit() && self.text_path_direction_is_available();
+        Some(
+            h_flex()
+                .gap_1()
+                .children(
+                    [
+                        DesignTextPathDirection::Forward,
+                        DesignTextPathDirection::Reverse,
+                    ]
+                    .into_iter()
+                    .map(|direction| {
+                        let control_id = SharedString::from(format!(
+                            "{}-text-path-direction-{}",
+                            self.id,
+                            direction.label()
+                        ));
+                        let debug_selector = control_id.to_string();
+                        let control = div()
+                            .id(control_id)
+                            .debug_selector(move || debug_selector)
+                            .flex_1()
+                            .h(px(ROW_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(cx.theme().transparent)
+                            .bg(if current == direction {
+                                cx.theme().accent
+                            } else {
+                                cx.theme().secondary
+                            })
+                            .text_xs()
+                            .when(!enabled, |control| {
+                                control
+                                    .text_color(cx.theme().muted_foreground)
+                                    .opacity(0.62)
+                            })
+                            .when(enabled, |control| {
+                                control
+                                    .key_context(CONTROL_KEY_CONTEXT)
+                                    .tab_index(0)
+                                    .cursor_pointer()
+                                    .hover(|style| style.bg(cx.theme().accent))
+                                    .focus(|style| style.border_color(cx.theme().selection))
+                                    .on_activate(cx.listener(move |this, _, _, cx| {
+                                        this.emit_text_path_direction(direction, cx)
+                                    }))
+                            });
+                        control.child(direction.label())
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+
     pub(super) fn render_typography(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let typography = self.node.typography.as_ref()?;
         let mut content = if let Some(binding) = typography.style_binding.as_ref() {
@@ -2772,6 +2896,31 @@ impl DesignPanel {
             content = content
                 .child(self.render_group_label("Text on path", cx))
                 .child(orientation_control);
+        }
+        if let Some(direction_control) = self.render_text_path_direction_control(cx) {
+            content = content
+                .child(self.render_group_label("Direction", cx))
+                .child(direction_control);
+        }
+        if self.text_path_placement_is_available()
+            && let Some(placement) = self.node.text_path_placement
+        {
+            content = content
+                .child(self.render_group_label("Start offset", cx))
+                .child(self.render_value_cell(
+                    "text-path-offset",
+                    "%",
+                    format!("{}%", format_number(placement.offset * 100.)),
+                    DesignPanelProperty::TextPathOffset,
+                    DesignPanelValue::Ratio(placement.offset),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Distance along the current path"),
+                );
         }
         if self.text_path_start_debug_controls_are_available()
             && let Some(start) = self.node.text_path_start_data

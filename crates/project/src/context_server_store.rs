@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use client::{Client, ClientSettings};
 use collections::{HashMap, HashSet};
 use context_server::oauth::{self, McpOAuthTokenProvider, OAuthDiscovery, OAuthSession};
 use context_server::transport::HttpTransport;
@@ -34,6 +35,35 @@ use crate::{
 /// Maximum timeout for context server requests
 /// Prevents extremely large timeout values from tying up resources indefinitely.
 const MAX_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
+fn uses_account_auth(
+    id: &str,
+    endpoint: &str,
+    headers: &HashMap<String, String>,
+    server_url: &str,
+) -> bool {
+    id == "fanta"
+        && !server_url.is_empty()
+        && endpoint.trim_end_matches('/') == format!("{}/mcp", server_url.trim_end_matches('/'))
+        && !headers.keys().any(|header| {
+            header.eq_ignore_ascii_case("authorization") || header.eq_ignore_ascii_case("x-api-key")
+        })
+}
+
+// Read credentials for every request so signing out also revokes transports
+// that were already created, without copying account secrets into settings.
+struct AccountTokenProvider(Arc<Client>);
+
+#[async_trait::async_trait]
+impl oauth::OAuthTokenProvider for AccountTokenProvider {
+    fn access_token(&self) -> Option<String> {
+        self.0.account_access_token().map(|token| token.to_string())
+    }
+
+    async fn try_refresh(&self) -> Result<bool> {
+        Ok(false)
+    }
+}
 
 pub fn init(cx: &mut App) {
     extension::init(cx);
@@ -176,6 +206,18 @@ pub enum ContextServerConfiguration {
 }
 
 impl ContextServerConfiguration {
+    fn uses_account_auth(&self, id: &ContextServerId, cx: &App) -> bool {
+        match self {
+            Self::Http { url, headers, .. } => uses_account_auth(
+                &id.0,
+                url.as_str(),
+                headers,
+                &ClientSettings::get_global(cx).server_url,
+            ),
+            _ => false,
+        }
+    }
+
     pub fn command(&self) -> Option<&ContextServerCommand> {
         match self {
             ContextServerConfiguration::Custom { command, .. } => Some(command),
@@ -186,9 +228,10 @@ impl ContextServerConfiguration {
 
     pub fn has_static_auth_header(&self) -> bool {
         match self {
-            ContextServerConfiguration::Http { headers, .. } => headers
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case("authorization")),
+            ContextServerConfiguration::Http { headers, .. } => headers.keys().any(|header| {
+                header.eq_ignore_ascii_case("authorization")
+                    || header.eq_ignore_ascii_case("x-api-key")
+            }),
             _ => false,
         }
     }
@@ -292,6 +335,7 @@ pub struct ContextServerStore {
     context_server_factory: Option<ContextServerFactory>,
     needs_server_update: bool,
     ai_disabled: bool,
+    _account_status_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -493,6 +537,42 @@ impl ContextServerStore {
         }
 
         let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
+        let account_status_task = if maintain_server_loop {
+            Client::try_global(cx).map(|client| {
+                let mut status = client.status();
+                let mut previous_token = client.account_access_token();
+                cx.spawn(async move |this, cx| {
+                    while status.next().await.is_some() {
+                        let token = client.account_access_token();
+                        if token == previous_token {
+                            continue;
+                        }
+                        previous_token = token;
+                        if this
+                            .update(cx, |this, cx| {
+                                let server_ids: Vec<_> = this
+                                    .servers
+                                    .iter()
+                                    .filter(|(id, state)| {
+                                        state.configuration().uses_account_auth(id, cx)
+                                    })
+                                    .map(|(id, _)| id.clone())
+                                    .collect();
+                                for id in server_ids {
+                                    this.stop_server(&id, cx).log_err();
+                                }
+                                this.available_context_servers_changed(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            })
+        } else {
+            None
+        };
         let mut this = Self {
             state,
             _subscriptions: subscriptions,
@@ -508,6 +588,7 @@ impl ContextServerStore {
             server_ids: Default::default(),
             update_servers_task: None,
             context_server_factory,
+            _account_status_task: account_status_task,
         };
         if maintain_server_loop && !DisableAiSettings::get_global(cx).disable_ai {
             this.available_context_servers_changed(cx);
@@ -949,8 +1030,19 @@ impl ContextServerStore {
             return Ok((server, configuration));
         }
 
+        let account_token_provider = cx.update(|cx| {
+            configuration
+                .uses_account_auth(&id, cx)
+                .then(|| Client::try_global(cx))
+                .flatten()
+                .map(|client| {
+                    Arc::new(AccountTokenProvider(client)) as Arc<dyn oauth::OAuthTokenProvider>
+                })
+        });
         let cached_token_provider: Option<Arc<dyn oauth::OAuthTokenProvider>> =
-            if let ContextServerConfiguration::Http { url, .. } = configuration.as_ref() {
+            if account_token_provider.is_some() {
+                account_token_provider
+            } else if let ContextServerConfiguration::Http { url, .. } = configuration.as_ref() {
                 if configuration.has_static_auth_header() {
                     None
                 } else {
@@ -1684,10 +1776,24 @@ impl ContextServerStore {
                 .or_insert(ContextServerSettings::default_extension());
         }
 
+        let (account_server_url, signed_in) = cx.update(|cx| {
+            (
+                ClientSettings::get_global(cx).server_url.clone(),
+                Client::try_global(cx)
+                    .and_then(|client| client.account_access_token())
+                    .is_some(),
+            )
+        });
         let (enabled_servers, disabled_servers): (HashMap<_, _>, HashMap<_, _>) =
-            configured_servers
-                .into_iter()
-                .partition(|(_, settings)| settings.enabled());
+            configured_servers.into_iter().partition(|(id, settings)| {
+                settings.enabled()
+                    && (signed_in
+                        || !matches!(
+                            settings,
+                            ContextServerSettings::Http { url, headers, .. }
+                                if uses_account_auth(id, url, headers, &account_server_url)
+                        ))
+            });
 
         let configured_servers = join_all(enabled_servers.into_iter().map(|(id, settings)| {
             let id = ContextServerId(id);
@@ -1857,12 +1963,21 @@ async fn resolve_auth_required(
     configuration: Arc<ContextServerConfiguration>,
     cx: &AsyncApp,
 ) -> ContextServerState {
-    if configuration.has_static_auth_header() {
-        log::warn!("{id} received 401 with a static Authorization header configured");
+    if cx.update(|cx| configuration.uses_account_auth(id, cx)) {
         return ContextServerState::Error {
             configuration,
             server,
-            error: "Server returned 401 Unauthorized. Check your configured Authorization header."
+            error:
+                "Your Fanta account could not authenticate. Sign out and sign in to Fanta again."
+                    .into(),
+        };
+    }
+    if configuration.has_static_auth_header() {
+        log::warn!("{id} received 401 with a static authentication header configured");
+        return ContextServerState::Error {
+            configuration,
+            server,
+            error: "Server returned 401 Unauthorized. Check your configured authentication header."
                 .into(),
         };
     }
@@ -1928,6 +2043,53 @@ async fn resolve_auth_required(
                 server,
                 error: format!("OAuth discovery failed: {discovery_err}").into(),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fanta_mcp_account_token_is_limited_to_backend_endpoint() {
+        let headers = HashMap::default();
+        let server_url = "https://api.fantaisa.net";
+        assert!(uses_account_auth(
+            "fanta",
+            "https://api.fantaisa.net/mcp",
+            &headers,
+            server_url
+        ));
+        assert!(uses_account_auth(
+            "fanta",
+            "https://api.fantaisa.net/mcp/",
+            &headers,
+            server_url
+        ));
+        for endpoint in [
+            "http://api.fantaisa.net/mcp",
+            "https://api.fantaisa.net.evil.example/mcp",
+            "https://api.fantaisa.net/other",
+            "https://api.fantaisa.net/mcp?target=other",
+            "https://api.fantaisa.net@evil.example/mcp",
+        ] {
+            assert!(!uses_account_auth("fanta", endpoint, &headers, server_url));
+        }
+        assert!(!uses_account_auth(
+            "other",
+            "https://api.fantaisa.net/mcp",
+            &headers,
+            server_url
+        ));
+        for header in ["Authorization", "authorization", "X-Api-Key", "x-api-key"] {
+            let headers = HashMap::from_iter([(header.to_string(), "explicit-key".to_string())]);
+            assert!(!uses_account_auth(
+                "fanta",
+                "https://api.fantaisa.net/mcp",
+                &headers,
+                server_url
+            ));
         }
     }
 }

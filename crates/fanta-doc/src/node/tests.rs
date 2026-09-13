@@ -31,6 +31,11 @@ fn new_node_has_variant_appropriate_default_name() {
     assert_eq!(v.name, "Shape");
     let t = CanvasNode::new(NodeData::Text(TextNode::new("hi", 100.0, 20.0)));
     assert_eq!(t.name, "Text");
+    let text_path = CanvasNode::new(NodeData::TextPath(TextPathNode::new(
+        crate::PathData::rect(0.0, 0.0, 10.0, 10.0),
+        "hi",
+    )));
+    assert_eq!(text_path.name, "Text on Path");
 }
 
 #[test]
@@ -164,6 +169,144 @@ fn text_node_round_trips_and_tags_as_text() {
         }
         _ => panic!("variant mismatch"),
     }
+}
+
+#[test]
+fn text_path_start_validates_without_panicking_and_rejects_invalid_json() {
+    let start = TextPathStart::new(3, 0.25).expect("valid normalized start");
+    assert_eq!(start.segment(), 3);
+    assert_eq!(start.position(), 0.25);
+    assert_eq!(start.with_segment(8).segment(), 8);
+    assert_eq!(
+        start
+            .with_position(1.0)
+            .expect("inclusive endpoint")
+            .position(),
+        1.0
+    );
+    assert!(TextPathStart::new(0, -0.01).is_none());
+    assert!(TextPathStart::new(0, 1.01).is_none());
+    assert!(TextPathStart::new(0, f64::NAN).is_none());
+    assert!(start.with_position(f64::INFINITY).is_none());
+
+    assert!(serde_json::from_str::<TextPathStart>(r#"{"segment":0,"position":-0.1}"#).is_err());
+    assert!(serde_json::from_str::<TextPathStart>(r#"{"segment":0,"position":1.1}"#).is_err());
+    let defaulted: TextPathStart = serde_json::from_str("{}").expect("missing fields default");
+    assert_eq!(defaulted, TextPathStart::DEFAULT);
+}
+
+#[test]
+fn text_path_node_round_trips_with_geometry_text_and_placement() {
+    let mut path = crate::PathData::new();
+    path.move_to(1.0, 2.0)
+        .quad_to(4.0, 8.0, 10.0, 2.0)
+        .cubic_to(12.0, -1.0, 16.0, -1.0, 18.0, 2.0)
+        .close();
+    let mut text_path = TextPathNode::new(path, "Path text");
+    text_path.style.font_family = "Test Sans".to_owned();
+    text_path.style.size_px = 22.0;
+    text_path.style.weight = 600;
+    text_path.style_runs.push(TextStyleRun {
+        start: 5,
+        end: 9,
+        style: TextStyle {
+            italic: true,
+            color: Color::rgb(0x11, 0x22, 0x33),
+            ..TextStyle::default()
+        },
+    });
+    text_path.start = TextPathStart::new(1, 0.375).expect("valid start");
+    text_path.alignment = TextPathAlignment::Center;
+    text_path.direction = TextPathDirection::Reverse;
+    text_path.side = TextPathSide::Flipped;
+
+    let node = CanvasNode::new(NodeData::TextPath(text_path.clone()));
+    let value = serde_json::to_value(&node).expect("TextPath serializes");
+    assert_eq!(value["type"], "text_path");
+    assert_eq!(value["start"]["segment"], 1);
+    assert_eq!(value["start"]["position"], 0.375);
+    assert_eq!(value["alignment"], "center");
+    assert_eq!(value["direction"], "reverse");
+    assert_eq!(value["side"], "flipped");
+
+    let restored: CanvasNode = serde_json::from_value(value).expect("TextPath deserializes");
+    assert_eq!(restored.data, NodeData::TextPath(text_path));
+}
+
+#[test]
+fn text_path_defaults_are_omitted_and_restore_canonically() {
+    let text_path = TextPathNode::new(crate::PathData::rect(0.0, 0.0, 20.0, 10.0), "Defaults");
+    let value = serde_json::to_value(&text_path).expect("TextPath serializes");
+    for key in ["start", "alignment", "direction", "side"] {
+        assert!(value.get(key).is_none(), "default `{key}` stays omitted");
+    }
+
+    let restored: TextPathNode = serde_json::from_value(value).expect("defaults deserialize");
+    assert_eq!(restored.start, TextPathStart::DEFAULT);
+    assert_eq!(restored.alignment, TextPathAlignment::Start);
+    assert_eq!(restored.direction, TextPathDirection::Forward);
+    assert_eq!(restored.side, TextPathSide::Default);
+}
+
+#[test]
+fn text_path_local_bounds_conservatively_include_shaped_ink_band() {
+    let mut path = crate::PathData::new();
+    path.move_to(0.0, 0.0).line_to(100.0, 0.0);
+    let mut text_path = TextPathNode::new(path, "Baseline");
+    text_path.style.size_px = 20.0;
+
+    let bounds = NodeData::TextPath(text_path)
+        .local_bounds()
+        .expect("text path bounds");
+    assert_eq!(bounds.min_x, -80.0);
+    assert_eq!(bounds.max_x, 180.0);
+    assert_eq!(bounds.min_y, -80.0);
+    assert_eq!(bounds.max_y, 80.0);
+}
+
+#[test]
+fn replacing_vector_with_text_path_keeps_identity_and_undo_redo() {
+    let mut doc = Doc::new();
+    let vector = VectorNode {
+        path: crate::PathData::rect(0.0, 0.0, 40.0, 20.0),
+        ..VectorNode::default()
+    };
+    let path = vector.path.clone();
+    let mut node = CanvasNode::new(NodeData::Vector(vector));
+    node.name = "Baseline".to_owned();
+    node.transform = crate::Transform2D::translation(12.0, 24.0);
+    node.meta = serde_json::json!({"source": "selected-vector"});
+    let id = node.id;
+    doc.apply(Operation::create_node(node))
+        .expect("create vector");
+
+    let wrapper_before = doc.scene.get(id).expect("vector exists").clone();
+
+    let old = doc.scene.get(id).expect("vector exists").data.clone();
+    let text_path = TextPathNode::new(path, "Same identity");
+    doc.apply(Operation::ReplaceData {
+        id,
+        old: Box::new(old.clone()),
+        new: Box::new(NodeData::TextPath(text_path.clone())),
+    })
+    .expect("replace vector data");
+    assert!(matches!(
+        doc.scene.get(id).map(|node| &node.data),
+        Some(NodeData::TextPath(current)) if current == &text_path
+    ));
+    let replaced = doc.scene.get(id).expect("same node after replace");
+    assert_eq!(replaced.id, wrapper_before.id);
+    assert_eq!(replaced.name, wrapper_before.name);
+    assert_eq!(replaced.transform, wrapper_before.transform);
+    assert_eq!(replaced.meta, wrapper_before.meta);
+
+    assert!(doc.undo().expect("undo replace"));
+    assert_eq!(&doc.scene.get(id).expect("same node after undo").data, &old);
+    assert!(doc.redo().expect("redo replace"));
+    assert_eq!(
+        &doc.scene.get(id).expect("same node after redo").data,
+        &NodeData::TextPath(text_path)
+    );
 }
 
 #[test]

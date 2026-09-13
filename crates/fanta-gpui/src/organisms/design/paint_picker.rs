@@ -809,6 +809,10 @@ impl PaintPicker {
         }
     }
 
+    pub(crate) fn color_only_title(&self) -> Option<&SharedString> {
+        self.color_only_title.as_ref()
+    }
+
     /// Independently gates RGB/eyedropper and alpha edits for retained
     /// color-only pickers.
     ///

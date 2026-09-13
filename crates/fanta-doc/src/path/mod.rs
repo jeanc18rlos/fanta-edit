@@ -12,6 +12,7 @@
 mod arc;
 mod data;
 mod fill_rule;
+mod measure;
 mod segment;
 mod svg;
 #[cfg(test)]
@@ -19,5 +20,6 @@ mod tests;
 
 pub use data::PathData;
 pub use fill_rule::FillRule;
+pub use measure::{MeasuredPath, MeasuredPathContour, MeasuredPathPoint, MeasuredPathSegment};
 pub use segment::PathSegment;
 pub use svg::SvgPathError;

@@ -454,6 +454,9 @@ impl EditorToolbar {
     /// controls without one.
     pub(super) fn choice_candidates(&self, control: ToolbarSecondaryControl) -> &[SharedString] {
         match control {
+            ToolbarSecondaryControl::MotionAddKeyframe => {
+                &self.motion_options.available_keyframe_properties
+            }
             ToolbarSecondaryControl::MotionAnimationStyle => {
                 &self.motion_options.available_animation_styles
             }
@@ -683,13 +686,10 @@ impl EditorToolbar {
     ) {
         cx.emit(ToolbarAction::CommandInvoked { command });
         match command {
-            ToolbarCommand::GenerateDesign
-            | ToolbarCommand::ReplaceContent
+            ToolbarCommand::ReplaceContent
             | ToolbarCommand::RewriteText
             | ToolbarCommand::TranslateText
             | ToolbarCommand::RenameLayers
-            | ToolbarCommand::RemoveBackground
-            | ToolbarCommand::GenerateImage
             | ToolbarCommand::MakePrototype => self.open_agent(window, cx),
             _ => {
                 self.set_overlay(None, cx);
@@ -839,7 +839,7 @@ mod tests {
         // The legacy category/description substring survives as the fallback
         // tier without label highlights.
         assert_eq!(
-            EditorToolbar::match_command(ToolbarCommand::GenerateDesign, "figma agent"),
+            EditorToolbar::match_command(ToolbarCommand::GenerateDesign, "editable frames"),
             Some((4, Vec::new()))
         );
         assert_eq!(

@@ -13,7 +13,9 @@ use gpui_component::{
 };
 
 use super::state::CommandMatch;
-use super::{CommandScope, EditorToolbar, POPOVER_GAP, TOOL_SIZE, ZoomMenuEntry};
+use super::{
+    AGENT_LAUNCHER_WIDTH, CommandScope, EditorToolbar, POPOVER_GAP, TOOL_SIZE, ZoomMenuEntry,
+};
 use crate::atoms::{CONTROL_KEY_CONTEXT, ControlExt as _, icon_button};
 use crate::molecules::{
     POPUP_SAFE_MARGIN, anchored_popup, popup_height, popup_max_height, popup_surface, popup_width,
@@ -35,9 +37,9 @@ const MENU_VERTICAL_PADDING: f32 = 16.;
 const ACTIONS_PALETTE_CHROME_HEIGHT: f32 = 128.;
 /// Tallest the Actions results viewport grows inside the 540 px palette cap.
 const ACTIONS_RESULTS_MAX_HEIGHT: f32 = 378.;
-/// Anchor inset mirroring the 36 px Agent launcher, so the composer's right
+/// Anchor inset mirroring the explicit AI launcher, so the composer's right
 /// edge aligns with its trigger's right edge.
-const AGENT_COMPOSER_ANCHOR_INSET: f32 = 36.;
+const AGENT_COMPOSER_ANCHOR_INSET: f32 = AGENT_LAUNCHER_WIDTH;
 /// Anchor inset mirroring the 58 px zoom trigger, so the zoom flyout's right
 /// edge aligns with its trigger's right edge.
 const ZOOM_MENU_ANCHOR_INSET: f32 = 58.;
@@ -262,7 +264,7 @@ impl EditorToolbar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let commands = self.filtered_commands(cx);
-        let palette_width = popup_width(window, 420.);
+        let palette_width = popup_width(window, 400.);
         // Let the results viewport absorb short-window pressure so the surface
         // itself always fits inside the anchored layer's safe margin.
         let results_height = px((window.viewport_size().height.as_f32()
@@ -368,7 +370,6 @@ impl EditorToolbar {
                                 .rounded(px(7.))
                                 .cursor_pointer()
                                 .text_xs()
-                                .font_medium()
                                 .border_1()
                                 .border_color(cx.theme().transparent)
                                 .bg(if self.command_scope == scope {
@@ -494,13 +495,7 @@ impl EditorToolbar {
                         .text_color(cx.theme().magenta)
                         .child(Icon::new(IconName::Bot).xsmall()),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_semibold()
-                        .text_sm()
-                        .child("Figma Agent"),
-                )
+                .child(div().flex_none().font_medium().text_sm().child("Fanta AI"))
                 .child(
                     div()
                         .debug_selector(|| "toolbar-agent-context-label".to_owned())
@@ -728,6 +723,7 @@ impl EditorToolbar {
     /// Debug-selector prefix for one secondary chip's anchored editor.
     fn editor_selector_prefix(control: ToolbarSecondaryControl) -> &'static str {
         match control {
+            ToolbarSecondaryControl::MotionAddKeyframe => "toolbar-motion-keyframe",
             ToolbarSecondaryControl::MotionAnimationStyle => "toolbar-motion-style",
             _ => "toolbar-option",
         }
