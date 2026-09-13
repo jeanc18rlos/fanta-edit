@@ -43,9 +43,28 @@ paint opacity fields and export scale selectors follow the font scale.
 The follow-up passes all 740 viewer tests, 597 shared UI tests, three
 architecture checks, and package-scoped `./script/clippy` with Cargo Machete.
 Coverage verifies host export access, toolbar preset parity, transient-edit
-rejection and recovery, and fixed settings during export. Native validation
-and exact-source hosted CI remain pending at this source checkpoint.
+rejection and recovery, and fixed settings during export.
+
+Exact clean source `6ca5d89c2ad05e5cc0304fe52711b2388f9ba8e2` built in 8m51s.
+The isolated ad-hoc QA bundle passed signature verification and two normal
+launch/quit cycles. Native checks passed multiple preset add/remove, PNG at
+1×/2×/4×, SVG, one-page PDF, and JPEG at 4×. A real directory-write failure
+appeared in the inspector; restoring the directory and retrying through
+toolbar Actions → Export wrote all three configured formats and displayed
+success. Removing all presets disabled Export. Reopen restored the documented
+session default, PNG 2×, and successfully exported again. All 15 original
+fixture files remained byte-identical after Save and reopen.
+
+Matching `f9a67f4` baseline captures reproduce the clipped Canvas/Design labels
+and Fill opacity at UI size 20. Candidate captures show complete labels and
+100% opacity in One Light at size 20 and One Dark at size 16, at window widths
+1089 and 1025 points. All 17 retained images were immediately inspected as
+Fanta pixels. This supersedes those specific clipping findings below; the full
+application font/content matrix and final signed installer remain unverified.
+Exact-source hosted CI is still running at this evidence checkpoint.
 Evidence: `/Users/jeanrojas/fanta-release-evidence/2026-09-13/merge-followup`.
+Native hashes, dimensions, output signatures and launch records are in
+`native-export/verification.json` within that directory.
 
 ## Text on Path direction and placement — September 13
 
