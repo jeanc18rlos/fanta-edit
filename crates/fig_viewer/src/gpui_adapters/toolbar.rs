@@ -42,6 +42,7 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::ZoomToSelection,
     ToolbarCommand::Export,
     ToolbarCommand::Present,
+    ToolbarCommand::PlaceImageVideo,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,
     ToolbarCommand::GenerateImage,
@@ -169,11 +170,8 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
     }
 }
 
-/// Partial: toolbar faces without a canvas tool (Arrow, Measure, Dev and
-/// Motion faces, …) are roadmap items and intentionally return `None`.
-/// `Resources` also has no canvas tool — `FigView::handle_toolbar_action`
-/// intercepts it as host chrome (reveal and focus the left sidebar) before
-/// this mapping is consulted.
+/// Partial: host actions such as Resources and ImageVideo are handled by
+/// `FigView::handle_toolbar_action` before this mapping is consulted.
 pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
     Some(match tool {
         ToolbarTool::Move => ToolKind::Select,
@@ -432,7 +430,7 @@ mod tests {
     /// `ToolbarTool` variant lands here on purpose or gets a mapping —
     /// never silently.
     #[test]
-    fn unmapped_toolbar_tools_are_exactly_the_roadmap_set() {
+    fn unmapped_toolbar_tools_are_exactly_the_host_actions_and_roadmap_set() {
         let unmapped: Vec<ToolbarTool> = ToolbarTool::ALL
             .iter()
             .copied()
@@ -579,6 +577,7 @@ mod tests {
             ToolbarCommand::Group,
             ToolbarCommand::Ungroup,
             ToolbarCommand::FrameSelection,
+            ToolbarCommand::PlaceImageVideo,
             ToolbarCommand::ReplaceContent,
             ToolbarCommand::RewriteText,
             ToolbarCommand::TranslateText,
@@ -702,6 +701,570 @@ mod echo_tests {
         });
         let cx = cx.clone();
         (view, toolbar, cx)
+    }
+
+    fn local_media_png(directory: &std::path::Path) -> PathBuf {
+        let path = directory.join("Local picture.png");
+        image::RgbaImage::from_pixel(24, 16, image::Rgba([32, 96, 224, 255]))
+            .save(&path)
+            .expect("write local PNG fixture");
+        path
+    }
+
+    fn local_media_snapshot(
+        item: &Entity<crate::document::FigItem>,
+        cx: &VisualTestContext,
+    ) -> (
+        serde_json::Value,
+        Vec<fanta_doc::NodeId>,
+        usize,
+        usize,
+        bool,
+    ) {
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.doc.selection.as_slice().to_vec(),
+                document.doc.history.undo_depth(),
+                document.raw_assets.len(),
+                item.is_dirty(),
+            )
+        })
+    }
+
+    fn request_local_media(
+        toolbar: &Entity<EditorToolbar>,
+        from_command: bool,
+        cx: &mut VisualTestContext,
+    ) {
+        toolbar.update(cx, |_, cx| {
+            cx.emit(if from_command {
+                ToolbarAction::CommandInvoked {
+                    command: ToolbarCommand::PlaceImageVideo,
+                }
+            } else {
+                ToolbarAction::ToolChangeRequested {
+                    mode: ToolbarMode::Design,
+                    tool: ToolbarTool::ImageVideo,
+                }
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    async fn assert_local_media_toolbar_placement(cx: &mut TestAppContext, from_command: bool) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        view.update(&mut cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [80., 120.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let before_count = item.read_with(&cx, |item, _| item.doc().expect("document").scene.len());
+        let directory = tempfile::tempdir().expect("local media directory");
+        let path = local_media_png(directory.path());
+        let bytes = std::fs::read(&path).expect("fixture bytes");
+        request_local_media(&toolbar, from_command, &mut cx);
+        assert!(
+            cx.did_prompt_for_paths(),
+            "the toolbar must open a local file chooser"
+        );
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files);
+            assert!(!options.directories);
+            assert!(!options.multiple);
+            Some(vec![path.clone()])
+        });
+        cx.run_until_parked();
+        let placed = item.read_with(&cx, |item, _| {
+            let document = item.document().expect("document");
+            let doc = &document.doc;
+            assert_eq!(doc.scene.len(), before_count + 1);
+            assert_eq!(doc.history.undo_depth(), 1);
+            let [id] = doc.selection.as_slice() else {
+                panic!("placed image must be selected")
+            };
+            let node = doc.scene.get(*id).expect("placed image");
+            let NodeData::Bitmap(bitmap) = &node.data else {
+                panic!("PNG must create a bitmap")
+            };
+            assert_eq!(node.name, "Local picture.png");
+            assert_eq!(node.parent, doc.active_page());
+            assert!(node.meta.is_null());
+            assert_eq!(bitmap.natural_size, [24, 16]);
+            assert_eq!(bitmap.local_size, [24., 16.]);
+            assert_eq!(node.transform, Transform2D::translation(68., 112.));
+            assert_eq!(document.raw_assets.get(&bitmap.asset), Some(&bytes));
+            assert!(item.is_dirty());
+            node.clone()
+        });
+        view.read_with(&cx, |view, _| {
+            assert!(view.media_import_task.is_none());
+            assert_eq!(view.active_tool(), ToolKind::Select);
+        });
+        for (command, exists) in [(ToolbarCommand::Undo, false), (ToolbarCommand::Redo, true)] {
+            toolbar.update(&mut cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(&cx, |item, _| {
+                let node = item.doc().expect("document").scene.get(placed.id);
+                assert_eq!(node.is_some(), exists);
+                if let Some(node) = node {
+                    assert_eq!(node, &placed);
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn local_media_toolbar_tool_places_png_with_single_step_undo(cx: &mut TestAppContext) {
+        assert_local_media_toolbar_placement(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn local_media_toolbar_command_places_png_with_single_step_undo(cx: &mut TestAppContext) {
+        assert_local_media_toolbar_placement(cx, true).await;
+    }
+
+    async fn assert_local_media_shortcut_opens_picker(cx: &mut TestAppContext, focus_canvas: bool) {
+        use gpui::Focusable as _;
+
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let before = local_media_snapshot(&item, &cx);
+        cx.update(|window, app| {
+            if focus_canvas {
+                let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                    settings::DEFAULT_KEYMAP_PATH,
+                    app,
+                )
+                .expect("shipped canvas key bindings");
+                app.bind_keys(bindings);
+                view.read(app).focus_handle(app).focus(window, app);
+            } else {
+                toolbar.read(app).focus_handle(app).focus(window, app);
+            }
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-secondary-k");
+        assert!(
+            cx.did_prompt_for_paths(),
+            "the toolbar's advertised shortcut must open the picker"
+        );
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(local_media_snapshot(&item, &cx), before);
+        view.read_with(&cx, |view, _| assert!(view.media_import_task.is_none()));
+    }
+
+    #[gpui::test]
+    async fn local_media_toolbar_shortcut_opens_local_picker(cx: &mut TestAppContext) {
+        assert_local_media_shortcut_opens_picker(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn local_media_canvas_shortcut_opens_local_picker(cx: &mut TestAppContext) {
+        assert_local_media_shortcut_opens_picker(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn local_media_canvas_shortcut_does_not_interrupt_text_editor(cx: &mut TestAppContext) {
+        let (view, _, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let node = item.read_with(&cx, |item, _| {
+            *item
+                .doc()
+                .expect("document")
+                .selection
+                .as_slice()
+                .first()
+                .expect("selected text")
+        });
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped canvas key bindings");
+            app.bind_keys(bindings);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_text_edit(node, crate::view::TextEditSeed::SelectAll, window, cx);
+        });
+        cx.run_until_parked();
+        let before = local_media_snapshot(&item, &cx);
+        cx.simulate_keystrokes("shift-secondary-k");
+        assert!(!cx.did_prompt_for_paths());
+        assert_eq!(local_media_snapshot(&item, &cx), before);
+        view.read_with(&cx, |view, _| {
+            assert!(view.media_import_task.is_none());
+            let edit = view
+                .text_edit
+                .as_ref()
+                .expect("text session survives shortcut");
+            assert_eq!(edit.session.node_id(), node);
+            assert_eq!(edit.session.buffer(), "Target");
+            assert_eq!(edit.session.selected_range(), 0..6);
+        });
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_cancellation_and_duplicate_request_preserve_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let before = local_media_snapshot(&item, &cx);
+        request_local_media(&toolbar, false, &mut cx);
+        assert!(cx.did_prompt_for_paths());
+        request_local_media(&toolbar, true, &mut cx);
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert!(
+            !cx.did_prompt_for_paths(),
+            "a pending import must not open a second chooser"
+        );
+        assert_eq!(local_media_snapshot(&item, &cx), before);
+        view.read_with(&cx, |view, _| assert!(view.media_import_task.is_none()));
+        request_local_media(&toolbar, true, &mut cx);
+        assert!(
+            cx.did_prompt_for_paths(),
+            "cancellation must permit a later import"
+        );
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(local_media_snapshot(&item, &cx), before);
+    }
+
+    #[gpui::test]
+    async fn local_media_failed_files_preserve_document_and_allow_retry(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let before = local_media_snapshot(&item, &cx);
+        let directory = tempfile::tempdir().expect("local media directory");
+        for name in ["missing.png", "broken.png", "unsupported.txt"] {
+            let path = directory.path().join(name);
+            if name != "missing.png" {
+                std::fs::write(&path, b"invalid local media").expect("invalid fixture");
+            }
+            request_local_media(&toolbar, true, &mut cx);
+            assert!(cx.did_prompt_for_paths());
+            cx.simulate_path_prompt_response(|_| Some(vec![path]));
+            cx.run_until_parked();
+            assert_eq!(
+                local_media_snapshot(&item, &cx),
+                before,
+                "failed file {name} must not mutate the document"
+            );
+            view.read_with(&cx, |view, _| assert!(view.media_import_task.is_none()));
+        }
+        request_local_media(&toolbar, false, &mut cx);
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn local_media_locked_document_does_not_open_picker(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        item.update(&mut cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        let before = local_media_snapshot(&item, &cx);
+        for from_command in [false, true] {
+            request_local_media(&toolbar, from_command, &mut cx);
+            assert!(!cx.did_prompt_for_paths());
+            assert_eq!(local_media_snapshot(&item, &cx), before);
+        }
+    }
+
+    #[gpui::test]
+    async fn local_media_invalid_timeline_duration_blocks_picker_and_preserves_draft(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::Focusable as _;
+
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let timeline = view.read_with(&cx, |view, _| view.timeline_for_test());
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        view.update(&mut cx, |view, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx)
+        });
+        cx.run_until_parked();
+        let duration = cx
+            .debug_bounds("fanta-motion-clip-duration")
+            .expect("timeline duration control");
+        cx.simulate_click(duration.center(), Modifiers::none());
+        cx.simulate_input("0");
+        cx.update(|window, app| {
+            toolbar.read(app).focus_handle(app).focus(window, app);
+        });
+        cx.run_until_parked();
+        let before = local_media_snapshot(&item, &cx);
+        for from_command in [false, true] {
+            timeline.read_with(&cx, |timeline, cx| {
+                assert!(timeline.has_pending_authoring());
+                assert_eq!(
+                    timeline.pending_clip_edit_text_for_test(cx).as_deref(),
+                    Some("0")
+                );
+            });
+            request_local_media(&toolbar, from_command, &mut cx);
+            assert!(
+                !cx.did_prompt_for_paths(),
+                "the native picker must not blur away an invalid timeline draft"
+            );
+            assert_eq!(local_media_snapshot(&item, &cx), before);
+            timeline.read_with(&cx, |timeline, cx| {
+                assert_eq!(
+                    timeline.pending_clip_edit_text_for_test(cx).as_deref(),
+                    Some("0")
+                );
+            });
+            view.read_with(&cx, |view, _| assert!(view.media_import_task.is_none()));
+        }
+
+        let editor = cx
+            .debug_bounds("fanta-motion-clip-duration-editor")
+            .expect("invalid duration editor remains visible");
+        cx.simulate_click(editor.center(), Modifiers::none());
+        cx.dispatch_action(editor::actions::SelectAll);
+        cx.simulate_input("2");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        timeline.read_with(&cx, |timeline, _| {
+            assert!(!timeline.has_pending_authoring())
+        });
+        item.read_with(&cx, |item, _| {
+            let clip = item
+                .doc()
+                .expect("document")
+                .motion
+                .clips
+                .get(&AnimationClipId::from_u128(7))
+                .expect("edited clip");
+            assert_eq!(clip.duration_ms, 2_000);
+        });
+        let after_edit = local_media_snapshot(&item, &cx);
+        request_local_media(&toolbar, true, &mut cx);
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(local_media_snapshot(&item, &cx), after_edit);
+    }
+
+    async fn assert_local_media_delayed_result_is_discarded(cx: &mut TestAppContext, change: &str) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let directory = tempfile::tempdir().expect("local media directory");
+        let path = local_media_png(directory.path());
+        let (release, ready) = futures::channel::oneshot::channel::<()>();
+        view.update(&mut cx, |view, cx| {
+            view.choose_local_media_with(
+                move |path| {
+                    Box::pin(async move {
+                        ready
+                            .await
+                            .map_err(|error| anyhow::anyhow!("release import: {error}"))?;
+                        crate::generation_media::prepare_local_media(&path).await
+                    })
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.run_until_parked();
+        view.read_with(&cx, |view, _| assert!(view.media_import_task.is_some()));
+        match change {
+            "page" => {
+                item.update(&mut cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                        let page_id = page.id;
+                        document
+                            .doc
+                            .apply(Operation::create_node(page))
+                            .expect("second page");
+                        document.doc.add_page(page_id);
+                        document.pages.push(crate::document::FigPage {
+                            root: Some(page_id),
+                            name: "Page 2".into(),
+                            bounds: crate::document::page_bounds(&document.doc, Some(page_id)),
+                            hidden: false,
+                        });
+                        document.doc.history = Default::default();
+                        ((), crate::document::DocChange::Content)
+                    });
+                });
+                view.update(&mut cx, |view, cx| view.select_page(1, cx));
+            }
+            "document" => {
+                item.update(&mut cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.scene = document.doc.scene.clone();
+                        ((), crate::document::DocChange::None)
+                    });
+                });
+            }
+            "lock" => item.update(&mut cx, |item, cx| item.set_source_edit_locked(true, cx)),
+            "workspace" => view.update(&mut cx, |view, cx| {
+                view.set_editor_workspace(crate::editor_session::EditorWorkspace::Code, cx)
+            }),
+            "mode" => view.update(&mut cx, |view, cx| {
+                view.set_editor_mode(EditorMode::Motion, cx)
+            }),
+            "text" => {
+                let node = item.read_with(&cx, |item, _| {
+                    *item
+                        .doc()
+                        .expect("document")
+                        .selection
+                        .as_slice()
+                        .first()
+                        .expect("selected text")
+                });
+                view.update_in(&mut cx, |view, window, cx| {
+                    view.open_text_edit(node, crate::view::TextEditSeed::SelectAll, window, cx);
+                });
+                view.read_with(&cx, |view, _| assert!(view.text_edit.is_some()));
+                item.read_with(&cx, |item, _| assert!(!item.content_preview_active()));
+            }
+            "pen" => {
+                view.update(&mut cx, |view, cx| view.activate_tool(ToolKind::Pen, cx));
+                cx.run_until_parked();
+                let bounds =
+                    view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+                cx.simulate_click(bounds.center(), Modifiers::none());
+                cx.simulate_mouse_move(
+                    bounds.center() + point(px(20.), px(30.)),
+                    None,
+                    Modifiers::none(),
+                );
+                view.read_with(&cx, |view, _| {
+                    assert!(view.tools().overlays.iter().any(|overlay| matches!(
+                        overlay,
+                        fanta_tools::ToolOverlay::PreviewLine { .. }
+                    )));
+                });
+                item.read_with(&cx, |item, _| assert!(!item.content_preview_active()));
+            }
+            _ => panic!("unknown import transition"),
+        }
+        cx.run_until_parked();
+        let after_change = local_media_snapshot(&item, &cx);
+        let text_draft = view.read_with(&cx, |view, _| {
+            view.text_edit.as_ref().map(|edit| {
+                (
+                    edit.session.node_id(),
+                    edit.session.buffer().to_owned(),
+                    edit.session.selected_range(),
+                )
+            })
+        });
+        let tool_overlays = view.read_with(&cx, |view, _| view.tools().overlays.clone());
+        if release.send(()).is_err() {
+            view.read_with(&cx, |view, _| assert!(view.media_import_task.is_none()));
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            local_media_snapshot(&item, &cx),
+            after_change,
+            "a delayed import must not modify a changed {change}"
+        );
+        view.read_with(&cx, |view, _| assert!(view.media_import_task.is_none()));
+        if change == "text" {
+            view.read_with(&cx, |view, _| {
+                assert_eq!(
+                    view.text_edit.as_ref().map(|edit| (
+                        edit.session.node_id(),
+                        edit.session.buffer().to_owned(),
+                        edit.session.selected_range(),
+                    )),
+                    text_draft,
+                    "a late import must preserve an unmodified text session"
+                );
+            });
+        }
+        if change == "pen" {
+            view.read_with(&cx, |view, _| {
+                assert_eq!(view.active_tool(), ToolKind::Pen);
+                assert_eq!(
+                    view.tools().overlays,
+                    tool_overlays,
+                    "a late import must preserve the between-click Pen draft"
+                );
+            });
+        }
+        if change == "lock" {
+            item.update(&mut cx, |item, cx| item.set_source_edit_locked(false, cx));
+        }
+        if change == "workspace" {
+            view.update(&mut cx, |view, cx| {
+                view.set_editor_workspace(crate::editor_session::EditorWorkspace::Canvas, cx)
+            });
+        }
+        if change == "mode" {
+            view.update(&mut cx, |view, cx| {
+                view.set_editor_mode(EditorMode::Design, cx)
+            });
+        }
+        if matches!(change, "text" | "pen") {
+            view.update(&mut cx, |view, cx| view.activate_tool(ToolKind::Select, cx));
+        }
+        cx.run_until_parked();
+        request_local_media(&toolbar, true, &mut cx);
+        assert!(
+            cx.did_prompt_for_paths(),
+            "a discarded import must allow a new request"
+        );
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_does_not_cross_pages(cx: &mut TestAppContext) {
+        assert_local_media_delayed_result_is_discarded(cx, "page").await;
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_does_not_modify_replaced_document(cx: &mut TestAppContext) {
+        assert_local_media_delayed_result_is_discarded(cx, "document").await;
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_respects_new_source_lock(cx: &mut TestAppContext) {
+        assert_local_media_delayed_result_is_discarded(cx, "lock").await;
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_does_not_cross_workspaces(cx: &mut TestAppContext) {
+        assert_local_media_delayed_result_is_discarded(cx, "workspace").await;
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_does_not_cross_editor_modes(cx: &mut TestAppContext) {
+        assert_local_media_delayed_result_is_discarded(cx, "mode").await;
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_preserves_unmodified_text_session(cx: &mut TestAppContext) {
+        assert_local_media_delayed_result_is_discarded(cx, "text").await;
+    }
+
+    #[gpui::test]
+    async fn local_media_delayed_result_preserves_pen_draft_between_clicks(
+        cx: &mut TestAppContext,
+    ) {
+        assert_local_media_delayed_result_is_discarded(cx, "pen").await;
     }
 
     #[gpui::test]

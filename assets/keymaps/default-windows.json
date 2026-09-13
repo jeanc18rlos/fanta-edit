@@ -1531,6 +1531,7 @@
       "ctrl-c": "fig_viewer::CopySelection",
       "ctrl-x": "fig_viewer::CutSelection",
       "ctrl-v": "fig_viewer::PasteSelection",
+      "ctrl-shift-k": "fig_viewer::PlaceLocalMedia",
       "ctrl-d": "fig_viewer::DuplicateSelection",
       "ctrl-g": "fig_viewer::GroupSelection",
       "ctrl-shift-g": "fig_viewer::UngroupSelection",

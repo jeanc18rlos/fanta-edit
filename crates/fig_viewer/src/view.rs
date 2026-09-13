@@ -106,6 +106,8 @@ actions!(
         CutSelection,
         /// Paste canvas subtrees from the clipboard.
         PasteSelection,
+        /// Place a local image or MP4 video on the canvas.
+        PlaceLocalMedia,
         /// Duplicate the selected canvas subtrees.
         DuplicateSelection,
         /// Group the selected layers.
@@ -231,6 +233,17 @@ struct SidebarResizeDrag {
     sidebar: SidebarKind,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct LocalMediaOrigin {
+    item: gpui::EntityId,
+    scene: u64,
+    page: NodeId,
+    scope: Option<FigScope>,
+    mode: EditorMode,
+    path: std::path::PathBuf,
+    generation: u64,
+}
+
 impl Render for SidebarResizeDrag {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
@@ -284,6 +297,8 @@ pub struct FigView {
     canvas_pointer_down: bool,
     /// The debounced autosave armed by the last committing edit.
     autosave_task: Option<Task<()>>,
+    pub(crate) media_import_task: Option<Task<()>>,
+    media_import_generation: std::cell::Cell<u64>,
     /// The selection handle the cursor is over, resolved on hover so
     /// `render` only reads it — hit-testing eight handles per redraw would
     /// run on every window frame, not just on pointer movement.
@@ -580,6 +595,8 @@ impl FigView {
             primary_pressed: false,
             canvas_pointer_down: false,
             autosave_task: None,
+            media_import_task: None,
+            media_import_generation: std::cell::Cell::new(0),
             hover_resize_handle: None,
             space_pan: false,
             container_bounds: None,
@@ -715,6 +732,7 @@ impl FigView {
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::StateChanged => {
+                    this.invalidate_local_media_origin();
                     this.reconcile_opened_entry_with_project_root(cx);
                     this.comment_state.clear_pending_motion_anchor();
                     // A reload replaces the document while prototype state
@@ -787,6 +805,7 @@ impl FigView {
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::SourceEditLockChanged => {
+                    this.invalidate_local_media_origin();
                     let source_edit_locked = this.item.read(cx).source_edit_locked();
                     let view = cx.weak_entity();
                     cx.defer(move |cx| {
@@ -801,6 +820,7 @@ impl FigView {
                     cx.emit(FigViewEvent::Edited);
                 }
                 FigItemEvent::ScopeApplied(scope, requester) => {
+                    this.invalidate_local_media_origin();
                     // A scoped open, a tab re-asserting its scope on focus, or
                     // the load-time apply re-targeted the shared document. The
                     // refit decision keys on WHO asked — not on `is_focused`,
@@ -1085,6 +1105,7 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
+        self.invalidate_local_media_origin();
         self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && workspace != EditorWorkspace::Canvas {
             self.exit_prototype_session(cx);
@@ -1106,6 +1127,7 @@ impl FigView {
         if self.editor_mode(cx) == mode {
             return;
         }
+        self.invalidate_local_media_origin();
         self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && mode != EditorMode::Prototype {
             self.exit_prototype_session(cx);
@@ -3381,6 +3403,219 @@ impl FigView {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn timeline_for_test(&self) -> Entity<TimelineShell> {
+        self.timeline_shell.clone()
+    }
+
+    fn invalidate_local_media_origin(&self) {
+        self.media_import_generation
+            .set(self.media_import_generation.get().wrapping_add(1));
+    }
+
+    fn local_media_origin(&self, cx: &Context<Self>) -> Result<LocalMediaOrigin> {
+        let item = self.item.read(cx);
+        anyhow::ensure!(item.is_editable(), "This document is currently read-only.");
+        anyhow::ensure!(
+            item.can_preview_for_owner(cx.entity_id()),
+            "Finish saving or editing this document before placing media."
+        );
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas && self.prototype_player.is_none(),
+            "Return to the canvas editor before placing media."
+        );
+        let inspector = self.inspector_sidebar.read(cx);
+        let pending_edit = item.content_preview_active()
+            || self.text_edit.is_some()
+            || self.pending_text_edit.is_some()
+            || self.motion_keyframe_drag.is_some()
+            || self.primary_pressed
+            || self.canvas_pointer_down
+            || inspector.editing_field.is_some()
+            || inspector.scrub.is_some()
+            || inspector.picker.is_some()
+            || inspector.gradient_editor.is_some()
+            || self.motion_sidebar.read(cx).has_continuous_edit()
+            || self.timeline_shell.read(cx).has_pending_authoring()
+            || self.prototype_sidebar.read(cx).has_pending_parameter_edit()
+            || self.tools.overlays.iter().any(|overlay| {
+                matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewLine { .. }
+                        | fanta_tools::ToolOverlay::PreviewRect { .. }
+                        | fanta_tools::ToolOverlay::PreviewEllipse { .. }
+                )
+            });
+        #[cfg(target_os = "macos")]
+        let pending_edit = pending_edit
+            || self
+                .canvas_video
+                .as_ref()
+                .is_some_and(|session| session.trim.is_some());
+        #[cfg(feature = "fanta-gpui-ui")]
+        let pending_edit = pending_edit
+            || self
+                .gpui_design
+                .as_ref()
+                .is_some_and(|adapter| adapter.session.is_some());
+        anyhow::ensure!(
+            !pending_edit,
+            "Finish or cancel the current edit before placing media."
+        );
+        let document = item
+            .document()
+            .context("The document is no longer available.")?;
+        let page = document
+            .doc
+            .active_page()
+            .context("Choose a page before placing media.")?;
+        anyhow::ensure!(
+            document.doc.pages().contains(&page),
+            "Choose a page before placing media."
+        );
+        Ok(LocalMediaOrigin {
+            item: self.item.entity_id(),
+            scene: document.doc.scene.instance_id(),
+            page,
+            scope: self.scope,
+            mode: self.editor_mode(cx),
+            path: item.abs_path().to_path_buf(),
+            generation: self.media_import_generation.get(),
+        })
+    }
+
+    fn validate_local_media_origin(
+        &self,
+        origin: &LocalMediaOrigin,
+        cx: &Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.local_media_origin(cx)? == *origin,
+            "The document or page changed while choosing media. Choose the file again."
+        );
+        Ok(())
+    }
+
+    pub(crate) fn choose_local_media(&mut self, cx: &mut Context<Self>) {
+        self.choose_local_media_with(
+            |path| async move { crate::generation_media::prepare_local_media(&path).await },
+            cx,
+        );
+    }
+
+    pub(crate) fn choose_local_media_with<Preparation>(
+        &mut self,
+        prepare: impl FnOnce(std::path::PathBuf) -> Preparation + 'static,
+        cx: &mut Context<Self>,
+    ) where
+        Preparation: std::future::Future<Output = Result<crate::generation_media::PreparedLocalMedia>>
+            + Send
+            + 'static,
+    {
+        if self.media_import_task.is_some() {
+            show_canvas_notice_deferred("A media import is already in progress.".into(), cx);
+            return;
+        }
+        let origin = match self.local_media_origin(cx) {
+            Ok(origin) => origin,
+            Err(error) => {
+                show_canvas_notice_deferred(format!("Could not place media: {error:#}"), cx);
+                return;
+            }
+        };
+        let viewport = self.viewport.unwrap_or(Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        });
+        let visible = self
+            .container_bounds
+            .map(bounds_size)
+            .map(|(width, height)| [width / viewport.zoom, height / viewport.zoom])
+            .unwrap_or([1024.0, 768.0]);
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Place image or MP4 video".into()),
+        });
+        self.media_import_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<Option<crate::generation_media::PreparedLocalMedia>> = async {
+                let Some(paths) = paths
+                    .await
+                    .context("The file picker closed unexpectedly.")??
+                else {
+                    return Ok(None);
+                };
+                anyhow::ensure!(paths.len() <= 1, "Choose one image or MP4 video at a time.");
+                let Some(path) = paths.into_iter().next() else {
+                    return Ok(None);
+                };
+                this.update(cx, |this, cx| {
+                    this.validate_local_media_origin(&origin, cx)?;
+                    let name = path
+                        .file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy();
+                    show_canvas_notice_deferred(format!("Preparing {name}…"), cx);
+                    Ok::<_, anyhow::Error>(())
+                })??;
+                let work = cx.background_spawn(prepare(path));
+                let timer = cx
+                    .background_executor()
+                    .timer(std::time::Duration::from_secs(30));
+                let prepared = match futures::future::select(work, timer).await {
+                    futures::future::Either::Left((result, _)) => result?,
+                    futures::future::Either::Right(_) => {
+                        anyhow::bail!("Preparing this media took too long. Try a smaller file.")
+                    }
+                };
+                Ok(Some(prepared))
+            }
+            .await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.media_import_task = None;
+                let result = result.and_then(|prepared| {
+                    let Some(prepared) = prepared else {
+                        return Ok(false);
+                    };
+                    this.validate_local_media_origin(&origin, cx)?;
+                    this.item.update(cx, |item, cx| {
+                        item.with_document(cx, |document| {
+                            crate::generation_media::place_local_media(
+                                document,
+                                prepared,
+                                viewport.center,
+                                visible,
+                            )
+                        })
+                        .context("The media document is no longer available.")?
+                    })?;
+                    Ok(true)
+                });
+                match result {
+                    Ok(true) => {
+                        this.tools.activate_without_context(ToolKind::Select);
+                        this.remember_tool_face(ToolKind::Select);
+                        this.invalidate_canvas_cache();
+                        show_canvas_notice_deferred("Media placed on the canvas.".into(), cx);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        log::warn!("placing local media failed: {error:#}");
+                        show_canvas_notice_deferred(
+                            format!("Could not place media: {error:#}"),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            }) {
+                log::debug!("The media import owner was closed: {error}");
+            }
+        }));
+        cx.notify();
+    }
+
     /// Paste in priority order: a canvas payload copied from this app, then
     /// image bytes from another app, then image files copied in a file
     /// manager. Text without a canvas payload is not pastable on the canvas.
@@ -5594,6 +5829,9 @@ impl Render for FigView {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::cut_selection))
             .on_action(cx.listener(Self::paste_selection))
+            .on_action(cx.listener(|this, _: &PlaceLocalMedia, _, cx| {
+                this.choose_local_media(cx);
+            }))
             .on_action(cx.listener(Self::duplicate_selection))
             .on_action(cx.listener(Self::group_selection))
             .on_action(cx.listener(Self::ungroup_selection))
@@ -6177,6 +6415,7 @@ impl Item for FigView {
     }
 
     fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.invalidate_local_media_origin();
         self.finish_document_edits(cx);
         #[cfg(target_os = "macos")]
         self.set_canvas_video_active(false, cx);
@@ -6189,6 +6428,7 @@ impl Item for FigView {
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
+        self.invalidate_local_media_origin();
         #[cfg(target_os = "macos")]
         {
             self.canvas_video_removed.set(true);
@@ -6539,6 +6779,8 @@ impl Item for FigView {
                 primary_pressed: false,
                 canvas_pointer_down: false,
                 autosave_task: None,
+                media_import_task: None,
+                media_import_generation: std::cell::Cell::new(0),
                 hover_resize_handle: None,
                 space_pan: false,
                 container_bounds: None,
@@ -7053,6 +7295,144 @@ mod tests {
                 .undo_depth()),
             before
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn assert_local_media_preserves_video_trim(cx: &mut TestAppContext, delayed: bool) {
+        let (directory, item, window) = video_trim_view_fixture(cx).await;
+        let snapshot = |item: &FigItem, _cx: &App| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.doc.selection.as_slice().to_vec(),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        };
+        let before = item.read_with(cx, snapshot);
+        let completion = if delayed {
+            let path = directory.path().join("Local picture.png");
+            image::RgbaImage::from_pixel(24, 16, image::Rgba([32, 96, 224, 255]))
+                .save(&path)
+                .expect("local PNG fixture");
+            let (send, receive) = futures::channel::oneshot::channel::<()>();
+            window
+                .update(cx, |view, _, cx| {
+                    view.cancel_video_trim(cx);
+                    view.choose_local_media_with(
+                        move |path| async move {
+                            receive.await.context("release local media preparation")?;
+                            crate::generation_media::prepare_local_media(&path).await
+                        },
+                        cx,
+                    );
+                })
+                .expect("start local media import");
+            cx.run_until_parked();
+            assert!(cx.did_prompt_for_paths());
+            cx.simulate_path_prompt_response(|_| Some(vec![path]));
+            cx.run_until_parked();
+            window
+                .update(cx, |view, window, cx| {
+                    assert!(view.media_import_task.is_some());
+                    let generation = view.media_import_generation.get();
+                    view.begin_video_trim(window, cx);
+                    assert_eq!(
+                        view.media_import_generation.get(),
+                        generation,
+                        "opening trim must exercise the pending edit guard"
+                    );
+                })
+                .expect("open trim while media is preparing");
+            Some(send)
+        } else {
+            None
+        };
+        let draft = window
+            .update(cx, |view, window, cx| {
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("trim draft");
+                trim.start
+                    .update(cx, |input, cx| input.set_text("invalid", window, cx));
+                trim.end
+                    .update(cx, |input, cx| input.set_text("2", window, cx));
+                view.apply_video_trim_with(|_, _| panic!("invalid trim reached decoder"), cx);
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("invalid trim remains open");
+                assert!(trim.error.is_some());
+                assert!(!view.item.read(cx).content_preview_active());
+                (
+                    trim.start.entity_id(),
+                    trim.end.entity_id(),
+                    trim.start.read(cx).text(cx),
+                    trim.end.read(cx).text(cx),
+                    trim.error.clone(),
+                )
+            })
+            .expect("enter invalid trim input");
+        if let Some(send) = completion {
+            send.send(())
+                .unwrap_or_else(|_| panic!("local media preparation must still be pending"));
+        } else {
+            window
+                .update(cx, |view, _, cx| view.choose_local_media(cx))
+                .expect("request import with trim open");
+        }
+        cx.run_until_parked();
+        assert!(!cx.did_prompt_for_paths());
+        assert_eq!(item.read_with(cx, snapshot), before);
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.media_import_task.is_none());
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("media import must preserve the trim draft");
+                assert_eq!(
+                    (
+                        trim.start.entity_id(),
+                        trim.end.entity_id(),
+                        trim.start.read(cx).text(cx),
+                        trim.end.read(cx).text(cx),
+                        trim.error.clone(),
+                    ),
+                    draft
+                );
+                assert!(trim.task.borrow().is_none());
+                assert!(!trim.cancelled.get());
+                view.cancel_video_trim(cx);
+                view.choose_local_media(cx);
+            })
+            .expect("cancel draft and retry import");
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        assert_eq!(item.read_with(cx, snapshot), before);
+        window
+            .update(cx, |view, _, _| assert!(view.media_import_task.is_none()))
+            .expect("cancelled import clears task");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn local_media_picker_preserves_invalid_video_trim(cx: &mut TestAppContext) {
+        assert_local_media_preserves_video_trim(cx, false).await;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn local_media_delayed_completion_preserves_invalid_video_trim(cx: &mut TestAppContext) {
+        assert_local_media_preserves_video_trim(cx, true).await;
     }
 
     #[cfg(target_os = "macos")]
@@ -10958,6 +11338,10 @@ impl FigView {
                 tool: ToolbarTool::Resources,
                 ..
             } => self.reveal_layers_sidebar(window, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::ImageVideo,
+                ..
+            } => self.choose_local_media(cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
                     Some(kind) => self.activate_tool(kind, cx),
@@ -11018,6 +11402,7 @@ impl FigView {
                 ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
                 ToolbarCommand::Export => self.export_from_toolbar(window, cx),
+                ToolbarCommand::PlaceImageVideo => self.choose_local_media(cx),
                 ToolbarCommand::Group => self.group_selection(&GroupSelection, window, cx),
                 ToolbarCommand::Ungroup => self.ungroup_selection(&UngroupSelection, window, cx),
                 ToolbarCommand::FrameSelection => self.frame_selection(&FrameSelection, window, cx),

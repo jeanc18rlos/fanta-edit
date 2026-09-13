@@ -1477,6 +1477,7 @@
       "cmd-c": "fig_viewer::CopySelection",
       "cmd-x": "fig_viewer::CutSelection",
       "cmd-v": "fig_viewer::PasteSelection",
+      "cmd-shift-k": "fig_viewer::PlaceLocalMedia",
       "cmd-d": "fig_viewer::DuplicateSelection",
       "cmd-g": "fig_viewer::GroupSelection",
       "cmd-shift-g": "fig_viewer::UngroupSelection",

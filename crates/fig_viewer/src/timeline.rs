@@ -299,6 +299,12 @@ impl TimelineShell {
         self.authoring_enabled
     }
 
+    pub(crate) fn has_pending_authoring(&self) -> bool {
+        self.editing_clip_field.is_some()
+            || self.easing_edit.is_some()
+            || self.keyframe_drag.is_some()
+    }
+
     pub(crate) fn set_authoring_enabled(
         &mut self,
         authoring_enabled: bool,
@@ -689,6 +695,15 @@ impl TimelineShell {
                     .then_some(TimelineEvent::SetClipDuration(duration_us)))
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_clip_edit_text_for_test(&self, cx: &App) -> Option<String> {
+        let editor = match self.editing_clip_field? {
+            TimelineClipField::Name => self.clip_name_editor.as_ref()?,
+            TimelineClipField::Duration => self.clip_duration_editor.as_ref()?,
+        };
+        Some(editor.read(cx).text(cx))
     }
 
     fn commit_clip_edit(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1485,17 +1500,19 @@ impl TimelineShell {
         if self.editing_clip_field == Some(TimelineClipField::Duration)
             && let Some(editor) = self.clip_duration_editor.clone()
         {
-            return div()
+            let element = div()
                 .id("fanta-motion-clip-duration-editor")
                 .w(px(76.))
                 .h(px(26.))
                 .overflow_hidden()
                 .on_key_down(cx.listener(Self::handle_clip_editor_key_down))
-                .child(editor)
-                .into_any_element();
+                .child(editor);
+            #[cfg(test)]
+            let element = element.debug_selector(|| "fanta-motion-clip-duration-editor".to_owned());
+            return element.into_any_element();
         }
 
-        div()
+        let element = div()
             .id("fanta-motion-clip-duration")
             .h(px(24.))
             .px_1()
@@ -1512,8 +1529,10 @@ impl TimelineShell {
                 Label::new(format_time(self.model.duration_us))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
-            )
-            .into_any_element()
+            );
+        #[cfg(test)]
+        let element = element.debug_selector(|| "fanta-motion-clip-duration".to_owned());
+        element.into_any_element()
     }
 
     fn render_interpolation_dropdown(

@@ -5,9 +5,262 @@ use fanta_doc::{
     Transaction, Transform2D, UnitInterval, VectorNode, VideoNode,
 };
 use serde_json::Value;
-use std::{fs::File, io::Write as _, path::Path, sync::Arc};
+use std::{
+    fs::File,
+    io::{Read as _, Write as _},
+    path::Path,
+    sync::Arc,
+};
 
 use crate::document::{DocChange, FigDocument};
+
+const MAX_LOCAL_VIDEO_BYTES: usize = 100 * 1024 * 1024;
+const MAX_LOCAL_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct PreparedLocalMedia {
+    name: String,
+    content: LocalMediaContent,
+}
+
+#[derive(Clone)]
+enum LocalMediaContent {
+    Image {
+        bytes: Arc<[u8]>,
+        natural_size: [u32; 2],
+    },
+    Video(PreparedVideo),
+}
+
+pub(crate) async fn prepare_local_media(path: &Path) -> Result<PreparedLocalMedia> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let video = extension == "mp4";
+    ensure!(
+        video
+            || matches!(
+                extension.as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif"
+            ),
+        "Choose a PNG, JPEG, WebP, GIF, BMP, TIFF, or MP4 file."
+    );
+    let name = path
+        .file_name()
+        .context("The selected file has no name.")?
+        .to_string_lossy()
+        .into_owned();
+    let limit = if video {
+        MAX_LOCAL_VIDEO_BYTES
+    } else {
+        crate::document::MAX_IMAGE_SOURCE_BYTES
+    };
+    let bytes = read_local_media_file(path, limit)?;
+    let content = if video {
+        ensure!(
+            cfg!(target_os = "macos"),
+            "Local MP4 placement requires the macOS video decoder."
+        );
+        LocalMediaContent::Video(prepare_video(bytes.into()).await?)
+    } else {
+        let natural_size = validate_local_image(&bytes)?;
+        LocalMediaContent::Image {
+            bytes: bytes.into(),
+            natural_size,
+        }
+    };
+    Ok(PreparedLocalMedia { name, content })
+}
+
+fn read_local_media_file(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    ensure!(
+        std::fs::metadata(path)
+            .with_context(|| format!("Reading {}", path.display()))?
+            .is_file(),
+        "Choose a regular image or video file."
+    );
+    let file = File::open(path).with_context(|| format!("Opening {}", path.display()))?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "Choose a regular image or video file.");
+    ensure!(
+        metadata.len() <= limit as u64,
+        "{} exceeds the {} MiB file limit.",
+        path.display(),
+        limit / (1024 * 1024)
+    );
+    // The file can grow after metadata is read. Cap the open handle too, before
+    // either decoder sees the bytes.
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    ensure!(
+        bytes.len() <= limit,
+        "{} exceeds the {} MiB file limit.",
+        path.display(),
+        limit / (1024 * 1024)
+    );
+    Ok(bytes)
+}
+
+fn validate_local_image(bytes: &[u8]) -> Result<[u32; 2]> {
+    let format = image::guess_format(bytes).context("The image format could not be read.")?;
+    ensure!(
+        matches!(
+            format,
+            image::ImageFormat::Png
+                | image::ImageFormat::Jpeg
+                | image::ImageFormat::WebP
+                | image::ImageFormat::Gif
+                | image::ImageFormat::Bmp
+                | image::ImageFormat::Tiff
+        ),
+        "This image format is not supported for local placement."
+    );
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(limits.clone());
+    let (width, height) = reader
+        .into_dimensions()
+        .context("The image dimensions could not be read.")?;
+    ensure!(
+        width > 0 && height > 0 && u64::from(width) * u64::from(height) <= MAX_LOCAL_IMAGE_PIXELS,
+        "The image exceeds the 32 megapixel placement limit."
+    );
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(limits);
+    reader.decode().context("The image could not be decoded.")?;
+    Ok([width, height])
+}
+
+pub(crate) fn place_local_media(
+    document: &mut FigDocument,
+    media: PreparedLocalMedia,
+    center: [f64; 2],
+    visible: [f64; 2],
+) -> (Result<NodeId>, DocChange) {
+    let result = place_local_media_inner(document, media, center, visible);
+    let change = if result.is_ok() {
+        DocChange::Content
+    } else {
+        DocChange::None
+    };
+    (result, change)
+}
+
+fn place_local_media_inner(
+    document: &mut FigDocument,
+    media: PreparedLocalMedia,
+    center: [f64; 2],
+    visible: [f64; 2],
+) -> Result<NodeId> {
+    let page = document
+        .doc
+        .active_page()
+        .context("There is no active page.")?;
+    ensure!(
+        document.doc.pages.contains(&page)
+            && document
+                .pages
+                .iter()
+                .any(|entry| entry.root == Some(page) && !entry.hidden),
+        "Choose a visible document page before placing media."
+    );
+    let root = document
+        .doc
+        .scene
+        .get(page)
+        .context("The page no longer exists.")?;
+    ensure!(
+        root.can_have_children(),
+        "The active page cannot contain media."
+    );
+    for node in std::iter::once(root).chain(document.doc.scene.ancestors_of(page)) {
+        ensure!(
+            !node
+                .flags
+                .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED),
+            "The active page is hidden or locked."
+        );
+    }
+    ensure!(
+        center.into_iter().all(f64::is_finite)
+            && visible
+                .into_iter()
+                .all(|value| value.is_finite() && value > 0.),
+        "The canvas placement bounds are invalid."
+    );
+    let natural_size = match &media.content {
+        LocalMediaContent::Image { natural_size, .. } => *natural_size,
+        LocalMediaContent::Video(video) => [video.metadata.width, video.metadata.height],
+    };
+    ensure!(
+        natural_size.into_iter().all(|value| value > 0),
+        "The media has no pixels."
+    );
+    let fit = (visible[0] * 0.8 / f64::from(natural_size[0]))
+        .min(visible[1] * 0.8 / f64::from(natural_size[1]))
+        .min(1.);
+    let size = [
+        f64::from(natural_size[0]) * fit,
+        f64::from(natural_size[1]) * fit,
+    ];
+    let mut node = crate::structure::image_layer_node(
+        &document.doc,
+        AssetId::new(),
+        natural_size,
+        size,
+        Some(page),
+        center[0] - size[0] * 0.5,
+        center[1] - size[1] * 0.5,
+        Some(&media.name),
+    )?;
+    let mut added_images = Vec::new();
+    let mut video_bytes = None;
+    match media.content {
+        LocalMediaContent::Image { bytes, .. } => {
+            let (asset, _) = document.doc_and_assets().1.add_image(bytes.to_vec())?;
+            added_images.push(asset);
+            if let NodeData::Bitmap(bitmap) = &mut node.data {
+                bitmap.asset = asset;
+            }
+        }
+        LocalMediaContent::Video(video) => {
+            let poster_asset = match &video.poster {
+                Some(poster) => {
+                    let (asset, _) = document.doc_and_assets().1.add_image(poster.png.to_vec())?;
+                    added_images.push(asset);
+                    Some(asset)
+                }
+                None => None,
+            };
+            let asset = AssetId::new();
+            let mut data = video_node_data(&video, asset, poster_asset);
+            data.local_size = size;
+            node.data = NodeData::Video(data);
+            video_bytes = Some((asset, video.bytes));
+        }
+    }
+    let id = node.id;
+    let mut transaction = Transaction::new("Place media");
+    transaction.push(Operation::create_node(node));
+    if let Err(error) = document.doc.apply_transaction(transaction) {
+        for asset in added_images {
+            document.doc_and_assets().1.remove(asset);
+        }
+        return Err(error.into());
+    }
+    if let Some((asset, bytes)) = video_bytes {
+        Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+    }
+    document.doc.selection.select_only(id);
+    Ok(id)
+}
 
 pub(crate) fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
     write_output_with(path, |file| file.write_all(bytes)).context("The result could not be saved")
@@ -404,12 +657,28 @@ pub(crate) struct PreparedVideo {
     pub poster: Option<VideoPoster>,
 }
 
-pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
-    let metadata = mp4_metadata(&bytes)?;
+async fn video_metadata_for_preparation(bytes: &Arc<[u8]>) -> Result<VideoMetadata> {
+    let metadata = mp4_metadata(bytes)?;
     ensure!(
         u64::from(metadata.width) * u64::from(metadata.height) <= 32 * 1024 * 1024,
         "The video resolution is too large to preview. Save it to open it in a video player."
     );
+    #[cfg(target_os = "macos")]
+    let metadata = {
+        // Track durations can include samples excluded by an MP4 edit list.
+        // Placement and trimming must use the same timeline as the player.
+        let playback = media::video::prepare_video_playback(bytes.clone(), 1200)?.await?;
+        VideoMetadata {
+            duration_us: i64::try_from(playback.info().duration_us)
+                .context("The video playback duration is invalid.")?,
+            ..metadata
+        }
+    };
+    Ok(metadata)
+}
+
+pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
+    let metadata = video_metadata_for_preparation(&bytes).await?;
     #[cfg(target_os = "macos")]
     let poster = {
         let frame = media::video::video_frame(bytes.clone(), 1200)?.await?;
@@ -464,7 +733,7 @@ pub(crate) async fn prepare_video_trim(
     bytes: Arc<[u8]>,
     range_us: [i64; 2],
 ) -> Result<PreparedVideoTrim> {
-    let metadata = mp4_metadata(&bytes)?;
+    let metadata = video_metadata_for_preparation(&bytes).await?;
     validate_video_trim(range_us, metadata.duration_us)?;
     let frame = media::video::video_frame_at(bytes, 1200, u64::try_from(range_us[0])?)?.await?;
     let difference = (i64::from(frame.width) * i64::from(metadata.height)
@@ -728,12 +997,7 @@ pub(crate) fn place_video(
     y: f64,
     provenance: Option<Value>,
 ) -> (Result<()>, DocChange) {
-    let PreparedVideo {
-        bytes,
-        metadata,
-        poster,
-    } = video;
-    let poster_asset = match poster.as_ref() {
+    let poster_asset = match video.poster.as_ref() {
         Some(poster) => match document.doc_and_assets().1.add_image(poster.png.to_vec()) {
             Ok((asset, _)) => Some(asset),
             Err(error) => {
@@ -746,18 +1010,11 @@ pub(crate) fn place_video(
         None => None,
     };
     let asset = AssetId::new();
-    let mut node = CanvasNode::new(NodeData::Video(VideoNode {
+    let mut node = CanvasNode::new(NodeData::Video(video_node_data(
+        &video,
         asset,
-        natural_size: [metadata.width, metadata.height],
-        local_size: [metadata.width as f64, metadata.height as f64],
-        time_range_us: [0, metadata.duration_us],
-        speed: 1.,
-        muted: false,
-        volume: 1.,
-        poster_frame_us: poster.map(|poster| poster.time_us),
-        poster: poster_asset,
-        fit: ImageFitMode::Fit,
-    }));
+        poster_asset,
+    )));
     node.name = "Generated video".into();
     node.parent = document.doc.active_page();
     node.index = document.doc.scene.next_child_index(node.parent);
@@ -767,7 +1024,7 @@ pub(crate) fn place_video(
     }
     match document.doc.apply(Operation::create_node(node)) {
         Ok(()) => {
-            Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+            Arc::make_mut(&mut document.raw_assets).insert(asset, video.bytes.to_vec());
             (Ok(()), DocChange::Content)
         }
         Err(error) => {
@@ -779,9 +1036,338 @@ pub(crate) fn place_video(
     }
 }
 
+fn video_node_data(
+    video: &PreparedVideo,
+    asset: AssetId,
+    poster_asset: Option<AssetId>,
+) -> VideoNode {
+    VideoNode {
+        asset,
+        natural_size: [video.metadata.width, video.metadata.height],
+        local_size: [video.metadata.width as f64, video.metadata.height as f64],
+        time_range_us: [0, video.metadata.duration_us],
+        speed: 1.,
+        muted: false,
+        volume: 1.,
+        poster_frame_us: video.poster.as_ref().map(|poster| poster.time_us),
+        poster: poster_asset,
+        fit: ImageFitMode::Fit,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_png(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            width,
+            height,
+            image::Rgba([32, 96, 192, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("PNG fixture");
+        bytes.into_inner()
+    }
+
+    async fn local_media_item(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<crate::document::FigItem>, NodeId) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let project = project::Project::test(project::FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = fanta_doc::Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.transform = Transform2D::scale(2.).then(&Transform2D::translation(100., 50.));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        doc.selection.select_only(page_id);
+        let item =
+            crate::document::ready_item_for_test(&project, "/tmp/Local-media.fig".into(), doc, cx);
+        (item, page_id)
+    }
+
+    #[test]
+    fn local_media_preparation_rejects_unsupported_corrupt_and_oversized_files() {
+        let directory = tempfile::tempdir().expect("directory");
+        for (name, bytes) in [
+            ("unsupported.svg", b"<svg/>".to_vec()),
+            ("corrupt.png", b"not an image".to_vec()),
+            ("corrupt.mp4", b"not a video".to_vec()),
+            ("too-wide.png", local_png(16_385, 1)),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes).expect("fixture");
+            assert!(
+                futures::executor::block_on(prepare_local_media(&path)).is_err(),
+                "{name} must fail before placement"
+            );
+        }
+        for (name, limit) in [
+            ("huge.png", crate::document::MAX_IMAGE_SOURCE_BYTES),
+            ("huge.mp4", MAX_LOCAL_VIDEO_BYTES),
+        ] {
+            let path = directory.path().join(name);
+            File::create(&path)
+                .expect("sparse fixture")
+                .set_len(limit as u64 + 1)
+                .expect("oversized length");
+            let error = futures::executor::block_on(prepare_local_media(&path))
+                .err()
+                .expect("oversized file rejected");
+            assert!(error.to_string().contains("file limit"), "{error:#}");
+        }
+        let bytes = local_png(2, 2);
+        assert!(validate_local_image(bytes.get(..33).expect("PNG header")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_media_preparation_decodes_real_mp4_and_rejects_corrupt_video() {
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("Camera take.MP4");
+        let bytes = include_bytes!("../../media/test_fixtures/quadrants.mp4");
+        std::fs::write(&path, bytes).expect("video fixture");
+        let prepared = futures::executor::block_on(prepare_local_media(&path))
+            .expect("native MP4 preparation");
+        assert_eq!(prepared.name, "Camera take.MP4");
+        let LocalMediaContent::Video(video) = prepared.content else {
+            panic!("prepared video");
+        };
+        assert_eq!(video.bytes.as_ref(), bytes);
+        assert!(video.poster.is_some());
+        let raw_metadata = mp4_metadata(bytes).expect("raw MP4 track metadata");
+        let playback = futures::executor::block_on(
+            media::video::prepare_video_playback(video.bytes.clone(), 1200)
+                .expect("native playback request"),
+        )
+        .expect("native playback metadata");
+        let playable_duration =
+            i64::try_from(playback.info().duration_us).expect("playback duration fits");
+        assert_eq!(raw_metadata.duration_us, 1_250_000);
+        assert_eq!(playable_duration, 1_000_000);
+        assert_eq!(video.metadata.duration_us, playable_duration);
+        let placed_video = video_node_data(&video, AssetId::new(), None);
+        assert_eq!(placed_video.time_range_us, [0, playable_duration]);
+        validate_video_trim(placed_video.time_range_us, playable_duration)
+            .expect("placed range fits the native playback timeline");
+        assert!(validate_video_trim([0, raw_metadata.duration_us], playable_duration).is_err());
+        let trim = futures::executor::block_on(prepare_video_trim(
+            video.bytes.clone(),
+            [250_000, playable_duration],
+        ))
+        .expect("trim within the playable timeline");
+        assert_eq!(trim.source_duration_us, playable_duration);
+        assert!(
+            futures::executor::block_on(prepare_video_trim(
+                video.bytes,
+                [0, raw_metadata.duration_us],
+            ))
+            .is_err()
+        );
+        std::fs::write(
+            &path,
+            include_bytes!("../../media/test_fixtures/quadrants-corrupt.mp4"),
+        )
+        .expect("corrupt video fixture");
+        assert!(futures::executor::block_on(prepare_local_media(&path)).is_err());
+    }
+
+    #[gpui::test]
+    async fn local_media_placement_preserves_name_assets_and_world_bounds_with_one_undo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, page_id) = local_media_item(cx).await;
+        let directory = tempfile::tempdir().expect("directory");
+        let path = directory.path().join("Reference artwork.PNG");
+        let image_bytes = local_png(100, 50);
+        std::fs::write(&path, &image_bytes).expect("image fixture");
+        let image = prepare_local_media(&path).await.expect("image prepared");
+        let video_bytes: Arc<[u8]> = Arc::from(&b"retained source video"[..]);
+        let video = PreparedLocalMedia {
+            name: "Camera take.mp4".to_owned(),
+            content: LocalMediaContent::Video(PreparedVideo {
+                bytes: video_bytes.clone(),
+                metadata: VideoMetadata {
+                    width: 100,
+                    height: 50,
+                    duration_us: 2_000_000,
+                },
+                poster: Some(VideoPoster {
+                    png: local_png(2, 1).into(),
+                    time_us: 0,
+                }),
+            }),
+        };
+        for (prepared, expected_name, expected_bytes) in [
+            (image, "Reference artwork.PNG", image_bytes.as_slice()),
+            (video, "Camera take.mp4", video_bytes.as_ref()),
+        ] {
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let depth = document.doc.history.undo_depth();
+                    let (result, change) =
+                        place_local_media(document, prepared, [80., 60.], [50., 50.]);
+                    let id = result.expect("place local media");
+                    assert_eq!(change, DocChange::Content);
+                    assert_eq!(document.doc.history.undo_depth(), depth + 1);
+                    assert_eq!(document.doc.selection.as_slice(), &[id]);
+                    let node = document.doc.scene.get(id).expect("placed layer").clone();
+                    assert_eq!(node.name, expected_name);
+                    assert_eq!(node.parent, Some(page_id));
+                    assert_eq!(node.meta, Value::Null);
+                    let asset = match &node.data {
+                        NodeData::Bitmap(bitmap) => {
+                            assert_eq!(bitmap.natural_size, [100, 50]);
+                            assert_eq!(bitmap.local_size, [40., 20.]);
+                            bitmap.asset
+                        }
+                        NodeData::Video(video) => {
+                            assert_eq!(video.natural_size, [100, 50]);
+                            assert_eq!(video.local_size, [40., 20.]);
+                            assert_eq!(video.time_range_us, [0, 2_000_000]);
+                            assert!(
+                                document
+                                    .raw_assets
+                                    .contains_key(&video.poster.expect("poster"))
+                            );
+                            video.asset
+                        }
+                        _ => panic!("media node"),
+                    };
+                    assert_eq!(
+                        document.raw_assets.get(&asset).expect("embedded asset"),
+                        expected_bytes
+                    );
+                    let world = document.doc.scene.world_bounds(id).expect("world bounds");
+                    assert_eq!(
+                        (world.min_x, world.min_y, world.max_x, world.max_y),
+                        (60., 50., 100., 70.)
+                    );
+                    assert!(document.doc.undo().expect("undo"));
+                    assert!(document.doc.scene.get(id).is_none());
+                    assert_eq!(document.doc.history.undo_depth(), depth);
+                    assert!(document.doc.redo().expect("redo"));
+                    assert_eq!(document.doc.scene.get(id), Some(&node));
+                    assert_eq!(
+                        document
+                            .raw_assets
+                            .get(&asset)
+                            .expect("asset retained for redo"),
+                        expected_bytes
+                    );
+                    ((), DocChange::Content)
+                })
+                .expect("document");
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn local_media_placement_failures_preserve_existing_assets_selection_and_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, page_id) = local_media_item(cx).await;
+        let image = PreparedLocalMedia {
+            name: "Reference.png".to_owned(),
+            content: LocalMediaContent::Image {
+                bytes: local_png(2, 2).into(),
+                natural_size: [2, 2],
+            },
+        };
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document
+                    .doc_and_assets()
+                    .1
+                    .add_image(local_png(1, 1))
+                    .expect("existing image");
+                let assets = document.raw_assets.clone();
+                let depth = document.doc.history.undo_depth();
+                let selection = document.doc.selection.as_slice().to_vec();
+                for case in [
+                    "locked",
+                    "hidden",
+                    "singular",
+                    "non-page",
+                    "missing",
+                    "invalid-bounds",
+                    "corrupt-poster",
+                ] {
+                    let original_root = document.doc.scene.get(page_id).expect("page").clone();
+                    let mut prepared = image.clone();
+                    let mut center = [0., 0.];
+                    match case {
+                        "locked" => document
+                            .doc
+                            .scene
+                            .get_mut(page_id)
+                            .expect("page")
+                            .flags
+                            .insert(fanta_doc::NodeFlags::LOCKED),
+                        "hidden" => {
+                            document
+                                .pages
+                                .iter_mut()
+                                .find(|page| page.root == Some(page_id))
+                                .expect("page")
+                                .hidden = true
+                        }
+                        "singular" => {
+                            document.doc.scene.get_mut(page_id).expect("page").transform =
+                                Transform2D::scale(0.)
+                        }
+                        "non-page" => document.doc.pages.clear(),
+                        "missing" => {
+                            document.doc.set_active_page(None);
+                        }
+                        "invalid-bounds" => center[0] = f64::NAN,
+                        "corrupt-poster" => {
+                            prepared.content = LocalMediaContent::Video(PreparedVideo {
+                                bytes: Arc::from(&b"source"[..]),
+                                metadata: VideoMetadata {
+                                    width: 2,
+                                    height: 2,
+                                    duration_us: 1000,
+                                },
+                                poster: Some(VideoPoster {
+                                    png: Arc::from(&b"bad poster"[..]),
+                                    time_us: 0,
+                                }),
+                            })
+                        }
+                        _ => unreachable!(),
+                    }
+                    let (result, change) =
+                        place_local_media(document, prepared, center, [100., 100.]);
+                    assert!(result.is_err(), "{case}");
+                    assert_eq!(change, DocChange::None, "{case}");
+                    assert_eq!(document.raw_assets, assets, "{case}");
+                    assert_eq!(
+                        document.doc.selection.as_slice(),
+                        selection.as_slice(),
+                        "{case}"
+                    );
+                    assert_eq!(document.doc.history.undo_depth(), depth, "{case}");
+                    *document.doc.scene.get_mut(page_id).expect("page") = original_root;
+                    document.doc.pages = vec![page_id];
+                    document.doc.set_active_page(Some(page_id));
+                    document
+                        .pages
+                        .iter_mut()
+                        .find(|page| page.root == Some(page_id))
+                        .expect("page")
+                        .hidden = false;
+                }
+                ((), DocChange::None)
+            })
+            .expect("document");
+        });
+    }
 
     #[test]
     fn output_partial_write_failure_preserves_existing_file() {
