@@ -1306,21 +1306,45 @@ mod tests {
             })
             .expect("Save route");
         assert!(save.await.is_err());
+        let file_system = fixture
+            .project
+            .read_with(cx, |project, _| project.fs().clone());
+        let destination_root = std::path::Path::new("/annotation-save-as-denial");
+        file_system
+            .create_dir(destination_root)
+            .await
+            .expect("fake destination worktree");
+        fixture
+            .project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(destination_root, true, cx)
+            })
+            .await
+            .expect("register destination worktree");
+        let destination_path = destination_root.join("Annotation Copy");
+        let destination = fixture
+            .project
+            .read_with(cx, |project, cx| {
+                project.find_project_path(&destination_path, cx)
+            })
+            .expect("valid project-relative Save As destination");
         let save_as = fixture
             .scratch
             .update(cx, |_, window, cx| {
                 fixture.view.update(cx, |view, cx| {
-                    Item::save_as(
-                        view,
-                        fixture.project.clone(),
-                        "/tmp/Annotation-copy-should-not-exist".into(),
-                        window,
-                        cx,
-                    )
+                    Item::save_as(view, fixture.project.clone(), destination, window, cx)
                 })
             })
             .expect("Save As route");
-        assert!(save_as.await.is_err());
+        let error = save_as.await.expect_err("unsent annotation blocks Save As");
+        assert!(error.to_string().contains("annotation"));
+        assert!(
+            file_system
+                .metadata(&destination_path)
+                .await
+                .expect("destination metadata")
+                .is_none()
+        );
         fixture.view.update(cx, |view, cx| {
             assert_eq!(
                 view.annotation_state
@@ -1830,7 +1854,7 @@ mod tests {
             .expect("Save target");
         cx.simulate_click(submit.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        view.update_in(cx, |view, window, cx| {
+        view.update_in(cx, |view, window, _| {
             assert!(!view.annotation_state.controller.has_pending_authoring());
             assert!(view.focus_handle.is_focused(window));
         });
