@@ -50,7 +50,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
     ],
     &[ToolKind::NodeEdit, ToolKind::Pencil, ToolKind::Pen],
     &[ToolKind::Text, ToolKind::TextPath],
-    &[ToolKind::Comment, ToolKind::Measure],
+    &[ToolKind::Comment, ToolKind::Measure, ToolKind::Annotation],
 ];
 
 /// The default face (button icon) for each toolbar group before the user picks
@@ -91,6 +91,7 @@ pub enum ToolKind {
     TextPath,
     Comment,
     Measure,
+    Annotation,
 }
 
 impl ToolKind {
@@ -117,6 +118,7 @@ impl ToolKind {
             Self::TextPath => "Text on Path",
             Self::Comment => "Comment",
             Self::Measure => "Measurement",
+            Self::Annotation => "Annotation",
         }
     }
 
@@ -142,6 +144,7 @@ impl ToolKind {
             Self::Text => IconName::ToolText,
             Self::TextPath => IconName::ToolTextPath,
             Self::Comment => IconName::Chat,
+            Self::Annotation => IconName::ToolPencil,
             Self::Measure => IconName::ArrowRightLeft,
         }
     }
@@ -173,7 +176,7 @@ impl ToolKind {
             // Comment mode is handled by the shell (click-to-pin); the select
             // tool backs it so unconsumed events stay harmless.
             Self::Comment => Box::new(SelectTool::new()),
-            Self::Measure => Box::new(MeasureTool),
+            Self::Measure | Self::Annotation => Box::new(MeasureTool),
         }
     }
 }
@@ -471,6 +474,15 @@ mod tests {
     fn measure_fallback_cannot_author_or_change_selection() {
         assert_host_fallback_is_inert(
             ToolKind::Measure,
+            CursorHint::Crosshair,
+            CursorStyle::Crosshair,
+        );
+    }
+
+    #[test]
+    fn annotation_fallback_cannot_author_or_change_selection() {
+        assert_host_fallback_is_inert(
+            ToolKind::Annotation,
             CursorHint::Crosshair,
             CursorStyle::Crosshair,
         );

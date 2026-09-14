@@ -3,6 +3,7 @@
 //! panels and the floating canvas toolbar.
 
 mod agent_surface;
+mod annotations;
 mod canvas;
 mod clipboard;
 mod code_workspace;

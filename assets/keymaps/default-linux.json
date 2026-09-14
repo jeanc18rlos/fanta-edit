@@ -1573,6 +1573,7 @@
       "l": "fig_viewer::ActivateLineTool",
       "shift-l": "fig_viewer::ActivateArrowTool",
       "shift-m": "fig_viewer::ActivateMeasureTool",
+      "shift-t": "fig_viewer::ActivateAnnotationTool",
       "p": "fig_viewer::ActivatePenTool",
       "shift-p": "fig_viewer::ActivatePolygonTool",
       "a": "fig_viewer::ActivateNodeEditTool",
