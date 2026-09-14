@@ -377,6 +377,9 @@ impl FigView {
             },
         ));
         editor.read(cx).focus_handle(cx).focus(window, cx);
+        // A canvas press bubbles past this newly focused editor to FigView's
+        // tracked-focus element, whose default would otherwise steal focus back.
+        window.prevent_default();
         self.annotation_state.editor = Some(editor);
         self.annotation_state.error = None;
         self.inspector_sidebar_visible = true;
@@ -1794,7 +1797,7 @@ mod tests {
             );
             view.container_bounds.expect("mounted canvas bounds")
         });
-        cx.simulate_click(canvas.center(), gpui::Modifiers::none());
+        cx.simulate_mouse_down(canvas.center(), MouseButton::Left, gpui::Modifiers::none());
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             assert!(view.annotation_state.controller.has_pending_authoring());
@@ -1803,6 +1806,18 @@ mod tests {
                     .editor
                     .as_ref()
                     .expect("click opened the annotation editor")
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+        cx.simulate_mouse_up(canvas.center(), MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(
+                view.annotation_state
+                    .editor
+                    .as_ref()
+                    .expect("annotation editor after pointer release")
                     .focus_handle(cx)
                     .is_focused(window)
             );
