@@ -18,6 +18,7 @@ pub struct CollapsibleIconTab {
     icon: IconName,
     label: SharedString,
     selected: bool,
+    preserve_focus: bool,
     on_click: TabHandler,
 }
 
@@ -36,8 +37,13 @@ impl CollapsibleIconTab {
             icon,
             label: label.into(),
             selected,
+            preserve_focus: false,
             on_click: Rc::new(on_click),
         }
+    }
+    pub fn preserve_focus(mut self) -> Self {
+        self.preserve_focus = true;
+        self
     }
 }
 
@@ -93,9 +99,17 @@ impl RenderOnce for CollapsibleIconTab {
                 tab.text_color(cx.theme().colors().text_muted)
                     .hover(|tab| tab.bg(cx.theme().colors().element_hover))
             })
+            .when(self.preserve_focus, |tab| {
+                tab.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                    window.prevent_default()
+                })
+            })
             .on_click(move |_, window, cx| on_click(window, cx))
             .child(Icon::new(self.icon).size(IconSize::Small))
             .when(selected, |tab| tab.child(label));
+        #[cfg(test)]
+        let tab = tab
+            .debug_selector(move || format!("fanta-collapsible-tab-{}-{}", self.scope, self.index));
         let animation_state = if selected { "expand" } else { "collapsed" };
 
         tab.with_animation(

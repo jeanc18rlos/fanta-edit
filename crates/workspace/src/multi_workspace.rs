@@ -537,6 +537,30 @@ impl MultiWorkspace {
         }
     }
 
+    pub fn can_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let workspaces = self.workspaces().cloned().collect::<Vec<_>>();
+        self.can_close_workspaces(&workspaces, window, cx)
+    }
+
+    fn can_close_workspaces(
+        &mut self,
+        workspaces: &[Entity<Workspace>],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        for workspace in workspaces {
+            if !workspace.update(cx, |workspace, cx| workspace.can_close_items(window, cx)) {
+                for retained in workspaces {
+                    retained.update(cx, |workspace, cx| workspace.cancel_close(window, cx));
+                }
+                self.activate(workspace.clone(), None, window, cx);
+                window.activate_window();
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
             let workspaces = this.update(cx, |multi_workspace, _cx| {
@@ -550,12 +574,15 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 if !should_continue {
+                    this.update_in(cx, |this, window, cx| this.can_close(window, cx))?;
                     return anyhow::Ok(());
                 }
             }
 
-            cx.update(|window, _cx| {
-                window.remove_window();
+            this.update_in(cx, |this, window, cx| {
+                if this.can_close(window, cx) {
+                    window.remove_window();
+                }
             })?;
 
             anyhow::Ok(())
@@ -1975,6 +2002,9 @@ impl MultiWorkspace {
                     .await?;
 
                 if !should_continue {
+                    this.update_in(cx, |this, window, cx| {
+                        this.can_close_workspaces(&workspaces, window, cx)
+                    })?;
                     return Ok(false);
                 }
             }
@@ -2002,7 +2032,10 @@ impl MultiWorkspace {
             }
 
             // Actually remove the workspaces.
-            this.update_in(cx, |this, _, cx| {
+            this.update_in(cx, |this, window, cx| {
+                if !this.can_close_workspaces(&workspaces, window, cx) {
+                    return Ok(false);
+                }
                 let mut removed_any = false;
 
                 for workspace in &workspaces {
@@ -2071,11 +2104,21 @@ impl MultiWorkspace {
                 let new_workspace = create_task.await?;
 
                 if let Some(empty_workspace) = empty_workspace {
-                    this.update(cx, |this, cx| {
+                    if !this.update_in(cx, |this, window, cx| {
+                        if !this.can_close_workspaces(
+                            std::slice::from_ref(&empty_workspace),
+                            window,
+                            cx,
+                        ) {
+                            return false;
+                        }
                         if this.is_workspace_retained(&empty_workspace) {
                             this.detach_workspace(&empty_workspace, cx);
                         }
-                    })?;
+                        true
+                    })? {
+                        return Ok(empty_workspace);
+                    }
                 }
 
                 Ok(new_workspace)

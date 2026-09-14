@@ -83,6 +83,8 @@ mod tests {
         active_modes: BTreeMap<VariableCollectionId, ModeId>,
         motion: crate::motion::MotionLibrary,
         flow_start: Option<NodeId>,
+        pages: Vec<NodeId>,
+        active_page: Option<NodeId>,
     }
     impl TestDoc {
         fn new() -> Self {
@@ -93,6 +95,8 @@ mod tests {
                 active_modes: BTreeMap::new(),
                 motion: crate::motion::MotionLibrary::new(),
                 flow_start: None,
+                pages: Vec::new(),
+                active_page: None,
             }
         }
         fn ctx(&mut self) -> OpCtx<'_> {
@@ -103,7 +107,76 @@ mod tests {
                 active_modes: &mut self.active_modes,
                 motion: &mut self.motion,
                 flow_start: &mut self.flow_start,
+                pages: &mut self.pages,
+                active_page: &mut self.active_page,
             }
+        }
+    }
+
+    #[test]
+    fn page_registry_round_trip_preserves_order_and_component_scope() {
+        let mut td = TestDoc::new();
+        let first = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.parent = Some(first.id);
+        td.scene.insert(first.clone()).expect("first page");
+        td.scene.insert(second.clone()).expect("second page");
+        td.scene.insert(master.clone()).expect("component root");
+        let component = ComponentId::new();
+        td.components
+            .defs
+            .insert(component, ComponentDef::new(component, master.id, "Master"));
+        td.pages = vec![first.id, second.id];
+        td.active_page = Some(master.id);
+        let operation = Operation::SetPageRegistry {
+            old_pages: td.pages.clone(),
+            new_pages: vec![second.id, first.id],
+            old_active_page: td.active_page,
+            new_active_page: Some(second.id),
+        };
+        operation.apply(&mut td.ctx()).expect("reorder");
+        assert_eq!(td.pages, vec![second.id, first.id]);
+        assert_eq!(td.active_page, Some(second.id));
+        operation.revert(&mut td.ctx()).expect("undo reorder");
+        assert_eq!(td.pages, vec![first.id, second.id]);
+        assert_eq!(td.active_page, Some(master.id));
+        let encoded = serde_json::to_string(&operation).expect("serialize");
+        let decoded: Operation = serde_json::from_str(&encoded).expect("deserialize");
+        decoded.apply(&mut td.ctx()).expect("replay");
+        assert_eq!(td.pages, vec![second.id, first.id]);
+    }
+
+    #[test]
+    fn page_registry_rejects_invalid_roots_and_active_membership_without_mutation() {
+        let mut td = TestDoc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let mut nested = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        nested.parent = Some(page.id);
+        let vector = rect_node();
+        for node in [page.clone(), nested.clone(), vector.clone()] {
+            td.scene.insert(node).expect("insert fixture");
+        }
+        td.pages = vec![page.id];
+        td.active_page = Some(page.id);
+        let missing = NodeId::new();
+        for (pages, active) in [
+            (vec![page.id, page.id], Some(page.id)),
+            (vec![missing], Some(missing)),
+            (vec![nested.id], Some(nested.id)),
+            (vec![vector.id], Some(vector.id)),
+            (vec![page.id], Some(nested.id)),
+            (vec![page.id], Some(missing)),
+        ] {
+            let operation = Operation::SetPageRegistry {
+                old_pages: td.pages.clone(),
+                new_pages: pages,
+                old_active_page: td.active_page,
+                new_active_page: active,
+            };
+            assert!(operation.apply(&mut td.ctx()).is_err());
+            assert_eq!(td.pages, vec![page.id]);
+            assert_eq!(td.active_page, Some(page.id));
         }
     }
 

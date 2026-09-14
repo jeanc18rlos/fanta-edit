@@ -147,6 +147,217 @@ fn mode_controls_share_pointer_enter_and_space_activation(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn dev_tool_shortcuts_cannot_switch_modes_or_request_hidden_artwork_tools(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+    cx.update(|window, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_mode(ToolbarMode::Dev, cx);
+            toolbar.set_active_tool(ToolbarTool::Inspect, cx);
+            toolbar.focus_handle.focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    for selector in [
+        "toolbar-tool-inspect",
+        "toolbar-tool-hand",
+        "toolbar-tool-measurement",
+        "toolbar-tool-annotation",
+        "toolbar-tool-saved-code",
+        "toolbar-tool-actions",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    for selector in [
+        "toolbar-group-move-tools-trigger",
+        "toolbar-tool-color-picker",
+        "toolbar-tool-comment",
+    ] {
+        assert!(cx.debug_bounds(selector).is_none(), "unexpected {selector}");
+    }
+
+    cx.simulate_keystrokes("r k f t c p l shift-l shift-i");
+    cx.run_until_parked();
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            for tool in [
+                ToolbarTool::ColorPicker,
+                ToolbarTool::Variables,
+                ToolbarTool::ReadyForDev,
+                ToolbarTool::NodeEdit,
+            ] {
+                toolbar.request_tool(tool, cx);
+            }
+        });
+    });
+    cx.run_until_parked();
+    assert!(actions.borrow().is_empty());
+    assert_eq!(cx.read(|app| toolbar.read(app).mode()), ToolbarMode::Dev);
+    assert_eq!(
+        cx.read(|app| toolbar.read(app).active_tool()),
+        ToolbarTool::Inspect
+    );
+
+    cx.simulate_keystrokes("v h shift-m shift-t");
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[
+            ToolbarTool::Inspect,
+            ToolbarTool::Hand,
+            ToolbarTool::Measure,
+            ToolbarTool::Annotation,
+        ]
+        .map(|tool| ToolbarAction::ToolChangeRequested {
+            mode: ToolbarMode::Dev,
+            tool,
+        })
+    );
+
+    actions.borrow_mut().clear();
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| toolbar.set_mode(ToolbarMode::Design, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("r");
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[ToolbarAction::ToolChangeRequested {
+            mode: ToolbarMode::Design,
+            tool: ToolbarTool::Rectangle,
+        }]
+    );
+}
+
+#[gpui::test]
+fn unavailable_readiness_is_inert_for_pointer_keyboard_and_direct_control_requests(
+    cx: &mut TestAppContext,
+) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+    cx.update(|window, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_mode(ToolbarMode::Dev, cx);
+            toolbar.set_active_tool(ToolbarTool::Inspect, cx);
+            toolbar.focus_handle.focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(!cx.read(|app| toolbar.read(app).dev_options().readiness_available));
+    let readiness = cx
+        .debug_bounds("toolbar-secondary-dev-ready")
+        .expect("readiness control");
+    cx.simulate_click(readiness.center(), Modifiers::none());
+    cx.simulate_keystrokes("enter space");
+    cx.run_until_parked();
+    assert!(actions.borrow().is_empty());
+
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_dev_options(
+                DevToolbarOptions {
+                    readiness_available: true,
+                    ready_for_development: false,
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    let readiness = cx
+        .debug_bounds("toolbar-secondary-dev-ready")
+        .expect("enabled readiness");
+    cx.simulate_click(readiness.center(), Modifiers::none());
+    cx.simulate_keystrokes("enter space");
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        vec![
+            ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Dev,
+                control: ToolbarSecondaryControl::DevReadyForDevelopment,
+                value: ToolbarControlValue::Toggle(true),
+            };
+            3
+        ]
+        .as_slice()
+    );
+
+    actions.borrow_mut().clear();
+    cx.update(|_, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_dev_options(
+                DevToolbarOptions {
+                    readiness_available: false,
+                    ready_for_development: true,
+                },
+                cx,
+            );
+            toolbar.request_secondary(ToolbarSecondaryControl::DevReadyForDevelopment, cx);
+            toolbar.request_control_value(
+                ToolbarSecondaryControl::DevReadyForDevelopment,
+                ToolbarControlValue::Toggle(false),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter space");
+    let readiness = cx
+        .debug_bounds("toolbar-secondary-dev-ready")
+        .expect("disabled readiness");
+    cx.simulate_click(readiness.center(), Modifiers::none());
+    cx.run_until_parked();
+    assert!(actions.borrow().is_empty());
+    assert_eq!(cx.read(|app| host.read(app).canvas_presses), 0);
+}
+
+#[gpui::test]
+fn actions_reject_commands_removed_from_the_current_catalog(cx: &mut TestAppContext) {
+    let (host, cx) = setup(cx);
+    cx.simulate_resize(size(px(1200.), px(700.)));
+    let toolbar = cx.read(|app| host.read(app).toolbar.clone());
+    let actions = cx.read(|app| host.read(app).actions.clone());
+    cx.update(|window, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_mode(ToolbarMode::Dev, cx);
+            toolbar.set_commands([ToolbarCommand::Delete, ToolbarCommand::ZoomToFit], cx);
+            toolbar.open_actions(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("toolbar-command-delete").is_some());
+    cx.update(|window, app| {
+        toolbar.update(app, |toolbar, cx| {
+            toolbar.set_commands([ToolbarCommand::ZoomToFit], cx);
+            toolbar.invoke_command(ToolbarCommand::Delete, window, cx);
+            toolbar.invoke_command(ToolbarCommand::ReplaceContent, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(actions.borrow().is_empty());
+    assert!(cx.debug_bounds("toolbar-command-delete").is_none());
+    assert_eq!(
+        cx.read(|app| toolbar.read(app).overlay),
+        Some(ToolbarOverlay::Actions)
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        actions.borrow().as_slice(),
+        &[ToolbarAction::CommandInvoked {
+            command: ToolbarCommand::ZoomToFit
+        }]
+    );
+    assert_eq!(cx.read(|app| toolbar.read(app).overlay), None);
+}
+
+#[gpui::test]
 fn actions_query_accepts_backward_and_forward_deletion(cx: &mut TestAppContext) {
     let (host, cx) = setup(cx);
     let toolbar = cx.read(|app| host.read(app).toolbar.clone());

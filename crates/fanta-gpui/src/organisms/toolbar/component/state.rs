@@ -374,6 +374,14 @@ impl EditorToolbar {
     }
 
     pub(super) fn request_tool(&mut self, tool: ToolbarTool, cx: &mut Context<Self>) {
+        let tool = if self.mode == ToolbarMode::Dev && tool == ToolbarTool::Move {
+            ToolbarTool::Inspect
+        } else {
+            tool
+        };
+        if self.mode == ToolbarMode::Dev && !tool.is_available_in(self.mode) {
+            return;
+        }
         self.set_overlay(None, cx);
         let requested_mode = if tool.is_available_in(self.mode) {
             self.mode
@@ -684,6 +692,9 @@ impl EditorToolbar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.commands.contains(&command) {
+            return;
+        }
         cx.emit(ToolbarAction::CommandInvoked { command });
         match command {
             ToolbarCommand::ReplaceContent
@@ -742,6 +753,11 @@ impl EditorToolbar {
         control: ToolbarSecondaryControl,
         cx: &mut Context<Self>,
     ) {
+        if control == ToolbarSecondaryControl::DevReadyForDevelopment
+            && !self.dev_options.readiness_available
+        {
+            return;
+        }
         cx.emit(ToolbarAction::SecondaryControlInvoked {
             mode: self.mode,
             control,
@@ -754,6 +770,11 @@ impl EditorToolbar {
         value: ToolbarControlValue,
         cx: &mut Context<Self>,
     ) {
+        if control == ToolbarSecondaryControl::DevReadyForDevelopment
+            && !self.dev_options.readiness_available
+        {
+            return;
+        }
         cx.emit(ToolbarAction::ControlChangeRequested {
             mode: self.mode,
             control,
