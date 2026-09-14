@@ -8574,6 +8574,283 @@ mod tests {
         assert_native_inspector_workspace_save(cx, true).await;
     }
 
+    #[derive(Clone, Copy)]
+    enum LegacyEscapeEntry {
+        FocusedField,
+        NativeInspectMenu,
+        #[cfg(feature = "fanta-gpui-ui")]
+        SharedInspectMenu,
+    }
+
+    async fn assert_workspace_legacy_escape_restores_preview(
+        cx: &mut TestAppContext,
+        entry: LegacyEscapeEntry,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        #[cfg(feature = "fanta-gpui-ui")]
+        if matches!(entry, LegacyEscapeEntry::SharedInspectMenu) {
+            cx.update(|cx| {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            });
+        }
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("complete shipped keymap including Editor and Workspace Escape");
+            cx.bind_keys(bindings);
+        });
+        let directory = tempfile::tempdir().expect("temporary Escape project");
+        let root = directory.path().join("Legacy Escape");
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        crate::document::write_project(&root, &doc, &BTreeMap::new()).expect("baseline project");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let (shell, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = shell.read_with(cx, |shell, _| shell.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            #[cfg(feature = "fanta-gpui-ui")]
+            view.update(cx, |view, cx| {
+                view.gpui_design = None;
+                cx.notify();
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        let original = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("snapshot")
+        });
+        let refresh_bounds = |cx: &mut gpui::VisualTestContext| {
+            // Cached pane replays omit per-frame debug bounds; read the current mounted frame.
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        };
+        refresh_bounds(cx);
+        let field = cx.debug_bounds("scrub-fanta-x-0").expect("legacy X field");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        let select_all_key = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(select_all_key);
+        cx.simulate_input("55.5");
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(crate::properties_snapshot::InspectorField::X(vector_id))
+            );
+            assert_eq!(panel.field_editor.read(cx).text(cx), "55.5");
+        });
+        item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .transform
+                    .0
+                    .translation
+                    .x,
+                55.5
+            );
+        });
+        let open_inspect = |cx: &mut gpui::VisualTestContext| {
+            refresh_bounds(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            if matches!(entry, LegacyEscapeEntry::SharedInspectMenu) {
+                let trigger = cx
+                    .debug_bounds("toolbar-group-move-tools-trigger")
+                    .expect("shared Move caret");
+                cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                refresh_bounds(cx);
+                let row = cx
+                    .debug_bounds("toolbar-flyout-inspect")
+                    .expect("shared Inspect row");
+                cx.simulate_click(row.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                return;
+            }
+            let trigger = cx
+                .debug_bounds("native-tool-menu-0")
+                .expect("native Move caret");
+            cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+                // TestWindow does not drive PopoverMenu's platform focus callback.
+                cx.global::<NativeToolbarMenuFocus>()
+                    .0
+                    .clone()
+                    .focus(window, cx);
+            });
+            cx.run_until_parked();
+            refresh_bounds(cx);
+            let row = cx
+                .debug_bounds("MENU_ITEM-Inspect")
+                .expect("native Inspect row");
+            cx.simulate_click(row.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        if !matches!(entry, LegacyEscapeEntry::FocusedField) {
+            open_inspect(cx);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.active_tool()),
+                ToolKind::Select
+            );
+            inspector.read_with(cx, |panel, cx| {
+                assert!(panel.editing_field.is_some());
+                assert_eq!(panel.field_editor.read(cx).text(cx), "55.5");
+            });
+            cx.simulate_click(field.center(), gpui::Modifiers::none());
+            cx.simulate_keystrokes(select_all_key);
+            cx.simulate_input("60");
+            cx.run_until_parked();
+            inspector.read_with(cx, |panel, cx| {
+                assert_eq!(panel.field_editor.read(cx).text(cx), "60")
+            });
+        }
+        cx.update(|window, cx| {
+            assert!(
+                inspector
+                    .read(cx)
+                    .field_editor
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "the refocused live editor receives Escape"
+            );
+            let contexts = window.context_stack();
+            for name in ["Workspace", "FigViewer", "FantaPropertiesPanel", "Editor"] {
+                assert!(
+                    contexts.iter().any(|context| context.contains(name)),
+                    "missing {name}: {contexts:?}"
+                );
+            }
+        });
+        let escaped_editor_cancel = std::rc::Rc::new(std::cell::Cell::new(None));
+        let _keys =
+            cx.update(|_, cx| {
+                let escaped_editor_cancel = escaped_editor_cancel.clone();
+                cx.observe_keystrokes(move |event, _, _| {
+                    if event.keystroke.key == "escape" {
+                        escaped_editor_cancel.set(Some(event.action.as_ref().is_some_and(
+                            |action| action.as_any().is::<editor::actions::Cancel>(),
+                        )));
+                    }
+                })
+            });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(
+            escaped_editor_cancel.get(),
+            Some(true),
+            "the propagated Editor Cancel is consumed before Workspace Unfollow"
+        );
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("restored snapshot"),
+                original
+            );
+        });
+        open_inspect(cx);
+        assert!(view.read_with(cx, |view, _| view.is_inspecting()));
+        let save_key = if cfg!(target_os = "macos") {
+            "cmd-s"
+        } else {
+            "ctrl-s"
+        };
+        cx.simulate_keystrokes(save_key);
+        cx.run_until_parked();
+        cx.condition(&item, |item, _| {
+            !item.is_dirty() && !item.content_preview_active()
+        })
+        .await;
+        let (saved, _) = fanta_format::read_project_tree(&root).expect("reopen canceled project");
+        assert_eq!(
+            saved
+                .scene
+                .get(vector_id)
+                .expect("saved vector")
+                .transform
+                .0
+                .translation
+                .x,
+            0.0
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert_eq!(
+                saved.scene.get(vector_id),
+                item.doc().expect("document").scene.get(vector_id)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_escape_restores_a_focused_legacy_numeric_preview(cx: &mut TestAppContext) {
+        assert_workspace_legacy_escape_restores_preview(cx, LegacyEscapeEntry::FocusedField).await;
+    }
+
+    #[gpui::test]
+    async fn workspace_escape_restores_legacy_preview_after_native_inspect_refusal(
+        cx: &mut TestAppContext,
+    ) {
+        assert_workspace_legacy_escape_restores_preview(cx, LegacyEscapeEntry::NativeInspectMenu)
+            .await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn workspace_escape_restores_legacy_preview_after_shared_inspect_refusal(
+        cx: &mut TestAppContext,
+    ) {
+        assert_workspace_legacy_escape_restores_preview(cx, LegacyEscapeEntry::SharedInspectMenu)
+            .await;
+    }
+
     async fn assert_native_inspect_menu_preserves_numeric_draft(
         cx: &mut TestAppContext,
         invalid: bool,

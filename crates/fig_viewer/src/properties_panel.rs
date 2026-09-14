@@ -2911,6 +2911,18 @@ impl Render for FantaPropertiesPanel {
         let root = v_flex()
             .key_context("FantaPropertiesPanel")
             .track_focus(&self.focus_handle)
+            // Bound actions run before raw key listeners. Consume a propagated
+            // editor cancellation before the workspace's Escape binding, while
+            // letting the editor dismiss its own menus first.
+            .on_action(
+                cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                    if this.editing_field.is_some() {
+                        this.cancel_editing(window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_drag_move(cx.listener(Self::handle_scrub_move))
             .on_drop(cx.listener(|this, _: &PanelDrag, _, cx| this.finish_scrub(cx)))
