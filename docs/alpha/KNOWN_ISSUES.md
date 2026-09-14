@@ -108,8 +108,15 @@ actually driven. Nothing here claims more than that record supports.
 
 ## Canvas and tools
 
-- **Unfinished roadmap faces either decline explicitly or stay hidden.** Direct
-  Image/Video placement, Arrow, Annotation, Measure, Dev mode/tools, arbitrary
+- **Inspect is a standalone Design tool.** Choose Inspect from the Move menu to
+  select layers and copy read-only properties. It blocks authoring actions in
+  that view until an explicit tool or mode exit; unfinished drafts must be
+  finished or canceled before entry. Locked layers can be inspected through
+  Layers. On-canvas sizes and gaps are transient world-space guides, not saved
+  measurements. Arrow drawing and local image/MP4 placement are implemented;
+  these no longer belong to the unavailable toolbar inventory.
+- **Unfinished roadmap faces either decline explicitly or stay hidden.**
+  Annotation, persistent Measure, full Dev mode/readiness, arbitrary
   toolbar file attachment and voice, direct-canvas auto-keyframe recording, page duplication,
   and page links are not implemented. Their visible
   handlers raise *"&lt;control&gt; is not available in the Fanta alpha yet."* or an

@@ -148,6 +148,7 @@ pub struct PagesPanel {
     next_result_focus_handle: FocusHandle,
     pages: Vec<PagesPanelItem>,
     expanded: bool,
+    read_only: bool,
     selected_page: Option<SharedString>,
     mode: PanelMode,
     editing: Option<PageEditorTarget>,
@@ -247,6 +248,7 @@ impl PagesPanel {
             next_result_focus_handle: cx.focus_handle(),
             pages,
             expanded: true,
+            read_only: false,
             selected_page: None,
             mode: PanelMode::Pages,
             editing: None,
@@ -279,6 +281,22 @@ impl PagesPanel {
             hovered_page: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.read_only != read_only {
+            self.read_only = read_only;
+            self.page_menu = None;
+            if read_only && self.mode == PanelMode::Replace {
+                self.mode = PanelMode::Find;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn has_pending_authoring(&self, cx: &App) -> bool {
+        self.editing.is_some()
+            || (self.mode == PanelMode::Replace && !self.replace_input.read(cx).value().is_empty())
     }
 
     /// Replaces the host-controlled page read model.

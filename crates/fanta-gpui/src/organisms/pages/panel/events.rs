@@ -252,6 +252,9 @@ impl PagesPanel {
     }
 
     pub(super) fn begin_new_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if !self.expanded {
             self.expanded = true;
             cx.emit(PagesPanelAction::ExpansionChanged { expanded: true });
@@ -274,6 +277,9 @@ impl PagesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         self.page_menu = None;
         self.editing = Some(PageEditorTarget::Existing {
             page_id,
@@ -307,6 +313,9 @@ impl PagesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let Some(target) = self.editing.take() else {
             return;
         };
@@ -427,6 +436,9 @@ impl PagesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only && action != PageMenuAction::CopyLink {
+            return;
+        }
         let Some(menu) = self.page_menu.take() else {
             return;
         };
@@ -533,6 +545,9 @@ impl PagesPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only && mode == PanelMode::Replace {
+            return;
+        }
         self.mode = mode;
         self.filter_menu_open = false;
         if mode == PanelMode::Replace {
@@ -597,7 +612,10 @@ impl PagesPanel {
     }
 
     pub(super) fn request_replace(&mut self, all: bool, cx: &mut Context<Self>) {
-        if (all && self.results.total == 0) || (!all && self.results.items.is_empty()) {
+        if self.read_only
+            || (all && self.results.total == 0)
+            || (!all && self.results.items.is_empty())
+        {
             return;
         }
         let request = self.build_search_request(cx);

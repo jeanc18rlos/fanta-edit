@@ -86,29 +86,31 @@ impl PagesPanel {
                 true,
                 cx,
             ))
-            .child(menu_separator(cx))
-            .child(self.render_page_menu_item(
-                "Rename page",
-                "pages-page-menu-rename",
-                PageMenuAction::Rename,
-                false,
-                cx,
-            ))
-            .child(self.render_page_menu_item(
-                "Duplicate page",
-                "pages-page-menu-duplicate",
-                PageMenuAction::Duplicate,
-                false,
-                cx,
-            ))
-            .child(menu_separator(cx))
-            .child(self.render_page_menu_item(
-                "Delete page",
-                "pages-page-menu-delete",
-                PageMenuAction::Delete,
-                false,
-                cx,
-            )),
+            .when(!self.read_only, |menu| {
+                menu.child(menu_separator(cx))
+                    .child(self.render_page_menu_item(
+                        "Rename page",
+                        "pages-page-menu-rename",
+                        PageMenuAction::Rename,
+                        false,
+                        cx,
+                    ))
+                    .child(self.render_page_menu_item(
+                        "Duplicate page",
+                        "pages-page-menu-duplicate",
+                        PageMenuAction::Duplicate,
+                        false,
+                        cx,
+                    ))
+                    .child(menu_separator(cx))
+                    .child(self.render_page_menu_item(
+                        "Delete page",
+                        "pages-page-menu-delete",
+                        PageMenuAction::Delete,
+                        false,
+                        cx,
+                    ))
+            }),
         )
         .with_priority(3)
         .into_any_element()
@@ -222,7 +224,9 @@ impl PagesPanel {
             .capture_key_up(prevent_keyboard_activation_click)
             .track_scroll(&self.filter_menu_scroll_handle)
             .child(self.render_mode_item(PanelMode::Find, "Find", mode, cx))
-            .child(self.render_mode_item(PanelMode::Replace, "Replace", mode, cx))
+            .when(!self.read_only, |menu| {
+                menu.child(self.render_mode_item(PanelMode::Replace, "Replace", mode, cx))
+            })
             .child(menu_separator(cx))
             .children(PagesPanelElementKind::FILTER_ORDER.into_iter().map(|kind| {
                 let active = if kind == PagesPanelElementKind::All {

@@ -104,41 +104,43 @@ impl PagesPanel {
                     )
                     .child(self.control_bounds_tracker(FocusTooltipKind::Find, cx)),
             )
-            .child(
-                div()
-                    .id(SharedString::from(format!("{}-add-control", self.id)))
-                    .relative()
-                    .flex_none()
-                    .debug_selector(|| "pages-add-trigger".to_owned())
-                    .key_context(CONTROL_KEY_CONTEXT)
-                    .track_focus(
-                        &self
-                            .add_page_focus_handle
-                            .clone()
-                            .tab_index(0)
-                            .tab_stop(true),
-                    )
-                    .focus(|style| style.bg(cx.theme().sidebar_accent).rounded(px(5.)))
-                    .occlude()
-                    .on_activate(cx.listener(|this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.begin_new_page(window, cx);
-                    }))
-                    .child(
-                        Button::new(SharedString::from(format!("{}-add", self.id)))
-                            .ghost()
-                            .xsmall()
-                            .compact()
-                            .tab_stop(false)
-                            .icon(IconName::Plus)
-                            .tooltip_with_action(
-                                "Add new page",
-                                &AddPage,
-                                Some(PAGES_PANEL_KEY_CONTEXT),
-                            ),
-                    )
-                    .child(self.control_bounds_tracker(FocusTooltipKind::AddPage, cx)),
-            )
+            .when(!self.read_only, |header| {
+                header.child(
+                    div()
+                        .id(SharedString::from(format!("{}-add-control", self.id)))
+                        .relative()
+                        .flex_none()
+                        .debug_selector(|| "pages-add-trigger".to_owned())
+                        .key_context(CONTROL_KEY_CONTEXT)
+                        .track_focus(
+                            &self
+                                .add_page_focus_handle
+                                .clone()
+                                .tab_index(0)
+                                .tab_stop(true),
+                        )
+                        .focus(|style| style.bg(cx.theme().sidebar_accent).rounded(px(5.)))
+                        .occlude()
+                        .on_activate(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.begin_new_page(window, cx);
+                        }))
+                        .child(
+                            Button::new(SharedString::from(format!("{}-add", self.id)))
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .tab_stop(false)
+                                .icon(IconName::Plus)
+                                .tooltip_with_action(
+                                    "Add new page",
+                                    &AddPage,
+                                    Some(PAGES_PANEL_KEY_CONTEXT),
+                                ),
+                        )
+                        .child(self.control_bounds_tracker(FocusTooltipKind::AddPage, cx)),
+                )
+            })
             .child(div().w(px(4.)))
             .into_any_element()
     }

@@ -34,7 +34,7 @@ use workspace::{
 
 use crate::canvas::{
     CanvasElement, RenderedCanvas, authored_local_bounds, bounds_size, evaluated_hit_test_screen,
-    precise_hit_test_screen, screen_position_in_bounds,
+    inspect_hit_test_screen, precise_hit_test_screen, screen_position_in_bounds,
 };
 use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
@@ -136,6 +136,8 @@ actions!(
         NudgeDown,
         /// Activate the move/select tool.
         ActivateSelectTool,
+        /// Inspect layers and properties without editing the design.
+        ActivateInspectTool,
         /// Activate the hand (pan) tool.
         ActivateHandTool,
         /// Activate the rectangle tool.
@@ -189,6 +191,7 @@ actions!(
 fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
     match kind {
         ToolKind::Select => Box::new(ActivateSelectTool),
+        ToolKind::Inspect => Box::new(ActivateInspectTool),
         ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
         ToolKind::NodeEdit => Box::new(ActivateNodeEditTool),
         ToolKind::Hand => Box::new(ActivateHandTool),
@@ -253,10 +256,17 @@ impl Render for SidebarResizeDrag {
     }
 }
 
+#[cfg(test)]
+struct NativeToolbarMenuFocus(FocusHandle);
+
+#[cfg(test)]
+impl gpui::Global for NativeToolbarMenuFocus {}
+
 pub struct FigView {
     pub(crate) item: Entity<FigItem>,
     project: Entity<Project>,
     pub(crate) focus_handle: FocusHandle,
+    native_toolbar_focus: FocusHandle,
     editor_session: Entity<EditorSession>,
     layers_sidebar: Entity<FantaDesignPanel>,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
@@ -618,6 +628,7 @@ impl FigView {
             tools: ToolShell::new(),
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
+            native_toolbar_focus: cx.focus_handle(),
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                 .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
@@ -916,6 +927,9 @@ impl FigView {
         if !self.item.read(cx).source_edit_locked() {
             return;
         }
+        if self.is_inspecting() {
+            return;
+        }
 
         self.comment_state.clear_pending_motion_anchor();
         #[cfg(feature = "fanta-gpui-ui")]
@@ -994,8 +1008,15 @@ impl FigView {
     }
 
     fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
+        if self
+            .inspector_sidebar
+            .read(cx)
+            .finishing_edits_requires_text_commit(cx)
+        {
+            self.commit_text_edit(cx);
+        }
         self.inspector_sidebar
-            .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+            .update(cx, |panel, cx| panel.finish_continuous_edits_from_view(cx));
         self.motion_sidebar
             .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
         self.variables_workspace
@@ -1108,6 +1129,9 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
+        if self.is_inspecting() {
+            self.activate_tool(ToolKind::Select, cx);
+        }
         self.invalidate_local_media_origin();
         self.comment_state.clear_pending_motion_anchor();
         if self.prototype_player.is_some() && workspace != EditorWorkspace::Canvas {
@@ -1129,6 +1153,9 @@ impl FigView {
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
         if self.editor_mode(cx) == mode {
             return;
+        }
+        if self.is_inspecting() {
+            self.activate_tool(ToolKind::Select, cx);
         }
         self.invalidate_local_media_origin();
         self.comment_state.clear_pending_motion_anchor();
@@ -2053,7 +2080,11 @@ impl FigView {
     }
 
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
-        self.item.read(cx).is_editable()
+        !self.is_inspecting() && self.item.read(cx).is_editable()
+    }
+
+    pub(crate) fn is_inspecting(&self) -> bool {
+        self.tools.kind() == ToolKind::Inspect
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
@@ -2308,7 +2339,10 @@ impl FigView {
     /// and layers panels stay useful before a project exists.
     fn handle_read_only_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
         let ToolEvent::Pointer(fanta_tools::PointerEvent::Press {
-            screen, modifiers, ..
+            screen,
+            modifiers,
+            button: ToolButton::Primary,
+            ..
         }) = event
         else {
             return;
@@ -2323,17 +2357,28 @@ impl FigView {
         let screen_size = DVec2::new(width, height);
         let screen_point = DVec2::new(screen[0], screen[1]);
         let extend = modifiers.extend_selection();
+        let inspecting = self.is_inspecting();
 
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let hit = precise_hit_test_screen(
-                    &document.doc.scene,
-                    &viewport,
-                    screen_size,
-                    screen_point,
-                    HitPrecision::Path,
-                    document.doc.active_page(),
-                );
+                let hit = if inspecting {
+                    inspect_hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        screen_size,
+                        screen_point,
+                        document.doc.active_page(),
+                    )
+                } else {
+                    precise_hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        screen_size,
+                        screen_point,
+                        HitPrecision::Path,
+                        document.doc.active_page(),
+                    )
+                };
                 match hit {
                     Some(node) if extend => document.doc.selection.toggle(node),
                     Some(node) => document.doc.selection.select_only(node),
@@ -2345,9 +2390,98 @@ impl FigView {
         });
     }
 
+    fn defer_after_preserved_design_draft(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+        _resume: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if self.gpui_design.as_ref().is_some_and(|adapter| {
+            adapter.panel.update(_cx, |panel, cx| {
+                panel.finish_preserved_property_draft(_window, cx)
+            })
+        }) {
+            // The panel emits the commit; its host subscription must receive it
+            // before the next action closes the remaining document edit sessions.
+            _cx.defer_in(_window, _resume);
+            return true;
+        }
+        false
+    }
+
+    fn activate_tool_from_action(
+        &mut self,
+        kind: ToolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if kind != ToolKind::Inspect
+            && self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+                this.activate_tool(kind, cx);
+            })
+        {
+            return;
+        }
+        self.activate_tool(kind, cx);
+    }
+
+    fn set_editor_mode_from_action(
+        &mut self,
+        mode: EditorMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+            this.set_editor_mode(mode, cx);
+        }) {
+            return;
+        }
+        self.set_editor_mode(mode, cx);
+    }
+
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        if kind == ToolKind::Inspect {
+            if self.is_inspecting() {
+                return;
+            }
+            if self.has_pending_authoring(cx)
+                || self.comment_state.draft.is_some()
+                || self.has_unsent_comment_reply(cx)
+            {
+                show_canvas_notice_deferred(
+                    "Finish or cancel the current edit before inspecting layers.".into(),
+                    cx,
+                );
+                return;
+            }
+            if self.editor_mode(cx) != EditorMode::Design
+                || self.editor_workspace(cx) != EditorWorkspace::Canvas
+                || self.prototype_player.is_some()
+            {
+                show_canvas_notice_deferred(
+                    "Return to the Design canvas to inspect layers.".into(),
+                    cx,
+                );
+                return;
+            }
+            self.invalidate_local_media_origin();
+            self.comment_state.close_thread();
+            self.tools.activate_without_context(kind);
+            self.remember_tool_face(kind);
+            self.hovered_node = None;
+            self.hover_resize_handle = None;
+            self.inspector_sidebar
+                .update(cx, |panel, cx| panel.set_inspecting(true, cx));
+            self.layers_sidebar
+                .update(cx, |panel, cx| panel.set_inspecting(true, cx));
+            self.inspector_sidebar_visible = true;
+            self.invalidate_canvas_cache();
+            cx.notify();
+            return;
+        }
         self.comment_state.clear_pending_motion_anchor();
-        if kind.requires_editing() && !self.is_editable(cx) {
+        if kind.requires_editing() && !self.item.read(cx).is_editable() {
             return;
         }
         if kind != ToolKind::Comment {
@@ -2357,6 +2491,12 @@ impl FigView {
         // Switching tools is a document edit boundary for every inspector and
         // inline session, not only text.
         self.finish_document_edits(cx);
+        self.inspector_sidebar
+            .update(cx, |panel, cx| panel.set_inspecting(false, cx));
+        self.layers_sidebar
+            .update(cx, |panel, cx| panel.set_inspecting(false, cx));
+        self.hover_resize_handle = None;
+        self.hovered_node = None;
         let activated_kind = if kind == ToolKind::TextPath {
             ToolKind::Select
         } else {
@@ -2499,7 +2639,7 @@ impl FigView {
             }
             return;
         }
-        if event.button == MouseButton::Left {
+        if event.button == MouseButton::Left && !self.is_inspecting() {
             self.finish_panel_edits(cx);
         }
         // While a text session is live, a left press inside the edited node
@@ -2583,6 +2723,7 @@ impl FigView {
         // canvas click opens the draft composer (nothing hits the doc until
         // Send) — the original fanta flow.
         if event.button == MouseButton::Left
+            && !self.is_inspecting()
             && self.handle_comment_mouse_down(event.position, window, cx)
         {
             return;
@@ -2805,14 +2946,18 @@ impl FigView {
             }
             return;
         }
-        if self.tools.kind() != ToolKind::Select {
+        if !matches!(self.tools.kind(), ToolKind::Select | ToolKind::Inspect) {
             let had_handle = self.hover_resize_handle.take().is_some();
             if self.hovered_node.take().is_some() || had_handle {
                 cx.notify();
             }
             return;
         }
-        self.update_hover_resize_handle(screen, cx);
+        if self.is_inspecting() {
+            self.hover_resize_handle = None;
+        } else {
+            self.update_hover_resize_handle(screen, cx);
+        }
         let Some(bounds) = self.container_bounds else {
             return;
         };
@@ -2823,7 +2968,15 @@ impl FigView {
         let hovered = {
             let item = self.item.read(cx);
             item.document().and_then(|document| {
-                if let Some(evaluation) = self.motion_evaluation(document, cx) {
+                if self.is_inspecting() {
+                    inspect_hit_test_screen(
+                        &document.doc.scene,
+                        &viewport,
+                        DVec2::new(width, height),
+                        screen,
+                        document.doc.active_page(),
+                    )
+                } else if let Some(evaluation) = self.motion_evaluation(document, cx) {
                     evaluated_hit_test_screen(
                         &document.doc.scene,
                         &evaluation,
@@ -2866,6 +3019,9 @@ impl FigView {
     }
 
     fn resize_handle_at(&self, screen: DVec2, cx: &App) -> Option<fanta_canvas::ResizeHandle> {
+        if self.is_inspecting() {
+            return None;
+        }
         let viewport = self.viewport?;
         let bounds = self.container_bounds?;
         let (width, height) = bounds_size(bounds);
@@ -3043,8 +3199,13 @@ impl FigView {
 
     // === Edit actions =====================================================
 
-    fn undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.undo(&Undo, window, cx);
+        }) {
             return;
         }
         self.finish_document_edits(cx);
@@ -3060,8 +3221,13 @@ impl FigView {
         }
     }
 
-    fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.redo(&Redo, window, cx);
+        }) {
             return;
         }
         self.finish_document_edits(cx);
@@ -3136,8 +3302,16 @@ impl FigView {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_inspecting() {
+            return;
+        }
         if self.prototype_player.is_some() {
             self.trigger_prototype_key("enter", cx);
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.confirm(&Confirm, window, cx);
+        }) {
             return;
         }
         self.finish_panel_edits(cx);
@@ -3177,6 +3351,11 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.delete_selection(&DeleteSelection, window, cx);
+        }) {
+            return;
+        }
         if matches!(self.tools.kind(), ToolKind::NodeEdit | ToolKind::PathSelect) {
             if self.is_editable(cx) {
                 self.finish_document_edits(cx);
@@ -3187,33 +3366,53 @@ impl FigView {
         }
     }
 
-    fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
+    fn copy_selection(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.copy_selection(&CopySelection, window, cx);
+        }) {
+            return;
+        }
         self.copy_selected_nodes(cx);
     }
 
-    fn cut_selection(&mut self, _: &CutSelection, _window: &mut Window, cx: &mut Context<Self>) {
+    fn cut_selection(&mut self, _: &CutSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.cut_selection(&CutSelection, window, cx);
+        }) {
+            return;
+        }
         self.cut_selected_nodes(cx);
     }
 
-    fn paste_selection(
-        &mut self,
-        _: &PasteSelection,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn paste_selection(&mut self, _: &PasteSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.paste_selection(&PasteSelection, window, cx);
+        }) {
+            return;
+        }
         self.paste_selected_nodes(cx);
     }
 
     fn duplicate_selection(
         &mut self,
         _: &DuplicateSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.duplicate_selection(&DuplicateSelection, window, cx);
+        }) {
+            return;
+        }
         self.duplicate_selected_nodes(cx);
     }
 
     fn group_selection(&mut self, _: &GroupSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.group_selection(&GroupSelection, window, cx);
+        }) {
+            return;
+        }
         self.group_nodes(None, window, cx);
     }
 
@@ -3223,10 +3422,20 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.ungroup_selection(&UngroupSelection, window, cx);
+        }) {
+            return;
+        }
         self.ungroup_nodes(None, window, cx);
     }
 
     fn frame_selection(&mut self, _: &FrameSelection, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.frame_selection(&FrameSelection, window, cx);
+        }) {
+            return;
+        }
         self.frame_nodes(None, window, cx);
     }
 
@@ -3336,10 +3545,15 @@ impl FigView {
     /// A document with no active page renders all of its roots, and
     /// `children_of(None)` would then hand back the pages themselves —
     /// selecting pages is not what "select all" means, so bail instead.
-    fn select_all(&mut self, _: &SelectAll, _window: &mut Window, cx: &mut Context<Self>) {
+    fn select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
         // The inline text session owns its own selection; selecting canvas
         // nodes underneath it mid-typing is never what the user asked for.
         if self.text_edit.is_some() {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.select_all(&SelectAll, window, cx);
+        }) {
             return;
         }
         self.item.update(cx, |item, cx| {
@@ -3360,7 +3574,9 @@ impl FigView {
     }
 
     pub(crate) fn copy_selected_nodes(&mut self, cx: &mut Context<Self>) {
-        self.finish_document_edits(cx);
+        if !self.is_inspecting() {
+            self.finish_document_edits(cx);
+        }
         let payload = self
             .item
             .read(cx)
@@ -3411,24 +3627,28 @@ impl FigView {
         self.timeline_shell.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inspector_for_test(&self) -> Entity<FantaPropertiesPanel> {
+        self.inspector_sidebar.clone()
+    }
+
+    pub(crate) fn draft_preserving_toolbar_focus_scope(&self, cx: &App) -> FocusHandle {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(toolbar) = &self.gpui_toolbar {
+            return toolbar.panel.focus_handle(cx);
+        }
+        let _ = cx;
+        self.native_toolbar_focus.clone()
+    }
+
     fn invalidate_local_media_origin(&self) {
         self.media_import_generation
             .set(self.media_import_generation.get().wrapping_add(1));
     }
 
-    fn local_media_origin(&self, cx: &Context<Self>) -> Result<LocalMediaOrigin> {
-        let item = self.item.read(cx);
-        anyhow::ensure!(item.is_editable(), "This document is currently read-only.");
-        anyhow::ensure!(
-            item.can_preview_for_owner(cx.entity_id()),
-            "Finish saving or editing this document before placing media."
-        );
-        anyhow::ensure!(
-            self.editor_workspace(cx) == EditorWorkspace::Canvas && self.prototype_player.is_none(),
-            "Return to the canvas editor before placing media."
-        );
+    fn has_pending_authoring(&self, cx: &App) -> bool {
         let inspector = self.inspector_sidebar.read(cx);
-        let pending_edit = item.content_preview_active()
+        let pending_edit = self.item.read(cx).content_preview_active()
             || self.text_edit.is_some()
             || self.pending_text_edit.is_some()
             || self.motion_keyframe_drag.is_some()
@@ -3441,6 +3661,8 @@ impl FigView {
             || self.motion_sidebar.read(cx).has_continuous_edit()
             || self.timeline_shell.read(cx).has_pending_authoring()
             || self.prototype_sidebar.read(cx).has_pending_parameter_edit()
+            || self.variables_workspace.read(cx).has_pending_authoring()
+            || self.layers_sidebar.read(cx).has_pending_authoring(cx)
             || self.tools.overlays.iter().any(|overlay| {
                 matches!(
                     overlay,
@@ -3461,8 +3683,25 @@ impl FigView {
                 .gpui_design
                 .as_ref()
                 .is_some_and(|adapter| adapter.session.is_some());
+        pending_edit
+    }
+
+    fn local_media_origin(&self, cx: &Context<Self>) -> Result<LocalMediaOrigin> {
+        let item = self.item.read(cx);
         anyhow::ensure!(
-            !pending_edit,
+            self.is_editable(cx),
+            "This document is currently read-only."
+        );
+        anyhow::ensure!(
+            item.can_preview_for_owner(cx.entity_id()),
+            "Finish saving or editing this document before placing media."
+        );
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas && self.prototype_player.is_none(),
+            "Return to the canvas editor before placing media."
+        );
+        anyhow::ensure!(
+            !self.has_pending_authoring(cx),
             "Finish or cancel the current edit before placing media."
         );
         let document = item
@@ -3703,6 +3942,13 @@ impl FigView {
     /// single undo step. An image that cannot be ingested (undecodable, or
     /// over the asset cap) is reported and skipped without failing the rest.
     fn place_pasted_images(&mut self, images: Vec<Vec<u8>>, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            show_canvas_notice_deferred(
+                "Could not paste images: the canvas is read-only.".into(),
+                cx,
+            );
+            return;
+        }
         let viewport = self.viewport.unwrap_or(Viewport {
             center: [0.0, 0.0],
             zoom: 1.0,
@@ -3782,6 +4028,9 @@ impl FigView {
         placement: ClipboardPlacement,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let result = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let pasted = match payload.instantiate(&document.doc, offset, placement) {
@@ -3816,8 +4065,17 @@ impl FigView {
             return;
         }
         if self.is_editable(cx) {
+            let modifiers = window.modifiers();
+            if self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+                if this.is_editable(cx) {
+                    this.finish_document_edits(cx);
+                    this.dispatch_tool_event(key_event(key, modifiers), cx);
+                }
+            }) {
+                return;
+            }
             self.finish_document_edits(cx);
-            self.dispatch_tool_event(key_event(key, window.modifiers()), cx);
+            self.dispatch_tool_event(key_event(key, modifiers), cx);
         }
     }
 
@@ -3827,6 +4085,11 @@ impl FigView {
 
     fn play_prototype(&mut self, _: &PlayPrototype, window: &mut Window, cx: &mut Context<Self>) {
         if self.prototype_player.is_some() {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, |this, window, cx| {
+            this.play_prototype(&PlayPrototype, window, cx);
+        }) {
             return;
         }
         self.finish_document_edits(cx);
@@ -4299,9 +4562,11 @@ impl FigView {
     fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.editor_mode(cx);
         let view = cx.weak_entity();
-        let tabs = EditorModeTabs::new(mode, move |mode, _, cx| {
-            view.update(cx, |view, cx| view.set_editor_mode(mode, cx))
-                .log_err();
+        let tabs = EditorModeTabs::new(mode, move |mode, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_editor_mode_from_action(mode, window, cx)
+            })
+            .log_err();
         });
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
@@ -4444,7 +4709,7 @@ impl FigView {
     }
 
     fn render_tool_pill(&self, cx: &mut Context<Self>) -> AnyElement {
-        let editable = self.is_editable(cx);
+        let editable = self.item.read(cx).is_editable();
         let active = self.tools.kind();
         // Before any interaction the viewport is initialized silently during
         // paint, so fall back to the fit zoom the canvas will use rather than
@@ -4484,6 +4749,8 @@ impl FigView {
             .justify_center()
             .child(
                 h_flex()
+                    .id("fanta-native-tool-pill")
+                    .track_focus(&self.native_toolbar_focus)
                     .occlude()
                     .gap_1()
                     .px_1p5()
@@ -4528,8 +4795,8 @@ impl FigView {
                                 })
                                 .disabled(face_disabled)
                                 .tooltip(Tooltip::text(face_kind.label()))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.activate_tool(face_kind, cx);
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.activate_tool_from_action(face_kind, window, cx);
                                 }));
                                 if group.len() <= 1 {
                                     children.push(face_btn.into_any_element());
@@ -4549,7 +4816,7 @@ impl FigView {
                                     )
                                     .menu(move |window, cx| {
                                         let view = menu_view.clone();
-                                        Some(ContextMenu::build(
+                                        let menu = ContextMenu::build(
                                             window,
                                             cx,
                                             move |mut menu, _window, _cx| {
@@ -4567,10 +4834,10 @@ impl FigView {
                                                                 kind == active,
                                                             )
                                                             .action(action_for_kind(kind))
-                                                            .handler(move |_window, cx| {
+                                                            .handler(move |window, cx| {
                                                                 if let Err(error) =
                                                                     view.update(cx, |this, cx| {
-                                                                        this.activate_tool(kind, cx);
+                                                                        this.activate_tool_from_action(kind, window, cx);
                                                                     })
                                                                 {
                                                                     log::debug!(
@@ -4583,13 +4850,16 @@ impl FigView {
                                                 }
                                                 menu
                                             },
-                                        ))
+                                        );
+                                        #[cfg(test)]
+                                        cx.set_global(NativeToolbarMenuFocus(menu.focus_handle(cx)));
+                                        Some(menu)
                                     });
                                 children.push(
                                     h_flex()
                                         .items_center()
                                         .child(face_btn)
-                                        .child(caret)
+                                        .child(div().debug_selector(move || format!("native-tool-menu-{group_index}")).child(caret))
                                         .into_any_element(),
                                 );
                                 children
@@ -5908,64 +6178,65 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &NudgeDown, window, cx| {
                 this.nudge(LogicalKey::ArrowDown, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateSelectTool, _, cx| {
-                this.activate_tool(ToolKind::Select, cx)
+            .on_action(cx.listener(|this, _: &ActivateSelectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Select, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateHandTool, _, cx| {
-                this.activate_tool(ToolKind::Hand, cx)
+            .on_action(cx.listener(|this, _: &ActivateInspectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Inspect, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateRectangleTool, _, cx| {
-                this.activate_tool(ToolKind::Rect, cx)
+            .on_action(cx.listener(|this, _: &ActivateHandTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Hand, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateEllipseTool, _, cx| {
-                this.activate_tool(ToolKind::Ellipse, cx)
+            .on_action(cx.listener(|this, _: &ActivateRectangleTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Rect, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateLineTool, _, cx| {
-                this.activate_tool(ToolKind::Line, cx)
+            .on_action(cx.listener(|this, _: &ActivateEllipseTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Ellipse, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateArrowTool, _, cx| {
-                this.activate_tool(ToolKind::Arrow, cx)
+            .on_action(cx.listener(|this, _: &ActivateLineTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Line, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivatePolygonTool, _, cx| {
-                this.activate_tool(ToolKind::Polygon, cx)
+            .on_action(cx.listener(|this, _: &ActivateArrowTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Arrow, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateStarTool, _, cx| {
-                this.activate_tool(ToolKind::Star, cx)
+            .on_action(cx.listener(|this, _: &ActivatePolygonTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Polygon, window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &ActivatePenTool, _, cx| {
-                    this.activate_tool(ToolKind::Pen, cx)
-                }),
-            )
-            .on_action(cx.listener(|this, _: &ActivateNodeEditTool, _, cx| {
-                this.activate_tool(ToolKind::NodeEdit, cx)
+            .on_action(cx.listener(|this, _: &ActivateStarTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Star, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateFrameTool, _, cx| {
-                this.activate_tool(ToolKind::Frame, cx)
+            .on_action(cx.listener(|this, _: &ActivatePenTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Pen, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateTextTool, _, cx| {
-                this.activate_tool(ToolKind::Text, cx)
+            .on_action(cx.listener(|this, _: &ActivateNodeEditTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::NodeEdit, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivatePencilTool, _, cx| {
-                this.activate_tool(ToolKind::Pencil, cx)
+            .on_action(cx.listener(|this, _: &ActivateFrameTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Frame, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateSectionTool, _, cx| {
-                this.activate_tool(ToolKind::Section, cx)
+            .on_action(cx.listener(|this, _: &ActivateTextTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Text, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateSliceTool, _, cx| {
-                this.activate_tool(ToolKind::Slice, cx)
+            .on_action(cx.listener(|this, _: &ActivatePencilTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Pencil, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateScaleTool, _, cx| {
-                this.activate_tool(ToolKind::Scale, cx)
+            .on_action(cx.listener(|this, _: &ActivateSectionTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Section, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivatePathSelectTool, _, cx| {
-                this.activate_tool(ToolKind::PathSelect, cx)
+            .on_action(cx.listener(|this, _: &ActivateSliceTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Slice, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateCommentTool, _, cx| {
-                this.activate_tool(ToolKind::Comment, cx)
+            .on_action(cx.listener(|this, _: &ActivateScaleTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Scale, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ActivateTextPathTool, _, cx| {
-                this.activate_tool(ToolKind::TextPath, cx)
+            .on_action(cx.listener(|this, _: &ActivatePathSelectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::PathSelect, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateCommentTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Comment, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTextPathTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::TextPath, window, cx)
             }))
             .on_action(cx.listener(Self::toggle_layers_sidebar))
             .on_action(cx.listener(Self::toggle_inspector_sidebar))
@@ -6805,6 +7076,7 @@ impl Item for FigView {
                 tools: ToolShell::new(),
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
+                native_toolbar_focus: cx.focus_handle(),
                 #[cfg(feature = "fanta-gpui-ui")]
                 gpui_toolbar: crate::gpui_adapters::runtime_enabled(cx)
                     .then(|| crate::gpui_adapters::toolbar::ToolbarAdapter::new(window, cx)),
@@ -6869,7 +7141,7 @@ impl Focusable for FigView {
 
 impl ToolKind {
     fn requires_editing(self) -> bool {
-        !matches!(self, Self::Select | Self::Hand)
+        !matches!(self, Self::Select | Self::Inspect | Self::Hand)
     }
 }
 
@@ -7954,6 +8226,972 @@ mod tests {
                     .expect("create rect");
                 ((), DocChange::Content)
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_rejects_an_image_file_paste_that_finishes_after_activation(
+        cx: &mut TestAppContext,
+    ) {
+        let (directory, _root, item, view) = autosave_fixture(cx).await;
+        let path = directory.path().join("picture.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([32, 64, 128, 255]))
+            .save(&path)
+            .expect("PNG fixture");
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(&item.doc().expect("document")).expect("snapshot")
+        });
+        view.update(cx, |view, cx| {
+            cx.write_to_clipboard(ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    smallvec::smallvec![path],
+                ))],
+            });
+            view.paste_selected_nodes(cx);
+            view.activate_tool(ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document")).expect("snapshot"),
+                before
+            );
+            assert!(item.document().expect("document").raw_assets.is_empty());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_selection_and_host_actions_preserve_authored_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, _root, item, view) = autosave_fixture(cx).await;
+        add_rect(&item, cx);
+        cx.run_until_parked();
+        let snapshot = |item: &FigItem, _: &App| {
+            let mut document = item.document().expect("document").doc.clone();
+            document.selection.clear();
+            (
+                serde_json::to_value(document).expect("snapshot"),
+                item.is_dirty(),
+            )
+        };
+        let before = item.read_with(cx, snapshot);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.container_bounds =
+                        Some(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
+                    view.viewport = Some(Viewport {
+                        center: [5., 5.],
+                        zoom: 2.,
+                    });
+                    view.activate_tool(ToolKind::Inspect, cx);
+                    assert!(view.is_inspecting());
+                    assert!(view.item.read(cx).is_editable());
+                    for clicks in [1, 2] {
+                        let position = point(px(400.), px(300.));
+                        view.handle_mouse_down(
+                            &MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: gpui::Modifiers::none(),
+                                click_count: clicks,
+                                first_mouse: false,
+                            },
+                            window,
+                            cx,
+                        );
+                        view.handle_mouse_move(
+                            &MouseMoveEvent {
+                                position: point(px(460.), px(340.)),
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: gpui::Modifiers::none(),
+                            },
+                            window,
+                            cx,
+                        );
+                        view.handle_mouse_up(
+                            &MouseUpEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers: gpui::Modifiers::none(),
+                                click_count: clicks,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("document").selection.len(),
+                        1
+                    );
+                    view.confirm(&Confirm, window, cx);
+                    view.delete_selection(&DeleteSelection, window, cx);
+                    view.cut_selected_nodes(cx);
+                    view.duplicate_selected_nodes(cx);
+                    view.group_selection(&GroupSelection, window, cx);
+                    view.nudge(LogicalKey::ArrowRight, window, cx);
+                    view.undo(&Undo, window, cx);
+                    view.redo(&Redo, window, cx);
+                    view.choose_local_media(cx);
+                    assert!(view.text_edit.is_none());
+                    assert!(view.media_import_task.is_none());
+                    assert!(view.hover_resize_handle.is_none());
+                    assert!(view.resize_handle_at(DVec2::new(390., 290.), cx).is_none());
+                    assert!(view.tools.overlays.is_empty());
+                });
+            })
+            .expect("inspect interactions");
+        assert_eq!(item.read_with(cx, snapshot), before);
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.is_inspecting());
+            assert!(!view.is_editable(cx));
+        });
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_tool(ToolKind::Select, cx);
+                    assert!(view.is_editable(cx));
+                    view.nudge(LogicalKey::ArrowRight, window, cx);
+                });
+            })
+            .expect("leave inspect");
+        assert_ne!(item.read_with(cx, snapshot), before);
+    }
+
+    #[gpui::test]
+    async fn finishing_legacy_panel_edits_keeps_canvas_text_sub_selection_live(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, text_id, _) = text_selection_doc(false);
+        doc.selection.select_only(text_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Legacy-text-finish.fig".into(),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_text_edit(text_id, TextEditSeed::SelectAll, window, cx);
+                let session = &mut view.text_edit.as_mut().expect("text session").session;
+                session.move_to(0, false);
+                session.move_to(2, true);
+            });
+            inspector.update(cx, |panel, cx| {
+                panel.start_editing(
+                    crate::properties_snapshot::InspectorField::FontSize(text_id),
+                    "16".into(),
+                    window,
+                    cx,
+                );
+                panel
+                    .field_editor
+                    .update(cx, |editor, cx| editor.set_text("30", window, cx));
+            });
+        });
+        cx.run_until_parked();
+        let preview = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("preview text session")
+                .session
+                .buffer_snapshot()
+        });
+        view.update(cx, |view, cx| {
+            view.finish_panel_edits(cx);
+            assert_eq!(
+                view.text_edit
+                    .as_ref()
+                    .expect("canvas click can still reposition the caret")
+                    .session
+                    .buffer_snapshot(),
+                preview
+            );
+        });
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+        item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+        });
+        view.update(cx, |view, cx| view.commit_text_edit(cx));
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 1);
+        });
+    }
+
+    async fn assert_native_inspector_workspace_save(cx: &mut TestAppContext, invalid: bool) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let save_key = if cfg!(target_os = "macos") {
+            "cmd-s"
+        } else {
+            "ctrl-s"
+        };
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                save_key,
+                workspace::Save { save_intent: None },
+                Some("Workspace"),
+            )])
+        });
+        let directory = tempfile::tempdir().expect("temporary saved project");
+        let root = directory.path().join("Native Inspector Save");
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        crate::document::write_project(&root, &doc, &BTreeMap::new()).expect("write baseline");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |shell, _| shell.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| window.is_window_active()));
+        #[cfg(feature = "fanta-gpui-ui")]
+        view.read_with(cx, |view, _| assert!(view.gpui_design.is_none()));
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item(cx).map(|item| item.item_id()),
+                Some(view.entity_id()),
+                "the saved canvas must be the mounted active workspace item"
+            );
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(view.inspector_sidebar_visible);
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("ready workspace document");
+            assert_eq!(doc.selection.as_slice(), &[vector_id]);
+            assert!(doc.scene.contains(vector_id));
+        });
+        inspector.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.active_view.as_ref().map(|view| view.entity_id()),
+                Some(view.entity_id()),
+                "the embedded inspector must finish its deferred binding"
+            );
+        });
+        // Cached pane replays do not repopulate GPUI's per-frame debug bounds.
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let canvas = cx.debug_bounds("fig-container");
+        let sidebar = cx.debug_bounds("fanta-inspector-sidebar");
+        let field = cx.debug_bounds("scrub-fanta-x-0").unwrap_or_else(|| {
+            panic!("mounted legacy X field: canvas={canvas:?}, sidebar={sidebar:?}")
+        });
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.dispatch_action(editor::actions::SelectAll);
+        cx.simulate_input("55.5");
+        if invalid {
+            cx.dispatch_action(editor::actions::SelectAll);
+            cx.simulate_input("invalid");
+        }
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_some()));
+        assert!(item.read_with(cx, |item, _| item.content_preview_active()));
+        cx.simulate_keystrokes(save_key);
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+        cx.condition(&item, |item, _| {
+            !item.is_dirty() && !item.content_preview_active()
+        })
+        .await;
+        let (saved, _) =
+            fanta_format::read_project_tree(&root).expect("reopen workspace Save bytes");
+        let saved_node = saved.scene.get(vector_id).expect("saved vector");
+        assert_eq!(
+            saved_node.transform.0.translation.x,
+            if invalid { 0.0 } else { 55.5 }
+        );
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(vector_id), Some(saved_node));
+            assert_eq!(doc.history.undo_depth(), usize::from(!invalid));
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_save_key_commits_a_mounted_legacy_numeric_preview(cx: &mut TestAppContext) {
+        assert_native_inspector_workspace_save(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn workspace_save_key_clears_a_mounted_invalid_legacy_numeric_draft(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_inspector_workspace_save(cx, true).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum LegacyEscapeEntry {
+        FocusedField,
+        NativeInspectMenu,
+        #[cfg(feature = "fanta-gpui-ui")]
+        SharedInspectMenu,
+    }
+
+    async fn assert_workspace_legacy_escape_restores_preview(
+        cx: &mut TestAppContext,
+        entry: LegacyEscapeEntry,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        #[cfg(feature = "fanta-gpui-ui")]
+        if matches!(entry, LegacyEscapeEntry::SharedInspectMenu) {
+            cx.update(|cx| {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            });
+        }
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("complete shipped keymap including Editor and Workspace Escape");
+            cx.bind_keys(bindings);
+        });
+        let directory = tempfile::tempdir().expect("temporary Escape project");
+        let root = directory.path().join("Legacy Escape");
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        crate::document::write_project(&root, &doc, &BTreeMap::new()).expect("baseline project");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let (shell, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = shell.read_with(cx, |shell, _| shell.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            #[cfg(feature = "fanta-gpui-ui")]
+            view.update(cx, |view, cx| {
+                view.gpui_design = None;
+                cx.notify();
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        let original = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("snapshot")
+        });
+        let refresh_bounds = |cx: &mut gpui::VisualTestContext| {
+            // Cached pane replays omit per-frame debug bounds; read the current mounted frame.
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        };
+        refresh_bounds(cx);
+        let field = cx.debug_bounds("scrub-fanta-x-0").expect("legacy X field");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        let select_all_key = if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        };
+        cx.simulate_keystrokes(select_all_key);
+        cx.simulate_input("55.5");
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(crate::properties_snapshot::InspectorField::X(vector_id))
+            );
+            assert_eq!(panel.field_editor.read(cx).text(cx), "55.5");
+        });
+        item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .transform
+                    .0
+                    .translation
+                    .x,
+                55.5
+            );
+        });
+        let open_inspect = |cx: &mut gpui::VisualTestContext| {
+            refresh_bounds(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            if matches!(entry, LegacyEscapeEntry::SharedInspectMenu) {
+                let trigger = cx
+                    .debug_bounds("toolbar-group-move-tools-trigger")
+                    .expect("shared Move caret");
+                cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                refresh_bounds(cx);
+                let row = cx
+                    .debug_bounds("toolbar-flyout-inspect")
+                    .expect("shared Inspect row");
+                cx.simulate_click(row.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                return;
+            }
+            let trigger = cx
+                .debug_bounds("native-tool-menu-0")
+                .expect("native Move caret");
+            cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+                // TestWindow does not drive PopoverMenu's platform focus callback.
+                cx.global::<NativeToolbarMenuFocus>()
+                    .0
+                    .clone()
+                    .focus(window, cx);
+            });
+            cx.run_until_parked();
+            refresh_bounds(cx);
+            let row = cx
+                .debug_bounds("MENU_ITEM-Inspect")
+                .expect("native Inspect row");
+            cx.simulate_click(row.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+        if !matches!(entry, LegacyEscapeEntry::FocusedField) {
+            open_inspect(cx);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.active_tool()),
+                ToolKind::Select
+            );
+            inspector.read_with(cx, |panel, cx| {
+                assert!(panel.editing_field.is_some());
+                assert_eq!(panel.field_editor.read(cx).text(cx), "55.5");
+            });
+            cx.simulate_click(field.center(), gpui::Modifiers::none());
+            cx.simulate_keystrokes(select_all_key);
+            cx.simulate_input("60");
+            cx.run_until_parked();
+            inspector.read_with(cx, |panel, cx| {
+                assert_eq!(panel.field_editor.read(cx).text(cx), "60")
+            });
+        }
+        cx.update(|window, cx| {
+            assert!(
+                inspector
+                    .read(cx)
+                    .field_editor
+                    .focus_handle(cx)
+                    .is_focused(window),
+                "the refocused live editor receives Escape"
+            );
+            let contexts = window.context_stack();
+            for name in ["Workspace", "FigViewer", "FantaPropertiesPanel", "Editor"] {
+                assert!(
+                    contexts.iter().any(|context| context.contains(name)),
+                    "missing {name}: {contexts:?}"
+                );
+            }
+        });
+        let escaped_editor_cancel = std::rc::Rc::new(std::cell::Cell::new(None));
+        let _keys =
+            cx.update(|_, cx| {
+                let escaped_editor_cancel = escaped_editor_cancel.clone();
+                cx.observe_keystrokes(move |event, _, _| {
+                    if event.keystroke.key == "escape" {
+                        escaped_editor_cancel.set(Some(event.action.as_ref().is_some_and(
+                            |action| action.as_any().is::<editor::actions::Cancel>(),
+                        )));
+                    }
+                })
+            });
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("restored snapshot"),
+                original
+            );
+        });
+        assert_eq!(
+            escaped_editor_cancel.get(),
+            Some(true),
+            "the propagated Editor Cancel is consumed before Workspace Unfollow"
+        );
+        open_inspect(cx);
+        assert!(view.read_with(cx, |view, _| view.is_inspecting()));
+        let save_key = if cfg!(target_os = "macos") {
+            "cmd-s"
+        } else {
+            "ctrl-s"
+        };
+        cx.simulate_keystrokes(save_key);
+        cx.run_until_parked();
+        cx.condition(&item, |item, _| {
+            !item.is_dirty() && !item.content_preview_active()
+        })
+        .await;
+        let (saved, _) = fanta_format::read_project_tree(&root).expect("reopen canceled project");
+        assert_eq!(
+            saved
+                .scene
+                .get(vector_id)
+                .expect("saved vector")
+                .transform
+                .0
+                .translation
+                .x,
+            0.0
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert_eq!(
+                saved.scene.get(vector_id),
+                item.doc().expect("document").scene.get(vector_id)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_escape_restores_a_focused_legacy_numeric_preview(cx: &mut TestAppContext) {
+        assert_workspace_legacy_escape_restores_preview(cx, LegacyEscapeEntry::FocusedField).await;
+    }
+
+    #[gpui::test]
+    async fn workspace_escape_restores_legacy_preview_after_native_inspect_refusal(
+        cx: &mut TestAppContext,
+    ) {
+        assert_workspace_legacy_escape_restores_preview(cx, LegacyEscapeEntry::NativeInspectMenu)
+            .await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn workspace_escape_restores_legacy_preview_after_shared_inspect_refusal(
+        cx: &mut TestAppContext,
+    ) {
+        assert_workspace_legacy_escape_restores_preview(cx, LegacyEscapeEntry::SharedInspectMenu)
+            .await;
+    }
+
+    async fn assert_native_inspect_menu_preserves_numeric_draft(
+        cx: &mut TestAppContext,
+        invalid: bool,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary Inspect project");
+        let root = directory.path().join("Native Inspect");
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        crate::document::write_project(&root, &doc, &BTreeMap::new())
+            .expect("write Inspect baseline");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        // Focus callbacks require an active platform window in GPUI tests.
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| window.is_window_active()));
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        #[cfg(feature = "fanta-gpui-ui")]
+        view.read_with(cx, |view, _| {
+            assert!(view.gpui_toolbar.is_none());
+            assert!(view.gpui_design.is_none());
+        });
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        let snapshot = |item: &FigItem, _: &App| {
+            (
+                serde_json::to_value(item.doc().expect("document")).expect("snapshot"),
+                item.is_dirty(),
+            )
+        };
+        let original = item.read_with(cx, snapshot);
+        let field = cx.debug_bounds("scrub-fanta-x-0").expect("native X field");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.dispatch_action(editor::actions::SelectAll);
+        cx.simulate_input("55.5");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .transform
+                    .0
+                    .translation
+                    .x,
+                55.5
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(item.content_preview_active());
+        });
+        if invalid {
+            cx.dispatch_action(editor::actions::SelectAll);
+            cx.simulate_input("invalid");
+            cx.run_until_parked();
+        }
+        let preview = item.read_with(cx, snapshot);
+        let preview_active = item.read_with(cx, |item, _| item.content_preview_active());
+        let trigger = cx
+            .debug_bounds("native-tool-menu-0")
+            .expect("native Move caret");
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        let focus_native_menu = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                window.draw(cx).clear();
+                // TestWindow does not drive on_next_frame callbacks. Focus the
+                // actual mounted menu as PopoverMenu's platform callback does.
+                cx.global::<NativeToolbarMenuFocus>()
+                    .0
+                    .clone()
+                    .focus(window, cx);
+            });
+            cx.run_until_parked();
+        };
+        focus_native_menu(cx);
+        assert!(
+            cx.update(|window, cx| view
+                .read(cx)
+                .native_toolbar_focus
+                .contains_focused(window, cx)),
+            "the deferred native ContextMenu is inside the toolbar's focus scope"
+        );
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(crate::properties_snapshot::InspectorField::X(vector_id))
+            );
+            assert_eq!(
+                panel.field_editor.read(cx).text(cx),
+                if invalid { "invalid" } else { "55.5" }
+            );
+        });
+        assert_eq!(item.read_with(cx, snapshot), preview);
+        assert_eq!(
+            item.read_with(cx, |item, _| item.content_preview_active()),
+            preview_active
+        );
+        let inspect = cx
+            .debug_bounds("MENU_ITEM-Inspect")
+            .expect("native Inspect row");
+        cx.simulate_click(inspect.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(crate::properties_snapshot::InspectorField::X(vector_id))
+            );
+            assert_eq!(
+                panel.field_editor.read(cx).text(cx),
+                if invalid { "invalid" } else { "55.5" }
+            );
+        });
+        assert_eq!(item.read_with(cx, snapshot), preview);
+        assert_eq!(
+            item.read_with(cx, |item, _| item.content_preview_active()),
+            preview_active
+        );
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        if invalid {
+            cx.dispatch_action(editor::actions::SelectAll);
+            cx.simulate_input("72.5");
+            cx.simulate_keystrokes("enter");
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    doc.scene
+                        .get(vector_id)
+                        .expect("vector")
+                        .transform
+                        .0
+                        .translation
+                        .x,
+                    72.5
+                );
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+        } else {
+            cx.simulate_keystrokes("escape");
+            inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+            assert!(!item.read_with(cx, |item, _| item.content_preview_active()));
+            assert_eq!(item.read_with(cx, snapshot), original);
+        }
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("native-tool-menu-0")
+            .expect("native Move caret");
+        cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+        focus_native_menu(cx);
+        let inspect = cx
+            .debug_bounds("MENU_ITEM-Inspect")
+            .expect("native Inspect row");
+        cx.simulate_click(inspect.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Inspect
+        );
+        let save = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                Item::save(view, SaveOptions::default(), project, window, cx)
+            })
+        });
+        save.await
+            .expect("Save after resolving the refused Inspect draft");
+        cx.run_until_parked();
+        let (saved, _) =
+            fanta_format::read_project_tree(&root).expect("reopen native Inspect Save");
+        assert_eq!(
+            saved.scene.get(vector_id),
+            item.read_with(cx, |item, _| item
+                .doc()
+                .expect("document")
+                .scene
+                .get(vector_id)
+                .cloned())
+                .as_ref()
+        );
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn native_inspect_menu_preserves_invalid_numeric_draft_until_corrected(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_inspect_menu_preserves_numeric_draft(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn native_inspect_menu_preserves_live_numeric_preview_until_cancelled(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_inspect_menu_preserves_numeric_draft(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn inspect_hover_and_selection_use_the_same_path_precision_on_active_page(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, page_one, page_two) = doc_with_two_pages();
+        let mut background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            120.,
+            120.,
+            Color::BLACK,
+        )));
+        background.parent = Some(page_one);
+        let other_page_node = background.id;
+        doc.apply(Operation::create_node(background))
+            .expect("page one layer");
+        let mut parent = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        parent.parent = Some(page_two);
+        parent.transform = Transform2D::translation(25., 35.);
+        let parent_id = parent.id;
+        doc.apply(Operation::create_node(parent))
+            .expect("transformed parent");
+        let mut path = PathData::new();
+        path.move_to(0., 0.).line_to(100., 100.);
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            strokes: smallvec::smallvec![Stroke::solid(Color::BLACK, 1.)],
+            ..VectorNode::default()
+        }));
+        vector.parent = Some(parent_id);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("thin diagonal");
+        doc.set_active_page(Some(page_two));
+        let item =
+            crate::document::ready_item_for_test(&project, "/tmp/Inspect.fig".into(), doc, cx);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("inspect view");
+        view.update(cx, |view, cx| {
+            view.select_page(1, cx);
+            view.activate_tool(ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+            let document = view.item.read(cx).doc().expect("document");
+            assert_eq!(document.active_page(), Some(page_two));
+            let transform = document
+                .scene
+                .world_transform(vector_id)
+                .expect("vector world transform");
+            let center = transform.transform_point(DVec2::new(50., 50.));
+            view.container_bounds =
+                Some(Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))));
+            for zoom in [0.5, 1., 2.] {
+                view.viewport = Some(Viewport {
+                    center: center.to_array(),
+                    zoom,
+                });
+                for (world, expected) in [
+                    (center, Some(vector_id)),
+                    (transform.transform_point(DVec2::new(50., 10.)), None),
+                ] {
+                    let screen = (world - center) * zoom + DVec2::new(400., 300.);
+                    view.update_hover(screen, cx);
+                    assert_eq!(view.hovered_node, expected, "zoom {zoom}");
+                    view.dispatch_tool_event(
+                        press_event(screen, ToolButton::Primary, gpui::Modifiers::none(), 1),
+                        cx,
+                    );
+                    assert_eq!(
+                        view.item
+                            .read(cx)
+                            .doc()
+                            .expect("document")
+                            .selection
+                            .as_slice(),
+                        expected.as_slice()
+                    );
+                    assert!(
+                        !view
+                            .item
+                            .read(cx)
+                            .doc()
+                            .expect("document")
+                            .selection
+                            .contains(other_page_node)
+                    );
+                    view.dispatch_tool_event(
+                        press_event(
+                            DVec2::ZERO,
+                            ToolButton::Secondary,
+                            gpui::Modifiers::none(),
+                            1,
+                        ),
+                        cx,
+                    );
+                    assert_eq!(
+                        view.item
+                            .read(cx)
+                            .doc()
+                            .expect("document")
+                            .selection
+                            .as_slice(),
+                        expected.as_slice()
+                    );
+                }
+            }
+            view.update_hover(DVec2::new(400., 300.), cx);
+            assert_eq!(view.hovered_node, Some(vector_id));
+            view.select_page(0, cx);
+            assert!(view.is_inspecting());
+            assert!(view.hovered_node.is_none());
         });
     }
 
@@ -11350,7 +12588,7 @@ impl FigView {
             } => self.choose_local_media(cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    Some(kind) => self.activate_tool(kind, cx),
+                    Some(kind) => self.activate_tool_from_action(kind, window, cx),
                     None => notify_unavailable(tool.label(), window, cx),
                 }
             }
@@ -11358,8 +12596,12 @@ impl FigView {
                 self.handle_toolbar_chrome_control(id, window, cx);
             }
             ToolbarAction::ModeChangeRequested { mode } => match mode {
-                ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
-                ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
+                ToolbarMode::Design => {
+                    self.set_editor_mode_from_action(EditorMode::Design, window, cx)
+                }
+                ToolbarMode::Motion => {
+                    self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
+                }
                 ToolbarMode::Dev => notify_unavailable("Dev mode", window, cx),
             },
             // The +/- steppers, the zoom menu's percent entries, typed
@@ -11405,8 +12647,12 @@ impl FigView {
                 ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
                 ToolbarCommand::ZoomToSelection => self.zoom_to_selection(cx),
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
-                ToolbarCommand::OpenDesignMode => self.set_editor_mode(EditorMode::Design, cx),
-                ToolbarCommand::OpenMotionMode => self.set_editor_mode(EditorMode::Motion, cx),
+                ToolbarCommand::OpenDesignMode => {
+                    self.set_editor_mode_from_action(EditorMode::Design, window, cx)
+                }
+                ToolbarCommand::OpenMotionMode => {
+                    self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
+                }
                 ToolbarCommand::Export => self.export_from_toolbar(window, cx),
                 ToolbarCommand::PlaceImageVideo => self.choose_local_media(cx),
                 ToolbarCommand::Group => self.group_selection(&GroupSelection, window, cx),
@@ -11852,9 +13098,8 @@ impl FigView {
                     show_canvas_notice(format!("Could not add time comment: {error}"), window, cx)
                 }
             },
-            ToolbarSecondaryControl::DevInspect
-            | ToolbarSecondaryControl::DevAnnotate
-            | ToolbarSecondaryControl::DevMeasure => {
+            ToolbarSecondaryControl::DevInspect => self.activate_tool(ToolKind::Inspect, cx),
+            ToolbarSecondaryControl::DevAnnotate | ToolbarSecondaryControl::DevMeasure => {
                 notify_unavailable(control.label(), window, cx);
             }
             other => notify_unavailable(other.label(), window, cx),

@@ -1,4 +1,4 @@
-# Release validation — 2026-09-13
+# Release validation — 2026-09-14
 
 **The customer release is not yet validated.** This records completed checks
 and the remaining work for the Apple Silicon alpha. Configuration and launch
@@ -6,7 +6,7 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 
 | Area | Current status |
 | --- | --- |
-| Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Latest source `9510f61` passes all four CI jobs, including 537 backend, 153 CPU worker and 17 real PostgreSQL cases; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
+| Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Backend source through merged PR 5 (`856b67d`) passes all four CI jobs, including 572 backend, 153 CPU worker and 18 real PostgreSQL cases. It adds checkout role checks, a default-off checkout gate, and retired-plan refusal; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
 | Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity. The three retained `9d92b30` toolbar screenshots are invalid because they show ChatGPT rather than Fanta, so that revision's Design/Motion/narrow layout claim remains unsubstantiated. A separate exact-`12e2e4c` local QA build supplies inspected Fanta captures for the current Design, Motion, and 1025-point narrow layouts. Other recorded `9d92b30` interaction checks covered toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export. Earlier trim/edit/save/reopen, subsecond counters, and one-click replay after end scrubbing also passed natively. Neither local bundle is the final signed/notarized artifact. |
 | Current editor work | Validated source/runtime candidate `12e2e4c` includes the previously recorded Text on Path, active-root canvas attachment, contextual Motion keyframing, and Motion time-comment work. It adds guarded Auto key editing through Motion's At playhead fields for Position X/Y, Rotation, Scale X/Y, Opacity, and Fill color: edits preview live, commit as one reversible keyframe operation, and become autosave-eligible only after commit. Its source gate passes 737/737 viewer tests and package-scoped `./script/clippy -p fanta-gpui -p fig_viewer`, including Cargo Machete. The exact local release build passed the bounded toolbar and Auto key smoke below; the later `f9a67f4` candidate adds native TextPath and bounded page-selection attachment checks in dark/light themes. Exact `f9a67f4` also passes bounded native time-comment creation, history, navigation, and reopen; the remaining Motion matrix still needs native coverage. No hosted artifact validates this combined slice. Direct-canvas auto-keying, Motion Path, Dev mode, and Voice input remain unavailable. |
@@ -19,6 +19,72 @@ image CRC, embedded `17de5eb` revision, strict ad-hoc signature, arm64 app/CLI,
 and bundled Git 2.53.0 passed non-launch inspection. The image was detached
 normally and the user's existing Fanta processes remained unchanged. Evidence:
 `/tmp/fanta-release-qa-20260909/github-17de5eb-hosted-installer/verification.json`.
+
+## Inspect continuation — September 14
+
+PR 4 is merged as `769bfae63f`, and Arrow PR 5 is merged as `1575ddd754`.
+Both Arrow Check jobs passed for `661fb04e95`; its merge tree exactly matches
+that tested source. The local media and Arrow native evidence remains under
+`/tmp/fanta-release-qa-20260913/direct-media-placement/` and `arrow-tool/`.
+
+The source adds standalone Inspect in the Design Move menu. It provides
+view-local read-only properties, Layers selection, authoring guards, and
+entry that preserves unfinished drafts. Hover and click share vector fill and
+stroke coverage, rounded frame clipping, and inverse-space box geometry for
+rotated layers. The query walks the active subtree in paint order; a
+conservative local vector bound avoids constructing distant Skia paths. It
+reuses transient size/gap guides without storing measurements.
+
+The repaired Inspect source passes 828 viewer tests, 602 shared UI tests and
+three architecture checks, plus the full 676-test legacy configuration. The
+unchanged renderer previously passed 282 unit tests and 24 integration tests.
+Package-scoped Clippy and Cargo Machete are rerun before the native build.
+Logs and later native evidence are recorded under
+`/tmp/fanta-release-qa-20260913/inspect-tool/`. Exact-source hosted CI, native
+QA, and the customer distribution artifact remain separate gates; source
+tests alone do not validate the released application.
+
+Native QA of the first Inspect source (`b5f7ef`) verified read-only selection,
+precise Arrow/thick-stroke/rounded-clip/rotated-image targeting, explicit Move
+exit with Undo, and all 20 geometry-fixture files unchanged after Save/reopen.
+It also found that opening the Move flyout could blur and clear a numeric draft
+before Inspect's entry guard. The follow-up preserves shared and legacy inputs
+while focus moves through either toolbar, then resumes ordinary blur when the
+user moves to another property control. Activated-window regressions cover
+valid/invalid drafts, correction/cancel retries, separate position/visibility
+Undo steps, and ordinary toolbar/keyboard Undo, Redo, Duplicate, nudge and tool
+transitions after a retained preview. Export preserves the draft and refuses
+to run until it is finished. The shipped keymap and an earlier history entry
+are exercised in activated-window regressions; all 51 Inspect-related cases
+pass on the prior source, along with its full viewer/shared suite and 25 legacy
+cases. Both hosted Check jobs passed on `df1b280`. Its exact native build
+verified shared-inspector refusal, cancellation, Export and keyboard history
+behavior, then exposed a legacy Save crash: the panel read FigView while Save
+already held that view for update.
+
+The repair finishes legacy edits through the host without taking that view
+lease again, while preserving live text sub-selection formatting. Ten new
+regressions cover direct Save, the actual application-window Save shortcut,
+and live text preservation; the native-menu regressions now also Save/reopen
+after correction or cancellation. All pass in both viewer configurations.
+Workspace shortcut tests mount the real MultiWorkspace action context and
+refresh cached pane rendering before locating the property field. Exact clean
+source `0394fc5` built in 11m50s and passed the native retained-preview Save,
+one-step Undo and invalid-input Save cases. All geometry FNX returned to their
+original bytes; only the document modification timestamp changed. The owned
+session exited zero.
+
+That native run found a distinct Escape cancellation failure. Bound actions
+resolve before the panel's raw key listener; outer Workspace bindings can
+consume Escape after Editor propagates it. The panel now handles the propagated
+Editor Cancel while a field draft exists, preserving the editor's first chance
+to dismiss its own popups. Three new tests mount MultiWorkspace with the shipped
+keymap and exercise focused input and both real toolbar menus. All three leave
+the draft active with the old panel and restore the exact document, clean state
+and zero Undo depth with the repair. Native retesting and fresh hosted checks
+remain pending for the final source. Evidence is under
+`inspect-tool/save-boundary-fix/` and `inspect-tool/escape-cancellation-fix/`;
+earlier native successes do not waive the final Escape or distribution gates.
 
 ## Post-merge export and font-scale follow-up — September 13
 

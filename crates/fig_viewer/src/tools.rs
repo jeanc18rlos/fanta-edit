@@ -37,6 +37,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
         ToolKind::PathSelect,
         ToolKind::Hand,
         ToolKind::Scale,
+        ToolKind::Inspect,
     ],
     &[ToolKind::Frame, ToolKind::Section, ToolKind::Slice],
     &[
@@ -70,6 +71,7 @@ pub fn group_index_of(kind: ToolKind) -> Option<usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolKind {
     Select,
+    Inspect,
     PathSelect,
     NodeEdit,
     Hand,
@@ -94,6 +96,7 @@ impl ToolKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Select => "Move",
+            Self::Inspect => "Inspect",
             Self::PathSelect => "Path Selection",
             Self::NodeEdit => "Edit Path",
             Self::Hand => "Hand",
@@ -118,6 +121,7 @@ impl ToolKind {
     pub fn icon(self) -> IconName {
         match self {
             Self::Select => IconName::ToolSelect,
+            Self::Inspect => IconName::MagnifyingGlass,
             Self::PathSelect => IconName::ToolPathSelect,
             Self::NodeEdit => IconName::ToolNodeEdit,
             Self::Hand => IconName::ToolHand,
@@ -142,6 +146,7 @@ impl ToolKind {
     fn build(self) -> Box<dyn Tool> {
         match self {
             Self::Select => Box::new(SelectTool::new()),
+            Self::Inspect => Box::new(InspectTool),
             Self::PathSelect => Box::new(PathSelectTool::new()),
             Self::NodeEdit => Box::new(NodeEditTool::new()),
             Self::Hand => Box::new(HandTool::new()),
@@ -166,6 +171,20 @@ impl ToolKind {
             // tool backs it so unconsumed events stay harmless.
             Self::Comment => Box::new(SelectTool::new()),
         }
+    }
+}
+
+struct InspectTool;
+
+impl Tool for InspectTool {
+    fn name(&self) -> &'static str {
+        "inspect"
+    }
+
+    fn handle_event(&mut self, _ctx: &mut ToolContext, _event: ToolEvent) -> ToolResponse {
+        // FigView owns inspection selection; unconsumed input must never reach
+        // an authoring tool such as Select or PathSelect.
+        ToolResponse::cursor(CursorHint::Default)
     }
 }
 
@@ -270,7 +289,9 @@ impl ToolShell {
             Some(CursorHint::Move) | Some(CursorHint::Default) => CursorStyle::Arrow,
             None => match self.kind {
                 ToolKind::Hand => CursorStyle::OpenHand,
-                ToolKind::Select | ToolKind::PathSelect | ToolKind::Scale => CursorStyle::Arrow,
+                ToolKind::Select | ToolKind::Inspect | ToolKind::PathSelect | ToolKind::Scale => {
+                    CursorStyle::Arrow
+                }
                 ToolKind::Text => CursorStyle::IBeam,
                 _ => CursorStyle::Crosshair,
             },
@@ -371,6 +392,63 @@ pub fn key_event(key: LogicalKey, modifiers: Modifiers) -> ToolEvent {
 mod tests {
     use super::*;
     use gpui::NavigationDirection;
+
+    #[test]
+    fn inspect_fallback_cannot_author_or_change_selection() {
+        let mut doc = Doc::new();
+        let node = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Text(fanta_doc::TextNode::new(
+            "Inspect me",
+            100.,
+            100.,
+        )));
+        let node_id = node.id;
+        doc.apply(fanta_doc::Operation::create_node(node))
+            .expect("create node");
+        doc.selection.select_only(node_id);
+        doc.history = Default::default();
+        let original = serde_json::to_value(&doc).expect("document snapshot");
+        let mut viewport = Viewport::default();
+        let mut shell = ToolShell::new();
+        let mut context = tool_context(
+            &mut doc,
+            &mut viewport,
+            DVec2::new(200., 200.),
+            ToolKind::Inspect,
+        );
+        shell.activate(ToolKind::Inspect, &mut context);
+        assert_eq!(shell.cursor_style(false), CursorStyle::Arrow);
+        for event in [
+            press_event(
+                DVec2::new(120., 120.),
+                Button::Primary,
+                Modifiers::none(),
+                1,
+            ),
+            move_event(DVec2::new(160., 160.), Modifiers::none()),
+            release_event(DVec2::new(160., 160.), Button::Primary, Modifiers::none()),
+            press_event(
+                DVec2::new(120., 120.),
+                Button::Primary,
+                Modifiers::none(),
+                2,
+            ),
+            key_event(LogicalKey::Enter, Modifiers::none()),
+            key_event(LogicalKey::Delete, Modifiers::none()),
+            key_event(LogicalKey::ArrowRight, Modifiers::none()),
+            key_event(LogicalKey::Escape, Modifiers::none()),
+        ] {
+            let response = shell.handle_event(&mut context, event);
+            assert!(!response.wants_exit);
+            assert!(response.overlays.is_empty());
+            assert_eq!(response.cursor, Some(CursorHint::Default));
+            assert_eq!(
+                serde_json::to_value(&*context.doc).expect("document snapshot"),
+                original
+            );
+            assert_eq!(context.doc.selection.as_slice(), &[node_id]);
+            assert_eq!(context.doc.history.undo_depth(), 0);
+        }
+    }
 
     /// Filled shapes land in Figma's neutral grey; the tools that spend the
     /// same field on a stroke or on glyphs keep black, where grey would be

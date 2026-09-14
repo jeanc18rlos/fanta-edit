@@ -1211,6 +1211,12 @@ impl FigView {
         if self.gpui_design.is_none() {
             return;
         }
+        let draft_scope = Some(self.draft_preserving_toolbar_focus_scope(cx));
+        if let Some(adapter) = &self.gpui_design {
+            adapter.panel.update(cx, |panel, _| {
+                panel.set_draft_preserving_focus_scope(draft_scope)
+            });
+        }
         let item = self.item().clone();
         let page_index = self.selected_page_index();
         let built = {
@@ -1218,7 +1224,7 @@ impl FigView {
             let Some(document) = fig_item.document() else {
                 return;
             };
-            let editable = fig_item.is_editable();
+            let editable = self.is_editable(cx);
             let doc = &document.doc;
             let selection: Vec<NodeId> = doc
                 .selection
@@ -1423,6 +1429,9 @@ impl FigView {
     /// Applies committed operations through the item: one op directly, many
     /// as a single history transaction (one undo step).
     fn design_apply_ops(&mut self, operations: Vec<Operation>, cx: &mut Context<Self>) -> bool {
+        if !self.is_editable(cx) {
+            return false;
+        }
         let operations = finite_transform_operations(operations);
         if operations.is_empty() {
             return false;
@@ -1472,6 +1481,9 @@ impl FigView {
         cx: &mut Context<Self>,
         build: impl FnOnce(&Doc) -> Vec<Operation>,
     ) -> Vec<Operation> {
+        if !self.is_editable(cx) {
+            return Vec::new();
+        }
         let item = self.item().clone();
         let item = item.read(cx);
         if !item.is_editable() {
@@ -1492,6 +1504,18 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx)
+            && !matches!(
+                action,
+                DesignPanelAction::PropertyCopyRequested { .. }
+                    | DesignPanelAction::ViewerSectionCopyRequested { .. }
+                    | DesignPanelAction::ViewerSectionRepresentationChangeRequested { .. }
+                    | DesignPanelAction::GoToMainComponentRequested { .. }
+                    | DesignPanelAction::SurfaceChangeRequested { .. }
+            )
+        {
+            return;
+        }
         match action {
             DesignPanelAction::PropertyCopyRequested {
                 target,
@@ -2042,7 +2066,9 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                self.finish_document_edits_for_external_change(cx);
+                if self.is_editable(cx) {
+                    self.finish_document_edits_for_external_change(cx);
+                }
                 let item = self.item().clone();
                 item.update(cx, |item, cx| {
                     item.with_document(cx, |document| {
@@ -2173,6 +2199,9 @@ impl FigView {
         id: NodeId,
         cx: &Context<Self>,
     ) -> bool {
+        if !self.is_editable(cx) {
+            return false;
+        }
         let panel_is_current = {
             let panel = panel.read(cx);
             panel.inspection_context().permissions().can_edit()
@@ -6004,6 +6033,202 @@ mod tests {
             assert_eq!(doc.scene.get(rect), Some(&before));
             assert!(!doc.history.can_undo());
             assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn inspect_echo_is_read_only_and_rejects_stale_edit_intents(cx: &mut TestAppContext) {
+        let (mut doc, page, [first, second, third]) = doc_with_three_squares();
+        doc.selection.select_only(first);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let before: Vec<_> = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            [page, first, second, third]
+                .into_iter()
+                .map(|id| doc.scene.get(id).expect("fixture node").clone())
+                .collect()
+        });
+        view.update_in(cx, |view, _, cx| {
+            assert!(view.is_editable(cx));
+            view.refresh_gpui_design(cx);
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+            view.refresh_gpui_design(cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let permissions = panel.inspection_context().permissions();
+            assert!(!permissions.can_edit());
+            assert!(permissions.can_copy());
+            assert!(panel.viewer_properties_view_data().is_some());
+        });
+        item.read_with(cx, |item, _| assert!(item.is_editable()));
+
+        set_viewer_permissions(&panel, DesignPanelPermissions::editor(), cx);
+        let actions = [
+            DesignPanelAction::PropertyChangeRequested {
+                node_id: first.to_string().into(),
+                property: DesignPanelProperty::Opacity,
+                value: DesignPanelValue::Number(25.0),
+            },
+            DesignPanelAction::PropertyEditRequested {
+                node_id: first.to_string().into(),
+                property: DesignPanelProperty::X,
+                value: DesignPanelValue::Number(400.0),
+                phase: DesignPanelEditPhase::Begin,
+            },
+            DesignPanelAction::PropertyEditRequested {
+                node_id: first.to_string().into(),
+                property: DesignPanelProperty::X,
+                value: DesignPanelValue::Number(400.0),
+                phase: DesignPanelEditPhase::Preview,
+            },
+            DesignPanelAction::PageBackgroundChangeRequested {
+                page_id: page.to_string().into(),
+                color: DesignColor::BLACK,
+            },
+            DesignPanelAction::CollectionItemAddRequested {
+                node_id: first.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: fanta_gpui::design::DesignPaintTarget::WholeLayer,
+            },
+        ];
+        view.update_in(cx, |view, window, cx| {
+            for action in actions {
+                view.handle_design_action(&panel, &action, window, cx);
+            }
+            assert!(
+                view.gpui_design
+                    .as_ref()
+                    .expect("adapter")
+                    .session
+                    .is_none()
+            );
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            for node in &before {
+                assert_eq!(doc.scene.get(node.id), Some(node));
+            }
+            assert!(!doc.history.can_undo());
+            assert!(!item.is_dirty());
+        });
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(second);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().id.as_ref(), second.to_string());
+            assert!(!panel.inspection_context().permissions().can_edit());
+        });
+        view.update_in(cx, |view, _, cx| {
+            view.activate_tool(crate::tools::ToolKind::Select, cx);
+            view.refresh_gpui_design(cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.inspection_context().permissions().can_edit());
+        });
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyChangeRequested {
+                node_id: second.to_string().into(),
+                property: DesignPanelProperty::Opacity,
+                value: DesignPanelValue::Number(50.0),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert_eq!(
+                doc.scene.get(second).expect("second square").opacity.get(),
+                0.5
+            );
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn inspecting_one_view_preserves_editing_in_another_view_of_the_same_item(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, _, rectangle) = doc_with_rect();
+        doc.selection.select_only(rectangle);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/SharedInspect.fig"),
+            doc,
+            cx,
+        );
+        let (inspecting, inspecting_context) = cx.add_window_view({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        let mut inspecting_context = inspecting_context.clone();
+        let (editing, editing_context) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        let mut editing_context = editing_context.clone();
+        cx.run_until_parked();
+        inspecting.update_in(&mut inspecting_context, |view, _, cx| {
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+        });
+        cx.run_until_parked();
+        editing.update_in(&mut editing_context, |view, window, cx| {
+            assert!(view.is_editable(cx));
+            let panel = view
+                .gpui_design
+                .as_ref()
+                .expect("editor adapter")
+                .panel
+                .clone();
+            view.handle_design_action(
+                &panel,
+                &DesignPanelAction::PropertyChangeRequested {
+                    node_id: rectangle.to_string().into(),
+                    property: DesignPanelProperty::Opacity,
+                    value: DesignPanelValue::Number(50.0),
+                },
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        inspecting.read_with(cx, |view, cx| {
+            assert!(view.is_inspecting());
+            assert!(!view.is_editable(cx));
+            let panel = view
+                .gpui_design
+                .as_ref()
+                .expect("inspection adapter")
+                .panel
+                .read(cx);
+            assert!(!panel.inspection_context().permissions().can_edit());
+            assert_eq!(panel.node().opacity, 50.0);
+        });
+        item.read_with(cx, |item, _| {
+            assert!(item.is_editable());
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(rectangle)
+                    .expect("rectangle")
+                    .opacity
+                    .get(),
+                0.5
+            );
         });
     }
 

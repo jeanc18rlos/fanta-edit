@@ -28,6 +28,7 @@ use gpui::{
 };
 use settings::{Settings as _, update_settings_file};
 use ui::{ListHeader, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use util::ResultExt;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -87,6 +88,7 @@ fn filter_pages(pages: Vec<PageEntry>, query: Option<&str>) -> Vec<PageEntry> {
     }
 }
 
+#[cfg(feature = "fanta-gpui-ui")]
 fn replace_text_data_matches(
     data: &NodeData,
     query: &str,
@@ -433,6 +435,8 @@ pub struct FantaDesignPanel {
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,
     active_view: Option<WeakEntity<FigView>>,
+    inspecting: bool,
+    _inspection_subscription: Option<Subscription>,
     width: Option<Pixels>,
     /// Host-controlled expansion of the layer tree, echoed into the gpui
     /// panel on every refresh (the panel's own expansion interactions come
@@ -597,6 +601,8 @@ impl FantaDesignPanel {
             focus_handle: cx.focus_handle(),
             fs,
             active_view: None,
+            inspecting: false,
+            _inspection_subscription: None,
             width: None,
             expanded_nodes: HashSet::new(),
             expansion_generation: 0,
@@ -652,6 +658,10 @@ impl FantaDesignPanel {
                     // document events, never in render — preview frames can't
                     // change tree structure, so they're skipped too.
                     let item = view.read(cx).item().clone();
+                    self.inspecting = view.read(cx).is_inspecting();
+                    self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
+                        this.set_inspecting(view.read(cx).is_inspecting(), cx);
+                    }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
                         |this, _, event: &crate::document::FigItemEvent, cx| {
@@ -719,6 +729,72 @@ impl FantaDesignPanel {
 
     fn active_view(&self, _cx: &App) -> Option<Entity<FigView>> {
         self.active_view.as_ref().and_then(|view| view.upgrade())
+    }
+
+    pub(crate) fn has_pending_authoring(&self, cx: &App) -> bool {
+        if self.renaming.is_some() {
+            return true;
+        }
+        #[cfg(feature = "fanta-gpui-ui")]
+        {
+            if self
+                .gpui_layers
+                .as_ref()
+                .is_some_and(|adapter| adapter.panel.read(cx).has_pending_authoring(cx))
+                || self
+                    .gpui_pages
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.panel.read(cx).has_pending_authoring(cx))
+            {
+                return true;
+            }
+        }
+        let _ = cx;
+        false
+    }
+
+    pub(crate) fn set_inspecting(&mut self, inspecting: bool, cx: &mut Context<Self>) {
+        if self.inspecting == inspecting {
+            return;
+        }
+        self.inspecting = inspecting;
+        if inspecting {
+            self.document_editable = false;
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                if let Some(adapter) = self.gpui_layers.as_ref() {
+                    adapter
+                        .panel
+                        .update(cx, |panel, cx| panel.set_read_only(true, cx));
+                }
+                if let Some(adapter) = self.gpui_pages.as_ref() {
+                    adapter
+                        .panel
+                        .update(cx, |panel, cx| panel.set_read_only(true, cx));
+                }
+            }
+        }
+        // Tool activation owns the FigView lease until this update returns.
+        let panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            panel
+                .update(cx, |this, cx| {
+                    this.rebuild_caches(cx);
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    {
+                        this.refresh_gpui_pages(cx);
+                        this.refresh_gpui_layers(cx);
+                    }
+                    cx.notify();
+                })
+                .log_err();
+        });
+        cx.notify();
+    }
+
+    fn is_editable(&self, cx: &App) -> bool {
+        self.active_view(cx)
+            .is_some_and(|view| view.read(cx).is_editable(cx))
     }
 
     // === Section and tree state ===========================================
@@ -902,6 +978,9 @@ impl FantaDesignPanel {
         placement: LayerDropPlacement,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -971,6 +1050,9 @@ impl FantaDesignPanel {
         placement: LayerDropPlacement,
         cx: &App,
     ) -> bool {
+        if !self.is_editable(cx) {
+            return false;
+        }
         let Some(view) = self.active_view(cx) else {
             return false;
         };
@@ -1026,6 +1108,9 @@ impl FantaDesignPanel {
         build: impl FnOnce(&Doc) -> Vec<Operation>,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -1090,6 +1175,9 @@ impl FantaDesignPanel {
     }
 
     fn toggle_node_flag(&mut self, id: NodeId, flag: NodeFlags, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -1139,6 +1227,9 @@ impl FantaDesignPanel {
     }
 
     fn add_page(&mut self, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -1197,6 +1288,9 @@ impl FantaDesignPanel {
     }
 
     fn delete_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -1292,7 +1386,7 @@ impl FantaDesignPanel {
     fn rebuild_tree(&mut self, view: &Entity<FigView>, cx: &App) {
         let view = view.read(cx);
         let fig_item = view.item().read(cx);
-        self.document_editable = fig_item.is_editable();
+        self.document_editable = view.is_editable(cx);
         let Some(document) = fig_item.document() else {
             return;
         };
@@ -1682,6 +1776,9 @@ impl FantaDesignPanel {
     /// Enter inline-rename mode for a page: seed the shared editor with the
     /// node's current name, select it all, and focus it.
     fn begin_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -1712,6 +1809,9 @@ impl FantaDesignPanel {
     }
 
     fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(target) = self.renaming.take() else {
             return;
         };
@@ -2341,6 +2441,7 @@ mod tests {
         assert!(filter_pages(pages, Some("zzz")).is_empty());
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
     #[test]
     fn text_replace_remaps_text_path_style_runs_and_rejects_invalid_input() {
         let mut text_path = TextPathNode::new(PathData::new(), "AB");
@@ -2806,6 +2907,93 @@ mod gpui_layers_tests {
     }
 
     #[gpui::test]
+    async fn inspect_layers_remain_selectable_and_reject_direct_authoring(cx: &mut TestAppContext) {
+        let mut harness = setup(cx, 2).await;
+        let page = harness.fixture.page;
+        let frame = harness.fixture.frame;
+        let first = harness.fixture.leaves[0];
+        let second = harness.fixture.leaves[1];
+        let item = harness
+            .view
+            .read_with(&harness.cx, |view, _| view.item().clone());
+        item.update(&mut harness.cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(first)
+                    .expect("first leaf")
+                    .flags
+                    .insert(NodeFlags::LOCKED);
+                document.doc.history = Default::default();
+                ((), DocChange::None)
+            });
+        });
+        let before: Vec<_> = with_doc(&harness, |doc| {
+            [
+                page,
+                frame,
+                first,
+                second,
+                harness.fixture.master,
+                harness.fixture.instance,
+            ]
+            .into_iter()
+            .map(|id| doc.scene.get(id).expect("fixture node").clone())
+            .collect()
+        });
+        harness.view.update_in(&mut harness.cx, |view, _, cx| {
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(view.is_inspecting());
+        });
+        harness.cx.run_until_parked();
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, window, cx| {
+                assert!(!panel.document_editable);
+                panel.select_node(first, false, cx);
+                panel.rename_node_to(first, "Changed".into(), cx);
+                panel.toggle_node_flag(first, NodeFlags::LOCKED, cx);
+                panel.drop_layer(second, first, LayerDropPlacement::Above, cx);
+                assert!(!panel.layer_drop_allowed(second, first, LayerDropPlacement::Above, cx));
+                panel.add_page(cx);
+                panel.delete_page(0, cx);
+                panel.begin_page_rename(0, page, window, cx);
+                assert!(!panel.has_pending_authoring(cx));
+            });
+        harness.cx.run_until_parked();
+        assert_eq!(
+            selection(&harness),
+            vec![first],
+            "Layers can inspect locked nodes"
+        );
+        item.read_with(&harness.cx, |item, _| {
+            let document = item.document().expect("document");
+            for node in &before {
+                assert_eq!(document.doc.scene.get(node.id), Some(node));
+            }
+            assert_eq!(document.pages.len(), 1);
+            assert!(!document.doc.history.can_undo());
+            assert!(!item.is_dirty());
+        });
+        harness.view.update_in(&mut harness.cx, |view, _, cx| {
+            view.activate_tool(crate::tools::ToolKind::Select, cx);
+        });
+        harness.cx.run_until_parked();
+        harness.panel.update_in(&mut harness.cx, |panel, _, cx| {
+            assert!(panel.document_editable);
+            panel.rename_node_to(second, "Renamed after inspection".into(), cx);
+        });
+        with_doc(&harness, |doc| {
+            assert_eq!(
+                doc.scene.get(second).expect("second leaf").name,
+                "Renamed after inspection"
+            );
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
     async fn canvas_selection_echoes_into_the_panel_expanding_ancestors_and_revealing_the_row(
         cx: &mut TestAppContext,
     ) {
@@ -3246,12 +3434,14 @@ impl FantaDesignPanel {
             .current_page_index
             .and_then(|index| document.pages.get(index).map(|page| (index, page.root)))
             .map(|(index, root)| crate::gpui_adapters::pages::page_id(root, index));
+        let editable = view.read(cx).is_editable(cx);
         let search = adapter.last_search.clone();
         let search_update = search.as_ref().map(|request| {
             crate::gpui_adapters::pages::search_pages(document, self.current_page_index, request)
         });
         adapter.id_map = id_map;
         adapter.panel.update(cx, |panel, cx| {
+            panel.set_read_only(!editable, cx);
             panel.set_pages(items, cx);
             panel.set_selected_page(selected, cx);
             if let Some((results, hit_map, order)) = search_update {
@@ -3490,6 +3680,9 @@ impl FantaDesignPanel {
         label: &'static str,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx) {
+            return;
+        }
         use crate::gpui_adapters::pages::{HitField, replace_matches};
         if hits.is_empty() {
             return;
@@ -3601,6 +3794,9 @@ impl FantaDesignPanel {
 
     /// Renames a node with the SetName pattern the native rename editor uses.
     fn rename_node_to(&mut self, node: NodeId, new_name: String, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
@@ -3708,6 +3904,7 @@ impl FantaDesignPanel {
             return;
         };
         let doc = &document.doc;
+        let editable = view.is_editable(cx);
         let page_root = Self::layers_page_root(view, document);
         let tree_key = crate::gpui_adapters::layers::LayersTreeKey {
             page_root,
@@ -3736,6 +3933,7 @@ impl FantaDesignPanel {
         if let Some(adapter) = self.gpui_layers.as_mut() {
             adapter.tree_key = Some(tree_key);
             adapter.panel.update(cx, |panel, cx| {
+                panel.set_read_only(!editable, cx);
                 if let Some(tree) = tree {
                     panel.set_nodes(tree, cx);
                 }

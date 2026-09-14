@@ -2507,6 +2507,178 @@ pub(crate) fn precise_hit_test_screen(
     precise_hit_test(scene, world_point, precision, active_page)
 }
 
+pub(crate) fn inspect_hit_test_screen(
+    scene: &fanta_doc::Scene,
+    viewport: &Viewport,
+    screen_size: DVec2,
+    screen_point: DVec2,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
+    if !world_point.is_finite() {
+        return None;
+    }
+    // The scene index contains path bounds, which exclude stroke widths, caps,
+    // and joins. Walk paint order so painted overflow reaches the precise test.
+    let mut pending = Vec::new();
+    if let Some(root) = active_page {
+        scene.get(root)?;
+        if scene.ancestors_of(root).any(|ancestor| {
+            ancestor
+                .flags
+                .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED)
+                || matches!(ancestor.data, fanta_doc::NodeData::Boolean(_))
+                || !inspect_descendants_visible_at(scene, ancestor, world_point)
+        }) {
+            return None;
+        }
+        pending.push((root, false));
+    } else {
+        pending.extend(scene.roots().iter().map(|&id| (id, false)));
+    }
+    while let Some((id, test_body)) = pending.pop() {
+        let Some(node) = scene.get(id) else {
+            continue;
+        };
+        if test_body {
+            if !(active_page == Some(id) && node.parent.is_none())
+                && inspect_node_contains_point(scene, node, world_point)
+            {
+                return Some(id);
+            }
+            continue;
+        }
+        if node
+            .flags
+            .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED)
+        {
+            continue;
+        }
+        pending.push((id, true));
+        if !matches!(node.data, fanta_doc::NodeData::Boolean(_))
+            && inspect_descendants_visible_at(scene, node, world_point)
+        {
+            pending.extend(scene.children_of(Some(id)).iter().map(|&id| (id, false)));
+        }
+    }
+    None
+}
+
+fn inspect_local_point(scene: &fanta_doc::Scene, id: NodeId, world_point: DVec2) -> Option<DVec2> {
+    let transform = scene.world_transform(id)?;
+    let [a, b, c, d, _, _] = transform.to_components();
+    let determinant = a * d - b * c;
+    if !transform.is_finite() || !determinant.is_finite() || determinant == 0. {
+        return None;
+    }
+    let local = transform.inverse().transform_point(world_point);
+    local.is_finite().then_some(local)
+}
+
+fn inspect_descendants_visible_at(
+    scene: &fanta_doc::Scene,
+    node: &fanta_doc::CanvasNode,
+    world_point: DVec2,
+) -> bool {
+    let fanta_doc::NodeData::Group(group) = &node.data else {
+        return true;
+    };
+    let Some([width, height]) = group.clip_size else {
+        return true;
+    };
+    if node
+        .meta
+        .get("clip_content")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return true;
+    }
+    inspect_local_point(scene, node.id, world_point).is_some_and(|local| {
+        fanta_render::rounded_rect_contains_point(
+            [0., 0., width, height],
+            group.corner_radius,
+            group.corner_radii,
+            group.corner_smoothing,
+            local.to_array(),
+        )
+    })
+}
+
+fn inspect_node_contains_point(
+    scene: &fanta_doc::Scene,
+    node: &fanta_doc::CanvasNode,
+    world_point: DVec2,
+) -> bool {
+    let Some(local) = inspect_local_point(scene, node.id, world_point) else {
+        return false;
+    };
+    match &node.data {
+        fanta_doc::NodeData::Vector(vector) => {
+            if !node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR)
+                && let Some([width, height]) = vector.local_size
+                && !fanta_doc::Bounds::from_xywh(0., 0., width, height).contains_point(local)
+            {
+                return false;
+            }
+            if let Some(bounds) = scene.local_bounds(node.id)
+                && let Some(padding) = vector.strokes.iter().try_fold(0.0_f64, |padding, stroke| {
+                    if !stroke.width.is_finite() || !stroke.miter_limit.is_finite() {
+                        return None;
+                    }
+                    let mut width = stroke.width.max(0.);
+                    if let Some(sides) = stroke.per_side {
+                        for side in sides {
+                            if !side.is_finite() {
+                                return None;
+                            }
+                            width = width.max(side);
+                        }
+                    }
+                    // Aligned strokes can use doubled width; square caps and
+                    // miter joins must fit even outside the original path box.
+                    let reach = width * 2. * stroke.miter_limit.max(1.);
+                    reach.is_finite().then_some(padding.max(reach))
+                })
+            {
+                let bounds = fanta_doc::Bounds {
+                    min_x: ((bounds.min_x - padding) as f32).next_down() as f64,
+                    min_y: ((bounds.min_y - padding) as f32).next_down() as f64,
+                    max_x: ((bounds.max_x + padding) as f32).next_up() as f64,
+                    max_y: ((bounds.max_y + padding) as f32).next_up() as f64,
+                };
+                if bounds.is_finite() && !bounds.contains_point(local) {
+                    return false;
+                }
+            }
+            fanta_render::vector_contains_point(vector, local.to_array())
+        }
+        fanta_doc::NodeData::Group(group) => {
+            if !group.is_frame_surface() {
+                return false;
+            }
+            let bounds = group
+                .clip_size
+                .or(group.local_size)
+                .map(|[width, height]| fanta_doc::Bounds::from_xywh(0., 0., width, height))
+                .or_else(|| scene.local_bounds(node.id));
+            bounds.is_some_and(|bounds| {
+                fanta_render::rounded_rect_contains_point(
+                    [bounds.min_x, bounds.min_y, bounds.width(), bounds.height()],
+                    group.corner_radius,
+                    group.corner_radii,
+                    group.corner_smoothing,
+                    local.to_array(),
+                )
+            })
+        }
+        fanta_doc::NodeData::TextPath(_) => accepts_precise_hit(scene, node.id, world_point),
+        _ => scene
+            .local_bounds(node.id)
+            .is_some_and(|bounds| bounds.contains_point(local)),
+    }
+}
+
 fn precise_hit_test(
     scene: &fanta_doc::Scene,
     world_point: DVec2,
@@ -2794,6 +2966,15 @@ impl CanvasElement {
         let motion = view.motion_evaluation(document, cx);
         let editing_node = view.text_edit.as_ref().map(|edit| edit.session.node_id());
         let page_root = doc.active_page();
+        let in_active_page = |id| {
+            page_root.is_none_or(|root| {
+                id == root
+                    || doc
+                        .scene
+                        .ancestors_of(id)
+                        .any(|ancestor| ancestor.id == root)
+            })
+        };
 
         // The selection-scaled scans (frame labels, per-node selection bounds,
         // text baselines) only depend on scene content, the active page, the
@@ -2860,6 +3041,9 @@ impl CanvasElement {
             let mut selected_bounds = Vec::new();
             let mut text_baselines = Vec::new();
             for &id in doc.selection.iter() {
+                if !in_active_page(id) {
+                    continue;
+                }
                 if let Some(world) = evaluated_world_bounds(&doc.scene, id, motion.as_ref()) {
                     if per_node_outlines {
                         selected_bounds.push(world);
@@ -2909,7 +3093,9 @@ impl CanvasElement {
                 doc.active_page(),
                 Some(authored_local_bounds),
             )
-        } else if let &[id] = doc.selection.as_slice() {
+        } else if let &[id] = doc.selection.as_slice()
+            && in_active_page(id)
+        {
             authored_selection_bounds(doc, id).zip(evaluated_world_transform(
                 &doc.scene,
                 id,
@@ -2931,6 +3117,7 @@ impl CanvasElement {
 
         data.hovered_bounds = view
             .hovered_node()
+            .filter(|hovered| in_active_page(*hovered))
             .filter(|hovered| !doc.selection.contains(*hovered))
             .and_then(|hovered| evaluated_world_bounds(&doc.scene, hovered, motion.as_ref()));
 
@@ -3002,6 +3189,8 @@ impl CanvasElement {
         // node hovered. The ancestor/descendant guard keeps the guides from
         // firing between a node and its own container (pure noise).
         if let (&[selected_id], Some(hovered_id)) = (doc.selection.as_slice(), view.hovered_node())
+            && in_active_page(selected_id)
+            && in_active_page(hovered_id)
             && hovered_id != selected_id
             && !is_related(&doc.scene, selected_id, hovered_id)
             && let Some(selected_world) =
@@ -3817,6 +4006,403 @@ mod geometry_tests {
         VectorNode,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn inspect_hit_testing_preserves_overlap_and_rotated_clip_visibility() -> anyhow::Result<()> {
+        let mut scene = Scene::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        scene.insert(page)?;
+        let mut background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -100.,
+            -100.,
+            300.,
+            300.,
+            Color::BLACK,
+        )));
+        background.parent = Some(page_id);
+        let background_id = background.id;
+        scene.insert(background)?;
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100., 100.]),
+            ..GroupNode::default()
+        }));
+        frame.parent = Some(page_id);
+        frame.index = fanta_doc::IndexKey::from_raw(2.);
+        frame.transform = Transform2D::rotation(std::f64::consts::FRAC_PI_4);
+        let frame_id = frame.id;
+        let transform = frame.transform;
+        scene.insert(frame)?;
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -50.,
+            -50.,
+            200.,
+            200.,
+            Color::WHITE,
+        )));
+        child.parent = Some(frame_id);
+        let child_id = child.id;
+        scene.insert(child)?;
+        let hit = |scene: &Scene, local: DVec2| {
+            inspect_hit_test_screen(
+                scene,
+                &Viewport {
+                    center: [0., 0.],
+                    zoom: 1.,
+                },
+                DVec2::new(800., 600.),
+                transform.transform_point(local) + DVec2::new(400., 300.),
+                Some(page_id),
+            )
+        };
+        assert_eq!(hit(&scene, DVec2::new(50., 50.)), Some(child_id));
+        assert_eq!(hit(&scene, DVec2::new(-10., 50.)), Some(background_id));
+        scene.get_mut(child_id).expect("child").flags = fanta_doc::NodeFlags::HIDDEN;
+        assert_ne!(hit(&scene, DVec2::new(50., 50.)), Some(child_id));
+        scene.get_mut(child_id).expect("child").flags = fanta_doc::NodeFlags::LOCKED;
+        assert_ne!(hit(&scene, DVec2::new(50., 50.)), Some(child_id));
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_hollow_vector_interior_selects_the_filled_layer_beneath() -> anyhow::Result<()> {
+        let mut scene = Scene::new();
+        let background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        let background_id = background.id;
+        scene.insert(background)?;
+        let mut foreground = CanvasNode::new(NodeData::Vector(VectorNode {
+            path: PathData::rect(0., 0., 100., 100.),
+            strokes: smallvec::smallvec![fanta_doc::Stroke::solid(Color::BLACK, 4.)],
+            ..VectorNode::default()
+        }));
+        foreground.index = scene.next_root_index();
+        let foreground_id = foreground.id;
+        scene.insert(foreground)?;
+        let viewport = Viewport {
+            center: [50., 50.],
+            zoom: 1.,
+        };
+        for (point, expected) in [
+            (DVec2::new(400., 300.), background_id),
+            (DVec2::new(351., 300.), foreground_id),
+        ] {
+            assert_eq!(
+                inspect_hit_test_screen(&scene, &viewport, DVec2::new(800., 600.), point, None),
+                Some(expected)
+            );
+        }
+        Ok(())
+    }
+
+    fn inspect_world_point(scene: &Scene, world: DVec2, page: Option<NodeId>) -> Option<NodeId> {
+        inspect_hit_test_screen(
+            scene,
+            &Viewport {
+                center: [0., 0.],
+                zoom: 1.,
+            },
+            DVec2::new(800., 600.),
+            world + DVec2::new(400., 300.),
+            page,
+        )
+    }
+
+    #[test]
+    fn inspect_stroke_overflow_survives_path_and_ancestor_bounds() -> anyhow::Result<()> {
+        let mut scene = Scene::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.transform = Transform2D::rotation(0.3).then(&Transform2D::translation(20., 30.));
+        let transform = page.transform;
+        let page_id = page.id;
+        scene.insert(page)?;
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        group.parent = Some(page_id);
+        let group_id = group.id;
+        scene.insert(group)?;
+        let mut path = PathData::new();
+        path.move_to(0., 0.).line_to(100., 0.);
+        let mut stroke = fanta_doc::Stroke::solid(Color::BLACK, 10.);
+        stroke.cap = fanta_doc::StrokeCap::Round;
+        let mut line = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            strokes: smallvec::smallvec![stroke],
+            ..VectorNode::default()
+        }));
+        line.parent = Some(group_id);
+        let line_id = line.id;
+        scene.insert(line)?;
+        let mut outside_stroke = fanta_doc::Stroke::solid(Color::BLACK, 4.);
+        outside_stroke.align = fanta_doc::StrokeAlign::Outside;
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode {
+            path: PathData::rect(200., 0., 100., 100.),
+            strokes: smallvec::smallvec![outside_stroke],
+            ..VectorNode::default()
+        }));
+        rectangle.parent = Some(group_id);
+        rectangle.index = scene.next_child_index(Some(group_id));
+        let rectangle_id = rectangle.id;
+        scene.insert(rectangle)?;
+
+        for zoom in [0.5, 1., 2.] {
+            let viewport = Viewport {
+                center: [120., 80.],
+                zoom,
+            };
+            for (local, expected) in [
+                (DVec2::new(50., 2.), Some(line_id)),
+                (DVec2::new(50., -2.), Some(line_id)),
+                (DVec2::new(-2., 0.), Some(line_id)),
+                (DVec2::new(250., -2.), Some(rectangle_id)),
+                (DVec2::new(50., 8.), None),
+                (DVec2::new(250., 50.), None),
+            ] {
+                let screen = fanta_canvas::world_to_screen(
+                    transform.transform_point(local),
+                    &viewport,
+                    DVec2::new(800., 600.),
+                );
+                assert_eq!(
+                    inspect_hit_test_screen(
+                        &scene,
+                        &viewport,
+                        DVec2::new(800., 600.),
+                        screen,
+                        Some(page_id),
+                    ),
+                    expected,
+                    "{local:?} at zoom {zoom}"
+                );
+            }
+        }
+        {
+            let line = scene.get_mut(line_id).expect("line");
+            let stroke = line
+                .data
+                .as_vector_mut()
+                .expect("vector")
+                .strokes
+                .first_mut()
+                .expect("stroke");
+            stroke.cap = fanta_doc::StrokeCap::Square;
+            stroke.miter_limit = 0.;
+        }
+        assert_eq!(
+            inspect_world_point(
+                &scene,
+                transform.transform_point(DVec2::new(-4., 4.)),
+                Some(page_id),
+            ),
+            Some(line_id)
+        );
+        {
+            let rectangle = scene.get_mut(rectangle_id).expect("rectangle");
+            let stroke = rectangle
+                .data
+                .as_vector_mut()
+                .expect("vector")
+                .strokes
+                .first_mut()
+                .expect("stroke");
+            stroke.width = 0.;
+            stroke.per_side = Some([30., 0., 0., 0.]);
+        }
+        assert_eq!(
+            inspect_world_point(
+                &scene,
+                transform.transform_point(DVec2::new(250., -25.)),
+                Some(page_id),
+            ),
+            Some(rectangle_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_rounded_clips_reject_cropped_children_and_allow_disabled_clipping()
+    -> anyhow::Result<()> {
+        let mut scene = Scene::new();
+        let background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -200.,
+            -200.,
+            500.,
+            500.,
+            Color::BLACK,
+        )));
+        let background_id = background.id;
+        scene.insert(background)?;
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100., 100.]),
+            corner_radius: Some(50.),
+            ..GroupNode::default()
+        }));
+        frame.index = scene.next_root_index();
+        frame.transform = Transform2D::rotation(0.4);
+        let transform = frame.transform;
+        let frame_id = frame.id;
+        scene.insert(frame)?;
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -50.,
+            -50.,
+            200.,
+            200.,
+            Color::WHITE,
+        )));
+        child.parent = Some(frame_id);
+        let child_id = child.id;
+        scene.insert(child)?;
+        let hit = |scene: &Scene, point: DVec2| {
+            inspect_world_point(scene, transform.transform_point(point), None)
+        };
+        assert_eq!(hit(&scene, DVec2::new(1., 1.)), Some(background_id));
+        assert_eq!(hit(&scene, DVec2::new(50., 50.)), Some(child_id));
+        {
+            let frame = scene.get_mut(frame_id).expect("frame");
+            let group = frame.data.as_group_mut().expect("frame group");
+            group.corner_radii = Some([40., 0., 0., 0.]);
+            group.corner_smoothing = 0.7;
+        }
+        assert_eq!(hit(&scene, DVec2::new(1., 1.)), Some(background_id));
+        assert_eq!(hit(&scene, DVec2::new(99., 1.)), Some(child_id));
+        scene.get_mut(frame_id).expect("frame").meta = serde_json::json!({"clip_content": false});
+        assert_eq!(hit(&scene, DVec2::new(1., 1.)), Some(child_id));
+        assert_eq!(hit(&scene, DVec2::new(-10., 50.)), Some(child_id));
+        scene.get_mut(child_id).expect("child").flags = fanta_doc::NodeFlags::HIDDEN;
+        assert_eq!(hit(&scene, DVec2::new(1., 1.)), Some(background_id));
+        assert_eq!(hit(&scene, DVec2::new(-10., 50.)), Some(background_id));
+        assert_eq!(hit(&scene, DVec2::new(50., 50.)), Some(frame_id));
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_rotated_bitmaps_reject_empty_world_bounds_corners() -> anyhow::Result<()> {
+        let mut scene = Scene::new();
+        let background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -100.,
+            -100.,
+            300.,
+            300.,
+            Color::BLACK,
+        )));
+        let background_id = background.id;
+        scene.insert(background)?;
+        let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+            asset: fanta_doc::AssetId::new(),
+            natural_size: [100, 100],
+            local_size: [100., 100.],
+            crop: None,
+            fit: fanta_doc::ImageFitMode::Fill,
+            tint: None,
+        }));
+        bitmap.index = scene.next_root_index();
+        bitmap.transform = Transform2D::rotation(std::f64::consts::FRAC_PI_4);
+        let transform = bitmap.transform;
+        let bitmap_id = bitmap.id;
+        scene.insert(bitmap)?;
+        let empty_corner = DVec2::new(-60., 10.);
+        assert!(
+            scene
+                .world_bounds(bitmap_id)
+                .expect("bounds")
+                .contains_point(empty_corner)
+        );
+        assert_eq!(
+            inspect_world_point(&scene, empty_corner, None),
+            Some(background_id)
+        );
+        assert_eq!(
+            inspect_world_point(
+                &scene,
+                transform.transform_point(DVec2::new(50., 50.)),
+                None
+            ),
+            Some(bitmap_id)
+        );
+        scene.get_mut(bitmap_id).expect("bitmap").transform = Transform2D::scale_xy(0., 1.);
+        assert_eq!(
+            inspect_world_point(&scene, DVec2::new(0., 50.), None),
+            Some(background_id)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_traversal_preserves_page_flags_and_boolean_eligibility() -> anyhow::Result<()> {
+        let mut scene = Scene::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100., 100.]),
+            ..GroupNode::default()
+        }));
+        let page_id = page.id;
+        scene.insert(page)?;
+        let mut other_page = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100., 100.]),
+            background: Some(fanta_doc::Fill::solid(Color::WHITE)),
+            ..GroupNode::default()
+        }));
+        other_page.index = scene.next_root_index();
+        scene.insert(other_page)?;
+        let point = DVec2::new(50., 50.);
+        assert_eq!(inspect_world_point(&scene, point, Some(page_id)), None);
+
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        group.parent = Some(page_id);
+        let group_id = group.id;
+        scene.insert(group)?;
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        child.parent = Some(group_id);
+        let child_id = child.id;
+        scene.insert(child)?;
+        assert_eq!(
+            inspect_world_point(&scene, point, Some(page_id)),
+            Some(child_id)
+        );
+        for flags in [fanta_doc::NodeFlags::HIDDEN, fanta_doc::NodeFlags::LOCKED] {
+            scene.get_mut(group_id).expect("group").flags = flags;
+            assert_eq!(inspect_world_point(&scene, point, Some(page_id)), None);
+            assert_eq!(inspect_world_point(&scene, point, Some(child_id)), None);
+        }
+        scene.get_mut(group_id).expect("group").flags = fanta_doc::NodeFlags::empty();
+        assert_eq!(
+            inspect_world_point(&scene, point, Some(group_id)),
+            Some(child_id)
+        );
+        let mut boolean = CanvasNode::new(NodeData::Boolean(fanta_doc::BooleanNode {
+            fills: smallvec::smallvec![fanta_doc::Fill::solid(Color::BLACK)],
+            ..fanta_doc::BooleanNode::default()
+        }));
+        boolean.parent = Some(page_id);
+        boolean.index = scene.next_child_index(Some(page_id));
+        let boolean_id = boolean.id;
+        scene.insert(boolean)?;
+        let mut operand = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::WHITE,
+        )));
+        operand.parent = Some(boolean_id);
+        let operand_id = operand.id;
+        scene.insert(operand)?;
+        assert_eq!(
+            inspect_world_point(&scene, point, Some(page_id)),
+            Some(boolean_id)
+        );
+        assert_eq!(inspect_world_point(&scene, point, Some(operand_id)), None);
+        Ok(())
+    }
 
     fn position_evaluation(node: NodeId, x: f64) -> MotionEvaluation {
         MotionEvaluation {
