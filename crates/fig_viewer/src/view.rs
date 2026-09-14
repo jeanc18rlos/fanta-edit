@@ -1008,8 +1008,15 @@ impl FigView {
     }
 
     fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
+        if self
+            .inspector_sidebar
+            .read(cx)
+            .finishing_edits_requires_text_commit(cx)
+        {
+            self.commit_text_edit(cx);
+        }
         self.inspector_sidebar
-            .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+            .update(cx, |panel, cx| panel.finish_continuous_edits_from_view(cx));
         self.motion_sidebar
             .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
         self.variables_workspace
@@ -8359,11 +8366,96 @@ mod tests {
         assert_ne!(item.read_with(cx, snapshot), before);
     }
 
-    async fn assert_native_inspect_menu_preserves_numeric_draft(
+    #[gpui::test]
+    async fn finishing_legacy_panel_edits_keeps_canvas_text_sub_selection_live(
         cx: &mut TestAppContext,
-        invalid: bool,
     ) {
         init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, text_id, _) = text_selection_doc(false);
+        doc.selection.select_only(text_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Legacy-text-finish.fig".into(),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_text_edit(text_id, TextEditSeed::SelectAll, window, cx);
+                let session = &mut view.text_edit.as_mut().expect("text session").session;
+                session.move_to(0, false);
+                session.move_to(2, true);
+            });
+            inspector.update(cx, |panel, cx| {
+                panel.start_editing(
+                    crate::properties_snapshot::InspectorField::FontSize(text_id),
+                    "16".into(),
+                    window,
+                    cx,
+                );
+                panel
+                    .field_editor
+                    .update(cx, |editor, cx| editor.set_text("30", window, cx));
+            });
+        });
+        cx.run_until_parked();
+        let preview = view.read_with(cx, |view, _| {
+            view.text_edit
+                .as_ref()
+                .expect("preview text session")
+                .session
+                .buffer_snapshot()
+        });
+        view.update(cx, |view, cx| {
+            view.finish_panel_edits(cx);
+            assert_eq!(
+                view.text_edit
+                    .as_ref()
+                    .expect("canvas click can still reposition the caret")
+                    .session
+                    .buffer_snapshot(),
+                preview
+            );
+        });
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+        item.read_with(cx, |item, _| {
+            assert!(item.content_preview_active());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+        });
+        view.update(cx, |view, cx| view.commit_text_edit(cx));
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 1);
+        });
+    }
+
+    async fn assert_native_inspector_workspace_save(cx: &mut TestAppContext, invalid: bool) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let save_key = if cfg!(target_os = "macos") {
+            "cmd-s"
+        } else {
+            "ctrl-s"
+        };
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                save_key,
+                workspace::Save { save_intent: None },
+                Some("Workspace"),
+            )])
+        });
+        let directory = tempfile::tempdir().expect("temporary saved project");
+        let root = directory.path().join("Native Inspector Save");
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let mut doc = doc_with_one_page();
         let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
@@ -8378,14 +8470,115 @@ mod tests {
         doc.apply(Operation::create_node(vector)).expect("vector");
         doc.selection.select_only(vector_id);
         doc.history = Default::default();
-        let item = crate::document::ready_item_for_test(
+        crate::document::write_project(&root, &doc, &BTreeMap::new()).expect("write baseline");
+        let item = crate::document::ready_item_with_root_for_test(
             &project,
-            "/tmp/Native-inspect-draft.fig".into(),
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let (workspace, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| workspace::Workspace::test_new(project, window, cx)
+        });
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| window.is_window_active()));
+        #[cfg(feature = "fanta-gpui-ui")]
+        view.read_with(cx, |view, _| assert!(view.gpui_design.is_none()));
+        let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
+        let field = cx
+            .debug_bounds("scrub-fanta-x-0")
+            .expect("mounted legacy X field");
+        cx.simulate_click(field.center(), gpui::Modifiers::none());
+        cx.dispatch_action(editor::actions::SelectAll);
+        cx.simulate_input("55.5");
+        if invalid {
+            cx.dispatch_action(editor::actions::SelectAll);
+            cx.simulate_input("invalid");
+        }
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_some()));
+        assert!(item.read_with(cx, |item, _| item.content_preview_active()));
+        cx.simulate_keystrokes(save_key);
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+        cx.wait_for(
+            &item,
+            |item| !item.is_dirty() && !item.content_preview_active(),
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .expect("workspace Save completes");
+        let (saved, _) =
+            fanta_format::read_project_tree(&root).expect("reopen workspace Save bytes");
+        let saved_node = saved.scene.get(vector_id).expect("saved vector");
+        assert_eq!(
+            saved_node.transform.0.translation.x,
+            if invalid { 0.0 } else { 55.5 }
+        );
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(vector_id), Some(saved_node));
+            assert_eq!(doc.history.undo_depth(), usize::from(!invalid));
+        });
+    }
+
+    #[gpui::test]
+    async fn workspace_save_key_commits_a_mounted_legacy_numeric_preview(cx: &mut TestAppContext) {
+        assert_native_inspector_workspace_save(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn workspace_save_key_clears_a_mounted_invalid_legacy_numeric_draft(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_inspector_workspace_save(cx, true).await;
+    }
+
+    async fn assert_native_inspect_menu_preserves_numeric_draft(
+        cx: &mut TestAppContext,
+        invalid: bool,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary Inspect project");
+        let root = directory.path().join("Native Inspect");
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        crate::document::write_project(&root, &doc, &BTreeMap::new())
+            .expect("write Inspect baseline");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
             doc,
             cx,
         );
         let (view, cx) = cx.add_window_view({
             let item = item.clone();
+            let project = project.clone();
             move |window, cx| FigView::new(item, project, window, cx)
         });
         // Focus callbacks require an active platform window in GPUI tests.
@@ -8518,6 +8711,8 @@ mod tests {
             });
         } else {
             cx.simulate_keystrokes("escape");
+            inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
+            assert!(!item.read_with(cx, |item, _| item.content_preview_active()));
             assert_eq!(item.read_with(cx, snapshot), original);
         }
         cx.run_until_parked();
@@ -8535,6 +8730,30 @@ mod tests {
             view.read_with(cx, |view, _| view.active_tool()),
             ToolKind::Inspect
         );
+        let save = cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                Item::save(view, SaveOptions::default(), project, window, cx)
+            })
+        });
+        save.await
+            .expect("Save after resolving the refused Inspect draft");
+        cx.run_until_parked();
+        let (saved, _) =
+            fanta_format::read_project_tree(&root).expect("reopen native Inspect Save");
+        assert_eq!(
+            saved.scene.get(vector_id),
+            item.read_with(cx, |item, _| item
+                .doc()
+                .expect("document")
+                .scene
+                .get(vector_id)
+                .cloned())
+                .as_ref()
+        );
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
     }
 
     #[gpui::test]

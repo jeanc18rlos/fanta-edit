@@ -153,6 +153,7 @@ pub struct FantaPropertiesPanel {
     pub(crate) active_item: Option<WeakEntity<FigItem>>,
     draft_preserving_focus_scope: Option<FocusHandle>,
     inspecting: bool,
+    finishing_from_view: bool,
     _inspection_subscription: Option<Subscription>,
     pub(crate) width: Option<Pixels>,
     pub(crate) field_editor: Entity<Editor>,
@@ -334,6 +335,7 @@ impl FantaPropertiesPanel {
             active_item: None,
             draft_preserving_focus_scope: None,
             inspecting: false,
+            finishing_from_view: false,
             _inspection_subscription: None,
             width: None,
             field_editor,
@@ -528,6 +530,33 @@ impl FantaPropertiesPanel {
 
     // === Mutations ========================================================
 
+    pub(crate) fn finishing_edits_requires_text_commit(&self, cx: &App) -> bool {
+        self.is_editable(cx)
+            && ((self.editing_field.is_some() && self.field_edit_text_buffer_snapshot.is_none())
+                || self.scrub.as_ref().is_some_and(|scrub| {
+                    scrub.moved
+                        && scrub.text_buffer_snapshot.is_none()
+                        && scrub.current_value != scrub.start_value
+                })
+                || self.picker.as_ref().is_some_and(|picker| {
+                    picker.changed
+                        && picker.text_buffer_snapshot.is_none()
+                        && picker.picker.read(cx).color() != picker.original
+                })
+                || self.gradient_editor.as_ref().is_some_and(|gradient| {
+                    gradient.changed && gradient.editor.read(cx).gradient() != gradient.original
+                }))
+    }
+
+    pub(crate) fn finish_continuous_edits_from_view(&mut self, cx: &mut Context<Self>) {
+        // The caller holds FigView's lease and has committed canvas text when
+        // a whole-node edit needs it. Sub-selection previews already contain
+        // their final value and must keep the caller's live text session.
+        let finishing_from_view = std::mem::replace(&mut self.finishing_from_view, true);
+        self.finish_continuous_edits(cx);
+        self.finishing_from_view = finishing_from_view;
+    }
+
     pub(crate) fn finish_continuous_edits(&mut self, cx: &mut Context<Self>) {
         self.commit_editing_value(cx);
         self.finish_scrub(cx);
@@ -554,7 +583,8 @@ impl FantaPropertiesPanel {
         let Some(item) = self.active_item(cx) else {
             return false;
         };
-        if let Some(view) = self.active_view(cx)
+        if !self.finishing_from_view
+            && let Some(view) = self.active_view(cx)
             && view.read(cx).has_active_text_edit()
             && item.read(cx).can_preview_for_owner(view.entity_id())
         {
@@ -965,7 +995,7 @@ impl FantaPropertiesPanel {
         text: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.is_editable(cx) {
+        if self.finishing_from_view || !self.is_editable(cx) {
             return false;
         }
         let id = match field {
@@ -3294,6 +3324,7 @@ mod panel_integration_tests {
         vector_id: NodeId,
         text_id: NodeId,
         _view: Entity<FigView>,
+        project: Entity<Project>,
         scratch: gpui::WindowHandle<gpui::Empty>,
         _temp: tempfile::TempDir,
     }
@@ -3367,6 +3398,7 @@ mod panel_integration_tests {
             vector_id,
             text_id,
             _view: view,
+            project,
             scratch,
             _temp: temp,
         }
@@ -3377,6 +3409,422 @@ mod panel_integration_tests {
             window.draw(cx).clear();
         })
         .expect("drawing the properties panel");
+    }
+
+    async fn save_legacy_inspector(harness: &Harness, cx: &mut TestAppContext) {
+        let save = harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                harness._view.update(cx, |view, cx| {
+                    workspace::item::Item::save(
+                        view,
+                        workspace::item::SaveOptions::default(),
+                        harness.project.clone(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("save from the host view");
+        save.await
+            .expect("save the project with a pending inspector edit");
+        cx.run_until_parked();
+        let inspector = harness
+            ._view
+            .read_with(cx, |view, _| view.inspector_for_test());
+        inspector.read_with(cx, |panel, _| {
+            assert!(panel.editing_field.is_none());
+            assert!(panel.scrub.is_none());
+            assert!(panel.picker.is_none());
+            assert!(panel.gradient_editor.is_none());
+            assert!(!panel.finishing_from_view);
+        });
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let (saved, _) = fanta_format::read_project_tree(harness._temp.path())
+            .expect("reopen saved project bytes");
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            let doc = item.doc().expect("document");
+            for node in [harness.vector_id, harness.text_id] {
+                assert_eq!(saved.scene.get(node), doc.scene.get(node));
+            }
+        });
+    }
+
+    async fn assert_legacy_numeric_save(
+        cx: &mut TestAppContext,
+        value: &str,
+        preview: bool,
+        cancel: bool,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let inspector = harness
+            ._view
+            .read_with(cx, |view, _| view.inspector_for_test());
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let original = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(harness.vector_id)
+                .expect("vector")
+                .clone()
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                inspector.update(cx, |panel, cx| {
+                    panel.start_editing(
+                        InspectorField::X(harness.vector_id),
+                        "0".into(),
+                        window,
+                        cx,
+                    );
+                    if preview {
+                        panel
+                            .field_editor
+                            .update(cx, |editor, cx| editor.set_text("55.5", window, cx));
+                    } else {
+                        panel
+                            .field_editor
+                            .update(cx, |editor, cx| editor.set_text(value, window, cx));
+                        panel.suppress_field_editor_events = true;
+                    }
+                });
+            })
+            .expect("start numeric edit");
+        cx.run_until_parked();
+        if !preview {
+            inspector.update(cx, |panel, _| {
+                panel.suppress_field_editor_events = false;
+                assert!(!panel.field_edit_previewed);
+            });
+            assert!(!item.read_with(cx, |item, _| item.content_preview_active()));
+        }
+        if preview && value != "55.5" {
+            harness
+                .scratch
+                .update(cx, |_, window, cx| {
+                    inspector.update(cx, |panel, cx| {
+                        panel
+                            .field_editor
+                            .update(cx, |editor, cx| editor.set_text(value, window, cx));
+                    });
+                })
+                .expect("replace the numeric preview");
+            cx.run_until_parked();
+        }
+        harness._view.update(cx, |view, cx| {
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            assert!(!view.is_inspecting());
+        });
+        inspector.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.editing_field,
+                Some(InspectorField::X(harness.vector_id))
+            );
+            assert_eq!(panel.field_editor.read(cx).text(cx), value);
+        });
+        if cancel {
+            harness
+                .scratch
+                .update(cx, |_, window, cx| {
+                    inspector.update(cx, |panel, cx| panel.cancel_editing(window, cx));
+                })
+                .expect("cancel numeric edit");
+            cx.run_until_parked();
+            harness._view.update(cx, |view, cx| {
+                view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+                assert!(view.is_inspecting());
+            });
+        }
+        save_legacy_inspector(&harness, cx).await;
+        let changed = value == "55.5" && !cancel;
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.scene.get(harness.vector_id).expect("vector");
+            assert_eq!(
+                node.transform.0.translation.x,
+                if changed { 55.5 } else { 0.0 }
+            );
+            assert_eq!(doc.history.undo_depth(), usize::from(changed));
+            if !changed {
+                assert_eq!(node, &original);
+            }
+        });
+        if changed {
+            item.update(cx, |item, cx| {
+                item.undo(cx).expect("undo saved numeric edit")
+            });
+            save_legacy_inspector(&harness, cx).await;
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.doc().expect("document").scene.get(harness.vector_id),
+                    Some(&original)
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn item_save_commits_legacy_numeric_preview_after_refused_inspect(
+        cx: &mut TestAppContext,
+    ) {
+        assert_legacy_numeric_save(cx, "55.5", true, false).await;
+    }
+
+    #[gpui::test]
+    async fn item_save_discards_invalid_legacy_numeric_preview_after_refused_inspect(
+        cx: &mut TestAppContext,
+    ) {
+        assert_legacy_numeric_save(cx, "invalid", true, false).await;
+    }
+
+    #[gpui::test]
+    async fn item_save_handles_legacy_numeric_draft_without_a_preview(cx: &mut TestAppContext) {
+        assert_legacy_numeric_save(cx, "invalid", false, false).await;
+    }
+
+    #[gpui::test]
+    async fn item_save_keeps_cancelled_legacy_numeric_preview_restored_in_inspect(
+        cx: &mut TestAppContext,
+    ) {
+        assert_legacy_numeric_save(cx, "55.5", true, true).await;
+    }
+
+    async fn assert_legacy_typography_save(cx: &mut TestAppContext, sub_selection: bool) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        harness.select(&[harness.text_id], cx);
+        let inspector = harness
+            ._view
+            .read_with(cx, |view, _| view.inspector_for_test());
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let original = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(harness.text_id)
+                .expect("text")
+                .clone()
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                if sub_selection {
+                    harness._view.update(cx, |view, cx| {
+                        view.open_text_edit(
+                            harness.text_id,
+                            crate::view::TextEditSeed::SelectAll,
+                            window,
+                            cx,
+                        );
+                        let session = &mut view.text_edit.as_mut().expect("text session").session;
+                        session.move_to(0, false);
+                        session.move_to(2, true);
+                    });
+                }
+                inspector.update(cx, |panel, cx| {
+                    panel.start_editing(
+                        InspectorField::FontSize(harness.text_id),
+                        "16".into(),
+                        window,
+                        cx,
+                    );
+                    panel
+                        .field_editor
+                        .update(cx, |editor, cx| editor.set_text("30", window, cx));
+                });
+            })
+            .expect("preview typography");
+        cx.run_until_parked();
+        inspector.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.field_edit_text_buffer_snapshot.is_some(),
+                sub_selection
+            );
+        });
+        let preview = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(harness.text_id)
+                .expect("text")
+                .data
+                .clone()
+        });
+        assert_ne!(preview, original.data);
+        save_legacy_inspector(&harness, cx).await;
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.scene.get(harness.text_id).expect("text");
+            assert_eq!(node.data, preview);
+            assert_eq!(doc.history.undo_depth(), 1);
+            let NodeData::Text(text) = &node.data else {
+                panic!("text node")
+            };
+            if sub_selection {
+                assert_eq!(text.style.size_px, 16.0);
+                assert!(
+                    text.style_runs
+                        .iter()
+                        .any(|run| run.start == 0 && run.end == 2 && run.style.size_px == 30.0)
+                );
+                assert!(
+                    text.style_runs
+                        .iter()
+                        .any(|run| run.start == 2 && run.end == 5 && run.style.size_px == 16.0)
+                );
+            } else {
+                assert_eq!(text.style.size_px, 30.0);
+            }
+        });
+        item.update(cx, |item, cx| item.undo(cx).expect("undo saved typography"));
+        save_legacy_inspector(&harness, cx).await;
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").scene.get(harness.text_id),
+                Some(&original)
+            );
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                harness._view.update(cx, |view, cx| {
+                    view.open_text_edit(
+                        harness.text_id,
+                        crate::view::TextEditSeed::SelectAll,
+                        window,
+                        cx,
+                    );
+                    let session = &mut view.text_edit.as_mut().expect("new text session").session;
+                    session.move_to(0, false);
+                    session.move_to(2, true);
+                });
+                inspector.update(cx, |panel, cx| {
+                    assert!(panel.try_apply_text_selection_field(
+                        &InspectorField::FontSize(harness.text_id),
+                        "40",
+                        cx
+                    ));
+                });
+            })
+            .expect("ordinary panel routing remains available after Save");
+        harness._view.read_with(cx, |view, _| {
+            assert!(view.has_active_text_edit());
+            let buffer = view
+                .text_edit
+                .as_ref()
+                .expect("text session")
+                .session
+                .text_buffer();
+            assert!(buffer.runs().iter().any(|run| run.style.size_px == 40.0));
+            assert!(buffer.runs().iter().any(|run| run.style.size_px == 16.0));
+        });
+    }
+
+    #[gpui::test]
+    async fn item_save_commits_legacy_whole_node_typography(cx: &mut TestAppContext) {
+        assert_legacy_typography_save(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn item_save_preserves_legacy_typography_sub_selection(cx: &mut TestAppContext) {
+        assert_legacy_typography_save(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn item_save_commits_legacy_scrub_picker_and_gradient(cx: &mut TestAppContext) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let inspector = harness
+            ._view
+            .read_with(cx, |view, _| view.inspector_for_test());
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        for gesture in 0..3 {
+            let node_id = if gesture == 1 {
+                harness.text_id
+            } else {
+                harness.vector_id
+            };
+            harness.select(&[node_id], cx);
+            let original = item.read_with(cx, |item, _| {
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(node_id)
+                    .expect("vector")
+                    .clone()
+            });
+            harness
+                .scratch
+                .update(cx, |_, window, cx| {
+                    inspector.update(cx, |panel, cx| match gesture {
+                        0 => {
+                            let field = InspectorField::X(harness.vector_id);
+                            panel.begin_field_scrub(
+                                field.clone(),
+                                0.0,
+                                gpui::point(px(0.0), px(0.0)),
+                                cx,
+                            );
+                            let scrub = panel.scrub.as_mut().expect("scrub");
+                            scrub.moved = true;
+                            scrub.current_value = 20.0;
+                            let snapshot = scrub.snapshot.clone();
+                            panel.preview_field_text(&field, &snapshot, "20", cx);
+                        }
+                        1 => {
+                            panel.toggle_color_picker(
+                                InspectorField::TextColor(harness.text_id),
+                                FantaColor::BLACK,
+                                window,
+                                cx,
+                            );
+                            let picker = panel.picker.as_ref().expect("picker").picker.clone();
+                            picker.update(cx, |picker, cx| {
+                                picker.set_test_color(FantaColor::WHITE, window, cx)
+                            });
+                        }
+                        _ => {
+                            panel.toggle_gradient_editor(
+                                harness.vector_id,
+                                0,
+                                false,
+                                linear_gradient_fill(),
+                                cx,
+                            );
+                            let editor = panel
+                                .gradient_editor
+                                .as_ref()
+                                .expect("gradient")
+                                .editor
+                                .clone();
+                            editor.update(cx, |editor, cx| {
+                                editor.set_kind(crate::color_picker::GradientKind::Radial, cx)
+                            });
+                        }
+                    });
+                })
+                .expect("stage legacy gesture");
+            cx.run_until_parked();
+            save_legacy_inspector(&harness, cx).await;
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_ne!(doc.scene.get(node_id), Some(&original));
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+            item.update(cx, |item, cx| item.undo(cx).expect("undo saved gesture"));
+            save_legacy_inspector(&harness, cx).await;
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.doc().expect("document").scene.get(node_id),
+                    Some(&original)
+                );
+            });
+        }
     }
 
     #[gpui::test]
