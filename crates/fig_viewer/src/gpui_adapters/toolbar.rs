@@ -841,10 +841,22 @@ mod echo_tests {
         cx: &mut VisualTestContext,
         selector: &'static str,
     ) -> gpui::Bounds<gpui::Pixels> {
+        let control = cx.debug_bounds(selector).expect("primary toolbar control");
+        if selector == "toolbar-tool-actions" {
+            // Actions is a fixed sibling of the scrolling tool viewport.
+            let dock = cx
+                .debug_bounds("toolbar-primary-dock-row")
+                .expect("primary dock row");
+            let canvas = cx.debug_bounds("fig-container").expect("canvas bounds");
+            assert!(
+                control.is_contained_within(&dock) && control.is_contained_within(&canvas),
+                "{selector} must be fully visible before pointer input: {control:?} in dock {dock:?} and canvas {canvas:?}"
+            );
+            return control;
+        }
         let viewport = cx
             .debug_bounds("toolbar-primary-viewport")
             .expect("primary toolbar viewport");
-        let control = cx.debug_bounds(selector).expect("primary toolbar control");
         let displacement = if control.left() < viewport.left() {
             viewport.left() - control.left() + px(8.)
         } else if control.right() > viewport.right() {
