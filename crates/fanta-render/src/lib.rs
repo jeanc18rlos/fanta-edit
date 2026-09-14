@@ -30,6 +30,7 @@ pub mod image;
 pub mod paint;
 pub mod path;
 pub mod raster;
+pub mod sampling;
 pub mod transform;
 
 pub use asset::{AssetResolver, DecodedImage, InMemoryAssetResolver, LazyAssetResolver};

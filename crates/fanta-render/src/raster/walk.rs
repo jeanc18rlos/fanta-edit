@@ -201,7 +201,18 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
 /// Geometry, visibility, culling, and painting read the same transient overlay
 /// (see [`resolve_overlay`]); the document is never mutated by rendering.
 pub(crate) fn render_node(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
+    if ctx
+        .metrics
+        .sampling_budget
+        .as_mut()
+        .is_some_and(|budget| !budget.enter())
+    {
+        return;
+    }
     render_node_with_clip(canvas, id, ctx);
+    if let Some(budget) = &mut ctx.metrics.sampling_budget {
+        budget.leave();
+    }
 }
 
 fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
@@ -276,7 +287,11 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // not this node's own (empty) effects layer. Self-contained — frosts nothing
     // and is free when the node carries no visible background blur.
     if ctx.supports_offscreen_layers {
-        apply_background_blur(canvas, node, Some(id), ctx.scene, ctx.effective_scale);
+        if apply_background_blur(canvas, node, Some(id), ctx.scene, ctx.effective_scale)
+            == super::effects::BackgroundBlurOutcome::Failed
+        {
+            ctx.metrics.effect_failed = true;
+        }
     }
 
     // The node's ZOOM-EFFECTIVE effects: which authored shadows / layer blur

@@ -167,6 +167,9 @@ pub(crate) fn stroke_sk_path(
         // the uniform-width guard below does not apply when `per_side` is set.)
         if let Some(sides) = stroke.per_side {
             if draw_per_side_border(canvas, sk_path, stroke, sides, local_bounds_f32) {
+                if matches!(stroke.paint, Fill::Image { .. }) {
+                    ctx.metrics.incomplete_artwork = true;
+                }
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
@@ -195,6 +198,7 @@ pub(crate) fn stroke_sk_path(
             // Missing / still-decoding asset: placeholder stroke below, and
             // no enclosing effects layer may be cached from this frame.
             ctx.layer_volatile = true;
+            ctx.metrics.incomplete_artwork = true;
         }
         // `ctx.paint_alpha` is 1.0 unless the walk folded this leaf's node
         // opacity into its single draw (see `opacity_folds_into_paint`).
@@ -870,6 +874,7 @@ pub(crate) fn paint_path_fills(
             // which may still be decoding, so an enclosing effects layer
             // must not be cached from this frame (see `layer_volatile`).
             ctx.layer_volatile = true;
+            ctx.metrics.incomplete_artwork = true;
         }
         let mut paint = fill_to_paint(fill, local_bounds_f32);
         // 1.0 unless the walk folded this leaf's node opacity into its single
