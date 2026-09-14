@@ -9312,7 +9312,7 @@ mod tests {
         doc.history = Default::default();
         let item = crate::document::ready_item_for_test(
             &project,
-            PathBuf::from("/tmp/Embedded Page Click.fig"),
+            std::path::PathBuf::from("/tmp/Embedded Page Click.fig"),
             doc,
             cx,
         );
@@ -9534,7 +9534,7 @@ mod tests {
         doc.history = Default::default();
         let item = crate::document::ready_item_for_test(
             &project,
-            PathBuf::from("/tmp/Embedded Component Link.fig"),
+            std::path::PathBuf::from("/tmp/Embedded Component Link.fig"),
             doc,
             cx,
         );
@@ -9592,8 +9592,11 @@ mod tests {
                 .debug_bounds("fanta-inspector-sidebar")
                 .expect("FigView-owned inspector");
             assert!(
-                link.is_contained_within(&inspector),
-                "visible link: {link:?}"
+                link.left() >= inspector.left()
+                    && link.top() >= inspector.top()
+                    && link.right() <= inspector.right()
+                    && link.bottom() <= inspector.bottom(),
+                "visible link: {link:?}, inspector: {inspector:?}"
             );
             cx.simulate_click(link.center(), gpui::Modifiers::none());
             cx.run_until_parked();
