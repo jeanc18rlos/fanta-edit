@@ -8478,10 +8478,11 @@ mod tests {
             doc,
             cx,
         );
-        let (workspace, cx) = cx.add_window_view({
+        let (multi_workspace, cx) = cx.add_window_view({
             let project = project.clone();
-            move |window, cx| workspace::Workspace::test_new(project, window, cx)
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
         });
+        let workspace = multi_workspace.read_with(cx, |shell, _| shell.workspace().clone());
         let view = cx.update(|window, cx| {
             let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
             workspace.update(cx, |workspace, cx| {
@@ -8496,9 +8497,40 @@ mod tests {
         #[cfg(feature = "fanta-gpui-ui")]
         view.read_with(cx, |view, _| assert!(view.gpui_design.is_none()));
         let inspector = view.read_with(cx, |view, _| view.inspector_for_test());
-        let field = cx
-            .debug_bounds("scrub-fanta-x-0")
-            .expect("mounted legacy X field");
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item(cx).map(|item| item.item_id()),
+                Some(view.entity_id()),
+                "the saved canvas must be the mounted active workspace item"
+            );
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(view.inspector_sidebar_visible);
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("ready workspace document");
+            assert_eq!(doc.selection.as_slice(), &[vector_id]);
+            assert!(doc.scene.contains(vector_id));
+        });
+        inspector.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.active_view.as_ref().map(|view| view.entity_id()),
+                Some(view.entity_id()),
+                "the embedded inspector must finish its deferred binding"
+            );
+        });
+        // Cached pane replays do not repopulate GPUI's per-frame debug bounds.
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let canvas = cx.debug_bounds("fig-container");
+        let sidebar = cx.debug_bounds("fanta-inspector-sidebar");
+        let field = cx.debug_bounds("scrub-fanta-x-0").unwrap_or_else(|| {
+            panic!("mounted legacy X field: canvas={canvas:?}, sidebar={sidebar:?}")
+        });
         cx.simulate_click(field.center(), gpui::Modifiers::none());
         cx.dispatch_action(editor::actions::SelectAll);
         cx.simulate_input("55.5");
@@ -8512,13 +8544,10 @@ mod tests {
         cx.simulate_keystrokes(save_key);
         cx.run_until_parked();
         inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
-        cx.wait_for(
-            &item,
-            |item| !item.is_dirty() && !item.content_preview_active(),
-            std::time::Duration::from_secs(3),
-        )
-        .await
-        .expect("workspace Save completes");
+        cx.condition(&item, |item, _| {
+            !item.is_dirty() && !item.content_preview_active()
+        })
+        .await;
         let (saved, _) =
             fanta_format::read_project_tree(&root).expect("reopen workspace Save bytes");
         let saved_node = saved.scene.get(vector_id).expect("saved vector");
