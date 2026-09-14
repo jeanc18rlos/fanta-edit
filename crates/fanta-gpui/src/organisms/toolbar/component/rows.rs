@@ -511,19 +511,19 @@ impl EditorToolbar {
         let label = label.into();
         let accent = Self::mode_accent(self.mode, cx);
         let pale_accent = Self::mode_accent_pale(self.mode, cx);
+        let disabled = control == ToolbarSecondaryControl::DevReadyForDevelopment
+            && !self.dev_options.readiness_available;
+        let selected = selected && !disabled;
         h_flex()
             .id(SharedString::from(format!(
                 "{}-secondary-{suffix}",
                 self.id
             )))
             .debug_selector(move || format!("toolbar-secondary-{suffix}"))
-            .key_context(CONTROL_KEY_CONTEXT)
-            .tab_index(0)
             .h(px(28.))
             .px_2()
             .gap_1()
             .rounded(px(7.))
-            .cursor_pointer()
             .text_xs()
             .border_1()
             .border_color(cx.theme().transparent)
@@ -532,16 +532,24 @@ impl EditorToolbar {
             } else {
                 cx.theme().transparent
             })
-            .text_color(if selected {
+            .text_color(if disabled {
+                cx.theme().muted_foreground
+            } else if selected {
                 accent
             } else {
                 cx.theme().popover_foreground
             })
-            .hover(|style| style.bg(cx.theme().accent))
-            .focus(|style| style.border_color(cx.theme().selection))
-            .on_activate(cx.listener(move |this, _, _, cx| {
-                this.request_control_value(control, value.clone(), cx);
-            }))
+            .when(!disabled, |button| {
+                button
+                    .key_context(CONTROL_KEY_CONTEXT)
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().accent))
+                    .focus(|style| style.border_color(cx.theme().selection))
+                    .on_activate(cx.listener(move |this, _, _, cx| {
+                        this.request_control_value(control, value.clone(), cx);
+                    }))
+            })
             .child(label)
             .into_any_element()
     }
@@ -650,7 +658,9 @@ impl EditorToolbar {
             .child(div().w(px(1.)).h(px(22.)).bg(cx.theme().border))
             .child(self.render_value_button(
                 "dev-ready",
-                if self.dev_options.ready_for_development {
+                if !self.dev_options.readiness_available {
+                    "Readiness unavailable"
+                } else if self.dev_options.ready_for_development {
                     "Ready for dev"
                 } else {
                     "Mark ready for dev"

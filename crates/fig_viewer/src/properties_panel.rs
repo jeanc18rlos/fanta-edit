@@ -535,9 +535,9 @@ impl FantaPropertiesPanel {
                     let item = view.read(cx).item().clone();
                     self.draft_preserving_focus_scope =
                         Some(view.read(cx).draft_preserving_toolbar_focus_scope(cx));
-                    self.set_inspecting(view.read(cx).is_art_read_only(), cx);
+                    self.set_inspecting(view.read(cx).is_art_read_only(cx), cx);
                     self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
-                        this.set_inspecting(view.read(cx).is_art_read_only(), cx);
+                        this.set_inspecting(view.read(cx).is_art_read_only(cx), cx);
                     }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,

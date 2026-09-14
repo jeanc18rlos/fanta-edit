@@ -45,6 +45,7 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::PlaceImageVideo,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::OpenDevMode,
     ToolbarCommand::GenerateImage,
     ToolbarCommand::GenerateVideo,
     ToolbarCommand::GenerateVector,
@@ -55,6 +56,19 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::TranslateText,
     ToolbarCommand::RenameLayers,
     ToolbarCommand::RemoveBackground,
+];
+
+pub(crate) const DEV_COMMANDS: &[ToolbarCommand] = &[
+    ToolbarCommand::Undo,
+    ToolbarCommand::Redo,
+    ToolbarCommand::Copy,
+    ToolbarCommand::SelectAll,
+    ToolbarCommand::ZoomToFit,
+    ToolbarCommand::ZoomToSelection,
+    ToolbarCommand::Export,
+    ToolbarCommand::OpenDesignMode,
+    ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::OpenDevMode,
 ];
 
 /// The entrance presets fig_viewer's Motion inspector can author — the same
@@ -204,11 +218,10 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
     })
 }
 
-/// The editor has no Dev mode; Prototype and Comments keep the Design strip
-/// visible.
 pub(crate) fn toolbar_mode(mode: EditorMode) -> ToolbarMode {
     match mode {
         EditorMode::Motion => ToolbarMode::Motion,
+        EditorMode::Dev => ToolbarMode::Dev,
         EditorMode::Design | EditorMode::Prototype | EditorMode::Comments => ToolbarMode::Design,
     }
 }
@@ -316,6 +329,16 @@ impl ToolbarAdapter {
             self.panel.update(cx, |toolbar, cx| {
                 if next.0 != last.0 {
                     toolbar.set_mode(next.0, cx);
+                    toolbar.set_commands(
+                        if next.0 == ToolbarMode::Dev {
+                            DEV_COMMANDS
+                        } else {
+                            IMPLEMENTED_COMMANDS
+                        }
+                        .iter()
+                        .copied(),
+                        cx,
+                    );
                 }
                 if next.1 != last.1 {
                     toolbar.set_active_tool(next.1, cx);
@@ -347,9 +370,8 @@ impl ToolbarAdapter {
             self.last_pushed_motion = Some(motion);
         }
 
-        // Truthful static: fig_viewer has no ready-for-development model (and
-        // no reachable Dev mode), so the readiness chip stays unset.
         let dev = DevToolbarOptions {
+            readiness_available: false,
             ready_for_development: false,
         };
         if self.last_pushed_dev != Some(dev) {
@@ -473,6 +495,7 @@ mod tests {
     fn every_editor_mode_maps_to_a_toolbar_mode() {
         assert_eq!(toolbar_mode(EditorMode::Design), ToolbarMode::Design);
         assert_eq!(toolbar_mode(EditorMode::Motion), ToolbarMode::Motion);
+        assert_eq!(toolbar_mode(EditorMode::Dev), ToolbarMode::Dev);
         assert_eq!(toolbar_mode(EditorMode::Prototype), ToolbarMode::Design);
         assert_eq!(toolbar_mode(EditorMode::Comments), ToolbarMode::Design);
     }
@@ -6358,5 +6381,333 @@ mod echo_tests {
         toolbar.read_with(cx, |toolbar, _| {
             assert!(toolbar.chrome_controls()[1].active)
         });
+    }
+
+    #[gpui::test]
+    async fn dev_shared_mode_tray_echoes_and_refuses_unsupported_host_intents(
+        cx: &mut TestAppContext,
+    ) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            ..
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        let original = local_media_snapshot(&item, &cx);
+        let dev = cx
+            .debug_bounds("toolbar-mode-dev")
+            .expect("Dev mode tray control");
+        cx.simulate_click(dev.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Dev);
+            assert_eq!(
+                view.editor_workspace(cx),
+                crate::editor_session::EditorWorkspace::Canvas
+            );
+            assert_eq!(view.active_tool(), ToolKind::Inspect);
+            assert!(view.is_art_read_only(cx));
+            assert!(!view.is_presenting_prototype());
+        });
+        toolbar.read_with(&cx, |toolbar, _| {
+            assert_eq!(toolbar.mode(), ToolbarMode::Dev);
+            assert_eq!(toolbar.active_tool(), ToolbarTool::Inspect);
+            assert!(!toolbar.dev_options().readiness_available);
+            assert!(!toolbar.dev_options().ready_for_development);
+        });
+        assert_eq!(local_media_snapshot(&item, &cx), original);
+        assert!(
+            cx.debug_bounds("toolbar-group-move-tools-trigger")
+                .is_none()
+        );
+
+        let motion = toolbar.read_with(&cx, |toolbar, _| toolbar.motion_options().clone());
+        for action in [
+            ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::Rectangle,
+            },
+            ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::Cut,
+            },
+            ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::Present,
+            },
+            ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAutoKeyframe,
+                value: ToolbarControlValue::Toggle(true),
+            },
+            ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAddKeyframe,
+            },
+            ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Dev,
+                control: ToolbarSecondaryControl::DevReadyForDevelopment,
+                value: ToolbarControlValue::Toggle(true),
+            },
+        ] {
+            toolbar.update(&mut cx, |_, cx| cx.emit(action));
+            cx.run_until_parked();
+            assert_eq!(local_media_snapshot(&item, &cx), original);
+            view.read_with(&cx, |view, cx| {
+                assert_eq!(view.editor_mode(cx), EditorMode::Dev);
+                assert_eq!(view.active_tool(), ToolKind::Inspect);
+                assert!(!view.is_presenting_prototype());
+            });
+            toolbar.read_with(&cx, |toolbar, _| {
+                assert_eq!(toolbar.mode(), ToolbarMode::Dev);
+                assert_eq!(toolbar.active_tool(), ToolbarTool::Inspect);
+                assert_eq!(toolbar.motion_options(), &motion);
+                assert!(!toolbar.dev_options().ready_for_development);
+            });
+        }
+
+        let hand = visible_primary_control(&mut cx, "toolbar-tool-hand");
+        cx.simulate_click(hand.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Dev);
+            assert_eq!(view.active_tool(), ToolKind::Hand);
+            assert!(view.is_art_read_only(cx));
+            assert!(view.can_edit_annotations(cx));
+            assert!(view.can_edit_measurements(cx));
+        });
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
+            ToolbarTool::Hand
+        );
+        let code = visible_primary_control(&mut cx, "toolbar-tool-saved-code");
+        cx.simulate_click(code.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Dev);
+            assert_eq!(
+                view.editor_workspace(cx),
+                crate::editor_session::EditorWorkspace::Code
+            );
+            assert_eq!(view.active_tool(), ToolKind::Inspect);
+        });
+        assert_eq!(local_media_snapshot(&item, &cx), original);
+    }
+
+    #[gpui::test]
+    async fn dev_shared_actions_entry_and_design_exit_refresh_the_host_catalog(
+        cx: &mut TestAppContext,
+    ) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            ..
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        let original = local_media_snapshot(&item, &cx);
+        let actions = visible_primary_control(&mut cx, "toolbar-tool-actions");
+        cx.simulate_click(actions.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_input("switch to dev");
+        cx.run_until_parked();
+        let dev = cx
+            .debug_bounds("toolbar-command-switch-to-dev-mode")
+            .expect("Dev Actions result");
+        cx.simulate_click(dev.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_none());
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Dev);
+            assert_eq!(view.active_tool(), ToolKind::Inspect);
+        });
+        toolbar.read_with(&cx, |toolbar, _| {
+            assert_eq!(toolbar.mode(), ToolbarMode::Dev);
+            assert_eq!(toolbar.active_tool(), ToolbarTool::Inspect);
+        });
+
+        let actions = visible_primary_control(&mut cx, "toolbar-tool-actions");
+        cx.simulate_click(actions.center(), Modifiers::none());
+        cx.run_until_parked();
+        for (query, selector) in [
+            ("present", "toolbar-command-present"),
+            ("cut", "toolbar-command-cut"),
+        ] {
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "Dev must not offer {query}"
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let design = cx
+            .debug_bounds("toolbar-mode-design")
+            .expect("Design mode tray control");
+        cx.simulate_click(design.center(), Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(&cx, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert_eq!(view.active_tool(), ToolKind::Select);
+            assert!(!view.is_art_read_only(cx));
+        });
+        toolbar.read_with(&cx, |toolbar, _| {
+            assert_eq!(toolbar.mode(), ToolbarMode::Design);
+            assert_eq!(toolbar.active_tool(), ToolbarTool::Move);
+        });
+
+        let actions = visible_primary_control(&mut cx, "toolbar-tool-actions");
+        cx.simulate_click(actions.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("present");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("toolbar-command-present").is_some());
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(local_media_snapshot(&item, &cx), original);
+    }
+
+    #[gpui::test]
+    async fn dev_shared_mode_tray_preserves_numeric_drafts_until_corrected_or_cancelled(
+        cx: &mut TestAppContext,
+    ) {
+        for invalid in [false, true] {
+            let CanvasGestureFixture {
+                view,
+                item,
+                toolbar,
+                mut cx,
+                vector_id,
+                ..
+            } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+            cx.update(|window, _| window.activate_window());
+            cx.run_until_parked();
+            assert!(cx.update(|window, _| window.is_window_active()));
+            let original = local_media_snapshot(&item, &cx);
+            let field = cx
+                .debug_bounds("fig-gpui-design-x")
+                .expect("shared X field");
+            cx.simulate_click(field.center(), Modifiers::none());
+            cx.run_until_parked();
+            cx.dispatch_action(gpui_component::input::SelectAll);
+            cx.simulate_input("55.5");
+            cx.run_until_parked();
+            if invalid {
+                cx.dispatch_action(gpui_component::input::SelectAll);
+                cx.simulate_input("invalid");
+                cx.run_until_parked();
+            }
+            item.read_with(&cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    doc.scene
+                        .get(vector_id)
+                        .expect("vector")
+                        .transform
+                        .0
+                        .translation
+                        .x,
+                    55.5
+                );
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert!(item.content_preview_active());
+            });
+            let preview = local_media_snapshot(&item, &cx);
+            let assert_pending = |cx: &VisualTestContext| {
+                view.read_with(cx, |view, cx| {
+                    assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                    assert_eq!(view.active_tool(), ToolKind::Select);
+                    assert!(
+                        view.gpui_design
+                            .as_ref()
+                            .expect("shared Design")
+                            .session
+                            .is_some()
+                    );
+                });
+                toolbar.read_with(cx, |toolbar, _| {
+                    assert_eq!(toolbar.mode(), ToolbarMode::Design);
+                    assert_eq!(toolbar.active_tool(), ToolbarTool::Move);
+                });
+                assert_eq!(local_media_snapshot(&item, cx), preview);
+                assert!(item.read_with(cx, |item, _| item.content_preview_active()));
+            };
+            let dev = cx
+                .debug_bounds("toolbar-mode-dev")
+                .expect("Dev mode tray control");
+            cx.simulate_mouse_down(dev.center(), gpui::MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            assert_pending(&cx);
+            cx.simulate_mouse_up(dev.center(), gpui::MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            assert_pending(&cx);
+
+            let field = cx
+                .debug_bounds("fig-gpui-design-x")
+                .expect("retained shared X field");
+            cx.simulate_click(field.center(), Modifiers::none());
+            cx.run_until_parked();
+            cx.dispatch_action(gpui_component::input::SelectAll);
+            cx.dispatch_action(gpui_component::input::Copy);
+            assert_eq!(
+                cx.update(|_, cx| cx
+                    .read_from_clipboard()
+                    .and_then(|clipboard| clipboard.text())),
+                Some(if invalid { "invalid" } else { "55.5" }.into())
+            );
+            assert_pending(&cx);
+            if invalid {
+                cx.simulate_input("72.5");
+                cx.simulate_keystrokes("enter");
+            } else {
+                cx.simulate_keystrokes("escape");
+            }
+            cx.run_until_parked();
+            view.read_with(&cx, |view, _| {
+                assert!(
+                    view.gpui_design
+                        .as_ref()
+                        .expect("shared Design")
+                        .session
+                        .is_none()
+                );
+            });
+            item.read_with(&cx, |item, _| {
+                assert!(!item.content_preview_active());
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.history.undo_depth(), usize::from(invalid));
+                assert_eq!(
+                    doc.scene
+                        .get(vector_id)
+                        .expect("vector")
+                        .transform
+                        .0
+                        .translation
+                        .x,
+                    if invalid { 72.5 } else { 0.0 }
+                );
+            });
+            if !invalid {
+                assert_eq!(local_media_snapshot(&item, &cx), original);
+            }
+            let settled = local_media_snapshot(&item, &cx);
+            let dev = cx
+                .debug_bounds("toolbar-mode-dev")
+                .expect("Dev retry control");
+            cx.simulate_click(dev.center(), Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(&cx, |view, cx| {
+                assert_eq!(view.editor_mode(cx), EditorMode::Dev);
+                assert_eq!(view.active_tool(), ToolKind::Inspect);
+            });
+            toolbar.read_with(&cx, |toolbar, _| {
+                assert_eq!(toolbar.mode(), ToolbarMode::Dev);
+                assert_eq!(toolbar.active_tool(), ToolbarTool::Inspect);
+            });
+            assert_eq!(local_media_snapshot(&item, &cx), settled);
+        }
     }
 }

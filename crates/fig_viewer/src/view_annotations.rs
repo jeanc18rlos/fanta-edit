@@ -33,7 +33,7 @@ pub(crate) struct AnnotationOverlay {
 
 impl FigView {
     pub(super) fn annotation_page(&self, cx: &App) -> Option<NodeId> {
-        if self.editor_mode(cx) != EditorMode::Design
+        if !self.is_design_canvas_mode(cx)
             || self.editor_workspace(cx) != EditorWorkspace::Canvas
             || self.prototype_player.is_some()
             || matches!(
