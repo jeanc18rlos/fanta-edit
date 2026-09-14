@@ -8189,6 +8189,7 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 canvas_video_active: std::cell::Cell::new(true),
                 tools: ToolShell::new(),
+                annotation_state: annotations_host::AnnotationHostState::default(),
                 measurement_controller: MeasurementController::default(),
                 measurement_origin: None,
                 measurement_selection: None,
