@@ -228,7 +228,7 @@ fn page_registry_requires_project_persistence_and_rejects_scoped_transactions_at
     workspace.open_artifact(id.clone()).expect("page artifact");
     let artifact = workspace.artifact_mut(&id).expect("artifact");
     let before = serde_json::to_value(artifact.doc()).expect("document snapshot");
-    let source = artifact.source_text().to_owned();
+    let source = artifact.source_text();
     let generation = artifact.working_generation();
     let registry = Operation::SetPageRegistry {
         old_pages: artifact.doc().pages().to_vec(),
