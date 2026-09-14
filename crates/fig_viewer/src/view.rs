@@ -2285,31 +2285,40 @@ impl FigView {
 
     // === Tool routing =====================================================
 
-    /// Send one event through the active tool, tracking whether it changed
-    /// document content, only the selection, or nothing.
-    pub(crate) fn can_edit_measurements(&self, cx: &App) -> bool {
-        !self.is_inspecting()
-            && self.item.read(cx).is_editable()
-            && self.is_design_canvas_mode(cx)
-            && self.editor_workspace(cx) == EditorWorkspace::Canvas
-            && self.prototype_player.is_none()
-            && self.item.read(cx).doc().is_some_and(|doc| {
-                doc.active_page()
-                    .is_some_and(|page| doc.pages().contains(&page))
-            })
-    }
-
-    pub(crate) fn page_measurements(&self, cx: &App) -> Vec<MeasurementRecord> {
+    pub(super) fn mark_page(&self, cx: &App) -> Option<NodeId> {
         if !self.is_design_canvas_mode(cx)
             || self.editor_workspace(cx) != EditorWorkspace::Canvas
             || self.prototype_player.is_some()
+            || matches!(
+                self.scope,
+                Some(FigScope::Component(_) | FigScope::Variables)
+            )
         {
-            return Vec::new();
+            return None;
         }
-        let Some(doc) = self.item.read(cx).doc() else {
+        let document = self.item.read(cx).document()?;
+        let page = document.doc.active_page()?;
+        let node = document.doc.scene.get(page)?;
+        (document.doc.pages().contains(&page)
+            && !document.doc.is_component_root(page)
+            && matches!(node.data, NodeData::Group(_))
+            && !node.flags.contains(fanta_doc::NodeFlags::HIDDEN)
+            && document
+                .pages
+                .iter()
+                .any(|candidate| candidate.root == Some(page) && !candidate.hidden))
+        .then_some(page)
+    }
+
+    pub(crate) fn can_edit_measurements(&self, cx: &App) -> bool {
+        !self.is_inspecting() && self.item.read(cx).is_editable() && self.mark_page(cx).is_some()
+    }
+
+    pub(crate) fn page_measurements(&self, cx: &App) -> Vec<MeasurementRecord> {
+        let Some(page) = self.mark_page(cx) else {
             return Vec::new();
         };
-        let Some(page) = doc.active_page().filter(|page| doc.pages().contains(page)) else {
+        let Some(doc) = self.item.read(cx).doc() else {
             return Vec::new();
         };
         let mut cache = self.measurement_cache.borrow_mut();
@@ -2553,9 +2562,9 @@ impl FigView {
             "Finish saving or editing this document before editing measurements."
         );
         let doc = item.doc().context("The document is no longer available.")?;
-        let page = doc
-            .active_page()
-            .context("Choose a page before measuring.")?;
+        let page = self
+            .mark_page(cx)
+            .context("Choose a visible ordinary page before measuring.")?;
         Ok(LocalMediaOrigin {
             item: self.item.entity_id(),
             scene: doc.scene.instance_id(),
@@ -3193,24 +3202,9 @@ impl FigView {
                 );
                 return;
             }
-            if !self.item.read(cx).is_editable()
-                || !self.is_design_canvas_mode(cx)
-                || self.editor_workspace(cx) != EditorWorkspace::Canvas
-                || self.prototype_player.is_some()
-                || self.item.read(cx).doc().is_none_or(|doc| {
-                    doc.active_page()
-                        .is_none_or(|page| !doc.pages().contains(&page))
-                })
-            {
+            if !self.item.read(cx).is_editable() || self.mark_page(cx).is_none() {
                 show_canvas_notice_deferred(
-                    "Choose an editable page on the Design canvas for this tool.".into(),
-                    cx,
-                );
-                return;
-            }
-            if kind == ToolKind::Annotation && self.annotation_page(cx).is_none() {
-                show_canvas_notice_deferred(
-                    "Choose a visible Design page for annotations.".into(),
+                    "Choose a visible, editable page for measurements and annotations.".into(),
                     cx,
                 );
                 return;

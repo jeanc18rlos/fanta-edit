@@ -98,7 +98,7 @@ impl FigView {
         {
             return false;
         }
-        let Some(page) = self.annotation_page(cx) else {
+        let Some(page) = self.mark_page(cx) else {
             return false;
         };
         let item = self.item.read(cx);
@@ -155,7 +155,7 @@ impl FigView {
                                     .disabled(
                                         matches!(tool, ToolKind::Measure | ToolKind::Annotation)
                                             && (!self.item.read(cx).is_editable()
-                                                || self.annotation_page(cx).is_none()),
+                                                || self.mark_page(cx).is_none()),
                                     )
                                     .tooltip(Tooltip::text(tool.label()))
                                     .on_click(cx.listener(move |view, _, window, cx| {
@@ -724,5 +724,163 @@ mod tests {
             assert!(view.comment_state.reply_editor.is_none());
             assert!(view.close_blocker(cx).is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn measurement_hidden_pages_refuse_keyboard_activation_and_armed_pointer_writes(
+        cx: &mut TestAppContext,
+    ) {
+        for hidden_by_registry in [true, false] {
+            let (project, initial_item, visible_page, _) = fixture(cx).await;
+            let mut doc =
+                initial_item.read_with(cx, |item, _| item.doc().expect("fixture doc").clone());
+            let mut hidden = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            hidden.name = "Internal component library".into();
+            if hidden_by_registry {
+                hidden.meta = serde_json::json!({"hidden_page": true});
+            } else {
+                hidden.flags.insert(fanta_doc::NodeFlags::HIDDEN);
+            }
+            let hidden_page = hidden.id;
+            doc.apply(Operation::create_node(hidden))
+                .expect("hidden page");
+            doc.add_page(hidden_page);
+            doc.history = Default::default();
+            let item = crate::document::ready_item_for_test(
+                &project,
+                "/tmp/Hidden-measurement-page.fig".into(),
+                doc,
+                cx,
+            );
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                let hidden = document
+                    .pages
+                    .iter()
+                    .find(|page| page.root == Some(hidden_page))
+                    .expect("hidden library remains navigable");
+                assert_eq!(hidden.hidden, hidden_by_registry);
+            });
+            let (view, cx) =
+                cx.add_window_view(|window, cx| FigView::new(item.clone(), project, window, cx));
+            activate_canvas(&view, cx);
+            for mode in [EditorMode::Design, EditorMode::Dev] {
+                view.update_in(cx, |view, window, cx| {
+                    view.set_editor_mode(mode, cx);
+                    view.activate_tool(ToolKind::Select, cx);
+                    view.select_page(1, cx);
+                    view.focus_handle.focus(window, cx);
+                });
+                cx.run_until_parked();
+                let baseline = snapshot(&item, cx);
+                let previous_tool = view.read_with(cx, |view, _| view.tools.kind());
+                cx.simulate_keystrokes("shift-m");
+                cx.run_until_parked();
+                if mode == EditorMode::Dev {
+                    let measure = cx
+                        .debug_bounds("native-dev-tool-2")
+                        .expect("disabled native Measurement control");
+                    cx.simulate_click(measure.center(), gpui::Modifiers::none());
+                    cx.run_until_parked();
+                }
+                view.update_in(cx, |view, _, cx| {
+                    assert_eq!(view.editor_mode(cx), mode);
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").active_page(),
+                        Some(hidden_page)
+                    );
+                    assert_eq!(
+                        view.tools.kind(),
+                        previous_tool,
+                        "hidden page keyboard activation is refused"
+                    );
+                    view.activate_tool(ToolKind::Measure, cx);
+                    assert_eq!(
+                        view.tools.kind(),
+                        previous_tool,
+                        "direct activation uses the same eligibility"
+                    );
+                    assert!(view.mark_page(cx).is_none());
+                    assert!(!view.can_edit_measurements(cx));
+                    assert!(!view.can_edit_annotations(cx));
+                    assert!(view.measurement_host_origin(cx).is_err());
+                    assert!(view.annotation_origin(cx).is_err());
+                });
+                assert_eq!(snapshot(&item, cx), baseline);
+
+                view.update_in(cx, |view, window, cx| {
+                    view.select_page(0, cx);
+                    view.focus_handle.focus(window, cx);
+                });
+                cx.run_until_parked();
+                cx.simulate_keystrokes("shift-m");
+                cx.run_until_parked();
+                view.update_in(cx, |view, _, cx| {
+                    assert_eq!(
+                        view.tools.kind(),
+                        ToolKind::Measure,
+                        "visible page arms Measure"
+                    );
+                    assert_eq!(view.mark_page(cx), Some(visible_page));
+                    view.select_page(1, cx);
+                });
+                cx.run_until_parked();
+                let baseline = snapshot(&item, cx);
+                let start = view.read_with(cx, |view, _| {
+                    assert_eq!(
+                        view.tools.kind(),
+                        ToolKind::Measure,
+                        "exercise a tool armed before navigation"
+                    );
+                    assert!(view.viewport.is_some());
+                    view.container_bounds.expect("rendered canvas").center()
+                });
+                let end = start + point(px(80.), px(30.));
+                cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+                cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+                cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+                cx.run_until_parked();
+                view.read_with(cx, |view, cx| {
+                    assert!(!view.measurement_controller.has_pending_authoring());
+                    assert!(view.page_measurements(cx).is_empty());
+                });
+                assert_eq!(
+                    snapshot(&item, cx),
+                    baseline,
+                    "hidden page pointer path must not write metadata or history"
+                );
+
+                view.update_in(cx, |view, window, cx| {
+                    view.select_page(0, cx);
+                    view.focus_handle.focus(window, cx);
+                });
+                cx.run_until_parked();
+                let start = view.read_with(cx, |view, _| {
+                    view.container_bounds.expect("visible canvas").center()
+                });
+                let end = start + point(px(80.), px(30.));
+                cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+                cx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+                cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+                cx.run_until_parked();
+                view.update_in(cx, |view, window, cx| {
+                    assert_eq!(
+                        view.page_measurements(cx).len(),
+                        1,
+                        "visible ordinary page still accepts the real pointer gesture"
+                    );
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        1
+                    );
+                    view.undo(&Undo, window, cx);
+                    assert!(view.page_measurements(cx).is_empty());
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        0
+                    );
+                });
+            }
+        }
     }
 }

@@ -32,35 +32,12 @@ pub(crate) struct AnnotationOverlay {
 }
 
 impl FigView {
-    pub(super) fn annotation_page(&self, cx: &App) -> Option<NodeId> {
-        if !self.is_design_canvas_mode(cx)
-            || self.editor_workspace(cx) != EditorWorkspace::Canvas
-            || self.prototype_player.is_some()
-            || matches!(
-                self.scope,
-                Some(FigScope::Component(_) | FigScope::Variables)
-            )
-        {
-            return None;
-        }
-        let document = self.item.read(cx).document()?;
-        let page = document.doc.active_page()?;
-        (document.doc.pages().contains(&page)
-            && document
-                .pages
-                .iter()
-                .any(|candidate| candidate.root == Some(page) && !candidate.hidden))
-        .then_some(page)
-    }
-
     pub(crate) fn can_edit_annotations(&self, cx: &App) -> bool {
-        !self.is_inspecting()
-            && self.item.read(cx).is_editable()
-            && self.annotation_page(cx).is_some()
+        !self.is_inspecting() && self.item.read(cx).is_editable() && self.mark_page(cx).is_some()
     }
 
     pub(crate) fn page_annotations(&self, cx: &App) -> Vec<AnnotationRecord> {
-        let Some(page) = self.annotation_page(cx) else {
+        let Some(page) = self.mark_page(cx) else {
             return Vec::new();
         };
         let Some(doc) = self.item.read(cx).doc() else {
@@ -121,7 +98,7 @@ impl FigView {
             item: self.item.entity_id(),
             scene: doc.scene.instance_id(),
             page: self
-                .annotation_page(cx)
+                .mark_page(cx)
                 .context("Choose a visible Design page for the annotation.")?,
             scope: self.scope,
             mode: self.editor_mode(cx),
@@ -705,7 +682,7 @@ impl FigView {
         screen_size: [f64; 2],
         cx: &App,
     ) -> Vec<AnnotationOverlay> {
-        let Some(page) = self.annotation_page(cx) else {
+        let Some(page) = self.mark_page(cx) else {
             return Vec::new();
         };
         let Some(doc) = self.item.read(cx).doc() else {
