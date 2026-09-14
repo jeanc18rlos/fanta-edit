@@ -2363,8 +2363,19 @@ impl FigView {
         let read_only = self.is_art_read_only(cx);
         self.inspector_sidebar
             .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
-        self.layers_sidebar
-            .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
+        // Page navigation can originate inside this panel's own update.
+        // Echo after its lease is released, using the final tool/page state.
+        let view = cx.weak_entity();
+        cx.defer(move |cx| {
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let (panel, read_only) = {
+                let view = view.read(cx);
+                (view.layers_sidebar.clone(), view.is_art_read_only(cx))
+            };
+            panel.update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
+        });
     }
 
     pub(crate) fn select_measurement(
@@ -9264,6 +9275,350 @@ mod tests {
         doc.add_page(root);
         doc.set_active_page(Some(root));
         doc
+    }
+
+    async fn assert_embedded_sidebar_page_click(cx: &mut TestAppContext, shared: bool) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        #[cfg(feature = "fanta-gpui-ui")]
+        if shared {
+            cx.update(|cx| {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            });
+        }
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let first = doc.active_page().expect("first page");
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.name = "Page 2".into();
+        let second = doc.scene.insert(second).expect("second page");
+        doc.add_page(second);
+        let pages = [first, second];
+        for page in pages {
+            let mut artwork = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                0.,
+                0.,
+                100.,
+                100.,
+                Color::BLACK,
+            )));
+            artwork.parent = Some(page);
+            doc.scene.insert(artwork).expect("page artwork");
+        }
+        doc.set_active_page(Some(first));
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Embedded Page Click.fig"),
+            doc,
+            cx,
+        );
+        let (shell, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = shell.read_with(cx, |shell, _| shell.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = FigView::new(item.clone(), project, window, cx);
+                view.layers_sidebar_visible = false;
+                view
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| view.focus_handle.focus(window, cx));
+        cx.dispatch_action(ToggleLayersSidebar);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_item(cx).map(|item| item.item_id()),
+                Some(view.entity_id()),
+            );
+        });
+        let baseline = item.read_with(cx, |item, _| {
+            serde_json::to_value(&item.doc().expect("document").scene).expect("scene")
+        });
+        let click_page = |index: usize, cx: &mut gpui::VisualTestContext| {
+            // The shared Pages component is a dependency here, so its reveal
+            // animation runs even though its own unit tests disable it.
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(200));
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let selector = if shared {
+                format!("pages-row-{}", pages[index])
+            } else {
+                format!("native-page-name-{index}")
+            };
+            let selector: &'static str = Box::leak(selector.into_boxed_str());
+            let row = cx.debug_bounds(selector).expect("mounted page label");
+            let sidebar = cx
+                .debug_bounds("fanta-layers-sidebar")
+                .expect("the FigView-owned sidebar is mounted");
+            assert!(row.is_contained_within(&sidebar), "visible page: {row:?}");
+            if shared {
+                let viewport = cx
+                    .debug_bounds("pages-scroll-viewport")
+                    .expect("revealed page viewport");
+                assert!(row.is_contained_within(&viewport), "revealed page: {row:?}");
+            }
+            let position = row.center();
+            cx.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+            });
+            cx.run_until_parked();
+        };
+        for (mode, tool, index) in [
+            (EditorMode::Design, ToolKind::Select, 1),
+            (EditorMode::Design, ToolKind::Inspect, 0),
+            (EditorMode::Dev, ToolKind::Inspect, 1),
+            (EditorMode::Dev, ToolKind::Measure, 0),
+            (EditorMode::Dev, ToolKind::Annotation, 1),
+            (EditorMode::Design, ToolKind::Select, 0),
+        ] {
+            view.update_in(cx, |view, _, cx| {
+                view.set_editor_mode(mode, cx);
+                view.activate_tool(tool, cx);
+            });
+            click_page(index, cx);
+            view.read_with(cx, |view, cx| {
+                assert!(view.layers_sidebar_visible);
+                assert_eq!(view.selected_page_index(), Some(index));
+                assert_eq!(view.editor_mode(cx), mode);
+                assert_eq!(view.tools.kind(), tool);
+                assert_eq!(
+                    view.is_editable(cx),
+                    mode == EditorMode::Design && tool == ToolKind::Select
+                );
+            });
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.active_page(), Some(pages[index]));
+                assert_eq!(serde_json::to_value(&doc.scene).expect("scene"), baseline);
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert!(!item.is_dirty());
+                assert!(item.is_editable());
+            });
+        }
+
+        view.update_in(cx, |view, _, cx| {
+            view.activate_tool(ToolKind::Annotation, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let canvas = cx.debug_bounds("fig-container").expect("mounted canvas");
+        cx.simulate_click(canvas.center(), gpui::Modifiers::none());
+        cx.simulate_input("Keep this unsent page note");
+        cx.run_until_parked();
+        let generation = view.read_with(cx, |view, _| {
+            let draft = view
+                .annotation_state
+                .controller
+                .draft()
+                .expect("typed draft");
+            assert_eq!(draft.annotation().text, "Keep this unsent page note");
+            draft.generation()
+        });
+        click_page(1, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected_page_index(), Some(0));
+            let draft = view
+                .annotation_state
+                .controller
+                .draft()
+                .expect("draft kept");
+            assert_eq!(draft.generation(), generation);
+            assert_eq!(draft.annotation().text, "Keep this unsent page note");
+        });
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.active_page(), Some(first));
+            assert_eq!(serde_json::to_value(&doc.scene).expect("scene"), baseline);
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(!item.is_dirty());
+        });
+        view.update_in(cx, |view, _, cx| {
+            assert!(view.cancel_annotation(Some(generation), cx));
+        });
+        click_page(1, cx);
+        assert_eq!(
+            view.read_with(cx, |view, _| view.selected_page_index()),
+            Some(1)
+        );
+    }
+
+    #[gpui::test]
+    async fn embedded_native_sidebar_page_click_preserves_navigation_and_drafts(
+        cx: &mut TestAppContext,
+    ) {
+        assert_embedded_sidebar_page_click(cx, false).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn embedded_shared_sidebar_page_click_preserves_navigation_and_drafts(
+        cx: &mut TestAppContext,
+    ) {
+        assert_embedded_sidebar_page_click(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn embedded_inspector_component_link_navigates_without_reentrant_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(project::DisableAiSettings::register);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let first = doc.active_page().expect("first page");
+        let mut library = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        library.name = "Components".into();
+        library.meta = serde_json::json!({"hidden_page": true});
+        let library = doc.scene.insert(library).expect("library page");
+        doc.add_page(library);
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.name = "Button master".into();
+        master.parent = Some(library);
+        let master = doc.scene.insert(master).expect("master");
+        let mut artwork = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        artwork.parent = Some(master);
+        doc.scene.insert(artwork).expect("master artwork");
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Button"),
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [100., 100.],
+        }));
+        instance.parent = Some(first);
+        let instance = doc.scene.insert(instance).expect("instance");
+        doc.selection.select_only(instance);
+        doc.set_active_page(Some(first));
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Embedded Component Link.fig"),
+            doc,
+            cx,
+        );
+        let (shell, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace = shell.read_with(cx, |shell, _| shell.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.simulate_resize(size(px(1400.), px(1000.)));
+        cx.run_until_parked();
+        let baseline = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert!(
+                document
+                    .pages
+                    .iter()
+                    .any(|page| page.root == Some(library) && page.hidden)
+            );
+            serde_json::to_value((&document.doc.scene, &document.doc.components)).expect("content")
+        });
+        for (mode, tool) in [
+            (EditorMode::Design, ToolKind::Select),
+            (EditorMode::Design, ToolKind::Inspect),
+            (EditorMode::Dev, ToolKind::Inspect),
+        ] {
+            view.update_in(cx, |view, _, cx| {
+                view.set_editor_mode(mode, cx);
+                view.select_page(0, cx);
+                view.activate_tool(tool, cx);
+                view.inspector_sidebar_visible = true;
+            });
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(instance);
+                    ((), DocChange::Selection)
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let link = cx
+                .debug_bounds("native-main-component")
+                .expect("the mounted instance inspector shows its main component link");
+            let inspector = cx
+                .debug_bounds("fanta-inspector-sidebar")
+                .expect("FigView-owned inspector");
+            assert!(
+                link.is_contained_within(&inspector),
+                "visible link: {link:?}"
+            );
+            cx.simulate_click(link.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.selected_page_index(), Some(1));
+                assert_eq!(view.editor_mode(cx), mode);
+                assert_eq!(view.tools.kind(), tool);
+                assert_eq!(
+                    view.is_editable(cx),
+                    mode == EditorMode::Design && tool == ToolKind::Select
+                );
+            });
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.active_page(), Some(library));
+                assert_eq!(doc.selection.as_slice(), &[master]);
+                assert_eq!(
+                    serde_json::to_value((&doc.scene, &doc.components)).expect("content"),
+                    baseline
+                );
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert!(!item.is_dirty());
+                assert!(item.is_editable());
+            });
+        }
     }
 
     fn doc_with_auto_key_target(position_x: f64) -> (fanta_doc::Doc, NodeId, AnimationClipId) {

@@ -2394,6 +2394,7 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         let mut identity = h_flex()
             .id("fanta-main-component")
+            .debug_selector(|| "native-main-component".to_owned())
             .px_4()
             .gap_1p5()
             .items_center()
