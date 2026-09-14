@@ -125,9 +125,21 @@ actually driven. Nothing here claims more than that record supports.
   close, or quit. Changed origins or conflicting records can leave a retained
   draft that requires recovery or cancellation. Inspect permits mark read/copy
   only; Dev permits mark editing while keeping artwork read-only. Saved Code
-  shows persisted FNX/JSON and can lag unsaved canvas changes. The combined
-  candidate passes its recorded local automated gates; final native and hosted
+  shows persisted FNX/JSON and can lag unsaved canvas changes. Earlier combined
+  source passed the recorded automated gates, but its first native run failed
+  during page navigation before mark acceptance. The repaired candidate passes
+  its full viewer/shared/legacy suites and scoped Clippy; native and hosted
   checks remain open.
+- **The first combined native candidate crashed on page navigation.** Exact
+  `93b9921` aborted on the first Page 2 click because the active sidebar updated
+  itself through FigView while already held for update. The owned process exited
+  -6; all 20 authored fixture files remained byte-identical. A related
+  inspector Go to Main Component route could revisit its held properties panel.
+  The repair now committed in `597f4763` defers the affected callbacks while
+  preserving immediate host permission checks. Three tests using the actual
+  mounted sidebars/inspector reproduce the old self-update panics and pass with
+  the repair. Final native confirmation is still required before claiming these
+  navigation paths fixed in the packaged app.
 - **Unfinished roadmap faces either decline explicitly or stay hidden.**
   Readiness, Dev Color Picker, arbitrary toolbar file attachment and voice,
   direct-canvas auto-keyframe recording, page duplication,

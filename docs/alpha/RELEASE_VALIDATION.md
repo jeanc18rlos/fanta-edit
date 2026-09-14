@@ -10,7 +10,7 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
 | Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity. The three retained `9d92b30` toolbar screenshots are invalid because they show ChatGPT rather than Fanta, so that revision's Design/Motion/narrow layout claim remains unsubstantiated. A separate exact-`12e2e4c` local QA build supplies inspected Fanta captures for the current Design, Motion, and 1025-point narrow layouts. Other recorded `9d92b30` interaction checks covered toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export. Earlier trim/edit/save/reopen, subsecond counters, and one-click replay after end scrubbing also passed natively. Neither local bundle is the final signed/notarized artifact. |
 | Earlier editor milestone | Validated source/runtime candidate `12e2e4c` includes the previously recorded Text on Path, active-root canvas attachment, contextual Motion keyframing, and Motion time-comment work. It adds guarded Auto key editing through Motion's At playhead fields for Position X/Y, Rotation, Scale X/Y, Opacity, and Fill color: edits preview live, commit as one reversible keyframe operation, and become autosave-eligible only after commit. Its source gate passes 737/737 viewer tests and package-scoped `./script/clippy -p fanta-gpui -p fig_viewer`, including Cargo Machete. The exact local release build passed the bounded toolbar and Auto key smoke below; the later `f9a67f4` candidate adds native TextPath and bounded page-selection attachment checks in dark/light themes. Exact `f9a67f4` also passes bounded native time-comment creation, history, navigation, and reopen; the remaining Motion matrix still needs native coverage. No hosted artifact validates this combined slice. At that checkpoint Dev and Voice were unavailable; the later guarded Dev candidate is recorded below. Direct-canvas auto-keying, Motion Path, and Voice remain unavailable. |
-| Current combined Dev tools | Persistent Measurement, Annotation, and a guarded Dev session are implemented. Clean `527c4b69` passes 931 viewer tests, 606 shared UI tests and three architecture checks, including the Annotation focus and hidden-page Measurement repairs. The unchanged document/format/workspace crates passed on `9300e003`. The full legacy configuration also passes all 760 tests. Scoped Clippy across six packages and Cargo Machete also pass. Exact-source native and hosted gates remain pending at this checkpoint. Readiness and Dev Color Picker remain unavailable. |
+| Current combined Dev tools | Persistent Measurement, Annotation, and a guarded Dev session are implemented. Earlier clean `527c4b69` passed 931 viewer, 606 shared UI, three architecture and 760 legacy tests, plus scoped Clippy and Cargo Machete. The unchanged document/format/workspace crates passed on `9300e003`. First native candidate `93b9921` then crashed on its first Page 2 click. The navigation repair now committed in `597f4763` passes three mounted regressions and the full 934-viewer, 606-shared UI, three-architecture and 762-legacy suites. Scoped Clippy and Cargo Machete also pass on that clean source. Its native and hosted gates remain pending. Readiness and Dev Color Picker remain unavailable. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
@@ -117,9 +117,9 @@ failure. The same revision passed the document/format suites and all 225
 workspace tests. The actual canvas-click focus regression failed without its
 repair and passed on clean `89d0da69`. `527c4b69` adds common visible ordinary-page
 eligibility for both marks after review found a hidden-page Measurement bypass.
-The focused hidden-page regression and the clean `527c4b69` full run now pass:
-931 viewer tests, 606 shared UI tests and three architecture checks. The full
-legacy configuration also passes all 760 tests. The
+The focused hidden-page regression and the clean `527c4b69` full run passed:
+931 viewer tests, 606 shared UI tests and three architecture checks. That full
+legacy configuration also passed all 760 tests. The
 document/format/workspace crates are unchanged from their passing `9300e003`
 run (355 document unit and eight integration tests; 151 format unit and 44
 integration tests; 225 workspace tests).
@@ -129,8 +129,56 @@ Scoped Clippy for `fanta-doc`, `fanta-format`, `fanta-gpui`, `fig_viewer`,
 in 48.54 seconds at 08:55:34 UTC. The candidate was then rebased onto the
 Inspect merge without Rust changes.
 
-Before merge, build the final exact source and
-exercise smoke rows 6f–6h, including real Save/reopen, transformed pages, page
+The first combined native build at exact `93b9921fb67f78d31e839d64cbd48b48d165c949`
+failed on the first Page 2 click after opening the embedded sidebar. The active
+FantaDesignPanel called FigView page navigation, which synchronously echoed
+permissions back into the same held panel. Owned PID 83638 exited -6. All 20
+fixture files remained byte-identical; no mark acceptance passed in that run.
+Independent review also found the inspector Go to Main Component callback could
+re-enter its own properties panel during cross-page navigation.
+
+The repair defers the layers permission echo until the sidebar callback releases
+its lease and recomputes permissions from the live view. Properties-origin
+component navigation is deferred as a whole and revalidates its item, scene,
+page, selected instance and master before navigating. A refused page switch
+cannot select the other-page target. Immediate host/inspector permission checks
+remain intact. Three tests mount the actual FigView-owned panels in
+MultiWorkspace and click real page rows/component links. The two sidebar tests
+reproduce FantaDesignPanel self-update panics with the old echo; the component
+test separately reproduces the FantaPropertiesPanel panic with the old callback.
+All three pass with the repair and the test-only corrections now committed in
+`597f4763c1459331875c60002dd2c8da45926c6e`. The focused green filter also ran one
+unrelated existing test, for four passing cases total. Clean `597f4763` then
+passed its full 934-viewer, 606-shared UI and three-architecture suite in
+75.38 seconds (`full-viewer-shared-page-fix.json`). Its complete 762-test legacy
+configuration also passed in 85.21 seconds (`full-legacy-page-fix.json`). Scoped
+Clippy across the same six packages and Cargo Machete then passed on clean
+`597f4763` in 48.78 seconds at 09:33:10 UTC (`clippy-page-fix.json`).
+
+The first harness used file/pipe stdout, allowing the application to import the
+user's login-shell environment and use its global log. Its automatic Fanta MCP
+connection still targeted the default hosted endpoint despite the loopback
+ClientSettings URL. This is not evidence of a fully isolated run or of an
+intentional provider request. Later QA harnesses use PTY stdout for local log
+capture and suppression of that import, and explicitly disable/redirect the
+separately configured default MCP entry. They remain QA controls, not a network
+sandbox. Preserve the first run's logs, crash and unchanged-file evidence.
+
+Separate V2 diagnostics on the unrepaired `93b9921` exercised Page 1 without
+repeating the known crashing Page 2 route. Exact Unicode Annotation Add/Save,
+V returning to Inspect, Measurement creation and endpoint movement, and one-step
+Undo passed. Undo restored the prior measurement and exact page FNX; undoing
+both mark creations restored baseline FNX with only the document modification
+timestamp changed. An unsent annotation refused Save/mode change and kept the
+app open on Quit. Explicit Cancel followed by Quit then exited zero
+(owned PID 86850). The session preserved 13 screenshots and raw metadata/FNX
+evidence under `dev-mode/native-qa-v2/sessions/shared-basic-01/`, including
+`diagnostic-verification.json` and `completion.json`. It did not run export or
+Save/reopen acceptance. These bounded observations do not confirm the repaired
+page navigation or complete the final candidate's native acceptance.
+
+Before merge, build the final exact repaired source and first repeat smoke row
+6i, then exercise rows 6f–6h, including real Save/reopen, transformed pages, page
 Delete/Undo navigation, draft/close recovery and unchanged art-only PNG/SVG
 output in both UI variants. Held-pointer Escape and modified drag remain
 core/GPUI coverage when the native automation API cannot express them. Require
@@ -139,8 +187,11 @@ inference, customer payments, signing/notarization or a complete Fanta release.
 
 Evidence and prepared acceptance procedures are under
 `/tmp/fanta-release-qa-20260913/measure-tool/`, `annotation-tool/`, and `dev-mode/`.
-The combined source review and both focused repair records retain the failed
-runs; do not replace them with the earlier Inspect or Measurement successes.
+The combined source review and focused repair records retain the failed runs,
+including `dev-mode/native-qa/`, `page-click-red-r2.log`,
+`component-click-red-r4.log`, and `page-click-green.log`. Final repaired native
+confirmation remains pending; earlier Inspect or Measurement successes do not
+replace it.
 
 ## Post-merge export and font-scale follow-up — September 13
 
