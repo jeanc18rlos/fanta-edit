@@ -2954,6 +2954,144 @@ mod gpui_layers_tests {
     }
 
     #[gpui::test]
+    async fn sidebar_page_delete_undo_restores_exact_annotation_metadata(cx: &mut TestAppContext) {
+        use crate::annotations::{DeveloperAnnotation, create_annotation_op, read_annotations};
+
+        let mut harness = setup(cx, 1).await;
+        let first = harness.fixture.page;
+        let item = harness
+            .view
+            .read_with(&harness.cx, |view, _| view.item().clone());
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, _, cx| panel.add_page(cx));
+        harness.cx.run_until_parked();
+        let second = with_doc(&harness, |doc| {
+            assert_eq!(doc.pages().len(), 2);
+            doc.active_page().expect("added page is active")
+        });
+        let annotation = DeveloperAnnotation::new(
+            [-18.5, 72.0],
+            "Keep this annotation after page deletion is undone.\nSecond line.".into(),
+            "Reviewer".into(),
+            71,
+        )
+        .expect("page annotation");
+        item.update(&mut harness.cx, |item, cx| {
+            let metadata = serde_json::json!({
+                "annotations": [{"version": 2, "id": "future-note", "opaque": {"keep": true}}],
+                "integration": {"page-token": "preserved"}
+            });
+            let old = item
+                .doc()
+                .expect("doc")
+                .scene
+                .get(second)
+                .expect("page")
+                .meta
+                .clone();
+            item.apply(
+                Operation::SetMeta {
+                    id: second,
+                    old,
+                    new: metadata,
+                },
+                cx,
+            )
+            .expect("seed unknown page metadata");
+            let operation = create_annotation_op(item.doc().expect("doc"), second, &annotation)
+                .expect("create annotation");
+            item.apply(operation, cx).expect("apply annotation");
+            item.with_document(cx, |document| {
+                document.doc.history = fanta_doc::History::new();
+                ((), DocChange::None)
+            });
+        });
+        harness.cx.run_until_parked();
+        let (first_snapshot, second_snapshot) = with_doc(&harness, |doc| {
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(
+                read_annotations(doc, second)
+                    .expect("note before delete")
+                    .len(),
+                1
+            );
+            (
+                doc.scene.get(first).cloned().expect("first page"),
+                doc.scene.get(second).cloned().expect("annotated page"),
+            )
+        });
+
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, _, cx| panel.delete_page(1, cx));
+        harness.cx.run_until_parked();
+        for cycle in 0..2 {
+            with_doc(&harness, |doc| {
+                assert_eq!(doc.pages(), &[first]);
+                assert_eq!(doc.active_page(), Some(first));
+                assert_eq!(doc.scene.get(first), Some(&first_snapshot));
+                assert!(!doc.scene.contains(second));
+                assert!(read_annotations(doc, second).is_err());
+                assert!(
+                    read_annotations(doc, first)
+                        .expect("surviving page notes")
+                        .is_empty()
+                );
+                assert_eq!(doc.history.undo_depth(), 1);
+                assert_eq!(doc.history.next_undo_label(), Some("Delete Page"));
+            });
+            item.read_with(&harness.cx, |item, _| {
+                let pages = &item.document().expect("document").pages;
+                assert_eq!(pages.len(), 1);
+                assert_eq!(pages.first().expect("remaining page").root, Some(first));
+            });
+            assert_eq!(
+                harness
+                    .view
+                    .read_with(&harness.cx, |view, _| view.selected_page_index()),
+                Some(0)
+            );
+            item.update(&mut harness.cx, |item, cx| {
+                assert!(item.undo(cx).expect("undo page deletion"));
+            });
+            harness.cx.run_until_parked();
+            with_doc(&harness, |doc| {
+                assert_eq!(doc.pages(), &[first, second]);
+                assert_eq!(doc.active_page(), Some(second));
+                assert_eq!(doc.scene.get(first), Some(&first_snapshot));
+                assert_eq!(doc.scene.get(second), Some(&second_snapshot));
+                assert_eq!(doc.history.undo_depth(), 0);
+                let restored = read_annotations(doc, second).expect("restored page notes");
+                assert_eq!(restored.len(), 1);
+                assert_eq!(
+                    restored.first().expect("restored note").annotation(),
+                    &annotation
+                );
+            });
+            item.read_with(&harness.cx, |item, _| {
+                let pages = &item.document().expect("document").pages;
+                assert_eq!(pages.len(), 2);
+                let restored = pages.get(1).expect("restored page row");
+                assert_eq!(restored.root, Some(second));
+                assert_eq!(restored.name.as_ref(), "Page 2");
+            });
+            assert_eq!(
+                harness
+                    .view
+                    .read_with(&harness.cx, |view, _| view.selected_page_index()),
+                Some(1)
+            );
+            if cycle == 0 {
+                item.update(&mut harness.cx, |item, cx| {
+                    assert!(item.redo(cx).expect("redo page deletion"));
+                });
+                harness.cx.run_until_parked();
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn inspect_layers_remain_selectable_and_reject_direct_authoring(cx: &mut TestAppContext) {
         let mut harness = setup(cx, 2).await;
         let page = harness.fixture.page;

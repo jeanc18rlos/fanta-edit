@@ -3,6 +3,9 @@
 //! and the `Item` integration that gives fanta projects text-editor-style
 //! dirty tracking and save.
 
+#[path = "view_annotations.rs"]
+pub(crate) mod annotations_host;
+
 use std::collections::HashSet;
 
 use anyhow::{Context as _, Result};
@@ -145,6 +148,8 @@ actions!(
         ActivateInspectTool,
         /// Add a persistent measurement at fixed positions on this page.
         ActivateMeasureTool,
+        /// Place a persistent plain-text annotation on the active page.
+        ActivateAnnotationTool,
         /// Activate the hand (pan) tool.
         ActivateHandTool,
         /// Activate the rectangle tool.
@@ -200,6 +205,7 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Select => Box::new(ActivateSelectTool),
         ToolKind::Inspect => Box::new(ActivateInspectTool),
         ToolKind::Measure => Box::new(ActivateMeasureTool),
+        ToolKind::Annotation => Box::new(ActivateAnnotationTool),
         ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
         ToolKind::NodeEdit => Box::new(ActivateNodeEditTool),
         ToolKind::Hand => Box::new(ActivateHandTool),
@@ -365,6 +371,7 @@ pub struct FigView {
     #[cfg(target_os = "macos")]
     canvas_video_active: std::cell::Cell<bool>,
     pub(crate) tools: ToolShell,
+    annotation_state: annotations_host::AnnotationHostState,
     measurement_controller: MeasurementController,
     measurement_origin: Option<LocalMediaOrigin>,
     measurement_selection: Option<MeasurementSelection>,
@@ -590,6 +597,7 @@ impl FigView {
         // cursor until space is pressed again.
         cx.on_focus_out(&focus_handle, window, |this: &mut Self, _, _, cx| {
             this.is_focused = false;
+            this.freeze_annotation_move(cx);
             if this.space_pan || this.pan_last_position.is_some() {
                 this.space_pan = false;
                 this.pan_last_position = None;
@@ -653,6 +661,7 @@ impl FigView {
             #[cfg(target_os = "macos")]
             canvas_video_active: std::cell::Cell::new(true),
             tools: ToolShell::new(),
+            annotation_state: annotations_host::AnnotationHostState::default(),
             measurement_controller: MeasurementController::default(),
             measurement_origin: None,
             measurement_selection: None,
@@ -718,6 +727,7 @@ impl FigView {
             if matches!(event, FigItemEvent::StateChanged) {
                 this.discard_gpui_design_edits();
             }
+            this.reconcile_annotations(cx);
             if this.measurement_selection.is_some()
                 && (this.selected_measurement(cx).is_none()
                     || this.item.read(cx).doc().is_some_and(|doc| !doc.selection.is_empty()))
@@ -974,6 +984,7 @@ impl FigView {
     }
 
     fn cancel_canvas_edits_for_source_lock(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_annotations(cx);
         if !self.item.read(cx).source_edit_locked() {
             return;
         }
@@ -1186,12 +1197,14 @@ impl FigView {
         if self.editor_workspace(cx) == workspace {
             return;
         }
-        if self.refuse_pending_measurement(cx) {
+        if self.refuse_pending_annotation(cx) || self.refuse_pending_measurement(cx) {
             return;
         }
         if self.is_inspecting()
-            || self.tools.kind() == ToolKind::Measure
+            || matches!(self.tools.kind(), ToolKind::Measure | ToolKind::Annotation)
             || self.measurement_selection.is_some()
+            || self.annotation_state.selection.is_some()
+            || self.annotation_state.controller.has_pending_authoring()
         {
             self.activate_tool(ToolKind::Select, cx);
         }
@@ -1217,12 +1230,13 @@ impl FigView {
         if self.editor_mode(cx) == mode {
             return;
         }
-        if self.refuse_pending_measurement(cx) {
+        if self.refuse_pending_annotation(cx) || self.refuse_pending_measurement(cx) {
             return;
         }
         if self.is_inspecting()
-            || self.tools.kind() == ToolKind::Measure
+            || matches!(self.tools.kind(), ToolKind::Measure | ToolKind::Annotation)
             || self.measurement_selection.is_some()
+            || self.annotation_state.selection.is_some()
         {
             self.activate_tool(ToolKind::Select, cx);
         }
@@ -2154,8 +2168,10 @@ impl FigView {
 
     pub(crate) fn is_art_read_only(&self) -> bool {
         self.is_inspecting()
-            || self.tools.kind() == ToolKind::Measure
+            || matches!(self.tools.kind(), ToolKind::Measure | ToolKind::Annotation)
             || self.measurement_selection.is_some()
+            || self.annotation_state.selection.is_some()
+            || self.annotation_state.controller.has_pending_authoring()
     }
 
     pub(crate) fn is_inspecting(&self) -> bool {
@@ -2163,7 +2179,8 @@ impl FigView {
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
-        if self.measurement_controller.is_dragging() {
+        if self.annotation_state.controller.is_moving() || self.measurement_controller.is_dragging()
+        {
             return;
         }
         self.viewport = Some(viewport);
@@ -2360,6 +2377,7 @@ impl FigView {
         let Some(doc) = self.item.read(cx).doc() else {
             return;
         };
+        self.annotation_state.selection = None;
         self.measurement_selection = Some(MeasurementSelection {
             document: doc.id,
             scene: doc.scene.instance_id(),
@@ -2827,7 +2845,9 @@ impl FigView {
     }
 
     fn dispatch_tool_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
-        if self.handle_measurement_tool_event(event, cx) {
+        if self.handle_annotation_tool_event(event, cx)
+            || self.handle_measurement_tool_event(event, cx)
+        {
             return;
         }
         let Some(bounds) = self.container_bounds else {
@@ -3071,11 +3091,15 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !matches!(kind, ToolKind::Inspect | ToolKind::Measure)
-            && self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
-                this.activate_tool(kind, cx);
-            })
-        {
+        if self.refuse_pending_annotation(cx) {
+            return;
+        }
+        if !matches!(
+            kind,
+            ToolKind::Inspect | ToolKind::Measure | ToolKind::Annotation
+        ) && self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+            this.activate_tool(kind, cx);
+        }) {
             return;
         }
         self.activate_tool(kind, cx);
@@ -3087,6 +3111,9 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_pending_annotation(cx) {
+            return;
+        }
         if self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
             this.set_editor_mode(mode, cx);
         }) {
@@ -3096,6 +3123,9 @@ impl FigView {
     }
 
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        if self.refuse_pending_annotation(cx) {
+            return;
+        }
         if self.measurement_controller.has_pending_authoring() {
             show_canvas_notice_deferred(
                 "Finish or cancel the measurement drag before changing tools.".into(),
@@ -3103,8 +3133,8 @@ impl FigView {
             );
             return;
         }
-        if kind == ToolKind::Measure {
-            if self.tools.kind() == ToolKind::Measure {
+        if matches!(kind, ToolKind::Measure | ToolKind::Annotation) {
+            if self.tools.kind() == kind {
                 return;
             }
             if self.has_pending_authoring(cx)
@@ -3112,7 +3142,10 @@ impl FigView {
                 || self.has_unsent_comment_reply(cx)
             {
                 show_canvas_notice_deferred(
-                    "Finish or cancel the current edit before measuring.".into(),
+                    format!(
+                        "Finish or cancel the current edit before using {}.",
+                        kind.label()
+                    ),
                     cx,
                 );
                 return;
@@ -3127,11 +3160,20 @@ impl FigView {
                 })
             {
                 show_canvas_notice_deferred(
-                    "Choose an editable page on the Design canvas to measure.".into(),
+                    "Choose an editable page on the Design canvas for this tool.".into(),
                     cx,
                 );
                 return;
             }
+            if kind == ToolKind::Annotation && self.annotation_page(cx).is_none() {
+                show_canvas_notice_deferred(
+                    "Choose a visible Design page for annotations.".into(),
+                    cx,
+                );
+                return;
+            }
+            self.annotation_state.selection = None;
+            self.measurement_selection = None;
             self.invalidate_local_media_origin();
             self.comment_state.close_thread();
             self.tools.activate_without_context(kind);
@@ -3187,6 +3229,7 @@ impl FigView {
             return;
         }
         self.measurement_selection = None;
+        self.annotation_state.selection = None;
         if kind != ToolKind::Comment {
             self.comment_state.draft = None;
             self.comment_state.hovered_pin = None;
@@ -3422,7 +3465,9 @@ impl FigView {
             return;
         };
 
-        if self.handle_measurement_mouse_down(event, window, cx) {
+        if self.handle_annotation_mouse_down(event, window, cx)
+            || self.handle_measurement_mouse_down(event, window, cx)
+        {
             return;
         }
 
@@ -3564,9 +3609,16 @@ impl FigView {
         event: &MouseMoveEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.annotation_state.controller.is_moving()
+            && event.pressed_button != Some(MouseButton::Left)
+        {
+            self.freeze_annotation_move(cx);
+            return;
+        }
         if self.measurement_controller.is_dragging()
             && event.pressed_button != Some(MouseButton::Left)
         {
+            self.freeze_annotation_move(cx);
             self.freeze_measurement_drag(cx);
             return;
         }
@@ -3915,6 +3967,7 @@ impl FigView {
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         if (!self.is_editable(cx) && !self.can_edit_measurements(cx))
             || self.measurement_controller.has_pending_authoring()
+            || self.annotation_state.controller.has_pending_authoring()
         {
             return;
         }
@@ -3943,6 +3996,7 @@ impl FigView {
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         if (!self.is_editable(cx) && !self.can_edit_measurements(cx))
             || self.measurement_controller.has_pending_authoring()
+            || self.annotation_state.controller.has_pending_authoring()
         {
             return;
         }
@@ -3977,6 +4031,14 @@ impl FigView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cancel_annotation(None, cx) {
+            return;
+        }
+        if self.annotation_state.selection.take().is_some() {
+            self.sync_measurement_edit_barrier(cx);
+            cx.notify();
+            return;
+        }
         if self.cancel_measurement_drag(cx) {
             return;
         }
@@ -4035,6 +4097,12 @@ impl FigView {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.annotation_state.controller.has_pending_authoring()
+            || self.tools.kind() == ToolKind::Annotation
+            || self.annotation_state.selection.is_some()
+        {
+            return;
+        }
         if self.measurement_controller.has_pending_authoring() {
             let result = self
                 .item
@@ -4295,8 +4363,10 @@ impl FigView {
     /// `children_of(None)` would then hand back the pages themselves —
     /// selecting pages is not what "select all" means, so bail instead.
     fn select_all(&mut self, _: &SelectAll, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tools.kind() == ToolKind::Measure
+        if matches!(self.tools.kind(), ToolKind::Measure | ToolKind::Annotation)
             || self.measurement_controller.has_pending_authoring()
+            || self.annotation_state.selection.is_some()
+            || self.annotation_state.controller.has_pending_authoring()
         {
             return;
         }
@@ -4328,12 +4398,22 @@ impl FigView {
     }
 
     pub(crate) fn copy_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        if let Some(record) = self.selected_annotation(cx) {
+            self.copy_annotation(&record, cx);
+            return;
+        }
+        if self.annotation_state.controller.has_pending_authoring()
+            || self.tools.kind() == ToolKind::Annotation
+        {
+            return;
+        }
         if let Some(record) = self.selected_measurement(cx) {
             self.copy_measurement(&record, cx);
             return;
         }
         if self.tools.kind() == ToolKind::Measure
             || self.measurement_controller.has_pending_authoring()
+            || self.annotation_state.controller.has_pending_authoring()
         {
             return;
         }
@@ -4362,6 +4442,10 @@ impl FigView {
     }
 
     pub(crate) fn delete_selected_nodes(&mut self, cx: &mut Context<Self>) {
+        if let Some(record) = self.selected_annotation(cx) {
+            self.delete_annotation(&record, cx);
+            return;
+        }
         if let Some(record) = self.selected_measurement(cx) {
             self.delete_measurement(&record, cx);
             return;
@@ -4421,7 +4505,8 @@ impl FigView {
 
     fn has_pending_authoring_except_pointer(&self, cx: &App) -> bool {
         let inspector = self.inspector_sidebar.read(cx);
-        let pending_edit = self.measurement_controller.has_pending_authoring()
+        let pending_edit = self.annotation_state.controller.has_pending_authoring()
+            || self.measurement_controller.has_pending_authoring()
             || self.item.read(cx).content_preview_active()
             || self.text_edit.is_some()
             || self.pending_text_edit.is_some()
@@ -5174,6 +5259,7 @@ impl FigView {
             self.viewport = None;
             self.hovered_node = None;
             self.measurement_selection = None;
+            self.freeze_annotation_move(cx);
             self.freeze_measurement_drag(cx);
             self.comment_state.clear_pending_motion_anchor();
             self.invalidate_local_media_origin();
@@ -5184,7 +5270,7 @@ impl FigView {
     }
 
     pub fn select_page(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.refuse_pending_measurement(cx) {
+        if self.refuse_pending_annotation(cx) || self.refuse_pending_measurement(cx) {
             return;
         }
         self.measurement_selection = None;
@@ -5247,6 +5333,7 @@ impl FigView {
     fn autosave_allowed(&self, cx: &App) -> bool {
         let item = self.item.read(cx);
         item.project_root().is_some()
+            && !self.annotation_state.controller.has_pending_authoring()
             && !self.measurement_controller.has_pending_authoring()
             && item.is_dirty()
             && !item.has_conflict()
@@ -5301,6 +5388,11 @@ impl FigView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<std::path::PathBuf>>> {
+        if self.annotation_state.controller.has_pending_authoring() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Add, save or cancel the annotation first. Its draft was kept."
+            )));
+        }
         if self.measurement_controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Finish or cancel the measurement drag before saving. Its preview was kept."
@@ -5402,6 +5494,12 @@ impl FigView {
             })
             .log_err();
         });
+        if self.annotation_state.controller.has_pending_authoring()
+            || self.selected_annotation(cx).is_some()
+            || self.tools.kind() == ToolKind::Annotation
+        {
+            return self.render_inspector_body(self.render_annotation_panel(cx), tabs, cx);
+        }
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => self.render_comments_sidebar(cx),
@@ -5526,6 +5624,20 @@ impl FigView {
                         .into_any_element()
                 }
             }
+        };
+        let body = if mode == EditorMode::Design && !self.page_annotations(cx).is_empty() {
+            v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(body))
+                .child(
+                    div()
+                        .h(px(150.0))
+                        .flex_shrink_0()
+                        .child(self.render_annotation_list(cx)),
+                )
+                .into_any_element()
+        } else {
+            body
         };
         self.render_inspector_body(body, tabs, cx)
     }
@@ -7134,6 +7246,9 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivateMeasureTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Measure, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActivateAnnotationTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Annotation, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ActivateInspectTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Inspect, window, cx)
             }))
@@ -7646,6 +7761,7 @@ impl Item for FigView {
 
     fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.invalidate_local_media_origin();
+        self.freeze_annotation_move(cx);
         self.freeze_measurement_drag(cx);
         self.finish_document_edits(cx);
         #[cfg(target_os = "macos")]
@@ -7654,6 +7770,7 @@ impl Item for FigView {
 
     fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         self.invalidate_local_media_origin();
+        self.freeze_annotation_move(cx);
         self.freeze_measurement_drag(cx);
         self.finish_document_edits(cx);
         #[cfg(target_os = "macos")]
@@ -7755,6 +7872,9 @@ impl Item for FigView {
     }
 
     fn close_blocker(&self, _cx: &App) -> Option<SharedString> {
+        if self.annotation_state.controller.has_pending_authoring() {
+            return Some("Add, save or cancel the annotation before closing this canvas. Its draft was kept.".into());
+        }
         self.measurement_controller
             .has_pending_authoring()
             .then(|| {
@@ -7810,6 +7930,11 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.annotation_state.controller.has_pending_authoring() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Add, save or cancel the annotation first. Its draft was kept."
+            )));
+        }
         if self.measurement_controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Finish or cancel the measurement drag first. Its preview was kept."
@@ -7831,6 +7956,11 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.annotation_state.controller.has_pending_authoring() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Add, save or cancel the annotation first. Its draft was kept."
+            )));
+        }
         if self.measurement_controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Finish or cancel the measurement drag first. Its preview was kept."
@@ -7919,6 +8049,11 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.annotation_state.controller.has_pending_authoring() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Add, save or cancel the annotation first. Its draft was kept."
+            )));
+        }
         if self.measurement_controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Finish or cancel the measurement drag first. Its preview was kept."
@@ -14815,9 +14950,7 @@ impl FigView {
             },
             ToolbarSecondaryControl::DevInspect => self.activate_tool(ToolKind::Inspect, cx),
             ToolbarSecondaryControl::DevMeasure => self.activate_tool(ToolKind::Measure, cx),
-            ToolbarSecondaryControl::DevAnnotate => {
-                notify_unavailable(control.label(), window, cx);
-            }
+            ToolbarSecondaryControl::DevAnnotate => self.activate_tool(ToolKind::Annotation, cx),
             other => notify_unavailable(other.label(), window, cx),
         }
     }

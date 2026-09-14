@@ -170,6 +170,7 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
         ToolKind::TextPath => ToolbarTool::TextPath,
         ToolKind::Comment => ToolbarTool::Comment,
         ToolKind::Measure => ToolbarTool::Measure,
+        ToolKind::Annotation => ToolbarTool::Annotation,
     }
 }
 
@@ -198,6 +199,7 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
         ToolbarTool::TextPath => ToolKind::TextPath,
         ToolbarTool::Comment => ToolKind::Comment,
         ToolbarTool::Measure => ToolKind::Measure,
+        ToolbarTool::Annotation => ToolKind::Annotation,
         _ => return None,
     })
 }
@@ -426,6 +428,7 @@ mod tests {
             ToolKind::TextPath,
             ToolKind::Comment,
             ToolKind::Measure,
+            ToolKind::Annotation,
         ] {
             assert_eq!(
                 tool_kind(toolbar_tool(kind)),
@@ -449,7 +452,6 @@ mod tests {
             unmapped,
             vec![
                 ToolbarTool::ImageVideo,
-                ToolbarTool::Annotation,
                 ToolbarTool::Resources,
                 ToolbarTool::Actions,
                 ToolbarTool::ColorPicker,
@@ -847,7 +849,7 @@ mod echo_tests {
         cx: &mut TestAppContext,
         invalid: bool,
         legacy: bool,
-        measure: bool,
+        tool: ToolKind,
     ) {
         use gpui::Focusable as _;
 
@@ -945,7 +947,7 @@ mod echo_tests {
 
         let trigger = visible_primary_control(
             &mut cx,
-            if measure {
+            if tool != ToolKind::Inspect {
                 "toolbar-group-comment-tools-trigger"
             } else {
                 "toolbar-group-move-tools-trigger"
@@ -959,10 +961,10 @@ mod echo_tests {
         );
         assert_pending(&cx);
         let inspect = cx
-            .debug_bounds(if measure {
-                "toolbar-flyout-measurement"
-            } else {
-                "toolbar-flyout-inspect"
+            .debug_bounds(match tool {
+                ToolKind::Measure => "toolbar-flyout-measurement",
+                ToolKind::Annotation => "toolbar-flyout-annotation",
+                _ => "toolbar-flyout-inspect",
             })
             .expect("Inspect row");
         cx.simulate_mouse_down(inspect.center(), gpui::MouseButton::Left, Modifiers::none());
@@ -1044,7 +1046,7 @@ mod echo_tests {
         }
         let trigger = visible_primary_control(
             &mut cx,
-            if measure {
+            if tool != ToolKind::Inspect {
                 "toolbar-group-comment-tools-trigger"
             } else {
                 "toolbar-group-move-tools-trigger"
@@ -1053,29 +1055,18 @@ mod echo_tests {
         cx.simulate_click(trigger.center(), Modifiers::none());
         cx.run_until_parked();
         let inspect = cx
-            .debug_bounds(if measure {
-                "toolbar-flyout-measurement"
-            } else {
-                "toolbar-flyout-inspect"
+            .debug_bounds(match tool {
+                ToolKind::Measure => "toolbar-flyout-measurement",
+                ToolKind::Annotation => "toolbar-flyout-annotation",
+                _ => "toolbar-flyout-inspect",
             })
             .expect("Inspect row");
         cx.simulate_click(inspect.center(), Modifiers::none());
         cx.run_until_parked();
-        assert_eq!(
-            view.read_with(&cx, |view, _| view.active_tool()),
-            if measure {
-                ToolKind::Measure
-            } else {
-                ToolKind::Inspect
-            }
-        );
+        assert_eq!(view.read_with(&cx, |view, _| view.active_tool()), tool);
         assert_eq!(
             toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
-            if measure {
-                ToolbarTool::Measure
-            } else {
-                ToolbarTool::Inspect
-            }
+            toolbar_tool(tool)
         );
     }
 
@@ -1083,42 +1074,56 @@ mod echo_tests {
     async fn inspect_menu_preserves_shared_invalid_numeric_draft_until_corrected(
         cx: &mut TestAppContext,
     ) {
-        assert_editorial_menu_preserves_numeric_draft(cx, true, false, false).await;
+        assert_editorial_menu_preserves_numeric_draft(cx, true, false, ToolKind::Inspect).await;
     }
 
     #[gpui::test]
     async fn inspect_menu_preserves_shared_live_numeric_preview_until_cancelled(
         cx: &mut TestAppContext,
     ) {
-        assert_editorial_menu_preserves_numeric_draft(cx, false, false, false).await;
+        assert_editorial_menu_preserves_numeric_draft(cx, false, false, ToolKind::Inspect).await;
     }
 
     #[gpui::test]
     async fn inspect_menu_preserves_legacy_invalid_numeric_draft_until_corrected(
         cx: &mut TestAppContext,
     ) {
-        assert_editorial_menu_preserves_numeric_draft(cx, true, true, false).await;
+        assert_editorial_menu_preserves_numeric_draft(cx, true, true, ToolKind::Inspect).await;
     }
 
     #[gpui::test]
     async fn inspect_menu_preserves_legacy_live_numeric_preview_until_cancelled(
         cx: &mut TestAppContext,
     ) {
-        assert_editorial_menu_preserves_numeric_draft(cx, false, true, false).await;
+        assert_editorial_menu_preserves_numeric_draft(cx, false, true, ToolKind::Inspect).await;
     }
 
     #[gpui::test]
     async fn measure_menu_preserves_shared_invalid_numeric_draft_until_corrected(
         cx: &mut TestAppContext,
     ) {
-        assert_editorial_menu_preserves_numeric_draft(cx, true, false, true).await;
+        assert_editorial_menu_preserves_numeric_draft(cx, true, false, ToolKind::Measure).await;
     }
 
     #[gpui::test]
     async fn measure_menu_preserves_shared_live_numeric_preview_until_cancelled(
         cx: &mut TestAppContext,
     ) {
-        assert_editorial_menu_preserves_numeric_draft(cx, false, false, true).await;
+        assert_editorial_menu_preserves_numeric_draft(cx, false, false, ToolKind::Measure).await;
+    }
+
+    #[gpui::test]
+    async fn annotation_menu_preserves_shared_invalid_numeric_draft_until_corrected(
+        cx: &mut TestAppContext,
+    ) {
+        assert_editorial_menu_preserves_numeric_draft(cx, true, false, ToolKind::Annotation).await;
+    }
+
+    #[gpui::test]
+    async fn annotation_menu_preserves_shared_live_numeric_preview_until_cancelled(
+        cx: &mut TestAppContext,
+    ) {
+        assert_editorial_menu_preserves_numeric_draft(cx, false, false, ToolKind::Annotation).await;
     }
 
     async fn assert_leaving_toolbar_finishes_the_retained_transaction(
@@ -1904,6 +1909,214 @@ mod echo_tests {
             let edit = view.text_edit.as_ref().expect("text editor remains open");
             assert_eq!(edit.session.node_id(), node);
             assert_eq!(edit.session.buffer(), "M");
+        });
+        item.read_with(&cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn annotation_feedback_menu_echoes_and_explicit_exit_preserves_authored_state(
+        cx: &mut TestAppContext,
+    ) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            ..
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        let authored = |item: &crate::document::FigItem, _: &gpui::App| {
+            let mut doc = item.doc().expect("document").clone();
+            doc.selection.clear();
+            (
+                serde_json::to_value(doc).expect("document snapshot"),
+                item.is_dirty(),
+            )
+        };
+        let original = item.read_with(&cx, authored);
+        let trigger = visible_primary_control(&mut cx, "toolbar-group-comment-tools-trigger");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        let annotation = cx
+            .debug_bounds("toolbar-flyout-annotation")
+            .expect("Annotation row");
+        cx.simulate_click(annotation.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Annotation
+        );
+        toolbar.read_with(&cx, |toolbar, _| {
+            assert_eq!(toolbar.active_tool(), ToolbarTool::Annotation);
+            assert_eq!(
+                fanta_gpui::toolbar::ToolbarToolGroup::Feedback.display_tool(toolbar.active_tool()),
+                ToolbarTool::Annotation,
+            );
+        });
+        assert_eq!(item.read_with(&cx, authored), original);
+
+        let trigger = visible_primary_control(&mut cx, "toolbar-group-move-tools-trigger");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        let move_tool = cx.debug_bounds("toolbar-flyout-move").expect("Move row");
+        cx.simulate_click(move_tool.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
+            ToolbarTool::Move
+        );
+
+        toolbar.update(&mut cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Dev,
+                control: ToolbarSecondaryControl::DevAnnotate,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Annotation
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
+            ToolbarTool::Annotation
+        );
+        assert_eq!(item.read_with(&cx, authored), original);
+    }
+
+    #[gpui::test]
+    async fn annotation_toolbar_routes_refuse_read_only_documents(cx: &mut TestAppContext) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            ..
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        item.update(&mut cx, |item, cx| item.set_source_edit_locked(true, cx));
+        cx.run_until_parked();
+        let original = local_media_snapshot(&item, &cx);
+        let trigger = visible_primary_control(&mut cx, "toolbar-group-comment-tools-trigger");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        let annotation = cx
+            .debug_bounds("toolbar-flyout-annotation")
+            .expect("Annotation row");
+        cx.simulate_click(annotation.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
+            ToolbarTool::Move
+        );
+        toolbar.update(&mut cx, |_, cx| {
+            cx.emit(ToolbarAction::SecondaryControlInvoked {
+                mode: ToolbarMode::Dev,
+                control: ToolbarSecondaryControl::DevAnnotate,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        assert_eq!(local_media_snapshot(&item, &cx), original);
+    }
+
+    async fn assert_annotation_canvas_shortcut(cx: &mut TestAppContext, source_locked: bool) {
+        use gpui::Focusable as _;
+
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            ..
+        } = canvas_gesture_fixture(cx, ToolbarTool::Move).await;
+        if source_locked {
+            item.update(&mut cx, |item, cx| item.set_source_edit_locked(true, cx));
+            cx.run_until_parked();
+        }
+        let original = local_media_snapshot(&item, &cx);
+        cx.update(|window, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped canvas key bindings");
+            app.bind_keys(bindings);
+            view.read(app).focus_handle(app).focus(window, app);
+        });
+        cx.simulate_keystrokes("shift-t");
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(&cx, |view, _| view.active_tool()),
+            if source_locked {
+                ToolKind::Select
+            } else {
+                ToolKind::Annotation
+            },
+        );
+        assert_eq!(
+            toolbar.read_with(&cx, |toolbar, _| toolbar.active_tool()),
+            if source_locked {
+                ToolbarTool::Move
+            } else {
+                ToolbarTool::Annotation
+            },
+        );
+        assert_eq!(local_media_snapshot(&item, &cx), original);
+    }
+
+    #[gpui::test]
+    async fn annotation_canvas_shortcut_activates_without_authoring(cx: &mut TestAppContext) {
+        assert_annotation_canvas_shortcut(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn annotation_canvas_shortcut_refuses_read_only_documents(cx: &mut TestAppContext) {
+        assert_annotation_canvas_shortcut(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn annotation_canvas_shortcut_keeps_inline_text_input(cx: &mut TestAppContext) {
+        let (view, _, mut cx) = setup(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let node = item.read_with(&cx, |item, _| {
+            *item
+                .doc()
+                .expect("document")
+                .selection
+                .as_slice()
+                .first()
+                .expect("selected text")
+        });
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped canvas key bindings");
+            app.bind_keys(bindings);
+        });
+        view.update_in(&mut cx, |view, window, cx| {
+            view.open_text_edit(node, crate::view::TextEditSeed::SelectAll, window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-t");
+        view.read_with(&cx, |view, _| {
+            assert_ne!(view.active_tool(), ToolKind::Annotation);
+            let edit = view.text_edit.as_ref().expect("text editor remains open");
+            assert_eq!(edit.session.node_id(), node);
+            assert_eq!(edit.session.buffer(), "T");
         });
         item.read_with(&cx, |item, _| {
             assert_eq!(item.doc().expect("document").history.undo_depth(), 0);

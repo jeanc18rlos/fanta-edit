@@ -2881,6 +2881,7 @@ struct OverlayData {
     /// node, when the alt-hover-style measure condition holds.
     measure_segments: Vec<GapSegment>,
     measurements: Vec<MeasurementOverlay>,
+    annotations: Vec<crate::view::annotations_host::AnnotationOverlay>,
     /// Comment pins on the active page, in stored (oldest-first) order.
     comment_pins: Vec<CommentPin>,
     prototype_connections: Vec<(DVec2, DVec2)>,
@@ -2957,6 +2958,7 @@ impl CanvasElement {
             selection_size: None,
             measure_segments: Vec::new(),
             measurements: Vec::new(),
+            annotations: Vec::new(),
             comment_pins: Vec::new(),
             prototype_connections: Vec::new(),
             prototype_handle: None,
@@ -2966,6 +2968,7 @@ impl CanvasElement {
         if let Some(viewport) = view.viewport() {
             let (width, height) = bounds_size(bounds);
             data.measurements = view.measurement_overlays(viewport, [width, height], cx);
+            data.annotations = view.annotation_overlays(viewport, [width, height], cx);
         }
         let item = view.item().read(cx);
         let Some(document) = item.document() else {
@@ -3620,6 +3623,49 @@ impl CanvasElement {
                         window,
                         cx,
                     );
+                }
+            }
+            let (width, height) = bounds_size(bounds);
+            for annotation in &data.annotations {
+                let [x, y] = annotation.screen;
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || x < -12.0
+                    || y < -12.0
+                    || x > width + 12.0
+                    || y > height + 12.0
+                {
+                    continue;
+                }
+                let center = bounds.origin + point(px(x as f32), px(y as f32));
+                let background = if annotation.selected {
+                    accent
+                } else {
+                    gpui::rgb(0xB96C14).into()
+                };
+                let background = if annotation.preview {
+                    background.opacity(0.75)
+                } else {
+                    background
+                };
+                window.paint_quad(gpui::quad(
+                    Bounds::new(center - point(px(12.0), px(12.0)), size(px(24.0), px(24.0))),
+                    px(12.0),
+                    background,
+                    px(1.0),
+                    gpui::white(),
+                    BorderStyle::Solid,
+                ));
+                let line = shape_label(&annotation.label, gpui::white(), &ui_font, window);
+                if let Err(error) = line.paint(
+                    point(center.x - line.width() / 2.0, center.y - PILL_HEIGHT / 2.0),
+                    PILL_HEIGHT,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                ) {
+                    log::warn!("Could not paint annotation pin: {error:#}");
                 }
             }
         });
