@@ -1815,30 +1815,69 @@ impl FantaPropertiesPanel {
             return;
         };
         let item = view.read(cx).item().clone();
-        let selected_page = view.read(cx).selected_page_index();
-        let (page_index, current_index) = {
-            let fig_item = item.read(cx);
-            let Some(document) = fig_item.document() else {
+        let Some(doc) = item.read(cx).doc() else {
+            return;
+        };
+        let [instance] = doc.selection.as_slice() else {
+            return;
+        };
+        let expected_instance = *instance;
+        let expected_scene = doc.scene.instance_id();
+        let expected_page = doc.active_page();
+        let view = view.downgrade();
+        // Navigation finishes inspector edits and echoes its permissions;
+        // both must wait until this inspector's click releases its lease.
+        cx.defer(move |cx| {
+            let Some(view) = view.upgrade() else {
                 return;
             };
-            (
-                document.page_index_of_node(target),
-                document.page_index(selected_page),
-            )
-        };
-        view.update(cx, |view, cx| {
-            if let Some(index) = page_index
-                && Some(index) != current_index
-            {
-                view.select_page(index, cx);
+            if view.read(cx).item().entity_id() != item.entity_id() {
+                return;
             }
-            view.focus_node(target, cx);
-        });
-        item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.selection.select_only(target);
-                ((), DocChange::Selection)
+            let selected_page = view.read(cx).selected_page_index();
+            let (page_index, current_index) = {
+                let item = item.read(cx);
+                let Some(document) = item.document() else {
+                    return;
+                };
+                let doc = &document.doc;
+                if doc.scene.instance_id() != expected_scene
+                    || doc.active_page() != expected_page
+                    || doc.selection.as_slice() != [expected_instance]
+                {
+                    return;
+                }
+                let Some(NodeData::Instance(instance)) =
+                    doc.scene.get(expected_instance).map(|node| &node.data)
+                else {
+                    return;
+                };
+                if doc.components.def(instance.component).map(|def| def.root) != Some(target) {
+                    return;
+                }
+                let Some(index) = document.page_index_of_node(target) else {
+                    return;
+                };
+                (index, document.page_index(selected_page))
+            };
+            let navigated = view.update(cx, |view, cx| {
+                if Some(page_index) != current_index {
+                    view.select_page(page_index, cx);
+                    if view.selected_page_index() != Some(page_index) {
+                        return false;
+                    }
+                }
+                view.focus_node(target, cx);
+                true
             });
+            if navigated {
+                item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(target);
+                        ((), DocChange::Selection)
+                    });
+                });
+            }
         });
     }
 

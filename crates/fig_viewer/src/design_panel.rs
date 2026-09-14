@@ -1670,6 +1670,7 @@ impl FantaDesignPanel {
             .child(
                 div()
                     .id(("fanta-page-name", index))
+                    .debug_selector(move || format!("native-page-name-{index}"))
                     .flex_1()
                     .min_w_0()
                     .tooltip(Tooltip::text(page_name.clone()))
