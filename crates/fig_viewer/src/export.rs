@@ -1014,6 +1014,153 @@ mod tests {
     }
 
     #[test]
+    fn persistent_measurements_leave_png_pixels_svg_paint_and_export_bounds_unchanged() {
+        use crate::measurements::{Measurement, create_measurement_op, read_measurements};
+
+        let directory = tempfile::tempdir().expect("measurement export fixture");
+        let mut document = Doc::new();
+        let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page_node.name = "Measured page".into();
+        page_node.transform = Transform2D::translation(120.0, -70.0);
+        let page = insert(&mut document, page_node);
+        document.add_page(page);
+        document.set_active_page(Some(page));
+        let mut art = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            48.0,
+            24.0,
+            Color::rgb(24, 96, 200),
+        )));
+        art.parent = Some(page);
+        art.transform = Transform2D::translation(8.0, 12.0);
+        if let NodeData::Vector(vector) = &mut art.data {
+            let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+            stroke.align = StrokeAlign::Outside;
+            vector.strokes.push(stroke);
+        }
+        insert(&mut document, art);
+        let art_count = document.scene.len();
+        let export = |document: &Doc, name: &str| {
+            let page = FigPage {
+                root: Some(page),
+                name: "Measured page".into(),
+                bounds: Bounds::ZERO,
+                hidden: false,
+            };
+            let batch = prepare_export_jobs(
+                document,
+                None,
+                Some(&page),
+                directory.path().join(name),
+                &[
+                    ExportPreset {
+                        format: ExportFormat::Png,
+                        scale: ExportScale::Two,
+                    },
+                    ExportPreset {
+                        format: ExportFormat::Svg,
+                        scale: ExportScale::One,
+                    },
+                ],
+            )
+            .expect("prepare actual page export");
+            let bounds = batch.targets.first().expect("page export target").bounds;
+            let files = run_export_jobs(batch).expect("write PNG and SVG");
+            let raster = image::open(files.first().expect("PNG file"))
+                .expect("decode exported PNG")
+                .to_rgba8();
+            let svg = std::fs::read_to_string(files.get(1).expect("SVG file"))
+                .expect("read exported SVG");
+            (bounds, raster, svg)
+        };
+        let before = export(&document, "before");
+        assert_eq!(
+            before.1.dimensions(),
+            (112, 64),
+            "baseline includes the outside stroke"
+        );
+        assert!(
+            before
+                .1
+                .pixels()
+                .any(|pixel| pixel[3] == 255 && pixel[2] > pixel[0]),
+            "fixture paints blue artwork"
+        );
+        assert!(
+            before.2.contains("<path") || before.2.contains("<rect"),
+            "SVG fixture includes vector paint"
+        );
+        assert!(!before.2.contains("<image"));
+
+        let inside = Measurement::new([12.0, 16.0], [48.0, 28.0], "Designer".into(), 42)
+            .expect("overlapping measurement");
+        let outside = Measurement::new(
+            [-1_000_000.0, 1_000_000.0],
+            [1_000_000.0, -1_000_000.0],
+            "Designer".into(),
+            43,
+        )
+        .expect("measurement far outside art bounds");
+        for measurement in [&inside, &outside] {
+            document
+                .apply(
+                    create_measurement_op(&document, page, measurement)
+                        .expect("create measurement"),
+                )
+                .expect("apply metadata");
+        }
+        assert_eq!(
+            document.scene.len(),
+            art_count,
+            "measurement IDs do not become scene nodes"
+        );
+        assert_eq!(
+            read_measurements(&document, page)
+                .expect("read marks")
+                .len(),
+            2
+        );
+        let after = export(&document, "after");
+        assert_eq!(
+            after.0, before.0,
+            "far-away measurement cannot inflate export bounds"
+        );
+        assert_eq!(after.1.dimensions(), before.1.dimensions());
+        assert_eq!(
+            after.1.as_raw(),
+            before.1.as_raw(),
+            "marks never enter art PNG pixels"
+        );
+        assert_eq!(after.2, before.2, "SVG paint stays exactly the same");
+        assert!(!after.2.contains(&inside.id));
+        assert!(!after.2.contains(&outside.id));
+
+        let project = directory.path().join("saved-project");
+        fanta_format::write_project_tree(&project, &document, &BTreeMap::new())
+            .expect("save measured project");
+        let (reopened, _) =
+            fanta_format::read_project_tree(&project).expect("reopen measured page FNX");
+        assert_eq!(
+            read_measurements(&reopened, page)
+                .expect("restored records")
+                .len(),
+            2
+        );
+        let restored = export(&reopened, "after-reopen");
+        assert_eq!(restored.0, before.0);
+        assert_eq!(
+            restored.1.as_raw(),
+            before.1.as_raw(),
+            "reopened measurements remain excluded from PNG"
+        );
+        assert_eq!(
+            restored.2, before.2,
+            "reopened measurements remain excluded from SVG"
+        );
+    }
+
+    #[test]
     fn empty_bounds_and_empty_presets_are_reported_before_background_export() {
         let mut doc = Doc::new();
         let empty = insert(

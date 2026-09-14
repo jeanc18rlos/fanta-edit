@@ -21,8 +21,8 @@ use fanta_text::TextBuffer;
 use fs::Fs;
 use gpui::{
     App, AsyncWindowContext, Bounds, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, Task,
-    WeakEntity, Window, actions, px,
+    Focusable, KeyDownEvent, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Subscription,
+    Task, WeakEntity, Window, actions, px,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::Divider;
@@ -71,6 +71,146 @@ actions!(
 );
 
 const NO_DOCUMENT_MESSAGE: &str = "Open a Figma document to inspect properties";
+
+type MeasurementActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+#[derive(IntoElement)]
+pub(crate) struct MeasurementProperties {
+    distance: SharedString,
+    start: [f64; 2],
+    end: [f64; 2],
+    editable: bool,
+    on_copy: MeasurementActionHandler,
+    on_delete: MeasurementActionHandler,
+}
+
+impl MeasurementProperties {
+    pub(crate) fn new(
+        distance: SharedString,
+        start: [f64; 2],
+        end: [f64; 2],
+        editable: bool,
+        on_copy: impl Fn(&mut Window, &mut App) + 'static,
+        on_delete: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            distance,
+            start,
+            end,
+            editable,
+            on_copy: Box::new(on_copy),
+            on_delete: Box::new(on_delete),
+        }
+    }
+}
+
+impl RenderOnce for MeasurementProperties {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let on_copy = self.on_copy;
+        let on_delete = self.on_delete;
+        v_flex()
+            .id("fanta-measurement-properties")
+            .w_full()
+            .max_h(px(340.))
+            .flex_shrink_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .bg(cx.theme().colors().panel_background)
+            .child(crate::inspector_components::InspectorSectionHeader::new(
+                "Measurement",
+            ))
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_3()
+                    .child(Label::new(self.distance))
+                    .children(
+                        [("Start", self.start), ("End", self.end)].map(|(label, point)| {
+                            h_flex()
+                                .gap_2()
+                                .flex_wrap()
+                                .justify_between()
+                                .child(Label::new(label).color(Color::Muted))
+                                .child(Label::new(format!(
+                                    "{}, {} px",
+                                    format_number(point[0]),
+                                    format_number(point[1]),
+                                )))
+                        }),
+                    )
+                    .child(Label::new("Fixed positions on this page").color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new("copy-measurement", "Copy value")
+                                    .on_click(move |_, window, cx| on_copy(window, cx)),
+                            )
+                            .child(
+                                Button::new("delete-measurement", "Delete")
+                                    .disabled(!self.editable)
+                                    .on_click(move |_, window, cx| on_delete(window, cx)),
+                            ),
+                    ),
+            )
+    }
+}
+
+type MeasurementSelectionHandler = std::rc::Rc<dyn Fn(SharedString, &mut Window, &mut App)>;
+
+#[derive(IntoElement)]
+pub(crate) struct MeasurementList {
+    rows: Vec<(SharedString, SharedString)>,
+    selected: Option<SharedString>,
+    on_select: MeasurementSelectionHandler,
+}
+
+impl MeasurementList {
+    pub(crate) fn new(
+        rows: Vec<(SharedString, SharedString)>,
+        selected: Option<SharedString>,
+        on_select: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            rows,
+            selected,
+            on_select: std::rc::Rc::new(on_select),
+        }
+    }
+}
+
+impl RenderOnce for MeasurementList {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let mut content = v_flex()
+            .id("fanta-measurement-list")
+            .w_full()
+            .min_h_0()
+            .flex_1()
+            .overflow_y_scroll()
+            .bg(cx.theme().colors().panel_background)
+            .child(crate::inspector_components::InspectorSectionHeader::new(
+                "Measurements on this page",
+            ));
+        if self.rows.is_empty() {
+            return content.child(crate::inspector_components::InspectorMessage::new(
+                "This page has no measurements yet.",
+            ));
+        }
+        for (id, label) in self.rows {
+            let on_select = self.on_select.clone();
+            let selected = self.selected.as_ref() == Some(&id);
+            content = content.child(
+                div().px_2().py_1().child(
+                    Button::new(SharedString::from(format!("measurement-list-{id}")), label)
+                        .toggle_state(selected)
+                        .on_click(move |_, window, cx| on_select(id.clone(), window, cx)),
+                ),
+            );
+        }
+        content
+    }
+}
 
 /// The panel's draggable slider tracks. Their painted bounds are captured every
 /// frame so a press maps straight to a fraction of the track.
@@ -395,9 +535,9 @@ impl FantaPropertiesPanel {
                     let item = view.read(cx).item().clone();
                     self.draft_preserving_focus_scope =
                         Some(view.read(cx).draft_preserving_toolbar_focus_scope(cx));
-                    self.set_inspecting(view.read(cx).is_inspecting(), cx);
+                    self.set_inspecting(view.read(cx).is_art_read_only(), cx);
                     self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
-                        this.set_inspecting(view.read(cx).is_inspecting(), cx);
+                        this.set_inspecting(view.read(cx).is_art_read_only(), cx);
                     }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,

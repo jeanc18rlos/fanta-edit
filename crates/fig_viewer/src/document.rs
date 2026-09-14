@@ -296,6 +296,8 @@ pub(crate) fn take_pending_view_descriptor(cx: &mut App) -> Option<FigViewDescri
 pub enum FigItemEvent {
     /// The document content changed through an operation, undo, or redo.
     Edited,
+    /// Page roots changed in history; views repair missing scopes and page indices.
+    PageRegistryChanged,
     /// A drag preview frame changed document content transiently. Fires per
     /// pointer move, so listeners doing non-trivial work per change (like the
     /// layers tree) should ignore it and wait for the committing [`Edited`].
@@ -752,6 +754,200 @@ impl FigDocument {
             return true;
         }
         false
+    }
+
+    pub(crate) fn add_page(&mut self) -> Result<Option<usize>> {
+        if self.doc.pages().is_empty() {
+            return Ok(None);
+        }
+        let mut node =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode::default()));
+        node.name = format!("Page {}", visible_page_roots(&self.doc).len() + 1);
+        node.index = self.doc.scene.next_root_index();
+        let root = node.id;
+        let old_pages = self.doc.pages().to_vec();
+        let mut new_pages = old_pages.clone();
+        new_pages.push(root);
+        let index = new_pages.len() - 1;
+        let registry = Operation::SetPageRegistry {
+            old_pages,
+            new_pages,
+            old_active_page: self.doc.active_page(),
+            new_active_page: Some(root),
+        };
+        self.apply_page_transaction("Add Page", vec![Operation::create_node(node), registry])?;
+        Ok(Some(index))
+    }
+
+    pub(crate) fn delete_page(&mut self, page_index: usize) -> Result<Option<usize>> {
+        let Some(page) = self.pages.get(page_index) else {
+            return Ok(None);
+        };
+        let Some(root) = page.root.filter(|_| !page.hidden) else {
+            return Ok(None);
+        };
+        if visible_page_roots(&self.doc).len() <= 1 {
+            return Ok(None);
+        }
+        let old_pages = self.doc.pages().to_vec();
+        let Some(index) = old_pages.iter().position(|page| *page == root) else {
+            return Ok(None);
+        };
+        let mut new_pages = old_pages.clone();
+        new_pages.remove(index);
+        let old_active_page = self.doc.active_page();
+        let active_removed = old_active_page.is_some_and(|active| {
+            active == root
+                || self
+                    .doc
+                    .scene
+                    .ancestors_of(active)
+                    .any(|node| node.id == root)
+        });
+        let new_active_page = if active_removed {
+            new_pages
+                .iter()
+                .skip(index)
+                .chain(new_pages.iter().rev())
+                .copied()
+                .find(|page| {
+                    self.doc
+                        .scene
+                        .get(*page)
+                        .and_then(|node| node.meta.get("hidden_page"))
+                        .and_then(|value| value.as_bool())
+                        != Some(true)
+                })
+        } else {
+            old_active_page
+        };
+        let snapshot = self
+            .doc
+            .scene
+            .descendants_of(root)
+            .filter_map(|id| self.doc.scene.get(id).cloned())
+            .collect();
+        self.apply_page_transaction(
+            "Delete Page",
+            vec![
+                Operation::SetPageRegistry {
+                    old_pages,
+                    new_pages,
+                    old_active_page,
+                    new_active_page,
+                },
+                Operation::DeleteSubtree { snapshot },
+            ],
+        )?;
+        Ok(Some(
+            self.doc
+                .pages()
+                .iter()
+                .position(|page| Some(*page) == new_active_page)
+                .unwrap_or(0),
+        ))
+    }
+
+    fn apply_page_transaction(&mut self, label: &str, operations: Vec<Operation>) -> Result<()> {
+        let modified_at = self.doc.metadata.modified_at;
+        if let Err(error) = crate::clipboard::apply_transaction(&mut self.doc, label, operations) {
+            self.doc.metadata.modified_at = modified_at;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn valid_scope(&self, scope: FigScope) -> bool {
+        match scope {
+            FigScope::Variables => true,
+            FigScope::Page(root) => self.doc.pages().contains(&root),
+            FigScope::Component(component) => self
+                .doc
+                .components
+                .defs
+                .get(&component)
+                .is_some_and(|definition| self.doc.scene.contains(definition.root)),
+        }
+    }
+
+    fn sync_page_registry(&mut self) -> bool {
+        let unchanged = if self.doc.pages().is_empty() {
+            self.pages.len() == 1 && self.pages.first().is_some_and(|page| page.root.is_none())
+        } else {
+            self.pages
+                .iter()
+                .map(|page| page.root)
+                .eq(self.doc.pages().iter().copied().map(Some))
+        };
+        if unchanged {
+            return false;
+        }
+        let default_root = self
+            .pages
+            .get(self.default_page_index)
+            .and_then(|page| page.root);
+        let mut previous: HashMap<_, _> = std::mem::take(&mut self.pages)
+            .into_iter()
+            .filter_map(|page| page.root.map(|root| (root, page)))
+            .collect();
+        self.pages = if self.doc.pages().is_empty() {
+            collect_pages(&self.doc, &[])
+        } else {
+            self.doc
+                .pages()
+                .iter()
+                .enumerate()
+                .map(|(index, root)| {
+                    let bounds = previous
+                        .remove(root)
+                        .map(|page| page.bounds)
+                        .unwrap_or_else(|| page_bounds(&self.doc, Some(*root)));
+                    FigPage {
+                        root: Some(*root),
+                        name: self
+                            .doc
+                            .page_name(*root)
+                            .filter(|name| !name.is_empty())
+                            .map(SharedString::from)
+                            .unwrap_or_else(|| format!("Page {}", index + 1).into()),
+                        bounds,
+                        hidden: self
+                            .doc
+                            .scene
+                            .get(*root)
+                            .and_then(|node| node.meta.get("hidden_page"))
+                            .and_then(|value| value.as_bool())
+                            == Some(true),
+                    }
+                })
+                .collect()
+        };
+        self.default_page_index = self
+            .pages
+            .iter()
+            .position(|page| page.root == default_root)
+            .or_else(|| {
+                self.pages
+                    .iter()
+                    .position(|page| page.root == self.doc.active_page())
+            })
+            .unwrap_or(0);
+        self.solved_pages
+            .retain(|root| self.doc.scene.contains(*root));
+        self.prewarmed_pages
+            .retain(|root| self.doc.scene.contains(*root));
+        let surviving_selection = self
+            .doc
+            .selection
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.doc.scene.contains(*id)
+                    && crate::clipboard::node_is_on_active_page(&self.doc, *id)
+            })
+            .collect::<Vec<_>>();
+        self.doc.selection.replace_with(surviving_selection);
+        true
     }
 
     fn refresh_page_bounds(&mut self, page_index: usize) {
@@ -1822,6 +2018,10 @@ impl FigItem {
             document.uses_auto_layout = true;
         }
         let active_page = document.doc.active_page();
+        if document.sync_page_registry() {
+            self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
+            cx.emit(FigItemEvent::PageRegistryChanged);
+        }
         document.resolve_after_edit(active_page);
         document.advance_render_generation();
         document.mark_variables_changed();
@@ -1895,6 +2095,10 @@ impl FigItem {
                     document.uses_auto_layout = true;
                 }
                 let active_page = document.doc.active_page();
+                if document.sync_page_registry() {
+                    self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
+                    cx.emit(FigItemEvent::PageRegistryChanged);
+                }
                 document.resolve_after_edit(active_page);
                 document.advance_render_generation();
                 document.mark_variables_changed();
@@ -1907,6 +2111,11 @@ impl FigItem {
                         "content preview used unowned document access; committing the mutation"
                     );
                     let active_page = document.doc.active_page();
+                    if document.sync_page_registry() {
+                        self.last_scope =
+                            self.last_scope.filter(|scope| document.valid_scope(*scope));
+                        cx.emit(FigItemEvent::PageRegistryChanged);
+                    }
                     document.resolve_after_edit(active_page);
                     document.advance_render_generation();
                     document.mark_variables_changed();
@@ -1951,6 +2160,10 @@ impl FigItem {
                 .collect::<Vec<_>>();
             document.doc.selection.replace_with(surviving_selection);
             let active_page = document.doc.active_page();
+            if document.sync_page_registry() {
+                self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
+                cx.emit(FigItemEvent::PageRegistryChanged);
+            }
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
             document.mark_variables_changed();
@@ -1981,6 +2194,10 @@ impl FigItem {
                 .collect::<Vec<_>>();
             document.doc.selection.replace_with(surviving_selection);
             let active_page = document.doc.active_page();
+            if document.sync_page_registry() {
+                self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
+                cx.emit(FigItemEvent::PageRegistryChanged);
+            }
             document.resolve_after_edit(active_page);
             document.advance_render_generation();
             document.mark_variables_changed();
@@ -3238,6 +3455,142 @@ mod tests {
         })
         .expect("define component");
         (doc, page_root, component, master_root)
+    }
+
+    #[test]
+    fn page_history_preserves_registry_metadata_and_surviving_caches() -> Result<()> {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData};
+        let (mut doc, first, _, master) = doc_with_page_and_component();
+        let mut hidden = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        hidden.name = "Components".into();
+        hidden.meta = serde_json::json!({"hidden_page": true, "vendor": {"keep": true}});
+        let hidden_root = hidden.id;
+        doc.scene.insert(hidden)?;
+        doc.add_page(hidden_root);
+        doc.history = fanta_doc::History::new();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let retained_bounds = fanta_doc::Bounds::from_xywh(12.0, 34.0, 56.0, 78.0);
+        document.pages.first_mut().expect("first page").bounds = retained_bounds;
+        document.solved_pages.extend([first, master]);
+        document.prewarmed_pages.extend([first, master]);
+        let index = document.add_page()?.expect("added page");
+        let added = document.doc.pages()[index];
+        assert_eq!(document.doc.history.next_undo_label(), Some("Add Page"));
+        assert!(document.sync_page_registry());
+        assert_eq!(document.doc.pages(), &[first, hidden_root, added]);
+        assert_eq!(document.pages[index].name.as_ref(), "Page 2");
+        assert!(document.pages[1].hidden);
+        assert_eq!(document.pages[0].bounds, retained_bounds);
+        assert!(document.solved_pages.contains(&master));
+        assert!(document.prewarmed_pages.contains(&master));
+        assert!(!document.sync_page_registry());
+        assert!(document.doc.undo()?);
+        assert!(document.sync_page_registry());
+        assert_eq!(document.doc.pages(), &[first, hidden_root]);
+        assert_eq!(document.doc.active_page(), Some(first));
+        assert!(!document.doc.scene.contains(added));
+        assert!(!document.doc.history.can_undo());
+        assert!(document.doc.redo()?);
+        assert!(document.sync_page_registry());
+        assert_eq!(document.pages[index].root, Some(added));
+        assert_eq!(document.doc.active_page(), Some(added));
+        assert_eq!(document.pages[0].bounds, retained_bounds);
+        document.doc.scene.get_mut(added).expect("page").meta = serde_json::json!({
+            "measurements": [{"version": 1, "id": "stable", "start": [0, 0], "end": [3, 4], "author": "Author", "created": 7}],
+            "future": ["preserved"]
+        });
+        let snapshot = document.doc.scene.get(added).cloned().expect("added page");
+        document.doc.selection.select_only(added);
+        assert!(document.delete_page(index)?.is_some());
+        assert!(document.sync_page_registry());
+        assert_eq!(document.doc.history.next_undo_label(), Some("Delete Page"));
+        assert_eq!(document.doc.active_page(), Some(first));
+        assert!(document.doc.selection.is_empty());
+        assert!(document.doc.undo()?);
+        assert!(document.sync_page_registry());
+        assert_eq!(document.doc.scene.get(added), Some(&snapshot));
+        assert_eq!(document.doc.pages(), &[first, hidden_root, added]);
+        assert_eq!(document.doc.active_page(), Some(added));
+        assert!(document.doc.redo()?);
+        assert!(document.sync_page_registry());
+        assert!(!document.doc.scene.contains(added));
+        assert_eq!(document.doc.pages(), &[first, hidden_root]);
+        assert!(
+            document.delete_page(0)?.is_none(),
+            "keep the final visible page"
+        );
+        assert!(
+            document.delete_page(1)?.is_none(),
+            "keep hidden component pages"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_page_transactions_roll_back_scene_registry_and_history() -> Result<()> {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData};
+        let mut document = FigDocument::from_doc(doc_with_one_page(), BTreeMap::new());
+        document.doc.history = fanta_doc::History::new();
+        document.doc.metadata.modified_at = 123;
+        let pages = document.doc.pages().to_vec();
+        let active = document.doc.active_page();
+        let node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let root = node.id;
+        let result = document.apply_page_transaction(
+            "Fail Add Page",
+            vec![
+                Operation::create_node(node),
+                Operation::SetPageRegistry {
+                    old_pages: pages.clone(),
+                    new_pages: vec![root, root],
+                    old_active_page: active,
+                    new_active_page: Some(root),
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert!(!document.doc.scene.contains(root));
+        assert_eq!(document.doc.pages(), pages);
+        assert_eq!(document.doc.active_page(), active);
+        assert_eq!(document.doc.metadata.modified_at, 123);
+        assert!(!document.doc.history.can_undo());
+        let result = document.apply_page_transaction(
+            "Fail Delete Page",
+            vec![
+                Operation::SetPageRegistry {
+                    old_pages: pages.clone(),
+                    new_pages: Vec::new(),
+                    old_active_page: active,
+                    new_active_page: None,
+                },
+                Operation::DeleteSubtree {
+                    snapshot: Vec::new(),
+                },
+            ],
+        );
+        assert!(result.is_err());
+        assert_eq!(document.doc.pages(), pages);
+        assert_eq!(document.doc.active_page(), active);
+        assert_eq!(document.doc.metadata.modified_at, 123);
+        assert!(!document.doc.history.can_undo());
+        assert!(!document.sync_page_registry());
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_another_page_preserves_component_scope_and_selection() -> Result<()> {
+        let (doc, first, _, master) = doc_with_page_and_component();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let added = document.add_page()?.expect("added page");
+        assert!(document.sync_page_registry());
+        document.doc.set_active_page(Some(master));
+        document.doc.selection.select_only(master);
+        assert!(document.delete_page(added)?.is_some());
+        assert!(document.sync_page_registry());
+        assert_eq!(document.doc.active_page(), Some(master));
+        assert!(document.doc.selection.contains(master));
+        assert_eq!(document.doc.pages(), &[first]);
+        Ok(())
     }
 
     #[test]

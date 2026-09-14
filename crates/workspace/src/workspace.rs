@@ -3285,12 +3285,38 @@ impl Workspace {
         }
     }
 
+    pub fn can_close_items(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let blocked = self.panes.iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .find(|item| item.close_blocker(cx).is_some())
+                .map(|item| (pane.clone(), item.item_id()))
+        });
+        let Some((pane, item)) = blocked else {
+            return true;
+        };
+        self.cancel_close(window, cx);
+        self.set_active_pane(&pane, window, cx);
+        pane.update(cx, |pane, cx| pane.can_close_item(item, window, cx))
+    }
+
+    pub(crate) fn cancel_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.removing = false;
+        if self.session_id.is_none() {
+            self.session_id = Some(self.app_state.session.read(cx).id().to_owned());
+            self.serialize_workspace(window, cx);
+        }
+    }
+
     pub fn prepare_to_close(
         &mut self,
         close_intent: CloseIntent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        if !self.can_close_items(window, cx) {
+            return Task::ready(Ok(false));
+        }
         let active_call = self.active_global_call();
 
         cx.spawn_in(window, async move |this, cx| {
@@ -3416,6 +3442,11 @@ impl Workspace {
                     .await;
             }
 
+            if save_result.as_ref().is_ok_and(|allowed| *allowed)
+                && !this.update_in(cx, |this, window, cx| this.can_close_items(window, cx))?
+            {
+                return Ok(false);
+            }
             save_result
         })
     }
@@ -3531,6 +3562,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        let closing = save_intent == SaveIntent::Close;
+        if closing && !self.can_close_items(window, cx) {
+            return Task::ready(Ok(false));
+        }
         if self.project.read(cx).is_disconnected(cx) {
             return Task::ready(Ok(true));
         }
@@ -3621,6 +3656,11 @@ impl Workspace {
                 {
                     return Ok(false);
                 }
+            }
+            if closing {
+                return workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.can_close_items(window, cx)
+                });
             }
             Ok(true)
         })
@@ -10707,7 +10747,7 @@ pub fn reload(cx: &mut App) {
         }
 
         // If the user cancels any save prompt, then keep the app open.
-        for window in workspace_windows {
+        for window in &workspace_windows {
             if let Ok(should_close) = window.update(cx, |multi_workspace, window, cx| {
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
@@ -10718,7 +10758,24 @@ pub fn reload(cx: &mut App) {
                 return anyhow::Ok(());
             }
         }
-        cx.update(|cx| cx.restart());
+        cx.update(|cx| {
+            for window in cx
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+            {
+                if window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.can_close(window, cx)
+                    })
+                    .log_err()
+                    .is_some_and(|allowed| !allowed)
+                {
+                    return;
+                }
+            }
+            cx.restart();
+        });
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -11827,6 +11884,144 @@ mod tests {
         cx.executor().run_until_parked();
 
         assert!(task.await.unwrap());
+    }
+
+    #[gpui::test]
+    async fn test_view_local_close_blocker_precedes_clean_filter_and_hot_exit(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| register_serializable_item::<TestItem>(cx));
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let serializations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let serialization_enabled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let item = cx.new(|cx| {
+            let serializations = serializations.clone();
+            let serialization_enabled = serialization_enabled.clone();
+            let mut item = TestItem::new(cx).with_serialize(move || {
+                if !serialization_enabled.get() {
+                    return None;
+                }
+                serializations.set(serializations.get() + 1);
+                Some(Task::ready(Ok(())))
+            });
+            item.close_blocker = Some("Finish or cancel the local draft.".into());
+            item.state = "exact unfinished text".into();
+            item
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        });
+        // Item insertion also queues an ordinary background serialization.
+        cx.run_until_parked();
+        serialization_enabled.set(true);
+        for dirty in [false, true] {
+            item.update(cx, |item, _| item.is_dirty = dirty);
+            for intent in [
+                CloseIntent::CloseWindow,
+                CloseIntent::Quit,
+                CloseIntent::ReplaceWindow,
+            ] {
+                let allowed = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.prepare_to_close(intent, window, cx)
+                    })
+                    .await
+                    .expect("close preflight");
+                assert!(!allowed);
+                assert!(!cx.has_pending_prompt());
+                workspace.read_with(cx, |workspace, cx| {
+                    assert!(!workspace.removing);
+                    assert_eq!(workspace.active_pane().read(cx).items_len(), 1);
+                });
+            }
+            assert!(
+                !workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.prompt_to_save_or_discard_dirty_items(window, cx)
+                    })
+                    .await
+                    .expect("archive preflight")
+            );
+        }
+        assert_eq!(serializations.get(), 0);
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.state, "exact unfinished text");
+            assert_eq!((item.save_count, item.reload_count), (0, 0));
+        });
+        item.update(cx, |item, _| item.close_blocker = None);
+        assert!(
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.prepare_to_close(CloseIntent::Quit, window, cx)
+                })
+                .await
+                .expect("hot exit resumes after local authoring finishes")
+        );
+        assert_eq!(serializations.get(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_view_local_close_blocker_created_during_hot_exit_keeps_workspace(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| register_serializable_item::<TestItem>(cx));
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let (sender, receiver) = oneshot::channel::<()>();
+        let receiver = std::rc::Rc::new(std::cell::RefCell::new(Some(receiver)));
+        let serialization_task = cx.spawn(async move |_| {
+            let receiver = receiver.borrow_mut().take().expect("one serialization");
+            receiver.await?;
+            anyhow::Ok(())
+        });
+        let serialization_task =
+            std::rc::Rc::new(std::cell::RefCell::new(Some(serialization_task)));
+        let pending_serialization = serialization_task.clone();
+        let serialization_enabled = std::rc::Rc::new(std::cell::Cell::new(false));
+        let item = cx.new(|cx| {
+            let serialization_enabled = serialization_enabled.clone();
+            TestItem::new(cx).with_dirty(true).with_serialize(move || {
+                if serialization_enabled.get() {
+                    serialization_task.borrow_mut().take()
+                } else {
+                    None
+                }
+            })
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        });
+        // Reserve the one-shot task for close, after initial item serialization.
+        cx.run_until_parked();
+        serialization_enabled.set(true);
+        let close = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.prepare_to_close(CloseIntent::Quit, window, cx)
+        });
+        cx.run_until_parked();
+        assert!(
+            pending_serialization.borrow().is_none(),
+            "close must be awaiting the delayed serialization"
+        );
+        assert!(!cx.has_pending_prompt());
+        item.update(cx, |item, _| {
+            item.close_blocker = Some("Finish or cancel the new local draft.".into());
+            item.state = "started while serialization awaited".into();
+        });
+        sender.send(()).expect("release serialization");
+        assert!(!close.await.expect("close rechecks after serialization"));
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_pane().read(cx).items_len(), 1);
+            assert!(!workspace.removing);
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.state, "started while serialization awaited")
+        });
+        assert!(!cx.has_pending_prompt());
     }
 
     #[gpui::test]

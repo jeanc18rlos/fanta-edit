@@ -71,6 +71,7 @@ use ui::prelude::*;
 
 use crate::document::FigDocument;
 use crate::editor_session::EditorMode;
+use crate::measurements::{MeasurementOverlay, ScreenMeasurement};
 use crate::view::FigView;
 
 const HANDLE_SIZE: f32 = 7.0;
@@ -92,6 +93,8 @@ const MEASURE_RED: (u8, u8, u8) = (0xF2, 0x4B, 0x4B);
 
 /// Screen-space height (logical px) of the badge/measurement pills.
 const PILL_HEIGHT: Pixels = px(16.0);
+const MEASUREMENT_LABEL_GAP: f64 = 8.0;
+const MEASUREMENT_HANDLE_DIAMETER: f32 = 8.0;
 
 /// Extra logical pixels rendered beyond each element edge. Reprojected frames
 /// can then cover pans (and modest zoom-outs) without exposing unrendered
@@ -2877,6 +2880,7 @@ struct OverlayData {
     /// Measurement gap segments between the single selection and the hovered
     /// node, when the alt-hover-style measure condition holds.
     measure_segments: Vec<GapSegment>,
+    measurements: Vec<MeasurementOverlay>,
     /// Comment pins on the active page, in stored (oldest-first) order.
     comment_pins: Vec<CommentPin>,
     prototype_connections: Vec<(DVec2, DVec2)>,
@@ -2941,7 +2945,7 @@ impl CanvasElement {
     /// the document into owned values. Done up front so the borrow of `cx` (via
     /// the view/document) is released before the paint pass, which needs a
     /// mutable `cx` to shape and paint text.
-    fn collect_overlay_data(&self, cx: &App) -> OverlayData {
+    fn collect_overlay_data(&self, bounds: Bounds<Pixels>, cx: &App) -> OverlayData {
         let collect_started = std::time::Instant::now();
         let mut data = OverlayData {
             frame_labels: Rc::new(Vec::new()),
@@ -2952,12 +2956,17 @@ impl CanvasElement {
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
+            measurements: Vec::new(),
             comment_pins: Vec::new(),
             prototype_connections: Vec::new(),
             prototype_handle: None,
             prototype_start: None,
         };
         let view = self.view.read(cx);
+        if let Some(viewport) = view.viewport() {
+            let (width, height) = bounds_size(bounds);
+            data.measurements = view.measurement_overlays(viewport, [width, height], cx);
+        }
         let item = view.item().read(cx);
         let Some(document) = item.document() else {
             return data;
@@ -3209,7 +3218,7 @@ impl CanvasElement {
         if self.view.read(cx).is_presenting_prototype() {
             return;
         }
-        let overlay_data = self.collect_overlay_data(cx);
+        let overlay_data = self.collect_overlay_data(bounds, cx);
 
         let view = self.view.read(cx);
         let Some(viewport) = view.viewport() else {
@@ -3588,7 +3597,258 @@ impl CanvasElement {
                     cx,
                 );
             }
+
+            if !data.measurements.is_empty() {
+                // Labels contain only the derived numeric distance and "px".
+                // A whole repertoire width per character conservatively culls
+                // distant badges before shaping each individual label.
+                let character_width = f64::from(f32::from(
+                    shape_label("0123456789.< px", gpui::white(), &ui_font, window).width(),
+                ));
+                let (width, height) = bounds_size(bounds);
+                for measurement in &data.measurements {
+                    if !measurement_might_be_visible(measurement, [width, height], character_width)
+                    {
+                        continue;
+                    }
+                    paint_measurement(
+                        measurement,
+                        bounds.origin,
+                        [width, height],
+                        accent,
+                        &ui_font,
+                        window,
+                        cx,
+                    );
+                }
+            }
         });
+    }
+}
+
+pub(crate) fn measurement_label_bounds(
+    screen: &ScreenMeasurement,
+    label: &str,
+    window: &Window,
+) -> fanta_doc::Bounds {
+    let line = shape_label(label, gpui::white(), &font(".SystemUIFont"), window);
+    measurement_label_bounds_for_width(screen, f64::from(f32::from(line.width())))
+}
+
+fn measurement_label_bounds_for_width(
+    screen: &ScreenMeasurement,
+    text_width: f64,
+) -> fanta_doc::Bounds {
+    let width = text_width + 12.;
+    let height = f64::from(f32::from(PILL_HEIGHT));
+    fanta_doc::Bounds::from_xywh(
+        screen.label_anchor[0] - width / 2.,
+        screen.label_anchor[1] - height - MEASUREMENT_LABEL_GAP,
+        width,
+        height,
+    )
+}
+
+fn measurement_might_be_visible(
+    measurement: &MeasurementOverlay,
+    screen_size: [f64; 2],
+    character_width: f64,
+) -> bool {
+    let screen = &measurement.screen;
+    if !screen
+        .start
+        .into_iter()
+        .chain(screen.end)
+        .chain(screen.label_anchor)
+        .all(f64::is_finite)
+    {
+        return false;
+    }
+    let radius = f64::from(MEASUREMENT_HANDLE_DIAMETER) / 2.;
+    let segment_bounds = fanta_doc::Bounds {
+        min_x: screen.start[0].min(screen.end[0]) - radius,
+        min_y: screen.start[1].min(screen.end[1]) - radius,
+        max_x: screen.start[0].max(screen.end[0]) + radius,
+        max_y: screen.start[1].max(screen.end[1]) + radius,
+    };
+    let label_bounds = measurement_label_bounds_for_width(
+        screen,
+        measurement.label.chars().count() as f64 * character_width,
+    );
+    let visible = |bounds: fanta_doc::Bounds| {
+        bounds.max_x >= 0.
+            && bounds.max_y >= 0.
+            && bounds.min_x <= screen_size[0]
+            && bounds.min_y <= screen_size[1]
+    };
+    visible(segment_bounds) || visible(label_bounds)
+}
+
+fn clip_measurement_segment(
+    start: [f64; 2],
+    end: [f64; 2],
+    screen_size: [f64; 2],
+) -> Option<[[f64; 2]; 2]> {
+    if !start.into_iter().chain(end).all(f64::is_finite)
+        || !screen_size
+            .into_iter()
+            .all(|size| size.is_finite() && size > 0.0 && size <= f64::from(f32::MAX))
+    {
+        return None;
+    }
+    let outside = |point: [f64; 2]| {
+        u8::from(point[0] < 0.0)
+            | (u8::from(point[0] > screen_size[0]) << 1)
+            | (u8::from(point[1] < 0.0) << 2)
+            | (u8::from(point[1] > screen_size[1]) << 3)
+    };
+    let scale = start
+        .into_iter()
+        .chain(end)
+        .map(f64::abs)
+        .fold(1.0_f64, f64::max);
+    let scaled_start = DVec2::from(start) / scale;
+    let scaled_end = DVec2::from(end) / scale;
+    let delta = scaled_end - scaled_start;
+    let cross = scaled_start.x * scaled_end.y - scaled_end.x * scaled_start.y;
+    let mut start = start;
+    let mut end = end;
+    // Normalized line coefficients avoid overflowing endpoint subtraction or
+    // losing both visible intersections to the same rounded interpolation t.
+    for _ in 0..8 {
+        let start_outside = outside(start);
+        let end_outside = outside(end);
+        if (start_outside | end_outside) == 0 {
+            return Some([start, end]);
+        }
+        if start_outside & end_outside != 0 {
+            return None;
+        }
+        let side = if start_outside != 0 {
+            start_outside
+        } else {
+            end_outside
+        };
+        let intersection = if side & 12 != 0 {
+            if delta.y == 0.0 {
+                return None;
+            }
+            let y = if side & 4 != 0 { 0.0 } else { screen_size[1] };
+            [delta.x.mul_add(y / scale, cross) / delta.y * scale, y]
+        } else {
+            if delta.x == 0.0 {
+                return None;
+            }
+            let x = if side & 1 != 0 { 0.0 } else { screen_size[0] };
+            [x, delta.y.mul_add(x / scale, -cross) / delta.x * scale]
+        };
+        if !intersection.into_iter().all(f64::is_finite) {
+            return None;
+        }
+        if start_outside != 0 {
+            start = intersection;
+        } else {
+            end = intersection;
+        }
+    }
+    None
+}
+
+fn measurement_endpoint_visible(endpoint: [f64; 2], screen_size: [f64; 2]) -> bool {
+    endpoint.into_iter().all(f64::is_finite)
+        && endpoint[0] >= 0.0
+        && endpoint[1] >= 0.0
+        && endpoint[0] <= screen_size[0]
+        && endpoint[1] <= screen_size[1]
+}
+
+fn measurement_label_visible(bounds: fanta_doc::Bounds, screen_size: [f64; 2]) -> bool {
+    bounds.is_finite()
+        && bounds.max_x >= 0.0
+        && bounds.max_y >= 0.0
+        && bounds.min_x <= screen_size[0]
+        && bounds.min_y <= screen_size[1]
+}
+
+fn paint_measurement(
+    measurement: &MeasurementOverlay,
+    origin: Point<Pixels>,
+    screen_size: [f64; 2],
+    accent: Hsla,
+    ui_font: &Font,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let color = if measurement.selected || measurement.preview {
+        accent
+    } else {
+        accent.opacity(0.7)
+    };
+    let project = |screen: [f64; 2]| {
+        let x = f32::from(origin.x) + screen[0] as f32;
+        let y = f32::from(origin.y) + screen[1] as f32;
+        (x.is_finite() && y.is_finite()).then(|| point(px(x), px(y)))
+    };
+    let segment = clip_measurement_segment(
+        measurement.screen.start,
+        measurement.screen.end,
+        screen_size,
+    );
+    if let Some([start, end]) = segment
+        && let Some(start) = project(start)
+        && let Some(end) = project(end)
+    {
+        paint_line(start, end, color, window);
+    }
+    let delta = segment
+        .map(|[start, end]| DVec2::from(end) - DVec2::from(start))
+        .unwrap_or(DVec2::ZERO);
+    let length = delta.x.hypot(delta.y);
+    let normal = if length > 0.0 {
+        DVec2::new(-delta.y / length, delta.x / length) * 4.0
+    } else {
+        DVec2::new(0.0, 4.0)
+    };
+    for endpoint in [measurement.screen.start, measurement.screen.end] {
+        if !measurement_endpoint_visible(endpoint, screen_size) {
+            continue;
+        }
+        let endpoint = DVec2::from(endpoint);
+        if let Some(start) = project((endpoint - normal).to_array())
+            && let Some(end) = project((endpoint + normal).to_array())
+        {
+            paint_line(start, end, color, window);
+        }
+    }
+    let line = shape_label(&measurement.label, gpui::white(), ui_font, window);
+    let label_bounds =
+        measurement_label_bounds_for_width(&measurement.screen, f64::from(f32::from(line.width())));
+    if measurement_label_visible(label_bounds, screen_size)
+        && let Some(anchor) = project([label_bounds.center().x, label_bounds.min_y])
+    {
+        paint_pill(anchor, &line, color, window, cx);
+    }
+    if measurement.show_handles {
+        let diameter = px(MEASUREMENT_HANDLE_DIAMETER);
+        for endpoint in [measurement.screen.start, measurement.screen.end] {
+            if !measurement_endpoint_visible(endpoint, screen_size) {
+                continue;
+            }
+            let Some(center) = project(endpoint) else {
+                continue;
+            };
+            window.paint_quad(gpui::quad(
+                Bounds {
+                    origin: point(center.x - diameter / 2., center.y - diameter / 2.),
+                    size: size(diameter, diameter),
+                },
+                diameter / 2.,
+                gpui::white(),
+                px(1.),
+                color,
+                BorderStyle::Solid,
+            ));
+        }
     }
 }
 
@@ -4006,6 +4266,160 @@ mod geometry_tests {
         VectorNode,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn measurement_clipping_keeps_huge_crossing_segments_in_finite_pixel_bounds() {
+        let screen_size = [200.0, 100.0];
+        for magnitude in [1e100, f64::MAX] {
+            for (start, end, expected) in [
+                (
+                    [-magnitude, 50.0],
+                    [magnitude, 50.0],
+                    [[0.0, 50.0], [200.0, 50.0]],
+                ),
+                (
+                    [magnitude, 50.0],
+                    [-magnitude, 50.0],
+                    [[200.0, 50.0], [0.0, 50.0]],
+                ),
+                (
+                    [50.0, -magnitude],
+                    [50.0, magnitude],
+                    [[50.0, 0.0], [50.0, 100.0]],
+                ),
+                (
+                    [-magnitude, -magnitude],
+                    [magnitude, magnitude],
+                    [[0.0, 0.0], [100.0, 100.0]],
+                ),
+            ] {
+                let clipped = clip_measurement_segment(start, end, screen_size)
+                    .expect("the visible crossing segment survives");
+                for (actual, expected) in clipped.into_iter().zip(expected) {
+                    assert!(measurement_endpoint_visible(actual, screen_size));
+                    assert!((actual[0] - expected[0]).abs() < 1e-9);
+                    assert!((actual[1] - expected[1]).abs() < 1e-9);
+                    assert!((actual[0] as f32).is_finite());
+                    assert!((actual[1] as f32).is_finite());
+                }
+                assert!(!measurement_endpoint_visible(start, screen_size));
+                assert!(!measurement_endpoint_visible(end, screen_size));
+            }
+        }
+    }
+
+    #[test]
+    fn measurement_clipping_rejects_huge_offscreen_and_invalid_geometry() {
+        let screen_size = [200.0, 100.0];
+        for (start, end) in [
+            ([-1e100, 150.0], [1e100, 150.0]),
+            ([250.0, -1e100], [250.0, 1e100]),
+            ([1e100, 1e100], [2e100, 2e100]),
+            ([f64::NAN, 0.0], [100.0, 50.0]),
+            ([0.0, 0.0], [f64::INFINITY, 50.0]),
+        ] {
+            assert_eq!(clip_measurement_segment(start, end, screen_size), None);
+        }
+        for invalid_size in [[0.0, 100.0], [200.0, f64::INFINITY], [1e100, 100.0]] {
+            assert_eq!(
+                clip_measurement_segment([0.0, 0.0], [100.0, 50.0], invalid_size),
+                None
+            );
+        }
+        assert_eq!(
+            clip_measurement_segment([20.0, 50.0], [180.0, 50.0], screen_size),
+            Some([[20.0, 50.0], [180.0, 50.0]])
+        );
+    }
+
+    #[test]
+    fn measurement_labels_are_only_painted_where_their_bounds_enter_the_canvas() {
+        let mut screen = ScreenMeasurement {
+            start: [-1e100, 50.0],
+            end: [1e100, 50.0],
+            label_anchor: [100.0, 50.0],
+        };
+        assert!(measurement_label_visible(
+            measurement_label_bounds_for_width(&screen, 40.0),
+            [200.0, 100.0]
+        ));
+        screen.label_anchor = [-15.0, 50.0];
+        assert!(measurement_label_visible(
+            measurement_label_bounds_for_width(&screen, 40.0),
+            [200.0, 100.0]
+        ));
+        screen.label_anchor = [1e100, 50.0];
+        assert!(!measurement_label_visible(
+            measurement_label_bounds_for_width(&screen, 40.0),
+            [200.0, 100.0]
+        ));
+    }
+
+    #[test]
+    fn measurement_label_layout_matches_canvas_relative_hit_targets() -> anyhow::Result<()> {
+        let screen = ScreenMeasurement {
+            start: [20., 50.],
+            end: [220., 50.],
+            label_anchor: [120., 50.],
+        };
+        let bounds = measurement_label_bounds_for_width(&screen, 40.);
+        assert_eq!(bounds, WorldBounds::from_xywh(94., 26., 52., 16.));
+        assert_eq!(
+            screen.hit_test([120., 34.], 6., false, Some(bounds))?,
+            Some(crate::measurements::MeasurementHit::Label),
+        );
+        assert_eq!(screen.hit_test([120., 24.], 6., false, Some(bounds))?, None);
+        assert_eq!(
+            screen.hit_test([20., 54.], 6., true, Some(bounds))?,
+            Some(crate::measurements::MeasurementHit::StartEndpoint),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn measurement_culling_keeps_crossing_lines_and_partially_visible_labels() {
+        let mut overlay = MeasurementOverlay {
+            id: Some("measurement".to_string()),
+            screen: ScreenMeasurement {
+                start: [-10., 50.],
+                end: [210., 50.],
+                label_anchor: [100., 50.],
+            },
+            label: "5 px".to_string(),
+            selected: false,
+            show_handles: false,
+            preview: false,
+        };
+        let visible =
+            |overlay: &MeasurementOverlay| measurement_might_be_visible(overlay, [200., 100.], 12.);
+        assert!(visible(&overlay));
+        overlay.screen = ScreenMeasurement {
+            start: [-20., 50.],
+            end: [-10., 50.],
+            label_anchor: [-15., 50.],
+        };
+        assert!(
+            visible(&overlay),
+            "the line is outside but the label enters the canvas"
+        );
+        overlay.screen = ScreenMeasurement {
+            start: [50., 116.],
+            end: [150., 116.],
+            label_anchor: [100., 116.],
+        };
+        assert!(
+            visible(&overlay),
+            "the label enters above its offscreen line"
+        );
+        overlay.screen = ScreenMeasurement {
+            start: [-1000., -1000.],
+            end: [-900., -1000.],
+            label_anchor: [-950., -1000.],
+        };
+        assert!(!visible(&overlay));
+        overlay.screen.start = [f64::NAN, 50.];
+        assert!(!visible(&overlay));
+    }
 
     #[test]
     fn inspect_hit_testing_preserves_overlap_and_rotated_clip_visibility() -> anyhow::Result<()> {
