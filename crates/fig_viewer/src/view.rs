@@ -8780,11 +8780,6 @@ mod tests {
             });
         cx.simulate_keystrokes("escape");
         cx.run_until_parked();
-        assert_eq!(
-            escaped_editor_cancel.get(),
-            Some(true),
-            "the propagated Editor Cancel is consumed before Workspace Unfollow"
-        );
         inspector.read_with(cx, |panel, _| assert!(panel.editing_field.is_none()));
         item.read_with(cx, |item, _| {
             assert!(!item.content_preview_active());
@@ -8795,6 +8790,11 @@ mod tests {
                 original
             );
         });
+        assert_eq!(
+            escaped_editor_cancel.get(),
+            Some(true),
+            "the propagated Editor Cancel is consumed before Workspace Unfollow"
+        );
         open_inspect(cx);
         assert!(view.read_with(cx, |view, _| view.is_inspecting()));
         let save_key = if cfg!(target_os = "macos") {

@@ -35,8 +35,8 @@ rotated layers. The query walks the active subtree in paint order; a
 conservative local vector bound avoids constructing distant Skia paths. It
 reuses transient size/gap guides without storing measurements.
 
-The repaired Inspect source passes 825 viewer tests, 602 shared UI tests and
-three architecture checks, plus the full 674-test legacy configuration. The
+The repaired Inspect source passes 828 viewer tests, 602 shared UI tests and
+three architecture checks, plus the full 676-test legacy configuration. The
 unchanged renderer previously passed 282 unit tests and 24 integration tests.
 Package-scoped Clippy and Cargo Machete are rerun before the native build.
 Logs and later native evidence are recorded under
@@ -68,10 +68,23 @@ regressions cover direct Save, the actual application-window Save shortcut,
 and live text preservation; the native-menu regressions now also Save/reopen
 after correction or cancellation. All pass in both viewer configurations.
 Workspace shortcut tests mount the real MultiWorkspace action context and
-refresh cached pane rendering before locating the property field. Exact-source
-native retesting and fresh hosted checks remain pending for this repair.
-Evidence is under `inspect-tool/save-boundary-fix/`; earlier native successes
-do not waive the Save-crash retest or the final distribution gate.
+refresh cached pane rendering before locating the property field. Exact clean
+source `0394fc5` built in 11m50s and passed the native retained-preview Save,
+one-step Undo and invalid-input Save cases. All geometry FNX returned to their
+original bytes; only the document modification timestamp changed. The owned
+session exited zero.
+
+That native run found a distinct Escape cancellation failure. Bound actions
+resolve before the panel's raw key listener; outer Workspace bindings can
+consume Escape after Editor propagates it. The panel now handles the propagated
+Editor Cancel while a field draft exists, preserving the editor's first chance
+to dismiss its own popups. Three new tests mount MultiWorkspace with the shipped
+keymap and exercise focused input and both real toolbar menus. All three leave
+the draft active with the old panel and restore the exact document, clean state
+and zero Undo depth with the repair. Native retesting and fresh hosted checks
+remain pending for the final source. Evidence is under
+`inspect-tool/save-boundary-fix/` and `inspect-tool/escape-cancellation-fix/`;
+earlier native successes do not waive the final Escape or distribution gates.
 
 ## Post-merge export and font-scale follow-up — September 13
 
