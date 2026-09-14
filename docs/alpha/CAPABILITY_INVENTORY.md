@@ -1,9 +1,10 @@
 # Fanta release capability inventory
 
-This inventory includes guarded Motion Auto key from `12e2e4c`, the corrected
-native evidence recorded in `5a7ee30`, and the current Text on Path direction
-and placement controls. Implementation, automated tests, native QA, and the
-final release artifact are separate gates. See
+This inventory includes standalone Inspect validated at `fa29a746`, and the
+combined persistent Measurement, Annotation, and guarded Dev session source.
+The combined candidate passes the recorded local automated gates and awaits
+its exact-source native and hosted checks; implemented behavior below is not a release sign-off. Implementation,
+automated tests, native QA, and the final release artifact are separate gates. See
 [RELEASE_VALIDATION.md](RELEASE_VALIDATION.md) for exact revisions and evidence.
 
 Status terms:
@@ -25,7 +26,9 @@ notarization were used.
 |---|---:|---:|---:|---:|---|
 | Canvas selection and drawing | Yes | Yes | Partial | N/A | Move, Inspect, Hand, Scale, Path Select, Node Edit, shapes including Arrow, Pen, Pencil, Frame, Section, Slice, Text, Comment, Text on Path, and local image/MP4 placement are wired. Text on Path conservatively converts one eligible selected vector in place, enters inline editing, and uses cluster-derived curved caret, hit, selection, and visual-bounds geometry. Scale and Path Select have native history/reopen evidence; exact `f9a67f4` has native inspector, text-edit, history, and reopen evidence; the final installer remains unverified. |
 | Toolbar chrome and editing commands | Yes | Yes | Partial | N/A | Resources, Actions, zoom, panel toggles, undo/redo, clipboard, duplicate/delete/select-all, Group, Ungroup, Frame Selection, Present, Design/Motion, and AI routes are wired. Fresh exact-`12e2e4c` captures verify centered Design/Motion layouts and narrow-window zoom collapse; the three old `9d92b30` images show the wrong app and remain rejected. Other `9d92b30` interaction evidence covers flyout isolation, Ask AI, and searchable Actions. The remaining editing-command and menu matrix still needs the final artifact pass. |
-| Roadmap toolbar controls | Partial | Yes | Partial | N/A | Text on Path and contextual Motion keyframing are implemented in source candidate `895b6b7`; Motion time comments are implemented in the current source tree. Auto key supports the seven At playhead Motion fields with guarded preview/commit persistence. Arrow drawing and local image/MP4 placement are implemented with native history, export, and reopen evidence. Standalone Inspect is available in Design’s Move menu with read-only properties and selection. Annotation, persistent Measure, and full Dev mode/readiness remain unavailable; Motion Path is hidden and unimplemented. Bounded TextPath, Auto key, and time-comment native checks exist; remaining native workflows and the final installer are separate gates. |
+| Roadmap toolbar controls | Partial | Yes | Partial | N/A | Text on Path and contextual Motion keyframing are implemented in source candidate `895b6b7`; Motion time comments are implemented in the current source tree. Auto key supports the seven At playhead Motion fields with guarded preview/commit persistence. Arrow drawing and local image/MP4 placement are implemented with native history, export, and reopen evidence. Standalone Inspect is available in Design’s Move menu with read-only properties and selection. Persistent Measurement, Annotation, and a guarded Dev inspection session are implemented in the combined candidate below; readiness and Dev Color Picker remain unavailable. Motion Path is hidden and unimplemented. Bounded TextPath, Auto key, and time-comment native checks exist; remaining native workflows and the final installer are separate gates. |
+| Persistent page marks | Yes | Partial | Unknown | N/A | Measurement (Shift+M) stores two fixed page-local endpoints; Annotation (Shift+T) stores an anchored plain-text note. Explicit create/edit/move/delete operations each have one Undo step. Page metadata preserves stable IDs and unrelated/unknown records through Save/reopen; overlays do not change artwork bounds or PNG/SVG output. Pending mark work blocks implicit Save/navigation/close/quit and remains recoverable in its owning view. Combined final verification is pending. |
+| Guarded Dev session | Partial | Partial | Unknown | N/A | Shift+D, mode controls, and Actions → Dev enter view-local Inspect. Inspect, Hand, Measurement, Annotation, and read-only Saved Code are available; artwork stays read-only in every Dev tool. Pending drafts block entry/exit and workspace changes. Dev mark Undo/Redo accepts only the next complete eligible current-page mark transaction, and never skips artwork history. Readiness and Color Picker remain unavailable. This bounded session is not complete developer handoff functionality. |
 | Application menus | Yes | Partial | Unknown | N/A | Fanta, File, Edit, View, Window, and Help are declared and routed in source. The packaged-installer menu pass is outstanding. |
 | Design inspector | Partial | Yes | Partial | N/A | Geometry, opacity, corners, stroke geometry, supported effects, single-axis auto layout, typography, component properties, masks, transforms, and alignment are wired. The TextPath inspector projects its exact kind/name; font family, Regular/Italic style, weight, size, line height, pixel letter spacing, start/center/end alignment, and underline/strikethrough; side/orientation; Forward/Reverse direction; and Start offset as a percentage of the current path length. Its synthetic glyph Fill permits RGB and opacity edits only; paint add, style, visibility, remove, and reorder actions are gated. Direction and offset use typed, document-backed actions; disabled non-applicable typography controls remain visible. See the current validation record for source gates. In exact `9d92b30` native QA, fill/stroke visibility changed the document and Undo restored Fill; switching Fill to Linear produced a finite rendered gradient that exported successfully. Text on Path and the remaining paint/blend matrix still need final-artifact native coverage. |
 | Prototype mode | Yes | Yes | Unknown | N/A | Triggers, navigation/overlay/scroll actions, variables/components, transitions, flows, and presentation runtime are implemented. |
@@ -71,8 +74,10 @@ change state, produce output, or give an explicit unavailable message.
    selection and property copying, blocks authoring until an explicit tool/mode
    exit, and preserves pending drafts by refusing entry. Locked layers remain
    selectable through Layers. Size and gap guides are transient world-space
-   measurements; persistent Measure, Annotation, and full Dev/readiness remain
-   unfinished.
+   measurements, separate from the persistent Measurement tool. Measurement,
+   Annotation, and guarded Dev are source-implemented; native persistence/export
+   checks and hosted CI remain open. Readiness
+   and Dev Color Picker are still unavailable.
 5. Voice input remains unavailable; no recorder, permission, transcription, or
    cancellation lifecycle is implemented.
 
@@ -183,9 +188,11 @@ These controls already decline explicitly, are deliberately read-only, or stay
 hidden because their document behavior does not exist. They should stay out of
 release claims, but they are not silent-handler bugs:
 
-- Full Dev mode/readiness, Annotation, and persistent Measure decline explicitly.
-  Standalone Inspect, Arrow, and local media placement are implemented. Motion
-  Path is hidden; direct-canvas auto-keyframe recording remains unimplemented.
+- Readiness and Dev Color Picker remain unavailable. The guarded Dev session
+  supports Inspect, Hand, Measurement, Annotation, and read-only Saved Code; it
+  blocks artwork authoring and offers no readiness persistence. Standalone
+  Inspect, Arrow, and local media placement are implemented. Motion Path is
+  hidden; direct-canvas auto-keyframe recording remains unimplemented.
 - Text on Path conversion of rounded, clipped, degenerate, hidden/locked, or
   ambiguously/unsupported-painted vectors; those cases decline without changing
   the document. Exact glyph-internal carets within one
@@ -239,7 +246,10 @@ Before release sign-off:
    page and component roots, identity checks, mixed-root rejection, both caps,
    and rapid queued requests; then finish the file-attachment and voice
    recording/transcription lifecycles.
-7. Implement Dev mode's inspect, measure, annotation, and readiness controls.
+7. Complete the combined Measurement/Annotation/Dev gates: visible-page
+   eligibility, draft/focus/close recovery, page deletion and Undo navigation,
+   real Save/reopen, and unchanged art-only PNG/SVG output in both UI variants.
+   Implement readiness and Dev Color Picker separately before claiming them.
 8. Extend the now-honest Design AI draft handoff into the agreed end-to-end
    progress, review, acceptance, and Undo workflow.
 9. Complete authenticated production Image, Video, Vector, and Mask checks

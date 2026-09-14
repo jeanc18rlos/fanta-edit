@@ -114,10 +114,23 @@ actually driven. Nothing here claims more than that record supports.
   finished or canceled before entry. Locked layers can be inspected through
   Layers. On-canvas sizes and gaps are transient world-space guides, not saved
   measurements. Arrow drawing and local image/MP4 placement are implemented;
-  these no longer belong to the unavailable toolbar inventory.
+  these no longer belong to the unavailable toolbar inventory. Exact
+  `fa29a746` passed the focused native Inspect Save/Escape/refusal checks in
+  four sessions; this does not validate the later combined Dev candidate.
+- **Persistent marks and the guarded Dev session still need final validation.**
+  Measurement and Annotation store fixed page-local metadata, not artwork or
+  geometry-linked dimensions. Annotation is plain text, with explicit Add/Save;
+  it does not send comments or Agent messages. Drafts stay with their owning
+  view until explicitly completed or canceled and can block Save, navigation,
+  close, or quit. Changed origins or conflicting records can leave a retained
+  draft that requires recovery or cancellation. Inspect permits mark read/copy
+  only; Dev permits mark editing while keeping artwork read-only. Saved Code
+  shows persisted FNX/JSON and can lag unsaved canvas changes. The combined
+  candidate passes its recorded local automated gates; final native and hosted
+  checks remain open.
 - **Unfinished roadmap faces either decline explicitly or stay hidden.**
-  Annotation, persistent Measure, full Dev mode/readiness, arbitrary
-  toolbar file attachment and voice, direct-canvas auto-keyframe recording, page duplication,
+  Readiness, Dev Color Picker, arbitrary toolbar file attachment and voice,
+  direct-canvas auto-keyframe recording, page duplication,
   and page links are not implemented. Their visible
   handlers raise *"&lt;control&gt; is not available in the Fanta alpha yet."* or an
   equally specific notice. Motion Path is hidden and unimplemented. Text on

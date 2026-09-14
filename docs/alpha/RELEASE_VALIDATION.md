@@ -9,7 +9,8 @@ instructions are in [LAUNCH.md](LAUNCH.md).
 | Backend and AI | `0d3753a` remains live. Earlier managed Sonnet streaming, metering and account checks passed. Backend source through merged PR 5 (`856b67d`) passes all four CI jobs, including 572 backend, 153 CPU worker and 18 real PostgreSQL cases. It adds checkout role checks, a default-off checkout gate, and retired-plan refusal; it is not deployed. Native production authentication, worker activation and real media remain unverified. |
 | Customer payments | Paid-term gating and annual monthly allocations pass real database races. Checkout remains disabled pending plan/currency decisions, migrations, deployment and provider sandbox validation. |
 | Editor and video | Both `17de5eb` hosted checks pass. Exact first-milestone commit `9d92b30` passes 646 viewer tests, 591 shared GPUI tests, three architecture checks, 11 media library tests, 11 native playback cases, and the package-scoped release Clippy gate. Its 7m14s release build was packaged under an isolated local QA identity. The three retained `9d92b30` toolbar screenshots are invalid because they show ChatGPT rather than Fanta, so that revision's Design/Motion/narrow layout claim remains unsubstantiated. A separate exact-`12e2e4c` local QA build supplies inspected Fanta captures for the current Design, Motion, and 1025-point narrow layouts. Other recorded `9d92b30` interaction checks covered toolbar Actions, signed-out Design AI drafting, Fill/Stroke visibility, Fill Undo, Linear gradient, and successful Export. Earlier trim/edit/save/reopen, subsecond counters, and one-click replay after end scrubbing also passed natively. Neither local bundle is the final signed/notarized artifact. |
-| Current editor work | Validated source/runtime candidate `12e2e4c` includes the previously recorded Text on Path, active-root canvas attachment, contextual Motion keyframing, and Motion time-comment work. It adds guarded Auto key editing through Motion's At playhead fields for Position X/Y, Rotation, Scale X/Y, Opacity, and Fill color: edits preview live, commit as one reversible keyframe operation, and become autosave-eligible only after commit. Its source gate passes 737/737 viewer tests and package-scoped `./script/clippy -p fanta-gpui -p fig_viewer`, including Cargo Machete. The exact local release build passed the bounded toolbar and Auto key smoke below; the later `f9a67f4` candidate adds native TextPath and bounded page-selection attachment checks in dark/light themes. Exact `f9a67f4` also passes bounded native time-comment creation, history, navigation, and reopen; the remaining Motion matrix still needs native coverage. No hosted artifact validates this combined slice. Direct-canvas auto-keying, Motion Path, Dev mode, and Voice input remain unavailable. |
+| Earlier editor milestone | Validated source/runtime candidate `12e2e4c` includes the previously recorded Text on Path, active-root canvas attachment, contextual Motion keyframing, and Motion time-comment work. It adds guarded Auto key editing through Motion's At playhead fields for Position X/Y, Rotation, Scale X/Y, Opacity, and Fill color: edits preview live, commit as one reversible keyframe operation, and become autosave-eligible only after commit. Its source gate passes 737/737 viewer tests and package-scoped `./script/clippy -p fanta-gpui -p fig_viewer`, including Cargo Machete. The exact local release build passed the bounded toolbar and Auto key smoke below; the later `f9a67f4` candidate adds native TextPath and bounded page-selection attachment checks in dark/light themes. Exact `f9a67f4` also passes bounded native time-comment creation, history, navigation, and reopen; the remaining Motion matrix still needs native coverage. No hosted artifact validates this combined slice. At that checkpoint Dev and Voice were unavailable; the later guarded Dev candidate is recorded below. Direct-canvas auto-keying, Motion Path, and Voice remain unavailable. |
+| Current combined Dev tools | Persistent Measurement, Annotation, and a guarded Dev session are implemented. Clean `527c4b69` passes 931 viewer tests, 606 shared UI tests and three architecture checks, including the Annotation focus and hidden-page Measurement repairs. The unchanged document/format/workspace crates passed on `9300e003`. The full legacy configuration also passes all 760 tests. Scoped Clippy across six packages and Cargo Machete also pass. Exact-source native and hosted gates remain pending at this checkpoint. Readiness and Dev Color Picker remain unavailable. |
 | Leads | PostHog US access recovered; live waitlist storage/attribution verified. Exclude the synthetic signup. No outreach or conversion improvement is claimed. |
 | Distribution | The exact `17de5eb` hosted Apple Silicon installer completed successfully at 13:52 UTC. Build/package, bundle and checksum verification, installer upload, and crash-symbol upload passed. Notarization and draft-release publication were skipped because the push build had no distribution credentials. Download/launch, notarization, Gatekeeper, clean-Mac validation, and automatic updates remain open. |
 | Performance and cleanup | Daily 04:00 Madrid housekeeping is active. The owned trim QA sessions closed normally. Native closed-state memory retained about 5.5 MiB above warmup; attribution and matched controls remain open. |
@@ -38,11 +39,13 @@ reuses transient size/gap guides without storing measurements.
 The repaired Inspect source passes 828 viewer tests, 602 shared UI tests and
 three architecture checks, plus the full 676-test legacy configuration. The
 unchanged renderer previously passed 282 unit tests and 24 integration tests.
-Package-scoped Clippy and Cargo Machete are rerun before the native build.
-Logs and later native evidence are recorded under
-`/tmp/fanta-release-qa-20260913/inspect-tool/`. Exact-source hosted CI, native
-QA, and the customer distribution artifact remain separate gates; source
-tests alone do not validate the released application.
+Package-scoped Clippy and Cargo Machete passed before the exact `fa29a746`
+native build. Logs and native evidence are recorded under
+`/tmp/fanta-release-qa-20260913/inspect-tool/`. [Inspect PR 6](https://github.com/jeanc18rlos/fanta-edit/pull/6)
+merged at 08:54:22 UTC on September 14 as `09727ec008cb7e905d06910591cc9c57917864a8`
+after both exact-`fa29a746` hosted Check jobs passed. Its merge tree
+`7e25f26bcd41b4aa3249f8a66dce3818ea6d5e4b` matches the tested source. The customer
+distribution artifact remains a separate gate.
 
 Native QA of the first Inspect source (`b5f7ef`) verified read-only selection,
 precise Arrow/thick-stroke/rounded-clip/rotated-image targeting, explicit Move
@@ -81,10 +84,63 @@ Editor Cancel while a field draft exists, preserving the editor's first chance
 to dismiss its own popups. Three new tests mount MultiWorkspace with the shipped
 keymap and exercise focused input and both real toolbar menus. All three leave
 the draft active with the old panel and restore the exact document, clean state
-and zero Undo depth with the repair. Native retesting and fresh hosted checks
-remain pending for the final source. Evidence is under
-`inspect-tool/save-boundary-fix/` and `inspect-tool/escape-cancellation-fix/`;
-earlier native successes do not waive the final Escape or distribution gates.
+and zero Undo depth with the repair. Exact `fa29a746418bd1b031c3dfebcbebb40f54f75cb7`
+then passed four isolated native sessions, all exit 0, covering legacy Save,
+valid/invalid draft refusal, focused Escape, correction/cancel, shared-path
+rechecks and read-only geometry. Two complete 20-file Save/reopen comparisons
+were byte-identical. This supersedes the bounded Save/Escape native gap, not
+the customer distribution gate. Evidence is under
+`inspect-tool/save-boundary-fix/` and
+`inspect-tool/escape-cancellation-fix/native-verification.json`.
+
+## Combined Measurement, Annotation, and Dev candidate — September 14
+
+Measurement stores stable page-local endpoints; Annotation stores fixed anchors
+and exact plain text. Create/edit/move/delete operations preserve other metadata
+and use one Undo step. Marks survive project Save/reopen and remain excluded
+from artwork bounds and static exports. Page creation/deletion includes registry
+history, so Undo restores page navigation and its records. Pending mark drafts
+stay view-local and block implicit Save/navigation/close/quit rather than being
+committed or discarded by those boundaries.
+
+The guarded Dev session enters Inspect, keeps artwork read-only across Inspect,
+Hand and both mark tools, and exposes read-only Saved Code with a persisted-source
+status. Mark Undo/Redo checks the next complete current-page transaction and
+refuses mixed/artwork history without skipping it. Existing comments are
+read/copy/close only. Readiness and Dev Color Picker remain unavailable.
+
+This is implemented source awaiting final validation. The earlier Measurement
+candidate `c472a7a4` has passing 876-viewer, 717-legacy, 225-workspace and scoped
+Clippy evidence. At combined `9300e003`, 606 shared UI and three architecture
+checks passed; the viewer run failed with 929 passed and one Annotation focus
+failure. The same revision passed the document/format suites and all 225
+workspace tests. The actual canvas-click focus regression failed without its
+repair and passed on clean `89d0da69`. `527c4b69` adds common visible ordinary-page
+eligibility for both marks after review found a hidden-page Measurement bypass.
+The focused hidden-page regression and the clean `527c4b69` full run now pass:
+931 viewer tests, 606 shared UI tests and three architecture checks. The full
+legacy configuration also passes all 760 tests. The
+document/format/workspace crates are unchanged from their passing `9300e003`
+run (355 document unit and eight integration tests; 151 format unit and 44
+integration tests; 225 workspace tests).
+
+Scoped Clippy for `fanta-doc`, `fanta-format`, `fanta-gpui`, `fig_viewer`,
+`workspace`, and `zed`, including Cargo Machete, passed on clean `527c4b69`
+in 48.54 seconds at 08:55:34 UTC. The candidate was then rebased onto the
+Inspect merge without Rust changes.
+
+Before merge, build the final exact source and
+exercise smoke rows 6f–6h, including real Save/reopen, transformed pages, page
+Delete/Undo navigation, draft/close recovery and unchanged art-only PNG/SVG
+output in both UI variants. Held-pointer Escape and modified drag remain
+core/GPUI coverage when the native automation API cannot express them. Require
+exact-source hosted checks before merge. None of this establishes production
+inference, customer payments, signing/notarization or a complete Fanta release.
+
+Evidence and prepared acceptance procedures are under
+`/tmp/fanta-release-qa-20260913/measure-tool/`, `annotation-tool/`, and `dev-mode/`.
+The combined source review and both focused repair records retain the failed
+runs; do not replace them with the earlier Inspect or Measurement successes.
 
 ## Post-merge export and font-scale follow-up — September 13
 
