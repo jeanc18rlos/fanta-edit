@@ -27,6 +27,7 @@ mod inspector_widgets;
 mod instance_text;
 mod live_mcp;
 mod mode_overrides;
+mod measurements;
 mod motion_edit;
 mod motion_panel;
 mod new_design;

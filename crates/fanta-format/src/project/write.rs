@@ -1171,6 +1171,114 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn page_registry_history_cached_save_reorders_prunes_and_restores_page_files() {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData, Operation, Transaction};
+
+        let directory = tempfile::tempdir().expect("project directory");
+        let mut document = Doc::new();
+        let mut first = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        first.name = "First".into();
+        let first = document.scene.insert(first).expect("first page");
+        document.add_page(first);
+        document.set_active_page(Some(first));
+        let assets = BTreeMap::new();
+        let mut cache = ProjectWriteCache::default();
+        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+            .expect("initial save");
+
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.name = "Second".into();
+        second.meta = json!({"measurements": {"preserved": "editorial data"}});
+        let second_id = second.id;
+        document
+            .apply_transaction(Transaction {
+                label: "Add page".into(),
+                ops: vec![
+                    Operation::create_node(second.clone()),
+                    Operation::SetPageRegistry {
+                        old_pages: vec![first],
+                        new_pages: vec![first, second_id],
+                        old_active_page: Some(first),
+                        new_active_page: Some(second_id),
+                    },
+                ],
+            })
+            .expect("add page transaction");
+        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+            .expect("save added page");
+        let source =
+            crate::locate_page_source(directory.path(), second_id).expect("second page source");
+        let source_bytes = fs::read(&source).expect("saved second page");
+        let (saved, _) = crate::read_project_tree(directory.path()).expect("reopen added page");
+        assert_eq!(saved.pages(), &[first, second_id]);
+
+        document
+            .apply(Operation::SetPageRegistry {
+                old_pages: vec![first, second_id],
+                new_pages: vec![second_id, first],
+                old_active_page: Some(second_id),
+                new_active_page: Some(second_id),
+            })
+            .expect("registry-only reorder");
+        let reordered = write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+            .expect("save registry-only reorder");
+        assert!(
+            reordered
+                .written
+                .iter()
+                .any(|path| path.file_name().is_some_and(|name| name == PAGE_JSON))
+        );
+        let (saved, _) =
+            crate::read_project_tree(directory.path()).expect("reopen reordered pages");
+        assert_eq!(saved.pages(), &[second_id, first]);
+
+        document
+            .apply_transaction(Transaction {
+                label: "Delete page".into(),
+                ops: vec![
+                    Operation::SetPageRegistry {
+                        old_pages: vec![second_id, first],
+                        new_pages: vec![first],
+                        old_active_page: Some(second_id),
+                        new_active_page: Some(first),
+                    },
+                    Operation::DeleteSubtree {
+                        snapshot: vec![second],
+                    },
+                ],
+            })
+            .expect("delete page transaction");
+        let removed = write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+            .expect("save deleted page");
+        assert!(!source.exists());
+        assert!(
+            removed
+                .removed
+                .iter()
+                .any(|path| path.file_name().is_some_and(|name| name == PAGE_FNX))
+        );
+        let (saved, _) = crate::read_project_tree(directory.path()).expect("reopen deleted page");
+        assert_eq!(saved.pages(), &[first]);
+        assert!(document.undo().expect("undo deletion"));
+        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+            .expect("save restored page");
+        assert_eq!(
+            fs::read(&source).expect("restored page source"),
+            source_bytes
+        );
+        let (saved, _) = crate::read_project_tree(directory.path()).expect("reopen restored page");
+        assert_eq!(saved.pages(), &[second_id, first]);
+        assert_eq!(
+            saved.scene.get(second_id).expect("restored page").meta,
+            document.scene.get(second_id).expect("live page").meta
+        );
+        assert!(document.redo().expect("redo deletion"));
+        write_project_tree_cached(directory.path(), &document, &assets, &mut cache)
+            .expect("save redone deletion");
+        assert!(!source.exists());
+    }
+
     fn assert_project_source_write_preserves_previous_bytes(name: &str, original: &[u8]) {
         let directory = tempfile::tempdir().expect("project directory");
         let destination = directory.path().join(name);

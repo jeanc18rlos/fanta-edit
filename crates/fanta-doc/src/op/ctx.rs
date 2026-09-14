@@ -26,6 +26,8 @@ pub struct OpCtx<'a> {
     pub active_modes: &'a mut BTreeMap<VariableCollectionId, ModeId>,
     pub motion: &'a mut MotionLibrary,
     pub flow_start: &'a mut Option<NodeId>,
+    pub pages: &'a mut Vec<NodeId>,
+    pub active_page: &'a mut Option<NodeId>,
 }
 
 impl OpCtx<'_> {

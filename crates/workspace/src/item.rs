@@ -295,6 +295,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         _ = (workspace_id, window, cx);
         unimplemented!("clone_on_split() must be implemented if can_split() returns true")
     }
+    /// View-local authoring state that cannot be saved or recovered through
+    /// the shared project item. Closing must leave this view available.
+    fn close_blocker(&self, _cx: &App) -> Option<SharedString> {
+        None
+    }
+
     fn is_dirty(&self, _: &App) -> bool {
         false
     }
@@ -550,6 +556,7 @@ pub trait ItemHandle: 'static + Send {
     fn navigate(&self, data: Arc<dyn Any + Send>, window: &mut Window, cx: &mut App) -> bool;
     fn item_id(&self) -> EntityId;
     fn to_any_view(&self) -> AnyView;
+    fn close_blocker(&self, cx: &App) -> Option<SharedString>;
     fn is_dirty(&self, cx: &App) -> bool;
     fn capability(&self, cx: &App) -> Capability;
     fn toggle_read_only(&self, window: &mut Window, cx: &mut App);
@@ -1059,6 +1066,10 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.clone().into()
     }
 
+    fn close_blocker(&self, cx: &App) -> Option<SharedString> {
+        self.read(cx).close_blocker(cx)
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
         self.read(cx).is_dirty(cx)
     }
@@ -1477,6 +1488,7 @@ pub mod test {
         pub workspace_id: Option<WorkspaceId>,
         pub state: String,
         pub label: String,
+        pub close_blocker: Option<SharedString>,
         pub save_count: usize,
         pub save_as_count: usize,
         pub reload_count: usize,
@@ -1568,6 +1580,7 @@ pub mod test {
             Self {
                 state: String::new(),
                 label: String::new(),
+                close_blocker: None,
                 save_count: 0,
                 save_as_count: 0,
                 reload_count: 0,
@@ -1759,6 +1772,7 @@ pub mod test {
                     save_count: self.save_count,
                     save_as_count: self.save_as_count,
                     reload_count: self.reload_count,
+                    close_blocker: self.close_blocker.clone(),
                     is_dirty: self.is_dirty,
                     buffer_kind: self.buffer_kind,
                     has_conflict: self.has_conflict,
@@ -1777,6 +1791,10 @@ pub mod test {
                         .collect(),
                 }
             })))
+        }
+
+        fn close_blocker(&self, _: &App) -> Option<SharedString> {
+            self.close_blocker.clone()
         }
 
         fn is_dirty(&self, _: &App) -> bool {
