@@ -159,7 +159,7 @@ impl ToolbarTool {
             Self::Actions => "Actions",
             Self::Inspect => "Inspect",
             Self::ColorPicker => "Color picker",
-            Self::Code => "Code",
+            Self::Code => "Saved Code",
             Self::Variables => "Variables",
             Self::ReadyForDev => "Mark ready for dev",
             Self::MotionSelect => "Motion select",
@@ -200,7 +200,7 @@ impl ToolbarTool {
             Self::Actions => "Search actions, AI tools, plugins, and widgets",
             Self::Inspect => "Inspect layer properties",
             Self::ColorPicker => "Sample colors and variables from the canvas",
-            Self::Code => "View generated or connected code",
+            Self::Code => "View the saved FNX and JSON project files",
             Self::Variables => "Explore variables and aliases",
             Self::ReadyForDev => "Mark the current selection ready for development",
             Self::MotionSelect => "Select layers and keyframes",
@@ -364,12 +364,12 @@ const DESIGN_LAYOUT: &[ToolbarItem] = &[
 ];
 
 const DEV_LAYOUT: &[ToolbarItem] = &[
-    ToolbarItem::Group(ToolbarToolGroup::Move),
+    ToolbarItem::Tool(ToolbarTool::Inspect),
+    ToolbarItem::Tool(ToolbarTool::Hand),
     ToolbarItem::Separator,
-    ToolbarItem::Tool(ToolbarTool::ColorPicker),
     ToolbarItem::Tool(ToolbarTool::Measure),
     ToolbarItem::Tool(ToolbarTool::Annotation),
-    ToolbarItem::Tool(ToolbarTool::Comment),
+    ToolbarItem::Tool(ToolbarTool::Code),
     ToolbarItem::Tool(ToolbarTool::Actions),
 ];
 
@@ -434,6 +434,7 @@ pub enum ToolbarControlValue {
 /// Host-provided Dev Mode toolbar values.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DevToolbarOptions {
+    pub readiness_available: bool,
     pub ready_for_development: bool,
 }
 
@@ -997,7 +998,7 @@ mod tests {
                 .iter()
                 .any(|group| group.tools().contains(tool));
             assert!(
-                in_layout || in_group,
+                in_layout || in_group || *tool == ToolbarTool::ColorPicker,
                 "{} is unreachable from every mode and group",
                 tool.label()
             );
@@ -1036,6 +1037,34 @@ mod tests {
             ToolbarToolGroup::Move.display_tool(ToolbarTool::Inspect),
             ToolbarTool::Inspect
         );
+    }
+
+    #[test]
+    fn dev_mode_exposes_only_inspection_navigation_marks_and_saved_code() {
+        let available: HashSet<_> = ToolbarTool::ALL
+            .iter()
+            .copied()
+            .filter(|tool| tool.is_available_in(ToolbarMode::Dev))
+            .collect();
+        assert_eq!(
+            available,
+            HashSet::from([
+                ToolbarTool::Inspect,
+                ToolbarTool::Hand,
+                ToolbarTool::Measure,
+                ToolbarTool::Annotation,
+                ToolbarTool::Code,
+                ToolbarTool::Actions,
+            ])
+        );
+        assert!(
+            ToolbarMode::Dev
+                .layout()
+                .iter()
+                .all(|item| { !matches!(item, ToolbarItem::Group(_)) })
+        );
+        assert_eq!(ToolbarTool::Code.label(), "Saved Code");
+        assert!(!DevToolbarOptions::default().readiness_available);
     }
 
     #[test]

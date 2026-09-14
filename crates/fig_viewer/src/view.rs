@@ -5,6 +5,8 @@
 
 #[path = "view_annotations.rs"]
 pub(crate) mod annotations_host;
+#[path = "view_dev_mode.rs"]
+mod dev_mode;
 
 use std::collections::HashSet;
 
@@ -150,6 +152,10 @@ actions!(
         ActivateMeasureTool,
         /// Place a persistent plain-text annotation on the active page.
         ActivateAnnotationTool,
+        /// Enter the developer inspection session.
+        EnterDevMode,
+        /// Read the saved FNX and JSON source for this page.
+        OpenSavedCode,
         /// Activate the hand (pan) tool.
         ActivateHandTool,
         /// Activate the rectangle tool.
@@ -1194,6 +1200,10 @@ impl FigView {
     }
 
     pub fn set_editor_workspace(&mut self, workspace: EditorWorkspace, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.set_dev_workspace(workspace, cx);
+            return;
+        }
         if self.editor_workspace(cx) == workspace {
             return;
         }
@@ -1227,6 +1237,10 @@ impl FigView {
     }
 
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        if mode == EditorMode::Dev || self.is_dev_mode(cx) {
+            self.set_dev_mode_boundary(mode, cx);
+            return;
+        }
         if self.editor_mode(cx) == mode {
             return;
         }
@@ -1423,6 +1437,9 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_dev_mode(cx) {
+            return;
+        }
         self.finish_document_edits(cx);
         self.comment_state.clear_pending_motion_anchor();
         let Some(duration_ms) = self.item.read(cx).document().and_then(|document| {
@@ -2163,11 +2180,12 @@ impl FigView {
     }
 
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
-        !self.is_art_read_only() && self.item.read(cx).is_editable()
+        !self.is_art_read_only(cx) && self.item.read(cx).is_editable()
     }
 
-    pub(crate) fn is_art_read_only(&self) -> bool {
-        self.is_inspecting()
+    pub(crate) fn is_art_read_only(&self, cx: &App) -> bool {
+        self.is_dev_mode(cx)
+            || self.is_inspecting()
             || matches!(self.tools.kind(), ToolKind::Measure | ToolKind::Annotation)
             || self.measurement_selection.is_some()
             || self.annotation_state.selection.is_some()
@@ -2272,7 +2290,7 @@ impl FigView {
     pub(crate) fn can_edit_measurements(&self, cx: &App) -> bool {
         !self.is_inspecting()
             && self.item.read(cx).is_editable()
-            && self.editor_mode(cx) == EditorMode::Design
+            && self.is_design_canvas_mode(cx)
             && self.editor_workspace(cx) == EditorWorkspace::Canvas
             && self.prototype_player.is_none()
             && self.item.read(cx).doc().is_some_and(|doc| {
@@ -2282,7 +2300,7 @@ impl FigView {
     }
 
     pub(crate) fn page_measurements(&self, cx: &App) -> Vec<MeasurementRecord> {
-        if self.editor_mode(cx) != EditorMode::Design
+        if !self.is_design_canvas_mode(cx)
             || self.editor_workspace(cx) != EditorWorkspace::Canvas
             || self.prototype_player.is_some()
         {
@@ -2333,7 +2351,7 @@ impl FigView {
     }
 
     fn sync_measurement_edit_barrier(&self, cx: &mut Context<Self>) {
-        let read_only = self.is_art_read_only();
+        let read_only = self.is_art_read_only(cx);
         self.inspector_sidebar
             .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
         self.layers_sidebar
@@ -3091,6 +3109,10 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_dev_mode(cx) {
+            self.activate_tool(kind, cx);
+            return;
+        }
         if self.refuse_pending_annotation(cx) {
             return;
         }
@@ -3111,6 +3133,10 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if mode == EditorMode::Dev || self.is_dev_mode(cx) {
+            self.set_editor_mode(mode, cx);
+            return;
+        }
         if self.refuse_pending_annotation(cx) {
             return;
         }
@@ -3123,6 +3149,23 @@ impl FigView {
     }
 
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) && self.refuse_dev_transition(cx) {
+            return;
+        }
+        let kind = if self.is_dev_mode(cx) {
+            match kind {
+                ToolKind::Select => ToolKind::Inspect,
+                ToolKind::Inspect | ToolKind::Hand | ToolKind::Measure | ToolKind::Annotation => {
+                    kind
+                }
+                _ => {
+                    show_canvas_notice_deferred("Switch to Design to edit artwork.".into(), cx);
+                    return;
+                }
+            }
+        } else {
+            kind
+        };
         if self.refuse_pending_annotation(cx) {
             return;
         }
@@ -3151,7 +3194,7 @@ impl FigView {
                 return;
             }
             if !self.item.read(cx).is_editable()
-                || self.editor_mode(cx) != EditorMode::Design
+                || !self.is_design_canvas_mode(cx)
                 || self.editor_workspace(cx) != EditorWorkspace::Canvas
                 || self.prototype_player.is_some()
                 || self.item.read(cx).doc().is_none_or(|doc| {
@@ -3199,7 +3242,7 @@ impl FigView {
                 );
                 return;
             }
-            if self.editor_mode(cx) != EditorMode::Design
+            if !self.is_design_canvas_mode(cx)
                 || self.editor_workspace(cx) != EditorWorkspace::Canvas
                 || self.prototype_player.is_some()
             {
@@ -3237,10 +3280,11 @@ impl FigView {
         // Switching tools is a document edit boundary for every inspector and
         // inline session, not only text.
         self.finish_document_edits(cx);
+        let read_only = self.is_dev_mode(cx);
         self.inspector_sidebar
-            .update(cx, |panel, cx| panel.set_inspecting(false, cx));
+            .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
         self.layers_sidebar
-            .update(cx, |panel, cx| panel.set_inspecting(false, cx));
+            .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
         self.hover_resize_handle = None;
         self.hovered_node = None;
         let activated_kind = if kind == ToolKind::TextPath {
@@ -3965,6 +4009,13 @@ impl FigView {
     // === Edit actions =====================================================
 
     fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) && !self.dev_history_allowed(false, cx) {
+            show_canvas_notice_deferred(
+                "Dev can undo page marks only. Switch to Design for other history.".into(),
+                cx,
+            );
+            return;
+        }
         if (!self.is_editable(cx) && !self.can_edit_measurements(cx))
             || self.measurement_controller.has_pending_authoring()
             || self.annotation_state.controller.has_pending_authoring()
@@ -3994,6 +4045,13 @@ impl FigView {
     }
 
     fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) && !self.dev_history_allowed(true, cx) {
+            show_canvas_notice_deferred(
+                "Dev can redo page marks only. Switch to Design for other history.".into(),
+                cx,
+            );
+            return;
+        }
         if (!self.is_editable(cx) && !self.can_edit_measurements(cx))
             || self.measurement_controller.has_pending_authoring()
             || self.annotation_state.controller.has_pending_authoring()
@@ -4941,6 +4999,10 @@ impl FigView {
     }
 
     fn play_prototype(&mut self, _: &PlayPrototype, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            show_canvas_notice_deferred("Switch to Design to present the prototype.".into(), cx);
+            return;
+        }
         if self.prototype_player.is_some() {
             return;
         }
@@ -5504,7 +5566,7 @@ impl FigView {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => self.render_comments_sidebar(cx),
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
-            EditorMode::Design => {
+            EditorMode::Design | EditorMode::Dev => {
                 let records = self.page_measurements(cx);
                 let selected = self.selected_measurement(cx);
                 if selected.is_some() || self.tools.kind() == ToolKind::Measure {
@@ -5625,7 +5687,7 @@ impl FigView {
                 }
             }
         };
-        let body = if mode == EditorMode::Design && !self.page_annotations(cx).is_empty() {
+        let body = if self.is_design_canvas_mode(cx) && !self.page_annotations(cx).is_empty() {
             v_flex()
                 .size_full()
                 .child(div().flex_1().min_h_0().child(body))
@@ -5675,7 +5737,8 @@ impl FigView {
         let tabs = EditorWorkspaceTabs::new(workspace, move |workspace, _, cx| {
             view.update(cx, |view, cx| view.set_editor_workspace(workspace, cx))
                 .log_err();
-        });
+        })
+        .variables_visible(!self.is_dev_mode(cx));
         h_flex()
             .absolute()
             .top(px(8.0))
@@ -5771,6 +5834,9 @@ impl FigView {
     }
 
     fn render_tool_pill(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.is_dev_mode(cx) {
+            return self.render_native_dev_toolbar(cx);
+        }
         let editable = self.item.read(cx).is_editable();
         let active = self.tools.kind();
         // Before any interaction the viewport is initialized silently during
@@ -7249,6 +7315,12 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivateAnnotationTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Annotation, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &EnterDevMode, window, cx| {
+                this.set_editor_mode_from_action(EditorMode::Dev, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenSavedCode, _, cx| {
+                this.set_editor_workspace(EditorWorkspace::Code, cx)
+            }))
             .on_action(cx.listener(|this, _: &ActivateInspectTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Inspect, window, cx)
             }))
@@ -8188,7 +8260,13 @@ impl Item for FigView {
                 canvas_video_removed: std::cell::Cell::new(false),
                 #[cfg(target_os = "macos")]
                 canvas_video_active: std::cell::Cell::new(true),
-                tools: ToolShell::new(),
+                tools: {
+                    let mut tools = ToolShell::new();
+                    if editor_mode == EditorMode::Dev {
+                        tools.activate_without_context(ToolKind::Inspect);
+                    }
+                    tools
+                },
                 annotation_state: annotations_host::AnnotationHostState::default(),
                 measurement_controller: MeasurementController::default(),
                 measurement_origin: None,
@@ -14425,8 +14503,48 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use fanta_gpui::toolbar::{ToolbarAction, ToolbarCommand, ToolbarMode, ToolbarTool};
+        use fanta_gpui::toolbar::{
+            ToolbarAction, ToolbarCommand, ToolbarMode, ToolbarSecondaryControl, ToolbarTool,
+        };
+        if self.is_dev_mode(cx) {
+            let allowed = match action {
+                ToolbarAction::ToolChangeRequested { tool, .. } => matches!(
+                    tool,
+                    ToolbarTool::Move
+                        | ToolbarTool::Inspect
+                        | ToolbarTool::Hand
+                        | ToolbarTool::Measure
+                        | ToolbarTool::Annotation
+                        | ToolbarTool::Code
+                ),
+                ToolbarAction::CommandInvoked { command } => {
+                    crate::gpui_adapters::toolbar::DEV_COMMANDS.contains(command)
+                }
+                ToolbarAction::SecondaryControlInvoked { control, .. } => matches!(
+                    control,
+                    ToolbarSecondaryControl::DevInspect
+                        | ToolbarSecondaryControl::DevMeasure
+                        | ToolbarSecondaryControl::DevAnnotate
+                ),
+                ToolbarAction::ControlChangeRequested { .. } => false,
+                _ => true,
+            };
+            if !allowed {
+                show_canvas_notice_deferred(
+                    "This control is unavailable in Dev. Switch to Design for artwork edits."
+                        .into(),
+                    cx,
+                );
+                return;
+            }
+        }
         match action {
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::Code,
+                ..
+            } => {
+                self.set_editor_workspace(EditorWorkspace::Code, cx);
+            }
             // Resources is host chrome, not a canvas tool: Figma's ⇧I panel
             // corresponds to the left pages/layers sidebar here.
             ToolbarAction::ToolChangeRequested {
@@ -14453,7 +14571,7 @@ impl FigView {
                 ToolbarMode::Motion => {
                     self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
                 }
-                ToolbarMode::Dev => notify_unavailable("Dev mode", window, cx),
+                ToolbarMode::Dev => self.set_editor_mode_from_action(EditorMode::Dev, window, cx),
             },
             // The +/- steppers, the zoom menu's percent entries, typed
             // percentages, and the ZoomCanvasTo100 command action all arrive
@@ -14503,6 +14621,9 @@ impl FigView {
                 }
                 ToolbarCommand::OpenMotionMode => {
                     self.set_editor_mode_from_action(EditorMode::Motion, window, cx)
+                }
+                ToolbarCommand::OpenDevMode => {
+                    self.set_editor_mode_from_action(EditorMode::Dev, window, cx)
                 }
                 ToolbarCommand::Export => self.export_from_toolbar(window, cx),
                 ToolbarCommand::PlaceImageVideo => self.choose_local_media(cx),

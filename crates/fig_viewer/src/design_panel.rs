@@ -658,9 +658,9 @@ impl FantaDesignPanel {
                     // document events, never in render — preview frames can't
                     // change tree structure, so they're skipped too.
                     let item = view.read(cx).item().clone();
-                    self.inspecting = view.read(cx).is_art_read_only();
+                    self.inspecting = view.read(cx).is_art_read_only(cx);
                     self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
-                        this.set_inspecting(view.read(cx).is_art_read_only(), cx);
+                        this.set_inspecting(view.read(cx).is_art_read_only(cx), cx);
                     }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,

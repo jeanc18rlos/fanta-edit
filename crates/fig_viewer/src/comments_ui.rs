@@ -641,18 +641,21 @@ impl FigView {
             self.comment_state
                 .read_until
                 .insert(id.clone(), comment.newest_created());
-            if let Some(anchor) = comment.motion_anchor {
+            if let Some(anchor) = comment.motion_anchor
+                && !self.is_dev_mode(cx)
+            {
                 self.navigate_to_motion_comment(anchor, window, cx);
             }
         }
         self.comment_state.open_thread = Some(id);
         self.comment_state.open_thread_origin = Some(origin);
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 4, window, cx);
-            editor.set_placeholder_text("Reply…", window, cx);
-            editor
+        self.comment_state.reply_editor = (!self.is_dev_mode(cx)).then(|| {
+            cx.new(|cx| {
+                let mut editor = Editor::auto_height(1, 4, window, cx);
+                editor.set_placeholder_text("Reply…", window, cx);
+                editor
+            })
         });
-        self.comment_state.reply_editor = Some(editor);
         self.comment_state.reply_composer_id = Some(NodeId::new().to_string());
         self.comment_state.reply_attachments.clear();
         self.comment_state.reply_error = None;
@@ -665,6 +668,12 @@ impl FigView {
     /// Post the draft: build the add op, open the new thread, return to Select
     /// (one pin per arming, like the original).
     pub(crate) fn post_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.draft_error =
+                Some("Switch to Design to post comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
         self.finish_document_edits_for_external_change(cx);
         let Some(draft) = self.comment_state.draft.as_ref() else {
             return;
@@ -784,6 +793,12 @@ impl FigView {
     }
 
     fn post_comment_reply(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.reply_error =
+                Some("Switch to Design to change comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
         self.finish_document_edits_for_external_change(cx);
         let Some(editor) = self.comment_state.reply_editor.clone() else {
             return;
@@ -884,6 +899,12 @@ impl FigView {
     }
 
     fn resolve_comment_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.reply_error =
+                Some("Switch to Design to change comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
         self.finish_document_edits_for_external_change(cx);
         let Some(origin) = self
             .comment_state
@@ -935,6 +956,12 @@ impl FigView {
     }
 
     fn delete_comment_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.reply_error =
+                Some("Switch to Design to change comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
         self.finish_document_edits_for_external_change(cx);
         let Some(origin) = self
             .comment_state
@@ -1412,7 +1439,14 @@ impl FigView {
             ));
         }
 
-        let reply_editor = self.comment_state.reply_editor.clone();
+        let read_only = self.is_dev_mode(cx);
+        let copy_text = std::iter::once(comment.text.clone())
+            .chain(comment.replies.iter().map(|reply| reply.body.clone()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let reply_editor = (!read_only)
+            .then(|| self.comment_state.reply_editor.clone())
+            .flatten();
         let reply_context = self.render_comment_composer_context(CommentComposerTarget::Reply, cx);
         let reply_tools = self.render_comment_composer_tools(CommentComposerTarget::Reply, cx);
         Some(comment_overlay(
@@ -1478,6 +1512,7 @@ impl FigView {
                                         },
                                     )
                                     .icon_size(IconSize::XSmall)
+                                    .disabled(read_only)
                                     .tooltip(Tooltip::text(if comment.resolved {
                                         "Reopen"
                                     } else {
@@ -1491,6 +1526,7 @@ impl FigView {
                                 )
                                 .child(
                                     IconButton::new("fanta-comment-delete-thread", IconName::Trash)
+                                        .disabled(read_only)
                                         .icon_size(IconSize::XSmall)
                                         .tooltip(Tooltip::text("Delete Thread"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1512,6 +1548,40 @@ impl FigView {
                         ),
                 )
                 .child(messages)
+                .when(read_only, |thread| {
+                    thread.child(
+                        h_flex()
+                            .debug_selector(|| "dev-comment-read-only".to_owned())
+                            .px_3p5()
+                            .py_2()
+                            .justify_between()
+                            .child(
+                                Label::new("Read-only in Dev")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "dev-comment-copy".to_owned())
+                                    .child(
+                                        IconButton::new(
+                                            "fanta-comment-copy-thread",
+                                            IconName::Copy,
+                                        )
+                                        .tooltip(Tooltip::text("Copy thread text"))
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(
+                                                        copy_text.clone(),
+                                                    ),
+                                                )
+                                            },
+                                        ),
+                                    ),
+                            ),
+                    )
+                })
                 .when_some(reply_editor, |this, editor| {
                     this.child(
                         v_flex()
