@@ -1777,24 +1777,36 @@ mod tests {
             .expect("canvas bindings");
             cx.bind_keys(bindings);
         });
+        cx.simulate_resize(size(px(1400.), px(1000.)));
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
             view.select_page(0, cx);
             view.activate_tool(ToolKind::Annotation, cx);
-            let bounds = view.container_bounds.expect("mounted canvas bounds");
-            view.handle_mouse_down(
-                &MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: bounds.center(),
-                    modifiers: gpui::Modifiers::none(),
-                    click_count: 1,
-                    first_mouse: false,
-                },
-                window,
-                cx,
-            );
+            view.focus_handle.focus(window, cx);
         });
         cx.run_until_parked();
+        let canvas = view.read_with(cx, |view, cx| {
+            assert_eq!(view.tools.kind(), ToolKind::Annotation);
+            assert!(view.can_edit_annotations(cx));
+            assert!(
+                view.viewport.is_some(),
+                "page selection must render before a pointer press"
+            );
+            view.container_bounds.expect("mounted canvas bounds")
+        });
+        cx.simulate_click(canvas.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.annotation_state.controller.has_pending_authoring());
+            assert!(
+                view.annotation_state
+                    .editor
+                    .as_ref()
+                    .expect("click opened the annotation editor")
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
         cx.simulate_keystrokes("shift-t");
         cx.run_until_parked();
         view.read_with(cx, |view, cx| {
@@ -1838,25 +1850,28 @@ mod tests {
             .expect("Edit target");
         cx.simulate_click(edit.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        view.update_in(cx, |view, window, cx| {
-            view.annotation_state
-                .editor
-                .as_ref()
-                .expect("edit editor")
-                .clone()
-                .update(cx, |editor, cx| {
-                    editor.set_text("Saved revision", window, cx)
-                });
-        });
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("Saved revision");
         cx.run_until_parked();
         let submit = cx
             .debug_bounds("annotation-submit-target")
             .expect("Save target");
         cx.simulate_click(submit.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        view.update_in(cx, |view, window, _| {
+        view.update_in(cx, |view, window, cx| {
             assert!(!view.annotation_state.controller.has_pending_authoring());
             assert!(view.focus_handle.is_focused(window));
+            assert_eq!(
+                view.selected_annotation(cx)
+                    .expect("saved note")
+                    .annotation()
+                    .text,
+                "Saved revision"
+            );
+            assert_eq!(
+                view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                2
+            );
         });
         cx.simulate_keystrokes("v");
         cx.run_until_parked();

@@ -3080,8 +3080,27 @@ mod gpui_layers_tests {
                 harness
                     .view
                     .read_with(&harness.cx, |view, _| view.selected_page_index()),
+                Some(0)
+            );
+            harness
+                .view
+                .update_in(&mut harness.cx, |view, _, cx| view.select_page(1, cx));
+            harness.cx.run_until_parked();
+            assert_eq!(
+                harness
+                    .view
+                    .read_with(&harness.cx, |view, _| view.selected_page_index()),
                 Some(1)
             );
+            harness.view.read_with(&harness.cx, |view, cx| {
+                assert_eq!(
+                    view.page_annotations(cx)
+                        .first()
+                        .expect("annotation is reachable on the restored page")
+                        .annotation(),
+                    &annotation
+                );
+            });
             if cycle == 0 {
                 item.update(&mut harness.cx, |item, cx| {
                     assert!(item.redo(cx).expect("redo page deletion"));
