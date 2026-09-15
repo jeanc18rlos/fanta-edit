@@ -1,13 +1,101 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn clear_option_interactions(&mut self) {
-        self.option_states.clear();
-        self.option_subscriptions.clear();
-        self.option_snapshots.clear();
+/// Internal option-field controller used by the Design facade and its
+/// extracted section renderers.
+pub(super) trait DesignOptionsController: Sized {
+    fn clear_option_interactions(&mut self);
+    fn option_properties(&self) -> Vec<DesignPanelProperty>;
+    fn sync_option_states(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn render_option_cell(
+        &self,
+        id_suffix: SharedString,
+        prefix: &'static str,
+        value: SharedString,
+        property: DesignPanelProperty,
+        options: Vec<PropertyOption>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_preview_option_cell(
+        &self,
+        id_suffix: SharedString,
+        prefix: &'static str,
+        value: SharedString,
+        property: DesignPanelProperty,
+        options: Vec<PropertyOption>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_remove_button(
+        &self,
+        id_suffix: impl Into<SharedString>,
+        collection: DesignPanelCollection,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn menu_preview_effect_index(property: DesignPanelProperty) -> Option<usize>;
+    fn property_supports_menu_preview(property: DesignPanelProperty) -> bool;
+    fn menu_preview_for_property(
+        &self,
+        property: DesignPanelProperty,
+        candidate: DesignPanelValue,
+    ) -> Option<DesignMenuPreview>;
+    fn begin_menu_preview(&mut self, preview: DesignMenuPreview, cx: &mut Context<Self>);
+    fn cancel_menu_preview(&mut self, cx: &mut Context<Self>);
+    fn menu_preview_matches_property_candidate(
+        preview: &DesignMenuPreview,
+        property: DesignPanelProperty,
+        candidate: &DesignPanelValue,
+    ) -> bool;
+    fn set_property_menu_preview(
+        &mut self,
+        property: DesignPanelProperty,
+        candidate: DesignPanelValue,
+        preview: bool,
+        cx: &mut Context<Self>,
+    );
+    fn cancel_menu_preview_for_property(
+        &mut self,
+        property: DesignPanelProperty,
+        cx: &mut Context<Self>,
+    );
+    fn begin_paint_blend_mode_preview(
+        &mut self,
+        target: &PickerEventTarget,
+        original: DesignBlendMode,
+        candidate: DesignBlendMode,
+        cx: &mut Context<Self>,
+    );
+    fn end_paint_blend_mode_preview(
+        &mut self,
+        target: &PickerEventTarget,
+        original: DesignBlendMode,
+        candidate: DesignBlendMode,
+        cx: &mut Context<Self>,
+    );
+    #[allow(dead_code)]
+    fn render_action_button(
+        &self,
+        id_suffix: &'static str,
+        label: &'static str,
+        action: DesignPanelAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_icon_action_button(
+        &self,
+        id_suffix: &'static str,
+        icon: IconName,
+        action: DesignPanelAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+}
+
+impl DesignOptionsController for DesignPanel {
+    fn clear_option_interactions(&mut self) {
+        self.retained.options.states.clear();
+        self.retained.options.subscriptions.clear();
+        self.retained.options.snapshots.clear();
     }
 
-    pub(super) fn option_properties(&self) -> Vec<DesignPanelProperty> {
+    fn option_properties(&self) -> Vec<DesignPanelProperty> {
         let mut properties = vec![
             DesignPanelProperty::HorizontalConstraint,
             DesignPanelProperty::VerticalConstraint,
@@ -40,14 +128,15 @@ impl DesignPanel {
             properties.push(DesignPanelProperty::VectorHandleMirroring);
         }
         properties.extend(
-            (0..self.node.component_properties.len()).map(DesignPanelProperty::ComponentProperty),
+            (0..self.host.inspected_node().component_properties.len())
+                .map(DesignPanelProperty::ComponentProperty),
         );
-        if let Some(layout) = self.node.layout.as_ref() {
+        if let Some(layout) = self.host.inspected_node().layout.as_ref() {
             properties
                 .extend((0..layout.grid_columns.len()).map(DesignPanelProperty::GridColumnTrack));
             properties.extend((0..layout.grid_rows.len()).map(DesignPanelProperty::GridRowTrack));
         }
-        if let Some(stroke) = self.node.stroke.as_ref() {
+        if let Some(stroke) = self.host.inspected_node().stroke.as_ref() {
             if stroke.capabilities.individual_weights {
                 properties.push(DesignPanelProperty::StrokeWeightMode);
             }
@@ -93,7 +182,13 @@ impl DesignPanel {
                 }
             }
         }
-        for (index, modifier) in self.node.transform_modifiers.iter().enumerate() {
+        for (index, modifier) in self
+            .host
+            .inspected_node()
+            .transform_modifiers
+            .iter()
+            .enumerate()
+        {
             properties.extend([
                 DesignPanelProperty::TransformRepeatType(index),
                 DesignPanelProperty::TransformRepeatUnit(index),
@@ -102,7 +197,7 @@ impl DesignPanel {
                 properties.push(DesignPanelProperty::TransformRepeatAxis(index));
             }
         }
-        for (index, effect) in self.node.effects.iter().enumerate() {
+        for (index, effect) in self.host.inspected_node().effects.iter().enumerate() {
             properties.push(DesignPanelProperty::EffectKind(index));
             match &effect.settings {
                 DesignEffectSettings::DropShadow(_) | DesignEffectSettings::InnerShadow(_) => {
@@ -123,7 +218,7 @@ impl DesignPanel {
                 | DesignEffectSettings::Opaque(_) => {}
             }
         }
-        for index in 0..self.node.layout_grids.len() {
+        for index in 0..self.host.inspected_node().layout_grids.len() {
             properties.push(DesignPanelProperty::LayoutGridKind(index));
             properties.push(DesignPanelProperty::LayoutGridAlignment(index));
         }
@@ -133,14 +228,20 @@ impl DesignPanel {
         properties
     }
 
-    pub(super) fn sync_option_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_option_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let properties = self.option_properties();
         let desired = properties.iter().copied().collect::<HashSet<_>>();
-        self.option_states
+        self.retained
+            .options
+            .states
             .retain(|property, _| desired.contains(property));
-        self.option_subscriptions
+        self.retained
+            .options
+            .subscriptions
             .retain(|property, _| desired.contains(property));
-        self.option_snapshots
+        self.retained
+            .options
+            .snapshots
             .retain(|property, _| desired.contains(property));
 
         for property in properties {
@@ -152,7 +253,7 @@ impl DesignPanel {
                 options: options.clone(),
                 selected: current.clone(),
             };
-            if self.option_snapshots.get(&property) == Some(&snapshot) {
+            if self.retained.options.snapshots.get(&property) == Some(&snapshot) {
                 continue;
             }
             let selected_index = current
@@ -160,12 +261,12 @@ impl DesignPanel {
                 .and_then(|current| options.iter().position(|option| &option.value == current))
                 .map(|index| IndexPath::default().row(index));
 
-            if let Some(state) = self.option_states.get(&property).cloned() {
+            if let Some(state) = self.retained.options.states.get(&property).cloned() {
                 state.update(cx, |state, cx| {
                     state.set_items(options, window, cx);
                     state.set_selected_index(selected_index, window, cx);
                 });
-                self.option_snapshots.insert(property, snapshot);
+                self.retained.options.snapshots.insert(property, snapshot);
                 continue;
             }
 
@@ -177,6 +278,15 @@ impl DesignPanel {
                     let SelectEvent::Confirm(Some(value)) = event else {
                         return;
                     };
+                    let field = crate::molecules::InspectorPickerField::new(
+                        inspector_fields::inspector_property_value(this, property),
+                        inspector_fields::inspector_property_presentation(
+                            this, property, false, false,
+                        ),
+                    );
+                    if field.select(value.clone()).is_none() {
+                        return;
+                    }
                     this.emit_property(property, value.clone(), cx);
                     let state = state.clone();
                     cx.defer_in(window, move |this, window, cx| {
@@ -191,275 +301,16 @@ impl DesignPanel {
                     });
                 },
             );
-            self.option_states.insert(property, state);
-            self.option_subscriptions.insert(property, subscription);
-            self.option_snapshots.insert(property, snapshot);
+            self.retained.options.states.insert(property, state);
+            self.retained
+                .options
+                .subscriptions
+                .insert(property, subscription);
+            self.retained.options.snapshots.insert(property, snapshot);
         }
     }
 
-    pub(super) fn render_compact_property_label(
-        &self,
-        id_suffix: &SharedString,
-        property: DesignPanelProperty,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selector = SharedString::from(format!("{}-{id_suffix}-additional-label", self.id));
-        let debug_selector = selector.to_string();
-        div()
-            .id(selector)
-            .debug_selector(move || debug_selector)
-            .min_w(px(0.))
-            .max_w(px(64.))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .truncate()
-            .text_size(px(10.))
-            .text_color(cx.theme().muted_foreground)
-            .child(Self::compact_property_label(property))
-            .into_any_element()
-    }
-
-    pub(super) fn render_value_cell(
-        &self,
-        id_suffix: impl Into<SharedString>,
-        prefix: &'static str,
-        value: impl Into<SharedString>,
-        property: DesignPanelProperty,
-        next: DesignPanelValue,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.render_value_cell_with_left_padding(id_suffix, prefix, value, property, next, 8., cx)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_value_cell_with_left_padding(
-        &self,
-        id_suffix: impl Into<SharedString>,
-        prefix: &'static str,
-        value: impl Into<SharedString>,
-        property: DesignPanelProperty,
-        next: DesignPanelValue,
-        left_padding: f32,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id_suffix = id_suffix.into();
-        let value = self.display_property_value(property, value.into());
-        let editable = self.property_is_editable(property);
-        let copyable = self.generic_property_is_copyable(property);
-        let interactive = editable || copyable;
-        if editable && let Some(options) = self.property_options(property) {
-            return self.render_option_cell(id_suffix, prefix, value, property, options, cx);
-        }
-
-        let editing = editable
-            && self
-                .property_editor
-                .as_ref()
-                .is_some_and(|editor| editor.property == property);
-        let scrubbing = self.numeric_scrub_is_active(property);
-        let scrub_enabled = self.numeric_scrub_surface_is_enabled(property);
-        let copy_value = value.clone();
-        let cell_id = SharedString::from(format!("{}-{}", self.id, id_suffix));
-        let debug_selector = cell_id.to_string();
-        let retained_focus = self
-            .editor_focus_return
-            .as_ref()
-            .filter(|return_focus| {
-                editable
-                    && matches!(
-                        return_focus.origin,
-                        EditorFocusOrigin::ValueCell(origin_property)
-                            if origin_property == property
-                    )
-            })
-            .map(|return_focus| return_focus.handle.clone());
-        let mut cell = h_flex()
-            .id(cell_id)
-            .debug_selector(move || debug_selector)
-            .h(px(ROW_HEIGHT))
-            .flex_1()
-            .min_w(px(0.))
-            .pl(px(left_padding))
-            .pr_2()
-            .gap_1()
-            .rounded(px(4.))
-            .border_1()
-            .border_color(if editing && self.property_editor_invalid {
-                cx.theme().red
-            } else if editing {
-                cx.theme().selection
-            } else {
-                cx.theme().transparent
-            })
-            .bg(cx.theme().secondary)
-            .when(interactive, |cell| {
-                cell.key_context(CONTROL_KEY_CONTEXT)
-                    .cursor_pointer()
-                    .hover(|style| style.border_color(cx.theme().muted_foreground))
-                    .focus(|style| {
-                        style
-                            .bg(cx.theme().accent)
-                            .border_color(cx.theme().selection)
-                    })
-            })
-            .when(!interactive, |cell| {
-                cell.text_color(cx.theme().muted_foreground).opacity(0.78)
-            });
-        if interactive {
-            cell = if let Some(focus) = retained_focus {
-                cell.track_focus(&focus.tab_index(0).tab_stop(true))
-            } else {
-                cell.tab_index(0)
-            };
-        }
-        if editable {
-            cell = cell.on_activate(cx.listener(move |this, _, window, cx| {
-                this.activate_property_from_control(
-                    EditorFocusOrigin::ValueCell(property),
-                    property,
-                    next.clone(),
-                    window,
-                    cx,
-                );
-            }));
-        } else if copyable {
-            cell = cell.on_activate(cx.listener(move |this, _, _, cx| {
-                this.emit_property_copy(property, copy_value.clone(), cx);
-            }));
-        }
-        if editing && !scrubbing {
-            if self.additional_labels {
-                cell = cell.child(self.render_compact_property_label(&id_suffix, property, cx));
-            }
-            cell = cell.child(
-                Input::new(&self.property_input)
-                    .appearance(false)
-                    .bordered(false)
-                    .focus_bordered(false)
-                    .xsmall()
-                    .h(px(ROW_HEIGHT - 2.))
-                    .flex_1()
-                    .min_w(px(0.)),
-            );
-        } else {
-            let mut readout = h_flex().h_full().flex_1().min_w(px(0.)).gap_1();
-            if !prefix.is_empty() {
-                readout = readout.child(
-                    div()
-                        .w(px(12.))
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(prefix),
-                );
-            }
-            if self.additional_labels {
-                readout =
-                    readout.child(self.render_compact_property_label(&id_suffix, property, cx));
-            }
-            readout = readout.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_xs()
-                    .child(value),
-            );
-            cell = cell.child(render_numeric_scrub_surface(
-                SharedString::from(format!("{}-{id_suffix}-scrub", self.id)),
-                cx.entity(),
-                property,
-                EditorFocusOrigin::ValueCell(property),
-                scrub_enabled,
-                readout.into_any_element(),
-            ));
-        }
-        if let Some(variable_button) = self.render_property_variable_button(property, cx) {
-            cell = cell.child(variable_button);
-        }
-        cell.into_any_element()
-    }
-
-    pub(super) fn render_value_field_icon(
-        &self,
-        icon: ValueFieldIcon,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let color = cx.theme().muted_foreground;
-        render_icon_canvas(color, 16., move |path| match icon {
-            ValueFieldIcon::Opacity => {
-                path.rect(2.5, 2.5, 13.5, 13.5);
-                for dot_y in [5., 8., 11.] {
-                    for dot_x in [5., 8., 11.] {
-                        path.line((dot_x - 0.25, dot_y), (dot_x + 0.25, dot_y));
-                    }
-                }
-            }
-            ValueFieldIcon::Corners => {
-                path.poly([(6., 2.5), (2.5, 2.5), (2.5, 6.)], false);
-                path.poly([(10., 2.5), (13.5, 2.5), (13.5, 6.)], false);
-                path.poly([(2.5, 10.), (2.5, 13.5), (6., 13.5)], false);
-                path.poly([(13.5, 10.), (13.5, 13.5), (10., 13.5)], false);
-            }
-        })
-    }
-
-    pub(super) fn render_icon_value_cell(
-        &self,
-        id_suffix: &'static str,
-        icon: ValueFieldIcon,
-        value: impl Into<SharedString>,
-        property: DesignPanelProperty,
-        next: DesignPanelValue,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let editable = self.property_is_editable(property);
-        let labeled_cell_selector =
-            SharedString::from(format!("{}-{id_suffix}-additional-label", self.id));
-        let labeled_cell_debug_selector = labeled_cell_selector.to_string();
-        let prefix = div()
-            .w(px(24.))
-            .h(px(ROW_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(!editable, |prefix| prefix.opacity(0.62))
-            .child(self.render_value_field_icon(icon, cx));
-
-        h_flex()
-            .id(SharedString::from(format!(
-                "{}-{id_suffix}-icon-value-cell",
-                self.id
-            )))
-            .when(self.additional_labels, |cell| {
-                cell.debug_selector(move || labeled_cell_debug_selector)
-            })
-            .h(px(ROW_HEIGHT))
-            .flex_1()
-            .min_w(px(0.))
-            .overflow_hidden()
-            .rounded(px(4.))
-            .bg(cx.theme().secondary)
-            .child(prefix)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .child(self.render_value_cell_with_left_padding(
-                        format!("{id_suffix}-value"),
-                        "",
-                        value,
-                        property,
-                        next,
-                        0.,
-                        cx,
-                    )),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn render_option_cell(
+    fn render_option_cell(
         &self,
         id_suffix: SharedString,
         prefix: &'static str,
@@ -473,11 +324,12 @@ impl DesignPanel {
                 .render_preview_option_cell(id_suffix, prefix, value, property, options, cx);
         }
         let additional_label = self
+            .preferences
             .additional_labels
             .then(|| Self::compact_property_label(property));
         let additional_label_selector =
             SharedString::from(format!("{}-{id_suffix}-additional-label", self.id));
-        let Some(state) = self.option_states.get(&property) else {
+        let Some(state) = self.retained.options.states.get(&property) else {
             let mut cell = h_flex()
                 .id(SharedString::from(format!("{}-{id_suffix}", self.id)))
                 .h(px(ROW_HEIGHT))
@@ -536,7 +388,7 @@ impl DesignPanel {
         let additional_debug_selector = additional_label_selector.to_string();
         h_flex()
             .id(SharedString::from(format!("{}-{id_suffix}", self.id)))
-            .when(self.additional_labels, |cell| {
+            .when(self.preferences.additional_labels, |cell| {
                 cell.debug_selector(move || additional_debug_selector)
             })
             .h(px(ROW_HEIGHT))
@@ -560,7 +412,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_preview_option_cell(
+    fn render_preview_option_cell(
         &self,
         id_suffix: SharedString,
         prefix: &'static str,
@@ -569,13 +421,13 @@ impl DesignPanel {
         options: Vec<PropertyOption>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.preview_option_menu_open == Some(property);
+        let open = self.overlays.preview_option_menu_open() == Some(property);
         let panel = cx.entity();
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
         let panel_id = self.id.clone();
         let current = self.resolved_property_value(property);
-        let label = if self.additional_labels {
+        let label = if self.preferences.additional_labels {
             let compact = Self::compact_property_label(property);
             if prefix.is_empty() {
                 format!("{compact}  {value}")
@@ -607,10 +459,11 @@ impl DesignPanel {
                     panel.update(cx, |this, cx| {
                         if !open {
                             this.cancel_menu_preview(cx);
-                            this.preview_option_menu_open = Some(property);
-                        } else if this.preview_option_menu_open == Some(property) {
+                            this.overlays
+                                .open(DesignOverlayState::PreviewOptionMenu(property));
+                        } else if this.overlays.preview_option_menu_open() == Some(property) {
                             this.cancel_menu_preview_for_property(property, cx);
-                            this.preview_option_menu_open = None;
+                            this.overlays.discard(DesignOpenOverlay::PreviewOptionMenu);
                         }
                         cx.notify();
                     });
@@ -625,16 +478,27 @@ impl DesignPanel {
             .anchor(Anchor::BottomLeft)
             .open(open)
             .overlay_closable(true)
-            .on_open_change(move |is_open, _, cx| {
+            .on_open_change(move |is_open, window, cx| {
                 panel_for_open.update(cx, |this, cx| {
                     if *is_open {
+                        this.remember_overlay_focus_return(
+                            DesignOpenOverlay::PreviewOptionMenu,
+                            window,
+                            cx,
+                        );
                         this.cancel_menu_preview(cx);
-                        this.preview_option_menu_open = Some(property);
-                    } else if this.preview_option_menu_open == Some(property) {
-                        this.cancel_menu_preview_for_property(property, cx);
-                        this.preview_option_menu_open = None;
+                        this.overlays
+                            .open(DesignOverlayState::PreviewOptionMenu(property));
+                    } else if this.overlays.preview_option_menu_open() == Some(property) {
+                        let _ = this.dismiss_overlay_from_outside_click(
+                            DesignOpenOverlay::PreviewOptionMenu,
+                            window,
+                            cx,
+                        );
                     }
-                    cx.notify();
+                    if *is_open {
+                        cx.notify();
+                    }
                 });
             })
             .trigger(trigger)
@@ -678,7 +542,7 @@ impl DesignPanel {
                                 .on_activate(move |_, _, cx| {
                                     panel.update(cx, |this, cx| {
                                         this.cancel_menu_preview(cx);
-                                        this.preview_option_menu_open = None;
+                                        this.overlays.discard(DesignOpenOverlay::PreviewOptionMenu);
                                         this.emit_property(property, candidate.clone(), cx);
                                         cx.notify();
                                     });
@@ -694,7 +558,8 @@ impl DesignPanel {
                                         match event.keystroke.key.as_str() {
                                             "enter" | "space" => {
                                                 this.cancel_menu_preview(cx);
-                                                this.preview_option_menu_open = None;
+                                                this.overlays
+                                                    .discard(DesignOpenOverlay::PreviewOptionMenu);
                                                 this.emit_property(
                                                     property,
                                                     key_candidate.clone(),
@@ -703,9 +568,13 @@ impl DesignPanel {
                                                 window.prevent_default();
                                                 cx.stop_propagation();
                                             }
-                                            "escape" => {
-                                                this.cancel_menu_preview(cx);
-                                                this.preview_option_menu_open = None;
+                                            "escape"
+                                                if this.dismiss_overlay_from_escape(
+                                                    DesignOpenOverlay::PreviewOptionMenu,
+                                                    window,
+                                                    cx,
+                                                ) =>
+                                            {
                                                 window.prevent_default();
                                                 cx.stop_propagation();
                                             }
@@ -733,134 +602,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_toggle_row(
-        &self,
-        id_suffix: impl Into<SharedString>,
-        label: &'static str,
-        checked: bool,
-        property: DesignPanelProperty,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let editable = self.property_is_editable(property);
-        let selector = SharedString::from(format!("{}-{}", self.id, id_suffix.into()));
-        let debug_selector = selector.to_string();
-        let mut row = h_flex()
-            .id(selector)
-            .debug_selector(move || debug_selector.clone())
-            .h(px(ROW_HEIGHT))
-            .w_full()
-            .justify_between()
-            .rounded(px(4.))
-            .border_1()
-            .border_color(cx.theme().transparent)
-            .when(editable, |row| {
-                row.key_context(CONTROL_KEY_CONTEXT)
-                    .tab_index(0)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().accent.opacity(0.55)))
-                    .focus(|style| {
-                        style
-                            .bg(cx.theme().accent)
-                            .border_color(cx.theme().selection)
-                    })
-            })
-            .when(!editable, |row| {
-                row.text_color(cx.theme().muted_foreground).opacity(0.78)
-            });
-        if editable {
-            row = row.on_activate(cx.listener(move |this, _, _, cx| {
-                this.emit_property(property, DesignPanelValue::Bool(!checked), cx);
-            }));
-        }
-        row.child(div().flex_1().text_xs().child(label))
-            .when_some(
-                self.render_property_variable_button(property, cx),
-                |row, button| row.child(button),
-            )
-            .child(
-                h_flex()
-                    .w(px(30.))
-                    .h(px(18.))
-                    .p(px(2.))
-                    .justify_end()
-                    .when(!checked, |toggle| toggle.justify_start())
-                    .rounded(px(9.))
-                    .bg(if checked {
-                        cx.theme().selection
-                    } else {
-                        cx.theme().border
-                    })
-                    .child(
-                        div()
-                            .size(px(14.))
-                            .rounded(px(7.))
-                            .bg(cx.theme().background),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn render_group_label(
-        &self,
-        label: &'static str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .h(px(16.))
-            .flex()
-            .items_center()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(label)
-            .into_any_element()
-    }
-
-    pub(super) fn render_checkbox_row(
-        &self,
-        id_suffix: impl Into<SharedString>,
-        label: &'static str,
-        checked: bool,
-        property: DesignPanelProperty,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let editable = self.property_is_editable(property);
-        let panel = cx.entity();
-        let id_suffix = id_suffix.into();
-        // Contract (§16): the pointer path stays on the Checkbox's own
-        // `on_click`, which carries the next `&bool` payload; this wrapper adds
-        // the Enter/Space command path so the row is not a dead tab stop.
-        div()
-            .id(SharedString::from(format!("{}-{id_suffix}-row", self.id)))
-            .h(px(ROW_HEIGHT))
-            .rounded(px(4.))
-            .border_1()
-            .border_color(cx.theme().transparent)
-            .when(editable, |row| {
-                row.key_context(CONTROL_KEY_CONTEXT)
-                    .tab_index(0)
-                    .focus(|style| style.border_color(cx.theme().selection))
-                    .on_action(cx.listener(move |this, _: &ActivateControl, _, cx| {
-                        this.emit_property(property, DesignPanelValue::Bool(!checked), cx);
-                    }))
-            })
-            .child(
-                Checkbox::new(SharedString::from(format!("{}-{id_suffix}", self.id)))
-                    .xsmall()
-                    .label(label)
-                    .checked(checked)
-                    .disabled(!editable)
-                    .tab_stop(false)
-                    .on_click(move |next, _, cx| {
-                        panel.update(cx, |this, cx| {
-                            this.emit_property(property, DesignPanelValue::Bool(*next), cx);
-                        });
-                    })
-                    .h(px(ROW_HEIGHT)),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn render_remove_button(
+    fn render_remove_button(
         &self,
         id_suffix: impl Into<SharedString>,
         collection: DesignPanelCollection,
@@ -873,9 +615,13 @@ impl DesignPanel {
                 DesignPanelCollection::Fill | DesignPanelCollection::Stroke
             ) || self.paint_style_binding(collection).is_none())
             && (collection != DesignPanelCollection::Effect
-                || self.node.effect_style_binding.is_none())
+                || self.host.inspected_node().effect_style_binding.is_none())
             && (collection != DesignPanelCollection::LayoutGrid
-                || self.node.layout_grid_style_binding.is_none());
+                || self
+                    .host
+                    .inspected_node()
+                    .layout_grid_style_binding
+                    .is_none());
         let can_remove = can_remove
             && if collection == DesignPanelCollection::Export {
                 self.can_export()
@@ -914,7 +660,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn menu_preview_effect_index(property: DesignPanelProperty) -> Option<usize> {
+    fn menu_preview_effect_index(property: DesignPanelProperty) -> Option<usize> {
         match property {
             DesignPanelProperty::EffectKind(index)
             | DesignPanelProperty::EffectShadowBlendMode(index)
@@ -925,7 +671,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn property_supports_menu_preview(property: DesignPanelProperty) -> bool {
+    fn property_supports_menu_preview(property: DesignPanelProperty) -> bool {
         matches!(
             property,
             DesignPanelProperty::BlendMode
@@ -935,7 +681,7 @@ impl DesignPanel {
         ) || Self::menu_preview_effect_index(property).is_some()
     }
 
-    pub(super) fn menu_preview_for_property(
+    fn menu_preview_for_property(
         &self,
         property: DesignPanelProperty,
         candidate: DesignPanelValue,
@@ -951,12 +697,12 @@ impl DesignPanel {
             return None;
         }
         if let Some(index) = Self::menu_preview_effect_index(property) {
-            if self.inspection_context.selection().kind() != DesignPanelSelectionKind::Single {
+            if self.host.inspection_context.selection().kind() != DesignPanelSelectionKind::Single {
                 return None;
             }
-            let effect = self.node.effects.get(index)?;
+            let effect = self.host.inspected_node().effects.get(index)?;
             return Some(DesignMenuPreview::EffectProperty {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 effect_id: effect.id.clone(),
                 index,
                 property,
@@ -975,16 +721,13 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn begin_menu_preview(
-        &mut self,
-        preview: DesignMenuPreview,
-        cx: &mut Context<Self>,
-    ) {
-        if self.active_menu_preview.as_ref() == Some(&preview) {
+    fn begin_menu_preview(&mut self, preview: DesignMenuPreview, cx: &mut Context<Self>) {
+        if self.overlays.active_menu_preview().as_ref() == Some(&preview) {
             return;
         }
         self.cancel_menu_preview(cx);
-        self.active_menu_preview = Some(preview.clone());
+        self.overlays
+            .open(DesignOverlayState::MenuPreview(Box::new(preview.clone())));
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::MenuPreviewRequested {
@@ -994,8 +737,8 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn cancel_menu_preview(&mut self, cx: &mut Context<Self>) {
-        let Some(preview) = self.active_menu_preview.take() else {
+    fn cancel_menu_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = self.overlays.take_menu_preview() else {
             return;
         };
         cx.emit_design_panel_action(
@@ -1007,7 +750,7 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn menu_preview_matches_property_candidate(
+    fn menu_preview_matches_property_candidate(
         preview: &DesignMenuPreview,
         property: DesignPanelProperty,
         candidate: &DesignPanelValue,
@@ -1027,7 +770,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn set_property_menu_preview(
+    fn set_property_menu_preview(
         &mut self,
         property: DesignPanelProperty,
         candidate: DesignPanelValue,
@@ -1035,9 +778,14 @@ impl DesignPanel {
         cx: &mut Context<Self>,
     ) {
         if !preview {
-            if self.active_menu_preview.as_ref().is_some_and(|active| {
-                Self::menu_preview_matches_property_candidate(active, property, &candidate)
-            }) {
+            if self
+                .overlays
+                .active_menu_preview()
+                .as_ref()
+                .is_some_and(|active| {
+                    Self::menu_preview_matches_property_candidate(active, property, &candidate)
+                })
+            {
                 self.cancel_menu_preview(cx);
             }
             return;
@@ -1047,28 +795,33 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn cancel_menu_preview_for_property(
+    fn cancel_menu_preview_for_property(
         &mut self,
         property: DesignPanelProperty,
         cx: &mut Context<Self>,
     ) {
-        if self.active_menu_preview.as_ref().is_some_and(|preview| {
-            matches!(
-                preview,
-                DesignMenuPreview::NodeProperty {
-                    property: active_property,
-                    ..
-                } | DesignMenuPreview::EffectProperty {
-                    property: active_property,
-                    ..
-                } if *active_property == property
-            )
-        }) {
+        if self
+            .overlays
+            .active_menu_preview()
+            .as_ref()
+            .is_some_and(|preview| {
+                matches!(
+                    preview,
+                    DesignMenuPreview::NodeProperty {
+                        property: active_property,
+                        ..
+                    } | DesignMenuPreview::EffectProperty {
+                        property: active_property,
+                        ..
+                    } if *active_property == property
+                )
+            })
+        {
             self.cancel_menu_preview(cx);
         }
     }
 
-    pub(super) fn begin_paint_blend_mode_preview(
+    fn begin_paint_blend_mode_preview(
         &mut self,
         target: &PickerEventTarget,
         original: DesignBlendMode,
@@ -1080,11 +833,15 @@ impl DesignPanel {
             index: target.index,
             paint_id: target.paint_id.clone(),
         };
-        let picker_is_exact = self.active_picker.as_ref().is_some_and(|active| {
-            active.collection == target.collection
-                && active.index == target.index
-                && active.paint_id == target.paint_id
-        });
+        let picker_is_exact = self
+            .overlays
+            .active_picker()
+            .as_ref()
+            .is_some_and(|active| {
+                active.collection == target.collection
+                    && active.index == target.index
+                    && active.paint_id == target.paint_id
+            });
         let paint = self
             .paint_collection(target.collection)
             .and_then(|paints| paints.get(target.index));
@@ -1093,8 +850,8 @@ impl DesignPanel {
                 && paint.blend_mode == original
                 && !paint.read_only
         });
-        if target.node_id != self.node.id
-            || self.inspection_context.selection().kind() != DesignPanelSelectionKind::Single
+        if target.node_id != self.host.inspected_node().id
+            || self.host.inspection_context.selection().kind() != DesignPanelSelectionKind::Single
             || !picker_is_exact
             || !paint_is_exact
             || self.paint_target_index(&panel_target) != Some(target.index)
@@ -1121,39 +878,44 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn end_paint_blend_mode_preview(
+    fn end_paint_blend_mode_preview(
         &mut self,
         target: &PickerEventTarget,
         original: DesignBlendMode,
         candidate: DesignBlendMode,
         cx: &mut Context<Self>,
     ) {
-        let matches = self.active_menu_preview.as_ref().is_some_and(|preview| {
-            matches!(
-                preview,
-                DesignMenuPreview::PaintProperty {
-                    node_id,
-                    collection,
-                    paint_id,
-                    index,
-                    property: DesignPaintProperty::BlendMode,
-                    original: DesignPaintValue::BlendMode(active_original),
-                    candidate: DesignPaintValue::BlendMode(active_candidate),
-                    ..
-                } if node_id == &target.node_id
-                    && *collection == target.collection
-                    && paint_id == &target.paint_id
-                    && *index == target.index
-                    && *active_original == original
-                    && *active_candidate == candidate
-            )
-        });
+        let matches = self
+            .overlays
+            .active_menu_preview()
+            .as_ref()
+            .is_some_and(|preview| {
+                matches!(
+                    preview,
+                    DesignMenuPreview::PaintProperty {
+                        node_id,
+                        collection,
+                        paint_id,
+                        index,
+                        property: DesignPaintProperty::BlendMode,
+                        original: DesignPaintValue::BlendMode(active_original),
+                        candidate: DesignPaintValue::BlendMode(active_candidate),
+                        ..
+                    } if node_id == &target.node_id
+                        && *collection == target.collection
+                        && paint_id == &target.paint_id
+                        && *index == target.index
+                        && *active_original == original
+                        && *active_candidate == candidate
+                )
+            });
         if matches {
             self.cancel_menu_preview(cx);
         }
     }
 
-    pub(super) fn render_action_button(
+    #[allow(dead_code)]
+    fn render_action_button(
         &self,
         id_suffix: &'static str,
         label: &'static str,
@@ -1205,7 +967,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_icon_action_button(
+    fn render_icon_action_button(
         &self,
         id_suffix: &'static str,
         icon: IconName,
@@ -1246,49 +1008,5 @@ impl DesignPanel {
             }));
         }
         button.child(Icon::new(icon).xsmall()).into_any_element()
-    }
-
-    pub(super) fn render_symbol_action_button(
-        &self,
-        id_suffix: &'static str,
-        symbol: &'static str,
-        action: DesignPanelAction,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let enabled = self.can_edit() && self.node_capability_allows_action(&action);
-        let mut button = div()
-            .id(SharedString::from(format!("{}-{id_suffix}", self.id)))
-            .size(px(ROW_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(4.))
-            .border_1()
-            .border_color(cx.theme().transparent)
-            .text_xs()
-            .when(enabled, |button| {
-                button
-                    .key_context(CONTROL_KEY_CONTEXT)
-                    .tab_index(0)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().accent))
-                    .focus(|style| {
-                        style
-                            .bg(cx.theme().accent)
-                            .border_color(cx.theme().selection)
-                    })
-            })
-            .when(!enabled, |button| {
-                button.text_color(cx.theme().muted_foreground).opacity(0.62)
-            });
-        if enabled {
-            button = button.on_activate(cx.listener(move |this, _, _, cx| {
-                if this.node_capability_allows_action(&action) {
-                    cx.emit_design_panel_action(this, action.clone());
-                }
-            }));
-        }
-        button.child(symbol).into_any_element()
     }
 }

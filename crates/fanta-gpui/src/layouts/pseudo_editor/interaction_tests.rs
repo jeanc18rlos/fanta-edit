@@ -4,14 +4,13 @@ use crate::test_support::{assert_pointer_and_keyboard_parity, mount_component};
 
 use super::*;
 use crate::{
-    assets::{AssetsPanel, AssetsViewData},
     design::{DesignPanel, DesignPanelNode, DesignPanelNodeKind},
     layers::LayersPanel,
     pages::PagesPanel,
     prototype::{PrototypePanel, PrototypeViewData},
     timeline::{Timeline, TimelineViewData},
     toolbar::{EditorToolbar, ToolbarMode, ToolbarTool},
-    variables::{VariablesPage, VariablesViewData},
+    variables::{VariablesScreen, VariablesViewData},
 };
 
 fn mount(
@@ -20,7 +19,6 @@ fn mount(
     let (host, actions, cx) = mount_component(cx, |window, cx| {
         let pages = cx.new(|cx| PagesPanel::new("pages", Vec::new(), window, cx));
         let layers = cx.new(|cx| LayersPanel::new("layers", Vec::new(), window, cx));
-        let assets = cx.new(|cx| AssetsPanel::new("assets", AssetsViewData::default(), window, cx));
         let design = cx.new(|cx| {
             DesignPanel::new(
                 "design",
@@ -43,7 +41,7 @@ fn mount(
             )
         });
         let variables = cx.new(|cx| {
-            VariablesPage::new(
+            VariablesScreen::new(
                 "variables",
                 VariablesViewData {
                     document_name: "Test".into(),
@@ -63,7 +61,6 @@ fn mount(
             PseudoEditorChildren {
                 pages,
                 layers,
-                assets,
                 design,
                 prototype,
                 timeline,
@@ -95,14 +92,6 @@ fn left_surface_tabs_share_pointer_enter_and_space_activation(cx: &mut TestAppCo
         &actions,
         PseudoEditorAction::LeftSurfaceChanged {
             surface: PseudoEditorLeftSurface::Layers,
-        },
-    );
-    assert_pointer_and_keyboard_parity(
-        cx,
-        "pseudo-editor-left-assets",
-        &actions,
-        PseudoEditorAction::LeftSurfaceChanged {
-            surface: PseudoEditorLeftSurface::Assets,
         },
     );
 }

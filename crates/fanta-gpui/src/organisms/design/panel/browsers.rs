@@ -1,27 +1,111 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn property_variable_target(
+/// Internal Browser/resource controller surface used by the thin `DesignPanel` facade.
+pub(super) trait DesignBrowserController: Sized + 'static {
+    fn property_variable_target(
+        &self,
+        property: DesignPanelProperty,
+    ) -> Option<DesignPropertyVariableTarget>;
+    fn property_variable_can_change(&self, property: DesignPanelProperty) -> bool;
+    fn emit_property_variable_apply(
+        &mut self,
+        property: DesignPanelProperty,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_property_variable_import(
+        &mut self,
+        property: DesignPanelProperty,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_property_variable_detach(
+        &mut self,
+        property: DesignPanelProperty,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn open_property_variable_picker(
+        &mut self,
+        property: DesignPanelProperty,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn render_color_styles_icon(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn normalized_style_browser_query(&self, cx: &App) -> String;
+    fn style_browser_row_matches(
+        query: &str,
+        name: &str,
+        summary: &str,
+        library_name: Option<&str>,
+    ) -> bool;
+    fn set_style_browser_source_filter(
+        &mut self,
+        filter: StyleBrowserSourceFilter,
+        cx: &mut Context<Self>,
+    );
+    fn set_style_browser_view_mode(
+        &mut self,
+        view_mode: StyleBrowserViewMode,
+        cx: &mut Context<Self>,
+    );
+    fn render_style_browser_toolbar(
+        panel: Entity<Self>,
+        scope: SharedString,
+        search: Entity<InputState>,
+        source_filter: StyleBrowserSourceFilter,
+        library_sources: Vec<(SharedString, SharedString)>,
+        view_mode: StyleBrowserViewMode,
+    ) -> AnyElement;
+    fn property_variable_button_state(
+        &self,
+        property: DesignPanelProperty,
+    ) -> Option<PropertyVariableButtonState>;
+    fn render_property_variable_button(
+        &self,
+        property: DesignPanelProperty,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement>;
+    fn render_property_variable_button_for<T: 'static>(
+        panel: Entity<DesignPanel>,
+        property: DesignPanelProperty,
+        button_state: PropertyVariableButtonState,
+        cx: &mut Context<T>,
+    ) -> Option<AnyElement>;
+    fn compact_property_label(property: DesignPanelProperty) -> &'static str;
+    fn render_bound_style_summary(
+        &self,
+        id_suffix: &'static str,
+        name: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+}
+
+impl DesignBrowserController for DesignPanel {
+    fn property_variable_target(
         &self,
         property: DesignPanelProperty,
     ) -> Option<DesignPropertyVariableTarget> {
-        self.node.property_variable_target(property).map(|target| {
-            if target.typography_target.is_some() {
-                target.with_typography_target(self.typography_target(property))
-            } else {
-                target
-            }
-        })
+        self.host
+            .inspected_node()
+            .property_variable_target(property)
+            .map(|target| {
+                if target.typography_target.is_some() {
+                    target.with_typography_target(self.typography_target(property))
+                } else {
+                    target
+                }
+            })
     }
 
-    pub(super) fn property_variable_can_change(&self, property: DesignPanelProperty) -> bool {
+    fn property_variable_can_change(&self, property: DesignPanelProperty) -> bool {
         if !self.can_edit()
             || !self.layout_property_is_applicable(property)
             || self.property_variable_target(property).is_none()
         {
             return false;
         }
-        let Some(state) = self.property_value_states.get(&property) else {
+        let Some(state) = self.host.property_states.get(&property) else {
             return self.property_is_editable(property);
         };
         if state.is_read_only()
@@ -34,7 +118,7 @@ impl DesignPanel {
         state.binding().is_some() || self.property_is_editable(property)
     }
 
-    pub(super) fn emit_property_variable_apply(
+    fn emit_property_variable_apply(
         &mut self,
         property: DesignPanelProperty,
         variable_id: SharedString,
@@ -44,7 +128,8 @@ impl DesignPanel {
             return;
         };
         let Some(variable) = self
-            .property_variable_view_data
+            .resources
+            .property_variables
             .variable(variable_id.as_ref())
         else {
             return;
@@ -56,11 +141,11 @@ impl DesignPanel {
         {
             return;
         }
-        self.property_variable_picker = None;
+        self.overlays.discard(DesignOpenOverlay::PropertyVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PropertyVariableApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
@@ -68,7 +153,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_property_variable_import(
+    fn emit_property_variable_import(
         &mut self,
         property: DesignPanelProperty,
         variable_id: SharedString,
@@ -78,7 +163,8 @@ impl DesignPanel {
             return;
         };
         let Some(variable) = self
-            .property_variable_view_data
+            .resources
+            .property_variables
             .variable(variable_id.as_ref())
         else {
             return;
@@ -93,14 +179,14 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PropertyVariableImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
         );
     }
 
-    pub(super) fn emit_property_variable_detach(
+    fn emit_property_variable_detach(
         &mut self,
         property: DesignPanelProperty,
         variable_id: SharedString,
@@ -110,7 +196,8 @@ impl DesignPanel {
             return;
         };
         let Some(binding) = self
-            .property_value_states
+            .host
+            .property_states
             .get(&property)
             .and_then(DesignPanelPropertyValueState::binding)
             .filter(|binding| {
@@ -124,11 +211,11 @@ impl DesignPanel {
             return;
         }
         let variable_id = binding.id().clone();
-        self.property_variable_picker = None;
+        self.overlays.discard(DesignOpenOverlay::PropertyVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PropertyVariableDetachRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
@@ -136,7 +223,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn open_property_variable_picker(
+    fn open_property_variable_picker(
         &mut self,
         property: DesignPanelProperty,
         window: &mut Window,
@@ -145,43 +232,37 @@ impl DesignPanel {
         if self.property_variable_target(property).is_none() {
             return;
         }
-        self.property_variable_picker = Some(property);
-        self.component_property_variable_picker = None;
-        self.component_swap_browser = None;
+        if self.overlays.property_variable_picker() != Some(property) {
+            self.remember_overlay_focus_return(DesignOpenOverlay::PropertyVariable, window, cx);
+        }
+        self.overlays
+            .open(DesignOverlayState::PropertyVariable(property));
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.grid_dimensions_picker = None;
-        self.effect_style_browser_open = false;
-        self.layout_grid_style_browser_open = false;
-        self.layout_grid_count_variable_target = None;
-        self.typography_style_picker_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
-        self.property_variable_search.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-            input.focus(window, cx);
-        });
+        self.retained
+            .inputs
+            .property_variable_search
+            .update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
         cx.notify();
     }
 
-    pub(super) fn render_color_styles_icon(&self, cx: &mut Context<Self>) -> AnyElement {
-        render_icon_canvas(cx.theme().foreground, 16., |path| {
-            for (center_x, center_y) in [(4., 4.), (12., 4.), (4., 12.), (12., 12.)] {
-                path.circle(center_x, center_y, 2.5);
-            }
-        })
+    fn render_color_styles_icon(&self, cx: &mut Context<Self>) -> AnyElement {
+        render_lucide_icon(LucideIcon::Palette, cx.theme().foreground, 16.)
     }
 
-    pub(super) fn normalized_style_browser_query(&self, cx: &App) -> String {
-        self.style_browser_search
+    fn normalized_style_browser_query(&self, cx: &App) -> String {
+        self.retained
+            .inputs
+            .style_browser_search
             .read(cx)
             .value()
             .trim()
             .to_ascii_lowercase()
     }
 
-    pub(super) fn style_browser_row_matches(
+    fn style_browser_row_matches(
         query: &str,
         name: &str,
         summary: &str,
@@ -193,29 +274,29 @@ impl DesignPanel {
             || library_name.is_some_and(|library| library.to_ascii_lowercase().contains(query))
     }
 
-    pub(super) fn set_style_browser_source_filter(
+    fn set_style_browser_source_filter(
         &mut self,
         filter: StyleBrowserSourceFilter,
         cx: &mut Context<Self>,
     ) {
-        if self.style_browser_source_filter != filter {
-            self.style_browser_source_filter = filter;
+        if self.features.style_browser.source_filter != filter {
+            self.features.style_browser.source_filter = filter;
             cx.notify();
         }
     }
 
-    pub(super) fn set_style_browser_view_mode(
+    fn set_style_browser_view_mode(
         &mut self,
         view_mode: StyleBrowserViewMode,
         cx: &mut Context<Self>,
     ) {
-        if self.style_browser_view_mode != view_mode {
-            self.style_browser_view_mode = view_mode;
+        if self.features.style_browser.view_mode != view_mode {
+            self.features.style_browser.view_mode = view_mode;
             cx.notify();
         }
     }
 
-    pub(super) fn render_style_browser_toolbar(
+    fn render_style_browser_toolbar(
         panel: Entity<Self>,
         scope: SharedString,
         search: Entity<InputState>,
@@ -307,23 +388,23 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn property_variable_button_state(
+    fn property_variable_button_state(
         &self,
         property: DesignPanelProperty,
     ) -> Option<PropertyVariableButtonState> {
         Some(PropertyVariableButtonState {
             target: self.property_variable_target(property)?,
             panel_id: self.id.clone(),
-            search_input: self.property_variable_search.clone(),
-            active: self.property_variable_picker == Some(property),
+            search_input: self.retained.inputs.property_variable_search.clone(),
+            active: self.overlays.property_variable_picker() == Some(property),
             can_change: self.property_variable_can_change(property),
             can_edit: self.can_edit(),
-            state: self.property_value_states.get(&property).cloned(),
-            variable_view_data: self.property_variable_view_data.clone(),
+            state: self.host.property_states.get(&property).cloned(),
+            variable_view_data: self.resources.property_variables.clone(),
         })
     }
 
-    pub(super) fn render_property_variable_button(
+    fn render_property_variable_button(
         &self,
         property: DesignPanelProperty,
         cx: &mut Context<Self>,
@@ -336,7 +417,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn render_property_variable_button_for<T: 'static>(
+    fn render_property_variable_button_for<T: 'static>(
         panel: Entity<DesignPanel>,
         property: DesignPanelProperty,
         button_state: PropertyVariableButtonState,
@@ -406,7 +487,7 @@ impl DesignPanel {
             "{}-property-variable-{property:?}",
             panel_id
         )))
-        .label("◇")
+        .label("Select")
         .tooltip(trigger_tooltip)
         .xsmall()
         .compact()
@@ -433,9 +514,12 @@ impl DesignPanel {
                 panel_for_open.update(cx, |this, cx| {
                     if *open {
                         this.open_property_variable_picker(property, window, cx);
-                    } else if this.property_variable_picker == Some(property) {
-                        this.property_variable_picker = None;
-                        cx.notify();
+                    } else if this.overlays.property_variable_picker() == Some(property) {
+                        let _ = this.dismiss_overlay_from_outside_click(
+                            DesignOpenOverlay::PropertyVariable,
+                            window,
+                            cx,
+                        );
                     }
                 });
             })
@@ -621,7 +705,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) const fn compact_property_label(property: DesignPanelProperty) -> &'static str {
+    fn compact_property_label(property: DesignPanelProperty) -> &'static str {
         match property {
             DesignPanelProperty::Visible
             | DesignPanelProperty::PaintVisible { .. }
@@ -847,7 +931,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_bound_style_summary(
+    fn render_bound_style_summary(
         &self,
         id_suffix: &'static str,
         name: SharedString,

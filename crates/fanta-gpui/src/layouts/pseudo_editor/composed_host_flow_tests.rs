@@ -6,14 +6,13 @@ use gpui_component::Root;
 
 use super::*;
 use crate::{
-    assets::{AssetsPanel, AssetsViewData},
     design::{DesignPanel, DesignPanelNode, DesignPanelNodeKind, DesignPanelWorkspaceMode},
     layers::LayersPanel,
     pages::PagesPanel,
     prototype::{PrototypePanel, PrototypeViewData},
     timeline::{Timeline, TimelineAction, TimelineViewData},
     toolbar::{EditorToolbar, ToolbarAction, ToolbarMode, ToolbarTool},
-    variables::{VariablesPage, VariablesViewData},
+    variables::{VariablesScreen, VariablesViewData},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,8 +42,6 @@ impl WorkflowHost {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let pages = cx.new(|cx| PagesPanel::new("flow-pages", Vec::new(), window, cx));
         let layers = cx.new(|cx| LayersPanel::new("flow-layers", Vec::new(), window, cx));
-        let assets =
-            cx.new(|cx| AssetsPanel::new("flow-assets", AssetsViewData::default(), window, cx));
         let design = cx.new(|cx| {
             DesignPanel::new(
                 "flow-design",
@@ -67,7 +64,7 @@ impl WorkflowHost {
             )
         });
         let variables = cx.new(|cx| {
-            VariablesPage::new(
+            VariablesScreen::new(
                 "flow-variables",
                 VariablesViewData {
                     document_name: "Workflow test".into(),
@@ -88,7 +85,6 @@ impl WorkflowHost {
                 PseudoEditorChildren {
                     pages,
                     layers,
-                    assets,
                     design: design.clone(),
                     prototype,
                     timeline: timeline.clone(),

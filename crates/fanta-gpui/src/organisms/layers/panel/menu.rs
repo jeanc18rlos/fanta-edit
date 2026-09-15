@@ -1,11 +1,12 @@
 use gpui::{InteractiveElement as _, MouseDownEvent, deferred, size};
 
+use crate::atoms::tokens;
 use crate::molecules::{clamp_menu_origin, menu_item, menu_surface};
 
 use super::*;
 
-const MENU_WIDTH: f32 = 224.;
-const MENU_ITEM_HEIGHT: f32 = 28.;
+const MENU_WIDTH: f32 = tokens::MenuWidth::STANDARD;
+const MENU_ITEM_HEIGHT: f32 = tokens::RowHeight::LIST;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct MenuEntry {

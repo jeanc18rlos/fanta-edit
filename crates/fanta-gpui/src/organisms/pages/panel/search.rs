@@ -1,9 +1,8 @@
 use super::*;
 
 impl PagesPanel {
-    /// Node-kind icon shared with the Layers iconography: code-native vector
-    /// icons for kinds a node draws, the toolbar's Rectangle drawing for
-    /// generic shapes, and canonical icon assets for the UI-only categories.
+    /// Node-kind icon shared with the Layers iconography. Every glyph comes
+    /// from the pinned Lucide catalog.
     pub(super) fn element_icon(kind: PagesPanelElementKind, cx: &App) -> AnyElement {
         let color = match kind {
             PagesPanelElementKind::Component | PagesPanelElementKind::Instance => {
@@ -18,16 +17,16 @@ impl PagesPanel {
             PagesPanelElementKind::Other => {
                 return themed_icon_asset(IconName::Ellipsis, color);
             }
-            PagesPanelElementKind::Text => ControlIcon::Text,
-            PagesPanelElementKind::FrameGroup => ControlIcon::Frame,
-            PagesPanelElementKind::Component => ControlIcon::Component,
-            PagesPanelElementKind::Instance => ControlIcon::Instance,
-            PagesPanelElementKind::Image => ControlIcon::Image,
+            PagesPanelElementKind::Text => LucideIcon::TypeIcon,
+            PagesPanelElementKind::FrameGroup => LucideIcon::Frame,
+            PagesPanelElementKind::Component => LucideIcon::Component,
+            PagesPanelElementKind::Instance => LucideIcon::Diamond,
+            PagesPanelElementKind::Image => LucideIcon::Image,
             PagesPanelElementKind::Shape => {
                 return render_tool_icon(ToolbarTool::Rectangle, color, ELEMENT_ICON_SIZE);
             }
         };
-        render_control_icon(icon, color, ELEMENT_ICON_SIZE)
+        render_lucide_icon(icon, color, ELEMENT_ICON_SIZE)
     }
 
     fn render_search_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {

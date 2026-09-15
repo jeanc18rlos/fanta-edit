@@ -1,7 +1,311 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn emit_page_background_edit(
+pub(super) trait DesignPaintController: Sized {
+    fn emit_page_background_edit(
+        &self,
+        color: DesignColor,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    );
+    fn paint_target(&self, collection: DesignPanelCollection) -> DesignPaintTarget;
+    fn paint_edit_for_property(
+        &self,
+        property: DesignPanelProperty,
+        value: &DesignPanelValue,
+    ) -> Option<(PaintPickerTarget, DesignPaintEdit)>;
+    fn emit_paint_edit(
+        &mut self,
+        target: PaintPickerTarget,
+        edit: DesignPaintEdit,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    );
+    fn paint_edit_is_applicable(&self, target: &PaintPickerTarget, edit: &DesignPaintEdit) -> bool;
+    fn track_paint_edit(
+        &mut self,
+        target: &PickerEventTarget,
+        edit: &DesignPaintEdit,
+        phase: DesignPanelEditPhase,
+    ) -> bool;
+    fn auxiliary_color(&self, target: &AuxiliaryColorPickerTarget) -> Option<DesignColor>;
+    fn auxiliary_color_paint(&self, target: &AuxiliaryColorPickerTarget) -> Option<DesignPaint>;
+    fn auxiliary_color_candidate(
+        &self,
+        target: &AuxiliaryColorPickerTarget,
+        edit: &DesignPaintEdit,
+    ) -> Option<DesignColor>;
+    fn emit_auxiliary_color_edit(
+        &mut self,
+        edit: &DesignPaintEdit,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    );
+    fn cancel_active_paint_edit(&mut self, cx: &mut Context<Self>);
+    fn reconcile_active_paint_edit(
+        &mut self,
+        target: Option<PickerEventTarget>,
+        cx: &mut Context<Self>,
+    );
+    fn emit_active_paint_cancel(&mut self, active: ActivePaintEdit, cx: &mut Context<Self>);
+    fn prepare_paint_picker_for_dismissal(&self, cx: &mut Context<Self>);
+    fn paint_index_in_node(
+        node: &DesignPanelNode,
+        collection: DesignPanelCollection,
+        paint_id: &str,
+        fallback_index: usize,
+    ) -> Option<usize>;
+    fn resolved_active_paint_edit_target(&self) -> Option<PickerEventTarget>;
+    fn emit_paint_reorder(
+        &self,
+        collection: DesignPanelCollection,
+        paint: &DesignPaint,
+        from_index: usize,
+        to_index: usize,
+        cx: &mut Context<Self>,
+    );
+    fn open_paint_style_browser(
+        &mut self,
+        collection: DesignPanelCollection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn paint_style_binding(
+        &self,
+        collection: DesignPanelCollection,
+    ) -> Option<super::super::DesignPaintStyleBinding>;
+    fn emit_paint_style_apply(
+        &mut self,
+        collection: DesignPanelCollection,
+        style: DesignPaintStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_paint_style_import(
+        &mut self,
+        collection: DesignPanelCollection,
+        style: DesignPaintStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_paint_style_create(
+        &mut self,
+        collection: DesignPanelCollection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_paint_style_detach(
+        &mut self,
+        collection: DesignPanelCollection,
+        cx: &mut Context<Self>,
+    );
+    fn render_paint_style_button(
+        &self,
+        collection: DesignPanelCollection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_paint_swatch(&self, paint: &DesignPaint, cx: &mut Context<Self>) -> AnyElement;
+    fn render_paint_row(
+        &self,
+        paint: DesignPaint,
+        collection: DesignPanelCollection,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn paint_section_identity(&self) -> sections::paints::PaintSectionIdentity;
+    fn fill_projection(&self) -> sections::paints::FillProjection;
+    fn stroke_projection(&self) -> sections::paints::StrokeProjection;
+    fn render_fill(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn render_stroke(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn render_auxiliary_color_picker_control(
+        &self,
+        panel: Entity<Self>,
+        id_suffix: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        color: DesignColor,
+        target: AuxiliaryColorPickerTarget,
+        cx: &mut App,
+    ) -> AnyElement;
+    fn selection_color(
+        &self,
+        selection_color_id: &str,
+    ) -> Option<super::super::DesignSelectionColor>;
+    fn selection_color_references_target_current(
+        &self,
+        color: &super::super::DesignSelectionColor,
+    ) -> bool;
+    fn selection_color_can_mutate(&self, color: &super::super::DesignSelectionColor) -> bool;
+    fn selection_color_can_select_occurrences(
+        &self,
+        color: &super::super::DesignSelectionColor,
+    ) -> bool;
+    fn selection_color_paint_editable(
+        &self,
+        color: &super::super::DesignSelectionColor,
+        edit: &DesignPaintEdit,
+    ) -> bool;
+    fn emit_selection_color_occurrences_select(
+        &mut self,
+        selection_color_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn open_selection_color_resource_browser(
+        &mut self,
+        selection_color_id: SharedString,
+        kind: SelectionColorResourceKind,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_paint_style_apply(
+        &mut self,
+        selection_color_id: SharedString,
+        style: DesignPaintStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_paint_style_import(
+        &mut self,
+        selection_color_id: SharedString,
+        style: DesignPaintStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_paint_style_create(
+        &mut self,
+        selection_color_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_paint_style_detach(
+        &mut self,
+        selection_color_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_variable_apply(
+        &mut self,
+        selection_color_id: SharedString,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_variable_import(
+        &mut self,
+        selection_color_id: SharedString,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_variable_create(
+        &mut self,
+        selection_color_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_selection_color_variable_detach(
+        &mut self,
+        selection_color_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn render_selection_color_paint_style_button(
+        &self,
+        color: &super::super::DesignSelectionColor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_selection_color_variable_button(
+        &self,
+        color: &super::super::DesignSelectionColor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_selection_paint_picker_control(
+        &self,
+        index: usize,
+        selection_color: &super::super::DesignSelectionColor,
+        target: AuxiliaryColorPickerTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_selection_color_occurrences_button(
+        &self,
+        color: &super::super::DesignSelectionColor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn selection_colors_projection(&self) -> sections::paints::SelectionColorsProjection;
+    fn render_selection_colors(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn paint_collection(&self, collection: DesignPanelCollection) -> Option<&[DesignPaint]>;
+    fn paint_target_index(&self, target: &PaintPickerTarget) -> Option<usize>;
+    fn emit_media_source_action(
+        &self,
+        target: PaintPickerTarget,
+        expected_source_id: &SharedString,
+        action: DesignMediaSourceAction,
+        cx: &mut Context<Self>,
+    );
+    fn media_drop_capabilities_for_target(
+        &self,
+        target: &PaintPickerTarget,
+    ) -> Option<(
+        usize,
+        DesignMediaKind,
+        SharedString,
+        DesignMediaPaintCapabilities,
+    )>;
+    fn emit_media_source_drop_from_paths(
+        &self,
+        target: PaintPickerTarget,
+        paths: &[PathBuf],
+        cx: &mut Context<Self>,
+    );
+    fn emit_media_source_drop(
+        &self,
+        target: PaintPickerTarget,
+        expected_source_id: &SharedString,
+        expected_media_kind: DesignMediaKind,
+        file: DesignMediaDroppedFile,
+        cx: &mut Context<Self>,
+    );
+    fn emit_media_crop_action(
+        &mut self,
+        target: &PaintPickerTarget,
+        action: DesignMediaCropAction,
+        cx: &mut Context<Self>,
+    );
+    fn emit_crop_cancel_if_active(&mut self, target: &PaintPickerTarget, cx: &mut Context<Self>);
+    fn resolve_paint_color_target(
+        &self,
+        target: &PaintPickerTarget,
+        color_target: &DesignPaintColorTarget,
+        allow_bound: bool,
+    ) -> Option<DesignPaintColorTarget>;
+    fn paint_color_binding(
+        &self,
+        target: &PaintPickerTarget,
+        color_target: &DesignPaintColorTarget,
+    ) -> Option<super::super::DesignPaintBinding>;
+    fn picker_paint(&self, target: &PaintPickerTarget) -> Option<DesignPaint>;
+    fn auxiliary_color_state_properties(
+        &self,
+        target: &AuxiliaryColorPickerTarget,
+    ) -> Vec<DesignPanelProperty>;
+    fn active_auxiliary_state_property(&self) -> Option<DesignPanelProperty>;
+    fn auxiliary_color_leaf_editability(&self, target: &AuxiliaryColorPickerTarget)
+    -> (bool, bool);
+    #[cfg(test)]
+    fn auxiliary_color_editable(&self, target: &AuxiliaryColorPickerTarget) -> bool;
+    fn auxiliary_paint_property_editable(
+        &self,
+        target: &AuxiliaryColorPickerTarget,
+        property: &DesignPaintProperty,
+    ) -> bool;
+    fn auxiliary_paint_editable(
+        &self,
+        target: &AuxiliaryColorPickerTarget,
+        edit: &DesignPaintEdit,
+    ) -> bool;
+    fn open_auxiliary_color_picker(
+        &mut self,
+        target: AuxiliaryColorPickerTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn active_color_contrast_view_data(&self) -> Option<DesignColorContrastPaintViewData>;
+    fn sync_paint_picker(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn render_page_background_picker(
+        &self,
+        page: &DesignPageViewData,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+}
+
+impl DesignPaintController for DesignPanel {
+    fn emit_page_background_edit(
         &self,
         color: DesignColor,
         phase: DesignPanelEditPhase,
@@ -23,15 +327,15 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn paint_target(&self, collection: DesignPanelCollection) -> DesignPaintTarget {
+    fn paint_target(&self, collection: DesignPanelCollection) -> DesignPaintTarget {
         if collection == DesignPanelCollection::Fill
-            && self.inspection_context.edit_mode() == DesignPanelEditMode::Text
+            && self.host.inspection_context.edit_mode() == DesignPanelEditMode::Text
             && matches!(
-                self.node.kind,
+                self.host.inspected_node().kind,
                 DesignPanelNodeKind::Text | DesignPanelNodeKind::TextPath
             )
         {
-            self.inspection_context.text_range_revision().map_or(
+            self.host.inspection_context.text_range_revision().map_or(
                 DesignPaintTarget::SelectedTextRange,
                 DesignPaintTarget::SelectedTextRangeRevision,
             )
@@ -40,7 +344,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn paint_edit_for_property(
+    fn paint_edit_for_property(
         &self,
         property: DesignPanelProperty,
         value: &DesignPanelValue,
@@ -81,7 +385,7 @@ impl DesignPanel {
         ))
     }
 
-    pub(super) fn emit_paint_edit(
+    fn emit_paint_edit(
         &mut self,
         target: PaintPickerTarget,
         edit: DesignPaintEdit,
@@ -106,7 +410,7 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintEditRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection: target.collection,
                 target: self.paint_target(target.collection),
                 paint_id: target.paint_id,
@@ -117,11 +421,7 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn paint_edit_is_applicable(
-        &self,
-        target: &PaintPickerTarget,
-        edit: &DesignPaintEdit,
-    ) -> bool {
+    fn paint_edit_is_applicable(&self, target: &PaintPickerTarget, edit: &DesignPaintEdit) -> bool {
         let Some(mut paint) = self.picker_paint(target) else {
             return false;
         };
@@ -135,7 +435,8 @@ impl DesignPanel {
         ) = (&edit.property, &edit.value, &paint.payload)
         {
             let Some(definition) = self
-                .shader_view_data
+                .resources
+                .shaders
                 .definition(shader.shader_id.as_ref())
                 .and_then(|shader| shader.property(definition_id.as_ref()))
             else {
@@ -148,7 +449,7 @@ impl DesignPanel {
         paint.apply_edit(edit)
     }
 
-    pub(super) fn track_paint_edit(
+    fn track_paint_edit(
         &mut self,
         target: &PickerEventTarget,
         edit: &DesignPaintEdit,
@@ -157,52 +458,21 @@ impl DesignPanel {
         // A picker transaction snapshots the complete paint. Its previews may
         // legitimately cross leaf properties (for example color, then alpha)
         // as long as the exact stable paint target remains unchanged.
-        let matches_active = self
-            .active_paint_edit
-            .as_ref()
-            .is_some_and(|active| active.target == *target);
-        match phase {
-            DesignPanelEditPhase::Begin if self.active_paint_edit.is_none() => {
-                self.active_paint_edit = Some(ActivePaintEdit {
-                    target: target.clone(),
-                    edit: edit.clone(),
-                });
-                true
-            }
-            DesignPanelEditPhase::Begin => false,
-            DesignPanelEditPhase::Preview if matches_active => {
-                if let Some(active) = self.active_paint_edit.as_mut() {
-                    active.edit = edit.clone();
-                }
-                true
-            }
-            DesignPanelEditPhase::Preview => false,
-            DesignPanelEditPhase::Commit if self.active_paint_edit.is_none() => {
-                // Picker buttons and toggles are atomic Commit-only edits.
-                true
-            }
-            DesignPanelEditPhase::Commit | DesignPanelEditPhase::Cancel if matches_active => {
-                self.active_paint_edit = None;
-                true
-            }
-            DesignPanelEditPhase::Commit | DesignPanelEditPhase::Cancel => false,
-        }
+        self.edit.track_paint_edit(target, edit, phase)
     }
 
-    pub(super) fn auxiliary_color(
-        &self,
-        target: &AuxiliaryColorPickerTarget,
-    ) -> Option<DesignColor> {
+    fn auxiliary_color(&self, target: &AuxiliaryColorPickerTarget) -> Option<DesignColor> {
         match target {
             AuxiliaryColorPickerTarget::PageBackground { page_id } => self
                 .page_view_data_for_context()
                 .filter(|page| page.page_id == *page_id)
                 .map(|page| page.background.color),
             AuxiliaryColorPickerTarget::TextDecoration { node_id, .. } => {
-                if self.node.id != *node_id {
+                if self.host.inspected_node().id != *node_id {
                     return None;
                 }
-                self.node
+                self.host
+                    .inspected_node()
                     .typography
                     .as_ref()?
                     .decoration_details
@@ -218,13 +488,14 @@ impl DesignPanel {
                 index,
                 property,
             } => {
-                if self.node.id != *node_id {
+                if self.host.inspected_node().id != *node_id {
                     return None;
                 }
                 let resolved_index = if effect_id.is_empty() {
-                    (*index < self.node.effects.len()).then_some(*index)
+                    (*index < self.host.inspected_node().effects.len()).then_some(*index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .effects
                         .iter()
                         .position(|effect| effect.id == *effect_id)
@@ -239,18 +510,23 @@ impl DesignPanel {
                 guide_id,
                 index,
             } => {
-                if self.node.id != *node_id {
+                if self.host.inspected_node().id != *node_id {
                     return None;
                 }
                 let resolved_index = if guide_id.is_empty() {
-                    (*index < self.node.layout_grids.len()).then_some(*index)
+                    (*index < self.host.inspected_node().layout_grids.len()).then_some(*index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .layout_grids
                         .iter()
                         .position(|guide| guide.id == *guide_id)
                 }?;
-                let guide = self.node.layout_grids.get(resolved_index)?;
+                let guide = self
+                    .host
+                    .inspected_node()
+                    .layout_grids
+                    .get(resolved_index)?;
                 Some(DesignColor::rgba(
                     guide.color.red,
                     guide.color.green,
@@ -261,7 +537,8 @@ impl DesignPanel {
             AuxiliaryColorPickerTarget::SelectionColor {
                 selection_color_id, ..
             } => self
-                .node
+                .host
+                .inspected_node()
                 .resolved_selection_colors()
                 .iter()
                 .find(|color| color.id == *selection_color_id)
@@ -269,16 +546,14 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn auxiliary_color_paint(
-        &self,
-        target: &AuxiliaryColorPickerTarget,
-    ) -> Option<DesignPaint> {
+    fn auxiliary_color_paint(&self, target: &AuxiliaryColorPickerTarget) -> Option<DesignPaint> {
         if let AuxiliaryColorPickerTarget::SelectionColor {
             selection_color_id, ..
         } = target
         {
             let color = self
-                .node
+                .host
+                .inspected_node()
                 .resolved_selection_colors()
                 .into_iter()
                 .find(|color| color.id == *selection_color_id)?;
@@ -300,7 +575,7 @@ impl DesignPanel {
         Some(paint)
     }
 
-    pub(super) fn auxiliary_color_candidate(
+    fn auxiliary_color_candidate(
         &self,
         target: &AuxiliaryColorPickerTarget,
         edit: &DesignPaintEdit,
@@ -323,13 +598,13 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn emit_auxiliary_color_edit(
+    fn emit_auxiliary_color_edit(
         &mut self,
         edit: &DesignPaintEdit,
         phase: DesignPanelEditPhase,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self.auxiliary_color_picker.clone() else {
+        let Some(target) = self.overlays.auxiliary_color_picker().clone() else {
             return;
         };
         if let AuxiliaryColorPickerTarget::SelectionColor {
@@ -378,7 +653,7 @@ impl DesignPanel {
             AuxiliaryColorPickerTarget::TextDecoration {
                 node_id,
                 typography_target,
-            } if node_id == self.node.id && self.can_edit() => {
+            } if node_id == self.host.inspected_node().id && self.can_edit() => {
                 cx.emit_design_panel_action(
                     self,
                     DesignPanelAction::TypographyPropertyEditRequested {
@@ -397,11 +672,12 @@ impl DesignPanel {
                 effect_id,
                 index,
                 property,
-            } if node_id == self.node.id && self.can_edit() => {
+            } if node_id == self.host.inspected_node().id && self.can_edit() => {
                 let resolved_index = if effect_id.is_empty() {
-                    (index < self.node.effects.len()).then_some(index)
+                    (index < self.host.inspected_node().effects.len()).then_some(index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .effects
                         .iter()
                         .position(|effect| effect.id == effect_id)
@@ -426,11 +702,12 @@ impl DesignPanel {
                 node_id,
                 guide_id,
                 index,
-            } if node_id == self.node.id && self.can_edit() => {
+            } if node_id == self.host.inspected_node().id && self.can_edit() => {
                 let resolved_index = if guide_id.is_empty() {
-                    (index < self.node.layout_grids.len()).then_some(index)
+                    (index < self.host.inspected_node().layout_grids.len()).then_some(index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .layout_grids
                         .iter()
                         .position(|guide| guide.id == guide_id)
@@ -438,7 +715,8 @@ impl DesignPanel {
                 let Some(resolved_index) = resolved_index else {
                     return;
                 };
-                let Some(guide) = self.node.layout_grids.get(resolved_index) else {
+                let Some(guide) = self.host.inspected_node().layout_grids.get(resolved_index)
+                else {
                     return;
                 };
                 let (property, value) = match (&edit.property, &edit.value) {
@@ -476,19 +754,37 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn cancel_active_paint_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(active) = self.active_paint_edit.take() else {
+    fn cancel_active_paint_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.edit.cancel_paint_edit() else {
             return;
         };
+        self.emit_active_paint_cancel(active, cx);
+    }
+
+    /// Applies one stable-target host reconciliation and emits Cancel only
+    /// when the controller consumes the transaction.
+    fn reconcile_active_paint_edit(
+        &mut self,
+        target: Option<PickerEventTarget>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(active) = self.edit.reconcile_paint_edit_target(target) else {
+            return;
+        };
+        self.emit_active_paint_cancel(active, cx);
+    }
+
+    fn emit_active_paint_cancel(&mut self, active: ActivePaintEdit, cx: &mut Context<Self>) {
         if self
-            .auxiliary_color_picker
+            .overlays
+            .auxiliary_color_picker()
             .as_ref()
             .is_some_and(|target| target.matches_picker_target(&active.target))
         {
             self.emit_auxiliary_color_edit(&active.edit, DesignPanelEditPhase::Cancel, cx);
             return;
         }
-        if active.target.node_id == self.node.id {
+        if active.target.node_id == self.host.inspected_node().id {
             self.emit_paint_edit(
                 PaintPickerTarget {
                     collection: active.target.collection,
@@ -502,12 +798,12 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn prepare_paint_picker_for_dismissal(&self, cx: &mut Context<Self>) {
+    fn prepare_paint_picker_for_dismissal(&self, cx: &mut Context<Self>) {
         self.paint_picker
             .update(cx, |picker, cx| picker.prepare_for_dismissal(cx));
     }
 
-    pub(super) fn paint_index_in_node(
+    fn paint_index_in_node(
         node: &DesignPanelNode,
         collection: DesignPanelCollection,
         paint_id: &str,
@@ -529,39 +825,37 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn active_paint_edit_is_editable(&self) -> bool {
-        let Some(active) = self.active_paint_edit.as_ref() else {
-            return true;
-        };
+    fn resolved_active_paint_edit_target(&self) -> Option<PickerEventTarget> {
+        let active = self.edit.active_paint_edit()?;
         if self
-            .auxiliary_color_picker
+            .overlays
+            .auxiliary_color_picker()
             .as_ref()
             .is_some_and(|target| target.matches_picker_target(&active.target))
         {
-            return true;
+            return Some(active.target.clone());
         }
-        if active.target.node_id != self.node.id {
-            return false;
+        if active.target.node_id != self.host.inspected_node().id {
+            return None;
         }
         let target = PaintPickerTarget {
             collection: active.target.collection,
             index: active.target.index,
             paint_id: active.target.paint_id.clone(),
         };
-        let Some(paint) = self.picker_paint(&target) else {
-            return false;
-        };
+        let resolved_index = self.paint_target_index(&target)?;
+        let paint = self.picker_paint(&target)?;
         if paint.read_only {
-            return false;
+            return None;
         }
-        match &active.edit.property {
+        let editable = match &active.edit.property {
             DesignPaintProperty::Color => matches!(
                 &paint.payload,
                 DesignPaintPayload::Solid(solid) if solid.binding.is_none()
             ),
             DesignPaintProperty::GradientStopColor { stop_id, index } => {
                 let DesignPaintPayload::Gradient(gradient) = &paint.payload else {
-                    return false;
+                    return None;
                 };
                 let stop = if stop_id.is_empty() {
                     gradient.stops.get(*index)
@@ -573,7 +867,7 @@ impl DesignPanel {
             DesignPaintProperty::GradientStopPosition { stop_id, index }
             | DesignPaintProperty::GradientStopRemove { stop_id, index } => {
                 let DesignPaintPayload::Gradient(gradient) = &paint.payload else {
-                    return false;
+                    return None;
                 };
                 if stop_id.is_empty() {
                     gradient.stops.get(*index).is_some()
@@ -585,10 +879,16 @@ impl DesignPanel {
                 let mut candidate = paint;
                 candidate.apply_edit(&active.edit)
             }
-        }
+        };
+        editable.then(|| PickerEventTarget {
+            node_id: active.target.node_id.clone(),
+            collection: active.target.collection,
+            index: resolved_index,
+            paint_id: active.target.paint_id.clone(),
+        })
     }
 
-    pub(super) fn emit_paint_reorder(
+    fn emit_paint_reorder(
         &self,
         collection: DesignPanelCollection,
         paint: &DesignPaint,
@@ -616,7 +916,7 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintReorderRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection,
                 target: self.paint_target(collection),
                 paint_id: paint.id.clone(),
@@ -626,10 +926,10 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn open_paint_style_browser(
+    fn open_paint_style_browser(
         &mut self,
         collection: DesignPanelCollection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !matches!(
@@ -639,41 +939,43 @@ impl DesignPanel {
         {
             return;
         }
-        self.style_browser_source_filter =
-            self.style_browser_source_filter.normalized_for_libraries(
-                self.paint_style_view_data
+        if self.overlays.paint_style_browser_open() != Some(collection) {
+            self.remember_overlay_focus_return(DesignOpenOverlay::PaintStyle, window, cx);
+        }
+        self.features.style_browser.source_filter = self
+            .features
+            .style_browser
+            .source_filter
+            .normalized_for_libraries(
+                self.resources
+                    .paint_styles
                     .libraries
                     .iter()
                     .map(|library| (&library.id, &library.name)),
             );
         self.prepare_paint_picker_for_dismissal(cx);
         self.cancel_active_paint_edit(cx);
-        self.auxiliary_color_picker = None;
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.paint_style_browser_open = Some(collection);
-        self.effect_style_browser_open = false;
-        self.layout_grid_style_browser_open = false;
-        self.typography_style_picker_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
+        self.overlays
+            .open(DesignOverlayState::PaintStyle(collection));
         cx.notify();
     }
 
-    pub(super) fn paint_style_binding(
+    fn paint_style_binding(
         &self,
         collection: DesignPanelCollection,
     ) -> Option<super::super::DesignPaintStyleBinding> {
         match collection {
-            DesignPanelCollection::Fill => self.node.fill_style_binding.clone(),
-            DesignPanelCollection::Stroke => self.node.stroke_style_binding.clone(),
+            DesignPanelCollection::Fill => self.host.inspected_node().fill_style_binding.clone(),
+            DesignPanelCollection::Stroke => {
+                self.host.inspected_node().stroke_style_binding.clone()
+            }
             DesignPanelCollection::Effect
             | DesignPanelCollection::LayoutGrid
             | DesignPanelCollection::Export => None,
         }
     }
 
-    pub(super) fn emit_paint_style_apply(
+    fn emit_paint_style_apply(
         &mut self,
         collection: DesignPanelCollection,
         style: DesignPaintStyleSelection,
@@ -682,17 +984,18 @@ impl DesignPanel {
         if !self.can_edit()
             || !self.collection_is_supported(collection)
             || self
-                .paint_style_view_data
+                .resources
+                .paint_styles
                 .style(&style)
                 .is_none_or(|style| style.import_state != DesignPaintStyleImportState::Imported)
         {
             return;
         }
-        self.paint_style_browser_open = None;
+        self.overlays.discard(DesignOpenOverlay::PaintStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintStyleApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection,
                 target: self.paint_target(collection),
                 style,
@@ -701,7 +1004,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_paint_style_import(
+    fn emit_paint_style_import(
         &mut self,
         collection: DesignPanelCollection,
         style: DesignPaintStyleSelection,
@@ -710,17 +1013,18 @@ impl DesignPanel {
         if !self.can_edit()
             || !self.collection_is_supported(collection)
             || self
-                .paint_style_view_data
+                .resources
+                .paint_styles
                 .style(&style)
                 .is_none_or(|style| style.import_state != DesignPaintStyleImportState::Available)
         {
             return;
         }
-        self.paint_style_browser_open = None;
+        self.overlays.discard(DesignOpenOverlay::PaintStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintStyleImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection,
                 target: self.paint_target(collection),
                 style,
@@ -729,7 +1033,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_paint_style_create(
+    fn emit_paint_style_create(
         &mut self,
         collection: DesignPanelCollection,
         cx: &mut Context<Self>,
@@ -740,11 +1044,11 @@ impl DesignPanel {
         if !self.can_edit() || paints.is_empty() || self.paint_style_binding(collection).is_some() {
             return;
         }
-        self.paint_style_browser_open = None;
+        self.overlays.discard(DesignOpenOverlay::PaintStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintStyleCreateRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection,
                 target: self.paint_target(collection),
                 paints,
@@ -753,7 +1057,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_paint_style_detach(
+    fn emit_paint_style_detach(
         &mut self,
         collection: DesignPanelCollection,
         cx: &mut Context<Self>,
@@ -767,11 +1071,11 @@ impl DesignPanel {
         if !self.can_edit() || !self.collection_is_supported(collection) {
             return;
         }
-        self.paint_style_browser_open = None;
+        self.overlays.discard(DesignOpenOverlay::PaintStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintStyleDetachRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection,
                 target: self.paint_target(collection),
                 style: binding.selection,
@@ -780,7 +1084,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn render_paint_style_button(
+    fn render_paint_style_button(
         &self,
         collection: DesignPanelCollection,
         cx: &mut Context<Self>,
@@ -789,7 +1093,7 @@ impl DesignPanel {
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
         let panel_id = self.id.clone();
-        let active = self.paint_style_browser_open == Some(collection);
+        let active = self.overlays.paint_style_browser_open() == Some(collection);
         let binding = self.paint_style_binding(collection);
         let can_edit = self.can_edit();
         let paints = self
@@ -798,16 +1102,18 @@ impl DesignPanel {
             .unwrap_or_default();
         let can_create = can_edit && !paints.is_empty() && binding.is_none();
         let query = self.normalized_style_browser_query(cx);
-        let source_filter = self.style_browser_source_filter.clone();
-        let view_mode = self.style_browser_view_mode;
-        let catalog_is_empty = self.paint_style_view_data.page_styles.is_empty()
+        let source_filter = self.features.style_browser.source_filter.clone();
+        let view_mode = self.features.style_browser.view_mode;
+        let catalog_is_empty = self.resources.paint_styles.page_styles.is_empty()
             && self
-                .paint_style_view_data
+                .resources
+                .paint_styles
                 .libraries
                 .iter()
                 .all(|library| library.styles.is_empty());
         let page_styles = if source_filter.includes_page() {
-            self.paint_style_view_data
+            self.resources
+                .paint_styles
                 .page_styles
                 .iter()
                 .map(|style| {
@@ -826,7 +1132,8 @@ impl DesignPanel {
             Vec::new()
         };
         let libraries = self
-            .paint_style_view_data
+            .resources
+            .paint_styles
             .libraries
             .iter()
             .filter(|library| source_filter.includes_library(library.id.as_ref()))
@@ -860,9 +1167,10 @@ impl DesignPanel {
             })
             .filter(|(_, styles)| !styles.is_empty())
             .collect::<Vec<_>>();
-        let style_browser_search = self.style_browser_search.clone();
+        let style_browser_search = self.retained.inputs.style_browser_search.clone();
         let style_browser_library_sources = self
-            .paint_style_view_data
+            .resources
+            .paint_styles
             .libraries
             .iter()
             .map(|library| (library.id.clone(), library.name.clone()))
@@ -904,9 +1212,12 @@ impl DesignPanel {
             panel_for_open.update(cx, |this, cx| {
                 if *open {
                     this.open_paint_style_browser(collection, window, cx);
-                } else if this.paint_style_browser_open == Some(collection) {
-                    this.paint_style_browser_open = None;
-                    cx.notify();
+                } else if this.overlays.paint_style_browser_open() == Some(collection) {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::PaintStyle,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -1117,11 +1428,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_paint_swatch(
-        &self,
-        paint: &DesignPaint,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_paint_swatch(&self, paint: &DesignPaint, cx: &mut Context<Self>) -> AnyElement {
         let swatch = div()
             .size(px(14.))
             .flex_none()
@@ -1182,7 +1489,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_paint_row(
+    fn render_paint_row(
         &self,
         paint: DesignPaint,
         collection: DesignPanelCollection,
@@ -1261,7 +1568,7 @@ impl DesignPanel {
             && self
                 .paint_collection(collection)
                 .is_some_and(|paints| paints.len() > 1);
-        let active = self.active_picker.as_ref() == Some(&target);
+        let active = self.overlays.active_picker().as_ref() == Some(&target);
         let panel = cx.entity();
         let picker = self.paint_picker.clone();
         let picker_content = picker.clone();
@@ -1282,7 +1589,7 @@ impl DesignPanel {
             .h_full()
             .justify_start()
             .disabled(
-                self.inspection_context.selection().kind() == DesignPanelSelectionKind::None
+                self.host.inspection_context.selection().kind() == DesignPanelSelectionKind::None
                     || collection_style_bound,
             )
             .on_keyboard_activate({
@@ -1291,21 +1598,18 @@ impl DesignPanel {
                 move |_, cx| {
                     panel.update(cx, |this, cx| {
                         if !active
-                            && this.inspection_context.selection().kind()
+                            && this.host.inspection_context.selection().kind()
                                 != DesignPanelSelectionKind::None
                             && this.paint_style_binding(collection).is_none()
                         {
                             this.cancel_active_paint_edit(cx);
-                            this.auxiliary_color_picker = None;
-                            this.paint_style_browser_open = None;
-                            this.active_picker = Some(target.clone());
-                            this.typography_style_picker_open = false;
-                            this.type_settings_open = false;
-                        } else if this.active_picker.as_ref() == Some(&target) {
+                            this.overlays
+                                .open(DesignOverlayState::PaintPicker(target.clone()));
+                        } else if this.overlays.active_picker().as_ref() == Some(&target) {
                             this.prepare_paint_picker_for_dismissal(cx);
                             this.cancel_active_paint_edit(cx);
                             this.emit_crop_cancel_if_active(&target, cx);
-                            this.active_picker = None;
+                            this.overlays.discard(DesignOpenOverlay::PaintPicker);
                         }
                         cx.notify();
                     });
@@ -1336,24 +1640,30 @@ impl DesignPanel {
                         .track_focus(&picker_focus)
                         .on_open_change({
                             let target = target.clone();
-                            move |open, _, cx| {
+                            move |open, window, cx| {
                                 panel.update(cx, |this, cx| {
                                     if *open
-                                        && this.inspection_context.selection().kind()
+                                        && this.host.inspection_context.selection().kind()
                                             != DesignPanelSelectionKind::None
                                         && this.paint_style_binding(collection).is_none()
                                     {
+                                        this.remember_overlay_focus_return(
+                                            DesignOpenOverlay::PaintPicker,
+                                            window,
+                                            cx,
+                                        );
                                         this.cancel_active_paint_edit(cx);
-                                        this.auxiliary_color_picker = None;
-                                        this.paint_style_browser_open = None;
-                                        this.active_picker = Some(target.clone());
-                                        this.typography_style_picker_open = false;
-                                        this.type_settings_open = false;
-                                    } else if this.active_picker.as_ref() == Some(&target) {
-                                        this.prepare_paint_picker_for_dismissal(cx);
-                                        this.cancel_active_paint_edit(cx);
-                                        this.emit_crop_cancel_if_active(&target, cx);
-                                        this.active_picker = None;
+                                        this.overlays
+                                            .open(DesignOverlayState::PaintPicker(target.clone()));
+                                    } else if this.overlays.active_picker().as_ref()
+                                        == Some(&target)
+                                    {
+                                        let _ = this.dismiss_overlay_from_outside_click(
+                                            DesignOpenOverlay::PaintPicker,
+                                            window,
+                                            cx,
+                                        );
+                                        return;
                                     }
                                     cx.notify();
                                 });
@@ -1472,605 +1782,80 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_fill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        (self.node.supports_fill() && self.node.supports_section(DesignPanelSection::Fill)).then(
-            || {
-                let mut content = v_flex().pl(px(PANEL_PADDING)).pr_2().pt_1().pb_4().gap_2();
-                if let Some(binding) = self.node.fill_style_binding.as_ref() {
-                    content = content.child(self.render_bound_style_summary(
-                        "fill",
-                        binding.name.clone(),
-                        cx,
-                    ));
-                } else {
-                    for (index, paint) in self.node.fills.iter().cloned().enumerate() {
-                        content = content.child(self.render_paint_row(
-                            paint,
-                            DesignPanelCollection::Fill,
-                            index,
-                            cx,
-                        ));
-                    }
-                    if self.node.fills.is_empty() {
-                        content = content.child(empty_collection("No fills", cx));
-                    }
-                    if let Some(show_in_exports) = self
-                        .node
-                        .fill_shows_in_exports
-                        .filter(|_| !self.node.fills.is_empty())
-                    {
-                        content = content.child(self.render_checkbox_row(
-                            "fill-shows-in-exports",
-                            "Show in exports",
-                            show_in_exports,
-                            DesignPanelProperty::FillShowsInExports,
-                            cx,
-                        ));
-                    }
-                }
-                self.render_section(
-                    DesignPanelSection::Fill,
-                    Some(DesignPanelCollection::Fill),
-                    content.into_any_element(),
-                    cx,
-                )
-            },
+    fn paint_section_identity(&self) -> sections::paints::PaintSectionIdentity {
+        sections::paints::PaintSectionIdentity::new(
+            self.id.clone(),
+            self.host.inspected_node().id.clone(),
+            self.command_target(),
         )
     }
 
-    pub(super) fn render_stroke(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        (self.node.supports_stroke() && self.node.supports_section(DesignPanelSection::Stroke))
-            .then(|| {
-                let mut content = v_flex().pl(px(PANEL_PADDING)).pr_2().pb_4().gap_2();
-                let Some(stroke) = self.node.stroke.as_ref() else {
-                    return self.render_section(
-                        DesignPanelSection::Stroke,
-                        Some(DesignPanelCollection::Stroke),
-                        div().into_any_element(),
-                        cx,
-                    );
-                };
-
-                if let Some(binding) = self.node.stroke_style_binding.as_ref() {
-                    content = content.child(self.render_bound_style_summary(
-                        "stroke",
-                        binding.name.clone(),
-                        cx,
-                    ));
-                } else {
-                    for (index, paint) in stroke.paints.iter().cloned().enumerate() {
-                        content = content.child(self.render_paint_row(
-                            paint,
-                            DesignPanelCollection::Stroke,
-                            index,
-                            cx,
-                        ));
-                    }
-                }
-                if stroke.paints.is_empty() && self.node.stroke_style_binding.is_none() {
-                    return self.render_section(
-                        DesignPanelSection::Stroke,
-                        Some(DesignPanelCollection::Stroke),
-                        div().into_any_element(),
-                        cx,
-                    );
-                } else {
-                    let basic = stroke.complex_stroke.is_basic();
-                    let mut geometry = v_flex().w_full().gap_2();
-                    let weight_control = h_flex()
-                        .w_full()
-                        .gap_1()
-                        .child(div().flex_1().min_w(px(0.)).child(self.render_value_cell(
-                            "stroke-weight",
-                            "—",
-                            format_number(stroke.weights.active()),
-                            DesignPanelProperty::StrokeWeight,
-                            DesignPanelValue::Number(stroke.weights.active() + 1.),
-                            cx,
-                        )))
-                        .when(stroke.capabilities.individual_weights, |row| {
-                            row.child(div().w(px(24.)).flex_none().child(
-                                self.render_icon_action_button(
-                                    "stroke-weight-mode",
-                                    IconName::Settings2,
-                                    DesignPanelAction::PropertyChangeRequested {
-                                        node_id: self.node.id.clone(),
-                                        property: DesignPanelProperty::StrokeWeightMode,
-                                        value: DesignPanelValue::StrokeWeightMode(
-                                            if stroke.weights.mode == DesignStrokeWeightMode::Custom
-                                            {
-                                                DesignStrokeWeightMode::All
-                                            } else {
-                                                DesignStrokeWeightMode::Custom
-                                            },
-                                        ),
-                                    },
-                                    cx,
-                                ),
-                            ))
-                        })
-                        .into_any_element();
-
-                    if stroke.capabilities.position && basic {
-                        geometry = geometry.child(
-                            h_flex()
-                                .w_full()
-                                .items_end()
-                                .gap_2()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .gap_1()
-                                        .child(self.render_group_label("Position", cx))
-                                        .child(self.render_value_cell(
-                                            "stroke-align",
-                                            "▣",
-                                            stroke.align.label(),
-                                            DesignPanelProperty::StrokeAlign,
-                                            DesignPanelValue::StrokeAlign(
-                                                DesignStrokeAlign::Center,
-                                            ),
-                                            cx,
-                                        )),
-                                )
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .gap_1()
-                                        .child(self.render_group_label("Weight", cx))
-                                        .child(weight_control),
-                                ),
-                        );
-                    } else {
-                        geometry = geometry.child(
-                            v_flex()
-                                .w_full()
-                                .gap_1()
-                                .child(self.render_group_label("Weight", cx))
-                                .child(weight_control),
-                        );
-                    }
-
-                    if stroke.capabilities.individual_weights
-                        && stroke.weights.mode == DesignStrokeWeightMode::Custom
-                    {
-                        geometry = geometry
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(self.render_value_cell(
-                                        "stroke-weight-top",
-                                        "T",
-                                        format_number(stroke.weights.top),
-                                        DesignPanelProperty::StrokeWeightTop,
-                                        DesignPanelValue::Number(stroke.weights.top + 1.),
-                                        cx,
-                                    ))
-                                    .child(self.render_value_cell(
-                                        "stroke-weight-right",
-                                        "R",
-                                        format_number(stroke.weights.right),
-                                        DesignPanelProperty::StrokeWeightRight,
-                                        DesignPanelValue::Number(stroke.weights.right + 1.),
-                                        cx,
-                                    )),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(self.render_value_cell(
-                                        "stroke-weight-bottom",
-                                        "B",
-                                        format_number(stroke.weights.bottom),
-                                        DesignPanelProperty::StrokeWeightBottom,
-                                        DesignPanelValue::Number(stroke.weights.bottom + 1.),
-                                        cx,
-                                    ))
-                                    .child(self.render_value_cell(
-                                        "stroke-weight-left",
-                                        "L",
-                                        format_number(stroke.weights.left),
-                                        DesignPanelProperty::StrokeWeightLeft,
-                                        DesignPanelValue::Number(stroke.weights.left + 1.),
-                                        cx,
-                                    )),
-                            );
-                    }
-
-                    if basic {
-                        geometry = geometry
-                            .child(self.render_group_label("Dash style", cx))
-                            .child(self.render_value_cell(
-                                "stroke-dash-mode",
-                                "⋯",
-                                stroke.dashes.mode.label(),
-                                DesignPanelProperty::StrokeDashMode,
-                                DesignPanelValue::StrokeDashMode(stroke.dashes.mode.next()),
-                                cx,
-                            ));
-                        if !stroke.dashes.is_solid() {
-                            geometry = geometry
-                                .child(self.render_group_label("Dash pattern", cx))
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            self.render_value_cell(
-                                                "stroke-dash-pattern",
-                                                "⋯",
-                                                stroke
-                                                    .dashes
-                                                    .pattern
-                                                    .iter()
-                                                    .map(|value| format_number(*value))
-                                                    .collect::<Vec<_>>()
-                                                    .join(", "),
-                                                DesignPanelProperty::StrokeDashPattern,
-                                                DesignPanelValue::NumberList(
-                                                    stroke.dashes.pattern.clone(),
-                                                ),
-                                                cx,
-                                            ),
-                                        )
-                                        .child(self.render_value_cell(
-                                            "stroke-dash-cap",
-                                            "•",
-                                            stroke.dash_cap.label(),
-                                            DesignPanelProperty::StrokeDashCap,
-                                            DesignPanelValue::StrokeCap(DesignStrokeCap::Round),
-                                            cx,
-                                        )),
-                                );
-                        }
-
-                        geometry = match stroke.edit_context.endpoint_control() {
-                            DesignStrokeEndpointControl::None => geometry,
-                            DesignStrokeEndpointControl::StartAndEnd => geometry.child(
-                                h_flex()
-                                    .w_full()
-                                    .items_end()
-                                    .gap_2()
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .gap_1()
-                                            .child(self.render_group_label("Start point", cx))
-                                            .child(self.render_value_cell(
-                                                "stroke-start-cap",
-                                                "←",
-                                                stroke.start_cap.label(),
-                                                DesignPanelProperty::StrokeStartCap,
-                                                DesignPanelValue::StrokeCap(DesignStrokeCap::Round),
-                                                cx,
-                                            )),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .gap_1()
-                                            .child(self.render_group_label("End point", cx))
-                                            .child(self.render_value_cell(
-                                                "stroke-end-cap",
-                                                "→",
-                                                stroke.end_cap.label(),
-                                                DesignPanelProperty::StrokeEndCap,
-                                                DesignPanelValue::StrokeCap(
-                                                    DesignStrokeCap::LineArrow,
-                                                ),
-                                                cx,
-                                            )),
-                                    )
-                                    .child(self.render_symbol_action_button(
-                                        "swap-stroke-endpoints",
-                                        "⇄",
-                                        DesignPanelAction::SwapStrokeEndpointsRequested {
-                                            node_id: self.node.id.clone(),
-                                        },
-                                        cx,
-                                    )),
-                            ),
-                            DesignStrokeEndpointControl::Aggregate => {
-                                geometry.child(self.render_value_cell(
-                                    "stroke-endpoint-cap",
-                                    "↔",
-                                    format!("End points · {}", stroke.endpoint_cap.label()),
-                                    DesignPanelProperty::StrokeEndpointCap,
-                                    DesignPanelValue::StrokeCap(DesignStrokeCap::Round),
-                                    cx,
-                                ))
-                            }
-                            DesignStrokeEndpointControl::SelectedVertices => {
-                                geometry.child(self.render_value_cell(
-                                    "stroke-selected-endpoint-cap",
-                                    "◆",
-                                    format!("Selection · {}", stroke.endpoint_cap.label()),
-                                    DesignPanelProperty::StrokeEndpointCap,
-                                    DesignPanelValue::StrokeCap(DesignStrokeCap::Round),
-                                    cx,
-                                ))
-                            }
-                        };
-
-                        if stroke.capabilities.joins {
-                            geometry = geometry.child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(self.render_value_cell(
-                                        "stroke-join",
-                                        "⌁",
-                                        stroke.join.label(),
-                                        DesignPanelProperty::StrokeJoin,
-                                        DesignPanelValue::StrokeJoin(DesignStrokeJoin::Round),
-                                        cx,
-                                    ))
-                                    .when(stroke.join == DesignStrokeJoin::Miter, |row| {
-                                        row.child(self.render_value_cell(
-                                            "stroke-miter-angle",
-                                            "°",
-                                            format_number(stroke.miter_angle),
-                                            DesignPanelProperty::StrokeMiterAngle,
-                                            DesignPanelValue::Number(
-                                                (stroke.miter_angle + 1.).min(180.),
-                                            ),
-                                            cx,
-                                        ))
-                                    }),
-                            );
-                        }
-                    }
-
-                    if stroke.supports_variable_width() {
-                        let variable_width_label = stroke
-                            .variable_width
-                            .as_ref()
-                            .map_or("None", DesignVariableWidthStroke::label);
-                        geometry = geometry
-                            .child(self.render_group_label("Variable width", cx))
-                            .child(self.render_value_cell(
-                                "stroke-variable-width",
-                                "⌇",
-                                variable_width_label,
-                                DesignPanelProperty::StrokeVariableWidth,
-                                DesignPanelValue::StrokeVariableWidth(Some(
-                                    DesignVariableWidthStroke::Preset(
-                                        DesignVariableWidthPreset::Taper,
-                                    ),
-                                )),
-                                cx,
-                            ));
-                        if let Some(DesignVariableWidthStroke::Custom { points }) =
-                            stroke.variable_width.as_ref()
-                        {
-                            for (index, point) in points.iter().enumerate() {
-                                geometry = geometry
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("Point {}", index + 1)),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(self.render_value_cell(
-                                            format!("stroke-width-point-{index}-position"),
-                                            "P",
-                                            format_number(point.position),
-                                            DesignPanelProperty::StrokeVariableWidthPointPosition(
-                                                index,
-                                            ),
-                                            DesignPanelValue::Number(
-                                                (point.position + 0.05).min(1.),
-                                            ),
-                                            cx,
-                                        ))
-                                        .child(self.render_value_cell(
-                                            format!("stroke-width-point-{index}-width"),
-                                            "W",
-                                            format_number(point.width),
-                                            DesignPanelProperty::StrokeVariableWidthPointWidth(
-                                                index,
-                                            ),
-                                            DesignPanelValue::Number(point.width + 0.1),
-                                            cx,
-                                        )),
-                                );
-                            }
-                        }
-                    }
-
-                    if stroke.capabilities.complex_stroke {
-                        let next_type = match stroke.complex_stroke.kind() {
-                            DesignStrokeType::Basic => DesignStrokeType::StretchBrush,
-                            DesignStrokeType::StretchBrush => DesignStrokeType::ScatterBrush,
-                            DesignStrokeType::ScatterBrush => DesignStrokeType::Dynamic,
-                            DesignStrokeType::Dynamic => DesignStrokeType::Basic,
-                            DesignStrokeType::Opaque => DesignStrokeType::Opaque,
-                        };
-                        geometry = geometry.child(self.render_value_cell(
-                            "stroke-type",
-                            "⌁",
-                            stroke.complex_stroke.label(),
-                            DesignPanelProperty::StrokeType,
-                            DesignPanelValue::StrokeType(next_type),
-                            cx,
-                        ));
-                        match &stroke.complex_stroke {
-                            DesignComplexStroke::Basic => {}
-                            DesignComplexStroke::StretchBrush(stretch) => {
-                                geometry = geometry.child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(self.render_value_cell(
-                                            "stroke-stretch-brush",
-                                            "✎",
-                                            stretch.brush.label(),
-                                            DesignPanelProperty::StrokeStretchBrush,
-                                            DesignPanelValue::StrokeStretchBrush(
-                                                stretch.brush.next(),
-                                            ),
-                                            cx,
-                                        ))
-                                        .child(self.render_value_cell(
-                                            "stroke-brush-direction",
-                                            "→",
-                                            stretch.direction.label(),
-                                            DesignPanelProperty::StrokeBrushDirection,
-                                            DesignPanelValue::StrokeBrushDirection(
-                                                match stretch.direction {
-                                                    DesignStrokeBrushDirection::Forward => {
-                                                        DesignStrokeBrushDirection::Backward
-                                                    }
-                                                    DesignStrokeBrushDirection::Backward => {
-                                                        DesignStrokeBrushDirection::Forward
-                                                    }
-                                                },
-                                            ),
-                                            cx,
-                                        )),
-                                );
-                            }
-                            DesignComplexStroke::ScatterBrush(scatter) => {
-                                geometry = geometry
-                                    .child(self.render_value_cell(
-                                        "stroke-scatter-brush",
-                                        "✣",
-                                        scatter.brush.label(),
-                                        DesignPanelProperty::StrokeScatterBrush,
-                                        DesignPanelValue::StrokeScatterBrush(scatter.brush.next()),
-                                        cx,
-                                    ))
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .child(self.render_value_cell(
-                                                "stroke-scatter-gap",
-                                                "G",
-                                                format_number(scatter.gap),
-                                                DesignPanelProperty::StrokeScatterGap,
-                                                DesignPanelValue::Number(scatter.gap + 0.25),
-                                                cx,
-                                            ))
-                                            .child(self.render_value_cell(
-                                                "stroke-scatter-wiggle",
-                                                "W",
-                                                format_number(scatter.wiggle),
-                                                DesignPanelProperty::StrokeScatterWiggle,
-                                                DesignPanelValue::Number(scatter.wiggle + 0.1),
-                                                cx,
-                                            )),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .child(self.render_value_cell(
-                                                "stroke-scatter-size-jitter",
-                                                "S",
-                                                format_number(scatter.size_jitter),
-                                                DesignPanelProperty::StrokeScatterSizeJitter,
-                                                DesignPanelValue::Number(
-                                                    (scatter.size_jitter + 0.1).min(3.),
-                                                ),
-                                                cx,
-                                            ))
-                                            .child(self.render_value_cell(
-                                                "stroke-scatter-angular-jitter",
-                                                "A",
-                                                format_number(scatter.angular_jitter),
-                                                DesignPanelProperty::StrokeScatterAngularJitter,
-                                                DesignPanelValue::Number(
-                                                    (scatter.angular_jitter + 15.).min(180.),
-                                                ),
-                                                cx,
-                                            )),
-                                    )
-                                    .child(self.render_value_cell(
-                                        "stroke-scatter-rotation",
-                                        "R",
-                                        format_number(scatter.rotation),
-                                        DesignPanelProperty::StrokeScatterRotation,
-                                        DesignPanelValue::Number(
-                                            (scatter.rotation + 15.).min(180.),
-                                        ),
-                                        cx,
-                                    ));
-                            }
-                            DesignComplexStroke::Dynamic(dynamic) => {
-                                geometry = geometry
-                                    .child(self.render_value_cell(
-                                        "stroke-dynamic-frequency",
-                                        "F",
-                                        format_number(dynamic.frequency),
-                                        DesignPanelProperty::StrokeDynamicFrequency,
-                                        DesignPanelValue::Number(
-                                            (dynamic.frequency + 0.25).min(20.),
-                                        ),
-                                        cx,
-                                    ))
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .child(self.render_value_cell(
-                                                "stroke-dynamic-wiggle",
-                                                "W",
-                                                format_number(dynamic.wiggle),
-                                                DesignPanelProperty::StrokeDynamicWiggle,
-                                                DesignPanelValue::Number(dynamic.wiggle + 0.1),
-                                                cx,
-                                            ))
-                                            .child(self.render_value_cell(
-                                                "stroke-dynamic-smoothen",
-                                                "S",
-                                                format_number(dynamic.smoothen),
-                                                DesignPanelProperty::StrokeDynamicSmoothen,
-                                                DesignPanelValue::Number(
-                                                    (dynamic.smoothen + 0.1).min(1.),
-                                                ),
-                                                cx,
-                                            )),
-                                    );
-                            }
-                            DesignComplexStroke::Opaque(opaque) => {
-                                geometry = geometry.child(
-                                    v_flex()
-                                        .w_full()
-                                        .gap_1()
-                                        .child(self.render_group_label("Custom stroke", cx))
-                                        .child(
-                                            div()
-                                                .w_full()
-                                                .min_h(px(ROW_HEIGHT))
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(px(4.))
-                                                .bg(cx.theme().secondary)
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!(
-                                                    "{} · {}",
-                                                    opaque.type_name, opaque.raw
-                                                )),
-                                        ),
-                                );
-                            }
-                        }
-                    }
-                    content = content.child(geometry);
-                }
-                self.render_section(
-                    DesignPanelSection::Stroke,
-                    Some(DesignPanelCollection::Stroke),
-                    content.into_any_element(),
-                    cx,
-                )
-            })
+    fn fill_projection(&self) -> sections::paints::FillProjection {
+        sections::paints::FillProjection::new(
+            sections::paints::PaintCollectionProjection::new(
+                self.host.inspected_node().supports_fill()
+                    && self
+                        .host
+                        .inspected_node()
+                        .supports_section(DesignPanelSection::Fill),
+                self.host.inspected_node().fills.clone(),
+                self.host.inspected_node().fill_style_binding.clone(),
+            ),
+            self.host.inspected_node().fill_shows_in_exports,
+        )
     }
 
-    pub(super) fn render_auxiliary_color_picker_control(
+    fn stroke_projection(&self) -> sections::paints::StrokeProjection {
+        let stroke = self.host.inspected_node().stroke.clone();
+        let weight_mode_action = DesignPanelAction::PropertyChangeRequested {
+            node_id: self.host.inspected_node().id.clone(),
+            property: DesignPanelProperty::StrokeWeightMode,
+            value: DesignPanelValue::StrokeWeightMode(
+                if stroke
+                    .as_ref()
+                    .is_some_and(|stroke| stroke.weights.mode == DesignStrokeWeightMode::Custom)
+                {
+                    DesignStrokeWeightMode::All
+                } else {
+                    DesignStrokeWeightMode::Custom
+                },
+            ),
+        };
+        let swap_action = DesignPanelAction::SwapStrokeEndpointsRequested {
+            node_id: self.host.inspected_node().id.clone(),
+        };
+        sections::paints::StrokeProjection::new(
+            self.paint_section_identity(),
+            sections::paints::PaintCollectionProjection::new(
+                self.host.inspected_node().supports_stroke()
+                    && self
+                        .host
+                        .inspected_node()
+                        .supports_section(DesignPanelSection::Stroke),
+                stroke
+                    .as_ref()
+                    .map(|stroke| stroke.paints.clone())
+                    .unwrap_or_default(),
+                self.host.inspected_node().stroke_style_binding.clone(),
+            ),
+            stroke,
+            sections::paints::StrokeActionAvailability::new(
+                self.can_edit() && self.node_capability_allows_action(&weight_mode_action),
+                self.can_edit() && self.node_capability_allows_action(&swap_action),
+            ),
+        )
+    }
+
+    fn render_fill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        sections::paints::render_fill(&self.fill_projection(), self, cx)
+    }
+
+    fn render_stroke(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let events = sections::paints::PaintsEventSink::new(cx.entity());
+        sections::paints::render_stroke(&self.stroke_projection(), self, &events, cx)
+    }
+
+    fn render_auxiliary_color_picker_control(
         &self,
         panel: Entity<Self>,
         id_suffix: impl Into<SharedString>,
@@ -2085,10 +1870,11 @@ impl DesignPanel {
         let picker_focus = picker.focus_handle(cx);
         let id_suffix = id_suffix.into();
         let label = label.into();
-        let open = self.auxiliary_color_picker.as_ref() == Some(&target);
+        let open = self.overlays.auxiliary_color_picker().as_ref() == Some(&target);
         let selected = matches!(target, AuxiliaryColorPickerTarget::TextDecoration { .. })
             && self
-                .node
+                .host
+                .inspected_node()
                 .typography
                 .as_ref()
                 .and_then(|typography| typography.decoration_details.as_ref())
@@ -2115,10 +1901,11 @@ impl DesignPanel {
                 panel.update(cx, |this, cx| {
                     if !open {
                         this.open_auxiliary_color_picker(target, window, cx);
-                    } else if this.auxiliary_color_picker.as_ref() == Some(&target) {
+                    } else if this.overlays.auxiliary_color_picker().as_ref() == Some(&target) {
                         this.prepare_paint_picker_for_dismissal(cx);
                         this.cancel_active_paint_edit(cx);
-                        this.auxiliary_color_picker = None;
+                        this.overlays
+                            .discard(DesignOpenOverlay::AuxiliaryColorPicker);
                     }
                     cx.notify();
                 });
@@ -2155,12 +1942,13 @@ impl DesignPanel {
             panel_for_open.update(cx, |this, cx| {
                 if *open {
                     this.open_auxiliary_color_picker(target, window, cx);
-                } else if this.auxiliary_color_picker.as_ref() == Some(&target) {
-                    this.prepare_paint_picker_for_dismissal(cx);
-                    this.cancel_active_paint_edit(cx);
-                    this.auxiliary_color_picker = None;
+                } else if this.overlays.auxiliary_color_picker().as_ref() == Some(&target) {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::AuxiliaryColorPicker,
+                        window,
+                        cx,
+                    );
                 }
-                cx.notify();
             });
         })
         .trigger(trigger)
@@ -2168,21 +1956,22 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn selection_color(
+    fn selection_color(
         &self,
         selection_color_id: &str,
     ) -> Option<super::super::DesignSelectionColor> {
-        self.node
+        self.host
+            .inspected_node()
             .resolved_selection_colors()
             .into_iter()
             .find(|color| color.id.as_ref() == selection_color_id)
     }
 
-    pub(super) fn selection_color_references_target_current(
+    fn selection_color_references_target_current(
         &self,
         color: &super::super::DesignSelectionColor,
     ) -> bool {
-        self.inspection_context.selection().kind() == DesignPanelSelectionKind::Multiple
+        self.host.inspection_context.selection().kind() == DesignPanelSelectionKind::Multiple
             && !color.paint_references.is_empty()
             && matches!(
                 self.command_target(),
@@ -2195,14 +1984,11 @@ impl DesignPanel {
             )
     }
 
-    pub(super) fn selection_color_can_mutate(
-        &self,
-        color: &super::super::DesignSelectionColor,
-    ) -> bool {
+    fn selection_color_can_mutate(&self, color: &super::super::DesignSelectionColor) -> bool {
         self.can_edit() && !color.read_only && self.selection_color_references_target_current(color)
     }
 
-    pub(super) fn selection_color_can_select_occurrences(
+    fn selection_color_can_select_occurrences(
         &self,
         color: &super::super::DesignSelectionColor,
     ) -> bool {
@@ -2210,7 +1996,7 @@ impl DesignPanel {
             && u32::try_from(color.paint_references.len()) == Ok(color.occurrence_count)
     }
 
-    pub(super) fn selection_color_paint_editable(
+    fn selection_color_paint_editable(
         &self,
         color: &super::super::DesignSelectionColor,
         edit: &DesignPaintEdit,
@@ -2234,7 +2020,7 @@ impl DesignPanel {
         candidate.apply_edit(edit)
     }
 
-    pub(super) fn emit_selection_color_occurrences_select(
+    fn emit_selection_color_occurrences_select(
         &mut self,
         selection_color_id: SharedString,
         cx: &mut Context<Self>,
@@ -2255,7 +2041,7 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn open_selection_color_resource_browser(
+    fn open_selection_color_resource_browser(
         &mut self,
         selection_color_id: SharedString,
         kind: SelectionColorResourceKind,
@@ -2265,9 +2051,13 @@ impl DesignPanel {
             return;
         }
         if kind == SelectionColorResourceKind::PaintStyle {
-            self.style_browser_source_filter =
-                self.style_browser_source_filter.normalized_for_libraries(
-                    self.paint_style_view_data
+            self.features.style_browser.source_filter = self
+                .features
+                .style_browser
+                .source_filter
+                .normalized_for_libraries(
+                    self.resources
+                        .paint_styles
                         .libraries
                         .iter()
                         .map(|library| (&library.id, &library.name)),
@@ -2275,21 +2065,17 @@ impl DesignPanel {
         }
         self.prepare_paint_picker_for_dismissal(cx);
         self.cancel_active_paint_edit(cx);
-        self.auxiliary_color_picker = None;
-        self.active_picker = None;
-        self.paint_style_browser_open = None;
-        self.effect_style_browser_open = false;
-        self.layout_grid_style_browser_open = false;
-        self.typography_style_picker_open = false;
-        self.selection_header_overlay = None;
-        self.selection_color_resource_browser = Some(SelectionColorResourceTarget {
-            selection_color_id,
-            kind,
-        });
+        self.overlays
+            .open(DesignOverlayState::SelectionColorResource(
+                SelectionColorResourceTarget {
+                    selection_color_id,
+                    kind,
+                },
+            ));
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_paint_style_apply(
+    fn emit_selection_color_paint_style_apply(
         &mut self,
         selection_color_id: SharedString,
         style: DesignPaintStyleSelection,
@@ -2300,13 +2086,15 @@ impl DesignPanel {
         };
         if !self.selection_color_can_mutate(&color)
             || self
-                .paint_style_view_data
+                .resources
+                .paint_styles
                 .style(&style)
                 .is_none_or(|style| style.import_state != DesignPaintStyleImportState::Imported)
         {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorPaintStyleApplyRequested {
@@ -2319,7 +2107,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_paint_style_import(
+    fn emit_selection_color_paint_style_import(
         &mut self,
         selection_color_id: SharedString,
         style: DesignPaintStyleSelection,
@@ -2330,13 +2118,15 @@ impl DesignPanel {
         };
         if !self.selection_color_can_mutate(&color)
             || self
-                .paint_style_view_data
+                .resources
+                .paint_styles
                 .style(&style)
                 .is_none_or(|style| style.import_state != DesignPaintStyleImportState::Available)
         {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorPaintStyleImportRequested {
@@ -2349,7 +2139,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_paint_style_create(
+    fn emit_selection_color_paint_style_create(
         &mut self,
         selection_color_id: SharedString,
         cx: &mut Context<Self>,
@@ -2363,7 +2153,8 @@ impl DesignPanel {
         {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorPaintStyleCreateRequested {
@@ -2376,7 +2167,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_paint_style_detach(
+    fn emit_selection_color_paint_style_detach(
         &mut self,
         selection_color_id: SharedString,
         cx: &mut Context<Self>,
@@ -2395,7 +2186,8 @@ impl DesignPanel {
         if !self.selection_color_can_mutate(&color) {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorPaintStyleDetachRequested {
@@ -2408,7 +2200,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_variable_apply(
+    fn emit_selection_color_variable_apply(
         &mut self,
         selection_color_id: SharedString,
         variable_id: SharedString,
@@ -2417,7 +2209,10 @@ impl DesignPanel {
         let Some(color) = self.selection_color(selection_color_id.as_ref()) else {
             return;
         };
-        let variable = self.paint_variable_view_data.variable(variable_id.as_ref());
+        let variable = self
+            .resources
+            .paint_variables
+            .variable(variable_id.as_ref());
         if !self.selection_color_can_mutate(&color)
             || color.style_binding.is_some()
             || variable.is_none_or(|variable| {
@@ -2430,7 +2225,8 @@ impl DesignPanel {
         {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorVariableApplyRequested {
@@ -2443,7 +2239,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_variable_import(
+    fn emit_selection_color_variable_import(
         &mut self,
         selection_color_id: SharedString,
         variable_id: SharedString,
@@ -2452,7 +2248,10 @@ impl DesignPanel {
         let Some(color) = self.selection_color(selection_color_id.as_ref()) else {
             return;
         };
-        let variable = self.paint_variable_view_data.variable(variable_id.as_ref());
+        let variable = self
+            .resources
+            .paint_variables
+            .variable(variable_id.as_ref());
         if !self.selection_color_can_mutate(&color)
             || color.style_binding.is_some()
             || variable.is_none_or(|variable| {
@@ -2462,7 +2261,8 @@ impl DesignPanel {
         {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorVariableImportRequested {
@@ -2475,7 +2275,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_variable_create(
+    fn emit_selection_color_variable_create(
         &mut self,
         selection_color_id: SharedString,
         cx: &mut Context<Self>,
@@ -2489,7 +2289,8 @@ impl DesignPanel {
         {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorVariableCreateRequested {
@@ -2502,7 +2303,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_selection_color_variable_detach(
+    fn emit_selection_color_variable_detach(
         &mut self,
         selection_color_id: SharedString,
         cx: &mut Context<Self>,
@@ -2516,7 +2317,8 @@ impl DesignPanel {
         if !self.selection_color_can_mutate(&color) || color.style_binding.is_some() {
             return;
         }
-        self.selection_color_resource_browser = None;
+        self.overlays
+            .discard(DesignOpenOverlay::SelectionColorResource);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::SelectionColorVariableDetachRequested {
@@ -2529,7 +2331,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn render_selection_color_paint_style_button(
+    fn render_selection_color_paint_style_button(
         &self,
         color: &super::super::DesignSelectionColor,
         cx: &mut Context<Self>,
@@ -2537,7 +2339,8 @@ impl DesignPanel {
         let color = color.clone();
         let selection_color_id = color.id.clone();
         let active = self
-            .selection_color_resource_browser
+            .overlays
+            .selection_color_resource_browser()
             .as_ref()
             .is_some_and(|target| {
                 target.selection_color_id == selection_color_id
@@ -2547,16 +2350,18 @@ impl DesignPanel {
         let binding = color.style_binding.clone();
         let can_create = can_mutate && binding.is_none() && !color.style_paints.is_empty();
         let query = self.normalized_style_browser_query(cx);
-        let source_filter = self.style_browser_source_filter.clone();
-        let view_mode = self.style_browser_view_mode;
-        let catalog_is_empty = self.paint_style_view_data.page_styles.is_empty()
+        let source_filter = self.features.style_browser.source_filter.clone();
+        let view_mode = self.features.style_browser.view_mode;
+        let catalog_is_empty = self.resources.paint_styles.page_styles.is_empty()
             && self
-                .paint_style_view_data
+                .resources
+                .paint_styles
                 .libraries
                 .iter()
                 .all(|library| library.styles.is_empty());
         let page_styles = if source_filter.includes_page() {
-            self.paint_style_view_data
+            self.resources
+                .paint_styles
                 .page_styles
                 .iter()
                 .map(|style| {
@@ -2575,7 +2380,8 @@ impl DesignPanel {
             Vec::new()
         };
         let libraries = self
-            .paint_style_view_data
+            .resources
+            .paint_styles
             .libraries
             .iter()
             .filter(|library| source_filter.includes_library(library.id.as_ref()))
@@ -2613,9 +2419,10 @@ impl DesignPanel {
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
         let panel_id = self.id.clone();
-        let style_browser_search = self.style_browser_search.clone();
+        let style_browser_search = self.retained.inputs.style_browser_search.clone();
         let style_browser_library_sources = self
-            .paint_style_view_data
+            .resources
+            .paint_styles
             .libraries
             .iter()
             .map(|library| (library.id.clone(), library.name.clone()))
@@ -2653,23 +2460,31 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(active)
         .overlay_closable(true)
-        .on_open_change(move |open, _, cx| {
+        .on_open_change(move |open, window, cx| {
             let selection_color_id = selection_color_id.clone();
             panel_for_open.update(cx, |this, cx| {
                 if *open {
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::SelectionColorResource,
+                        window,
+                        cx,
+                    );
                     this.open_selection_color_resource_browser(
                         selection_color_id,
                         SelectionColorResourceKind::PaintStyle,
                         cx,
                     );
-                } else if this.selection_color_resource_browser.as_ref()
+                } else if this.overlays.selection_color_resource_browser().as_ref()
                     == Some(&SelectionColorResourceTarget {
                         selection_color_id,
                         kind: SelectionColorResourceKind::PaintStyle,
                     })
                 {
-                    this.selection_color_resource_browser = None;
-                    cx.notify();
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::SelectionColorResource,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -2884,7 +2699,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_selection_color_variable_button(
+    fn render_selection_color_variable_button(
         &self,
         color: &super::super::DesignSelectionColor,
         cx: &mut Context<Self>,
@@ -2892,7 +2707,8 @@ impl DesignPanel {
         let color = color.clone();
         let selection_color_id = color.id.clone();
         let active = self
-            .selection_color_resource_browser
+            .overlays
+            .selection_color_resource_browser()
             .as_ref()
             .is_some_and(|target| {
                 target.selection_color_id == selection_color_id
@@ -2905,7 +2721,7 @@ impl DesignPanel {
         let binding = color.binding.clone();
         let can_create = can_change_leaf && binding.is_none();
         let mut groups: Vec<(DesignVariableSource, Vec<DesignVariable>)> = Vec::new();
-        for variable in self.paint_variable_view_data.variables.iter().cloned() {
+        for variable in self.resources.paint_variables.variables.iter().cloned() {
             if let Some((_, variables)) = groups
                 .iter_mut()
                 .find(|(source, _)| *source == variable.source)
@@ -2935,7 +2751,7 @@ impl DesignPanel {
         let trigger = Button::new(SharedString::from(format!(
             "{panel_id}-selection-color-{selection_color_id}-variable"
         )))
-        .label("◇")
+        .label("Select")
         .tooltip(tooltip)
         .xsmall()
         .compact()
@@ -2959,23 +2775,31 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(active)
         .overlay_closable(true)
-        .on_open_change(move |open, _, cx| {
+        .on_open_change(move |open, window, cx| {
             let selection_color_id = selection_color_id.clone();
             panel_for_open.update(cx, |this, cx| {
                 if *open {
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::SelectionColorResource,
+                        window,
+                        cx,
+                    );
                     this.open_selection_color_resource_browser(
                         selection_color_id,
                         SelectionColorResourceKind::ColorVariable,
                         cx,
                     );
-                } else if this.selection_color_resource_browser.as_ref()
+                } else if this.overlays.selection_color_resource_browser().as_ref()
                     == Some(&SelectionColorResourceTarget {
                         selection_color_id,
                         kind: SelectionColorResourceKind::ColorVariable,
                     })
                 {
-                    this.selection_color_resource_browser = None;
-                    cx.notify();
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::SelectionColorResource,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -3123,7 +2947,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_selection_paint_picker_control(
+    fn render_selection_paint_picker_control(
         &self,
         index: usize,
         selection_color: &super::super::DesignSelectionColor,
@@ -3147,7 +2971,7 @@ impl DesignPanel {
         } else {
             paint_label
         };
-        let open = self.auxiliary_color_picker.as_ref() == Some(&target);
+        let open = self.overlays.auxiliary_color_picker().as_ref() == Some(&target);
         let panel = cx.entity();
         let picker = self.paint_picker.clone();
         let picker_content = picker.clone();
@@ -3170,10 +2994,11 @@ impl DesignPanel {
                 panel.update(cx, |this, cx| {
                     if !open {
                         this.open_auxiliary_color_picker(target, window, cx);
-                    } else if this.auxiliary_color_picker.as_ref() == Some(&target) {
+                    } else if this.overlays.auxiliary_color_picker().as_ref() == Some(&target) {
                         this.prepare_paint_picker_for_dismissal(cx);
                         this.cancel_active_paint_edit(cx);
-                        this.auxiliary_color_picker = None;
+                        this.overlays
+                            .discard(DesignOpenOverlay::AuxiliaryColorPicker);
                     }
                     cx.notify();
                 });
@@ -3202,12 +3027,13 @@ impl DesignPanel {
             panel.update(cx, |this, cx| {
                 if *open {
                     this.open_auxiliary_color_picker(target, window, cx);
-                } else if this.auxiliary_color_picker.as_ref() == Some(&target) {
-                    this.prepare_paint_picker_for_dismissal(cx);
-                    this.cancel_active_paint_edit(cx);
-                    this.auxiliary_color_picker = None;
+                } else if this.overlays.auxiliary_color_picker().as_ref() == Some(&target) {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::AuxiliaryColorPicker,
+                        window,
+                        cx,
+                    );
                 }
-                cx.notify();
             });
         })
         .trigger(trigger)
@@ -3215,7 +3041,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_selection_color_occurrences_button(
+    fn render_selection_color_occurrences_button(
         &self,
         color: &super::super::DesignSelectionColor,
         cx: &mut Context<Self>,
@@ -3247,63 +3073,39 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_selection_colors(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.inspection_context.selection().kind() != DesignPanelSelectionKind::Multiple {
-            return None;
-        }
-        let colors = self.node.resolved_selection_colors();
-        if colors.is_empty() {
-            return None;
-        }
-        let mut content = v_flex().px(px(PANEL_PADDING)).pb_4().gap_1();
-        for (index, selection_color) in colors.into_iter().enumerate() {
-            let target = AuxiliaryColorPickerTarget::SelectionColor {
-                target: self.command_target(),
-                selection_color_id: selection_color.id.clone(),
-            };
-            content = content.child(
-                h_flex()
-                    .h(px(28.))
-                    .w_full()
-                    .gap_1()
-                    .child(div().flex_1().min_w(px(0.)).child(
-                        self.render_selection_paint_picker_control(
-                            index,
-                            &selection_color,
-                            target,
-                            cx,
-                        ),
-                    ))
-                    .child(self.render_selection_color_paint_style_button(&selection_color, cx))
-                    .child(self.render_selection_color_variable_button(&selection_color, cx))
-                    .child(self.render_selection_color_occurrences_button(&selection_color, cx)),
-            );
-        }
-        Some(self.render_section(
-            DesignPanelSection::Selection,
-            None,
-            content.into_any_element(),
-            cx,
-        ))
+    fn selection_colors_projection(&self) -> sections::paints::SelectionColorsProjection {
+        sections::paints::SelectionColorsProjection::new(
+            self.paint_section_identity(),
+            self.host.inspection_context.selection().kind() == DesignPanelSelectionKind::Multiple,
+            self.host.inspected_node().resolved_selection_colors(),
+        )
     }
 
-    pub(super) fn paint_collection(
-        &self,
-        collection: DesignPanelCollection,
-    ) -> Option<&[DesignPaint]> {
+    fn render_selection_colors(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        sections::paints::render_selection_colors(&self.selection_colors_projection(), self, cx)
+    }
+
+    fn paint_collection(&self, collection: DesignPanelCollection) -> Option<&[DesignPaint]> {
         if !self.collection_is_supported(collection) {
             return None;
         }
         match collection {
-            DesignPanelCollection::Fill => Some(&self.node.fills),
-            DesignPanelCollection::Stroke => Some(self.node.stroke.as_ref()?.paints.as_slice()),
+            DesignPanelCollection::Fill => Some(&self.host.inspected_node().fills),
+            DesignPanelCollection::Stroke => Some(
+                self.host
+                    .inspected_node()
+                    .stroke
+                    .as_ref()?
+                    .paints
+                    .as_slice(),
+            ),
             DesignPanelCollection::Effect
             | DesignPanelCollection::LayoutGrid
             | DesignPanelCollection::Export => None,
         }
     }
 
-    pub(super) fn paint_target_index(&self, target: &PaintPickerTarget) -> Option<usize> {
+    fn paint_target_index(&self, target: &PaintPickerTarget) -> Option<usize> {
         let paints = self.paint_collection(target.collection)?;
         if !target.paint_id.is_empty() {
             return paints.iter().position(|paint| paint.id == target.paint_id);
@@ -3311,7 +3113,7 @@ impl DesignPanel {
         (target.index < paints.len()).then_some(target.index)
     }
 
-    pub(super) fn emit_media_source_action(
+    fn emit_media_source_action(
         &self,
         target: PaintPickerTarget,
         expected_source_id: &SharedString,
@@ -3345,7 +3147,8 @@ impl DesignPanel {
             return;
         }
         let capabilities = self
-            .media_paint_view_data
+            .resources
+            .media_paints
             .paint(target.collection, &target.paint_id, index)
             .map_or_else(DesignMediaPaintCapabilities::default, |view| {
                 view.capabilities
@@ -3356,7 +3159,7 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintMediaSourceActionRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection: target.collection,
                 target: self.paint_target(target.collection),
                 paint_id: target.paint_id,
@@ -3367,7 +3170,7 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn media_drop_capabilities_for_target(
+    fn media_drop_capabilities_for_target(
         &self,
         target: &PaintPickerTarget,
     ) -> Option<(
@@ -3393,7 +3196,8 @@ impl DesignPanel {
             _ => return None,
         };
         let capabilities = self
-            .media_paint_view_data
+            .resources
+            .media_paints
             .paint(target.collection, &target.paint_id, index)
             .map_or_else(DesignMediaPaintCapabilities::default, |view| {
                 view.capabilities
@@ -3402,7 +3206,7 @@ impl DesignPanel {
             .then_some((index, media_kind, source_id, capabilities))
     }
 
-    pub(super) fn emit_media_source_drop_from_paths(
+    fn emit_media_source_drop_from_paths(
         &self,
         target: PaintPickerTarget,
         paths: &[PathBuf],
@@ -3419,7 +3223,7 @@ impl DesignPanel {
         self.emit_media_source_drop(target, &expected_source_id, expected_media_kind, file, cx);
     }
 
-    pub(super) fn emit_media_source_drop(
+    fn emit_media_source_drop(
         &self,
         target: PaintPickerTarget,
         expected_source_id: &SharedString,
@@ -3442,7 +3246,7 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::PaintMediaSourceDropRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 collection: target.collection,
                 target: self.paint_target(target.collection),
                 paint_id: target.paint_id,
@@ -3454,16 +3258,57 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn emit_crop_cancel_if_active(
-        &self,
+    /// Forwards one crop-tool action through the edit controller's guarded
+    /// lifecycle. The host snapshot intentionally remains authoritative for
+    /// whether an externally-started crop is active.
+    fn emit_media_crop_action(
+        &mut self,
         target: &PaintPickerTarget,
+        action: DesignMediaCropAction,
         cx: &mut Context<Self>,
     ) {
         let Some(index) = self.paint_target_index(target) else {
             return;
         };
+        if !self.can_edit() {
+            return;
+        }
+        let host_active = self
+            .resources
+            .media_paints
+            .paint(target.collection, &target.paint_id, index)
+            .is_some_and(|view| view.crop_tool.active);
+        let lifecycle_target = DesignMediaCropEditTarget::new(
+            self.host.inspected_node().id.clone(),
+            target.collection,
+            target.paint_id.clone(),
+        );
+        if !self
+            .edit
+            .should_forward_media_crop_action(lifecycle_target, &action, host_active)
+        {
+            return;
+        }
+        cx.emit_design_panel_action(
+            self,
+            DesignPanelAction::PaintMediaCropActionRequested {
+                node_id: self.host.inspected_node().id.clone(),
+                collection: target.collection,
+                target: self.paint_target(target.collection),
+                paint_id: target.paint_id.clone(),
+                index,
+                action,
+            },
+        );
+    }
+
+    fn emit_crop_cancel_if_active(&mut self, target: &PaintPickerTarget, cx: &mut Context<Self>) {
+        let Some(index) = self.paint_target_index(target) else {
+            return;
+        };
         let Some(view) =
-            self.media_paint_view_data
+            self.resources
+                .media_paints
                 .paint(target.collection, &target.paint_id, index)
         else {
             return;
@@ -3485,21 +3330,11 @@ impl DesignPanel {
             && view.crop_tool.active
             && crop_paint
         {
-            cx.emit_design_panel_action(
-                self,
-                DesignPanelAction::PaintMediaCropActionRequested {
-                    node_id: self.node.id.clone(),
-                    collection: target.collection,
-                    target: self.paint_target(target.collection),
-                    paint_id: target.paint_id.clone(),
-                    index,
-                    action: DesignMediaCropAction::Cancel,
-                },
-            );
+            self.emit_media_crop_action(target, DesignMediaCropAction::Cancel, cx);
         }
     }
 
-    pub(super) fn resolve_paint_color_target(
+    fn resolve_paint_color_target(
         &self,
         target: &PaintPickerTarget,
         color_target: &DesignPaintColorTarget,
@@ -3537,7 +3372,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn paint_color_binding(
+    fn paint_color_binding(
         &self,
         target: &PaintPickerTarget,
         color_target: &DesignPaintColorTarget,
@@ -3562,14 +3397,14 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn picker_paint(&self, target: &PaintPickerTarget) -> Option<DesignPaint> {
+    fn picker_paint(&self, target: &PaintPickerTarget) -> Option<DesignPaint> {
         let index = self.paint_target_index(target)?;
         self.paint_collection(target.collection)?
             .get(index)
             .cloned()
     }
 
-    pub(super) fn auxiliary_color_state_properties(
+    fn auxiliary_color_state_properties(
         &self,
         target: &AuxiliaryColorPickerTarget,
     ) -> Vec<DesignPanelProperty> {
@@ -3585,9 +3420,14 @@ impl DesignPanel {
                 ..
             } => {
                 let resolved_index = if effect_id.is_empty() {
-                    self.node.effects.get(*index).map(|_| *index)
+                    self.host
+                        .inspected_node()
+                        .effects
+                        .get(*index)
+                        .map(|_| *index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .effects
                         .iter()
                         .position(|effect| effect.id == *effect_id)
@@ -3600,9 +3440,14 @@ impl DesignPanel {
                 guide_id, index, ..
             } => {
                 let resolved_index = if guide_id.is_empty() {
-                    self.node.layout_grids.get(*index).map(|_| *index)
+                    self.host
+                        .inspected_node()
+                        .layout_grids
+                        .get(*index)
+                        .map(|_| *index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .layout_grids
                         .iter()
                         .position(|guide| guide.id == *guide_id)
@@ -3617,7 +3462,8 @@ impl DesignPanel {
             AuxiliaryColorPickerTarget::SelectionColor {
                 selection_color_id, ..
             } => self
-                .node
+                .host
+                .inspected_node()
                 .resolved_selection_colors()
                 .iter()
                 .position(|color| color.id == *selection_color_id)
@@ -3626,13 +3472,13 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn active_auxiliary_state_property(&self) -> Option<DesignPanelProperty> {
-        let target = self.auxiliary_color_picker.as_ref()?;
+    fn active_auxiliary_state_property(&self) -> Option<DesignPanelProperty> {
+        let target = self.overlays.auxiliary_color_picker()?;
         let active = self
-            .active_paint_edit
-            .as_ref()
+            .edit
+            .active_paint_edit()
             .filter(|active| target.matches_picker_target(&active.target))?;
-        let properties = self.auxiliary_color_state_properties(target);
+        let properties = self.auxiliary_color_state_properties(&target);
         match (&target, &active.edit.property) {
             (AuxiliaryColorPickerTarget::LayoutGrid { .. }, DesignPaintProperty::Color) => {
                 properties.first().copied()
@@ -3647,7 +3493,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn auxiliary_color_leaf_editability(
+    fn auxiliary_color_leaf_editability(
         &self,
         target: &AuxiliaryColorPickerTarget,
     ) -> (bool, bool) {
@@ -3659,7 +3505,7 @@ impl DesignPanel {
                 (editable, editable)
             }
             AuxiliaryColorPickerTarget::TextDecoration { node_id, .. } => {
-                let editable = *node_id == self.node.id
+                let editable = *node_id == self.host.inspected_node().id
                     && self.property_is_editable(DesignPanelProperty::TextDecorationColor);
                 (editable, editable)
             }
@@ -3670,14 +3516,15 @@ impl DesignPanel {
                 property,
             } => {
                 let resolved_index = if effect_id.is_empty() {
-                    (*index < self.node.effects.len()).then_some(*index)
+                    (*index < self.host.inspected_node().effects.len()).then_some(*index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .effects
                         .iter()
                         .position(|effect| effect.id == *effect_id)
                 };
-                let editable = *node_id == self.node.id
+                let editable = *node_id == self.host.inspected_node().id
                     && resolved_index.is_some_and(|resolved_index| {
                         self.property_is_editable(property.with_effect_index(resolved_index))
                     });
@@ -3689,14 +3536,15 @@ impl DesignPanel {
                 index,
             } => {
                 let resolved_index = if guide_id.is_empty() {
-                    (*index < self.node.layout_grids.len()).then_some(*index)
+                    (*index < self.host.inspected_node().layout_grids.len()).then_some(*index)
                 } else {
-                    self.node
+                    self.host
+                        .inspected_node()
                         .layout_grids
                         .iter()
                         .position(|guide| guide.id == *guide_id)
                 };
-                if *node_id != self.node.id {
+                if *node_id != self.host.inspected_node().id {
                     return (false, false);
                 }
                 resolved_index.map_or((false, false), |resolved_index| {
@@ -3714,7 +3562,8 @@ impl DesignPanel {
                 selection_color_id, ..
             } => {
                 let Some(color) = self
-                    .node
+                    .host
+                    .inspected_node()
                     .resolved_selection_colors()
                     .into_iter()
                     .find(|color| color.id == *selection_color_id)
@@ -3732,12 +3581,12 @@ impl DesignPanel {
     }
 
     #[cfg(test)]
-    pub(super) fn auxiliary_color_editable(&self, target: &AuxiliaryColorPickerTarget) -> bool {
+    fn auxiliary_color_editable(&self, target: &AuxiliaryColorPickerTarget) -> bool {
         let (color_editable, opacity_editable) = self.auxiliary_color_leaf_editability(target);
         color_editable || opacity_editable
     }
 
-    pub(super) fn auxiliary_paint_property_editable(
+    fn auxiliary_paint_property_editable(
         &self,
         target: &AuxiliaryColorPickerTarget,
         property: &DesignPaintProperty,
@@ -3784,7 +3633,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn auxiliary_paint_editable(
+    fn auxiliary_paint_editable(
         &self,
         target: &AuxiliaryColorPickerTarget,
         edit: &DesignPaintEdit,
@@ -3800,7 +3649,7 @@ impl DesignPanel {
         self.auxiliary_paint_property_editable(target, &edit.property)
     }
 
-    pub(super) fn open_auxiliary_color_picker(
+    fn open_auxiliary_color_picker(
         &mut self,
         target: AuxiliaryColorPickerTarget,
         window: &mut Window,
@@ -3809,15 +3658,14 @@ impl DesignPanel {
         let Some(paint) = self.auxiliary_color_paint(&target) else {
             return;
         };
+        if self.overlays.auxiliary_color_picker().as_ref() != Some(&target) {
+            self.remember_overlay_focus_return(DesignOpenOverlay::AuxiliaryColorPicker, window, cx);
+        }
         let editability = self.auxiliary_color_leaf_editability(&target);
         self.cancel_active_paint_edit(cx);
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.paint_style_browser_open = None;
-        self.auxiliary_color_picker = Some(target.clone());
-        self.effect_style_browser_open = false;
-        self.typography_style_picker_open = false;
-        self.selection_header_overlay = None;
+        self.overlays
+            .open(DesignOverlayState::AuxiliaryColorPicker(target.clone()));
         let title = SharedString::from(target.title());
         let full_paint = matches!(target, AuxiliaryColorPickerTarget::SelectionColor { .. });
         let disabled = full_paint
@@ -3850,13 +3698,11 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn active_color_contrast_view_data(
-        &self,
-    ) -> Option<DesignColorContrastPaintViewData> {
+    fn active_color_contrast_view_data(&self) -> Option<DesignColorContrastPaintViewData> {
         let target = if let Some(AuxiliaryColorPickerTarget::SelectionColor {
             target,
             selection_color_id,
-        }) = self.auxiliary_color_picker.as_ref()
+        }) = self.overlays.auxiliary_color_picker().as_ref()
         {
             if *target != self.command_target() {
                 return None;
@@ -3865,11 +3711,11 @@ impl DesignPanel {
                 target.clone(),
                 selection_color_id.clone(),
             )
-        } else if self.auxiliary_color_picker.is_none() {
-            let target = self.active_picker.as_ref()?;
-            let index = self.paint_target_index(target)?;
+        } else if self.overlays.auxiliary_color_picker().is_none() {
+            let target = self.overlays.active_picker()?;
+            let index = self.paint_target_index(&target)?;
             DesignColorContrastPaintTarget::paint(
-                self.node.id.clone(),
+                self.host.inspected_node().id.clone(),
                 target.collection,
                 target.paint_id.clone(),
                 index,
@@ -3877,15 +3723,16 @@ impl DesignPanel {
         } else {
             return None;
         };
-        self.color_contrast_view_data.paint(&target).cloned()
+        self.resources.color_contrast.paint(&target).cloned()
     }
 
-    pub(super) fn sync_paint_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_paint_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let contrast_view_data = self.active_color_contrast_view_data();
-        if let Some(target) = self.auxiliary_color_picker.clone() {
+        if let Some(target) = self.overlays.auxiliary_color_picker().clone() {
             let Some(paint) = self.auxiliary_color_paint(&target) else {
                 self.cancel_active_paint_edit(cx);
-                self.auxiliary_color_picker = None;
+                self.overlays
+                    .discard(DesignOpenOverlay::AuxiliaryColorPicker);
                 self.paint_picker
                     .update(cx, |picker, cx| picker.clear(window, cx));
                 return;
@@ -3938,7 +3785,7 @@ impl DesignPanel {
             }
             return;
         }
-        let desired = self.active_picker.as_ref().and_then(|target| {
+        let desired = self.overlays.active_picker().as_ref().and_then(|target| {
             let index = self.paint_target_index(target)?;
             self.picker_paint(target)
                 .map(|paint| (target.clone(), index, paint))
@@ -3951,7 +3798,7 @@ impl DesignPanel {
             let picker = self.paint_picker.read(cx);
             let target_matches = match (&desired, picker.target()) {
                 (Some((target, index, _)), Some(current)) => {
-                    current.node_id == self.node.id
+                    current.node_id == self.host.inspected_node().id
                         && current.collection == target.collection
                         && if current.paint_id.is_empty() || target.paint_id.is_empty() {
                             current.index == *index
@@ -3981,7 +3828,7 @@ impl DesignPanel {
             return;
         }
 
-        let node_id = self.node.id.clone();
+        let node_id = self.host.inspected_node().id.clone();
         self.paint_picker.update(cx, |picker, cx| {
             picker.set_color_only(None, cx);
             match desired {
@@ -3998,7 +3845,7 @@ impl DesignPanel {
         });
     }
 
-    pub(super) fn render_page_background_picker(
+    fn render_page_background_picker(
         &self,
         page: &DesignPageViewData,
         cx: &mut Context<Self>,
@@ -4012,9 +3859,9 @@ impl DesignPanel {
         let target = AuxiliaryColorPickerTarget::PageBackground {
             page_id: page.page_id.clone(),
         };
-        let open = self.page_background_picker_open
-            && self.auxiliary_color_picker.as_ref() == Some(&target);
-        let disabled_reason = if !self.inspection_context.permissions().can_edit() {
+        let open = self.overlays.page_background_picker_open()
+            && self.overlays.auxiliary_color_picker().as_ref() == Some(&target);
+        let disabled_reason = if !self.host.inspection_context.permissions().can_edit() {
             Some(SharedString::from("View only"))
         } else if page.background.read_only {
             page.background
@@ -4043,15 +3890,15 @@ impl DesignPanel {
             move |window, cx| {
                 let target = target.clone();
                 panel.update(cx, |this, cx| {
-                    this.page_background_picker_open = !open;
+                    this.overlays
+                        .set_open(DesignOverlayState::PageBackground, !open);
                     if !open {
-                        this.page_resource_browser = None;
-                        this.variable_mode_browser_open = false;
                         this.open_auxiliary_color_picker(target, window, cx);
-                    } else if this.auxiliary_color_picker.as_ref() == Some(&target) {
+                    } else if this.overlays.auxiliary_color_picker().as_ref() == Some(&target) {
                         this.prepare_paint_picker_for_dismissal(cx);
                         this.cancel_active_paint_edit(cx);
-                        this.auxiliary_color_picker = None;
+                        this.overlays
+                            .discard(DesignOpenOverlay::AuxiliaryColorPicker);
                     }
                     cx.notify();
                 });
@@ -4069,17 +3916,27 @@ impl DesignPanel {
         .on_open_change(move |open, window, cx| {
             let target = target.clone();
             panel_for_open.update(cx, |this, cx| {
-                this.page_background_picker_open = *open;
                 if *open {
-                    this.page_resource_browser = None;
-                    this.variable_mode_browser_open = false;
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::PageBackground,
+                        window,
+                        cx,
+                    );
+                    this.overlays.open(DesignOverlayState::PageBackground);
                     this.open_auxiliary_color_picker(target, window, cx);
-                } else if this.auxiliary_color_picker.as_ref() == Some(&target) {
-                    this.prepare_paint_picker_for_dismissal(cx);
-                    this.cancel_active_paint_edit(cx);
-                    this.auxiliary_color_picker = None;
+                } else if this.overlays.auxiliary_color_picker().as_ref() == Some(&target) {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::AuxiliaryColorPicker,
+                        window,
+                        cx,
+                    );
+                } else if this.overlays.page_background_picker_open() {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::PageBackground,
+                        window,
+                        cx,
+                    );
                 }
-                cx.notify();
             });
         })
         .trigger(trigger)

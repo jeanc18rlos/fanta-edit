@@ -18,6 +18,7 @@ mod shape;
 mod stroke;
 mod typography;
 mod variables;
+mod view_data;
 mod viewer;
 mod workspace;
 
@@ -36,6 +37,7 @@ pub use shape::*;
 pub use stroke::*;
 pub use typography::*;
 pub use variables::*;
+pub use view_data::*;
 pub use viewer::*;
 pub use workspace::*;
 

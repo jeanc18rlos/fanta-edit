@@ -1,43 +1,336 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn component_property_index(&self, property_id: &str) -> Option<usize> {
-        self.node
+mod dialogs;
+mod editors;
+mod state;
+
+pub(super) use state::ComponentAuthoringState;
+
+/// Internal Component/instance controller surface used by the thin `DesignPanel` facade.
+pub(super) trait DesignComponentController: Sized + 'static {
+    fn emit_component_multiline_event(
+        &self,
+        event: DesignComponentMultilineEditEvent,
+        cx: &mut Context<Self>,
+    );
+    fn component_property_index(&self, property_id: &str) -> Option<usize>;
+    fn component_property_variable_target(
+        &self,
+        index: usize,
+    ) -> Option<DesignComponentPropertyVariableTarget>;
+    fn component_property_variable_can_change(&self, index: usize) -> bool;
+    fn emit_component_property_variable_apply(
+        &mut self,
+        index: usize,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_component_property_variable_import(
+        &mut self,
+        index: usize,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_component_property_variable_detach(
+        &mut self,
+        index: usize,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn open_component_property_variable_picker(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn component_swap_can_change(&self, index: usize) -> bool;
+    fn emit_component_swap_apply(
+        &mut self,
+        index: usize,
+        selection: Option<DesignComponentSwapSelection>,
+        cx: &mut Context<Self>,
+    );
+    fn emit_component_swap_import(
+        &mut self,
+        index: usize,
+        selection: DesignComponentSwapSelection,
+        cx: &mut Context<Self>,
+    );
+    fn set_component_swap_preview(
+        &mut self,
+        index: usize,
+        selection: Option<DesignComponentSwapSelection>,
+        cx: &mut Context<Self>,
+    );
+    fn clear_component_swap_preview(&mut self, property_id: &str, cx: &mut Context<Self>);
+    fn open_component_swap_browser(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn open_component_multiline_editor(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn open_component_multiline_editor_from_control(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn preview_component_multiline(&mut self, cx: &mut Context<Self>);
+    fn finish_component_multiline_editor(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn component_change_for_property(
+        &self,
+        property: DesignPanelProperty,
+        value: &DesignPanelValue,
+    ) -> Option<(SharedString, DesignComponentPropertyValue)>;
+    fn slot_settings_change_for_property(
+        &self,
+        property: DesignPanelProperty,
+        value: &DesignPanelValue,
+    ) -> Option<(
+        SharedString,
+        super::super::DesignSlotSettings,
+        DesignSlotSettingsChange,
+    )>;
+    fn component_property_with_index(
+        property: DesignPanelProperty,
+        index: usize,
+    ) -> DesignPanelProperty;
+    fn cancel_component_multiline_transaction(&mut self, cx: &mut Context<Self>);
+    fn cancel_component_swap_preview(&mut self, cx: &mut Context<Self>);
+    fn render_component_property_variable_button(
+        &self,
+        index: usize,
+        panel: Entity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement>;
+    fn render_component_swap_browser(
+        &self,
+        index: usize,
+        property: &super::super::DesignComponentProperty,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn component_authoring_view_data(&self) -> Option<&DesignComponentAuthoringViewData>;
+    fn component_property_partition_order(
+        &self,
+        partition: DesignComponentPropertyPartition,
+    ) -> Vec<SharedString>;
+    fn reconcile_slot_limits_state(&mut self);
+    fn component_variant_option_order(&self, property_id: &str) -> Option<Vec<SharedString>>;
+    fn component_property_name(&self, property_id: &str) -> Option<SharedString>;
+    fn component_variant_option_name(
+        &self,
+        property_id: &str,
+        option_id: &str,
+    ) -> Option<SharedString>;
+    fn order_successor(order: &[SharedString], id: &str) -> Option<SharedString>;
+    fn reconcile_component_authoring_edit_sessions(&mut self, cx: &mut Context<Self>);
+    fn reconcile_component_authoring_state(&mut self, cx: &mut Context<Self>);
+    fn open_component_authoring_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn cancel_component_authoring_dialog_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn begin_component_property_create(
+        &mut self,
+        kind: DesignComponentPropertyKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn cancel_component_property_create(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn close_component_authoring_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn submit_component_property_create(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn component_authoring_slot_limits(&self, cx: &App) -> Option<(Option<u32>, Option<u32>)>;
+    fn open_component_property_edit(
+        &mut self,
+        property_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn finish_component_property_edit(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn cancel_component_authoring_edit_transactions(&mut self, cx: &mut Context<Self>);
+    fn cancel_component_authoring_for_workspace_change(&mut self, cx: &mut Context<Self>);
+    fn begin_component_property_rename(
+        &mut self,
+        property_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn begin_component_variant_option_rename(
+        &mut self,
+        property_id: SharedString,
+        option_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn begin_component_variant_option_create(
+        &mut self,
+        property_id: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn preview_component_authoring_name(&mut self, cx: &mut Context<Self>);
+    fn finish_component_authoring_name_edit(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn request_component_property_delete(
+        &mut self,
+        property_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn begin_component_property_reorder(
+        &mut self,
+        drag: &ComponentPropertyDefinitionDrag,
+        cx: &mut Context<Self>,
+    );
+    fn preview_component_property_reorder(
+        &mut self,
+        before_property_id: Option<SharedString>,
+        cx: &mut Context<Self>,
+    );
+    fn finish_component_property_reorder(&mut self, commit: bool, cx: &mut Context<Self>);
+    fn begin_component_variant_option_reorder(
+        &mut self,
+        drag: &ComponentVariantOptionDrag,
+        cx: &mut Context<Self>,
+    );
+    fn preview_component_variant_option_reorder(
+        &mut self,
+        before_option_id: Option<SharedString>,
+        cx: &mut Context<Self>,
+    );
+    fn finish_component_variant_option_reorder(&mut self, commit: bool, cx: &mut Context<Self>);
+    fn component_authoring_action_is_enabled(&self, action: &DesignPanelAction) -> bool;
+    fn emit_component_authoring_edit_action(
+        &mut self,
+        action: DesignPanelAction,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn emit_component_authoring_action(&self, action: DesignPanelAction, cx: &mut Context<Self>);
+    fn render_applied_component_property_controls(
+        &self,
+        surface: DesignComponentPropertyApplicationSurface,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement>;
+    fn render_component_property_create_popover(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn component_authoring_uses_inline_modal_fallback(&self) -> bool;
+    fn render_component_property_create_modal(
+        &self,
+        panel: Entity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement>;
+    fn render_component_property_edit_modal(
+        &self,
+        panel: Entity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement>;
+    fn render_component_definition_authoring(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn render_nested_component_property_exposures(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement>;
+    fn render_slot_limits(
+        &self,
+        property: &DesignComponentProperty,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement>;
+    fn render_component_property_row(
+        &self,
+        role: DesignComponentRole,
+        index: usize,
+        property: DesignComponentProperty,
+        multiline_editor_active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn component_projection(&self) -> Option<sections::component::ComponentProjection>;
+    fn render_component(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn component_action_is_enabled(&self, action: &DesignPanelAction) -> bool;
+    fn emit_component_action(&self, action: DesignPanelAction, cx: &mut Context<Self>);
+    fn render_component_action_button(
+        &self,
+        id_suffix: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        action: DesignPanelAction,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+}
+
+impl DesignComponentController for DesignPanel {
+    fn emit_component_multiline_event(
+        &self,
+        event: DesignComponentMultilineEditEvent,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit_design_panel_action(
+            self,
+            DesignPanelAction::ComponentPropertyEditRequested {
+                node_id: self.host.inspected_node().id.clone(),
+                property_id: event.property_id,
+                value: event.value,
+                phase: event.phase,
+            },
+        );
+    }
+
+    fn component_property_index(&self, property_id: &str) -> Option<usize> {
+        self.host
+            .inspected_node()
             .component_properties
             .iter()
             .position(|property| property.id.as_ref() == property_id)
     }
 
-    pub(super) fn component_property_variable_target(
+    fn component_property_variable_target(
         &self,
         index: usize,
     ) -> Option<DesignComponentPropertyVariableTarget> {
-        let role = self.node.component_role()?;
-        self.node
+        let role = self.host.inspected_node().component_role()?;
+        self.host
+            .inspected_node()
             .component_properties
             .get(index)?
             .variable_target(role)
     }
 
-    pub(super) fn component_property_variable_can_change(&self, index: usize) -> bool {
+    fn component_property_variable_can_change(&self, index: usize) -> bool {
         if !self.can_edit() {
             return false;
         }
-        let Some(role) = self.node.component_role() else {
+        let Some(role) = self.host.inspected_node().component_role() else {
             return false;
         };
-        let Some(property) = self.node.component_properties.get(index) else {
+        let Some(property) = self.host.inspected_node().component_properties.get(index) else {
             return false;
         };
         if property.variable_target(role).is_none() {
             return false;
         }
-        self.property_value_states
+        self.host
+            .property_states
             .get(&DesignPanelProperty::ComponentProperty(index))
             .is_none_or(|state| !state.is_read_only() && state.binding().is_none())
     }
 
-    pub(super) fn emit_component_property_variable_apply(
+    fn emit_component_property_variable_apply(
         &mut self,
         index: usize,
         variable_id: SharedString,
@@ -47,7 +340,8 @@ impl DesignPanel {
             return;
         };
         let Some(variable) = self
-            .property_variable_view_data
+            .resources
+            .property_variables
             .variable(variable_id.as_ref())
         else {
             return;
@@ -59,11 +353,12 @@ impl DesignPanel {
         {
             return;
         }
-        self.component_property_variable_picker = None;
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::ComponentPropertyVariableApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
@@ -71,7 +366,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_component_property_variable_import(
+    fn emit_component_property_variable_import(
         &mut self,
         index: usize,
         variable_id: SharedString,
@@ -81,7 +376,8 @@ impl DesignPanel {
             return;
         };
         let Some(variable) = self
-            .property_variable_view_data
+            .resources
+            .property_variables
             .variable(variable_id.as_ref())
         else {
             return;
@@ -96,14 +392,14 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::ComponentPropertyVariableImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
         );
     }
 
-    pub(super) fn emit_component_property_variable_detach(
+    fn emit_component_property_variable_detach(
         &mut self,
         index: usize,
         variable_id: SharedString,
@@ -113,7 +409,8 @@ impl DesignPanel {
             return;
         };
         let Some(binding) = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .get(index)
             .and_then(|property| property.variable_binding(target.field))
@@ -127,11 +424,12 @@ impl DesignPanel {
             return;
         }
         let variable_id = binding.variable_id.clone();
-        self.component_property_variable_picker = None;
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::ComponentPropertyVariableDetachRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
@@ -139,7 +437,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn open_component_property_variable_picker(
+    fn open_component_property_variable_picker(
         &mut self,
         index: usize,
         window: &mut Window,
@@ -148,14 +446,19 @@ impl DesignPanel {
         let Some(target) = self.component_property_variable_target(index) else {
             return;
         };
-        self.component_property_variable_picker = Some(target);
-        self.component_swap_browser = None;
-        self.property_variable_picker = None;
+        if self.overlays.component_property_variable_picker().as_ref() != Some(&target) {
+            self.remember_overlay_focus_return(
+                DesignOpenOverlay::ComponentPropertyVariable,
+                window,
+                cx,
+            );
+        }
+        self.overlays
+            .open(DesignOverlayState::ComponentPropertyVariable(target));
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.type_settings_open = false;
-        self.component_property_variable_search
+        self.retained
+            .inputs
+            .component_property_variable_search
             .update(cx, |input, cx| {
                 input.set_value("", window, cx);
                 input.focus(window, cx);
@@ -163,8 +466,9 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn component_swap_can_change(&self, index: usize) -> bool {
-        self.node
+    fn component_swap_can_change(&self, index: usize) -> bool {
+        self.host
+            .inspected_node()
             .component_properties
             .get(index)
             .is_some_and(|property| {
@@ -176,7 +480,7 @@ impl DesignPanel {
             && self.property_is_editable(DesignPanelProperty::ComponentProperty(index))
     }
 
-    pub(super) fn emit_component_swap_apply(
+    fn emit_component_swap_apply(
         &mut self,
         index: usize,
         selection: Option<DesignComponentSwapSelection>,
@@ -185,7 +489,8 @@ impl DesignPanel {
         if !self.component_swap_can_change(index)
             || selection.as_ref().is_some_and(|selection| {
                 !self
-                    .component_swap_view_data
+                    .resources
+                    .component_swaps
                     .candidate(selection)
                     .is_some_and(DesignComponentSwapCandidate::can_apply)
             })
@@ -193,7 +498,8 @@ impl DesignPanel {
             return;
         }
         let Some(property_id) = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .get(index)
             .map(|property| property.id.clone())
@@ -201,11 +507,11 @@ impl DesignPanel {
             return;
         };
         self.clear_component_swap_preview(property_id.as_ref(), cx);
-        self.component_swap_browser = None;
+        self.overlays.discard(DesignOpenOverlay::ComponentSwap);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::ComponentSwapApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 property_id,
                 selection,
             },
@@ -213,7 +519,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_component_swap_import(
+    fn emit_component_swap_import(
         &mut self,
         index: usize,
         selection: DesignComponentSwapSelection,
@@ -221,14 +527,16 @@ impl DesignPanel {
     ) {
         if !self.component_swap_can_change(index)
             || !self
-                .component_swap_view_data
+                .resources
+                .component_swaps
                 .candidate(&selection)
                 .is_some_and(DesignComponentSwapCandidate::can_import)
         {
             return;
         }
         let Some(property_id) = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .get(index)
             .map(|property| property.id.clone())
@@ -238,14 +546,14 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::ComponentSwapImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 property_id,
                 selection,
             },
         );
     }
 
-    pub(super) fn set_component_swap_preview(
+    fn set_component_swap_preview(
         &mut self,
         index: usize,
         selection: Option<DesignComponentSwapSelection>,
@@ -255,7 +563,8 @@ impl DesignPanel {
             return;
         }
         let Some(property_id) = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .get(index)
             .map(|property| property.id.clone())
@@ -264,13 +573,14 @@ impl DesignPanel {
         };
         if selection.as_ref().is_some_and(|selection| {
             !self
-                .component_swap_view_data
+                .resources
+                .component_swaps
                 .candidate(selection)
                 .is_some_and(DesignComponentSwapCandidate::can_apply)
         }) {
             return;
         }
-        if self.component_swap_hovered.as_ref()
+        if self.features.component.swap_hovered.as_ref()
             == selection
                 .as_ref()
                 .map(|selection| (property_id.clone(), selection.clone()))
@@ -278,11 +588,11 @@ impl DesignPanel {
         {
             return;
         }
-        if let Some((previous_property_id, _)) = self.component_swap_hovered.take() {
+        if let Some((previous_property_id, _)) = self.features.component.swap_hovered.take() {
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::ComponentSwapPreviewRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id: previous_property_id,
                     selection: None,
                 },
@@ -292,30 +602,28 @@ impl DesignPanel {
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::ComponentSwapPreviewRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id: property_id.clone(),
                     selection: Some(selection.clone()),
                 },
             );
-            self.component_swap_hovered = Some((property_id, selection));
+            self.features.component.swap_hovered = Some((property_id, selection));
         }
     }
 
-    pub(super) fn clear_component_swap_preview(
-        &mut self,
-        property_id: &str,
-        cx: &mut Context<Self>,
-    ) {
+    fn clear_component_swap_preview(&mut self, property_id: &str, cx: &mut Context<Self>) {
         let should_clear = self
-            .component_swap_hovered
+            .features
+            .component
+            .swap_hovered
             .as_ref()
             .is_some_and(|(current, _)| current.as_ref() == property_id);
         if should_clear {
-            self.component_swap_hovered = None;
+            self.features.component.swap_hovered = None;
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::ComponentSwapPreviewRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id: property_id.to_owned().into(),
                     selection: None,
                 },
@@ -323,45 +631,60 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn open_component_swap_browser(
+    fn open_component_swap_browser(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(property) = self.node.component_properties.get(index) else {
+        let Some(property_id) = self
+            .host
+            .inspected_node()
+            .component_properties
+            .get(index)
+            .filter(|property| {
+                matches!(
+                    property.definition,
+                    DesignComponentPropertyDefinition::InstanceSwap { .. }
+                )
+            })
+            .map(|property| property.id.clone())
+        else {
             return;
         };
-        if !matches!(
-            property.definition,
-            DesignComponentPropertyDefinition::InstanceSwap { .. }
-        ) {
-            return;
+        if self.overlays.component_swap_browser().as_ref() != Some(&property_id) {
+            self.remember_overlay_focus_return(DesignOpenOverlay::ComponentSwap, window, cx);
         }
-        self.component_swap_browser = Some(property.id.clone());
-        self.component_property_variable_picker = None;
-        self.property_variable_picker = None;
+        self.overlays
+            .open(DesignOverlayState::ComponentSwap(property_id));
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.type_settings_open = false;
-        self.component_swap_search.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-            input.focus(window, cx);
-        });
+        self.retained
+            .inputs
+            .component_swap_search
+            .update(cx, |input, cx| {
+                input.set_value("", window, cx);
+                input.focus(window, cx);
+            });
         cx.notify();
     }
 
-    pub(super) fn open_component_multiline_editor(
+    fn open_component_multiline_editor(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // This is the lowest-level entry point and is also used by tests and
+        // non-pointer command paths. Guard it here—not only in the visual
+        // wrapper—so a second activation can never overwrite an unmatched
+        // Begin transaction.
+        if self.edit.component_multiline.is_some() {
+            return;
+        }
         if !self.property_is_editable(DesignPanelProperty::ComponentProperty(index)) {
             return;
         }
-        let Some(property) = self.node.component_properties.get(index) else {
+        let Some(property) = self.host.inspected_node().component_properties.get(index) else {
             return;
         };
         if !matches!(
@@ -377,42 +700,41 @@ impl DesignPanel {
             return;
         };
         let property_id = property.id.clone();
-        let original = DesignComponentPropertyValue::Text(value.clone());
-        self.editor_focus_return = None;
-        self.component_multiline_editor = Some(ComponentMultilineEditor {
-            property_id: property_id.clone(),
-            original: original.clone(),
-            last_preview: None,
-        });
-        self.component_swap_browser = None;
-        self.component_property_variable_picker = None;
-        cx.emit_design_panel_action(
-            self,
-            DesignPanelAction::ComponentPropertyEditRequested {
-                node_id: self.node.id.clone(),
-                property_id,
-                value: original,
-                phase: DesignPanelEditPhase::Begin,
-            },
-        );
-        self.component_multiline_input.update(cx, |input, cx| {
-            input.set_value(value, window, cx);
-            input.focus(window, cx);
-        });
+        let value = value.clone();
+        self.edit.focus_return = None;
+        let editor = ComponentMultilineEditor::new(property_id, value.clone());
+        let Some(begin) = self
+            .edit
+            .begin_component_multiline_edit(editor, value.clone())
+        else {
+            return;
+        };
+        self.overlays.discard(DesignOpenOverlay::ComponentSwap);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
+        self.emit_component_multiline_event(begin, cx);
+        self.retained
+            .inputs
+            .component_multiline
+            .update(cx, |input, cx| {
+                input.set_value(value, window, cx);
+                input.focus(window, cx);
+            });
         cx.notify();
     }
 
-    pub(super) fn open_component_multiline_editor_from_control(
+    fn open_component_multiline_editor_from_control(
         &mut self,
         index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.component_multiline_editor.is_some() {
+        if self.edit.component_multiline.is_some() {
             return;
         }
         let Some(property_id) = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .get(index)
             .map(|property| property.id.clone())
@@ -425,74 +747,56 @@ impl DesignPanel {
         });
         self.open_component_multiline_editor(index, window, cx);
         if self
-            .component_multiline_editor
+            .edit
+            .component_multiline
             .as_ref()
             .is_some_and(|editor| editor.property_id == property_id)
         {
-            self.editor_focus_return = return_focus;
+            self.edit.focus_return = return_focus;
         }
     }
 
-    pub(super) fn preview_component_multiline(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.component_multiline_editor.as_ref() else {
+    fn preview_component_multiline(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.edit.component_multiline.as_ref() else {
             return;
         };
-        let Some(index) = self.component_property_index(editor.property_id.as_ref()) else {
+        let property_id = editor.property_id.clone();
+        let Some(index) = self.component_property_index(property_id.as_ref()) else {
             return;
         };
         if !self.property_is_editable(DesignPanelProperty::ComponentProperty(index)) {
             return;
         }
-        let value =
-            DesignComponentPropertyValue::Text(self.component_multiline_input.read(cx).value());
-        let should_preview = !(editor.last_preview.is_none() && editor.original == value)
-            && editor.last_preview.as_ref() != Some(&value);
-        if !should_preview {
+        let value = self.retained.inputs.component_multiline.read(cx).value();
+        let Some(preview) = self
+            .edit
+            .preview_component_multiline_edit(property_id.as_ref(), value)
+        else {
             return;
-        }
-        let property_id = editor.property_id.clone();
-        if let Some(editor) = self.component_multiline_editor.as_mut() {
-            editor.last_preview = Some(value.clone());
-        }
-        cx.emit_design_panel_action(
-            self,
-            DesignPanelAction::ComponentPropertyEditRequested {
-                node_id: self.node.id.clone(),
-                property_id,
-                value,
-                phase: DesignPanelEditPhase::Preview,
-            },
-        );
+        };
+        self.emit_component_multiline_event(preview, cx);
         cx.notify();
     }
 
-    pub(super) fn finish_component_multiline_editor(
+    fn finish_component_multiline_editor(
         &mut self,
         commit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.component_multiline_editor.take() else {
+        let Some(property_id) = self
+            .edit
+            .component_multiline
+            .as_ref()
+            .map(|editor| editor.property_id.clone())
+        else {
             return;
         };
-        let return_focus = self.component_multiline_return_focus(editor.property_id.as_ref());
-        let (phase, value) = if commit {
-            (
-                DesignPanelEditPhase::Commit,
-                DesignComponentPropertyValue::Text(self.component_multiline_input.read(cx).value()),
-            )
-        } else {
-            (DesignPanelEditPhase::Cancel, editor.original)
-        };
-        cx.emit_design_panel_action(
-            self,
-            DesignPanelAction::ComponentPropertyEditRequested {
-                node_id: self.node.id.clone(),
-                property_id: editor.property_id,
-                value,
-                phase,
-            },
-        );
+        let return_focus = self.component_multiline_return_focus(property_id.as_ref());
+        let value = commit.then(|| self.retained.inputs.component_multiline.read(cx).value());
+        if let Some(event) = self.edit.finish_component_multiline_edit(value) {
+            self.emit_component_multiline_event(event, cx);
+        }
         Self::defer_editor_focus(
             return_focus.unwrap_or_else(|| self.focus_handle.clone()),
             window,
@@ -501,7 +805,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn component_change_for_property(
+    fn component_change_for_property(
         &self,
         property: DesignPanelProperty,
         value: &DesignPanelValue,
@@ -509,7 +813,7 @@ impl DesignPanel {
         let DesignPanelProperty::ComponentProperty(index) = property else {
             return None;
         };
-        let property = self.node.component_properties.get(index)?;
+        let property = self.host.inspected_node().component_properties.get(index)?;
         let value = match value {
             DesignPanelValue::Text(value) => property.value_from_display(value.clone())?,
             DesignPanelValue::Bool(value)
@@ -525,7 +829,7 @@ impl DesignPanel {
         Some((property.id.clone(), value))
     }
 
-    pub(super) fn slot_settings_change_for_property(
+    fn slot_settings_change_for_property(
         &self,
         property: DesignPanelProperty,
         value: &DesignPanelValue,
@@ -590,12 +894,12 @@ impl DesignPanel {
             ) => (index, DesignSlotSettingsChange::PreferredValuesOnly(*value)),
             _ => return None,
         };
-        let property = self.node.component_properties.get(index)?;
+        let property = self.host.inspected_node().component_properties.get(index)?;
         let expected_settings = property.slot_settings()?.clone();
         Some((property.id.clone(), expected_settings, change))
     }
 
-    pub(super) fn component_property_with_index(
+    fn component_property_with_index(
         property: DesignPanelProperty,
         index: usize,
     ) -> DesignPanelProperty {
@@ -622,39 +926,27 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn cancel_component_multiline_transaction(&mut self, cx: &mut Context<Self>) {
-        if let Some(editor) = self.component_multiline_editor.take() {
-            if self
-                .editor_focus_return
-                .as_ref()
-                .is_some_and(|return_focus| {
-                    matches!(
-                        &return_focus.origin,
-                        EditorFocusOrigin::ComponentMultiline(property_id)
-                            if property_id == &editor.property_id
-                    )
-                })
-            {
-                self.editor_focus_return = None;
+    fn cancel_component_multiline_transaction(&mut self, cx: &mut Context<Self>) {
+        if let Some(event) = self.edit.finish_component_multiline_edit(None) {
+            if self.edit.focus_return.as_ref().is_some_and(|return_focus| {
+                matches!(
+                    &return_focus.origin,
+                    EditorFocusOrigin::ComponentMultiline(property_id)
+                        if property_id == &event.property_id
+                )
+            }) {
+                self.edit.focus_return = None;
             }
-            cx.emit_design_panel_action(
-                self,
-                DesignPanelAction::ComponentPropertyEditRequested {
-                    node_id: self.node.id.clone(),
-                    property_id: editor.property_id,
-                    value: editor.original,
-                    phase: DesignPanelEditPhase::Cancel,
-                },
-            );
+            self.emit_component_multiline_event(event, cx);
         }
     }
 
-    pub(super) fn cancel_component_swap_preview(&mut self, cx: &mut Context<Self>) {
-        if let Some((property_id, _)) = self.component_swap_hovered.take() {
+    fn cancel_component_swap_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some((property_id, _)) = self.features.component.swap_hovered.take() {
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::ComponentSwapPreviewRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id,
                     selection: None,
                 },
@@ -662,24 +954,29 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_component_property_variable_button(
+    fn render_component_property_variable_button(
         &self,
         index: usize,
         panel: Entity<Self>,
         cx: &App,
     ) -> Option<AnyElement> {
         let target = self.component_property_variable_target(index)?;
-        let property = self.node.component_properties.get(index)?;
+        let property = self.host.inspected_node().component_properties.get(index)?;
         let binding = property.variable_binding(target.field).cloned();
-        let open = self.component_property_variable_picker.as_ref() == Some(&target);
+        let open = self.overlays.component_property_variable_picker().as_ref() == Some(&target);
         let can_change = self.component_property_variable_can_change(index);
         let panel_for_open = panel.clone();
         let panel_for_content = panel.clone();
-        let search_input = self.component_property_variable_search.clone();
+        let search_input = self
+            .retained
+            .inputs
+            .component_property_variable_search
+            .clone();
         let query = search_input.read(cx).value();
         let mut groups: Vec<(DesignVariableSource, Vec<DesignVariable>)> = Vec::new();
         for variable in self
-            .property_variable_view_data
+            .resources
+            .property_variables
             .variables
             .iter()
             .filter(|variable| {
@@ -709,7 +1006,7 @@ impl DesignPanel {
             property.id,
             target.field.api_name()
         )))
-        .label("◇")
+        .label("Select")
         .tooltip(trigger_tooltip)
         .xsmall()
         .compact()
@@ -745,9 +1042,14 @@ impl DesignPanel {
                         {
                             this.open_component_property_variable_picker(index, window, cx);
                         }
-                    } else if this.component_property_variable_picker.as_ref() == Some(&target) {
-                        this.component_property_variable_picker = None;
-                        cx.notify();
+                    } else if this.overlays.component_property_variable_picker().as_ref()
+                        == Some(&target)
+                    {
+                        let _ = this.dismiss_overlay_from_outside_click(
+                            DesignOpenOverlay::ComponentPropertyVariable,
+                            window,
+                            cx,
+                        );
                     }
                 });
             })
@@ -914,7 +1216,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn render_component_swap_browser(
+    fn render_component_swap_browser(
         &self,
         index: usize,
         property: &super::super::DesignComponentProperty,
@@ -933,9 +1235,10 @@ impl DesignPanel {
                 .collect::<HashSet<_>>(),
             _ => HashSet::new(),
         };
-        let query = self.component_swap_search.read(cx).value();
+        let query = self.retained.inputs.component_swap_search.read(cx).value();
         let matches = self
-            .component_swap_view_data
+            .resources
+            .component_swaps
             .matching(query.as_ref())
             .cloned()
             .collect::<Vec<_>>();
@@ -967,7 +1270,7 @@ impl DesignPanel {
                 groups.push((label, vec![candidate]));
             }
         }
-        let open = self.component_swap_browser.as_ref() == Some(&property.id);
+        let open = self.overlays.component_swap_browser().as_ref() == Some(&property.id);
         let can_change = self.component_swap_can_change(index);
         let panel = cx.entity();
         let panel_for_open = panel.clone();
@@ -975,7 +1278,7 @@ impl DesignPanel {
         let property_id = property.id.clone();
         let property_id_for_open = property.id.clone();
         let property_id_for_content = property.id.clone();
-        let search_input = self.component_swap_search.clone();
+        let search_input = self.retained.inputs.component_swap_search.clone();
         let trigger = Button::new(SharedString::from(format!(
             "{}-component-swap-{}",
             self.id, property.id
@@ -1013,10 +1316,12 @@ impl DesignPanel {
                     if let Some(index) = this.component_property_index(property_id.as_ref()) {
                         this.open_component_swap_browser(index, window, cx);
                     }
-                } else if this.component_swap_browser.as_ref() == Some(&property_id) {
-                    this.clear_component_swap_preview(property_id.as_ref(), cx);
-                    this.component_swap_browser = None;
-                    cx.notify();
+                } else if this.overlays.component_swap_browser().as_ref() == Some(&property_id) {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::ComponentSwap,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -1173,23 +1478,24 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn component_authoring_view_data(
-        &self,
-    ) -> Option<&DesignComponentAuthoringViewData> {
-        self.node
+    fn component_authoring_view_data(&self) -> Option<&DesignComponentAuthoringViewData> {
+        self.host
+            .inspected_node()
             .component_role()
             .filter(|role| role.can_author_component_properties())?;
-        self.node
+        self.host
+            .inspected_node()
             .component_context
             .as_ref()
             .and_then(|context| context.authoring.as_ref())
     }
 
-    pub(super) fn component_property_partition_order(
+    fn component_property_partition_order(
         &self,
         partition: DesignComponentPropertyPartition,
     ) -> Vec<SharedString> {
-        self.node
+        self.host
+            .inspected_node()
             .component_properties
             .iter()
             .filter(|property| {
@@ -1199,27 +1505,30 @@ impl DesignPanel {
             .collect()
     }
 
-    pub(super) fn reconcile_slot_limits_state(&mut self) {
-        let valid = self.open_slot_limits.as_ref().is_some_and(|property_id| {
-            self.node
-                .component_role()
-                .is_some_and(DesignComponentRole::can_modify_slot_instances)
-                && self
-                    .node
-                    .component_properties
-                    .iter()
-                    .find(|property| &property.id == property_id)
-                    .is_some_and(|property| !slot_limit_guidelines(property).is_empty())
-        });
+    fn reconcile_slot_limits_state(&mut self) {
+        let valid = self
+            .component_authoring
+            .open_slot_limits
+            .as_ref()
+            .is_some_and(|property_id| {
+                self.host
+                    .inspected_node()
+                    .component_role()
+                    .is_some_and(DesignComponentRole::can_modify_slot_instances)
+                    && self
+                        .host
+                        .inspected_node()
+                        .component_properties
+                        .iter()
+                        .find(|property| &property.id == property_id)
+                        .is_some_and(|property| !slot_limit_guidelines(property).is_empty())
+            });
         if !valid {
-            self.open_slot_limits = None;
+            self.component_authoring.open_slot_limits = None;
         }
     }
 
-    pub(super) fn component_variant_option_order(
-        &self,
-        property_id: &str,
-    ) -> Option<Vec<SharedString>> {
+    fn component_variant_option_order(&self, property_id: &str) -> Option<Vec<SharedString>> {
         Some(
             self.component_authoring_view_data()?
                 .definition(property_id)?
@@ -1230,15 +1539,16 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn component_property_name(&self, property_id: &str) -> Option<SharedString> {
-        self.node
+    fn component_property_name(&self, property_id: &str) -> Option<SharedString> {
+        self.host
+            .inspected_node()
             .component_properties
             .iter()
             .find(|property| property.id.as_ref() == property_id)
             .map(|property| property.name.clone())
     }
 
-    pub(super) fn component_variant_option_name(
+    fn component_variant_option_name(
         &self,
         property_id: &str,
         option_id: &str,
@@ -1251,7 +1561,7 @@ impl DesignPanel {
             .map(|option| option.name.clone())
     }
 
-    pub(super) fn order_successor(order: &[SharedString], id: &str) -> Option<SharedString> {
+    fn order_successor(order: &[SharedString], id: &str) -> Option<SharedString> {
         order
             .iter()
             .position(|candidate| candidate.as_ref() == id)
@@ -1259,17 +1569,149 @@ impl DesignPanel {
             .cloned()
     }
 
-    pub(super) fn reconcile_component_authoring_state(&mut self) {
+    fn reconcile_component_authoring_edit_sessions(&mut self, cx: &mut Context<Self>) {
+        let current_node_id = self.host.inspected_node().id.clone();
+
+        let name_resolution = self
+            .edit
+            .component_authoring
+            .name_editor()
+            .cloned()
+            .map(|editor| match editor {
+                ComponentAuthoringNameEditor::Property { property_id, .. } => {
+                    let current_name = self.component_property_name(property_id.as_ref());
+                    let editable = self.can_edit()
+                        && self
+                            .component_authoring_view_data()
+                            .and_then(|authoring| authoring.definition(property_id.as_ref()))
+                            .is_some_and(|definition| definition.capabilities.rename);
+                    (current_name, editable)
+                }
+                ComponentAuthoringNameEditor::VariantOption {
+                    property_id,
+                    option_id,
+                    ..
+                } => {
+                    let current_name = self
+                        .component_variant_option_name(property_id.as_ref(), option_id.as_ref());
+                    let editable = self.can_edit()
+                        && self
+                            .component_authoring_view_data()
+                            .and_then(|authoring| authoring.definition(property_id.as_ref()))
+                            .is_some_and(|definition| {
+                                definition.capabilities.edit_variant_options
+                                    && definition
+                                        .variant_options
+                                        .iter()
+                                        .find(|option| option.id == option_id)
+                                        .is_some_and(|option| option.can_rename)
+                            });
+                    (current_name, editable)
+                }
+                ComponentAuthoringNameEditor::NewVariantOption { property_id, .. } => {
+                    let editable = self.can_edit()
+                        && self
+                            .component_authoring_view_data()
+                            .and_then(|authoring| authoring.definition(property_id.as_ref()))
+                            .is_some_and(|definition| definition.capabilities.edit_variant_options);
+                    (None, editable)
+                }
+            });
+        if let Some((current_name, editable)) = name_resolution
+            && let Some(action) = self.edit.component_authoring.reconcile_name_edit(
+                &current_node_id,
+                current_name,
+                editable,
+            )
+        {
+            cx.emit_design_panel_action(self, action);
+        }
+
+        let property_reorder_resolution = self
+            .edit
+            .component_authoring
+            .property_reorder()
+            .cloned()
+            .map(|session| {
+                let current_order = self
+                    .component_authoring_view_data()
+                    .map(|_| self.component_property_partition_order(session.partition));
+                let editable = self.can_edit()
+                    && self
+                        .component_authoring_view_data()
+                        .is_some_and(|authoring| {
+                            authoring.preserves_variant_partition(
+                                &self.host.inspected_node().component_properties,
+                            ) && self
+                                .host
+                                .inspected_node()
+                                .component_properties
+                                .iter()
+                                .find(|property| property.id == session.property_id)
+                                .filter(|property| {
+                                    DesignComponentPropertyPartition::for_kind(
+                                        property.definition.kind(),
+                                    ) == session.partition
+                                })
+                                .and_then(|property| authoring.definition(property.id.as_ref()))
+                                .is_some_and(|definition| definition.capabilities.reorder)
+                        });
+                (current_order, editable)
+            });
+        if let Some((current_order, editable)) = property_reorder_resolution
+            && let Some(action) = self.edit.component_authoring.reconcile_property_reorder(
+                &current_node_id,
+                current_order,
+                editable,
+            )
+        {
+            cx.emit_design_panel_action(self, action);
+        }
+
+        let option_reorder_resolution = self
+            .edit
+            .component_authoring
+            .variant_option_reorder()
+            .cloned()
+            .map(|session| {
+                let current_order =
+                    self.component_variant_option_order(session.property_id.as_ref());
+                let editable = self.can_edit()
+                    && self
+                        .component_authoring_view_data()
+                        .and_then(|authoring| authoring.definition(session.property_id.as_ref()))
+                        .is_some_and(|definition| {
+                            definition.capabilities.edit_variant_options
+                                && definition
+                                    .variant_options
+                                    .iter()
+                                    .find(|option| option.id == session.option_id)
+                                    .is_some_and(|option| option.can_reorder)
+                        });
+                (current_order, editable)
+            });
+        if let Some((current_order, editable)) = option_reorder_resolution
+            && let Some(action) = self
+                .edit
+                .component_authoring
+                .reconcile_variant_option_reorder(&current_node_id, current_order, editable)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
+    }
+
+    fn reconcile_component_authoring_state(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_component_authoring_edit_sessions(cx);
         let authoring_available = self.can_edit() && self.component_authoring_view_data().is_some();
         if !authoring_available {
-            self.component_property_create_menu_open = false;
-            self.component_property_create_draft = None;
-            self.component_property_edit_modal = None;
-            self.component_property_selected = None;
-            self.component_property_context_menu = None;
-            self.component_authoring_name_editor = None;
-            self.component_property_reorder = None;
-            self.component_variant_option_reorder = None;
+            self.overlays
+                .discard(DesignOpenOverlay::ComponentPropertyCreateMenu);
+            self.component_authoring.create_draft = None;
+            self.component_authoring.edit_draft = None;
+            self.component_authoring.selected_property = None;
+            self.overlays
+                .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
+            self.edit.component_authoring.clear_after_cancellation();
             return;
         }
 
@@ -1281,105 +1723,50 @@ impl DesignPanel {
                     .is_some()
         };
         if self
-            .component_property_edit_modal
+            .component_authoring
+            .edit_draft
             .as_ref()
             .is_some_and(|draft| !property_exists(self, &draft.property_id))
         {
-            self.component_property_edit_modal = None;
+            self.component_authoring.edit_draft = None;
         }
         if self
-            .component_property_selected
+            .component_authoring
+            .selected_property
             .as_ref()
             .is_some_and(|property_id| !property_exists(self, property_id))
         {
-            self.component_property_selected = None;
+            self.component_authoring.selected_property = None;
         }
         if self
-            .component_property_context_menu
+            .overlays
+            .component_property_context_menu()
             .as_ref()
             .is_some_and(|property_id| !property_exists(self, property_id))
         {
-            self.component_property_context_menu = None;
-        }
-
-        let editor_valid = self
-            .component_authoring_name_editor
-            .as_ref()
-            .is_none_or(|editor| match editor {
-                ComponentAuthoringNameEditor::Property {
-                    property_id,
-                    original_name,
-                    last_preview,
-                } => self
-                    .component_property_name(property_id.as_ref())
-                    .is_some_and(|current| {
-                        current == *original_name
-                            || last_preview.as_ref().is_some_and(|last| current == *last)
-                    }),
-                ComponentAuthoringNameEditor::VariantOption {
-                    property_id,
-                    option_id,
-                    original_name,
-                    last_preview,
-                } => self
-                    .component_variant_option_name(property_id.as_ref(), option_id.as_ref())
-                    .is_some_and(|current| {
-                        current == *original_name
-                            || last_preview.as_ref().is_some_and(|last| current == *last)
-                    }),
-                ComponentAuthoringNameEditor::NewVariantOption { property_id, .. } => {
-                    property_exists(self, property_id)
-                }
-            });
-        if !editor_valid {
-            self.component_authoring_name_editor = None;
-        }
-
-        if self
-            .component_property_reorder
-            .as_ref()
-            .is_some_and(|session| {
-                let current = self.component_property_partition_order(session.partition);
-                !current.contains(&session.property_id)
-                    || !component_authoring_orders_have_same_unique_members(
-                        &current,
-                        &session.original_order,
-                    )
-            })
-        {
-            self.component_property_reorder = None;
-        }
-        if self
-            .component_variant_option_reorder
-            .as_ref()
-            .is_some_and(|session| {
-                self.component_variant_option_order(session.property_id.as_ref())
-                    .is_none_or(|current| {
-                        !current.contains(&session.option_id)
-                            || !component_authoring_orders_have_same_unique_members(
-                                &current,
-                                &session.original_order,
-                            )
-                    })
-            })
-        {
-            self.component_variant_option_reorder = None;
+            self.overlays
+                .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
         }
     }
 
-    pub(super) fn open_component_authoring_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.component_authoring_dialog_open {
+    fn open_component_authoring_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlays.component_authoring_dialog_open() {
             return;
         }
-        self.component_authoring_dialog_open = true;
-        self.component_authoring_dialog_close_pending = false;
+        self.overlays
+            .open(DesignOverlayState::ComponentPropertyEdit);
+        // Native dialogs restore to the stable inspector root. The create
+        // path has already prepared/focused its retained input before the
+        // dialog is mounted, so sampling `window.focused` here would capture
+        // a transient child instead of the opening surface.
+        self.overlays.remember_focus_return(
+            DesignOpenOverlay::ComponentPropertyEdit,
+            self.focus_handle.clone(),
+        );
+        self.component_authoring.dialog_close_pending = false;
         #[cfg(test)]
         {
-            self.component_authoring_dialog_last_rendered_kind = None;
+            self.component_authoring.dialog_last_rendered_kind = None;
         }
         let panel = cx.entity();
         let panel_for_cancel = panel.clone();
@@ -1388,13 +1775,15 @@ impl DesignPanel {
             let content = panel.update(cx, |panel_ref, cx| {
                 #[cfg(test)]
                 {
-                    panel_ref.component_authoring_dialog_last_rendered_kind = panel_ref
-                        .component_property_create_draft
+                    panel_ref.component_authoring.dialog_last_rendered_kind = panel_ref
+                        .component_authoring
+                        .create_draft
                         .as_ref()
                         .map(|draft| draft.kind)
                         .or_else(|| {
                             panel_ref
-                                .component_property_edit_modal
+                                .component_authoring
+                                .edit_draft
                                 .as_ref()
                                 .map(|draft| draft.definition.kind())
                         });
@@ -1402,20 +1791,11 @@ impl DesignPanel {
                 panel_ref
                     .render_component_property_create_modal(panel.clone(), cx)
                     .or_else(|| panel_ref.render_component_property_edit_modal(panel.clone(), cx))
-                    .unwrap_or_else(|| {
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("This component-property editor is no longer available.")
-                            .into_any_element()
-                    })
+                    .unwrap_or_else(|| dialogs::unavailable_editor(cx))
             });
             let panel_for_cancel = panel_for_cancel.clone();
             let panel_for_close = panel_for_close.clone();
-            dialog
-                .w(popup_width(window, 440.))
-                .max_w(popup_width(window, 560.))
-                .overlay_closable(false)
+            dialogs::configure_host(dialog, window)
                 .on_cancel(move |_, window, cx| {
                     panel_for_cancel.update(cx, |this, cx| {
                         this.cancel_component_authoring_dialog_state(window, cx);
@@ -1424,11 +1804,14 @@ impl DesignPanel {
                 })
                 .on_close(move |_, _, cx| {
                     panel_for_close.update(cx, |this, cx| {
-                        this.component_authoring_dialog_open = false;
-                        this.component_authoring_dialog_close_pending = false;
+                        this.overlays
+                            .discard(DesignOpenOverlay::ComponentPropertyEdit);
+                        this.component_authoring.dialog_close_pending = false;
+                        this.overlays
+                            .forget_focus_return(DesignOpenOverlay::ComponentPropertyEdit);
                         #[cfg(test)]
                         {
-                            this.component_authoring_dialog_last_rendered_kind = None;
+                            this.component_authoring.dialog_last_rendered_kind = None;
                         }
                         cx.notify();
                     });
@@ -1440,24 +1823,35 @@ impl DesignPanel {
     /// Applies the state transition shared by the native Dialog's Cancel
     /// action and its Escape-key binding. The Dialog host closes the overlay
     /// after the callback returns `true`.
-    pub(super) fn cancel_component_authoring_dialog_state(
+    fn cancel_component_authoring_dialog_state(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.component_property_create_draft = None;
-        self.component_property_edit_modal = None;
-        self.component_authoring_dialog_open = false;
-        self.component_authoring_dialog_close_pending = false;
+        self.cancel_component_authoring_edit_transactions(cx);
+        let dismissal = self
+            .overlays
+            .escape_dismissal_intent_for(DesignOpenOverlay::ComponentPropertyEdit);
+        self.component_authoring.create_draft = None;
+        self.component_authoring.edit_draft = None;
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyEdit);
+        self.component_authoring.dialog_close_pending = false;
         #[cfg(test)]
         {
-            self.component_authoring_dialog_last_rendered_kind = None;
+            self.component_authoring.dialog_last_rendered_kind = None;
         }
-        self.focus_handle.focus(window, cx);
+        if let Some(dismissal) = dismissal {
+            if let Some(focus_return) = self.overlays.finish_dismissal(&dismissal) {
+                focus_return.restore(window, cx);
+            }
+        } else {
+            self.focus_handle.focus(window, cx);
+        }
         cx.notify();
     }
 
-    pub(super) fn begin_component_property_create(
+    fn begin_component_property_create(
         &mut self,
         kind: DesignComponentPropertyKind,
         window: &mut Window,
@@ -1470,89 +1864,48 @@ impl DesignPanel {
         {
             return;
         }
-        self.component_property_create_menu_open = false;
-        self.component_property_context_menu = None;
-        let definition = match kind {
-            DesignComponentPropertyKind::Boolean => DesignComponentPropertyDefinition::Boolean {
-                default_value: true,
-            },
-            DesignComponentPropertyKind::Text => DesignComponentPropertyDefinition::Text {
-                default_value: "Text".into(),
-                multiline: false,
-            },
-            DesignComponentPropertyKind::InstanceSwap => {
-                DesignComponentPropertyDefinition::InstanceSwap {
-                    default_value: None,
-                    preferred_values: Vec::new(),
-                }
-            }
-            DesignComponentPropertyKind::Variant => DesignComponentPropertyDefinition::Variant {
-                default_value: "Default".into(),
-                options: vec!["Default".into()],
-            },
-            DesignComponentPropertyKind::Slot => DesignComponentPropertyDefinition::Slot {
-                default_value: super::super::DesignSlotValue::default(),
-                settings: super::super::DesignSlotSettings::default(),
-            },
-        };
-        self.component_property_create_draft = Some(ComponentPropertyCreateDraft {
-            kind,
-            description: None,
-            documentation_links: Vec::new(),
-            definition,
-            default_variable_id: None,
-        });
-        let name = match kind {
-            DesignComponentPropertyKind::Boolean => "Show layer",
-            DesignComponentPropertyKind::Text => "Text",
-            DesignComponentPropertyKind::InstanceSwap => "Instance",
-            DesignComponentPropertyKind::Variant => "Property",
-            DesignComponentPropertyKind::Slot => "Slot",
-        };
-        let default = match kind {
-            DesignComponentPropertyKind::Boolean => "True",
-            DesignComponentPropertyKind::Text => "Text",
-            DesignComponentPropertyKind::InstanceSwap => "",
-            DesignComponentPropertyKind::Variant => "Default",
-            DesignComponentPropertyKind::Slot => "",
-        };
-        self.component_authoring_name_input.update(cx, |input, cx| {
-            input.set_value(name, window, cx);
+        self.cancel_component_authoring_edit_transactions(cx);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyCreateMenu);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
+        let seed = editors::create_editor_seed(kind);
+        self.component_authoring.create_draft = Some(seed.draft);
+        self.component_authoring.name_input.update(cx, |input, cx| {
+            input.set_value(seed.name, window, cx);
             input.focus(window, cx);
         });
-        self.component_authoring_default_input
-            .update(cx, |input, cx| input.set_value(default, window, cx));
-        self.component_authoring_slot_minimum_input
+        self.component_authoring
+            .default_input
+            .update(cx, |input, cx| {
+                input.set_value(seed.default_or_description, window, cx);
+            });
+        self.component_authoring
+            .slot_minimum_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.component_authoring_slot_maximum_input
+        self.component_authoring
+            .slot_maximum_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.open_component_authoring_dialog(window, cx);
         cx.notify();
     }
 
-    pub(super) fn cancel_component_property_create(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.component_property_create_draft.take().is_some() {
+    fn cancel_component_property_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.component_authoring.create_draft.take().is_some() {
             self.close_component_authoring_dialog(window, cx);
             self.focus_handle.focus(window, cx);
             cx.notify();
         }
     }
 
-    pub(super) fn close_component_authoring_dialog(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.component_authoring_dialog_open {
-            self.component_authoring_dialog_open = false;
-            self.component_authoring_dialog_close_pending = false;
+    fn close_component_authoring_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overlays.component_authoring_dialog_open() {
+            self.overlays
+                .discard(DesignOpenOverlay::ComponentPropertyEdit);
+            self.component_authoring.dialog_close_pending = false;
             #[cfg(test)]
             {
-                self.component_authoring_dialog_last_rendered_kind = None;
+                self.component_authoring.dialog_last_rendered_kind = None;
             }
             if window.has_active_dialog(cx) {
                 window.close_dialog(cx);
@@ -1560,68 +1913,26 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn submit_component_property_create(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(mut draft) = self.component_property_create_draft.clone() else {
+    fn submit_component_property_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = self.component_authoring.create_draft.clone() else {
             return;
         };
-        let name = self.component_authoring_name_input.read(cx).value();
-        let name = name.trim();
-        if name.is_empty() {
+        let name = self.component_authoring.name_input.read(cx).value();
+        let default = self.component_authoring.default_input.read(cx).value();
+        let slot_minimum = self.component_authoring.slot_minimum_input.read(cx).value();
+        let slot_maximum = self.component_authoring.slot_maximum_input.read(cx).value();
+        let Some(prepared) =
+            editors::prepare_create(draft, name, default, slot_minimum, slot_maximum)
+        else {
             return;
-        }
-        let default = self.component_authoring_default_input.read(cx).value();
-        draft.definition = match draft.kind {
-            DesignComponentPropertyKind::Boolean | DesignComponentPropertyKind::InstanceSwap => {
-                draft.definition
-            }
-            DesignComponentPropertyKind::Text => DesignComponentPropertyDefinition::Text {
-                default_value: default,
-                multiline: false,
-            },
-            DesignComponentPropertyKind::Variant => {
-                let default: SharedString = if default.trim().is_empty() {
-                    "Default".into()
-                } else {
-                    default.trim().to_owned().into()
-                };
-                DesignComponentPropertyDefinition::Variant {
-                    default_value: default.clone(),
-                    options: vec![default],
-                }
-            }
-            DesignComponentPropertyKind::Slot => {
-                let Some((minimum_children, maximum_children)) =
-                    self.component_authoring_slot_limits(cx)
-                else {
-                    return;
-                };
-                let DesignComponentPropertyDefinition::Slot {
-                    default_value,
-                    mut settings,
-                } = draft.definition
-                else {
-                    return;
-                };
-                settings.minimum_children = minimum_children;
-                settings.maximum_children = maximum_children;
-                draft.description = (!default.trim().is_empty())
-                    .then(|| SharedString::from(default.trim().to_owned()));
-                DesignComponentPropertyDefinition::Slot {
-                    default_value,
-                    settings,
-                }
-            }
         };
+        let draft = prepared.draft;
         let partition = DesignComponentPropertyPartition::for_kind(draft.kind);
         let expected_property_order = self.component_property_partition_order(partition);
         let action = DesignPanelAction::ComponentPropertyDefinitionCreateRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             kind: draft.kind,
-            name: name.to_owned().into(),
+            name: prepared.name,
             description: draft.description,
             documentation_links: draft.documentation_links,
             definition: draft.definition,
@@ -1632,44 +1943,29 @@ impl DesignPanel {
         };
         if self.component_authoring_action_is_enabled(&action) {
             cx.emit_design_panel_action(self, action);
-            self.component_property_create_draft = None;
+            self.component_authoring.create_draft = None;
             self.close_component_authoring_dialog(window, cx);
             self.focus_handle.focus(window, cx);
             cx.notify();
         }
     }
 
-    pub(super) fn component_authoring_slot_limits(
-        &self,
-        cx: &App,
-    ) -> Option<(Option<u32>, Option<u32>)> {
-        let parse = |value: SharedString| {
-            let value = value.trim();
-            if value.is_empty() {
-                Some(None)
-            } else {
-                value.parse::<u32>().ok().map(Some)
-            }
-        };
-        let minimum = parse(self.component_authoring_slot_minimum_input.read(cx).value())?;
-        let maximum = parse(self.component_authoring_slot_maximum_input.read(cx).value())?;
-        if minimum
-            .zip(maximum)
-            .is_some_and(|(minimum, maximum)| minimum > maximum)
-        {
-            return None;
-        }
-        Some((minimum, maximum))
+    fn component_authoring_slot_limits(&self, cx: &App) -> Option<(Option<u32>, Option<u32>)> {
+        editors::parse_slot_limits(
+            self.component_authoring.slot_minimum_input.read(cx).value(),
+            self.component_authoring.slot_maximum_input.read(cx).value(),
+        )
     }
 
-    pub(super) fn open_component_property_edit(
+    fn open_component_property_edit(
         &mut self,
         property_id: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(property) = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .iter()
             .find(|property| property.id == property_id)
@@ -1691,93 +1987,59 @@ impl DesignPanel {
         {
             return;
         }
-        self.component_property_edit_modal = Some(ComponentPropertyEditDraft {
+        self.cancel_component_authoring_edit_transactions(cx);
+        let seed = editors::edit_editor_seed(
             property_id,
-            expected_description: property.description.clone(),
-            description: property.description.clone(),
-            expected_documentation_links: property.documentation_links.clone(),
-            documentation_links: property.documentation_links.clone(),
-            expected_definition: property.definition.clone(),
-            definition: property.definition.clone(),
-        });
-        let default_or_description = match &property.definition {
-            DesignComponentPropertyDefinition::Text { default_value, .. } => default_value.clone(),
-            DesignComponentPropertyDefinition::Slot { .. } => {
-                property.description.clone().unwrap_or_default()
-            }
-            _ => "".into(),
-        };
-        self.component_authoring_default_input
+            property.description,
+            property.documentation_links,
+            property.definition,
+        );
+        self.component_authoring.edit_draft = Some(seed.draft);
+        self.component_authoring
+            .default_input
             .update(cx, |input, cx| {
-                input.set_value(default_or_description, window, cx);
+                input.set_value(seed.default_or_description, window, cx);
             });
-        if let DesignComponentPropertyDefinition::Slot { settings, .. } = &property.definition {
-            self.component_authoring_slot_minimum_input
-                .update(cx, |input, cx| {
-                    input.set_value(
-                        settings
-                            .minimum_children
-                            .map(|value| value.to_string())
-                            .unwrap_or_default(),
-                        window,
-                        cx,
-                    );
-                });
-            self.component_authoring_slot_maximum_input
-                .update(cx, |input, cx| {
-                    input.set_value(
-                        settings
-                            .maximum_children
-                            .map(|value| value.to_string())
-                            .unwrap_or_default(),
-                        window,
-                        cx,
-                    );
-                });
-        }
-        self.component_property_context_menu = None;
+        self.component_authoring
+            .slot_minimum_input
+            .update(cx, |input, cx| {
+                input.set_value(seed.slot_minimum, window, cx);
+            });
+        self.component_authoring
+            .slot_maximum_input
+            .update(cx, |input, cx| {
+                input.set_value(seed.slot_maximum, window, cx);
+            });
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
         self.open_component_authoring_dialog(window, cx);
         cx.notify();
     }
 
-    pub(super) fn finish_component_property_edit(
+    fn finish_component_property_edit(
         &mut self,
         commit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut draft) = self.component_property_edit_modal.take() else {
+        let Some(draft) = self.component_authoring.edit_draft.take() else {
             return;
         };
         if commit {
-            match &mut draft.definition {
-                DesignComponentPropertyDefinition::Text { default_value, .. } => {
-                    *default_value = self.component_authoring_default_input.read(cx).value();
+            let default = self.component_authoring.default_input.read(cx).value();
+            let slot_minimum = self.component_authoring.slot_minimum_input.read(cx).value();
+            let slot_maximum = self.component_authoring.slot_maximum_input.read(cx).value();
+            let draft = match editors::prepare_edit(draft, default, slot_minimum, slot_maximum) {
+                editors::ComponentPropertyEditPreparation::Ready(draft) => draft,
+                editors::ComponentPropertyEditPreparation::Invalid(draft) => {
+                    self.component_authoring.edit_draft = Some(draft);
+                    return;
                 }
-                DesignComponentPropertyDefinition::Slot { settings, .. } => {
-                    let Some((minimum_children, maximum_children)) =
-                        self.component_authoring_slot_limits(cx)
-                    else {
-                        self.component_property_edit_modal = Some(draft);
-                        return;
-                    };
-                    settings.minimum_children = minimum_children;
-                    settings.maximum_children = maximum_children;
-                    let description = self.component_authoring_default_input.read(cx).value();
-                    draft.description = (!description.trim().is_empty())
-                        .then(|| SharedString::from(description.trim().to_owned()));
-                }
-                DesignComponentPropertyDefinition::Boolean { .. }
-                | DesignComponentPropertyDefinition::InstanceSwap { .. }
-                | DesignComponentPropertyDefinition::Variant { .. } => {}
-            }
-            if draft.description != draft.expected_description
-                || draft.documentation_links != draft.expected_documentation_links
-                || draft.definition != draft.expected_definition
-            {
+            };
+            if editors::edit_has_changes(&draft) {
                 self.emit_component_authoring_action(
                     DesignPanelAction::ComponentPropertyDefinitionEditRequested {
-                        node_id: self.node.id.clone(),
+                        node_id: self.host.inspected_node().id.clone(),
                         property_id: draft.property_id,
                         expected_description: draft.expected_description,
                         description: draft.description,
@@ -1790,10 +2052,61 @@ impl DesignPanel {
                 );
             }
         }
-        self.component_authoring_name_editor = None;
+        self.cancel_component_authoring_edit_transactions(cx);
         self.close_component_authoring_dialog(window, cx);
         self.focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    fn cancel_component_authoring_edit_transactions(&mut self, cx: &mut Context<Self>) {
+        let expected_name = self
+            .edit
+            .component_authoring
+            .name_editor()
+            .and_then(|editor| match editor {
+                ComponentAuthoringNameEditor::Property { property_id, .. } => {
+                    self.component_property_name(property_id.as_ref())
+                }
+                ComponentAuthoringNameEditor::VariantOption {
+                    property_id,
+                    option_id,
+                    ..
+                } => self.component_variant_option_name(property_id.as_ref(), option_id.as_ref()),
+                ComponentAuthoringNameEditor::NewVariantOption { .. } => None,
+            });
+        if let Some(action) = self
+            .edit
+            .component_authoring
+            .cancel_name_edit(expected_name)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
+
+        let property_order = self
+            .edit
+            .component_authoring
+            .property_reorder()
+            .map(|session| self.component_property_partition_order(session.partition));
+        if let Some(action) = self
+            .edit
+            .component_authoring
+            .cancel_property_reorder(property_order)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
+
+        let option_order = self
+            .edit
+            .component_authoring
+            .variant_option_reorder()
+            .and_then(|session| self.component_variant_option_order(session.property_id.as_ref()));
+        if let Some(action) = self
+            .edit
+            .component_authoring
+            .cancel_variant_option_reorder(option_order)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
     }
 
     /// Cancels every phased component-authoring interaction before the
@@ -1802,75 +2115,32 @@ impl DesignPanel {
     /// This deliberately emits balanced `Cancel` intents while the matching
     /// transient session is still present, then drops presentation-only
     /// menus, drafts, and selection state.
-    pub(super) fn cancel_component_authoring_for_workspace_change(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(editor) = self.component_authoring_name_editor.clone() {
-            let action = match editor {
-                ComponentAuthoringNameEditor::Property {
-                    property_id,
-                    original_name,
-                    ..
-                } => self
-                    .component_property_name(property_id.as_ref())
-                    .map(|expected_name| {
-                        DesignPanelAction::ComponentPropertyDefinitionRenameRequested {
-                            node_id: self.node.id.clone(),
-                            property_id,
-                            original_name: original_name.clone(),
-                            expected_name,
-                            name: original_name,
-                            phase: DesignPanelEditPhase::Cancel,
-                        }
-                    }),
-                ComponentAuthoringNameEditor::VariantOption {
-                    property_id,
-                    option_id,
-                    original_name,
-                    ..
-                } => self
-                    .component_variant_option_name(property_id.as_ref(), option_id.as_ref())
-                    .map(|expected_name| {
-                        DesignPanelAction::ComponentVariantOptionRenameRequested {
-                            node_id: self.node.id.clone(),
-                            property_id,
-                            option_id,
-                            original_name: original_name.clone(),
-                            expected_name,
-                            name: original_name,
-                            phase: DesignPanelEditPhase::Cancel,
-                        }
-                    }),
-                ComponentAuthoringNameEditor::NewVariantOption { .. } => None,
-            };
-            if let Some(action) = action {
-                self.emit_component_authoring_action(action, cx);
-            }
-            self.component_authoring_name_editor = None;
-        }
-        self.finish_component_property_reorder(false, cx);
-        self.finish_component_variant_option_reorder(false, cx);
-        self.component_property_create_menu_open = false;
-        self.component_property_create_draft = None;
-        self.component_property_edit_modal = None;
-        self.component_property_selected = None;
-        self.component_property_context_menu = None;
-        self.component_property_variable_picker = None;
-        self.component_swap_browser = None;
-        self.component_swap_hovered = None;
-        if self.component_authoring_dialog_open {
-            self.component_authoring_dialog_open = false;
-            self.component_authoring_dialog_close_pending = true;
+    fn cancel_component_authoring_for_workspace_change(&mut self, cx: &mut Context<Self>) {
+        self.cancel_component_authoring_edit_transactions(cx);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyCreateMenu);
+        self.component_authoring.create_draft = None;
+        self.component_authoring.edit_draft = None;
+        self.component_authoring.selected_property = None;
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
+        self.overlays.discard(DesignOpenOverlay::ComponentSwap);
+        self.features.component.swap_hovered = None;
+        if self.overlays.component_authoring_dialog_open() {
+            self.overlays
+                .discard(DesignOpenOverlay::ComponentPropertyEdit);
+            self.component_authoring.dialog_close_pending = true;
             #[cfg(test)]
             {
-                self.component_authoring_dialog_last_rendered_kind = None;
+                self.component_authoring.dialog_last_rendered_kind = None;
             }
         }
         cx.notify();
     }
 
-    pub(super) fn begin_component_property_rename(
+    fn begin_component_property_rename(
         &mut self,
         property_id: SharedString,
         window: &mut Window,
@@ -1879,32 +2149,25 @@ impl DesignPanel {
         let Some(original_name) = self.component_property_name(property_id.as_ref()) else {
             return;
         };
-        self.component_authoring_name_editor = Some(ComponentAuthoringNameEditor::Property {
-            property_id: property_id.clone(),
-            original_name: original_name.clone(),
-            last_preview: None,
-        });
         let action = DesignPanelAction::ComponentPropertyDefinitionRenameRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             property_id,
             original_name: original_name.clone(),
             expected_name: original_name.clone(),
             name: original_name.clone(),
             phase: DesignPanelEditPhase::Begin,
         };
-        if !self.component_authoring_action_is_enabled(&action) {
-            self.component_authoring_name_editor = None;
+        if !self.emit_component_authoring_edit_action(action, cx) {
             return;
         }
-        cx.emit_design_panel_action(self, action);
-        self.component_authoring_name_input.update(cx, |input, cx| {
+        self.component_authoring.name_input.update(cx, |input, cx| {
             input.set_value(original_name, window, cx);
             input.focus(window, cx);
         });
         cx.notify();
     }
 
-    pub(super) fn begin_component_variant_option_rename(
+    fn begin_component_variant_option_rename(
         &mut self,
         property_id: SharedString,
         option_id: SharedString,
@@ -1916,14 +2179,8 @@ impl DesignPanel {
         else {
             return;
         };
-        self.component_authoring_name_editor = Some(ComponentAuthoringNameEditor::VariantOption {
-            property_id: property_id.clone(),
-            option_id: option_id.clone(),
-            original_name: original_name.clone(),
-            last_preview: None,
-        });
         let action = DesignPanelAction::ComponentVariantOptionRenameRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             property_id,
             option_id,
             original_name: original_name.clone(),
@@ -1931,19 +2188,17 @@ impl DesignPanel {
             name: original_name.clone(),
             phase: DesignPanelEditPhase::Begin,
         };
-        if !self.component_authoring_action_is_enabled(&action) {
-            self.component_authoring_name_editor = None;
+        if !self.emit_component_authoring_edit_action(action, cx) {
             return;
         }
-        cx.emit_design_panel_action(self, action);
-        self.component_authoring_name_input.update(cx, |input, cx| {
+        self.component_authoring.name_input.update(cx, |input, cx| {
             input.set_value(original_name, window, cx);
             input.focus(window, cx);
         });
         cx.notify();
     }
 
-    pub(super) fn begin_component_variant_option_create(
+    fn begin_component_variant_option_create(
         &mut self,
         property_id: SharedString,
         window: &mut Window,
@@ -1952,31 +2207,35 @@ impl DesignPanel {
         let Some(order) = self.component_variant_option_order(property_id.as_ref()) else {
             return;
         };
-        self.component_authoring_name_editor =
-            Some(ComponentAuthoringNameEditor::NewVariantOption {
-                property_id,
-                after_option_id: order.last().cloned(),
-            });
-        self.component_authoring_name_input.update(cx, |input, cx| {
+        if !self.edit.component_authoring.begin_new_variant_option(
+            self.host.inspected_node().id.clone(),
+            property_id,
+            order.last().cloned(),
+        ) {
+            return;
+        }
+        self.component_authoring.name_input.update(cx, |input, cx| {
             input.set_value(format!("Value {}", order.len() + 1), window, cx);
             input.focus(window, cx);
         });
         cx.notify();
     }
 
-    pub(super) fn preview_component_authoring_name(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self.component_authoring_name_editor.clone() else {
+    fn preview_component_authoring_name(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.edit.component_authoring.name_editor().cloned() else {
             return;
         };
-        let candidate = self.component_authoring_name_input.read(cx).value();
+        let candidate = self.component_authoring.name_input.read(cx).value();
         if candidate.trim().is_empty() {
             return;
         }
         let action = match &editor {
             ComponentAuthoringNameEditor::Property {
+                node_id,
                 property_id,
                 original_name,
                 last_preview,
+                ..
             } => {
                 if last_preview.as_ref() == Some(&candidate) || candidate == *original_name {
                     return;
@@ -1985,7 +2244,7 @@ impl DesignPanel {
                     return;
                 };
                 DesignPanelAction::ComponentPropertyDefinitionRenameRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: node_id.clone(),
                     property_id: property_id.clone(),
                     original_name: original_name.clone(),
                     expected_name,
@@ -1994,10 +2253,12 @@ impl DesignPanel {
                 }
             }
             ComponentAuthoringNameEditor::VariantOption {
+                node_id,
                 property_id,
                 option_id,
                 original_name,
                 last_preview,
+                ..
             } => {
                 if last_preview.as_ref() == Some(&candidate) || candidate == *original_name {
                     return;
@@ -2008,7 +2269,7 @@ impl DesignPanel {
                     return;
                 };
                 DesignPanelAction::ComponentVariantOptionRenameRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: node_id.clone(),
                     property_id: property_id.clone(),
                     option_id: option_id.clone(),
                     original_name: original_name.clone(),
@@ -2019,30 +2280,21 @@ impl DesignPanel {
             }
             ComponentAuthoringNameEditor::NewVariantOption { .. } => return,
         };
-        if !self.component_authoring_action_is_enabled(&action) {
-            return;
-        }
-        cx.emit_design_panel_action(self, action);
-        match self.component_authoring_name_editor.as_mut() {
-            Some(ComponentAuthoringNameEditor::Property { last_preview, .. })
-            | Some(ComponentAuthoringNameEditor::VariantOption { last_preview, .. }) => {
-                *last_preview = Some(candidate);
-            }
-            _ => {}
-        }
+        let _ = self.emit_component_authoring_edit_action(action, cx);
     }
 
-    pub(super) fn finish_component_authoring_name_edit(
+    fn finish_component_authoring_name_edit(
         &mut self,
         commit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(editor) = self.component_authoring_name_editor.clone() else {
+        let Some(editor) = self.edit.component_authoring.name_editor().cloned() else {
             return;
         };
-        let candidate = self.component_authoring_name_input.read(cx).value();
+        let candidate = self.component_authoring.name_input.read(cx).value();
         if let ComponentAuthoringNameEditor::NewVariantOption {
+            node_id,
             property_id,
             after_option_id,
         } = editor
@@ -2051,11 +2303,11 @@ impl DesignPanel {
                 let Some(expected_option_order) =
                     self.component_variant_option_order(property_id.as_ref())
                 else {
-                    self.component_authoring_name_editor = None;
+                    self.edit.component_authoring.clear_unphased_name_editor();
                     return;
                 };
                 let action = DesignPanelAction::ComponentVariantOptionCreateRequested {
-                    node_id: self.node.id.clone(),
+                    node_id,
                     property_id,
                     name: candidate.trim().to_owned().into(),
                     expected_option_order,
@@ -2063,7 +2315,7 @@ impl DesignPanel {
                 };
                 self.emit_component_authoring_action(action, cx);
             }
-            self.component_authoring_name_editor = None;
+            self.edit.component_authoring.clear_unphased_name_editor();
             self.focus_handle.focus(window, cx);
             cx.notify();
             return;
@@ -2072,16 +2324,19 @@ impl DesignPanel {
         let nonempty_commit = commit && !candidate.trim().is_empty();
         let action = match editor {
             ComponentAuthoringNameEditor::Property {
+                node_id,
                 property_id,
                 original_name,
                 ..
             } => {
                 let Some(expected_name) = self.component_property_name(property_id.as_ref()) else {
-                    self.component_authoring_name_editor = None;
+                    if let Some(action) = self.edit.component_authoring.cancel_name_edit(None) {
+                        cx.emit_design_panel_action(self, action);
+                    }
                     return;
                 };
                 DesignPanelAction::ComponentPropertyDefinitionRenameRequested {
-                    node_id: self.node.id.clone(),
+                    node_id,
                     property_id,
                     original_name: original_name.clone(),
                     expected_name,
@@ -2098,6 +2353,7 @@ impl DesignPanel {
                 }
             }
             ComponentAuthoringNameEditor::VariantOption {
+                node_id,
                 property_id,
                 option_id,
                 original_name,
@@ -2106,11 +2362,13 @@ impl DesignPanel {
                 let Some(expected_name) =
                     self.component_variant_option_name(property_id.as_ref(), option_id.as_ref())
                 else {
-                    self.component_authoring_name_editor = None;
+                    if let Some(action) = self.edit.component_authoring.cancel_name_edit(None) {
+                        cx.emit_design_panel_action(self, action);
+                    }
                     return;
                 };
                 DesignPanelAction::ComponentVariantOptionRenameRequested {
-                    node_id: self.node.id.clone(),
+                    node_id,
                     property_id,
                     option_id,
                     original_name: original_name.clone(),
@@ -2129,13 +2387,16 @@ impl DesignPanel {
             }
             ComponentAuthoringNameEditor::NewVariantOption { .. } => unreachable!(),
         };
-        self.emit_component_authoring_action(action, cx);
-        self.component_authoring_name_editor = None;
+        if !self.emit_component_authoring_edit_action(action, cx)
+            && let Some(action) = self.edit.component_authoring.cancel_name_edit(None)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
-    pub(super) fn request_component_property_delete(
+    fn request_component_property_delete(
         &mut self,
         property_id: SharedString,
         cx: &mut Context<Self>,
@@ -2145,21 +2406,22 @@ impl DesignPanel {
         };
         self.emit_component_authoring_action(
             DesignPanelAction::ComponentPropertyDefinitionDeleteRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 property_id,
                 expected_name,
             },
             cx,
         );
-        self.component_property_context_menu = None;
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
     }
 
-    pub(super) fn begin_component_property_reorder(
+    fn begin_component_property_reorder(
         &mut self,
         drag: &ComponentPropertyDefinitionDrag,
         cx: &mut Context<Self>,
     ) {
-        if drag.node_id != self.node.id || self.component_property_reorder.is_some() {
+        if drag.node_id != self.host.inspected_node().id {
             return;
         }
         let expected_property_order = self.component_property_partition_order(drag.partition);
@@ -2168,14 +2430,8 @@ impl DesignPanel {
         }
         let before_property_id =
             Self::order_successor(&expected_property_order, drag.property_id.as_ref());
-        self.component_property_reorder = Some(ComponentPropertyReorderSession {
-            property_id: drag.property_id.clone(),
-            partition: drag.partition,
-            original_order: drag.original_order.clone(),
-            last_before_property_id: before_property_id.clone(),
-        });
         let action = DesignPanelAction::ComponentPropertyDefinitionReorderRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             property_id: drag.property_id.clone(),
             partition: drag.partition,
             original_property_order: drag.original_order.clone(),
@@ -2183,19 +2439,15 @@ impl DesignPanel {
             before_property_id,
             phase: DesignPanelEditPhase::Begin,
         };
-        if self.component_authoring_action_is_enabled(&action) {
-            cx.emit_design_panel_action(self, action);
-        } else {
-            self.component_property_reorder = None;
-        }
+        let _ = self.emit_component_authoring_edit_action(action, cx);
     }
 
-    pub(super) fn preview_component_property_reorder(
+    fn preview_component_property_reorder(
         &mut self,
         before_property_id: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.component_property_reorder.clone() else {
+        let Some(session) = self.edit.component_authoring.property_reorder().cloned() else {
             return;
         };
         if session.last_before_property_id == before_property_id
@@ -2204,7 +2456,7 @@ impl DesignPanel {
             return;
         }
         let action = DesignPanelAction::ComponentPropertyDefinitionReorderRequested {
-            node_id: self.node.id.clone(),
+            node_id: session.node_id,
             property_id: session.property_id,
             partition: session.partition,
             original_property_order: session.original_order,
@@ -2212,20 +2464,11 @@ impl DesignPanel {
             before_property_id: before_property_id.clone(),
             phase: DesignPanelEditPhase::Preview,
         };
-        if self.component_authoring_action_is_enabled(&action) {
-            cx.emit_design_panel_action(self, action);
-            if let Some(active) = self.component_property_reorder.as_mut() {
-                active.last_before_property_id = before_property_id;
-            }
-        }
+        let _ = self.emit_component_authoring_edit_action(action, cx);
     }
 
-    pub(super) fn finish_component_property_reorder(
-        &mut self,
-        commit: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.component_property_reorder.clone() else {
+    fn finish_component_property_reorder(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(session) = self.edit.component_authoring.property_reorder().cloned() else {
             return;
         };
         let before_property_id = if commit {
@@ -2234,7 +2477,7 @@ impl DesignPanel {
             Self::order_successor(&session.original_order, session.property_id.as_ref())
         };
         let action = DesignPanelAction::ComponentPropertyDefinitionReorderRequested {
-            node_id: self.node.id.clone(),
+            node_id: session.node_id,
             property_id: session.property_id,
             partition: session.partition,
             original_property_order: session.original_order,
@@ -2246,17 +2489,20 @@ impl DesignPanel {
                 DesignPanelEditPhase::Cancel
             },
         };
-        self.emit_component_authoring_action(action, cx);
-        self.component_property_reorder = None;
+        if !self.emit_component_authoring_edit_action(action, cx)
+            && let Some(action) = self.edit.component_authoring.cancel_property_reorder(None)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
         cx.notify();
     }
 
-    pub(super) fn begin_component_variant_option_reorder(
+    fn begin_component_variant_option_reorder(
         &mut self,
         drag: &ComponentVariantOptionDrag,
         cx: &mut Context<Self>,
     ) {
-        if drag.node_id != self.node.id || self.component_variant_option_reorder.is_some() {
+        if drag.node_id != self.host.inspected_node().id {
             return;
         }
         let Some(expected_option_order) =
@@ -2269,14 +2515,8 @@ impl DesignPanel {
         }
         let before_option_id =
             Self::order_successor(&expected_option_order, drag.option_id.as_ref());
-        self.component_variant_option_reorder = Some(ComponentVariantOptionReorderSession {
-            property_id: drag.property_id.clone(),
-            option_id: drag.option_id.clone(),
-            original_order: drag.original_order.clone(),
-            last_before_option_id: before_option_id.clone(),
-        });
         let action = DesignPanelAction::ComponentVariantOptionReorderRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             property_id: drag.property_id.clone(),
             option_id: drag.option_id.clone(),
             original_option_order: drag.original_order.clone(),
@@ -2284,19 +2524,20 @@ impl DesignPanel {
             before_option_id,
             phase: DesignPanelEditPhase::Begin,
         };
-        if self.component_authoring_action_is_enabled(&action) {
-            cx.emit_design_panel_action(self, action);
-        } else {
-            self.component_variant_option_reorder = None;
-        }
+        let _ = self.emit_component_authoring_edit_action(action, cx);
     }
 
-    pub(super) fn preview_component_variant_option_reorder(
+    fn preview_component_variant_option_reorder(
         &mut self,
         before_option_id: Option<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        let Some(session) = self.component_variant_option_reorder.clone() else {
+        let Some(session) = self
+            .edit
+            .component_authoring
+            .variant_option_reorder()
+            .cloned()
+        else {
             return;
         };
         if session.last_before_option_id == before_option_id
@@ -2310,7 +2551,7 @@ impl DesignPanel {
             return;
         };
         let action = DesignPanelAction::ComponentVariantOptionReorderRequested {
-            node_id: self.node.id.clone(),
+            node_id: session.node_id,
             property_id: session.property_id,
             option_id: session.option_id,
             original_option_order: session.original_order,
@@ -2318,26 +2559,28 @@ impl DesignPanel {
             before_option_id: before_option_id.clone(),
             phase: DesignPanelEditPhase::Preview,
         };
-        if self.component_authoring_action_is_enabled(&action) {
-            cx.emit_design_panel_action(self, action);
-            if let Some(active) = self.component_variant_option_reorder.as_mut() {
-                active.last_before_option_id = before_option_id;
-            }
-        }
+        let _ = self.emit_component_authoring_edit_action(action, cx);
     }
 
-    pub(super) fn finish_component_variant_option_reorder(
-        &mut self,
-        commit: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self.component_variant_option_reorder.clone() else {
+    fn finish_component_variant_option_reorder(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(session) = self
+            .edit
+            .component_authoring
+            .variant_option_reorder()
+            .cloned()
+        else {
             return;
         };
         let Some(expected_option_order) =
             self.component_variant_option_order(session.property_id.as_ref())
         else {
-            self.component_variant_option_reorder = None;
+            if let Some(action) = self
+                .edit
+                .component_authoring
+                .cancel_variant_option_reorder(None)
+            {
+                cx.emit_design_panel_action(self, action);
+            }
             return;
         };
         let before_option_id = if commit {
@@ -2346,7 +2589,7 @@ impl DesignPanel {
             Self::order_successor(&session.original_order, session.option_id.as_ref())
         };
         let action = DesignPanelAction::ComponentVariantOptionReorderRequested {
-            node_id: self.node.id.clone(),
+            node_id: session.node_id,
             property_id: session.property_id,
             option_id: session.option_id,
             original_option_order: session.original_order,
@@ -2358,12 +2601,18 @@ impl DesignPanel {
                 DesignPanelEditPhase::Cancel
             },
         };
-        self.emit_component_authoring_action(action, cx);
-        self.component_variant_option_reorder = None;
+        if !self.emit_component_authoring_edit_action(action, cx)
+            && let Some(action) = self
+                .edit
+                .component_authoring
+                .cancel_variant_option_reorder(None)
+        {
+            cx.emit_design_panel_action(self, action);
+        }
         cx.notify();
     }
 
-    pub(super) fn component_authoring_action_is_enabled(&self, action: &DesignPanelAction) -> bool {
+    fn component_authoring_action_is_enabled(&self, action: &DesignPanelAction) -> bool {
         if !self.can_edit() {
             return false;
         }
@@ -2371,7 +2620,8 @@ impl DesignPanel {
             return false;
         };
         let property = |property_id: &SharedString| {
-            self.node
+            self.host
+                .inspected_node()
                 .component_properties
                 .iter()
                 .find(|property| &property.id == property_id)
@@ -2379,10 +2629,11 @@ impl DesignPanel {
         let authored_property = |property_id: &SharedString| {
             property(property_id).zip(authoring.definition(property_id.as_ref()))
         };
-        let node_matches = |node_id: &SharedString| node_id == &self.node.id;
+        let node_matches = |node_id: &SharedString| node_id == &self.host.inspected_node().id;
         let component_reference_is_current =
             |reference: &super::super::DesignComponentReference| {
-                self.component_swap_view_data
+                self.resources
+                    .component_swaps
                     .candidates
                     .iter()
                     .any(|candidate| candidate.can_apply() && candidate.reference == *reference)
@@ -2446,7 +2697,8 @@ impl DesignPanel {
                         } else {
                             super::super::DesignVariableResolvedType::String
                         };
-                        self.property_variable_view_data
+                        self.resources
+                            .property_variables
                             .variable(variable_id.as_ref())
                             .is_some_and(|variable| {
                                 variable.resolved_type == expected_type
@@ -2464,7 +2716,9 @@ impl DesignPanel {
                     (_, None) => true,
                 };
                 node_matches(node_id)
-                    && authoring.preserves_variant_partition(&self.node.component_properties)
+                    && authoring.preserves_variant_partition(
+                        &self.host.inspected_node().component_properties,
+                    )
                     && authoring.create_kinds.contains(kind)
                     && definition.kind() == *kind
                     && definition_is_valid
@@ -2490,8 +2744,9 @@ impl DesignPanel {
                 phase,
             } => {
                 let editor_matches = self
-                    .component_authoring_name_editor
-                    .as_ref()
+                    .edit
+                    .component_authoring
+                    .name_editor()
                     .is_some_and(|editor| {
                         matches!(
                             editor,
@@ -2676,16 +2931,19 @@ impl DesignPanel {
                     original_property_order,
                     &current_order,
                 );
-                let session_matches =
-                    self.component_property_reorder
-                        .as_ref()
-                        .is_some_and(|session| {
-                            session.property_id == *property_id
-                                && session.partition == *partition
-                                && session.original_order == *original_property_order
-                        });
+                let session_matches = self
+                    .edit
+                    .component_authoring
+                    .property_reorder()
+                    .is_some_and(|session| {
+                        session.property_id == *property_id
+                            && session.partition == *partition
+                            && session.original_order == *original_property_order
+                    });
                 node_matches(node_id)
-                    && authoring.preserves_variant_partition(&self.node.component_properties)
+                    && authoring.preserves_variant_partition(
+                        &self.host.inspected_node().component_properties,
+                    )
                     && definition.capabilities.reorder
                     && *partition == expected_partition
                     && *expected_property_order == current_order
@@ -2732,8 +2990,9 @@ impl DesignPanel {
                 phase,
             } => {
                 let editor_matches =
-                    self.component_authoring_name_editor
-                        .as_ref()
+                    self.edit
+                        .component_authoring
+                        .name_editor()
                         .is_some_and(|editor| {
                             matches!(
                                 editor,
@@ -2811,8 +3070,9 @@ impl DesignPanel {
                             &current_order,
                         );
                         let session_matches = self
-                            .component_variant_option_reorder
-                            .as_ref()
+                            .edit
+                            .component_authoring
+                            .variant_option_reorder()
                             .is_some_and(|session| {
                                 session.property_id == *property_id
                                     && session.option_id == *option_id
@@ -2971,17 +3231,27 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn emit_component_authoring_action(
-        &self,
+    fn emit_component_authoring_edit_action(
+        &mut self,
         action: DesignPanelAction,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        if !self.component_authoring_action_is_enabled(&action)
+            || !self.edit.component_authoring.track_action(&action)
+        {
+            return false;
+        }
+        cx.emit_design_panel_action(self, action);
+        true
+    }
+
+    fn emit_component_authoring_action(&self, action: DesignPanelAction, cx: &mut Context<Self>) {
         if self.component_authoring_action_is_enabled(&action) {
             cx.emit_design_panel_action(self, action);
         }
     }
 
-    pub(super) fn render_applied_component_property_controls(
+    fn render_applied_component_property_controls(
         &self,
         surface: DesignComponentPropertyApplicationSurface,
         cx: &mut Context<Self>,
@@ -3019,7 +3289,7 @@ impl DesignPanel {
                         format!("apply-property-{}", control.control_id),
                         "Apply",
                         DesignPanelAction::ComponentPropertyApplyToLayerRequested {
-                            node_id: self.node.id.clone(),
+                            node_id: self.host.inspected_node().id.clone(),
                             control_id: control.control_id.clone(),
                             layer_id: control.layer_id.clone(),
                             surface,
@@ -3033,7 +3303,7 @@ impl DesignPanel {
                         format!("switch-property-{}", control.control_id),
                         "Switch",
                         DesignPanelAction::ComponentPropertySwitchOnLayerRequested {
-                            node_id: self.node.id.clone(),
+                            node_id: self.host.inspected_node().id.clone(),
                             control_id: control.control_id.clone(),
                             layer_id: control.layer_id.clone(),
                             surface,
@@ -3050,7 +3320,7 @@ impl DesignPanel {
                     format!("detach-property-{}", control.control_id),
                     "Detach",
                     DesignPanelAction::ComponentPropertyDetachFromLayerRequested {
-                        node_id: self.node.id.clone(),
+                        node_id: self.host.inspected_node().id.clone(),
                         control_id: control.control_id.clone(),
                         layer_id: control.layer_id.clone(),
                         surface,
@@ -3106,15 +3376,12 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn render_component_property_create_popover(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_component_property_create_popover(&self, cx: &mut Context<Self>) -> AnyElement {
         let authoring = self
             .component_authoring_view_data()
             .expect("create control requires authoring view data");
         let kinds = authoring.create_kinds.clone();
-        let open = self.component_property_create_menu_open;
+        let open = self.overlays.component_property_create_menu_open();
         let panel = cx.entity();
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
@@ -3132,7 +3399,8 @@ impl DesignPanel {
         .disabled(kinds.is_empty())
         .on_keyboard_activate(move |_, cx| {
             panel_for_keyboard.update(cx, |this, cx| {
-                this.component_property_create_menu_open = !open;
+                this.overlays
+                    .set_open(DesignOverlayState::ComponentPropertyCreateMenu, !open);
                 cx.notify();
             });
         });
@@ -3144,10 +3412,24 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(open)
         .overlay_closable(true)
-        .on_open_change(move |is_open, _, cx| {
+        .on_open_change(move |is_open, window, cx| {
             panel_for_open.update(cx, |this, cx| {
-                this.component_property_create_menu_open = *is_open;
-                cx.notify();
+                if *is_open {
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::ComponentPropertyCreateMenu,
+                        window,
+                        cx,
+                    );
+                    this.overlays
+                        .open(DesignOverlayState::ComponentPropertyCreateMenu);
+                    cx.notify();
+                } else if this.overlays.component_property_create_menu_open() {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::ComponentPropertyCreateMenu,
+                        window,
+                        cx,
+                    );
+                }
             });
         })
         .trigger(trigger)
@@ -3183,23 +3465,24 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn component_authoring_uses_inline_modal_fallback(&self) -> bool {
-        !self.component_authoring_dialog_open
-            && !self.component_authoring_dialog_close_pending
-            && (self.component_property_create_draft.is_some()
-                || self.component_property_edit_modal.is_some())
+    fn component_authoring_uses_inline_modal_fallback(&self) -> bool {
+        !self.overlays.component_authoring_dialog_open()
+            && !self.component_authoring.dialog_close_pending
+            && (self.component_authoring.create_draft.is_some()
+                || self.component_authoring.edit_draft.is_some())
     }
 
-    pub(super) fn render_component_property_create_modal(
+    fn render_component_property_create_modal(
         &self,
         panel: Entity<Self>,
         cx: &App,
     ) -> Option<AnyElement> {
-        let draft = self.component_property_create_draft.clone()?;
+        let draft = self.component_authoring.create_draft.clone()?;
         let panel_for_cancel = panel.clone();
         let panel_for_submit = panel.clone();
         let name_invalid = self
-            .component_authoring_name_input
+            .component_authoring
+            .name_input
             .read(cx)
             .value()
             .trim()
@@ -3216,7 +3499,7 @@ impl DesignPanel {
                     .child("Name"),
             )
             .child(
-                Input::new(&self.component_authoring_name_input)
+                Input::new(&self.component_authoring.name_input)
                     .appearance(false)
                     .bordered(true)
                     .xsmall()
@@ -3249,7 +3532,7 @@ impl DesignPanel {
                                                     default_value,
                                                 },
                                             ..
-                                        }) = this.component_property_create_draft.as_mut()
+                                        }) = this.component_authoring.create_draft.as_mut()
                                         {
                                             *default_value = *checked;
                                             cx.notify();
@@ -3272,7 +3555,7 @@ impl DesignPanel {
                             }),
                     )
                     .child(
-                        Input::new(&self.component_authoring_default_input)
+                        Input::new(&self.component_authoring.default_input)
                             .appearance(false)
                             .bordered(true)
                             .xsmall()
@@ -3312,7 +3595,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_create_draft.as_mut()
+                                    }) = this.component_authoring.create_draft.as_mut()
                                     {
                                         *default_value = None;
                                         cx.notify();
@@ -3321,7 +3604,8 @@ impl DesignPanel {
                             }),
                     );
                 for candidate in self
-                    .component_swap_view_data
+                    .resources
+                    .component_swaps
                     .candidates
                     .iter()
                     .filter(|candidate| candidate.can_apply())
@@ -3346,7 +3630,11 @@ impl DesignPanel {
                                     .items_center()
                                     .justify_center()
                                     .text_color(cx.theme().selection)
-                                    .child("◇"),
+                                    .child(render_lucide_icon(
+                                        LucideIcon::Diamond,
+                                        cx.theme().selection,
+                                        16.,
+                                    )),
                             )
                             .child(
                                 div()
@@ -3375,7 +3663,7 @@ impl DesignPanel {
                                                     ..
                                                 },
                                             ..
-                                        }) = this.component_property_create_draft.as_mut()
+                                        }) = this.component_authoring.create_draft.as_mut()
                                         {
                                             *default_value = Some(reference_for_default.clone());
                                             cx.notify();
@@ -3388,7 +3676,11 @@ impl DesignPanel {
                                     "component-property-instance-preferred-{}",
                                     reference.id
                                 )))
-                                .label(if is_preferred { "✓" } else { "+" })
+                                .icon(if is_preferred {
+                                    IconName::Check
+                                } else {
+                                    IconName::Plus
+                                })
                                 .tooltip("Preferred instance")
                                 .xsmall()
                                 .compact()
@@ -3403,7 +3695,7 @@ impl DesignPanel {
                                                     ..
                                                 },
                                             ..
-                                        }) = this.component_property_create_draft.as_mut()
+                                        }) = this.component_authoring.create_draft.as_mut()
                                         {
                                             if let Some(index) =
                                                 preferred_values.iter().position(|value| {
@@ -3439,7 +3731,7 @@ impl DesignPanel {
                             .child("Description"),
                     )
                     .child(
-                        Input::new(&self.component_authoring_default_input)
+                        Input::new(&self.component_authoring.default_input)
                             .appearance(false)
                             .bordered(true)
                             .xsmall()
@@ -3455,7 +3747,7 @@ impl DesignPanel {
                                     .gap_0p5()
                                     .child(div().text_xs().child("Minimum layers"))
                                     .child(
-                                        Input::new(&self.component_authoring_slot_minimum_input)
+                                        Input::new(&self.component_authoring.slot_minimum_input)
                                             .appearance(false)
                                             .bordered(true)
                                             .xsmall()
@@ -3468,7 +3760,7 @@ impl DesignPanel {
                                     .gap_0p5()
                                     .child(div().text_xs().child("Maximum layers"))
                                     .child(
-                                        Input::new(&self.component_authoring_slot_maximum_input)
+                                        Input::new(&self.component_authoring.slot_maximum_input)
                                             .appearance(false)
                                             .bordered(true)
                                             .xsmall()
@@ -3504,7 +3796,7 @@ impl DesignPanel {
                                                         ..
                                                     },
                                                 ..
-                                            }) = this.component_property_create_draft.as_mut()
+                                            }) = this.component_authoring.create_draft.as_mut()
                                             {
                                                 settings.stretch_child_on_insert = *checked;
                                                 cx.notify();
@@ -3528,7 +3820,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_create_draft.as_mut()
+                                    }) = this.component_authoring.create_draft.as_mut()
                                     {
                                         settings.display_empty = *checked;
                                         cx.notify();
@@ -3551,7 +3843,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_create_draft.as_mut()
+                                    }) = this.component_authoring.create_draft.as_mut()
                                     {
                                         settings.preferred_values_only = *checked;
                                         cx.notify();
@@ -3567,7 +3859,8 @@ impl DesignPanel {
                             .child("Preferred instances"),
                     );
                 for candidate in self
-                    .component_swap_view_data
+                    .resources
+                    .component_swaps
                     .candidates
                     .iter()
                     .filter(|candidate| candidate.can_apply())
@@ -3581,11 +3874,7 @@ impl DesignPanel {
                             "component-property-slot-preferred-{}",
                             reference.id
                         )))
-                        .label(format!(
-                            "{}  {}",
-                            if selected { "✓" } else { "◇" },
-                            reference.name
-                        ))
+                        .label(reference.name.clone())
                         .xsmall()
                         .compact()
                         .ghost()
@@ -3597,7 +3886,7 @@ impl DesignPanel {
                                     definition:
                                         DesignComponentPropertyDefinition::Slot { settings, .. },
                                     ..
-                                }) = this.component_property_create_draft.as_mut()
+                                }) = this.component_authoring.create_draft.as_mut()
                                 {
                                     if let Some(index) = settings
                                         .preferred_values
@@ -3645,7 +3934,8 @@ impl DesignPanel {
                         .selected(draft.default_variable_id.is_none())
                         .on_activate(move |_, _, cx| {
                             panel_for_none.update(cx, |this, cx| {
-                                if let Some(draft) = this.component_property_create_draft.as_mut() {
+                                if let Some(draft) = this.component_authoring.create_draft.as_mut()
+                                {
                                     draft.default_variable_id = None;
                                     cx.notify();
                                 }
@@ -3653,7 +3943,8 @@ impl DesignPanel {
                         }),
                 );
             for variable in self
-                .property_variable_view_data
+                .resources
+                .property_variables
                 .variables
                 .iter()
                 .filter(|variable| {
@@ -3679,7 +3970,7 @@ impl DesignPanel {
                     .selected(selected)
                     .on_activate(move |_, _, cx| {
                         panel_for_variable.update(cx, |this, cx| {
-                            if let Some(draft) = this.component_property_create_draft.as_mut() {
+                            if let Some(draft) = this.component_authoring.create_draft.as_mut() {
                                 draft.default_variable_id = Some(variable_id.clone());
                                 cx.notify();
                             }
@@ -3689,77 +3980,72 @@ impl DesignPanel {
             }
         }
 
-        Some(
-            v_flex()
-                .w_full()
-                .p_3()
-                .gap_3()
-                .rounded(px(8.))
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().popover)
-                .shadow_lg()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_semibold()
-                                .child("Create component property"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(draft.kind.label()),
-                        ),
-                )
-                .child(fields)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .gap_1()
-                        .child(
-                            Button::new("component-property-create-cancel")
-                                .label("Cancel")
-                                .xsmall()
-                                .compact()
-                                .ghost()
-                                .on_activate(move |_, window, cx| {
-                                    panel_for_cancel.update(cx, |this, cx| {
-                                        this.cancel_component_property_create(window, cx);
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("component-property-create-submit")
-                                .label("Create")
-                                .xsmall()
-                                .compact()
-                                .disabled(name_invalid || settings_invalid)
-                                .on_activate(move |_, window, cx| {
-                                    panel_for_submit.update(cx, |this, cx| {
-                                        this.submit_component_property_create(window, cx);
-                                    });
-                                }),
-                        ),
-                )
-                .into_any_element(),
-        )
+        let header = h_flex()
+            .w_full()
+            .justify_between()
+            .child(
+                div()
+                    .text_sm()
+                    .font_semibold()
+                    .child("Create component property"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(draft.kind.label()),
+            )
+            .into_any_element();
+        let footer = h_flex()
+            .w_full()
+            .justify_end()
+            .gap_1()
+            .child(
+                Button::new("component-property-create-cancel")
+                    .label("Cancel")
+                    .xsmall()
+                    .compact()
+                    .ghost()
+                    .on_activate(move |_, window, cx| {
+                        panel_for_cancel.update(cx, |this, cx| {
+                            this.cancel_component_property_create(window, cx);
+                        });
+                    }),
+            )
+            .child(
+                Button::new("component-property-create-submit")
+                    .label("Create")
+                    .xsmall()
+                    .compact()
+                    .disabled(name_invalid || settings_invalid)
+                    .on_activate(move |_, window, cx| {
+                        panel_for_submit.update(cx, |this, cx| {
+                            this.submit_component_property_create(window, cx);
+                        });
+                    }),
+            )
+            .into_any_element();
+        Some(dialogs::render(
+            dialogs::ComponentAuthoringDialogView {
+                header,
+                content: fields.into_any_element(),
+                footer,
+                spacing: dialogs::ComponentAuthoringDialogSpacing::Relaxed,
+            },
+            cx,
+        ))
     }
 
-    pub(super) fn render_component_property_edit_modal(
+    fn render_component_property_edit_modal(
         &self,
         panel: Entity<Self>,
         cx: &App,
     ) -> Option<AnyElement> {
-        let draft = self.component_property_edit_modal.clone()?;
+        let draft = self.component_authoring.edit_draft.clone()?;
         let property_id = draft.property_id.clone();
         let property = self
-            .node
+            .host
+            .inspected_node()
             .component_properties
             .iter()
             .find(|property| property.id == property_id)?
@@ -3769,56 +4055,47 @@ impl DesignPanel {
             .definition(property_id.as_ref())?
             .clone();
         let panel_for_close = panel.clone();
-        let mut modal = v_flex()
+        let header = h_flex()
             .w_full()
-            .p_3()
+            .justify_between()
             .gap_2()
-            .rounded(px(8.))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().popover)
-            .shadow_lg()
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_between()
-                    .gap_2()
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child("Edit component property"),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!(
-                                        "{} · {}",
-                                        property.definition.kind().label(),
-                                        property.name
-                                    )),
-                            ),
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_semibold()
+                            .child("Edit component property"),
                     )
                     .child(
-                        Button::new("component-property-edit-close")
-                            .label("Cancel")
-                            .xsmall()
-                            .compact()
-                            .ghost()
-                            .on_activate(move |_, window, cx| {
-                                panel_for_close.update(cx, |this, cx| {
-                                    this.finish_component_property_edit(false, window, cx);
-                                });
-                            }),
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "{} · {}",
+                                property.definition.kind().label(),
+                                property.name
+                            )),
                     ),
-            );
+            )
+            .child(
+                Button::new("component-property-edit-close")
+                    .label("Cancel")
+                    .xsmall()
+                    .compact()
+                    .ghost()
+                    .on_activate(move |_, window, cx| {
+                        panel_for_close.update(cx, |this, cx| {
+                            this.finish_component_property_edit(false, window, cx);
+                        });
+                    }),
+            )
+            .into_any_element();
+        let mut modal = v_flex().child(header);
 
         if definition.capabilities.edit_metadata
             && property.definition.kind() != DesignComponentPropertyKind::Slot
@@ -3874,7 +4151,7 @@ impl DesignPanel {
                                                 default_value,
                                             },
                                         ..
-                                    }) = this.component_property_edit_modal.as_mut()
+                                    }) = this.component_authoring.edit_draft.as_mut()
                                     {
                                         *default_value = *checked;
                                         cx.notify();
@@ -3894,7 +4171,7 @@ impl DesignPanel {
                             .gap_1()
                             .child(
                                 div().flex_1().min_w(px(0.)).child(
-                                    Input::new(&self.component_authoring_default_input)
+                                    Input::new(&self.component_authoring.default_input)
                                         .appearance(false)
                                         .bordered(true)
                                         .xsmall()
@@ -3935,7 +4212,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_edit_modal.as_mut()
+                                    }) = this.component_authoring.edit_draft.as_mut()
                                     {
                                         *default_value = None;
                                         cx.notify();
@@ -3945,7 +4222,8 @@ impl DesignPanel {
                     );
                 }
                 for candidate in self
-                    .component_swap_view_data
+                    .resources
+                    .component_swaps
                     .candidates
                     .iter()
                     .filter(|candidate| candidate.can_apply())
@@ -3970,7 +4248,11 @@ impl DesignPanel {
                                     .items_center()
                                     .justify_center()
                                     .text_color(cx.theme().selection)
-                                    .child("◇"),
+                                    .child(render_lucide_icon(
+                                        LucideIcon::Diamond,
+                                        cx.theme().selection,
+                                        16.,
+                                    )),
                             )
                             .child(
                                 div()
@@ -4000,7 +4282,7 @@ impl DesignPanel {
                                                         ..
                                                     },
                                                 ..
-                                            }) = this.component_property_edit_modal.as_mut()
+                                            }) = this.component_authoring.edit_draft.as_mut()
                                             {
                                                 *default_value =
                                                     Some(reference_for_default.clone());
@@ -4016,7 +4298,11 @@ impl DesignPanel {
                                         "component-property-edit-instance-preferred-{}",
                                         reference.id
                                     )))
-                                    .label(if is_preferred { "✓" } else { "+" })
+                                    .icon(if is_preferred {
+                                        IconName::Check
+                                    } else {
+                                        IconName::Plus
+                                    })
                                     .tooltip("Preferred instance")
                                     .xsmall()
                                     .compact()
@@ -4031,7 +4317,7 @@ impl DesignPanel {
                                                         ..
                                                     },
                                                 ..
-                                            }) = this.component_property_edit_modal.as_mut()
+                                            }) = this.component_authoring.edit_draft.as_mut()
                                             {
                                                 if let Some(index) = preferred_values
                                                     .iter()
@@ -4084,7 +4370,7 @@ impl DesignPanel {
                     )
                     .child(div().text_xs().child("Description"))
                     .child(
-                        Input::new(&self.component_authoring_default_input)
+                        Input::new(&self.component_authoring.default_input)
                             .appearance(false)
                             .bordered(true)
                             .xsmall()
@@ -4100,7 +4386,7 @@ impl DesignPanel {
                                     .gap_0p5()
                                     .child(div().text_xs().child("Minimum layers"))
                                     .child(
-                                        Input::new(&self.component_authoring_slot_minimum_input)
+                                        Input::new(&self.component_authoring.slot_minimum_input)
                                             .appearance(false)
                                             .bordered(true)
                                             .xsmall()
@@ -4113,7 +4399,7 @@ impl DesignPanel {
                                     .gap_0p5()
                                     .child(div().text_xs().child("Maximum layers"))
                                     .child(
-                                        Input::new(&self.component_authoring_slot_maximum_input)
+                                        Input::new(&self.component_authoring.slot_maximum_input)
                                             .appearance(false)
                                             .bordered(true)
                                             .xsmall()
@@ -4144,7 +4430,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_edit_modal.as_mut()
+                                    }) = this.component_authoring.edit_draft.as_mut()
                                     {
                                         settings.stretch_child_on_insert = *checked;
                                         cx.notify();
@@ -4167,7 +4453,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_edit_modal.as_mut()
+                                    }) = this.component_authoring.edit_draft.as_mut()
                                     {
                                         settings.display_empty = *checked;
                                         cx.notify();
@@ -4190,7 +4476,7 @@ impl DesignPanel {
                                                 ..
                                             },
                                         ..
-                                    }) = this.component_property_edit_modal.as_mut()
+                                    }) = this.component_authoring.edit_draft.as_mut()
                                     {
                                         settings.preferred_values_only = *checked;
                                         cx.notify();
@@ -4206,7 +4492,8 @@ impl DesignPanel {
                             .child("Preferred instances"),
                     );
                 for candidate in self
-                    .component_swap_view_data
+                    .resources
+                    .component_swaps
                     .candidates
                     .iter()
                     .filter(|candidate| candidate.can_apply())
@@ -4220,11 +4507,7 @@ impl DesignPanel {
                             "component-property-edit-slot-preferred-{}",
                             reference.id
                         )))
-                        .label(format!(
-                            "{}  {}",
-                            if selected { "✓" } else { "◇" },
-                            reference.name
-                        ))
+                        .label(reference.name.clone())
                         .xsmall()
                         .compact()
                         .ghost()
@@ -4236,7 +4519,7 @@ impl DesignPanel {
                                     definition:
                                         DesignComponentPropertyDefinition::Slot { settings, .. },
                                     ..
-                                }) = this.component_property_edit_modal.as_mut()
+                                }) = this.component_authoring.edit_draft.as_mut()
                                 {
                                     if let Some(index) = settings
                                         .preferred_values
@@ -4280,7 +4563,7 @@ impl DesignPanel {
                     property_id, option.id
                 ));
                 let editing = matches!(
-                    self.component_authoring_name_editor.as_ref(),
+                    self.edit.component_authoring.name_editor(),
                     Some(ComponentAuthoringNameEditor::VariantOption {
                         property_id: active_property_id,
                         option_id: active_option_id,
@@ -4288,7 +4571,7 @@ impl DesignPanel {
                     }) if active_property_id == &property_id && active_option_id == &option.id
                 );
                 let drag = ComponentVariantOptionDrag {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id: property_id.clone(),
                     option_id: option.id.clone(),
                     option_name: option.name.clone(),
@@ -4362,7 +4645,7 @@ impl DesignPanel {
                     .child(handle);
                 if editing {
                     row = row.child(
-                        Input::new(&self.component_authoring_name_input)
+                        Input::new(&self.component_authoring.name_input)
                             .appearance(false)
                             .bordered(false)
                             .focus_bordered(true)
@@ -4400,7 +4683,7 @@ impl DesignPanel {
                             panel_for_delete.update(cx, |this, cx| {
                                 this.emit_component_authoring_action(
                                     DesignPanelAction::ComponentVariantOptionDeleteRequested {
-                                        node_id: this.node.id.clone(),
+                                        node_id: this.host.inspected_node().id.clone(),
                                         property_id: property_id_for_delete.clone(),
                                         option_id: option_id_for_delete.clone(),
                                         expected_name: expected_name.clone(),
@@ -4463,7 +4746,7 @@ impl DesignPanel {
                     })
                     .on_drop(move |drag: &ComponentVariantOptionDrag, _, cx| {
                         panel_for_drop.update(cx, |this, cx| {
-                            if this.component_variant_option_reorder.is_none() {
+                            if !this.edit.component_authoring.has_variant_option_reorder() {
                                 this.begin_component_variant_option_reorder(drag, cx);
                             }
                             this.preview_component_variant_option_reorder(
@@ -4477,7 +4760,7 @@ impl DesignPanel {
             }
 
             let creating_option = matches!(
-                self.component_authoring_name_editor.as_ref(),
+                self.edit.component_authoring.name_editor(),
                 Some(ComponentAuthoringNameEditor::NewVariantOption {
                     property_id: active_property_id,
                     ..
@@ -4486,7 +4769,7 @@ impl DesignPanel {
             if creating_option {
                 modal = modal.child(
                     h_flex().w_full().h(px(ROW_HEIGHT)).pl(px(18.)).child(
-                        Input::new(&self.component_authoring_name_input)
+                        Input::new(&self.component_authoring.name_input)
                             .appearance(false)
                             .bordered(true)
                             .xsmall()
@@ -4520,8 +4803,10 @@ impl DesignPanel {
             draft.definition,
             DesignComponentPropertyDefinition::Slot { .. }
         ) && self.component_authoring_slot_limits(cx).is_none();
-        modal = modal.child(
-            h_flex().w_full().justify_end().child(
+        let footer = h_flex()
+            .w_full()
+            .justify_end()
+            .child(
                 Button::new("component-property-edit-save")
                     .label("Save")
                     .xsmall()
@@ -4532,15 +4817,17 @@ impl DesignPanel {
                             this.finish_component_property_edit(true, window, cx);
                         });
                     }),
-            ),
-        );
-        Some(modal.into_any_element())
+            )
+            .into_any_element();
+        modal = modal.child(footer);
+        Some(dialogs::render_container(
+            modal,
+            dialogs::ComponentAuthoringDialogSpacing::Compact,
+            cx,
+        ))
     }
 
-    pub(super) fn render_component_definition_authoring(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_component_definition_authoring(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let authoring = self.component_authoring_view_data()?.clone();
         let mut content = v_flex()
             .w_full()
@@ -4556,7 +4843,8 @@ impl DesignPanel {
                     .child(div().text_xs().font_semibold().child("Properties"))
                     .child(self.render_component_property_create_popover(cx)),
             );
-        if !authoring.preserves_variant_partition(&self.node.component_properties) {
+        if !authoring.preserves_variant_partition(&self.host.inspected_node().component_properties)
+        {
             return Some(
                 content
                     .child(
@@ -4580,7 +4868,8 @@ impl DesignPanel {
             DesignComponentPropertyPartition::Regular,
         ] {
             let partition_properties = self
-                .node
+                .host
+                .inspected_node()
                 .component_properties
                 .iter()
                 .filter(|property| {
@@ -4608,9 +4897,10 @@ impl DesignPanel {
                     .definition(property.id.as_ref())
                     .expect("filtered authoring definition");
                 let kind = property.definition.kind();
-                let selected = self.component_property_selected.as_ref() == Some(&property.id);
+                let selected =
+                    self.component_authoring.selected_property.as_ref() == Some(&property.id);
                 let editing = matches!(
-                    self.component_authoring_name_editor.as_ref(),
+                    self.edit.component_authoring.name_editor(),
                     Some(ComponentAuthoringNameEditor::Property {
                         property_id: active_property_id,
                         ..
@@ -4619,7 +4909,7 @@ impl DesignPanel {
                 let group_name =
                     SharedString::from(format!("component-property-row-{}", property.id));
                 let drag = ComponentPropertyDefinitionDrag {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id: property.id.clone(),
                     property_name: property.name.clone(),
                     partition,
@@ -4709,16 +4999,16 @@ impl DesignPanel {
                             .text_xs()
                             .text_color(cx.theme().selection)
                             .child(match kind {
-                                DesignComponentPropertyKind::Variant => "◆",
+                                DesignComponentPropertyKind::Variant => "V",
                                 DesignComponentPropertyKind::Text => "T",
-                                DesignComponentPropertyKind::Boolean => "✓",
-                                DesignComponentPropertyKind::InstanceSwap => "◇",
-                                DesignComponentPropertyKind::Slot => "◈",
+                                DesignComponentPropertyKind::Boolean => "B",
+                                DesignComponentPropertyKind::InstanceSwap => "I",
+                                DesignComponentPropertyKind::Slot => "S",
                             }),
                     );
                 if editing {
                     row = row.child(
-                        Input::new(&self.component_authoring_name_input)
+                        Input::new(&self.component_authoring.name_input)
                             .appearance(false)
                             .bordered(false)
                             .focus_bordered(true)
@@ -4776,7 +5066,7 @@ impl DesignPanel {
                 let target_property_id_for_move = property.id.clone();
                 let target_property_id_for_style = property.id.clone();
                 let target_property_id_for_drop = property.id.clone();
-                let can_drop_node_id = self.node.id.clone();
+                let can_drop_node_id = self.host.inspected_node().id.clone();
                 let panel_for_move = panel.clone();
                 let panel_for_drop = panel.clone();
                 // Contract (§16): this row keeps an explicit action/click pair
@@ -4786,9 +5076,10 @@ impl DesignPanel {
                 row = row
                     .on_action(move |_: &ActivateControl, _, cx| {
                         panel_for_keyboard.update(cx, |this, cx| {
-                            this.component_property_selected =
+                            this.component_authoring.selected_property =
                                 Some(property_id_for_keyboard.clone());
-                            this.component_property_context_menu = None;
+                            this.overlays
+                                .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
                             cx.notify();
                         });
                     })
@@ -4797,8 +5088,10 @@ impl DesignPanel {
                             return;
                         }
                         panel_for_click.update(cx, |this, cx| {
-                            this.component_property_selected = Some(property_id_for_click.clone());
-                            this.component_property_context_menu = None;
+                            this.component_authoring.selected_property =
+                                Some(property_id_for_click.clone());
+                            this.overlays
+                                .discard(DesignOpenOverlay::ComponentPropertyContextMenu);
                             if event.click_count() >= 2 {
                                 this.begin_component_property_rename(
                                     property_id_for_click.clone(),
@@ -4813,10 +5106,12 @@ impl DesignPanel {
                     .on_mouse_down(MouseButton::Right, move |_: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         panel_for_context.update(cx, |this, cx| {
-                            this.component_property_selected =
+                            this.component_authoring.selected_property =
                                 Some(property_id_for_context.clone());
-                            this.component_property_context_menu =
-                                Some(property_id_for_context.clone());
+                            this.overlays
+                                .open(DesignOverlayState::ComponentPropertyContextMenu(
+                                    property_id_for_context.clone(),
+                                ));
                             cx.notify();
                         });
                     })
@@ -4852,7 +5147,7 @@ impl DesignPanel {
                     })
                     .on_drop(move |drag: &ComponentPropertyDefinitionDrag, _, cx| {
                         panel_for_drop.update(cx, |this, cx| {
-                            if this.component_property_reorder.is_none() {
+                            if !this.edit.component_authoring.has_property_reorder() {
                                 this.begin_component_property_reorder(drag, cx);
                             }
                             this.preview_component_property_reorder(
@@ -4864,7 +5159,7 @@ impl DesignPanel {
                     });
                 content = content.child(row);
 
-                if self.component_property_context_menu.as_ref() == Some(&property.id) {
+                if self.overlays.component_property_context_menu().as_ref() == Some(&property.id) {
                     let panel_for_rename = panel.clone();
                     let property_id_for_rename = property.id.clone();
                     let panel_for_delete = panel.clone();
@@ -4958,7 +5253,7 @@ impl DesignPanel {
                     })
                     .on_drop(move |drag: &ComponentPropertyDefinitionDrag, _, cx| {
                         panel_for_end_drop.update(cx, |this, cx| {
-                            if this.component_property_reorder.is_none() {
+                            if !this.edit.component_authoring.has_property_reorder() {
                                 this.begin_component_property_reorder(drag, cx);
                             }
                             this.preview_component_property_reorder(None, cx);
@@ -4972,7 +5267,7 @@ impl DesignPanel {
         {
             content = content.child(edit_modal);
         }
-        if self.node.component_properties.is_empty() {
+        if self.host.inspected_node().component_properties.is_empty() {
             content = content.child(
                 div()
                     .text_xs()
@@ -4983,7 +5278,7 @@ impl DesignPanel {
         Some(content.into_any_element())
     }
 
-    pub(super) fn render_nested_component_property_exposures(
+    fn render_nested_component_property_exposures(
         &self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
@@ -5010,14 +5305,14 @@ impl DesignPanel {
         for candidate in candidates {
             let candidate_for_hover = candidate.clone();
             let panel_for_hover = panel.clone();
-            let node_id_for_hover = self.node.id.clone();
+            let node_id_for_hover = self.host.inspected_node().id.clone();
             let mut actions = h_flex().gap_1();
             if let Some(exposed_property_id) = candidate.exposed_property_id.clone() {
                 actions = actions.child(self.render_component_action_button(
                     format!("unexpose-nested-{}", candidate.candidate_id),
                     "Unexpose",
                     DesignPanelAction::NestedComponentPropertyUnexposeRequested {
-                        node_id: self.node.id.clone(),
+                        node_id: self.host.inspected_node().id.clone(),
                         candidate_id: candidate.candidate_id.clone(),
                         nested_instance_id: candidate.nested_instance_id.clone(),
                         nested_property_id: candidate.nested_property.property_id.clone(),
@@ -5030,7 +5325,7 @@ impl DesignPanel {
                     format!("expose-nested-{}", candidate.candidate_id),
                     "Expose",
                     DesignPanelAction::NestedComponentPropertyExposeRequested {
-                        node_id: self.node.id.clone(),
+                        node_id: self.host.inspected_node().id.clone(),
                         candidate_id: candidate.candidate_id.clone(),
                         nested_instance_id: candidate.nested_instance_id.clone(),
                         nested_property_id: candidate.nested_property.property_id.clone(),
@@ -5065,7 +5360,11 @@ impl DesignPanel {
                                 this.emit_component_authoring_action(action, cx);
                             });
                         })
-                        .child(div().w(px(16.)).text_color(cx.theme().selection).child("◇"))
+                        .child(render_lucide_icon(
+                            LucideIcon::Diamond,
+                            cx.theme().selection,
+                            16.,
+                        ))
                         .child(
                             v_flex()
                                 .flex_1()
@@ -5094,7 +5393,7 @@ impl DesignPanel {
         Some(rows.into_any_element())
     }
 
-    pub(super) fn render_slot_limits(
+    fn render_slot_limits(
         &self,
         property: &DesignComponentProperty,
         cx: &mut Context<Self>,
@@ -5103,7 +5402,7 @@ impl DesignPanel {
         if guidelines.is_empty() {
             return None;
         }
-        let open = self.open_slot_limits.as_ref() == Some(&property.id);
+        let open = self.component_authoring.open_slot_limits.as_ref() == Some(&property.id);
         let unmet = guidelines
             .iter()
             .any(|guideline| guideline.status == SlotLimitGuidelineStatus::Unmet);
@@ -5140,10 +5439,13 @@ impl DesignPanel {
                         .border_color(cx.theme().selection)
                 })
                 .on_activate(cx.listener(move |this, _, _, cx| {
-                    if this.open_slot_limits.as_ref() == Some(&property_id_for_activate) {
-                        this.open_slot_limits = None;
+                    if this.component_authoring.open_slot_limits.as_ref()
+                        == Some(&property_id_for_activate)
+                    {
+                        this.component_authoring.open_slot_limits = None;
                     } else {
-                        this.open_slot_limits = Some(property_id_for_activate.clone());
+                        this.component_authoring.open_slot_limits =
+                            Some(property_id_for_activate.clone());
                     }
                     cx.notify();
                 }))
@@ -5151,7 +5453,13 @@ impl DesignPanel {
                     div()
                         .w(px(14.))
                         .text_color(cx.theme().warning)
-                        .child(if unmet { "⚠" } else { "" }),
+                        .when(unmet, |warning| {
+                            warning.child(render_lucide_icon(
+                                LucideIcon::TriangleAlert,
+                                cx.theme().warning,
+                                14.,
+                            ))
+                        }),
                 )
                 .child(div().flex_1().font_semibold().child("Limits"))
                 .child(
@@ -5167,7 +5475,7 @@ impl DesignPanel {
             let offending_ids = slot_preferred_violation_layer_ids(property);
             let view_layers_action = (!offending_ids.is_empty()).then(|| {
                 DesignPanelAction::SlotLimitLayersSelectRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id: property.id.clone(),
                     child_node_ids: offending_ids,
                 }
@@ -5183,9 +5491,9 @@ impl DesignPanel {
                 .bg(cx.theme().secondary);
             for guideline in guidelines {
                 let (icon, color) = match guideline.status {
-                    SlotLimitGuidelineStatus::Met => ("✓", cx.theme().green),
-                    SlotLimitGuidelineStatus::Unmet => ("⚠", cx.theme().warning),
-                    SlotLimitGuidelineStatus::Unknown => ("–", cx.theme().muted_foreground),
+                    SlotLimitGuidelineStatus::Met => ("Met", cx.theme().green),
+                    SlotLimitGuidelineStatus::Unmet => ("Unmet", cx.theme().warning),
+                    SlotLimitGuidelineStatus::Unknown => ("Unknown", cx.theme().muted_foreground),
                 };
                 details = details.child(
                     h_flex()
@@ -5215,817 +5523,680 @@ impl DesignPanel {
         Some(limits.into_any_element())
     }
 
-    pub(super) fn render_component(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let role = self.node.component_role()?;
-        let mut content = v_flex().px(px(PANEL_PADDING)).pb_4().gap_2();
-
-        if let Some(context) = self.node.component_context.as_ref() {
-            content = content.child(
-                h_flex()
-                    .h(px(24.))
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(role.label()),
-                    )
-                    .when(context.overrides.reset_state.is_overridden(), |row| {
-                        row.child(
-                            div()
-                                .px_2()
-                                .py(px(2.))
-                                .rounded(px(4.))
-                                .bg(cx.theme().accent)
-                                .text_xs()
-                                .child(format!(
-                                    "{} overrides",
-                                    context.overrides.overridden_property_count
-                                        + context.overrides.nested_override_count
-                                )),
-                        )
-                    }),
-            );
-
-            if let Some(main) = context.main_component.as_ref() {
-                let origin: SharedString = match &main.origin {
-                    super::super::DesignComponentOrigin::Local => "Local".into(),
-                    super::super::DesignComponentOrigin::Remote { library_name } => {
-                        format!("Library · {library_name}").into()
-                    }
+    fn render_component_property_row(
+        &self,
+        role: DesignComponentRole,
+        index: usize,
+        property: DesignComponentProperty,
+        multiline_editor_active: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let kind = property.definition.kind();
+        let value = property.effective_value();
+        let next = property
+            .definition
+            .option_labels()
+            .into_iter()
+            .find(|option| option != &value.display_value())
+            .unwrap_or_else(|| value.display_value());
+        let multiline = matches!(
+            property.definition,
+            DesignComponentPropertyDefinition::Text {
+                multiline: true,
+                ..
+            }
+        );
+        let value_control = match kind {
+            DesignComponentPropertyKind::InstanceSwap => {
+                self.render_component_swap_browser(index, &property, cx)
+            }
+            DesignComponentPropertyKind::Text if multiline => {
+                let display_value: SharedString = match &value {
+                    DesignComponentPropertyValue::Text(value) if value.is_empty() => "Empty".into(),
+                    DesignComponentPropertyValue::Text(value) => value.replace('\n', " ↵ ").into(),
+                    _ => value.display_value(),
                 };
-                let available = main.availability.is_available();
-                content = content.child(
-                    h_flex()
-                        .min_h(px(42.))
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .rounded(px(5.))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().secondary)
-                        .child(div().text_color(cx.theme().selection).child(
-                            if role.uses_instance_section() {
-                                "◇"
-                            } else {
-                                "◆"
-                            },
-                        ))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(div().truncate().text_xs().child(main.name.clone()))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(origin),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if available {
-                                    cx.theme().green
-                                } else {
-                                    cx.theme().red
-                                })
-                                .child(main.availability.label()),
-                        )
-                        .when(available && role.uses_instance_section(), |row| {
-                            row.child(Icon::new(IconName::ChevronRight).xsmall())
-                        }),
-                );
+                Button::new(SharedString::from(format!(
+                    "{}-component-multiline-{}",
+                    self.id, property.id
+                )))
+                .label(display_value)
+                .tooltip("Edit multiline text")
+                .xsmall()
+                .compact()
+                .w_full()
+                .h(px(ROW_HEIGHT))
+                .disabled(!self.property_is_editable(DesignPanelProperty::ComponentProperty(index)))
+                .on_activate(cx.listener(move |this, _, window, cx| {
+                    this.open_component_multiline_editor_from_control(index, window, cx);
+                }))
+                .into_any_element()
             }
-
-            if let Some(description) = context.description.as_ref() {
-                content = content.child(
+            _ => self.render_value_cell(
+                format!("component-property-{index}"),
+                match kind {
+                    DesignComponentPropertyKind::Variant => "V",
+                    DesignComponentPropertyKind::Text => "T",
+                    DesignComponentPropertyKind::Boolean => "B",
+                    DesignComponentPropertyKind::InstanceSwap => "I",
+                    DesignComponentPropertyKind::Slot => "S",
+                },
+                value.display_value(),
+                DesignPanelProperty::ComponentProperty(index),
+                DesignPanelValue::Text(next),
+                cx,
+            ),
+        };
+        let mut property_content = v_flex().gap_1().child(
+            h_flex()
+                .min_h(px(ROW_HEIGHT))
+                .gap_2()
+                .child(
                     div()
+                        .w(px(104.))
+                        .truncate()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(description.clone()),
-                );
-            }
-            for link in &context.documentation_links {
-                content = content.child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().text_color(cx.theme().selection).child("↗"))
-                        .child(
-                            div()
-                                .flex_1()
-                                .truncate()
-                                .text_xs()
-                                .child(link.label.clone()),
-                        )
-                        .child(
-                            div()
-                                .max_w(px(120.))
-                                .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(link.url.clone()),
-                        ),
-                );
-            }
-        }
-
-        if let Some(applied) = self.render_applied_component_property_controls(
-            DesignComponentPropertyApplicationSurface::NestedInstance,
-            cx,
-        ) {
-            content = content.child(applied);
-        }
-        if let Some(definitions) = self.render_component_definition_authoring(cx) {
-            content = content.child(definitions);
-        }
-
-        let mut previous_origin: Option<DesignComponentPropertyOrigin> = None;
-        for (index, property) in self.node.component_properties.iter().cloned().enumerate() {
-            if previous_origin.as_ref() != Some(&property.origin) {
-                if let DesignComponentPropertyOrigin::NestedInstance {
-                    instance_id,
-                    instance_name,
-                    main_component,
-                } = &property.origin
-                {
-                    let select_action =
-                        DesignPanelAction::ComponentPropertyNestedInstanceSelectRequested {
-                            node_id: self.node.id.clone(),
-                            property_id: property.id.clone(),
-                            instance_id: instance_id.clone(),
-                        };
-                    let mut group_header = h_flex()
-                        .w_full()
-                        .min_h(px(32.))
-                        .gap_2()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .child(div().text_color(cx.theme().selection).child("◇"))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .child(instance_name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("Nested instance"),
-                                ),
-                        )
-                        .child(self.render_component_action_button(
-                            format!("nested-select-{instance_id}"),
-                            "Select",
-                            select_action,
-                            cx,
-                        ));
-                    if let Some(main_component) = main_component.as_ref() {
-                        group_header = group_header.child(self.render_component_action_button(
-                            format!("nested-go-to-{}-{}", instance_id, main_component.id),
-                            "Go to",
-                            DesignPanelAction::ComponentPropertyNestedInstanceGoToMainRequested {
-                                node_id: self.node.id.clone(),
-                                property_id: property.id.clone(),
-                                instance_id: instance_id.clone(),
-                                main_component_id: main_component.id.clone(),
-                            },
-                            cx,
-                        ));
-                    }
-                    content = content.child(group_header);
-                }
-                previous_origin = Some(property.origin.clone());
-            }
-            let kind = property.definition.kind();
-            let value = property.effective_value();
-            let next = property
-                .definition
-                .option_labels()
-                .into_iter()
-                .find(|option| option != &value.display_value())
-                .unwrap_or_else(|| value.display_value());
-            let multiline = matches!(
-                property.definition,
-                DesignComponentPropertyDefinition::Text {
-                    multiline: true,
-                    ..
-                }
-            );
-            let value_control = match kind {
-                DesignComponentPropertyKind::InstanceSwap => {
-                    self.render_component_swap_browser(index, &property, cx)
-                }
-                DesignComponentPropertyKind::Text if multiline => {
-                    let display_value: SharedString = match &value {
-                        DesignComponentPropertyValue::Text(value) if value.is_empty() => {
-                            "Empty".into()
-                        }
-                        DesignComponentPropertyValue::Text(value) => {
-                            value.replace('\n', " ↵ ").into()
-                        }
-                        _ => value.display_value(),
-                    };
-                    Button::new(SharedString::from(format!(
-                        "{}-component-multiline-{}",
-                        self.id, property.id
-                    )))
-                    .label(display_value)
-                    .tooltip("Edit multiline text")
-                    .xsmall()
-                    .compact()
-                    .w_full()
-                    .h(px(ROW_HEIGHT))
-                    .disabled(
-                        !self.property_is_editable(DesignPanelProperty::ComponentProperty(index)),
-                    )
-                    .on_activate(cx.listener(move |this, _, window, cx| {
-                        this.open_component_multiline_editor_from_control(index, window, cx);
-                    }))
-                    .into_any_element()
-                }
-                _ => self.render_value_cell(
-                    format!("component-property-{index}"),
-                    match kind {
-                        DesignComponentPropertyKind::Variant => "◆",
-                        DesignComponentPropertyKind::Text => "T",
-                        DesignComponentPropertyKind::Boolean => "✓",
-                        DesignComponentPropertyKind::InstanceSwap => "◇",
-                        DesignComponentPropertyKind::Slot => "◈",
-                    },
-                    value.display_value(),
-                    DesignPanelProperty::ComponentProperty(index),
-                    DesignPanelValue::Text(next),
-                    cx,
-                ),
-            };
-            let mut property_content = v_flex().gap_1().child(
-                h_flex()
-                    .min_h(px(ROW_HEIGHT))
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(104.))
-                            .truncate()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(property.name.clone()),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .gap_1()
-                            .child(div().flex_1().min_w(px(0.)).child(value_control))
-                            .when_some(
-                                self.render_component_property_variable_button(
-                                    index,
-                                    cx.entity(),
-                                    cx,
-                                ),
-                                |row, button| row.child(button),
-                            ),
-                    ),
-            );
-
-            if multiline
-                && self
-                    .component_multiline_editor
-                    .as_ref()
-                    .is_some_and(|editor| editor.property_id == property.id)
-            {
-                property_content = property_content.child(
-                    v_flex()
-                        .pl(px(112.))
-                        .gap_1()
-                        .child(
-                            div()
-                                .h(px(88.))
-                                .w_full()
-                                .rounded(px(4.))
-                                .border_1()
-                                .border_color(cx.theme().selection)
-                                .child(
-                                    Input::new(&self.component_multiline_input)
-                                        .appearance(false)
-                                        .bordered(false)
-                                        .focus_bordered(false)
-                                        .small()
-                                        .h_full()
-                                        .w_full(),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .justify_end()
-                                .gap_1()
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "{}-component-multiline-cancel-{}",
-                                        self.id, property.id
-                                    )))
-                                    .label("Cancel")
-                                    .xsmall()
-                                    .compact()
-                                    .ghost()
-                                    .on_activate(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.finish_component_multiline_editor(
-                                                false, window, cx,
-                                            );
-                                        }),
-                                    ),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!(
-                                        "{}-component-multiline-apply-{}",
-                                        self.id, property.id
-                                    )))
-                                    .label("Apply")
-                                    .xsmall()
-                                    .compact()
-                                    .on_activate(
-                                        cx.listener(|this, _, window, cx| {
-                                            this.finish_component_multiline_editor(
-                                                true, window, cx,
-                                            );
-                                        }),
-                                    ),
-                                ),
-                        ),
-                );
-            }
-
-            if matches!(
-                property.definition,
-                DesignComponentPropertyDefinition::Slot { .. }
-            ) && let Some(description) = property.description.as_ref()
-            {
-                property_content = property_content.child(
-                    div()
-                        .pl(px(112.))
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(description.clone()),
-                );
-            }
-            for link in &property.documentation_links {
-                property_content = property_content.child(
-                    h_flex()
-                        .pl(px(112.))
-                        .gap_1()
-                        .text_xs()
-                        .text_color(cx.theme().selection)
-                        .child("↗")
-                        .child(link.label.clone()),
-                );
-            }
-            if property.override_state != DesignComponentPropertyOverrideState::Default {
-                property_content = property_content.child(
-                    h_flex()
-                        .pl(px(112.))
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(match property.override_state {
-                                    DesignComponentPropertyOverrideState::Default => "",
-                                    DesignComponentPropertyOverrideState::Overridden => {
-                                        "Overridden"
-                                    }
-                                    DesignComponentPropertyOverrideState::Mixed => "Mixed override",
-                                }),
-                        )
-                        .when(property.reset_state.can_reset(), |row| {
-                            row.child(self.render_component_action_button(
-                                format!("reset-component-property-{}", property.id),
-                                "Reset",
-                                DesignPanelAction::ComponentPropertyResetRequested {
-                                    node_id: self.node.id.clone(),
-                                    property_id: property.id.clone(),
-                                },
-                                cx,
-                            ))
-                        }),
-                );
-            }
-
-            if let DesignComponentPropertyDefinition::Slot { settings, .. } = &property.definition {
-                if role.can_configure_slot() {
-                    property_content = property_content
-                        .child(self.render_toggle_row(
-                            format!("slot-stretch-{index}"),
-                            "Stretch child on insert",
-                            settings.stretch_child_on_insert,
-                            DesignPanelProperty::SlotStretchChildOnInsert(index),
-                            cx,
-                        ))
-                        .child(self.render_toggle_row(
-                            format!("slot-display-empty-{index}"),
-                            "Display empty slot",
-                            settings.display_empty,
-                            DesignPanelProperty::SlotDisplayEmpty(index),
-                            cx,
-                        ))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .gap_1()
-                                        .child(self.render_group_label("Minimum layers", cx))
-                                        .child(
-                                            self.render_value_cell(
-                                                format!("slot-minimum-{index}"),
-                                                "Min",
-                                                settings.minimum_children.map_or_else(
-                                                    || "None".into(),
-                                                    |value| value.to_string(),
-                                                ),
-                                                DesignPanelProperty::SlotMinimumInstances(index),
-                                                DesignPanelValue::OptionalNumber(
-                                                    settings
-                                                        .minimum_children
-                                                        .map_or(Some(0.), |value| {
-                                                            Some(value as f32 + 1.)
-                                                        }),
-                                                ),
-                                                cx,
-                                            ),
-                                        ),
-                                )
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .gap_1()
-                                        .child(self.render_group_label("Maximum layers", cx))
-                                        .child(
-                                            self.render_value_cell(
-                                                format!("slot-maximum-{index}"),
-                                                "Max",
-                                                settings.maximum_children.map_or_else(
-                                                    || "None".into(),
-                                                    |value| value.to_string(),
-                                                ),
-                                                DesignPanelProperty::SlotMaximumInstances(index),
-                                                DesignPanelValue::OptionalNumber(
-                                                    settings
-                                                        .maximum_children
-                                                        .map_or(Some(1.), |value| {
-                                                            Some(value as f32 + 1.)
-                                                        }),
-                                                ),
-                                                cx,
-                                            ),
-                                        ),
-                                ),
-                        )
-                        .child(self.render_toggle_row(
-                            format!("slot-preferred-only-{index}"),
-                            "Only allow preferred instances",
-                            settings.preferred_values_only,
-                            DesignPanelProperty::SlotPreferredValuesOnly(index),
-                            cx,
-                        ));
-                }
-
-                if role.can_modify_slot_instances()
-                    && let Some(limits) = self.render_slot_limits(&property, cx)
-                {
-                    property_content = property_content.child(limits);
-                }
-
-                if !settings.preferred_values.is_empty() {
-                    property_content = property_content.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Preferred instances"),
-                    );
-                    for preferred in &settings.preferred_values {
-                        let action = DesignPanelAction::SlotAddInstanceRequested {
-                            node_id: self.node.id.clone(),
-                            property_id: property.id.clone(),
-                            preferred_component: Some(preferred.clone()),
-                        };
-                        property_content = property_content.child(
-                            h_flex()
-                                .gap_2()
-                                .child(div().text_color(cx.theme().selection).child("◇"))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .truncate()
-                                        .text_xs()
-                                        .child(preferred.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(preferred.origin.label()),
-                                )
-                                .when(role.can_modify_slot_instances(), |row| {
-                                    row.child(self.render_component_action_button(
-                                        format!(
-                                            "slot-add-preferred-{}-{}",
-                                            property.id, preferred.id
-                                        ),
-                                        "Add",
-                                        action,
-                                        cx,
-                                    ))
-                                }),
-                        );
-                    }
-                }
-
-                if let DesignComponentPropertyValue::Slot(slot_value) = &value {
-                    for (child_index, child) in slot_value.children.iter().enumerate() {
-                        let previous_index = child_index.saturating_sub(1);
-                        let next_index =
-                            (child_index + 1).min(slot_value.children.len().saturating_sub(1));
-                        let replacement = settings
-                            .preferred_values
-                            .iter()
-                            .find(|candidate| {
-                                candidate.availability.is_available()
-                                    && child
-                                        .main_component
-                                        .as_ref()
-                                        .is_none_or(|current| current.id != candidate.id)
-                            })
-                            .cloned();
-                        property_content = property_content.child(
-                            v_flex()
-                                .gap_1()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_color(cx.theme().selection)
-                                                .child(child.kind.glyph()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .truncate()
-                                                .text_xs()
-                                                .child(child.name.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(child.kind.label()),
-                                        ),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .when(child.capabilities.select, |row| {
-                                            row.child(self.render_component_action_button(
-                                                format!(
-                                                    "slot-child-select-{}-{}",
-                                                    property.id, child.node_id
-                                                ),
-                                                "Select",
-                                                DesignPanelAction::SlotChildSelectRequested {
-                                                    node_id: self.node.id.clone(),
-                                                    property_id: property.id.clone(),
-                                                    child_node_id: child.node_id.clone(),
-                                                },
-                                                cx,
-                                            ))
-                                        })
-                                        .when(
-                                            child.capabilities.reorder && child_index > 0,
-                                            |row| {
-                                                row.child(self.render_component_action_button(
-                                                    format!(
-                                                        "slot-child-up-{}-{}",
-                                                        property.id, child.node_id
-                                                    ),
-                                                    "↑",
-                                                    DesignPanelAction::SlotChildReorderRequested {
-                                                        node_id: self.node.id.clone(),
-                                                        property_id: property.id.clone(),
-                                                        child_node_id: child.node_id.clone(),
-                                                        from_index: child_index,
-                                                        to_index: previous_index,
-                                                    },
-                                                    cx,
-                                                ))
-                                            },
-                                        )
-                                        .when(
-                                            child.capabilities.reorder
-                                                && child_index + 1 < slot_value.children.len(),
-                                            |row| {
-                                                row.child(self.render_component_action_button(
-                                                    format!(
-                                                        "slot-child-down-{}-{}",
-                                                        property.id, child.node_id
-                                                    ),
-                                                    "↓",
-                                                    DesignPanelAction::SlotChildReorderRequested {
-                                                        node_id: self.node.id.clone(),
-                                                        property_id: property.id.clone(),
-                                                        child_node_id: child.node_id.clone(),
-                                                        from_index: child_index,
-                                                        to_index: next_index,
-                                                    },
-                                                    cx,
-                                                ))
-                                            },
-                                        )
-                                        .when_some(
-                                            child
-                                                .capabilities
-                                                .replace_instance
-                                                .then_some(replacement)
-                                                .flatten(),
-                                            |row, replacement| {
-                                                row.child(self.render_component_action_button(
-                                                    format!(
-                                                        "slot-child-replace-{}-{}",
-                                                        property.id, child.node_id
-                                                    ),
-                                                    "Swap",
-                                                    DesignPanelAction::SlotChildReplaceRequested {
-                                                        node_id: self.node.id.clone(),
-                                                        property_id: property.id.clone(),
-                                                        child_node_id: child.node_id.clone(),
-                                                        replacement,
-                                                    },
-                                                    cx,
-                                                ))
-                                            },
-                                        )
-                                        .when(child.capabilities.remove, |row| {
-                                            row.child(self.render_component_action_button(
-                                                format!(
-                                                    "slot-child-remove-{}-{}",
-                                                    property.id, child.node_id
-                                                ),
-                                                "Remove",
-                                                DesignPanelAction::SlotChildRemoveRequested {
-                                                    node_id: self.node.id.clone(),
-                                                    property_id: property.id.clone(),
-                                                    child_node_id: child.node_id.clone(),
-                                                    index: child_index,
-                                                },
-                                                cx,
-                                            ))
-                                        }),
-                                ),
-                        );
-                    }
-                }
-
-                if role.can_modify_slot_instances() {
-                    property_content = property_content.child(
-                        h_flex()
-                            .gap_2()
-                            .when(
-                                property
-                                    .slot_state
-                                    .as_ref()
-                                    .is_some_and(|state| state.reset_state.can_reset()),
-                                |row| {
-                                    row.child(self.render_component_action_button(
-                                        format!("slot-reset-{}", property.id),
-                                        "Reset",
-                                        DesignPanelAction::SlotResetRequested {
-                                            node_id: self.node.id.clone(),
-                                            property_id: property.id.clone(),
-                                        },
-                                        cx,
-                                    ))
-                                },
-                            )
-                            .child(self.render_component_action_button(
-                                format!("slot-clear-{}", property.id),
-                                "Delete contents",
-                                DesignPanelAction::SlotClearRequested {
-                                    node_id: self.node.id.clone(),
-                                    property_id: property.id.clone(),
-                                },
-                                cx,
-                            ))
-                            .child(self.render_component_action_button(
-                                format!("slot-add-{}", property.id),
-                                "Add instances",
-                                DesignPanelAction::SlotAddInstanceRequested {
-                                    node_id: self.node.id.clone(),
-                                    property_id: property.id.clone(),
-                                    preferred_component: None,
-                                },
-                                cx,
-                            )),
-                    );
-                }
-            }
-
-            content = content.child(
-                property_content
-                    .pb_2()
-                    .border_b_1()
-                    .border_color(cx.theme().border),
-            );
-        }
-
-        if let Some(exposures) = self.render_nested_component_property_exposures(cx) {
-            content = content.child(exposures);
-        }
-
-        if role.can_reset_instance_overrides() {
-            content = content
-                .when(
-                    self.node
-                        .component_context
-                        .as_ref()
-                        .is_some_and(|context| context.overrides.reset_state.can_reset()),
-                    |content| {
-                        content.child(self.render_component_action_button(
-                            "reset-overrides",
-                            "Reset all overrides",
-                            DesignPanelAction::ResetInstanceOverridesRequested {
-                                node_id: self.node.id.clone(),
-                            },
-                            cx,
-                        ))
-                    },
+                        .child(property.name.clone()),
                 )
                 .child(
                     h_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap_1()
+                        .child(div().flex_1().min_w(px(0.)).child(value_control))
+                        .when_some(
+                            self.render_component_property_variable_button(index, cx.entity(), cx),
+                            |row, button| row.child(button),
+                        ),
+                ),
+        );
+
+        if multiline && multiline_editor_active {
+            property_content = property_content.child(
+                v_flex()
+                    .pl(px(112.))
+                    .gap_1()
+                    .child(
+                        div()
+                            .h(px(88.))
+                            .w_full()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(cx.theme().selection)
+                            .child(
+                                Input::new(&self.retained.inputs.component_multiline)
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false)
+                                    .small()
+                                    .h_full()
+                                    .w_full(),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_1()
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "{}-component-multiline-cancel-{}",
+                                    self.id, property.id
+                                )))
+                                .label("Cancel")
+                                .xsmall()
+                                .compact()
+                                .ghost()
+                                .on_activate(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.finish_component_multiline_editor(false, window, cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "{}-component-multiline-apply-{}",
+                                    self.id, property.id
+                                )))
+                                .label("Apply")
+                                .xsmall()
+                                .compact()
+                                .on_activate(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.finish_component_multiline_editor(true, window, cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            );
+        }
+
+        if matches!(
+            property.definition,
+            DesignComponentPropertyDefinition::Slot { .. }
+        ) && let Some(description) = property.description.as_ref()
+        {
+            property_content = property_content.child(
+                div()
+                    .pl(px(112.))
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(description.clone()),
+            );
+        }
+        for link in &property.documentation_links {
+            property_content = property_content.child(
+                h_flex()
+                    .pl(px(112.))
+                    .gap_1()
+                    .text_xs()
+                    .text_color(cx.theme().selection)
+                    .child(render_lucide_icon(
+                        LucideIcon::ExternalLink,
+                        cx.theme().selection,
+                        14.,
+                    ))
+                    .child(link.label.clone()),
+            );
+        }
+        if property.override_state != DesignComponentPropertyOverrideState::Default {
+            property_content = property_content.child(
+                h_flex()
+                    .pl(px(112.))
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(match property.override_state {
+                                DesignComponentPropertyOverrideState::Default => "",
+                                DesignComponentPropertyOverrideState::Overridden => "Overridden",
+                                DesignComponentPropertyOverrideState::Mixed => "Mixed override",
+                            }),
+                    )
+                    .when(property.reset_state.can_reset(), |row| {
+                        row.child(self.render_component_action_button(
+                            format!("reset-component-property-{}", property.id),
+                            "Reset",
+                            DesignPanelAction::ComponentPropertyResetRequested {
+                                node_id: self.host.inspected_node().id.clone(),
+                                property_id: property.id.clone(),
+                            },
+                            cx,
+                        ))
+                    }),
+            );
+        }
+
+        if let DesignComponentPropertyDefinition::Slot { settings, .. } = &property.definition {
+            if role.can_configure_slot() {
+                property_content = property_content
+                    .child(self.render_toggle_row(
+                        format!("slot-stretch-{index}"),
+                        "Stretch child on insert",
+                        settings.stretch_child_on_insert,
+                        DesignPanelProperty::SlotStretchChildOnInsert(index),
+                        cx,
+                    ))
+                    .child(self.render_toggle_row(
+                        format!("slot-display-empty-{index}"),
+                        "Display empty slot",
+                        settings.display_empty,
+                        DesignPanelProperty::SlotDisplayEmpty(index),
+                        cx,
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .gap_1()
+                                    .child(self.render_group_label("Minimum layers", cx))
+                                    .child(
+                                        self.render_value_cell(
+                                            format!("slot-minimum-{index}"),
+                                            "Min",
+                                            settings.minimum_children.map_or_else(
+                                                || "None".into(),
+                                                |value| value.to_string(),
+                                            ),
+                                            DesignPanelProperty::SlotMinimumInstances(index),
+                                            DesignPanelValue::OptionalNumber(
+                                                settings
+                                                    .minimum_children
+                                                    .map_or(Some(0.), |value| {
+                                                        Some(value as f32 + 1.)
+                                                    }),
+                                            ),
+                                            cx,
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .gap_1()
+                                    .child(self.render_group_label("Maximum layers", cx))
+                                    .child(
+                                        self.render_value_cell(
+                                            format!("slot-maximum-{index}"),
+                                            "Max",
+                                            settings.maximum_children.map_or_else(
+                                                || "None".into(),
+                                                |value| value.to_string(),
+                                            ),
+                                            DesignPanelProperty::SlotMaximumInstances(index),
+                                            DesignPanelValue::OptionalNumber(
+                                                settings
+                                                    .maximum_children
+                                                    .map_or(Some(1.), |value| {
+                                                        Some(value as f32 + 1.)
+                                                    }),
+                                            ),
+                                            cx,
+                                        ),
+                                    ),
+                            ),
+                    )
+                    .child(self.render_toggle_row(
+                        format!("slot-preferred-only-{index}"),
+                        "Only allow preferred instances",
+                        settings.preferred_values_only,
+                        DesignPanelProperty::SlotPreferredValuesOnly(index),
+                        cx,
+                    ));
+            }
+
+            if role.can_modify_slot_instances()
+                && let Some(limits) = self.render_slot_limits(&property, cx)
+            {
+                property_content = property_content.child(limits);
+            }
+
+            if !settings.preferred_values.is_empty() {
+                property_content = property_content.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Preferred instances"),
+                );
+                for preferred in &settings.preferred_values {
+                    let action = DesignPanelAction::SlotAddInstanceRequested {
+                        node_id: self.host.inspected_node().id.clone(),
+                        property_id: property.id.clone(),
+                        preferred_component: Some(preferred.clone()),
+                    };
+                    property_content = property_content.child(
+                        h_flex()
+                            .gap_2()
+                            .child(render_lucide_icon(
+                                LucideIcon::Diamond,
+                                cx.theme().selection,
+                                16.,
+                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_xs()
+                                    .child(preferred.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(preferred.origin.label()),
+                            )
+                            .when(role.can_modify_slot_instances(), |row| {
+                                row.child(self.render_component_action_button(
+                                    format!("slot-add-preferred-{}-{}", property.id, preferred.id),
+                                    "Add",
+                                    action,
+                                    cx,
+                                ))
+                            }),
+                    );
+                }
+            }
+
+            if let DesignComponentPropertyValue::Slot(slot_value) = &value {
+                for (child_index, child) in slot_value.children.iter().enumerate() {
+                    let previous_index = child_index.saturating_sub(1);
+                    let next_index =
+                        (child_index + 1).min(slot_value.children.len().saturating_sub(1));
+                    let replacement = settings
+                        .preferred_values
+                        .iter()
+                        .find(|candidate| {
+                            candidate.availability.is_available()
+                                && child
+                                    .main_component
+                                    .as_ref()
+                                    .is_none_or(|current| current.id != candidate.id)
+                        })
+                        .cloned();
+                    property_content = property_content.child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(div().text_color(cx.theme().selection).child(
+                                        render_lucide_icon(
+                                            child.kind.lucide_icon(),
+                                            cx.theme().selection,
+                                            16.,
+                                        ),
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .truncate()
+                                            .text_xs()
+                                            .child(child.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(child.kind.label()),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .when(child.capabilities.select, |row| {
+                                        row.child(self.render_component_action_button(
+                                            format!(
+                                                "slot-child-select-{}-{}",
+                                                property.id, child.node_id
+                                            ),
+                                            "Select",
+                                            DesignPanelAction::SlotChildSelectRequested {
+                                                node_id: self.host.inspected_node().id.clone(),
+                                                property_id: property.id.clone(),
+                                                child_node_id: child.node_id.clone(),
+                                            },
+                                            cx,
+                                        ))
+                                    })
+                                    .when(child.capabilities.reorder && child_index > 0, |row| {
+                                        row.child(self.render_component_action_button(
+                                            format!(
+                                                "slot-child-up-{}-{}",
+                                                property.id, child.node_id
+                                            ),
+                                            "↑",
+                                            DesignPanelAction::SlotChildReorderRequested {
+                                                node_id: self.host.inspected_node().id.clone(),
+                                                property_id: property.id.clone(),
+                                                child_node_id: child.node_id.clone(),
+                                                from_index: child_index,
+                                                to_index: previous_index,
+                                            },
+                                            cx,
+                                        ))
+                                    })
+                                    .when(
+                                        child.capabilities.reorder
+                                            && child_index + 1 < slot_value.children.len(),
+                                        |row| {
+                                            row.child(self.render_component_action_button(
+                                                format!(
+                                                    "slot-child-down-{}-{}",
+                                                    property.id, child.node_id
+                                                ),
+                                                "↓",
+                                                DesignPanelAction::SlotChildReorderRequested {
+                                                    node_id: self.host.inspected_node().id.clone(),
+                                                    property_id: property.id.clone(),
+                                                    child_node_id: child.node_id.clone(),
+                                                    from_index: child_index,
+                                                    to_index: next_index,
+                                                },
+                                                cx,
+                                            ))
+                                        },
+                                    )
+                                    .when_some(
+                                        child
+                                            .capabilities
+                                            .replace_instance
+                                            .then_some(replacement)
+                                            .flatten(),
+                                        |row, replacement| {
+                                            row.child(self.render_component_action_button(
+                                                format!(
+                                                    "slot-child-replace-{}-{}",
+                                                    property.id, child.node_id
+                                                ),
+                                                "Swap",
+                                                DesignPanelAction::SlotChildReplaceRequested {
+                                                    node_id: self.host.inspected_node().id.clone(),
+                                                    property_id: property.id.clone(),
+                                                    child_node_id: child.node_id.clone(),
+                                                    replacement,
+                                                },
+                                                cx,
+                                            ))
+                                        },
+                                    )
+                                    .when(child.capabilities.remove, |row| {
+                                        row.child(self.render_component_action_button(
+                                            format!(
+                                                "slot-child-remove-{}-{}",
+                                                property.id, child.node_id
+                                            ),
+                                            "Remove",
+                                            DesignPanelAction::SlotChildRemoveRequested {
+                                                node_id: self.host.inspected_node().id.clone(),
+                                                property_id: property.id.clone(),
+                                                child_node_id: child.node_id.clone(),
+                                                index: child_index,
+                                            },
+                                            cx,
+                                        ))
+                                    }),
+                            ),
+                    );
+                }
+            }
+
+            if role.can_modify_slot_instances() {
+                property_content = property_content.child(
+                    h_flex()
                         .gap_2()
                         .when(
-                            self.node
-                                .component_context
+                            property
+                                .slot_state
                                 .as_ref()
-                                .and_then(|context| context.main_component.as_ref())
-                                .is_some(),
+                                .is_some_and(|state| state.reset_state.can_reset()),
                             |row| {
                                 row.child(self.render_component_action_button(
-                                    "go-to-main",
-                                    "Go to main",
-                                    DesignPanelAction::GoToMainComponentRequested {
-                                        node_id: self.node.id.clone(),
+                                    format!("slot-reset-{}", property.id),
+                                    "Reset",
+                                    DesignPanelAction::SlotResetRequested {
+                                        node_id: self.host.inspected_node().id.clone(),
+                                        property_id: property.id.clone(),
                                     },
                                     cx,
                                 ))
                             },
                         )
-                        .when(role.can_detach_instance(), |row| {
-                            row.child(self.render_component_action_button(
-                                "detach-instance",
-                                "Detach",
-                                DesignPanelAction::DetachInstanceRequested {
-                                    node_id: self.node.id.clone(),
-                                },
-                                cx,
-                            ))
-                        }),
+                        .child(self.render_component_action_button(
+                            format!("slot-clear-{}", property.id),
+                            "Delete contents",
+                            DesignPanelAction::SlotClearRequested {
+                                node_id: self.host.inspected_node().id.clone(),
+                                property_id: property.id.clone(),
+                            },
+                            cx,
+                        ))
+                        .child(self.render_component_action_button(
+                            format!("slot-add-{}", property.id),
+                            "Add instances",
+                            DesignPanelAction::SlotAddInstanceRequested {
+                                node_id: self.host.inspected_node().id.clone(),
+                                property_id: property.id.clone(),
+                                preferred_component: None,
+                            },
+                            cx,
+                        )),
                 );
+            }
         }
-        Some(self.render_section(
-            if role.uses_instance_section() {
-                DesignPanelSection::Instance
-            } else {
-                DesignPanelSection::Component
-            },
-            None,
-            content.into_any_element(),
+
+        property_content
+            .pb_2()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .into_any_element()
+    }
+
+    fn component_projection(&self) -> Option<sections::component::ComponentProjection> {
+        let role = self.host.inspected_node().component_role()?;
+        let identity = sections::component::ComponentIdentityProjection::new(
+            self.id.clone(),
+            self.host.inspected_node().id.clone(),
+            self.command_target(),
+        );
+        let context = self.host.inspected_node().component_context.clone();
+        let authoring = self.component_authoring_view_data();
+        let authoring_projection = sections::component::ComponentAuthoringProjection::new(
+            authoring.is_some_and(|authoring| {
+                authoring.applied_properties.iter().any(|control| {
+                    control.surface == DesignComponentPropertyApplicationSurface::NestedInstance
+                })
+            }),
+            authoring.is_some(),
+            authoring.is_some_and(|authoring| !authoring.exposure_candidates.is_empty()),
+        );
+        let rows = self
+            .host
+            .inspected_node()
+            .component_properties
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, property)| {
+                let (select_enabled, go_to_main_enabled) = match &property.origin {
+                    DesignComponentPropertyOrigin::NestedInstance {
+                        instance_id,
+                        main_component,
+                        ..
+                    } => {
+                        let select =
+                            DesignPanelAction::ComponentPropertyNestedInstanceSelectRequested {
+                                node_id: self.host.inspected_node().id.clone(),
+                                property_id: property.id.clone(),
+                                instance_id: instance_id.clone(),
+                            };
+                        let go_to_main = main_component.as_ref().map(|main_component| {
+                            DesignPanelAction::ComponentPropertyNestedInstanceGoToMainRequested {
+                                node_id: self.host.inspected_node().id.clone(),
+                                property_id: property.id.clone(),
+                                instance_id: instance_id.clone(),
+                                main_component_id: main_component.id.clone(),
+                            }
+                        });
+                        (
+                            self.component_action_is_enabled(&select),
+                            go_to_main
+                                .as_ref()
+                                .is_some_and(|action| self.component_action_is_enabled(action)),
+                        )
+                    }
+                    DesignComponentPropertyOrigin::SelectedNode => (false, false),
+                };
+                sections::component::ComponentPropertyProjection::new(
+                    index,
+                    property,
+                    sections::component::NestedInstanceActionAccess::new(
+                        select_enabled,
+                        go_to_main_enabled,
+                    ),
+                )
+            })
+            .collect();
+
+        let reset_action = DesignPanelAction::ResetInstanceOverridesRequested {
+            node_id: self.host.inspected_node().id.clone(),
+        };
+        let go_to_main_action = DesignPanelAction::GoToMainComponentRequested {
+            node_id: self.host.inspected_node().id.clone(),
+        };
+        let detach_action = DesignPanelAction::DetachInstanceRequested {
+            node_id: self.host.inspected_node().id.clone(),
+        };
+        let reset_visible = role.can_reset_instance_overrides()
+            && context
+                .as_ref()
+                .is_some_and(|context| context.overrides.reset_state.can_reset());
+        let go_to_main_visible = role.can_reset_instance_overrides()
+            && context
+                .as_ref()
+                .and_then(|context| context.main_component.as_ref())
+                .is_some();
+        let detach_visible = role.can_reset_instance_overrides() && role.can_detach_instance();
+        let multiline_property_id = self
+            .edit
+            .component_multiline
+            .as_ref()
+            .map(|editor| editor.property_id.clone());
+
+        Some(sections::component::ComponentProjection::new(
+            identity,
+            sections::component::ComponentRoleProjection::new(role),
+            sections::component::ComponentContextProjection::new(context),
+            sections::component::ComponentPropertiesProjection::new(rows),
+            authoring_projection,
+            sections::component::ComponentPresentationProjection::new(
+                multiline_property_id,
+                sections::component::ComponentFooterPresentation::new(
+                    (
+                        reset_visible,
+                        self.component_action_is_enabled(&reset_action),
+                    ),
+                    (
+                        go_to_main_visible,
+                        self.component_action_is_enabled(&go_to_main_action),
+                    ),
+                    (
+                        detach_visible,
+                        self.component_action_is_enabled(&detach_action),
+                    ),
+                ),
+            ),
+        ))
+    }
+
+    fn render_component(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let projection = self.component_projection()?;
+        Some(sections::component::render_component(
+            &projection,
+            self,
+            sections::component::ComponentEventSink::new(cx.entity()),
             cx,
         ))
     }
 
-    pub(super) fn component_action_is_enabled(&self, action: &DesignPanelAction) -> bool {
-        if !self.node.supports_section(DesignPanelSection::Component)
-            && !self.node.supports_section(DesignPanelSection::Instance)
+    fn component_action_is_enabled(&self, action: &DesignPanelAction) -> bool {
+        if !self
+            .host
+            .inspected_node()
+            .supports_section(DesignPanelSection::Component)
+            && !self
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Instance)
         {
             return false;
         }
-        let Some(role) = self.node.component_role() else {
+        let Some(role) = self.host.inspected_node().component_role() else {
             return false;
         };
         if matches!(
@@ -6050,7 +6221,8 @@ impl DesignPanel {
             return self.component_authoring_action_is_enabled(action);
         }
         let property = |property_id: &SharedString| {
-            self.node
+            self.host
+                .inspected_node()
                 .component_properties
                 .iter()
                 .find(|property| &property.id == property_id)
@@ -6084,7 +6256,7 @@ impl DesignPanel {
             let expected = property(property_id)
                 .map(slot_preferred_violation_layer_ids)
                 .unwrap_or_default();
-            return node_id == &self.node.id
+            return node_id == &self.host.inspected_node().id
                 && role.can_modify_slot_instances()
                 && !expected.is_empty()
                 && *child_node_ids == expected
@@ -6129,7 +6301,8 @@ impl DesignPanel {
             DesignPanelAction::ResetInstanceOverridesRequested { .. } => {
                 role.can_reset_instance_overrides()
                     && self
-                        .node
+                        .host
+                        .inspected_node()
                         .component_context
                         .as_ref()
                         .is_some_and(|context| context.overrides.reset_state.can_reset())
@@ -6137,7 +6310,8 @@ impl DesignPanel {
             DesignPanelAction::GoToMainComponentRequested { .. } => {
                 role.uses_instance_section()
                     && self
-                        .node
+                        .host
+                        .inspected_node()
                         .component_context
                         .as_ref()
                         .and_then(|context| context.main_component.as_ref())
@@ -6255,13 +6429,13 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn emit_component_action(&self, action: DesignPanelAction, cx: &mut Context<Self>) {
+    fn emit_component_action(&self, action: DesignPanelAction, cx: &mut Context<Self>) {
         if self.component_action_is_enabled(&action) {
             cx.emit_design_panel_action(self, action);
         }
     }
 
-    pub(super) fn render_component_action_button(
+    fn render_component_action_button(
         &self,
         id_suffix: impl Into<SharedString>,
         label: impl Into<SharedString>,

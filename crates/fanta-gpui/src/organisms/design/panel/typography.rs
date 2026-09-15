@@ -1,22 +1,253 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn text_path_flip_is_available(&self) -> bool {
-        self.node.kind == DesignPanelNodeKind::TextPath
-            && self.node.supports_section(DesignPanelSection::Typography)
+/// Project Typography-owned host, catalog, access, and presentation state at
+/// the compatibility boundary. The standalone renderer never reads the panel
+/// facade directly.
+pub(super) fn projection(
+    panel: &DesignPanel,
+    cx: &App,
+) -> Option<sections::typography::TypographyProjection> {
+    let typography = panel.host.inspected_node().typography.clone()?;
+    let panel_target = panel.command_target();
+    let query = panel.retained.inputs.font_search.read(cx).value();
+    let font_browser = sections::typography::font_browser::FontBrowserProjection::from_panel(
+        panel,
+        query.as_ref(),
+    );
+    let style_picker = sections::typography::style_picker::TypographyStylePickerProjection::new(
+        panel.id.clone(),
+        panel_target.clone(),
+        panel.overlays.typography_style_picker_open(),
+        panel.property_is_editable(DesignPanelProperty::TypographyStyle),
+        panel.typography_style_picker.clone(),
+    );
+    let type_settings =
+        sections::typography::type_settings::TypeSettingsOverlayProjection::from_panel(
+            panel,
+            !typography.variable_axes.is_empty(),
+        );
+
+    Some(sections::typography::TypographyProjection::new(
+        sections::typography::TypographyIdentityProjection::new(
+            panel.id.clone(),
+            panel_target,
+            panel.typography_target(DesignPanelProperty::FontFamily),
+        ),
+        sections::typography::TypographyValuesProjection::new(
+            typography,
+            panel.host.inspected_node().text_path,
+            panel.host.inspected_node().text_path_start_data,
+        ),
+        sections::typography::TypographyAccessProjection::new(
+            panel.can_edit(),
+            panel.property_is_editable(DesignPanelProperty::HorizontalTextAlignment),
+            panel.property_is_editable(DesignPanelProperty::VerticalTextAlignment),
+            panel.text_path_flip_is_available(),
+            panel.text_path_start_debug_controls_are_available(),
+        ),
+        sections::typography::TypographyResourceProjection::new(
+            font_browser,
+            panel.retained.inputs.font_search.clone(),
+            style_picker,
+        ),
+        sections::typography::TypographyPresentationProjection::new(
+            panel.sections.is_expanded(DesignPanelSection::Typography),
+            type_settings,
+        ),
+    ))
+}
+
+/// Internal controller for Typography targeting, transient edits, resources,
+/// and compatibility chrome used by the extracted Typography section.
+pub(super) trait DesignTypographyController: Sized {
+    fn text_path_flip_is_available(&self) -> bool;
+    fn text_path_start_debug_controls_are_available(&self) -> bool;
+    fn text_max_lines_are_available(&self) -> bool;
+    fn typography_target(&self, property: DesignPanelProperty) -> DesignTypographyTarget;
+    fn variable_font_axis(&self, tag: &str) -> Option<&DesignFontAxis>;
+    fn variable_font_axis_target(&self) -> DesignTypographyTarget;
+    fn variable_font_axis_is_editable(&self, tag: &str) -> bool;
+    fn variable_font_axis_editor_survives(&self, editor: &VariableFontAxisEditor) -> bool;
+    fn emit_variable_font_axis_event(
+        &self,
+        event: DesignVariableFontAxisEditEvent,
+        cx: &mut Context<Self>,
+    );
+    fn begin_variable_font_axis_edit(&mut self, tag: SharedString, cx: &mut Context<Self>) -> bool;
+    fn activate_variable_font_axis_input(
+        &mut self,
+        tag: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn parsed_variable_font_axis_draft(&self, cx: &App) -> Option<Result<f32, ()>>;
+    fn validate_variable_font_axis_draft(&mut self, cx: &mut Context<Self>);
+    fn cancel_variable_font_axis_transaction(&mut self, cx: &mut Context<Self>);
+    fn finish_variable_font_axis_edit(
+        &mut self,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn step_variable_font_axis_input(
+        &mut self,
+        direction: ArrowStep,
+        modifiers: Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn apply_variable_font_axis_keyboard_step(
+        &mut self,
+        tag: SharedString,
+        key: &str,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn handle_variable_font_axis_slider_key_down(
+        &mut self,
+        tag: SharedString,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn start_variable_font_axis_scrub(
+        &mut self,
+        tag: SharedString,
+        position_x: f32,
+        position_y: f32,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn snapped_variable_font_axis_value(
+        editor: &VariableFontAxisEditor,
+        value: f32,
+        fine: bool,
+    ) -> f32;
+    fn update_variable_font_axis_scrub(
+        &mut self,
+        tag: &str,
+        position_x: f32,
+        position_y: f32,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    );
+    fn finish_variable_font_axis_scrub(
+        &mut self,
+        commit: bool,
+        suppress_click: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn text_path_start_for_property(
+        &self,
+        property: DesignPanelProperty,
+        value: &DesignPanelValue,
+    ) -> Option<DesignTextPathStartData>;
+    fn typography_style_binding(&self) -> Option<DesignTypographyStyleBinding>;
+    fn sync_typography_style_picker(&self, cx: &mut Context<Self>);
+    fn open_typography_style_picker(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn render_typography_style_button(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn open_font_browser(&mut self, window: &mut Window, cx: &mut Context<Self>);
+    fn emit_font_apply(&mut self, font: DesignFontSelection, cx: &mut Context<Self>);
+    fn emit_font_import(&mut self, font: DesignFontSelection, cx: &mut Context<Self>);
+    fn emit_open_type_feature(
+        &mut self,
+        tag: DesignOpenTypeFeatureTag,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    );
+    fn emit_text_path_flip_orientation(&mut self, cx: &mut Context<Self>);
+    #[cfg(test)]
+    fn render_font_browser(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn render_text_resize_icon(&self, icon: TextResizeIcon, cx: &mut Context<Self>) -> AnyElement;
+    fn render_text_resize_control(
+        &self,
+        current: DesignTextResize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_type_setting_segments(
+        panel_id: SharedString,
+        id_suffix: &'static str,
+        options: Vec<(SharedString, bool, DesignPanelValue)>,
+        enabled: bool,
+        property: DesignPanelProperty,
+        panel: Entity<Self>,
+        cx: &mut App,
+    ) -> AnyElement;
+    #[allow(clippy::too_many_arguments)]
+    fn render_type_setting_number_field(
+        panel_id: SharedString,
+        id_suffix: &'static str,
+        label: SharedString,
+        property: DesignPanelProperty,
+        value: DesignPanelValue,
+        enabled: bool,
+        editing: bool,
+        invalid: bool,
+        input: Entity<InputState>,
+        panel: Entity<Self>,
+        cx: &mut App,
+    ) -> AnyElement;
+    fn render_variable_font_axis_number_field(
+        panel_id: SharedString,
+        index: usize,
+        axis: DesignFontAxis,
+        panel: Entity<Self>,
+        cx: &mut App,
+    ) -> AnyElement;
+    fn render_variable_font_axis_slider(
+        panel_id: SharedString,
+        index: usize,
+        axis: DesignFontAxis,
+        panel: Entity<Self>,
+        cx: &mut App,
+    ) -> AnyElement;
+    fn render_variable_font_axis_row(
+        panel_id: SharedString,
+        index: usize,
+        axis: DesignFontAxis,
+        panel: Entity<Self>,
+        cx: &mut App,
+    ) -> AnyElement;
+    #[cfg(test)]
+    fn render_type_settings_popover(
+        &self,
+        typography: &super::super::DesignTypography,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_type_settings_popover_projected(
+        &self,
+        typography: &super::super::DesignTypography,
+        overlay: sections::typography::type_settings::TypeSettingsOverlayProjection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_typography(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+}
+
+impl DesignTypographyController for DesignPanel {
+    fn text_path_flip_is_available(&self) -> bool {
+        self.host.inspected_node().kind == DesignPanelNodeKind::TextPath
             && self
-                .node
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Typography)
+            && self
+                .host
+                .inspected_node()
                 .text_path
                 .as_ref()
                 .is_some_and(|text_path| text_path.can_flip_orientation)
     }
 
-    pub(super) fn text_path_start_debug_controls_are_available(&self) -> bool {
-        self.node.kind == DesignPanelNodeKind::TextPath
-            && self.node.supports_section(DesignPanelSection::Typography)
-            && self.node.text_path_start_data.is_some()
+    fn text_path_start_debug_controls_are_available(&self) -> bool {
+        self.host.inspected_node().kind == DesignPanelNodeKind::TextPath
             && self
-                .node
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Typography)
+            && self.host.inspected_node().text_path_start_data.is_some()
+            && self
+                .host
+                .inspected_node()
                 .text_path
                 .as_ref()
                 .is_some_and(|text_path| text_path.show_start_data_debug_controls)
@@ -25,19 +256,20 @@ impl DesignPanel {
     /// Mirrors Figma's contextual Max lines disclosure. The row exists only
     /// for ending-truncated Auto width/Auto height text, and an auto-layout
     /// child additionally has to use vertical Hug sizing.
-    pub(super) fn text_max_lines_are_available(&self) -> bool {
-        self.node
-            .text_max_lines_are_available(self.inspection_context.parent_layout().is_auto_layout())
+    fn text_max_lines_are_available(&self) -> bool {
+        self.host.inspected_node().text_max_lines_are_available(
+            self.host
+                .inspection_context
+                .parent_layout()
+                .is_auto_layout(),
+        )
     }
 
-    pub(super) fn typography_target(
-        &self,
-        property: DesignPanelProperty,
-    ) -> DesignTypographyTarget {
-        if self.inspection_context.edit_mode() == DesignPanelEditMode::Text
+    fn typography_target(&self, property: DesignPanelProperty) -> DesignTypographyTarget {
+        if self.host.inspection_context.edit_mode() == DesignPanelEditMode::Text
             && property.supports_selected_text_range()
         {
-            self.inspection_context.text_range_revision().map_or(
+            self.host.inspection_context.text_range_revision().map_or(
                 DesignTypographyTarget::SelectedTextRange,
                 DesignTypographyTarget::SelectedTextRangeRevision,
             )
@@ -46,21 +278,27 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn variable_font_axis(&self, tag: &str) -> Option<&DesignFontAxis> {
-        let axes = &self.node.typography.as_ref()?.variable_axes;
+    fn variable_font_axis(&self, tag: &str) -> Option<&DesignFontAxis> {
+        let axes = &self
+            .host
+            .inspected_node()
+            .typography
+            .as_ref()?
+            .variable_axes;
         let mut matching = axes.iter().filter(|axis| axis.tag.as_ref() == tag);
         let axis = matching.next()?;
         matching.next().is_none().then_some(axis)
     }
 
-    pub(super) fn variable_font_axis_target(&self) -> DesignTypographyTarget {
+    fn variable_font_axis_target(&self) -> DesignTypographyTarget {
         self.typography_target(DesignPanelProperty::FontWeight)
     }
 
-    pub(super) fn variable_font_axis_is_editable(&self, tag: &str) -> bool {
+    fn variable_font_axis_is_editable(&self, tag: &str) -> bool {
         self.can_edit()
             && self
-                .node
+                .host
+                .inspected_node()
                 .typography
                 .as_ref()
                 .is_some_and(|typography| typography.style_binding.is_none())
@@ -69,10 +307,7 @@ impl DesignPanel {
                 .is_some_and(DesignFontAxis::is_editable)
     }
 
-    pub(super) fn variable_font_axis_editor_survives(
-        &self,
-        editor: &VariableFontAxisEditor,
-    ) -> bool {
+    fn variable_font_axis_editor_survives(&self, editor: &VariableFontAxisEditor) -> bool {
         editor.target == self.variable_font_axis_target()
             && self.variable_font_axis_is_editable(editor.tag.as_ref())
             && self
@@ -85,33 +320,27 @@ impl DesignPanel {
                 })
     }
 
-    pub(super) fn emit_variable_font_axis_action(
+    fn emit_variable_font_axis_event(
         &self,
-        editor: &VariableFontAxisEditor,
-        value: f32,
-        phase: DesignPanelEditPhase,
+        event: DesignVariableFontAxisEditEvent,
         cx: &mut Context<Self>,
     ) {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::TypographyVariableAxisEditRequested {
-                node_id: self.node.id.clone(),
-                target: editor.target,
-                tag: editor.tag.clone(),
-                value,
-                phase,
+                node_id: self.host.inspected_node().id.clone(),
+                target: event.target,
+                tag: event.tag,
+                value: event.value,
+                phase: event.phase,
             },
         );
     }
 
-    pub(super) fn begin_variable_font_axis_edit(
-        &mut self,
-        tag: SharedString,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.property_editor.is_some()
-            || self.numeric_property_scrub.is_some()
-            || self.variable_font_axis_editor.is_some()
+    fn begin_variable_font_axis_edit(&mut self, tag: SharedString, cx: &mut Context<Self>) -> bool {
+        if self.edit.property.is_some()
+            || self.edit.numeric_scrub.is_some()
+            || self.edit.variable_font_axis.is_some()
             || !self.variable_font_axis_is_editable(tag.as_ref())
         {
             return false;
@@ -120,45 +349,35 @@ impl DesignPanel {
             return false;
         };
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.effect_style_browser_open = false;
-        self.property_variable_picker = None;
-        self.component_property_variable_picker = None;
-        self.component_swap_browser = None;
-        let editor = VariableFontAxisEditor {
-            tag,
-            target: self.variable_font_axis_target(),
-            original: axis.value,
-            last_preview: None,
-            min: axis.min,
-            max: axis.max,
-            default: axis.default,
-            step: axis.step,
+        self.overlays.discard(DesignOpenOverlay::PaintPicker);
+        self.overlays.discard(DesignOpenOverlay::EffectSettings);
+        self.overlays.discard(DesignOpenOverlay::EffectStyle);
+        self.overlays.discard(DesignOpenOverlay::PropertyVariable);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
+        self.overlays.discard(DesignOpenOverlay::ComponentSwap);
+        let editor = VariableFontAxisEditor::new(tag, self.variable_font_axis_target(), &axis);
+        let displayed = format_number(editor.original);
+        let Some(begin) = self.edit.begin_variable_font_axis_edit(editor, &displayed) else {
+            return false;
         };
-        self.emit_variable_font_axis_action(
-            &editor,
-            editor.original,
-            DesignPanelEditPhase::Begin,
-            cx,
-        );
-        self.variable_font_axis_editor = Some(editor);
-        self.variable_font_axis_editor_invalid = false;
+        self.emit_variable_font_axis_event(begin, cx);
         true
     }
 
-    pub(super) fn activate_variable_font_axis_input(
+    fn activate_variable_font_axis_input(
         &mut self,
         tag: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.suppress_next_control_activation {
-            self.suppress_next_control_activation = false;
+        if self.edit.suppress_next_control_activation {
+            self.edit.suppress_next_control_activation = false;
             return;
         }
         if self
-            .variable_font_axis_editor
+            .edit
+            .variable_font_axis
             .as_ref()
             .is_some_and(|editor| editor.tag == tag)
         {
@@ -167,95 +386,80 @@ impl DesignPanel {
         if !self.begin_variable_font_axis_edit(tag, cx) {
             return;
         }
-        let Some(editor) = self.variable_font_axis_editor.as_ref() else {
+        let Some(editor) = self.edit.variable_font_axis.as_ref() else {
             return;
         };
         let draft = format_number(editor.original);
-        self.suppress_property_input_change = true;
-        self.property_input.update(cx, |input, cx| {
+        self.edit.suppress_property_input_change = true;
+        self.retained.inputs.property.update(cx, |input, cx| {
             input.set_value(draft, window, cx);
             input.focus(window, cx);
         });
-        self.suppress_property_input_change = false;
+        self.edit.suppress_property_input_change = false;
         cx.notify();
     }
 
-    pub(super) fn parsed_variable_font_axis_draft(&self, cx: &App) -> Option<Result<f32, ()>> {
-        let editor = self.variable_font_axis_editor.as_ref()?;
+    fn parsed_variable_font_axis_draft(&self, cx: &App) -> Option<Result<f32, ()>> {
+        let editor = self.edit.variable_font_axis.as_ref()?;
         let clamp =
             NumericClamp::new(Some(f64::from(editor.min)), Some(f64::from(editor.max))).ok();
+        let input_draft = self.retained.inputs.property.read(cx).value();
+        let draft = editor.field.draft().unwrap_or(input_draft.as_ref());
         Some(
-            evaluate_numeric_expression(
-                self.property_input.read(cx).value().as_ref(),
-                f64::from(editor.original),
-                clamp,
-            )
-            .map_err(|_| ())
-            .and_then(|value| {
-                (value >= f64::from(f32::MIN) && value <= f64::from(f32::MAX))
-                    .then_some(value as f32)
-                    .filter(|value| value.is_finite())
-                    .ok_or(())
-            }),
+            evaluate_numeric_expression(draft, f64::from(editor.original), clamp)
+                .map_err(|_| ())
+                .and_then(|value| {
+                    (value >= f64::from(f32::MIN) && value <= f64::from(f32::MAX))
+                        .then_some(value as f32)
+                        .filter(|value| value.is_finite())
+                        .ok_or(())
+                }),
         )
     }
 
-    pub(super) fn validate_variable_font_axis_draft(&mut self, cx: &mut Context<Self>) {
+    fn validate_variable_font_axis_draft(&mut self, cx: &mut Context<Self>) {
+        let draft = self.retained.inputs.property.read(cx).value();
+        let _ = self.edit.sync_variable_font_axis_draft(draft.as_ref());
         let parsed = self.parsed_variable_font_axis_draft(cx);
-        self.variable_font_axis_editor_invalid = parsed.as_ref().is_some_and(Result::is_err);
-        if !self.suppress_property_input_change
-            && !self.variable_font_axis_editor_invalid
+        self.edit.variable_font_axis_invalid = parsed.as_ref().is_some_and(Result::is_err);
+        if !self.edit.suppress_property_input_change
+            && !self.edit.variable_font_axis_invalid
             && let Some(Ok(value)) = parsed
         {
-            let should_preview = self
-                .variable_font_axis_editor
+            let editor = self.edit.variable_font_axis.as_ref().cloned();
+            if editor
                 .as_ref()
-                .is_some_and(|editor| {
-                    self.variable_font_axis_editor_survives(editor)
-                        && !(editor.last_preview.is_none() && editor.original == value)
-                        && editor.last_preview != Some(value)
-                });
-            if should_preview {
-                let editor = self
-                    .variable_font_axis_editor
-                    .as_ref()
-                    .expect("axis preview requires an active editor")
-                    .clone();
-                if let Some(active) = self.variable_font_axis_editor.as_mut() {
-                    active.last_preview = Some(value);
-                }
-                self.emit_variable_font_axis_action(
-                    &editor,
+                .is_some_and(|editor| self.variable_font_axis_editor_survives(editor))
+                && let Some(event) = self.edit.preview_variable_font_axis_edit(
+                    editor
+                        .as_ref()
+                        .expect("axis preview requires an active editor")
+                        .tag
+                        .as_ref(),
                     value,
-                    DesignPanelEditPhase::Preview,
-                    cx,
-                );
+                    Some(draft.as_ref()),
+                )
+            {
+                self.emit_variable_font_axis_event(event, cx);
             }
         }
         cx.notify();
     }
 
-    pub(super) fn cancel_variable_font_axis_transaction(&mut self, cx: &mut Context<Self>) {
-        if let Some(editor) = self.variable_font_axis_editor.take() {
-            self.emit_variable_font_axis_action(
-                &editor,
-                editor.original,
-                DesignPanelEditPhase::Cancel,
-                cx,
-            );
+    fn cancel_variable_font_axis_transaction(&mut self, cx: &mut Context<Self>) {
+        if let Some(event) = self.edit.finish_variable_font_axis_edit(None) {
+            self.emit_variable_font_axis_event(event, cx);
         }
-        self.variable_font_axis_scrub = None;
-        self.variable_font_axis_editor_invalid = false;
-        self.suppress_property_input_change = false;
     }
 
-    pub(super) fn finish_variable_font_axis_edit(
+    fn finish_variable_font_axis_edit(
         &mut self,
         commit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self
+            .edit
             .variable_font_axis_scrub
             .as_ref()
             .is_some_and(|scrub| scrub.active)
@@ -263,35 +467,37 @@ impl DesignPanel {
             self.finish_variable_font_axis_scrub(commit, false, window, cx);
             return;
         }
-        let Some(editor) = self.variable_font_axis_editor.clone() else {
+        let Some(editor) = self.edit.variable_font_axis.as_ref().cloned() else {
             return;
         };
+        let draft = self.retained.inputs.property.read(cx).value();
+        let _ = self.edit.sync_variable_font_axis_draft(draft.as_ref());
         let value = commit
             .then(|| self.parsed_variable_font_axis_draft(cx))
             .flatten()
             .and_then(Result::ok)
             .filter(|_| self.variable_font_axis_editor_survives(&editor));
-        self.variable_font_axis_editor = None;
-        self.variable_font_axis_scrub = None;
-        self.variable_font_axis_editor_invalid = false;
-        self.suppress_property_input_change = false;
-        let (phase, value) = value
-            .map_or((DesignPanelEditPhase::Cancel, editor.original), |value| {
-                (DesignPanelEditPhase::Commit, value)
-            });
-        self.emit_variable_font_axis_action(&editor, value, phase, cx);
-        self.type_settings_focus.focus(window, cx);
+        if let Some(event) = self.edit.finish_variable_font_axis_edit(value) {
+            self.emit_variable_font_axis_event(event, cx);
+        }
+        self.overlays.type_settings_focus().focus(window, cx);
         cx.notify();
     }
 
-    pub(super) fn step_variable_font_axis_input(
+    fn step_variable_font_axis_input(
         &mut self,
         direction: ArrowStep,
         modifiers: Modifiers,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(editor) = self.variable_font_axis_editor.clone() else {
+        // A key event may run before InputState's change notification. Keep
+        // the shared numeric field authoritative by synchronizing the visible
+        // draft first; otherwise an invalid draft would nudge the last valid
+        // controller value instead of being rejected.
+        let draft = self.retained.inputs.property.read(cx).value();
+        let _ = self.edit.sync_variable_font_axis_draft(draft.as_ref());
+        let Some(editor) = self.edit.variable_font_axis.clone() else {
             return false;
         };
         if !self.variable_font_axis_editor_survives(&editor) {
@@ -301,29 +507,38 @@ impl DesignPanel {
             return false;
         };
         let fine = if modifiers.alt { 0.1 } else { 1. };
-        let delta = editor.step * self.nudge_settings.amount(modifiers.shift) * fine;
+        let delta = editor.step * self.preferences.nudge_settings.amount(modifiers.shift) * fine;
         let value = match direction {
             ArrowStep::Increase => current + delta,
             ArrowStep::Decrease => current - delta,
         }
         .clamp(editor.min, editor.max);
-        self.property_input.update(cx, |input, cx| {
-            input.set_value(format_nudge_number(value), window, cx);
+        let draft = format_nudge_number(value);
+        let preview =
+            self.edit
+                .nudge_variable_font_axis_edit(editor.tag.as_ref(), current, value, &draft);
+        self.edit.suppress_property_input_change = true;
+        self.retained.inputs.property.update(cx, |input, cx| {
+            input.set_value(draft, window, cx);
         });
+        self.edit.suppress_property_input_change = false;
+        if let Some(preview) = preview {
+            self.emit_variable_font_axis_event(preview, cx);
+        }
         true
     }
 
-    pub(super) fn apply_variable_font_axis_keyboard_step(
+    fn apply_variable_font_axis_keyboard_step(
         &mut self,
         tag: SharedString,
         key: &str,
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.property_editor.is_some()
-            || self.numeric_property_scrub.is_some()
-            || self.variable_font_axis_editor.is_some()
-            || self.variable_font_axis_scrub.is_some()
+        if self.edit.property.is_some()
+            || self.edit.numeric_scrub.is_some()
+            || self.edit.variable_font_axis.is_some()
+            || self.edit.variable_font_axis_scrub.is_some()
             || modifiers.control
             || modifiers.platform
             || modifiers.function
@@ -338,7 +553,7 @@ impl DesignPanel {
             return false;
         };
         let fine = if modifiers.alt { 0.1 } else { 1. };
-        let nudge = self.nudge_settings.amount(modifiers.shift) * fine;
+        let nudge = self.preferences.nudge_settings.amount(modifiers.shift) * fine;
         let candidate = match key {
             "left" | "down" => axis.value - axis.step * nudge,
             "right" | "up" => axis.value + axis.step * nudge,
@@ -350,28 +565,30 @@ impl DesignPanel {
         if value == axis.value {
             return true;
         }
-        let editor = VariableFontAxisEditor {
-            tag,
-            target: self.variable_font_axis_target(),
-            original: axis.value,
-            last_preview: Some(value),
-            min: axis.min,
-            max: axis.max,
-            default: axis.default,
-            step: axis.step,
+        let editor = VariableFontAxisEditor::new(tag, self.variable_font_axis_target(), &axis);
+        let Some(begin) = self
+            .edit
+            .begin_variable_font_axis_edit(editor, &format_number(axis.value))
+        else {
+            return false;
         };
-        self.emit_variable_font_axis_action(
-            &editor,
-            editor.original,
-            DesignPanelEditPhase::Begin,
-            cx,
-        );
-        self.emit_variable_font_axis_action(&editor, value, DesignPanelEditPhase::Preview, cx);
-        self.emit_variable_font_axis_action(&editor, value, DesignPanelEditPhase::Commit, cx);
+        let Some(preview) =
+            self.edit
+                .preview_variable_font_axis_edit(begin.tag.as_ref(), value, None)
+        else {
+            let _ = self.edit.finish_variable_font_axis_edit(None);
+            return true;
+        };
+        let Some(commit) = self.edit.finish_variable_font_axis_edit(Some(value)) else {
+            return true;
+        };
+        self.emit_variable_font_axis_event(begin, cx);
+        self.emit_variable_font_axis_event(preview, cx);
+        self.emit_variable_font_axis_event(commit, cx);
         true
     }
 
-    pub(super) fn handle_variable_font_axis_slider_key_down(
+    fn handle_variable_font_axis_slider_key_down(
         &mut self,
         tag: SharedString,
         event: &KeyDownEvent,
@@ -389,17 +606,17 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn start_variable_font_axis_scrub(
+    fn start_variable_font_axis_scrub(
         &mut self,
         tag: SharedString,
         position_x: f32,
         position_y: f32,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.property_editor.is_some()
-            || self.numeric_property_scrub.is_some()
-            || self.variable_font_axis_editor.is_some()
-            || self.variable_font_axis_scrub.is_some()
+        if self.edit.property.is_some()
+            || self.edit.numeric_scrub.is_some()
+            || self.edit.variable_font_axis.is_some()
+            || self.edit.variable_font_axis_scrub.is_some()
             || !self.variable_font_axis_is_editable(tag.as_ref())
         {
             return false;
@@ -407,7 +624,7 @@ impl DesignPanel {
         let Some(axis) = self.variable_font_axis(tag.as_ref()) else {
             return false;
         };
-        self.variable_font_axis_scrub = Some(VariableFontAxisScrub {
+        self.edit.variable_font_axis_scrub = Some(VariableFontAxisScrub {
             tag,
             original: axis.value,
             scalar: axis.value,
@@ -421,7 +638,7 @@ impl DesignPanel {
         true
     }
 
-    pub(super) fn snapped_variable_font_axis_value(
+    fn snapped_variable_font_axis_value(
         editor: &VariableFontAxisEditor,
         value: f32,
         fine: bool,
@@ -431,7 +648,7 @@ impl DesignPanel {
         snapped.clamp(editor.min, editor.max)
     }
 
-    pub(super) fn update_variable_font_axis_scrub(
+    fn update_variable_font_axis_scrub(
         &mut self,
         tag: &str,
         position_x: f32,
@@ -439,11 +656,11 @@ impl DesignPanel {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut scrub) = self.variable_font_axis_scrub.take() else {
+        let Some(mut scrub) = self.edit.variable_font_axis_scrub.take() else {
             return;
         };
         if scrub.tag.as_ref() != tag {
-            self.variable_font_axis_scrub = Some(scrub);
+            self.edit.variable_font_axis_scrub = Some(scrub);
             return;
         }
         let speed = DesignScrubSpeed::from_vertical_displacement(position_y - scrub.origin_y);
@@ -453,7 +670,7 @@ impl DesignPanel {
         } else {
             let total = position_x - scrub.origin_x;
             if total.abs() < NUMERIC_SCRUB_THRESHOLD {
-                self.variable_font_axis_scrub = Some(scrub);
+                self.edit.variable_font_axis_scrub = Some(scrub);
                 return;
             }
             if self
@@ -467,7 +684,7 @@ impl DesignPanel {
             total
         };
         scrub.last_x = position_x;
-        let Some(editor) = self.variable_font_axis_editor.clone() else {
+        let Some(editor) = self.edit.variable_font_axis.clone() else {
             return;
         };
         let coarse = if modifiers.shift { 10. } else { 1. };
@@ -476,27 +693,28 @@ impl DesignPanel {
         let raw = scrub.scalar + delta * units_per_pixel * coarse * fine * speed.multiplier();
         let value = Self::snapped_variable_font_axis_value(&editor, raw, modifiers.alt);
         scrub.scalar = value;
-        let should_preview = self.variable_font_axis_editor_survives(&editor)
-            && !(editor.last_preview.is_none() && editor.original == value)
-            && editor.last_preview != Some(value);
-        if should_preview && let Some(active) = self.variable_font_axis_editor.as_mut() {
-            active.last_preview = Some(value);
-        }
-        self.variable_font_axis_scrub = Some(scrub);
-        if should_preview {
-            self.emit_variable_font_axis_action(&editor, value, DesignPanelEditPhase::Preview, cx);
+        let preview = self
+            .variable_font_axis_editor_survives(&editor)
+            .then(|| {
+                self.edit
+                    .preview_variable_font_axis_edit(editor.tag.as_ref(), value, None)
+            })
+            .flatten();
+        self.edit.variable_font_axis_scrub = Some(scrub);
+        if let Some(preview) = preview {
+            self.emit_variable_font_axis_event(preview, cx);
         }
         cx.notify();
     }
 
-    pub(super) fn finish_variable_font_axis_scrub(
+    fn finish_variable_font_axis_scrub(
         &mut self,
         commit: bool,
         suppress_click: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(scrub) = self.variable_font_axis_scrub.take() else {
+        let Some(scrub) = self.edit.variable_font_axis_scrub.take() else {
             return false;
         };
         if !scrub.active {
@@ -504,42 +722,37 @@ impl DesignPanel {
             return false;
         }
         let Some(editor) = self
-            .variable_font_axis_editor
-            .take()
+            .edit
+            .variable_font_axis
+            .as_ref()
             .filter(|editor| editor.tag == scrub.tag)
+            .cloned()
         else {
             cx.notify();
             return false;
         };
-        self.variable_font_axis_editor_invalid = false;
-        self.suppress_property_input_change = false;
         let valid_commit = commit && self.variable_font_axis_editor_survives(&editor);
-        let (phase, value) = if valid_commit {
-            (
-                DesignPanelEditPhase::Commit,
-                editor.last_preview.unwrap_or(editor.original),
-            )
-        } else {
-            (DesignPanelEditPhase::Cancel, editor.original)
-        };
-        self.emit_variable_font_axis_action(&editor, value, phase, cx);
+        let value = valid_commit.then(|| editor.last_preview.unwrap_or(editor.original));
+        if let Some(event) = self.edit.finish_variable_font_axis_edit(value) {
+            self.emit_variable_font_axis_event(event, cx);
+        }
         if suppress_click {
-            self.suppress_next_control_activation = true;
+            self.edit.suppress_next_control_activation = true;
             cx.defer_in(window, |this, _, _| {
-                this.suppress_next_control_activation = false;
+                this.edit.suppress_next_control_activation = false;
             });
         }
-        self.type_settings_focus.focus(window, cx);
+        self.overlays.type_settings_focus().focus(window, cx);
         cx.notify();
         true
     }
 
-    pub(super) fn text_path_start_for_property(
+    fn text_path_start_for_property(
         &self,
         property: DesignPanelProperty,
         value: &DesignPanelValue,
     ) -> Option<DesignTextPathStartData> {
-        let current = self.node.text_path_start_data?;
+        let current = self.host.inspected_node().text_path_start_data?;
         match (property, value) {
             (DesignPanelProperty::TextPathStartSegment, DesignPanelValue::Integer(segment)) => {
                 Some(current.with_segment(u32::try_from(*segment).ok()?))
@@ -556,14 +769,15 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn typography_style_binding(&self) -> Option<DesignTypographyStyleBinding> {
-        self.node
+    fn typography_style_binding(&self) -> Option<DesignTypographyStyleBinding> {
+        self.host
+            .inspected_node()
             .typography
             .as_ref()
             .and_then(|typography| typography.style_binding.clone())
     }
 
-    pub(super) fn sync_typography_style_picker(&self, cx: &mut Context<Self>) {
+    fn sync_typography_style_picker(&self, cx: &mut Context<Self>) {
         let binding = self.typography_style_binding();
         let disabled = !self.property_is_editable(DesignPanelProperty::TypographyStyle);
         self.typography_style_picker.update(cx, |picker, cx| {
@@ -572,26 +786,18 @@ impl DesignPanel {
         });
     }
 
-    pub(super) fn open_typography_style_picker(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.node.typography.is_none()
-            || self.inspection_context.selection().kind() == DesignPanelSelectionKind::None
+    fn open_typography_style_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host.inspected_node().typography.is_none()
+            || self.host.inspection_context.selection().kind() == DesignPanelSelectionKind::None
         {
             return;
         }
-        self.typography_style_picker_open = true;
-        self.paint_style_browser_open = None;
-        self.font_browser_open = false;
+        if !self.overlays.typography_style_picker_open() {
+            self.remember_overlay_focus_return(DesignOpenOverlay::TypographyStyle, window, cx);
+        }
+        self.overlays.open(DesignOverlayState::TypographyStyle);
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.effect_style_browser_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
-        let view_data = self.typography_style_view_data.clone();
+        let view_data = self.resources.typography_styles.clone();
         let binding = self.typography_style_binding();
         let disabled = !self.property_is_editable(DesignPanelProperty::TypographyStyle);
         self.typography_style_picker.update(cx, |picker, cx| {
@@ -603,79 +809,41 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn render_typography_style_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        let panel = cx.entity();
-        let picker = self.typography_style_picker.clone();
-        let picker_content = picker.clone();
-        let picker_focus = picker.focus_handle(cx);
-        let active = self.typography_style_picker_open;
-        let tooltip = if self.property_is_editable(DesignPanelProperty::TypographyStyle) {
-            "Text styles"
-        } else {
-            "Text styles · View only"
-        };
-        let trigger = Button::new(SharedString::from(format!("{}-typography-styles", self.id)))
-            .tooltip(tooltip)
-            .xsmall()
-            .compact()
-            .ghost()
-            .w(px(24.))
-            .h(px(24.))
-            .selected(active)
-            .child(self.render_color_styles_icon(cx))
-            .on_activate(cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.open_typography_style_picker(window, cx);
-            }));
-
-        Popover::new(SharedString::from(format!(
-            "{}-typography-style-popover",
-            self.id
-        )))
-        .anchor(Anchor::TopRight)
-        .open(active)
-        .overlay_closable(true)
-        .track_focus(&picker_focus)
-        .on_open_change(move |open, window, cx| {
-            panel.update(cx, |this, cx| {
-                if *open {
-                    this.open_typography_style_picker(window, cx);
-                } else if this.typography_style_picker_open {
-                    this.typography_style_picker_open = false;
-                    cx.notify();
-                }
-            });
-        })
-        .trigger(trigger)
-        .content(move |_, _, _| picker_content.clone())
-        .into_any_element()
+    fn render_typography_style_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let projection = sections::typography::style_picker::TypographyStylePickerProjection::new(
+            self.id.clone(),
+            self.command_target(),
+            self.overlays.typography_style_picker_open(),
+            self.property_is_editable(DesignPanelProperty::TypographyStyle),
+            self.typography_style_picker.clone(),
+        );
+        let events =
+            sections::typography::style_picker::TypographyStylePickerEventSink::new(cx.entity());
+        sections::typography::style_picker::render(&projection, &events, cx)
     }
 
-    pub(super) fn open_font_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.node.typography.is_none()
-            || self.inspection_context.selection().kind() == DesignPanelSelectionKind::None
+    fn open_font_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host.inspected_node().typography.is_none()
+            || self.host.inspection_context.selection().kind() == DesignPanelSelectionKind::None
         {
             return;
         }
-        self.font_browser_open = true;
-        self.paint_style_browser_open = None;
-        self.typography_style_picker_open = false;
-        self.type_settings_open = false;
+        if !self.overlays.font_browser_open() {
+            self.remember_overlay_focus_return(DesignOpenOverlay::FontBrowser, window, cx);
+        }
+        self.overlays.open(DesignOverlayState::FontBrowser);
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.effect_style_browser_open = false;
-        self.selection_header_overlay = None;
-        self.font_search.update(cx, |input, cx| {
+        self.retained.inputs.font_search.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
         });
         cx.notify();
     }
 
-    pub(super) fn emit_font_apply(&mut self, font: DesignFontSelection, cx: &mut Context<Self>) {
+    fn emit_font_apply(&mut self, font: DesignFontSelection, cx: &mut Context<Self>) {
         let applicable_weight = self
-            .font_view_data
+            .resources
+            .fonts
             .font(&font)
             .filter(|(_, style)| style.availability.can_apply())
             .map(|(_, style)| style.weight);
@@ -689,11 +857,11 @@ impl DesignPanel {
         {
             return;
         }
-        self.font_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::FontBrowser);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::TypographyFontApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target: self.typography_target(DesignPanelProperty::FontFamily),
                 font,
             },
@@ -701,10 +869,11 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_font_import(&mut self, font: DesignFontSelection, cx: &mut Context<Self>) {
+    fn emit_font_import(&mut self, font: DesignFontSelection, cx: &mut Context<Self>) {
         if !self.can_edit()
             || !self
-                .font_view_data
+                .resources
+                .fonts
                 .font(&font)
                 .is_some_and(|(_, style)| style.availability.can_import())
         {
@@ -713,21 +882,22 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::TypographyFontImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target: self.typography_target(DesignPanelProperty::FontFamily),
                 font,
             },
         );
     }
 
-    pub(super) fn emit_open_type_feature(
+    fn emit_open_type_feature(
         &mut self,
         tag: DesignOpenTypeFeatureTag,
         enabled: bool,
         cx: &mut Context<Self>,
     ) {
         let can_change = self
-            .node
+            .host
+            .inspected_node()
             .typography
             .as_ref()
             .and_then(|typography| {
@@ -745,7 +915,7 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::TypographyOpenTypeFeatureChangeRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target: self.typography_target(DesignPanelProperty::TextCase),
                 tag,
                 enabled,
@@ -753,9 +923,9 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn emit_text_path_flip_orientation(&mut self, cx: &mut Context<Self>) {
+    fn emit_text_path_flip_orientation(&mut self, cx: &mut Context<Self>) {
         let action = DesignPanelAction::TextPathFlipOrientationRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
         };
         if !self.can_edit() || !self.node_capability_allows_action(&action) {
             return;
@@ -763,188 +933,24 @@ impl DesignPanel {
         cx.emit_design_panel_action(self, action);
     }
 
-    pub(super) fn render_font_browser(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(typography) = self.node.typography.as_ref() else {
+    #[cfg(test)]
+    fn render_font_browser(&self, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.retained.inputs.font_search.read(cx).value();
+        let Some(projection) =
+            sections::typography::font_browser::FontBrowserProjection::from_panel(
+                self,
+                query.as_ref(),
+            )
+        else {
             return div().into_any_element();
         };
-        let open = self.font_browser_open;
-        let family_label =
-            self.display_property_value(DesignPanelProperty::FontFamily, typography.family.clone());
-        let style_label =
-            self.display_property_value(DesignPanelProperty::FontStyle, typography.style.clone());
-        let trigger_label: SharedString = format!("{family_label} · {style_label}").into();
-        let panel = cx.entity();
-        let panel_for_open = panel.clone();
-        let panel_for_content = panel;
-        let search = self.font_search.clone();
-        let query = search.read(cx).value();
-        let rows = self
-            .font_view_data
-            .matching(query.as_ref())
-            .map(|(family, style)| {
-                (
-                    family.name.clone(),
-                    style.clone(),
-                    DesignFontSelection {
-                        source: family.source.clone(),
-                        family_id: family.id.clone(),
-                        style_id: style.id.clone(),
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let state = self.font_view_data.state.clone();
-        let current_family = typography.family.clone();
-        let current_style = typography.style.clone();
-        let can_edit = self.can_edit();
-        let can_edit_family = self.property_is_editable(DesignPanelProperty::FontFamily);
-        let can_edit_style = self.property_is_editable(DesignPanelProperty::FontStyle);
-        let can_edit_weight = self.property_is_editable(DesignPanelProperty::FontWeight);
-        let trigger = Button::new(SharedString::from(format!("{}-font-browser", self.id)))
-            .label(trigger_label)
-            .tooltip("Browse font family and style")
-            .xsmall()
-            .compact()
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .selected(open)
-            .on_activate(cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.open_font_browser(window, cx);
-            }));
-
-        let browser = Popover::new(SharedString::from(format!("{}-font-popover", self.id)))
-            .anchor(Anchor::TopRight)
-            .open(open)
-            .overlay_closable(true)
-            .on_open_change(move |is_open, window, cx| {
-                panel_for_open.update(cx, |this, cx| {
-                    if *is_open {
-                        this.open_font_browser(window, cx);
-                    } else if this.font_browser_open {
-                        this.font_browser_open = false;
-                        cx.notify();
-                    }
-                });
-            })
-            .trigger(trigger)
-            .content(move |_, window, cx| {
-                let mut content = v_flex()
-                    .w(popup_width(window, 320.))
-                    .max_h(popup_height(window, 460.))
-                    .gap_1()
-                    .p_2()
-                    .child(div().text_sm().font_semibold().child("Fonts"))
-                    .child(
-                        Input::new(&search)
-                            .small()
-                            .prefix(Icon::new(IconName::Search).small()),
-                    );
-                match state.clone() {
-                    DesignFontCatalogState::Loading => {
-                        content = content.child(
-                            div()
-                                .px_1()
-                                .py_3()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Loading available fonts…"),
-                        );
-                    }
-                    DesignFontCatalogState::Unavailable { reason } => {
-                        content = content.child(
-                            v_flex()
-                                .px_1()
-                                .py_3()
-                                .gap_1()
-                                .child(div().text_xs().child("Fonts unavailable"))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(reason),
-                                ),
-                        );
-                    }
-                    DesignFontCatalogState::Ready if rows.is_empty() => {
-                        content = content.child(
-                            div()
-                                .px_1()
-                                .py_3()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("No fonts found"),
-                        );
-                    }
-                    DesignFontCatalogState::Ready => {
-                        let mut list = v_flex()
-                            .w_full()
-                            .max_h(popup_height(window, 360.))
-                            .overflow_y_scrollbar();
-                        for (family_name, style, selection) in rows.clone() {
-                            let selected =
-                                family_name == current_family && style.name == current_style;
-                            let availability_label: SharedString = match &style.availability {
-                                DesignFontAvailability::Imported => "Ready".into(),
-                                DesignFontAvailability::Available => "Import".into(),
-                                DesignFontAvailability::Missing { reason } => {
-                                    format!("Missing · {reason}").into()
-                                }
-                                DesignFontAvailability::Unavailable { reason } => {
-                                    format!("Unavailable · {reason}").into()
-                                }
-                            };
-                            let can_apply = style.availability.can_apply();
-                            let can_import = style.availability.can_import();
-                            let can_apply_properties = can_edit_family
-                                && can_edit_style
-                                && (style.weight.is_none() || can_edit_weight);
-                            let panel = panel_for_content.clone();
-                            let selection_for_click = selection.clone();
-                            list = list.child(
-                                Button::new(SharedString::from(format!(
-                                    "font-{}-{}",
-                                    selection.family_id, selection.style_id
-                                )))
-                                .label(format!(
-                                    "{} · {}  —  {}",
-                                    family_name, style.name, availability_label
-                                ))
-                                .tooltip(
-                                    style
-                                        .preview
-                                        .clone()
-                                        .unwrap_or_else(|| "Font family and style".into()),
-                                )
-                                .xsmall()
-                                .compact()
-                                .ghost()
-                                .w_full()
-                                .selected(selected)
-                                .disabled(
-                                    !can_edit
-                                        || (!can_import && (!can_apply || !can_apply_properties)),
-                                )
-                                .on_activate(move |_, _, cx| {
-                                    let selection = selection_for_click.clone();
-                                    panel.update(cx, |this, cx| {
-                                        if can_import {
-                                            this.emit_font_import(selection, cx);
-                                        } else {
-                                            this.emit_font_apply(selection, cx);
-                                        }
-                                    });
-                                }),
-                            );
-                        }
-                        content = content.child(list);
-                    }
-                }
-                content
-            })
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .into_any_element();
+        let events = sections::typography::font_browser::FontBrowserEventSink::new(cx.entity());
+        let browser = sections::typography::font_browser::render(
+            projection,
+            self.retained.inputs.font_search.clone(),
+            &events,
+            cx,
+        );
 
         h_flex()
             .w_full()
@@ -960,35 +966,20 @@ impl DesignPanel {
             )
             .into_any_element()
     }
-
-    pub(super) fn render_text_resize_icon(
-        &self,
-        icon: TextResizeIcon,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_text_resize_icon(&self, icon: TextResizeIcon, cx: &mut Context<Self>) -> AnyElement {
         let color = cx.theme().foreground;
-        render_icon_canvas(color, 16., move |path| match icon {
-            TextResizeIcon::AutoWidth => {
-                path.line((3., 2.5), (3., 13.5));
-                path.line((5., 8.), (13., 8.));
-                path.poly([(10., 5.), (13., 8.), (10., 11.)], false);
-            }
-            TextResizeIcon::AutoHeight => {
-                path.line((3., 2.5), (3., 13.5));
-                path.line((13., 2.5), (13., 13.5));
-                for (line_y, width) in [(5., 6.), (8., 8.), (11., 5.)] {
-                    path.line((5., line_y), (5. + width, line_y));
-                }
-            }
-            TextResizeIcon::FixedSize => {
-                path.rect(2.5, 2.5, 13.5, 13.5);
-                path.line((5., 6.), (11., 6.));
-                path.line((5., 9.), (9., 9.));
-            }
-        })
+        render_lucide_icon(
+            match icon {
+                TextResizeIcon::AutoWidth => LucideIcon::MoveHorizontal,
+                TextResizeIcon::AutoHeight => LucideIcon::Rows3,
+                TextResizeIcon::FixedSize => LucideIcon::SquareDashed,
+            },
+            color,
+            16.,
+        )
     }
 
-    pub(super) fn render_text_resize_control(
+    fn render_text_resize_control(
         &self,
         current: DesignTextResize,
         cx: &mut Context<Self>,
@@ -1053,73 +1044,7 @@ impl DesignPanel {
         control.into_any_element()
     }
 
-    pub(super) fn render_typography_alignment_icon(
-        &self,
-        icon: TypographyAlignmentIcon,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let color = cx.theme().foreground;
-        render_icon_canvas(color, 16., move |path| match icon {
-            TypographyAlignmentIcon::Horizontal(alignment) => {
-                let middle_x = match alignment {
-                    DesignTextHorizontalAlignment::Left => 2.,
-                    DesignTextHorizontalAlignment::Center => 4.,
-                    DesignTextHorizontalAlignment::Right => 6.,
-                    DesignTextHorizontalAlignment::Justified => 2.,
-                };
-                let middle_width = if alignment == DesignTextHorizontalAlignment::Justified {
-                    12.
-                } else {
-                    8.
-                };
-                for (line_y, line_x, width) in
-                    [(3., 2., 12.), (7., middle_x, middle_width), (11., 2., 12.)]
-                {
-                    path.line((line_x, line_y), (line_x + width, line_y));
-                }
-            }
-            TypographyAlignmentIcon::Vertical(alignment) => {
-                let start_y = match alignment {
-                    DesignTextVerticalAlignment::Top => 1.,
-                    DesignTextVerticalAlignment::Center => 4.,
-                    DesignTextVerticalAlignment::Bottom => 7.,
-                };
-                for (line_y, line_x, width) in [
-                    (start_y, 2., 12.),
-                    (start_y + 3., 4., 8.),
-                    (start_y + 6., 2., 12.),
-                ] {
-                    path.line((line_x, line_y), (line_x + width, line_y));
-                }
-            }
-        })
-    }
-
-    pub(super) fn render_typography_alignment_segment(
-        &self,
-        id_suffix: &'static str,
-        icon: TypographyAlignmentIcon,
-        selected: bool,
-        property: DesignPanelProperty,
-        value: DesignPanelValue,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        Button::new(SharedString::from(format!("{}-{id_suffix}", self.id)))
-            .xsmall()
-            .compact()
-            .ghost()
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .selected(selected)
-            .disabled(!self.property_is_editable(property))
-            .child(self.render_typography_alignment_icon(icon, cx))
-            .on_activate(cx.listener(move |this, _, _, cx| {
-                this.emit_property(property, value.clone(), cx);
-            }))
-            .into_any_element()
-    }
-
-    pub(super) fn render_type_setting_segments(
+    fn render_type_setting_segments(
         panel_id: SharedString,
         id_suffix: &'static str,
         options: Vec<(SharedString, bool, DesignPanelValue)>,
@@ -1128,49 +1053,14 @@ impl DesignPanel {
         panel: Entity<Self>,
         cx: &mut App,
     ) -> AnyElement {
-        let mut segments = h_flex()
-            .h(px(28.))
-            .w_full()
-            .overflow_hidden()
-            .rounded(px(4.))
-            .bg(cx.theme().secondary);
-        for (index, (label, selected, value)) in options.into_iter().enumerate() {
-            let panel = panel.clone();
-            segments = segments.child(
-                div()
-                    .h_full()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .when(index > 0, |segment| {
-                        segment
-                            .border_l_1()
-                            .border_color(cx.theme().border.opacity(0.72))
-                    })
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "{panel_id}-type-setting-{id_suffix}-{index}"
-                        )))
-                        .label(label)
-                        .xsmall()
-                        .compact()
-                        .ghost()
-                        .w_full()
-                        .h_full()
-                        .selected(selected)
-                        .disabled(!enabled)
-                        .on_activate(move |_, _, cx| {
-                            panel.update(cx, |this, cx| {
-                                this.emit_property(property, value.clone(), cx);
-                            });
-                        }),
-                    ),
-            );
-        }
-        segments.into_any_element()
+        let events = sections::typography::type_settings::TypeSettingsEventSink::new(panel);
+        sections::typography::type_settings::render_segments(
+            panel_id, id_suffix, options, enabled, property, &events, cx,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn render_type_setting_number_field(
+    fn render_type_setting_number_field(
         panel_id: SharedString,
         id_suffix: &'static str,
         label: SharedString,
@@ -1183,90 +1073,13 @@ impl DesignPanel {
         panel: Entity<Self>,
         cx: &mut App,
     ) -> AnyElement {
-        let id = SharedString::from(format!("{panel_id}-type-setting-{id_suffix}-number"));
-        let (scrubbing, scrub_enabled) = {
-            let panel = panel.read(cx);
-            (
-                panel.numeric_scrub_is_active(property),
-                panel.numeric_scrub_surface_is_enabled(property),
-            )
-        };
-        let panel_for_activate = panel.clone();
-        let button_id = SharedString::from(format!("{id}-activate"));
-        let button_debug_selector = button_id.clone();
-        let button = Button::new(button_id)
-            .debug_selector(move || button_debug_selector.to_string())
-            .label(label)
-            .xsmall()
-            .compact()
-            .w_full()
-            .h(px(28.))
-            .disabled(!enabled)
-            .on_activate(move |_, window, cx| {
-                panel_for_activate.update(cx, |this, cx| {
-                    let type_settings_was_open = this.type_settings_open;
-                    this.activate_property_from_control(
-                        EditorFocusOrigin::TypeSetting(property),
-                        property,
-                        value.clone(),
-                        window,
-                        cx,
-                    );
-                    this.type_settings_open = type_settings_was_open;
-                    cx.notify();
-                });
-            });
-        if editing && !scrubbing {
-            return div()
-                .id(id)
-                .relative()
-                .h(px(28.))
-                .w_full()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(if invalid {
-                    cx.theme().red
-                } else {
-                    cx.theme().selection
-                })
-                .bg(cx.theme().secondary)
-                .child(button.invisible().tab_stop(false))
-                .child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .top_0()
-                        .bottom_0()
-                        .child(
-                            Input::new(&input)
-                                .appearance(false)
-                                .bordered(false)
-                                .focus_bordered(false)
-                                .xsmall()
-                                .h(px(26.))
-                                .w_full(),
-                        ),
-                )
-                .into_any_element();
-        }
-
-        div()
-            .id(id)
-            .h(px(28.))
-            .w_full()
-            .child(render_numeric_scrub_surface(
-                SharedString::from(format!("{panel_id}-type-setting-{id_suffix}-number-scrub")),
-                panel,
-                property,
-                EditorFocusOrigin::TypeSetting(property),
-                scrub_enabled,
-                button.into_any_element(),
-            ))
-            .into_any_element()
+        let events = sections::typography::type_settings::TypeSettingsEventSink::new(panel);
+        sections::typography::type_settings::render_number_field(
+            panel_id, id_suffix, label, property, value, enabled, editing, invalid, input, &events,
+            cx,
+        )
     }
-
-    pub(super) fn render_variable_font_axis_number_field(
+    fn render_variable_font_axis_number_field(
         panel_id: SharedString,
         index: usize,
         axis: DesignFontAxis,
@@ -1285,15 +1098,18 @@ impl DesignPanel {
         ) = {
             let panel = panel.read(cx);
             let editing = panel
-                .variable_font_axis_editor
+                .edit
+                .variable_font_axis
                 .as_ref()
                 .is_some_and(|editor| editor.tag == tag);
             let scrubbing = panel
+                .edit
                 .variable_font_axis_scrub
                 .as_ref()
                 .is_some_and(|scrub| scrub.tag == tag && scrub.active);
             let displayed_value = panel
-                .variable_font_axis_editor
+                .edit
+                .variable_font_axis
                 .as_ref()
                 .filter(|editor| editor.tag == tag)
                 .map_or(axis.value, |editor| {
@@ -1315,10 +1131,10 @@ impl DesignPanel {
                 editable,
                 editing,
                 scrubbing,
-                panel.variable_font_axis_editor_invalid,
+                panel.edit.variable_font_axis_invalid,
                 displayed_value,
                 disabled_reason,
-                panel.property_input.clone(),
+                panel.retained.inputs.property.clone(),
             )
         };
         let id = SharedString::from(format!(
@@ -1386,7 +1202,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn render_variable_font_axis_slider(
+    fn render_variable_font_axis_slider(
         panel_id: SharedString,
         index: usize,
         axis: DesignFontAxis,
@@ -1398,7 +1214,8 @@ impl DesignPanel {
             let panel = panel.read(cx);
             let editable = panel.variable_font_axis_is_editable(tag.as_ref());
             let displayed_value = panel
-                .variable_font_axis_editor
+                .edit
+                .variable_font_axis
                 .as_ref()
                 .filter(|editor| editor.tag == tag)
                 .map_or(axis.value, |editor| {
@@ -1503,7 +1320,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn render_variable_font_axis_row(
+    fn render_variable_font_axis_row(
         panel_id: SharedString,
         index: usize,
         axis: DesignFontAxis,
@@ -1588,26 +1405,42 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_type_settings_popover(
+    #[cfg(test)]
+    fn render_type_settings_popover(
         &self,
         typography: &super::super::DesignTypography,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let overlay =
+            sections::typography::type_settings::TypeSettingsOverlayProjection::from_panel(
+                self,
+                !typography.variable_axes.is_empty(),
+            );
+        self.render_type_settings_popover_projected(typography, overlay, cx)
+    }
+
+    fn render_type_settings_popover_projected(
+        &self,
+        typography: &super::super::DesignTypography,
+        overlay: sections::typography::type_settings::TypeSettingsOverlayProjection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let panel = cx.entity();
+        let type_settings_events =
+            sections::typography::type_settings::TypeSettingsEventSink::new(panel.clone());
         let panel_for_open = panel.clone();
-        let open = self.type_settings_open;
-        let requested_tab = self.type_settings_tab;
-        let tab = if requested_tab == TypographySettingsTab::Variable
-            && typography.variable_axes.is_empty()
-        {
-            TypographySettingsTab::Details
-        } else {
-            requested_tab
-        };
-        let focus = self.type_settings_focus.clone();
+        let axes = typography.variable_axes.clone();
+        let has_variable_axes = !axes.is_empty();
+        let trigger =
+            sections::typography::type_settings::render_trigger(&overlay, &type_settings_events);
+        let open = overlay.open;
+        let tab = overlay.tab;
+        let focus = overlay.focus.clone();
         let focus_for_open = focus.clone();
         let focus_for_content = focus.clone();
-        let panel_id = self.id.clone();
+        let target_for_open = overlay.target.clone();
+        let target_for_content = overlay.target.clone();
+        let panel_id = overlay.panel_id.clone();
         let paragraph_spacing = typography.paragraph_spacing;
         let horizontal_alignment = typography.horizontal_alignment;
         let case = typography.case;
@@ -1622,8 +1455,6 @@ impl DesignPanel {
         let hanging_lists = typography.hanging_lists;
         let decoration_details = typography.decoration_details;
         let open_type_features = typography.open_type_features.clone();
-        let axes = typography.variable_axes.clone();
-        let has_variable_axes = !axes.is_empty();
         let alignment_editable =
             self.property_is_editable(DesignPanelProperty::HorizontalTextAlignment);
         let case_editable = self.property_is_editable(DesignPanelProperty::TextCase);
@@ -1651,7 +1482,7 @@ impl DesignPanel {
         let decoration_color_editable =
             self.property_is_editable(DesignPanelProperty::TextDecorationColor);
         let decoration_color_picker_target = AuxiliaryColorPickerTarget::TextDecoration {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             typography_target: self.typography_target(DesignPanelProperty::TextDecorationColor),
         };
         let decoration_skip_ink_editable =
@@ -1673,127 +1504,89 @@ impl DesignPanel {
             format_text_max_lines(max_lines).into(),
         );
         let paragraph_indent_editing = self
-            .property_editor
+            .edit
+            .property
             .as_ref()
             .is_some_and(|editor| editor.property == DesignPanelProperty::ParagraphIndent);
         let paragraph_spacing_editing = self
-            .property_editor
+            .edit
+            .property
             .as_ref()
             .is_some_and(|editor| editor.property == DesignPanelProperty::ParagraphSpacing);
         let list_spacing_editing = self
-            .property_editor
+            .edit
+            .property
             .as_ref()
             .is_some_and(|editor| editor.property == DesignPanelProperty::ListSpacing);
         let max_lines_editing = self
-            .property_editor
+            .edit
+            .property
             .as_ref()
             .is_some_and(|editor| editor.property == DesignPanelProperty::TextMaxLines);
-        let property_input = self.property_input.clone();
-        let property_editor_invalid = self.property_editor_invalid;
+        let property_input = self.retained.inputs.property.clone();
+        let property_editor_invalid = self.edit.property_invalid;
         let can_edit_typography = self.can_edit();
         let paragraph_spacing_variable_button_state =
             self.property_variable_button_state(DesignPanelProperty::ParagraphSpacing);
         let paragraph_indent_variable_button_state =
             self.property_variable_button_state(DesignPanelProperty::ParagraphIndent);
 
-        let trigger = Button::new(SharedString::from(format!("{}-type-settings", self.id)))
-            .xsmall()
-            .compact()
-            .ghost()
-            .w(px(24.))
-            .h(px(ROW_HEIGHT))
-            .on_keyboard_activate({
-                let panel = panel.clone();
-                let focus = focus.clone();
-                move |window, cx| {
-                    panel.update(cx, |this, cx| {
-                        this.type_settings_open = !open;
-                        if !open {
-                            this.cancel_menu_preview(cx);
-                            this.active_picker = None;
-                            this.typography_style_picker_open = false;
-                            this.font_browser_open = false;
-                            focus.focus(window, cx);
-                        } else {
-                            this.type_settings_tab = TypographySettingsTab::Basics;
-                        }
-                        cx.notify();
-                    });
-                }
-            })
-            .child(Icon::new(IconName::Settings2).xsmall());
-
         Popover::new(SharedString::from(format!(
-            "{}-type-settings-popover",
-            self.id
+            "{panel_id}-type-settings-popover"
         )))
         .anchor(Anchor::TopRight)
         .open(open)
         .overlay_closable(true)
         .track_focus(&focus)
         .on_open_change(move |open, window, cx| {
-            panel_for_open.update(cx, |this, cx| {
-                this.type_settings_open = *open;
-                if *open {
-                    this.cancel_menu_preview(cx);
-                    this.active_picker = None;
-                    this.typography_style_picker_open = false;
-                    this.font_browser_open = false;
-                    focus_for_open.focus(window, cx);
-                } else {
-                    this.type_settings_tab = TypographySettingsTab::Basics;
-                }
-                cx.notify();
-            });
+            let events = sections::typography::type_settings::TypeSettingsEventSink::new(
+                panel_for_open.clone(),
+            );
+            events.send_overlay(
+                &target_for_open,
+                sections::typography::type_settings::TypeSettingsOverlayEvent::OpenChanged(*open),
+                &focus_for_open,
+                window,
+                cx,
+            );
         })
         .trigger(trigger)
         .content(move |_, window, cx| {
             let popover = cx.entity();
             let muted_foreground = cx.theme().muted_foreground;
-            let tab_button = |candidate: TypographySettingsTab, panel: Entity<DesignPanel>| {
-                Button::new(SharedString::from(format!(
-                    "{}-type-settings-tab-{}",
-                    panel_id,
-                    candidate.label().to_lowercase()
-                )))
-                .label(candidate.label())
-                .xsmall()
-                .compact()
-                .ghost()
-                .h(px(28.))
-                .selected(candidate == tab)
-                .on_activate(move |_, _, cx| {
-                    panel.update(cx, |this, cx| {
-                        this.type_settings_tab = candidate;
-                        cx.notify();
-                    });
-                })
+            let layout = sections::typography::type_settings::grid_layout();
+            let metrics = layout.metrics;
+            let tab_button = |candidate: TypographySettingsTab| {
+                sections::typography::type_settings::render_tab(
+                    &panel_id,
+                    tab,
+                    candidate,
+                    target_for_content.clone(),
+                    &type_settings_events,
+                    focus_for_content.clone(),
+                )
             };
             let control_row = |label: &'static str, control: AnyElement| {
-                h_flex()
-                    .h(px(28.))
+                crate::molecules::inspector_row_with_layout(layout)
+                    .h(layout.row_height())
                     .w_full()
-                    .gap_2()
                     .child(
-                        div()
-                            .w(px(112.))
-                            .flex_none()
-                            .text_xs()
+                        crate::molecules::inspector_field_label(layout)
                             .text_color(muted_foreground)
                             .child(label),
                     )
                     .child(div().flex_1().min_w(px(0.)).child(control))
             };
-            let mut tabs = h_flex()
+            let mut tabs = crate::molecules::inspector_action_group(metrics)
                 .flex_1()
                 .gap_1()
-                .child(tab_button(TypographySettingsTab::Basics, panel.clone()))
-                .child(tab_button(TypographySettingsTab::Details, panel.clone()));
+                .child(tab_button(TypographySettingsTab::Basics))
+                .child(tab_button(TypographySettingsTab::Details));
             if has_variable_axes {
-                tabs = tabs.child(tab_button(TypographySettingsTab::Variable, panel.clone()));
+                tabs = tabs.child(tab_button(TypographySettingsTab::Variable));
             }
 
-            let mut body = v_flex().w_full().gap_2();
+            let mut body = crate::molecules::inspector_field_grid_with_layout(layout).px(px(0.));
             match tab {
                 TypographySettingsTab::Basics => {
                     let alignment_options = DesignTextHorizontalAlignment::ALL
@@ -1809,7 +1602,7 @@ impl DesignPanel {
                         .collect();
                     let decoration_options = DesignTextDecoration::ALL
                         .into_iter()
-                        .zip(["—", "U̲", "S̶"])
+                        .zip(["None", "Underline", "Strike"])
                         .map(|(candidate, label)| {
                             (
                                 SharedString::from(label),
@@ -1826,7 +1619,7 @@ impl DesignPanel {
                         DesignTextCase::SmallCaps,
                     ]
                     .into_iter()
-                    .zip(["—", "AG", "ag", "Ag", "Aɢ"])
+                    .zip(["None", "AG", "ag", "Ag", "Aɢ"])
                     .map(|(candidate, label)| {
                         (
                             SharedString::from(label),
@@ -1837,7 +1630,7 @@ impl DesignPanel {
                     .collect();
                     let list_options = DesignTextList::ALL
                         .into_iter()
-                        .zip(["—", "•≡", "1≡"])
+                        .zip(["None", "Bullets", "Numbers"])
                         .map(|(candidate, label)| {
                             (
                                 SharedString::from(label),
@@ -1859,7 +1652,7 @@ impl DesignPanel {
                         .collect();
                     let truncate_options = [
                         (
-                            SharedString::from("—"),
+                            SharedString::from("None"),
                             !truncate,
                             DesignPanelValue::Bool(false),
                         ),
@@ -2037,12 +1830,12 @@ impl DesignPanel {
                     let bool_options = |enabled: bool| {
                         vec![
                             (
-                                SharedString::from("—"),
+                                SharedString::from("Off"),
                                 !enabled,
                                 DesignPanelValue::Bool(false),
                             ),
                             (
-                                SharedString::from("✓"),
+                                SharedString::from("On"),
                                 enabled,
                                 DesignPanelValue::Bool(true),
                             ),
@@ -2050,7 +1843,7 @@ impl DesignPanel {
                     };
                     let case_options = DesignTextCase::ALL
                         .into_iter()
-                        .zip(["—", "AG", "ag", "Ag", "Aɢ", "Aɢ⁺"])
+                        .zip(["None", "AG", "ag", "Ag", "Aɢ", "Aɢ⁺"])
                         .map(|(candidate, label)| {
                             (
                                 SharedString::from(label),
@@ -2355,7 +2148,7 @@ impl DesignPanel {
                         let off_tag = feature.tag.clone();
                         let on_tag = feature.tag.clone();
                         let controls = h_flex()
-                            .h(px(28.))
+                            .h(layout.row_height())
                             .w_full()
                             .overflow_hidden()
                             .rounded(px(4.))
@@ -2401,16 +2194,12 @@ impl DesignPanel {
                                 .w_full()
                                 .gap_1()
                                 .child(
-                                    h_flex()
-                                        .h(px(28.))
+                                    crate::molecules::inspector_row_with_layout(layout)
+                                        .h(layout.row_height())
                                         .w_full()
-                                        .gap_2()
                                         .child(
-                                            div()
-                                                .w(px(112.))
-                                                .flex_none()
+                                            crate::molecules::inspector_field_label(layout)
                                                 .truncate()
-                                                .text_xs()
                                                 .text_color(muted_foreground)
                                                 .child(feature_name),
                                         )
@@ -2448,8 +2237,7 @@ impl DesignPanel {
             }
 
             let close_popover = popover.clone();
-            v_flex()
-                .id("type-settings-content")
+            crate::molecules::inspector_popover_surface("type-settings-content", metrics, cx)
                 .key_context(DESIGN_PANEL_KEY_CONTEXT)
                 .track_focus(&focus_for_content)
                 .tab_index(0)
@@ -2458,13 +2246,9 @@ impl DesignPanel {
                 .p_3()
                 .gap_2()
                 .rounded(px(8.))
-                .border_1()
-                .border_color(cx.theme().border)
-                .bg(cx.theme().popover)
-                .text_color(cx.theme().popover_foreground)
-                .shadow_lg()
+                .overflow_hidden()
                 .child(
-                    h_flex().h(px(28.)).gap_1().child(tabs).child(
+                    h_flex().h(layout.row_height()).gap_1().child(tabs).child(
                         Button::new(SharedString::from(format!(
                             "{}-type-settings-close",
                             panel_id
@@ -2472,8 +2256,8 @@ impl DesignPanel {
                         .xsmall()
                         .compact()
                         .ghost()
-                        .w(px(28.))
-                        .h(px(28.))
+                        .w(layout.row_height())
+                        .h(layout.row_height())
                         .child(Icon::new(IconName::Close).xsmall())
                         .on_activate(move |_, window, cx| {
                             close_popover.update(cx, |popover, cx| {
@@ -2495,314 +2279,22 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_text_path_orientation_control(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let text_path = self.node.text_path.as_ref()?;
-        let enabled = self.can_edit() && self.text_path_flip_is_available();
-        let orientation = text_path.orientation;
-        let tooltip: SharedString = if enabled {
-            format!("Flip text orientation · currently {}", orientation.label()).into()
-        } else if self.can_edit() {
-            format!(
-                "Flip text orientation unavailable · currently {}",
-                orientation.label()
-            )
-            .into()
-        } else {
-            format!(
-                "Flip text orientation · view only · currently {}",
-                orientation.label()
-            )
-            .into()
-        };
-
-        let control_id = SharedString::from(format!("{}-text-path-flip-orientation", self.id));
-        let debug_selector = control_id.to_string();
-        let mut flip_control = div()
-            .id(control_id)
-            .debug_selector(move || debug_selector)
-            .w_full()
-            .h(px(ROW_HEIGHT))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(4.))
-            .border_1()
-            .border_color(cx.theme().transparent)
-            .bg(if orientation == DesignTextPathOrientation::Flipped {
-                cx.theme().accent
-            } else {
-                cx.theme().secondary
-            })
-            .text_xs()
-            .when(!enabled, |control| {
-                control
-                    .text_color(cx.theme().muted_foreground)
-                    .opacity(0.62)
-            });
-        if enabled {
-            flip_control = flip_control
-                .key_context(CONTROL_KEY_CONTEXT)
-                .tab_index(0)
-                .cursor_pointer()
-                .hover(|style| style.bg(cx.theme().accent))
-                .focus(|style| {
-                    style
-                        .bg(cx.theme().accent)
-                        .border_color(cx.theme().selection)
-                })
-                .on_activate(cx.listener(|this, _, _, cx| {
-                    this.emit_text_path_flip_orientation(cx);
-                }));
-        }
-        Some(
-            v_flex()
-                .w_full()
-                .gap_1()
-                .child(flip_control.child("Flip text orientation"))
-                .child(
-                    div()
-                        .px_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(tooltip),
-                )
-                .into_any_element(),
-        )
-    }
-
-    pub(super) fn render_typography(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let typography = self.node.typography.as_ref()?;
-        let mut content = if let Some(binding) = typography.style_binding.as_ref() {
-            v_flex()
-                .px(px(PANEL_PADDING))
-                .pb_4()
-                .gap_2()
-                .child(self.render_bound_style_summary("typography", binding.name.clone(), cx))
-        } else {
-            v_flex()
-                .px(px(PANEL_PADDING))
-                .pb_4()
-                .gap_2()
-                .child(self.render_font_browser(cx))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(self.render_group_label("Weight", cx))
-                                .child(self.render_value_cell(
-                                    "font-weight",
-                                    "W",
-                                    format_number(typography.weight),
-                                    DesignPanelProperty::FontWeight,
-                                    DesignPanelValue::Number((typography.weight + 100.).min(1000.)),
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(self.render_group_label("Size", cx))
-                                .child(self.render_value_cell(
-                                    "font-size",
-                                    "↕",
-                                    format_number(typography.size),
-                                    DesignPanelProperty::FontSize,
-                                    DesignPanelValue::Number((typography.size + 1.).max(1.)),
-                                    cx,
-                                )),
-                        ),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(self.render_group_label("Line height", cx))
-                                .child(self.render_value_cell(
-                                    "line-height",
-                                    "↕",
-                                    format_line_height(typography.line_height),
-                                    DesignPanelProperty::LineHeight,
-                                    DesignPanelValue::LineHeight(next_line_height(
-                                        typography.line_height,
-                                    )),
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .gap_1()
-                                .child(self.render_group_label("Letter spacing", cx))
-                                .child(self.render_value_cell(
-                                    "letter-spacing",
-                                    "↔",
-                                    format_letter_spacing(typography.letter_spacing),
-                                    DesignPanelProperty::LetterSpacing,
-                                    DesignPanelValue::LetterSpacing(next_letter_spacing(
-                                        typography.letter_spacing,
-                                    )),
-                                    cx,
-                                )),
-                        ),
-                )
-                .child(self.render_group_label("Alignment", cx))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .h(px(ROW_HEIGHT))
-                                .flex_1()
-                                .overflow_hidden()
-                                .rounded(px(4.))
-                                .bg(cx.theme().secondary)
-                                .child(self.render_typography_alignment_segment(
-                                    "text-align-left",
-                                    TypographyAlignmentIcon::Horizontal(
-                                        DesignTextHorizontalAlignment::Left,
-                                    ),
-                                    typography.horizontal_alignment
-                                        == DesignTextHorizontalAlignment::Left,
-                                    DesignPanelProperty::HorizontalTextAlignment,
-                                    DesignPanelValue::TextHorizontalAlignment(
-                                        DesignTextHorizontalAlignment::Left,
-                                    ),
-                                    cx,
-                                ))
-                                .child(self.render_typography_alignment_segment(
-                                    "text-align-center",
-                                    TypographyAlignmentIcon::Horizontal(
-                                        DesignTextHorizontalAlignment::Center,
-                                    ),
-                                    typography.horizontal_alignment
-                                        == DesignTextHorizontalAlignment::Center,
-                                    DesignPanelProperty::HorizontalTextAlignment,
-                                    DesignPanelValue::TextHorizontalAlignment(
-                                        DesignTextHorizontalAlignment::Center,
-                                    ),
-                                    cx,
-                                ))
-                                .child(self.render_typography_alignment_segment(
-                                    "text-align-right",
-                                    TypographyAlignmentIcon::Horizontal(
-                                        DesignTextHorizontalAlignment::Right,
-                                    ),
-                                    typography.horizontal_alignment
-                                        == DesignTextHorizontalAlignment::Right,
-                                    DesignPanelProperty::HorizontalTextAlignment,
-                                    DesignPanelValue::TextHorizontalAlignment(
-                                        DesignTextHorizontalAlignment::Right,
-                                    ),
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            h_flex()
-                                .h(px(ROW_HEIGHT))
-                                .flex_1()
-                                .overflow_hidden()
-                                .rounded(px(4.))
-                                .bg(cx.theme().secondary)
-                                .child(self.render_typography_alignment_segment(
-                                    "vertical-text-align-top",
-                                    TypographyAlignmentIcon::Vertical(
-                                        DesignTextVerticalAlignment::Top,
-                                    ),
-                                    typography.vertical_alignment
-                                        == DesignTextVerticalAlignment::Top,
-                                    DesignPanelProperty::VerticalTextAlignment,
-                                    DesignPanelValue::TextVerticalAlignment(
-                                        DesignTextVerticalAlignment::Top,
-                                    ),
-                                    cx,
-                                ))
-                                .child(self.render_typography_alignment_segment(
-                                    "vertical-text-align-center",
-                                    TypographyAlignmentIcon::Vertical(
-                                        DesignTextVerticalAlignment::Center,
-                                    ),
-                                    typography.vertical_alignment
-                                        == DesignTextVerticalAlignment::Center,
-                                    DesignPanelProperty::VerticalTextAlignment,
-                                    DesignPanelValue::TextVerticalAlignment(
-                                        DesignTextVerticalAlignment::Center,
-                                    ),
-                                    cx,
-                                ))
-                                .child(self.render_typography_alignment_segment(
-                                    "vertical-text-align-bottom",
-                                    TypographyAlignmentIcon::Vertical(
-                                        DesignTextVerticalAlignment::Bottom,
-                                    ),
-                                    typography.vertical_alignment
-                                        == DesignTextVerticalAlignment::Bottom,
-                                    DesignPanelProperty::VerticalTextAlignment,
-                                    DesignPanelValue::TextVerticalAlignment(
-                                        DesignTextVerticalAlignment::Bottom,
-                                    ),
-                                    cx,
-                                )),
-                        )
-                        .child(self.render_type_settings_popover(typography, cx)),
-                )
-        };
-        if let Some(applied) = self.render_applied_component_property_controls(
-            DesignComponentPropertyApplicationSurface::Text,
-            cx,
-        ) {
-            content = content.child(applied);
-        }
-        if let Some(orientation_control) = self.render_text_path_orientation_control(cx) {
-            content = content
-                .child(self.render_group_label("Text on path", cx))
-                .child(orientation_control);
-        }
-        if self.text_path_start_debug_controls_are_available()
-            && let Some(start) = self.node.text_path_start_data
-        {
-            content = content
-                .child(self.render_group_label("Start data · API debug", cx))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(div().flex_1().min_w(px(0.)).child(self.render_value_cell(
-                            "text-path-start-segment",
-                            "#",
-                            start.segment.to_string(),
-                            DesignPanelProperty::TextPathStartSegment,
-                            DesignPanelValue::Integer(i64::from(start.segment.saturating_add(1))),
-                            cx,
-                        )))
-                        .child(div().flex_1().min_w(px(0.)).child(self.render_value_cell(
-                            "text-path-start-position",
-                            "%",
-                            format!("{}%", format_number(start.position * 100.)),
-                            DesignPanelProperty::TextPathStartPosition,
-                            DesignPanelValue::Ratio((start.position + 0.05).min(1.)),
-                            cx,
-                        ))),
-                );
-        }
-        Some(self.render_section(
-            DesignPanelSection::Typography,
-            None,
-            content.into_any_element(),
+    fn render_typography(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let projection = projection(self, cx)?;
+        let controls = sections::typography::TypographySupplementaryControls::new(
+            self.render_property_variable_button(DesignPanelProperty::FontFamily, cx),
+            self.render_property_variable_button(DesignPanelProperty::FontStyle, cx),
+            self.render_applied_component_property_controls(
+                DesignComponentPropertyApplicationSurface::Text,
+                cx,
+            ),
+        );
+        let events = sections::typography::TypographyEventSink::new(cx.entity());
+        Some(sections::typography::render(
+            &projection,
+            self,
+            controls,
+            &events,
             cx,
         ))
     }

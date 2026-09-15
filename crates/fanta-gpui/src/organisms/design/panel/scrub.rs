@@ -1,17 +1,72 @@
 use super::*;
 
-impl DesignPanel {
+pub(super) trait DesignScrubController: Sized {
+    fn active_scrub_speed_from_controller(&self) -> Option<DesignScrubSpeed>;
+    fn render_scrub_speed_cue(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn numeric_scrub_seed(
+        &self,
+        property: DesignPanelProperty,
+    ) -> Option<(DesignPanelValue, PropertyEditorKind, f64)>;
+    fn numeric_scrub_value(
+        property: DesignPanelProperty,
+        kind: PropertyEditorKind,
+        original: &DesignPanelValue,
+        scalar: f64,
+    ) -> Option<(f64, DesignPanelValue)>;
+    fn numeric_scrub_multiplier(modifiers: Modifiers) -> f64;
+    fn numeric_scrub_is_active(&self, property: DesignPanelProperty) -> bool;
+    fn numeric_scrub_surface_is_enabled(&self, property: DesignPanelProperty) -> bool;
+    fn start_numeric_property_scrub(
+        &mut self,
+        property: DesignPanelProperty,
+        position_x: f32,
+        position_y: f32,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn begin_numeric_property_scrub_transaction(
+        &mut self,
+        scrub: &NumericPropertyScrub,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn update_numeric_property_scrub(
+        &mut self,
+        property: DesignPanelProperty,
+        position_x: f32,
+        position_y: f32,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    );
+    fn finish_numeric_property_scrub(
+        &mut self,
+        commit: bool,
+        suppress_click: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn finish_numeric_property_scrub_with_focus_restore(
+        &mut self,
+        commit: bool,
+        suppress_click: bool,
+        restore_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool;
+}
+
+impl DesignScrubController for DesignPanel {
     /// Current Figma scrub band while either numeric scrub transaction is
     /// active. Pre-threshold click candidates deliberately return `None`.
-    pub fn active_scrub_speed(&self) -> Option<DesignScrubSpeed> {
-        self.numeric_property_scrub
+    fn active_scrub_speed_from_controller(&self) -> Option<DesignScrubSpeed> {
+        self.edit
+            .numeric_scrub
             .as_ref()
             .filter(|scrub| scrub.active)
             .map(|scrub| {
                 DesignScrubSpeed::from_vertical_displacement(scrub.last_y - scrub.origin_y)
             })
             .or_else(|| {
-                self.variable_font_axis_scrub
+                self.edit
+                    .variable_font_axis_scrub
                     .as_ref()
                     .filter(|scrub| scrub.active)
                     .map(|scrub| {
@@ -20,8 +75,8 @@ impl DesignPanel {
             })
     }
 
-    pub(super) fn render_scrub_speed_cue(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let speed = self.active_scrub_speed()?;
+    fn render_scrub_speed_cue(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let speed = self.active_scrub_speed_from_controller()?;
         let id = SharedString::from(format!("{}-scrub-speed-cue", self.id));
         let selector = id.to_string();
         Some(
@@ -63,7 +118,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn numeric_scrub_seed(
+    fn numeric_scrub_seed(
         &self,
         property: DesignPanelProperty,
     ) -> Option<(DesignPanelValue, PropertyEditorKind, f64)> {
@@ -73,7 +128,7 @@ impl DesignPanel {
         {
             return None;
         }
-        let current = match self.property_value_states.get(&property) {
+        let current = match self.host.property_states.get(&property) {
             Some(DesignPanelPropertyValueState::Uniform(value)) => value.clone(),
             Some(
                 DesignPanelPropertyValueState::Unset
@@ -123,7 +178,7 @@ impl DesignPanel {
         scalar.is_finite().then_some((current, kind, scalar))
     }
 
-    pub(super) fn numeric_scrub_value(
+    fn numeric_scrub_value(
         property: DesignPanelProperty,
         kind: PropertyEditorKind,
         original: &DesignPanelValue,
@@ -223,42 +278,47 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn numeric_scrub_multiplier(modifiers: Modifiers) -> f64 {
+    fn numeric_scrub_multiplier(modifiers: Modifiers) -> f64 {
         let coarse = if modifiers.shift { 10. } else { 1. };
         let fine = if modifiers.alt { 0.1 } else { 1. };
         coarse * fine
     }
 
-    pub(super) fn numeric_scrub_is_active(&self, property: DesignPanelProperty) -> bool {
-        self.numeric_property_scrub
+    fn numeric_scrub_is_active(&self, property: DesignPanelProperty) -> bool {
+        self.edit
+            .numeric_scrub
             .as_ref()
             .is_some_and(|scrub| scrub.property == property && scrub.active)
     }
 
-    pub(super) fn numeric_scrub_surface_is_enabled(&self, property: DesignPanelProperty) -> bool {
-        self.numeric_property_scrub
+    fn numeric_scrub_surface_is_enabled(&self, property: DesignPanelProperty) -> bool {
+        self.edit
+            .numeric_scrub
             .as_ref()
             .is_some_and(|scrub| scrub.property == property)
-            || (self.property_editor.is_none()
-                && self.numeric_property_scrub.is_none()
+            || (self.edit.property.is_none()
+                && self.edit.numeric_scrub.is_none()
                 && self.numeric_scrub_seed(property).is_some())
     }
 
-    pub(super) fn start_numeric_property_scrub(
+    fn start_numeric_property_scrub(
         &mut self,
         property: DesignPanelProperty,
         position_x: f32,
         position_y: f32,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.property_editor.is_some() || self.numeric_property_scrub.is_some() {
+        if self.edit.has_property_edit()
+            || self.edit.property.is_some()
+            || self.edit.numeric_scrub.is_some()
+        {
             return false;
         }
         let Some((original, kind, scalar)) = self.numeric_scrub_seed(property) else {
             return false;
         };
-        self.editor_focus_return = None;
-        self.numeric_property_scrub = Some(NumericPropertyScrub {
+        self.edit.focus_return = None;
+        self.edit.numeric_scrub = Some(NumericPropertyScrub {
             property,
             original,
             kind,
@@ -273,12 +333,12 @@ impl DesignPanel {
         true
     }
 
-    pub(super) fn begin_numeric_property_scrub_transaction(
+    fn begin_numeric_property_scrub_transaction(
         &mut self,
         scrub: &NumericPropertyScrub,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.property_editor.is_some() {
+        if self.edit.has_property_edit() || self.edit.property.is_some() {
             return false;
         }
         let Some((current, kind, scalar)) = self.numeric_scrub_seed(scrub.property) else {
@@ -287,25 +347,26 @@ impl DesignPanel {
         if current != scrub.original || kind != scrub.kind || scalar != scrub.scalar {
             return false;
         }
-        if let Some((property_id, _)) = self.component_swap_hovered.take() {
+        if let Some((property_id, _)) = self.features.component.swap_hovered.take() {
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::ComponentSwapPreviewRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id,
                     selection: None,
                 },
             );
         }
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.active_effect_settings = None;
-        self.grid_dimensions_picker = None;
-        self.effect_style_browser_open = false;
-        self.property_variable_picker = None;
-        self.component_property_variable_picker = None;
-        self.component_swap_browser = None;
-        self.vector_edit_target_ids = Self::vector_property_is_contextual(scrub.property)
+        self.overlays.discard(DesignOpenOverlay::PaintPicker);
+        self.overlays.discard(DesignOpenOverlay::EffectSettings);
+        self.overlays.discard(DesignOpenOverlay::GridDimensions);
+        self.overlays.discard(DesignOpenOverlay::EffectStyle);
+        self.overlays.discard(DesignOpenOverlay::PropertyVariable);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
+        self.overlays.discard(DesignOpenOverlay::ComponentSwap);
+        self.edit.vector_target_ids = Self::vector_property_is_contextual(scrub.property)
             .then(|| {
                 self.active_vector_edit()
                     .map(DesignVectorEditViewData::selected_vertex_ids)
@@ -318,26 +379,34 @@ impl DesignPanel {
         let export_configuration_id = Self::export_property_index(scrub.property)
             .and_then(|index| self.export_configuration(index))
             .map(|configuration| configuration.id);
-        self.property_editor = Some(PropertyEditor {
+        let Some(begin) = self
+            .edit
+            .begin_property_edit(scrub.property, scrub.original.clone())
+        else {
+            return false;
+        };
+        let draft = match &scrub.original {
+            DesignPanelValue::ExportSizing(value) => value.to_string(),
+            DesignPanelValue::LayoutGridCount(value) => value.label().to_string(),
+            DesignPanelValue::Integer(value) => value.to_string(),
+            _ => format_nudge_number(scrub.scalar as f32),
+        };
+        self.edit.property = Some(PropertyEditor::new(PropertyEditorSeed {
             property: scrub.property,
             layout_grid_target,
             export_configuration_id,
             original: scrub.original.clone(),
-            last_preview: None,
+            value: InspectorValue::Uniform(scrub.original.clone()),
             base: scrub.scalar,
             kind: scrub.kind,
-        });
-        self.property_editor_invalid = false;
-        self.emit_property_edit(
-            scrub.property,
-            scrub.original.clone(),
-            DesignPanelEditPhase::Begin,
-            cx,
-        );
+            draft,
+        }));
+        self.edit.property_invalid = false;
+        self.emit_property_lifecycle_event(begin, cx);
         true
     }
 
-    pub(super) fn update_numeric_property_scrub(
+    fn update_numeric_property_scrub(
         &mut self,
         property: DesignPanelProperty,
         position_x: f32,
@@ -345,11 +414,11 @@ impl DesignPanel {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let Some(mut scrub) = self.numeric_property_scrub.take() else {
+        let Some(mut scrub) = self.edit.numeric_scrub.take() else {
             return;
         };
         if scrub.property != property {
-            self.numeric_property_scrub = Some(scrub);
+            self.edit.numeric_scrub = Some(scrub);
             return;
         }
 
@@ -360,7 +429,7 @@ impl DesignPanel {
         } else {
             let total = position_x - scrub.origin_x;
             if total.abs() < NUMERIC_SCRUB_THRESHOLD {
-                self.numeric_property_scrub = Some(scrub);
+                self.edit.numeric_scrub = Some(scrub);
                 return;
             }
             if !self.begin_numeric_property_scrub_transaction(&scrub, cx) {
@@ -377,26 +446,29 @@ impl DesignPanel {
         let Some((scalar, value)) =
             Self::numeric_scrub_value(scrub.property, scrub.kind, &scrub.original, scalar)
         else {
-            self.numeric_property_scrub = Some(scrub);
+            self.edit.numeric_scrub = Some(scrub);
             return;
         };
         scrub.scalar = scalar;
-        let should_preview = self.property_editor.as_ref().is_some_and(|editor| {
-            editor.property == scrub.property
-                && !(editor.last_preview.is_none() && editor.original == value)
-                && editor.last_preview.as_ref() != Some(&value)
-        }) && self.layout_property_value_is_applicable(scrub.property, &value);
-        if should_preview && let Some(editor) = self.property_editor.as_mut() {
-            editor.last_preview = Some(value.clone());
-        }
-        self.numeric_property_scrub = Some(scrub);
-        if should_preview {
-            self.emit_property_edit(property, value, DesignPanelEditPhase::Preview, cx);
+        let applicable = self.layout_property_value_is_applicable(scrub.property, &value);
+        let should_preview = applicable
+            && self.edit.property.as_mut().is_some_and(|editor| {
+                editor.property == scrub.property && editor.scrub_controlled(scalar, &value)
+            });
+        let preview = should_preview
+            .then(|| {
+                self.edit
+                    .preview_property_edit(scrub.property, value.clone())
+            })
+            .flatten();
+        self.edit.numeric_scrub = Some(scrub);
+        if let Some(event) = preview {
+            self.emit_property_lifecycle_event(event, cx);
         }
         cx.notify();
     }
 
-    pub(super) fn finish_numeric_property_scrub(
+    fn finish_numeric_property_scrub(
         &mut self,
         commit: bool,
         suppress_click: bool,
@@ -412,7 +484,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn finish_numeric_property_scrub_with_focus_restore(
+    fn finish_numeric_property_scrub_with_focus_restore(
         &mut self,
         commit: bool,
         suppress_click: bool,
@@ -420,44 +492,57 @@ impl DesignPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(scrub) = self.numeric_property_scrub.take() else {
+        let Some(scrub) = self.edit.numeric_scrub.take() else {
             return false;
         };
         if !scrub.active {
             cx.notify();
             return false;
         }
-        let Some(editor) = self
-            .property_editor
+        let Some(mut editor) = self
+            .edit
+            .property
             .take()
             .filter(|editor| editor.property == scrub.property)
         else {
             cx.notify();
             return false;
         };
-        self.vector_edit_target_ids = None;
-        self.property_editor_invalid = false;
-        self.suppress_property_input_change = false;
-        let (phase, value) = if commit {
-            (
-                DesignPanelEditPhase::Commit,
-                editor
-                    .last_preview
-                    .unwrap_or_else(|| editor.original.clone()),
-            )
+        self.edit.vector_target_ids = None;
+        self.edit.property_invalid = false;
+        self.edit.suppress_property_input_change = false;
+        let accepted = commit.then(|| {
+            editor
+                .last_preview
+                .clone()
+                .unwrap_or_else(|| editor.original.clone())
+        });
+        let controlled_phase = editor.finish_controlled(commit, accepted.as_ref());
+        debug_assert_eq!(
+            controlled_phase,
+            Some(if commit {
+                InspectorEditPhase::Commit
+            } else {
+                InspectorEditPhase::Cancel
+            })
+        );
+        let event = if let Some(value) = accepted {
+            self.edit.commit_property_edit(scrub.property, value)
         } else {
-            (DesignPanelEditPhase::Cancel, editor.original)
+            self.edit.cancel_property_edit()
         };
         let return_focus = self.numeric_scrub_return_focus(scrub.property);
-        self.emit_property_edit(scrub.property, value, phase, cx);
+        if let Some(event) = event {
+            self.emit_property_lifecycle_event(event, cx);
+        }
         if suppress_click {
-            self.suppress_next_control_activation = true;
+            self.edit.suppress_next_control_activation = true;
             cx.defer_in(window, |this, _, _| {
-                this.suppress_next_control_activation = false;
+                this.edit.suppress_next_control_activation = false;
             });
         }
-        let fallback = if self.type_settings_open {
-            self.type_settings_focus.clone()
+        let fallback = if self.overlays.type_settings_open() {
+            self.overlays.type_settings_focus().clone()
         } else {
             self.focus_handle.clone()
         };

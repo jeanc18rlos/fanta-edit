@@ -9,10 +9,13 @@
 //! popups, rows, and scroll affordances from these recipes so transient
 //! surfaces share the library's clamping, chrome, and focus contracts.
 
+mod inspector;
 mod list_row;
 mod menu;
 mod popup;
 mod scroll_fade;
+
+pub use inspector::*;
 
 pub use list_row::list_row;
 pub use menu::{clamp_menu_origin, menu_item, menu_surface};

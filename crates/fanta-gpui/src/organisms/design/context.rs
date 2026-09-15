@@ -653,6 +653,14 @@ impl<T> DesignPanelPropertyValueState<T> {
         matches!(self, Self::ReadOnly(_))
     }
 
+    /// Host-supplied explanation for a read-only value, when present.
+    pub fn read_only_reason(&self) -> Option<&str> {
+        match self {
+            Self::ReadOnly(read_only) => read_only.reason(),
+            _ => None,
+        }
+    }
+
     pub fn is_unset(&self) -> bool {
         match self {
             Self::Unset => true,
@@ -902,12 +910,10 @@ mod tests {
         );
         assert!(read_only_bound.is_read_only());
         assert_eq!(
-            match &read_only_bound {
-                DesignPanelPropertyValueState::ReadOnly(value) => value.reason(),
-                _ => None,
-            },
+            read_only_bound.read_only_reason(),
             Some("Library component")
         );
+        assert_eq!(uniform.read_only_reason(), None);
         assert!(read_only_mixed.is_mixed());
         assert_eq!(read_only_mixed.resolved(), None);
     }

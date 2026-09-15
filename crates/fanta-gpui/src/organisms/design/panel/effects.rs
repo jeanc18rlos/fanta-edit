@@ -1,12 +1,170 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn effect_edit_target(
+pub(super) fn projection(panel: &DesignPanel) -> sections::effects::EffectsProjection {
+    let active_settings = panel
+        .overlays
+        .active_effect_settings()
+        .as_ref()
+        .map(|target| {
+            sections::effects::EffectTargetProjection::new(
+                panel.host.inspected_node().id.clone(),
+                target.effect_id.clone(),
+                target.index,
+            )
+        });
+    sections::effects::EffectsProjection::new(
+        sections::effects::EffectsIdentityProjection::new(
+            panel.id.clone(),
+            panel.host.inspected_node().id.clone(),
+        ),
+        sections::effects::EffectsAccessProjection::new(
+            panel.can_edit(),
+            panel.collection_is_supported(DesignPanelCollection::Effect),
+        ),
+        sections::effects::EffectsContentProjection::new(
+            panel
+                .host
+                .inspected_node()
+                .effect_style_binding
+                .as_ref()
+                .map(|binding| binding.name.clone()),
+            panel.host.inspected_node().effects.clone(),
+        ),
+        sections::effects::EffectsOverlayProjection::new(active_settings),
+    )
+}
+
+/// Internal controller for effect transactions, resources, and retained
+/// compatibility chrome used by the extracted Effects section.
+pub(super) trait DesignEffectsController: Sized {
+    fn effect_edit_target(
+        &self,
+        property: DesignPanelProperty,
+    ) -> Option<(usize, SharedString, Option<SharedString>)>;
+    fn emit_effect_edit(
+        &self,
+        property: DesignPanelProperty,
+        value: DesignPanelValue,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn effect_shader_property(
+        &self,
+        index: usize,
+        property_index: usize,
+    ) -> Option<(&DesignEffect, &super::super::DesignShaderProperty)>;
+    fn request_effect_shader_property_editor(
+        &self,
+        index: usize,
+        property_index: usize,
+        target: DesignShaderPropertyEditorTarget,
+        editor: DesignShaderPropertyEditorKind,
+        cx: &mut Context<Self>,
+    );
+    fn request_effect_shader_property_variable_detach(
+        &self,
+        index: usize,
+        property_index: usize,
+        target: DesignShaderPropertyEditorTarget,
+        expected_variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_effect_reorder(
+        &self,
+        effect_id: SharedString,
+        fallback_from_index: usize,
+        to_index: usize,
+        cx: &mut Context<Self>,
+    );
+    fn activate_shader_property_field_from_control(
+        &mut self,
+        property: DesignPanelProperty,
+        field: ShaderPropertyEditorField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn activate_shader_property_field(
+        &mut self,
+        property: DesignPanelProperty,
+        field: ShaderPropertyEditorField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn open_effect_style_browser(&mut self, cx: &mut Context<Self>);
+    fn emit_effect_style_apply(
+        &mut self,
+        style: DesignEffectStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_effect_style_create(&mut self, cx: &mut Context<Self>);
+    fn emit_effect_style_detach(&mut self, cx: &mut Context<Self>);
+    fn render_effect_style_button(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn render_effect_color_cell(
+        &self,
+        id_suffix: impl Into<SharedString>,
+        label: &'static str,
+        color: DesignColor,
+        property: DesignPanelProperty,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn emit_effect_variable_action(
+        &self,
+        index: usize,
+        field: DesignEffectVariableField,
+        cx: &mut Context<Self>,
+    );
+    fn render_effect_variables(
+        &self,
+        index: usize,
+        effect: &DesignEffect,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement>;
+    fn render_shader_property_field_cell(
+        &self,
+        id_suffix: impl Into<SharedString>,
+        prefix: &'static str,
+        value: impl Into<SharedString>,
+        property: DesignPanelProperty,
+        field: ShaderPropertyEditorField,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_shader_property_toggle(
+        &self,
+        id_suffix: impl Into<SharedString>,
+        checked: bool,
+        property: DesignPanelProperty,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_shader_property_variable_controls(
+        &self,
+        index: usize,
+        property_index: usize,
+        target: DesignShaderPropertyEditorTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_effect_shader_property(
+        &self,
+        index: usize,
+        property_index: usize,
+        property: &super::super::DesignShaderProperty,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_effect_settings(
+        &self,
+        index: usize,
+        effect: &DesignEffect,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_effects(&self, cx: &mut Context<Self>) -> AnyElement;
+}
+
+impl DesignEffectsController for DesignPanel {
+    fn effect_edit_target(
         &self,
         property: DesignPanelProperty,
     ) -> Option<(usize, SharedString, Option<SharedString>)> {
         let index = property.effect_index()?;
-        let effect = self.node.effects.get(index)?;
+        let effect = self.host.inspected_node().effects.get(index)?;
         let shader_property_id =
             if let DesignPanelProperty::EffectShaderProperty(_, property_index) = property {
                 let DesignEffectSettings::Shader(shader) = &effect.settings else {
@@ -19,7 +177,7 @@ impl DesignPanel {
         Some((index, effect.id.clone(), shader_property_id))
     }
 
-    pub(super) fn emit_effect_edit(
+    fn emit_effect_edit(
         &self,
         property: DesignPanelProperty,
         value: DesignPanelValue,
@@ -38,7 +196,7 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::EffectEditRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 effect_id,
                 index,
                 property,
@@ -50,19 +208,19 @@ impl DesignPanel {
         true
     }
 
-    pub(super) fn effect_shader_property(
+    fn effect_shader_property(
         &self,
         index: usize,
         property_index: usize,
     ) -> Option<(&DesignEffect, &super::super::DesignShaderProperty)> {
-        let effect = self.node.effects.get(index)?;
+        let effect = self.host.inspected_node().effects.get(index)?;
         let DesignEffectSettings::Shader(shader) = &effect.settings else {
             return None;
         };
         Some((effect, shader.properties.get(property_index)?))
     }
 
-    pub(super) fn request_effect_shader_property_editor(
+    fn request_effect_shader_property_editor(
         &self,
         index: usize,
         property_index: usize,
@@ -105,7 +263,7 @@ impl DesignPanel {
         };
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::Effect)
-            || self.node.effect_style_binding.is_some()
+            || self.host.inspected_node().effect_style_binding.is_some()
             || property.read_only
             || !target_is_valid
             || !editor_is_valid
@@ -113,7 +271,7 @@ impl DesignPanel {
             return;
         }
         let action = DesignPanelAction::EffectShaderPropertyEditorRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             effect_id: effect.id.clone(),
             index,
             shader_property_id: property.definition_id.clone(),
@@ -128,7 +286,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn request_effect_shader_property_variable_detach(
+    fn request_effect_shader_property_variable_detach(
         &self,
         index: usize,
         property_index: usize,
@@ -142,14 +300,14 @@ impl DesignPanel {
         let current_variable_id = shader_property_variable_id(&property.value, target);
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::Effect)
-            || self.node.effect_style_binding.is_some()
+            || self.host.inspected_node().effect_style_binding.is_some()
             || property.read_only
             || current_variable_id != Some(&expected_variable_id)
         {
             return;
         }
         let action = DesignPanelAction::EffectShaderPropertyVariableDetachRequested {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             effect_id: effect.id.clone(),
             index,
             shader_property_id: property.definition_id.clone(),
@@ -162,7 +320,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn emit_effect_reorder(
+    fn emit_effect_reorder(
         &self,
         effect_id: SharedString,
         fallback_from_index: usize,
@@ -171,27 +329,28 @@ impl DesignPanel {
     ) {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::Effect)
-            || self.node.effect_style_binding.is_some()
+            || self.host.inspected_node().effect_style_binding.is_some()
         {
             return;
         }
         let from_index = if effect_id.is_empty() {
             fallback_from_index
         } else {
-            self.node
+            self.host
+                .inspected_node()
                 .effect_index_by_id(effect_id.as_ref())
                 .unwrap_or(fallback_from_index)
         };
         if from_index == to_index
-            || from_index >= self.node.effects.len()
-            || to_index >= self.node.effects.len()
+            || from_index >= self.host.inspected_node().effects.len()
+            || to_index >= self.host.inspected_node().effects.len()
         {
             return;
         }
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::EffectReorderRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 effect_id,
                 from_index,
                 to_index,
@@ -199,14 +358,14 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn activate_shader_property_field_from_control(
+    fn activate_shader_property_field_from_control(
         &mut self,
         property: DesignPanelProperty,
         field: ShaderPropertyEditorField,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.property_editor.as_ref().is_some_and(|editor| {
+        if self.edit.property.as_ref().is_some_and(|editor| {
             editor.property == property
                 && matches!(
                     editor.kind,
@@ -223,7 +382,7 @@ impl DesignPanel {
             handle,
         });
         self.activate_shader_property_field(property, field, window, cx);
-        if self.property_editor.as_ref().is_some_and(|editor| {
+        if self.edit.property.as_ref().is_some_and(|editor| {
             editor.property == property
                 && matches!(
                     editor.kind,
@@ -233,22 +392,22 @@ impl DesignPanel {
                     } if active_field == field
                 )
         }) {
-            self.editor_focus_return = return_focus;
+            self.edit.focus_return = return_focus;
         }
     }
 
-    pub(super) fn activate_shader_property_field(
+    fn activate_shader_property_field(
         &mut self,
         property: DesignPanelProperty,
         field: ShaderPropertyEditorField,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.property_is_editable(property) || self.suppress_next_control_activation {
-            self.suppress_next_control_activation = false;
+        if !self.property_is_editable(property) || self.edit.suppress_next_control_activation {
+            self.edit.suppress_next_control_activation = false;
             return;
         }
-        if self.property_editor.is_some() {
+        if self.edit.has_property_edit() || self.edit.property.is_some() {
             return;
         }
         let Some(current) = self
@@ -267,26 +426,30 @@ impl DesignPanel {
             return;
         };
 
-        if let Some((property_id, _)) = self.component_swap_hovered.take() {
+        if let Some((property_id, _)) = self.features.component.swap_hovered.take() {
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::ComponentSwapPreviewRequested {
-                    node_id: self.node.id.clone(),
+                    node_id: self.host.inspected_node().id.clone(),
                     property_id,
                     selection: None,
                 },
             );
         }
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.effect_style_browser_open = false;
-        self.property_variable_picker = None;
-        self.component_property_variable_picker = None;
-        self.component_swap_browser = None;
-        self.type_settings_open = false;
-        self.vector_edit_target_ids = None;
-        self.editor_focus_return = None;
-        self.property_editor = Some(PropertyEditor {
+        self.overlays.discard(DesignOpenOverlay::PaintPicker);
+        self.overlays.discard(DesignOpenOverlay::EffectStyle);
+        self.overlays.discard(DesignOpenOverlay::PropertyVariable);
+        self.overlays
+            .discard(DesignOpenOverlay::ComponentPropertyVariable);
+        self.overlays.discard(DesignOpenOverlay::ComponentSwap);
+        self.overlays.discard(DesignOpenOverlay::TypeSettings);
+        let Some(begin) = self.edit.begin_property_edit(property, current.clone()) else {
+            return;
+        };
+        self.edit.vector_target_ids = None;
+        self.edit.focus_return = None;
+        self.edit.property = Some(PropertyEditor {
             property,
             layout_grid_target: None,
             export_configuration_id: None,
@@ -294,124 +457,127 @@ impl DesignPanel {
             last_preview: None,
             base,
             kind: PropertyEditorKind::Shader { field, input },
+            controlled: PropertyEditorControlledField::Compound,
         });
-        self.property_editor_invalid = false;
-        self.emit_property_edit(property, current, DesignPanelEditPhase::Begin, cx);
-        self.suppress_property_input_change = true;
-        self.property_input.update(cx, |input, cx| {
+        self.edit.property_invalid = false;
+        self.emit_property_lifecycle_event(begin, cx);
+        self.edit.suppress_property_input_change = true;
+        self.retained.inputs.property.update(cx, |input, cx| {
             input.set_value(draft, window, cx);
             input.focus(window, cx);
         });
-        self.suppress_property_input_change = false;
+        self.edit.suppress_property_input_change = false;
         cx.notify();
     }
 
-    pub(super) fn open_effect_style_browser(&mut self, cx: &mut Context<Self>) {
+    fn open_effect_style_browser(&mut self, cx: &mut Context<Self>) {
         if !self.collection_is_supported(DesignPanelCollection::Effect) {
             return;
         }
-        self.style_browser_source_filter =
-            self.style_browser_source_filter.normalized_for_libraries(
-                self.effect_style_view_data
+        self.features.style_browser.source_filter = self
+            .features
+            .style_browser
+            .source_filter
+            .normalized_for_libraries(
+                self.resources
+                    .effect_styles
                     .libraries
                     .iter()
                     .map(|library| (&library.id, &library.name)),
             );
-        self.effect_style_browser_open = true;
-        self.paint_style_browser_open = None;
-        self.active_effect_settings = None;
+        self.overlays.open(DesignOverlayState::EffectStyle);
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.typography_style_picker_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
         cx.notify();
     }
 
-    pub(super) fn emit_effect_style_apply(
+    fn emit_effect_style_apply(
         &mut self,
         style: DesignEffectStyleSelection,
         cx: &mut Context<Self>,
     ) {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::Effect)
-            || self.effect_style_view_data.style(&style).is_none()
+            || self.resources.effect_styles.style(&style).is_none()
         {
             return;
         }
-        self.effect_style_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::EffectStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::EffectStyleApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 style,
             },
         );
         cx.notify();
     }
 
-    pub(super) fn emit_effect_style_create(&mut self, cx: &mut Context<Self>) {
+    fn emit_effect_style_create(&mut self, cx: &mut Context<Self>) {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::Effect)
-            || self.node.effects.is_empty()
-            || self.node.effect_style_binding.is_some()
+            || self.host.inspected_node().effects.is_empty()
+            || self.host.inspected_node().effect_style_binding.is_some()
         {
             return;
         }
-        self.effect_style_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::EffectStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::EffectStyleCreateRequested {
-                node_id: self.node.id.clone(),
-                effects: self.node.effects.clone(),
+                node_id: self.host.inspected_node().id.clone(),
+                effects: self.host.inspected_node().effects.clone(),
             },
         );
         cx.notify();
     }
 
-    pub(super) fn emit_effect_style_detach(&mut self, cx: &mut Context<Self>) {
+    fn emit_effect_style_detach(&mut self, cx: &mut Context<Self>) {
         if !self.can_edit() || !self.collection_is_supported(DesignPanelCollection::Effect) {
             return;
         }
         let Some(binding) = self
-            .node
+            .host
+            .inspected_node()
             .effect_style_binding
             .as_ref()
             .filter(|binding| binding.can_detach)
         else {
             return;
         };
-        self.effect_style_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::EffectStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::EffectStyleDetachRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 style: binding.selection.clone(),
             },
         );
         cx.notify();
     }
 
-    pub(super) fn render_effect_style_button(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_effect_style_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let panel = cx.entity();
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
         let panel_id = self.id.clone();
-        let active = self.effect_style_browser_open;
-        let binding = self.node.effect_style_binding.clone();
+        let active = self.overlays.effect_style_browser_open();
+        let binding = self.host.inspected_node().effect_style_binding.clone();
         let can_edit = self.can_edit();
-        let can_create = can_edit && !self.node.effects.is_empty() && binding.is_none();
+        let can_create =
+            can_edit && !self.host.inspected_node().effects.is_empty() && binding.is_none();
         let query = self.normalized_style_browser_query(cx);
-        let source_filter = self.style_browser_source_filter.clone();
-        let view_mode = self.style_browser_view_mode;
-        let catalog_is_empty = self.effect_style_view_data.page_styles.is_empty()
+        let source_filter = self.features.style_browser.source_filter.clone();
+        let view_mode = self.features.style_browser.view_mode;
+        let catalog_is_empty = self.resources.effect_styles.page_styles.is_empty()
             && self
-                .effect_style_view_data
+                .resources
+                .effect_styles
                 .libraries
                 .iter()
                 .all(|library| library.styles.is_empty());
         let page_styles = if source_filter.includes_page() {
-            self.effect_style_view_data
+            self.resources
+                .effect_styles
                 .page_styles
                 .iter()
                 .map(|style| {
@@ -436,7 +602,8 @@ impl DesignPanel {
             Vec::new()
         };
         let libraries = self
-            .effect_style_view_data
+            .resources
+            .effect_styles
             .libraries
             .iter()
             .filter(|library| source_filter.includes_library(library.id.as_ref()))
@@ -476,9 +643,10 @@ impl DesignPanel {
             })
             .filter(|(_, styles)| !styles.is_empty())
             .collect::<Vec<_>>();
-        let style_browser_search = self.style_browser_search.clone();
+        let style_browser_search = self.retained.inputs.style_browser_search.clone();
         let style_browser_library_sources = self
-            .effect_style_view_data
+            .resources
+            .effect_styles
             .libraries
             .iter()
             .map(|library| (library.id.clone(), library.name.clone()))
@@ -508,13 +676,17 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(active)
         .overlay_closable(true)
-        .on_open_change(move |open, _, cx| {
+        .on_open_change(move |open, window, cx| {
             panel_for_open.update(cx, |this, cx| {
                 if *open {
+                    this.remember_overlay_focus_return(DesignOpenOverlay::EffectStyle, window, cx);
                     this.open_effect_style_browser(cx);
-                } else if this.effect_style_browser_open {
-                    this.effect_style_browser_open = false;
-                    cx.notify();
+                } else if this.overlays.effect_style_browser_open() {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::EffectStyle,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -685,7 +857,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_effect_color_cell(
+    fn render_effect_color_cell(
         &self,
         id_suffix: impl Into<SharedString>,
         label: &'static str,
@@ -696,7 +868,7 @@ impl DesignPanel {
         let Some(index) = property.effect_index() else {
             return div().into_any_element();
         };
-        let Some(effect) = self.node.effects.get(index) else {
+        let Some(effect) = self.host.inspected_node().effects.get(index) else {
             return div().into_any_element();
         };
         self.render_auxiliary_color_picker_control(
@@ -705,7 +877,7 @@ impl DesignPanel {
             format!("{label} · #{}", color.hex()),
             color,
             AuxiliaryColorPickerTarget::Effect {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 effect_id: effect.id.clone(),
                 index,
                 property,
@@ -714,7 +886,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn emit_effect_variable_action(
+    fn emit_effect_variable_action(
         &self,
         index: usize,
         field: DesignEffectVariableField,
@@ -722,11 +894,11 @@ impl DesignPanel {
     ) {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::Effect)
-            || self.node.effect_style_binding.is_some()
+            || self.host.inspected_node().effect_style_binding.is_some()
         {
             return;
         }
-        let Some(effect) = self.node.effects.get(index) else {
+        let Some(effect) = self.host.inspected_node().effects.get(index) else {
             return;
         };
         if let Some(binding) = effect.variable_binding(field) {
@@ -734,7 +906,7 @@ impl DesignPanel {
                 cx.emit_design_panel_action(
                     self,
                     DesignPanelAction::EffectVariableDetachRequested {
-                        node_id: self.node.id.clone(),
+                        node_id: self.host.inspected_node().id.clone(),
                         effect_id: effect.id.clone(),
                         index,
                         field,
@@ -744,13 +916,13 @@ impl DesignPanel {
             }
             return;
         }
-        let Some(variable) = self.effect_variable_view_data.compatible(field).next() else {
+        let Some(variable) = self.resources.effect_variables.compatible(field).next() else {
             return;
         };
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::EffectVariableApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 effect_id: effect.id.clone(),
                 index,
                 field,
@@ -759,13 +931,14 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn render_effect_variables(
+    fn render_effect_variables(
         &self,
         index: usize,
         effect: &DesignEffect,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let fields = effect.variable_fields(self.node.effect_capabilities.shadow_spread);
+        let fields =
+            effect.variable_fields(self.host.inspected_node().effect_capabilities.shadow_spread);
         (!fields.is_empty()).then(|| {
             let mut content = v_flex()
                 .w_full()
@@ -781,9 +954,9 @@ impl DesignPanel {
                 );
             for field in fields {
                 let binding = effect.variable_binding(*field);
-                let candidate = self.effect_variable_view_data.compatible(*field).next();
+                let candidate = self.resources.effect_variables.compatible(*field).next();
                 let enabled = self.can_edit()
-                    && self.node.effect_style_binding.is_none()
+                    && self.host.inspected_node().effect_style_binding.is_none()
                     && (binding.is_some_and(|binding| binding.can_detach)
                         || binding.is_none() && candidate.is_some());
                 let value: SharedString = binding.map_or_else(
@@ -826,7 +999,7 @@ impl DesignPanel {
         })
     }
 
-    pub(super) fn render_shader_property_field_cell(
+    fn render_shader_property_field_cell(
         &self,
         id_suffix: impl Into<SharedString>,
         prefix: &'static str,
@@ -848,7 +1021,7 @@ impl DesignPanel {
                         && shader_property_field_draft(&value, field).is_some()
                 });
         let editing = editable
-            && self.property_editor.as_ref().is_some_and(|editor| {
+            && self.edit.property.as_ref().is_some_and(|editor| {
                 editor.property == property
                     && matches!(
                         editor.kind,
@@ -859,7 +1032,8 @@ impl DesignPanel {
                     )
             });
         let retained_focus = self
-            .editor_focus_return
+            .edit
+            .focus_return
             .as_ref()
             .filter(|return_focus| {
                 matches!(
@@ -881,7 +1055,7 @@ impl DesignPanel {
             .gap_1()
             .rounded(px(4.))
             .border_1()
-            .border_color(if editing && self.property_editor_invalid {
+            .border_color(if editing && self.edit.property_invalid {
                 cx.theme().red
             } else if editing {
                 cx.theme().selection
@@ -925,7 +1099,7 @@ impl DesignPanel {
         });
         if editing {
             cell = cell.child(
-                Input::new(&self.property_input)
+                Input::new(&self.retained.inputs.property)
                     .appearance(false)
                     .bordered(false)
                     .focus_bordered(false)
@@ -940,7 +1114,7 @@ impl DesignPanel {
         cell.into_any_element()
     }
 
-    pub(super) fn render_shader_property_toggle(
+    fn render_shader_property_toggle(
         &self,
         id_suffix: impl Into<SharedString>,
         checked: bool,
@@ -1004,7 +1178,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_shader_property_variable_controls(
+    fn render_shader_property_variable_controls(
         &self,
         index: usize,
         property_index: usize,
@@ -1016,7 +1190,7 @@ impl DesignPanel {
         };
         let binding = shader_property_variable_id(&property.value, target).cloned();
         let enabled = self.can_edit()
-            && self.node.effect_style_binding.is_none()
+            && self.host.inspected_node().effect_style_binding.is_none()
             && !property.read_only
             && !matches!(&property.value, DesignShaderPropertyValue::Opaque { .. });
         let panel = cx.entity();
@@ -1094,7 +1268,7 @@ impl DesignPanel {
         row.into_any_element()
     }
 
-    pub(super) fn render_effect_shader_property(
+    fn render_effect_shader_property(
         &self,
         index: usize,
         property_index: usize,
@@ -1622,7 +1796,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_effect_settings(
+    fn render_effect_settings(
         &self,
         index: usize,
         effect: &DesignEffect,
@@ -1687,19 +1861,23 @@ impl DesignPanel {
                             DesignPanelValue::Number(settings.radius + 1.),
                             cx,
                         ))
-                        .when(self.node.effect_capabilities.shadow_spread, |row| {
-                            row.child(self.render_value_cell(
-                                format!("effect-shadow-spread-{index}"),
-                                "S",
-                                format!("Spread · {}", format_number(settings.spread)),
-                                DesignPanelProperty::EffectShadowSpread(index),
-                                DesignPanelValue::Number(settings.spread + 1.),
-                                cx,
-                            ))
-                        }),
+                        .when(
+                            self.host.inspected_node().effect_capabilities.shadow_spread,
+                            |row| {
+                                row.child(self.render_value_cell(
+                                    format!("effect-shadow-spread-{index}"),
+                                    "S",
+                                    format!("Spread · {}", format_number(settings.spread)),
+                                    DesignPanelProperty::EffectShadowSpread(index),
+                                    DesignPanelValue::Number(settings.spread + 1.),
+                                    cx,
+                                ))
+                            },
+                        ),
                 )
                 .when(
-                    self.node
+                    self.host
+                        .inspected_node()
                         .effect_capabilities
                         .show_shadow_behind_transparent_areas,
                     |content| {
@@ -1770,16 +1948,19 @@ impl DesignPanel {
                             DesignPanelValue::Number(settings.radius + 1.),
                             cx,
                         ))
-                        .when(self.node.effect_capabilities.shadow_spread, |row| {
-                            row.child(self.render_value_cell(
-                                format!("effect-shadow-spread-{index}"),
-                                "S",
-                                format!("Spread · {}", format_number(settings.spread)),
-                                DesignPanelProperty::EffectShadowSpread(index),
-                                DesignPanelValue::Number(settings.spread + 1.),
-                                cx,
-                            ))
-                        }),
+                        .when(
+                            self.host.inspected_node().effect_capabilities.shadow_spread,
+                            |row| {
+                                row.child(self.render_value_cell(
+                                    format!("effect-shadow-spread-{index}"),
+                                    "S",
+                                    format!("Spread · {}", format_number(settings.spread)),
+                                    DesignPanelProperty::EffectShadowSpread(index),
+                                    DesignPanelValue::Number(settings.spread + 1.),
+                                    cx,
+                                ))
+                            },
+                        ),
                 )
                 .into_any_element(),
             DesignEffectSettings::LayerBlur(settings)
@@ -2106,7 +2287,7 @@ impl DesignPanel {
             DesignEffectSettings::Shader(shader) => {
                 let panel = cx.entity();
                 let effect_id = effect.id.clone();
-                let node_id = self.node.id.clone();
+                let node_id = self.host.inspected_node().id.clone();
                 let mut content = v_flex().w_full().gap_2().child(
                     Button::new(SharedString::from(format!(
                         "{}-effect-shader-source-{index}",
@@ -2129,7 +2310,7 @@ impl DesignPanel {
                     .disabled(
                         !self.can_edit()
                             || !self.collection_is_supported(DesignPanelCollection::Effect)
-                            || self.node.effect_style_binding.is_some(),
+                            || self.host.inspected_node().effect_style_binding.is_some(),
                     )
                     .on_activate(move |_, _, cx| {
                         panel.update(cx, |this, cx| {
@@ -2139,7 +2320,7 @@ impl DesignPanel {
                                 index,
                             };
                             if this.can_edit()
-                                && this.node.effect_style_binding.is_none()
+                                && this.host.inspected_node().effect_style_binding.is_none()
                                 && this.node_capability_allows_action(&action)
                             {
                                 cx.emit_design_panel_action(this, action);
@@ -2192,230 +2373,8 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_effects(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(binding) = self.node.effect_style_binding.as_ref() {
-            let content = v_flex()
-                .px(px(PANEL_PADDING))
-                .pb_4()
-                .child(self.render_bound_style_summary("effects", binding.name.clone(), cx));
-            return self.render_section(
-                DesignPanelSection::Effects,
-                Some(DesignPanelCollection::Effect),
-                content.into_any_element(),
-                cx,
-            );
-        }
-        if self.node.effects.is_empty() {
-            return self.render_section(
-                DesignPanelSection::Effects,
-                Some(DesignPanelCollection::Effect),
-                div().into_any_element(),
-                cx,
-            );
-        }
-        let mut content = v_flex().px(px(PANEL_PADDING)).pb_4().gap_1();
-        for (index, effect) in self.node.effects.iter().enumerate() {
-            let can_reorder = self.can_edit()
-                && self.collection_is_supported(DesignPanelCollection::Effect)
-                && self.node.effect_style_binding.is_none()
-                && self.node.effects.len() > 1;
-            let active = self
-                .active_effect_settings
-                .as_ref()
-                .is_some_and(|target| target.matches(effect, index));
-            let panel = cx.entity();
-            let panel_for_open = panel.clone();
-            let panel_for_content = panel.clone();
-            let effect_for_open = effect.clone();
-            let effect_for_content = effect.clone();
-            let effect_id = effect.id.clone();
-            let panel_for_keyboard = panel.clone();
-            let effect_for_keyboard = effect.clone();
-            let keyboard_effect_id = effect.id.clone();
-            let settings_trigger = Button::new(SharedString::from(format!(
-                "{}-effect-settings-{index}",
-                self.id
-            )))
-            .tooltip("Effect settings")
-            .xsmall()
-            .compact()
-            .ghost()
-            .w(px(24.))
-            .h(px(24.))
-            .selected(active)
-            .on_keyboard_activate(move |_, cx| {
-                panel_for_keyboard.update(cx, |this, cx| {
-                    if !active {
-                        this.prepare_paint_picker_for_dismissal(cx);
-                        this.cancel_menu_preview(cx);
-                        this.active_effect_settings = Some(EffectSettingsTarget {
-                            index,
-                            effect_id: keyboard_effect_id.clone(),
-                        });
-                        this.effect_style_browser_open = false;
-                        this.active_picker = None;
-                        this.typography_style_picker_open = false;
-                    } else if this
-                        .active_effect_settings
-                        .as_ref()
-                        .is_some_and(|target| target.matches(&effect_for_keyboard, index))
-                    {
-                        this.cancel_menu_preview(cx);
-                        this.preview_option_menu_open = None;
-                        this.active_effect_settings = None;
-                    }
-                    cx.notify();
-                });
-            })
-            .icon(IconName::Settings2);
-            // Popover sizing applies to its deferred overlay, not this trigger.
-            // Keep the 24 px dimensions on the button so the natural-width
-            // settings surface can use its TopRight anchor and open inward.
-            let settings_popover = Popover::new(SharedString::from(format!(
-                "{}-effect-settings-popover-{index}",
-                self.id
-            )))
-            .anchor(Anchor::TopRight)
-            .open(active)
-            .overlay_closable(true)
-            .on_open_change(move |open, _, cx| {
-                panel_for_open.update(cx, |this, cx| {
-                    if *open {
-                        this.prepare_paint_picker_for_dismissal(cx);
-                        this.cancel_menu_preview(cx);
-                        this.active_effect_settings = Some(EffectSettingsTarget {
-                            index,
-                            effect_id: effect_id.clone(),
-                        });
-                        this.effect_style_browser_open = false;
-                        this.active_picker = None;
-                        this.typography_style_picker_open = false;
-                    } else if this
-                        .active_effect_settings
-                        .as_ref()
-                        .is_some_and(|target| target.matches(&effect_for_open, index))
-                    {
-                        this.cancel_menu_preview(cx);
-                        this.preview_option_menu_open = None;
-                        this.active_effect_settings = None;
-                    }
-                    cx.notify();
-                });
-            })
-            .trigger(settings_trigger)
-            .content(move |_, window, cx| {
-                let effect = effect_for_content.clone();
-                panel_for_content.update(cx, |this, cx| {
-                    v_flex()
-                        .w(popup_width(window, 292.))
-                        .p_3()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_semibold()
-                                .child(effect.settings.kind().label()),
-                        )
-                        .child(this.render_effect_settings(index, &effect, cx))
-                })
-            });
-
-            let drop_effect_id = effect.id.clone();
-            let can_drop_effect_id = effect.id.clone();
-            let drop_background = cx.theme().selection.opacity(0.18);
-            let drop_border = cx.theme().selection;
-            let drag = EffectDrag {
-                effect_id: effect.id.clone(),
-                from_index: index,
-                label: effect.settings.kind().label().into(),
-            };
-            let drop_listener = cx.listener(move |this, drag: &EffectDrag, _, cx| {
-                this.emit_effect_reorder(drag.effect_id.clone(), drag.from_index, index, cx);
-            });
-            let row = h_flex()
-                .id(SharedString::from(format!(
-                    "{}-effect-row-{index}",
-                    self.id
-                )))
-                .w_full()
-                .h(px(ROW_HEIGHT))
-                .gap_1()
-                .rounded(px(4.))
-                .border_1()
-                .border_color(cx.theme().transparent)
-                .when(can_reorder, |row| row.cursor_move())
-                .child(
-                    div()
-                        .w(px(14.))
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .when(can_reorder, |handle| handle.child("⠿")),
-                )
-                .child(
-                    div()
-                        .size(px(20.))
-                        .flex_none()
-                        .rounded(px(4.))
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(color_hsla(effect.color)),
-                )
-                .child(self.render_value_cell(
-                    format!("effect-kind-{index}"),
-                    "",
-                    effect.settings.kind().label(),
-                    DesignPanelProperty::EffectKind(index),
-                    DesignPanelValue::EffectKind(DesignEffectKind::DropShadow),
-                    cx,
-                ))
-                .child(settings_popover)
-                .child(self.render_visibility_button(
-                    format!("effect-visible-{index}"),
-                    effect.visible,
-                    DesignPanelProperty::EffectVisible(index),
-                    cx,
-                ))
-                .child(self.render_remove_button(
-                    format!("remove-effect-{index}"),
-                    DesignPanelCollection::Effect,
-                    index,
-                    cx,
-                ))
-                .when(can_reorder, move |row| {
-                    row.on_drag(drag, |drag, _, _, cx| {
-                        cx.new(|_| EffectDragPreview { drag: drag.clone() })
-                    })
-                    .can_drop(move |drag, _, _| {
-                        drag.downcast_ref::<EffectDrag>().is_some_and(|drag| {
-                            if drag.effect_id.is_empty() || can_drop_effect_id.is_empty() {
-                                drag.from_index != index
-                            } else {
-                                drag.effect_id != can_drop_effect_id
-                            }
-                        })
-                    })
-                    .drag_over::<EffectDrag>(move |style, drag, _, _| {
-                        let same = if drag.effect_id.is_empty() || drop_effect_id.is_empty() {
-                            drag.from_index == index
-                        } else {
-                            drag.effect_id == drop_effect_id
-                        };
-                        if same {
-                            style
-                        } else {
-                            style.bg(drop_background).border_color(drop_border)
-                        }
-                    })
-                    .on_drop(drop_listener)
-                });
-            content = content.child(row);
-        }
-        self.render_section(
-            DesignPanelSection::Effects,
-            Some(DesignPanelCollection::Effect),
-            content.into_any_element(),
-            cx,
-        )
+    fn render_effects(&self, cx: &mut Context<Self>) -> AnyElement {
+        let events = sections::effects::EffectsEventSink::new(cx.entity());
+        sections::effects::render(&projection(self), self, &events, cx)
     }
 }

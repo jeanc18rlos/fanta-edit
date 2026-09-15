@@ -20,7 +20,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::atoms::ButtonControlExt as _;
+use crate::atoms::{ButtonControlExt as _, tokens};
 use crate::molecules::{popup_height, popup_width};
 
 use super::{
@@ -29,7 +29,7 @@ use super::{
     DesignTypographyStyleViewData,
 };
 
-const PICKER_WIDTH: f32 = 304.;
+const PICKER_WIDTH: f32 = tokens::MenuWidth::PICKER_WIDE;
 const PICKER_MAX_HEIGHT: f32 = 520.;
 
 #[derive(Clone, Debug, PartialEq)]

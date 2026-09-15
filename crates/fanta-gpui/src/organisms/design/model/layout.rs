@@ -1983,10 +1983,10 @@ impl DesignSmartSelectionAxis {
         }
     }
 
-    pub const fn glyph(self) -> &'static str {
+    pub const fn short_label(self) -> &'static str {
         match self {
-            Self::Horizontal => "↔",
-            Self::Vertical => "↕",
+            Self::Horizontal => "H",
+            Self::Vertical => "V",
         }
     }
 }

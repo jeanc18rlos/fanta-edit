@@ -683,13 +683,10 @@ impl EditorToolbar {
     ) {
         cx.emit(ToolbarAction::CommandInvoked { command });
         match command {
-            ToolbarCommand::GenerateDesign
-            | ToolbarCommand::ReplaceContent
+            ToolbarCommand::ReplaceContent
             | ToolbarCommand::RewriteText
             | ToolbarCommand::TranslateText
             | ToolbarCommand::RenameLayers
-            | ToolbarCommand::RemoveBackground
-            | ToolbarCommand::GenerateImage
             | ToolbarCommand::MakePrototype => self.open_agent(window, cx),
             _ => {
                 self.set_overlay(None, cx);
@@ -836,10 +833,10 @@ mod tests {
             EditorToolbar::match_command(ToolbarCommand::ZoomToFit, "zmf"),
             Some((3, vec![0..1, 3..4, 8..9]))
         );
-        // The legacy category/description substring survives as the fallback
-        // tier without label highlights.
+        // A phrase that only the description carries still matches, in the
+        // fallback tier and without label highlights.
         assert_eq!(
-            EditorToolbar::match_command(ToolbarCommand::GenerateDesign, "figma agent"),
+            EditorToolbar::match_command(ToolbarCommand::GenerateDesign, "editable frames"),
             Some((4, Vec::new()))
         );
         assert_eq!(

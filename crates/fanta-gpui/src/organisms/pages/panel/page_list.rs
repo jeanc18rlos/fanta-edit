@@ -43,7 +43,6 @@ impl PagesPanel {
             .overflow_scroll()
             .track_scroll(&self.pages_scroll_handle)
             .p_2()
-            .gap_1()
             .children(rows)
             .when(self.editing_is_new(), |content| {
                 content.child(self.render_page_editor(format!("{}-new-page", self.id)))
@@ -139,13 +138,10 @@ impl PagesPanel {
         )
         .debug_selector(move || row_selector)
         .track_focus(&row_focus_handle.tab_index(0).tab_stop(true))
+        .border_0()
         .px_2()
         .text_sm()
-        .focus(|style| {
-            style
-                .bg(cx.theme().sidebar_accent.opacity(0.65))
-                .border_color(cx.theme().selection)
-        })
+        .focus(|style| style.bg(cx.theme().sidebar_accent.opacity(0.8)))
         .when(is_hovered && !is_selected, |row| {
             row.bg(cx.theme().sidebar_accent.opacity(0.65))
         })

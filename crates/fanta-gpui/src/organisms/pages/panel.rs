@@ -33,8 +33,8 @@ use super::{
     TogglePagesPanel, ToggleSearchSettings,
 };
 use crate::atoms::{
-    ActivateControl, ActivateEvent, CONTROL_KEY_CONTEXT, ControlExt as _, ControlIcon,
-    render_control_icon, track_bounds, truncating_label,
+    ActivateControl, ActivateEvent, CONTROL_KEY_CONTEXT, ControlExt as _, LucideIcon,
+    render_lucide_icon, tokens, track_bounds, truncating_label,
 };
 use crate::molecules::{clamp_menu_origin, list_row, menu_item, menu_surface};
 use crate::toolbar::{ToolbarTool, render_tool_icon};
@@ -55,23 +55,23 @@ pub const PAGES_PANEL_MIN_WIDTH: f32 = 240.;
 /// useful slice of the page list or search results; both lists scroll.
 pub const PAGES_PANEL_MIN_HEIGHT: f32 = 400.;
 
-const HEADER_HEIGHT: f32 = 40.;
-const PAGE_ROW_HEIGHT: f32 = 32.;
-const PAGE_ROW_GAP: f32 = 4.;
-const PAGE_PADDING: f32 = 8.;
+const HEADER_HEIGHT: f32 = tokens::RowHeight::SECTION_HEADER;
+const PAGE_ROW_HEIGHT: f32 = tokens::RowHeight::PAGE;
+const PAGE_ROW_GAP: f32 = 0.;
+const PAGE_PADDING: f32 = tokens::Space::SM;
 const MAX_PAGE_LIST_HEIGHT: f32 = 320.;
 const DOUBLE_ENTER_INTERVAL: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
 const REVEAL_DURATION: f64 = 0.18;
-const ELEMENT_ICON_SIZE: f32 = 14.;
-const PAGE_MENU_WIDTH: f32 = 224.;
+const ELEMENT_ICON_SIZE: f32 = tokens::IconSize::SM;
+const PAGE_MENU_WIDTH: f32 = tokens::MenuWidth::STANDARD;
 /// Four 36px rows, two separators, and the surface padding/border.
 const PAGE_MENU_HEIGHT: f32 = 196.;
-const FILTER_MENU_WIDTH: f32 = 224.;
-const SCOPE_MENU_WIDTH: f32 = 168.;
+const FILTER_MENU_WIDTH: f32 = tokens::MenuWidth::STANDARD;
+const SCOPE_MENU_WIDTH: f32 = tokens::MenuWidth::NARROW;
 /// Two 36px rows plus the surface padding/border.
 const SCOPE_MENU_HEIGHT: f32 = 90.;
-const MENU_RADIUS: f32 = 12.;
+const MENU_RADIUS: f32 = tokens::Radius::MENU;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PageEditorTarget {

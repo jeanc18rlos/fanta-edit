@@ -11,7 +11,7 @@ use gpui_component::{
 
 use crate::{
     atoms::{
-        CONTROL_KEY_CONTEXT, ControlExt as _, ControlIcon, icon_button, render_control_icon,
+        CONTROL_KEY_CONTEXT, ControlExt as _, LucideIcon, icon_button, render_lucide_icon, tokens,
         truncating_label,
     },
     color::parse_hex_rgba,
@@ -126,7 +126,7 @@ impl PrototypePanel {
             .items_center()
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(11.))
+            .text_size(px(tokens::TypeScale::CAPTION))
             .text_color(if selected {
                 cx.theme().tab_active_foreground
             } else {
@@ -151,7 +151,7 @@ impl PrototypePanel {
         hint: PrototypeHint,
         title: &'static str,
         body: &'static str,
-        icon: ControlIcon,
+        icon: LucideIcon,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let dismiss_selector = match hint {
@@ -163,7 +163,12 @@ impl PrototypePanel {
             .child(
                 h_flex()
                     .w_full()
-                    .child(div().font_semibold().text_size(px(11.)).child(title))
+                    .child(
+                        div()
+                            .font_semibold()
+                            .text_size(px(tokens::TypeScale::CAPTION))
+                            .child(title),
+                    )
                     .child(div().flex_1())
                     .child(
                         icon_button(
@@ -197,7 +202,7 @@ impl PrototypePanel {
                     .min_w(px(0.))
                     .items_start()
                     .gap(px(16.))
-                    .child(div().w(px(16.)).flex_none().child(render_control_icon(
+                    .child(div().w(px(16.)).flex_none().child(render_lucide_icon(
                         icon,
                         cx.theme().foreground,
                         16.,
@@ -206,7 +211,7 @@ impl PrototypePanel {
                         div()
                             .flex_1()
                             .min_w(px(0.))
-                            .text_size(px(11.))
+                            .text_size(px(tokens::TypeScale::CAPTION))
                             .line_height(px(16.))
                             .child(body),
                     ),
@@ -275,7 +280,7 @@ impl Render for PrototypePanel {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(tokens::TypeScale::MICRO))
                                     .child(format!("{}%", self.view_data.zoom_percent)),
                             )
                             .child(Icon::new(IconName::ChevronDown).xsmall()),
@@ -290,7 +295,7 @@ impl Render for PrototypePanel {
                     .child(
                         div()
                             .font_semibold()
-                            .text_size(px(11.))
+                            .text_size(px(tokens::TypeScale::CAPTION))
                             .child("Prototype settings"),
                     )
                     .child(
@@ -307,7 +312,7 @@ impl Render for PrototypePanel {
                             .border_1()
                             .border_color(cx.theme().border)
                             .cursor_pointer()
-                            .text_size(px(11.))
+                            .text_size(px(tokens::TypeScale::CAPTION))
                             .hover(|style| style.bg(cx.theme().accent))
                             .focus(|style| style.border_color(cx.theme().selection))
                             .on_activate(cx.listener(|_, _, _, cx| {
@@ -350,7 +355,7 @@ impl Render for PrototypePanel {
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(tokens::TypeScale::CAPTION))
                                     .child(self.view_data.background_hex.clone()),
                             ),
                     ),
@@ -369,7 +374,7 @@ impl Render for PrototypePanel {
                             PrototypeHint::CreatingConnection,
                             "Creating a connection",
                             "Select a frame or object in a frame and use the circular node to drag a connection to another frame.",
-                            ControlIcon::JumpArrow,
+                            LucideIcon::CornerUpRight,
                             cx,
                         ))
                     })
@@ -378,7 +383,7 @@ impl Render for PrototypePanel {
                             PrototypeHint::RunningPrototype,
                             "Running your prototype",
                             "Use the play button in the toolbar to play your prototype. If there are no connections, the play button can be used to play a presentation of your frames.",
-                            ControlIcon::Play,
+                            LucideIcon::Play,
                             cx,
                         ))
                     }),

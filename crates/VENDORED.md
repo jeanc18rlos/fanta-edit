@@ -7,7 +7,7 @@ shipped binary is satisfied by this repository alone.
 | Crate(s) | Upstream | Commit |
 |---|---|---|
 | `fanta-canvas`, `fanta-doc`, `fanta-fig-interop`, `fanta-fnx`, `fanta-format`, `fanta-present`, `fanta-render`, `fanta-text`, `fanta-tools` | `squidred-dev/fantaisa-engine` | `9370fa2` |
-| `fanta-gpui` | `squidred-dev/fanta-ui` | `a5edcd6` |
+| `fanta-gpui` | `squidred-dev/fanta-ui` | `6c197a9` |
 
 Upstream crates not vendored because nothing here uses them: `fanta-engine`,
 `fanta-harness`, `fanta-psd-interop`, `fanta-illustrator-interop`,
@@ -88,6 +88,18 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   `FnxShapeSugarProps`, because the printer now emits it on a `<Rect>` /
   `<Ellipse>` whose viewport matches its extent (see the `fanta-fnx` sugar
   divergence above).
+
+- `fanta-gpui`: resynced to upstream `6c197a9`, which brings the atomic-design
+  tiers, the Design-inspector decomposition and `atoms::tokens`. Two host-only
+  changes that had only ever existed in this copy were pushed upstream first and
+  are now part of that commit rather than divergences: the toolbar's
+  `GenerateVideo`/`GenerateVector`/`GenerateMasks` commands with their palette
+  focus fixes, and `LayersPanelItem::has_children`, the hint that lets this host
+  keep pruning collapsed subtrees for large documents. The resync also adds
+  `lucide-static-svg` (MIT AND ISC), `roxmltree` and `svgtypes`: upstream now
+  renders the pinned Lucide catalog instead of the hand-drawn `vector_icon`
+  module this copy carried. `[package]` still omits `repository` and the
+  `[lints]` block still allows `redundant_clone`, per the rules above.
 
 All other source is byte-identical to upstream. Edits belong here now; the
 sibling checkouts are no longer part of the build.

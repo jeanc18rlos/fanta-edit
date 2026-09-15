@@ -1,29 +1,32 @@
 //! Atoms: the crate's smallest shared interaction and presentation units.
 //!
 //! The single Enter/Space activation command, the activatable-control builder
-//! extensions, the compact button atom, the code-native vector icon set, and
+//! extensions, the compact button atom, canonical Lucide icons, and
 //! the bounds/truncation utilities. Molecules (`crate::molecules`) and the
 //! feature organisms compose these instead of re-implementing key contexts,
 //! focus rings, and listener pairs per control (ARCHITECTURE.md §9, §16).
 //!
 //! This module is the curated public atoms API: hosts build custom chrome
 //! from these pieces so their controls share the library's activation,
-//! focus-ring, icon, and truncation contracts. Drawing internals (the
-//! stroke-path builder behind [`ControlIcon`]) stay crate-private.
+//! focus-ring, icon, and truncation contracts.
+//!
+//! [`tokens`] is the shared geometry scale behind that chrome, reached as a
+//! path (`atoms::tokens::RowHeight::FIELD`) rather than re-exported flat.
 
 use gpui::{App, KeyBinding, actions};
 
 mod activatable;
 mod bounds;
 mod button;
+mod lucide;
+pub mod tokens;
 mod truncate;
-pub(crate) mod vector_icon;
 
 pub use activatable::{ActivateEvent, ButtonControlExt, ControlExt};
 pub use bounds::track_bounds;
 pub use button::icon_button;
+pub use lucide::{LucideIcon, render_lucide_icon};
 pub use truncate::truncating_label;
-pub use vector_icon::{ControlIcon, render_control_icon};
 
 actions!(fanta_controls, [ActivateControl]);
 

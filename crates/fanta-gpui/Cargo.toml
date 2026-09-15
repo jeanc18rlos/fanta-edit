@@ -10,9 +10,12 @@ license.workspace = true
 [dependencies]
 gpui.workspace = true
 gpui-component.workspace = true
-# Stroke cap/join styles for the Lucide-idiom vector icons; the same lyon
-# gpui itself tessellates with, so no new code is compiled.
+# Official Lucide release and SVG path parser. Fanta renders this pinned
+# catalog directly instead of maintaining a second, hand-drawn icon set.
+lucide-static-svg = { version = "=1.45.0", default-features = false, features = ["svg"] }
 lyon = "1.0"
+roxmltree = "0.20"
+svgtypes = "0.16.1"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

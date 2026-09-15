@@ -1,5 +1,7 @@
 use gpui::SharedString;
 
+use crate::atoms::LucideIcon;
+
 use super::*;
 
 /// Paint collection containing one occurrence in a Selection colors aggregate.
@@ -435,7 +437,7 @@ impl DesignSelectionHeaderMenu {
 ///
 /// `Default` preserves the icon implied by the built-in control kind. The
 /// remaining variants let an integration reproduce contextual or plugin
-/// controls without pretending they are one of the built-in commands.
+/// controls while staying inside the canonical Lucide catalog.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub enum DesignSelectionHeaderControlIcon {
     #[default]
@@ -449,8 +451,8 @@ pub enum DesignSelectionHeaderControlIcon {
     File,
     Inspector,
     Layout,
-    /// A compact host-supplied glyph such as a plugin monogram.
-    Glyph(SharedString),
+    /// Any icon from the pinned Lucide catalog.
+    Lucide(LucideIcon),
 }
 
 /// One ordered primary or overflow control in the selected-node header.

@@ -1,8 +1,148 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn layout_grid_target_for_index(&self, index: usize) -> Option<LayoutGridTarget> {
-        self.node
+pub(super) fn projection(panel: &DesignPanel) -> sections::layout_guides::LayoutGuidesProjection {
+    let node_id = panel.host.inspected_node().id.clone();
+    let guides = panel
+        .host
+        .inspected_node()
+        .layout_grids
+        .iter()
+        .enumerate()
+        .map(|(index, guide)| {
+            sections::layout_guides::LayoutGuideTargetProjection::new(
+                node_id.clone(),
+                guide.id.clone(),
+                index,
+            )
+        })
+        .collect();
+    sections::layout_guides::LayoutGuidesProjection::new(
+        sections::layout_guides::LayoutGuidesIdentityProjection::new(panel.id.clone(), node_id),
+        sections::layout_guides::LayoutGuidesAccessProjection::new(
+            panel.can_edit(),
+            panel.collection_is_supported(DesignPanelCollection::LayoutGrid),
+            panel.host.inspected_node().supports_layout_guides(),
+            panel
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::LayoutGrid),
+        ),
+        sections::layout_guides::LayoutGuidesContentProjection::new(
+            panel
+                .host
+                .inspected_node()
+                .layout_grid_style_binding
+                .as_ref()
+                .map(|binding| binding.style_name.clone()),
+            guides,
+        ),
+    )
+}
+
+/// Internal Layout Guides controller surface used by the thin `DesignPanel` facade.
+pub(super) trait DesignLayoutGridController: Sized + 'static {
+    fn layout_grid_target_for_index(&self, index: usize) -> Option<LayoutGridTarget>;
+    fn layout_grid_target_index(&self, target: &LayoutGridTarget) -> Option<usize>;
+    fn reconcile_layout_grid_targets(&mut self);
+    fn layout_grid_edit_target(&self, property: DesignPanelProperty) -> Option<LayoutGridTarget>;
+    fn emit_layout_grid_property_edit(
+        &self,
+        property: DesignPanelProperty,
+        value: DesignPanelValue,
+        phase: DesignPanelEditPhase,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn layout_grid_variable_target(
+        &self,
+        index: usize,
+        property: DesignPanelProperty,
+    ) -> Option<(
+        DesignLayoutGridVariableTarget,
+        DesignLayoutGridVariableValue,
+    )>;
+    fn layout_grid_variable_target_index(
+        &self,
+        target: &DesignLayoutGridVariableTarget,
+    ) -> Option<usize>;
+    fn resolve_layout_grid_variable_target(
+        &self,
+        target: &DesignLayoutGridVariableTarget,
+    ) -> Option<(
+        DesignLayoutGridVariableTarget,
+        DesignLayoutGridVariableValue,
+    )>;
+    fn layout_grid_variable_binding(
+        &self,
+        target: &DesignLayoutGridVariableTarget,
+    ) -> Option<&super::super::DesignLayoutGridVariableBinding>;
+    fn layout_grid_variable_can_change(&self, target: &DesignLayoutGridVariableTarget) -> bool;
+    fn open_layout_grid_style_browser(&mut self, cx: &mut Context<Self>);
+    fn open_layout_grid_variable_browser(
+        &mut self,
+        target: DesignLayoutGridVariableTarget,
+        cx: &mut Context<Self>,
+    );
+    fn emit_layout_grid_style_apply(
+        &mut self,
+        style: DesignLayoutGridStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_layout_grid_style_import(
+        &mut self,
+        style: DesignLayoutGridStyleSelection,
+        cx: &mut Context<Self>,
+    );
+    fn emit_layout_grid_style_create(&mut self, cx: &mut Context<Self>);
+    fn emit_layout_grid_style_detach(&mut self, cx: &mut Context<Self>);
+    fn emit_layout_grid_variable_apply(
+        &mut self,
+        target: DesignLayoutGridVariableTarget,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_layout_grid_variable_import(
+        &mut self,
+        target: DesignLayoutGridVariableTarget,
+        variable_id: SharedString,
+        cx: &mut Context<Self>,
+    );
+    fn emit_layout_grid_variable_detach(
+        &mut self,
+        target: DesignLayoutGridVariableTarget,
+        cx: &mut Context<Self>,
+    );
+    fn emit_layout_grid_variable_create(
+        &mut self,
+        target: DesignLayoutGridVariableTarget,
+        cx: &mut Context<Self>,
+    );
+    fn render_layout_grid_style_button(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn layout_grid_variable_targets_match(
+        left: &DesignLayoutGridVariableTarget,
+        right: &DesignLayoutGridVariableTarget,
+    ) -> bool;
+    fn layout_grid_variable_label(&self, target: &DesignLayoutGridVariableTarget) -> &'static str;
+    fn render_layout_grid_variable_cell(
+        &self,
+        index: usize,
+        property: DesignPanelProperty,
+        cell: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_layout_grid_variable_button(
+        &self,
+        target: DesignLayoutGridVariableTarget,
+        value: DesignLayoutGridVariableValue,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_layout_grids_retained(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn render_layout_grids(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+}
+
+impl DesignLayoutGridController for DesignPanel {
+    fn layout_grid_target_for_index(&self, index: usize) -> Option<LayoutGridTarget> {
+        self.host
+            .inspected_node()
             .layout_grids
             .get(index)
             .map(|guide| LayoutGridTarget {
@@ -11,30 +151,42 @@ impl DesignPanel {
             })
     }
 
-    pub(super) fn layout_grid_target_index(&self, target: &LayoutGridTarget) -> Option<usize> {
+    fn layout_grid_target_index(&self, target: &LayoutGridTarget) -> Option<usize> {
         if target.guide_id.is_empty() {
-            self.node
+            self.host
+                .inspected_node()
                 .layout_grids
                 .get(target.index)
                 .map(|_| target.index)
         } else {
-            self.node
+            self.host
+                .inspected_node()
                 .layout_grids
                 .iter()
                 .position(|guide| guide.id == target.guide_id)
         }
     }
 
-    pub(super) fn reconcile_layout_grid_targets(&mut self) {
+    fn reconcile_layout_grid_targets(&mut self) {
         let next_variable_target = self
-            .layout_grid_count_variable_target
+            .overlays
+            .layout_grid_count_variable_target()
             .clone()
             .and_then(|target| self.resolve_layout_grid_variable_target(&target))
             .map(|(target, _)| target);
-        self.layout_grid_count_variable_target = next_variable_target;
+        match next_variable_target {
+            Some(target) => self
+                .overlays
+                .replace(DesignOverlayState::LayoutGridCountVariable(target)),
+            None => {
+                self.overlays
+                    .discard(DesignOpenOverlay::LayoutGridCountVariable);
+            }
+        }
 
         let next_editor_target = self
-            .property_editor
+            .edit
+            .property
             .as_ref()
             .and_then(|editor| editor.layout_grid_target.clone())
             .and_then(|mut target| {
@@ -42,38 +194,51 @@ impl DesignPanel {
                 Some(target)
             });
         if self
-            .property_editor
+            .edit
+            .property
             .as_ref()
             .is_some_and(|editor| editor.layout_grid_target.is_some())
         {
             if let Some(target) = next_editor_target {
                 let target_index = target.index;
-                if let Some(editor) = self.property_editor.as_mut() {
+                let property_rebase = self.edit.property.as_ref().map(|editor| {
+                    (
+                        editor.property,
+                        editor.property.with_layout_grid_index(target_index),
+                    )
+                });
+                if let Some(editor) = self.edit.property.as_mut() {
                     editor.property = editor.property.with_layout_grid_index(target_index);
                     editor.layout_grid_target = Some(target);
                 }
+                if let Some((previous, next)) = property_rebase {
+                    self.edit.rebase_property_edit(previous, next);
+                }
                 if let Some(scrub) = self
-                    .numeric_property_scrub
+                    .edit
+                    .numeric_scrub
                     .as_mut()
                     .filter(|scrub| scrub.active)
                 {
                     scrub.property = scrub.property.with_layout_grid_index(target_index);
                 }
             } else {
-                self.property_editor = None;
-                self.numeric_property_scrub = None;
-                self.property_editor_invalid = false;
-                self.suppress_property_input_change = false;
+                debug_assert!(
+                    !self.edit.has_property_edit(),
+                    "a stale guide edit must be cancelled during host-echo reconciliation"
+                );
+                self.edit.property = None;
+                self.edit.numeric_scrub = None;
+                self.edit.property_invalid = false;
+                self.edit.suppress_property_input_change = false;
             }
         }
     }
 
-    pub(super) fn layout_grid_edit_target(
-        &self,
-        property: DesignPanelProperty,
-    ) -> Option<LayoutGridTarget> {
+    fn layout_grid_edit_target(&self, property: DesignPanelProperty) -> Option<LayoutGridTarget> {
         let property_index = property.layout_grid_index()?;
-        self.property_editor
+        self.edit
+            .property
             .as_ref()
             .filter(|editor| {
                 editor.property.with_layout_grid_index(0) == property.with_layout_grid_index(0)
@@ -82,7 +247,7 @@ impl DesignPanel {
             .or_else(|| self.layout_grid_target_for_index(property_index))
     }
 
-    pub(super) fn emit_layout_grid_property_edit(
+    fn emit_layout_grid_property_edit(
         &self,
         property: DesignPanelProperty,
         value: DesignPanelValue,
@@ -104,8 +269,8 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridPropertyEditRequested {
-                node_id: self.node.id.clone(),
-                guide_id: self.node.layout_grids[index].id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
+                guide_id: self.host.inspected_node().layout_grids[index].id.clone(),
                 index,
                 property: property.with_layout_grid_index(index),
                 value,
@@ -115,7 +280,7 @@ impl DesignPanel {
         true
     }
 
-    pub(super) fn layout_grid_variable_target(
+    fn layout_grid_variable_target(
         &self,
         index: usize,
         property: DesignPanelProperty,
@@ -123,13 +288,14 @@ impl DesignPanel {
         DesignLayoutGridVariableTarget,
         DesignLayoutGridVariableValue,
     )> {
-        self.node
+        self.host
+            .inspected_node()
             .layout_grids
             .get(index)?
             .variable_target(index, property)
     }
 
-    pub(super) fn layout_grid_variable_target_index(
+    fn layout_grid_variable_target_index(
         &self,
         target: &DesignLayoutGridVariableTarget,
     ) -> Option<usize> {
@@ -139,7 +305,7 @@ impl DesignPanel {
         })
     }
 
-    pub(super) fn resolve_layout_grid_variable_target(
+    fn resolve_layout_grid_variable_target(
         &self,
         target: &DesignLayoutGridVariableTarget,
     ) -> Option<(
@@ -155,24 +321,26 @@ impl DesignPanel {
         .then_some((resolved, value))
     }
 
-    pub(super) fn layout_grid_variable_binding(
+    fn layout_grid_variable_binding(
         &self,
         target: &DesignLayoutGridVariableTarget,
     ) -> Option<&super::super::DesignLayoutGridVariableBinding> {
         let index = self.layout_grid_variable_target_index(target)?;
-        self.node
+        self.host
+            .inspected_node()
             .layout_grids
             .get(index)?
             .variable_binding(target.field)
     }
 
-    pub(super) fn layout_grid_variable_can_change(
-        &self,
-        target: &DesignLayoutGridVariableTarget,
-    ) -> bool {
+    fn layout_grid_variable_can_change(&self, target: &DesignLayoutGridVariableTarget) -> bool {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::LayoutGrid)
-            || self.node.layout_grid_style_binding.is_some()
+            || self
+                .host
+                .inspected_node()
+                .layout_grid_style_binding
+                .is_some()
             || self.resolve_layout_grid_variable_target(target).is_none()
         {
             return false;
@@ -183,7 +351,8 @@ impl DesignPanel {
         {
             return false;
         }
-        self.property_value_states
+        self.host
+            .property_states
             .get(&target.property)
             .is_none_or(|state| {
                 !state.is_read_only()
@@ -193,33 +362,29 @@ impl DesignPanel {
             })
     }
 
-    pub(super) fn open_layout_grid_style_browser(&mut self, cx: &mut Context<Self>) {
+    fn open_layout_grid_style_browser(&mut self, cx: &mut Context<Self>) {
         if !self.collection_is_supported(DesignPanelCollection::LayoutGrid)
-            || self.node.layout_grids.is_empty()
+            || self.host.inspected_node().layout_grids.is_empty()
         {
             return;
         }
-        self.style_browser_source_filter =
-            self.style_browser_source_filter.normalized_for_libraries(
-                self.layout_grid_style_view_data
+        self.features.style_browser.source_filter = self
+            .features
+            .style_browser
+            .source_filter
+            .normalized_for_libraries(
+                self.resources
+                    .layout_grid_styles
                     .libraries
                     .iter()
                     .map(|library| (&library.id, &library.name)),
             );
-        self.layout_grid_style_browser_open = true;
-        self.paint_style_browser_open = None;
-        self.layout_grid_count_variable_target = None;
-        self.active_effect_settings = None;
-        self.effect_style_browser_open = false;
+        self.overlays.open(DesignOverlayState::LayoutGridStyle);
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.typography_style_picker_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
         cx.notify();
     }
 
-    pub(super) fn open_layout_grid_variable_browser(
+    fn open_layout_grid_variable_browser(
         &mut self,
         target: DesignLayoutGridVariableTarget,
         cx: &mut Context<Self>,
@@ -230,19 +395,13 @@ impl DesignPanel {
         let Some((target, _)) = self.resolve_layout_grid_variable_target(&target) else {
             return;
         };
-        self.layout_grid_count_variable_target = Some(target);
-        self.layout_grid_style_browser_open = false;
-        self.active_effect_settings = None;
-        self.effect_style_browser_open = false;
+        self.overlays
+            .open(DesignOverlayState::LayoutGridCountVariable(target));
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.typography_style_picker_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
         cx.notify();
     }
 
-    pub(super) fn emit_layout_grid_style_apply(
+    fn emit_layout_grid_style_apply(
         &mut self,
         style: DesignLayoutGridStyleSelection,
         cx: &mut Context<Self>,
@@ -250,7 +409,8 @@ impl DesignPanel {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::LayoutGrid)
             || !self
-                .layout_grid_style_view_data
+                .resources
+                .layout_grid_styles
                 .style(&style)
                 .is_some_and(|style| {
                     style.import_state == DesignLayoutGridStyleImportState::Imported
@@ -258,18 +418,18 @@ impl DesignPanel {
         {
             return;
         }
-        self.layout_grid_style_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::LayoutGridStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridStyleApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 style,
             },
         );
         cx.notify();
     }
 
-    pub(super) fn emit_layout_grid_style_import(
+    fn emit_layout_grid_style_import(
         &mut self,
         style: DesignLayoutGridStyleSelection,
         cx: &mut Context<Self>,
@@ -278,7 +438,8 @@ impl DesignPanel {
             || !self.collection_is_supported(DesignPanelCollection::LayoutGrid)
             || !matches!(&style.source, DesignLayoutGridStyleSource::Library { .. })
             || !self
-                .layout_grid_style_view_data
+                .resources
+                .layout_grid_styles
                 .style(&style)
                 .is_some_and(|style| {
                     style.import_state == DesignLayoutGridStyleImportState::Available
@@ -289,55 +450,60 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridStyleImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 style,
             },
         );
     }
 
-    pub(super) fn emit_layout_grid_style_create(&mut self, cx: &mut Context<Self>) {
+    fn emit_layout_grid_style_create(&mut self, cx: &mut Context<Self>) {
         if !self.can_edit()
             || !self.collection_is_supported(DesignPanelCollection::LayoutGrid)
-            || self.node.layout_grids.is_empty()
-            || self.node.layout_grid_style_binding.is_some()
+            || self.host.inspected_node().layout_grids.is_empty()
+            || self
+                .host
+                .inspected_node()
+                .layout_grid_style_binding
+                .is_some()
         {
             return;
         }
-        self.layout_grid_style_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::LayoutGridStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridStyleCreateRequested {
-                node_id: self.node.id.clone(),
-                layout_grids: self.node.layout_grids.clone(),
+                node_id: self.host.inspected_node().id.clone(),
+                layout_grids: self.host.inspected_node().layout_grids.clone(),
             },
         );
         cx.notify();
     }
 
-    pub(super) fn emit_layout_grid_style_detach(&mut self, cx: &mut Context<Self>) {
+    fn emit_layout_grid_style_detach(&mut self, cx: &mut Context<Self>) {
         if !self.can_edit() || !self.collection_is_supported(DesignPanelCollection::LayoutGrid) {
             return;
         }
         let Some(style) = self
-            .node
+            .host
+            .inspected_node()
             .layout_grid_style_binding
             .as_ref()
             .filter(|style| style.can_detach)
         else {
             return;
         };
-        self.layout_grid_style_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::LayoutGridStyle);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridStyleDetachRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 style: style.selection(),
             },
         );
         cx.notify();
     }
 
-    pub(super) fn emit_layout_grid_variable_apply(
+    fn emit_layout_grid_variable_apply(
         &mut self,
         target: DesignLayoutGridVariableTarget,
         variable_id: SharedString,
@@ -347,7 +513,8 @@ impl DesignPanel {
             return;
         };
         let Some(variable) = self
-            .layout_grid_variable_view_data
+            .resources
+            .layout_grid_variables
             .variable(variable_id.as_ref())
         else {
             return;
@@ -358,11 +525,12 @@ impl DesignPanel {
         {
             return;
         }
-        self.layout_grid_count_variable_target = None;
+        self.overlays
+            .discard(DesignOpenOverlay::LayoutGridCountVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridVariableApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
@@ -370,7 +538,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_layout_grid_variable_import(
+    fn emit_layout_grid_variable_import(
         &mut self,
         target: DesignLayoutGridVariableTarget,
         variable_id: SharedString,
@@ -380,7 +548,8 @@ impl DesignPanel {
             return;
         };
         let Some(variable) = self
-            .layout_grid_variable_view_data
+            .resources
+            .layout_grid_variables
             .variable(variable_id.as_ref())
         else {
             return;
@@ -394,14 +563,14 @@ impl DesignPanel {
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridVariableImportRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
         );
     }
 
-    pub(super) fn emit_layout_grid_variable_detach(
+    fn emit_layout_grid_variable_detach(
         &mut self,
         target: DesignLayoutGridVariableTarget,
         cx: &mut Context<Self>,
@@ -419,11 +588,12 @@ impl DesignPanel {
             return;
         }
         let variable_id = binding.variable_id.clone();
-        self.layout_grid_count_variable_target = None;
+        self.overlays
+            .discard(DesignOpenOverlay::LayoutGridCountVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridVariableDetachRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 variable_id,
             },
@@ -431,7 +601,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn emit_layout_grid_variable_create(
+    fn emit_layout_grid_variable_create(
         &mut self,
         target: DesignLayoutGridVariableTarget,
         cx: &mut Context<Self>,
@@ -442,17 +612,19 @@ impl DesignPanel {
         if !self.layout_grid_variable_can_change(&target)
             || self.layout_grid_variable_binding(&target).is_some()
             || !self
-                .layout_grid_variable_view_data
+                .resources
+                .layout_grid_variables
                 .create_state
                 .is_enabled()
         {
             return;
         }
-        self.layout_grid_count_variable_target = None;
+        self.overlays
+            .discard(DesignOpenOverlay::LayoutGridCountVariable);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::LayoutGridVariableCreateRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 target,
                 value,
             },
@@ -460,26 +632,29 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn render_layout_grid_style_button(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_layout_grid_style_button(&self, cx: &mut Context<Self>) -> AnyElement {
         let panel = cx.entity();
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
         let panel_id = self.id.clone();
-        let active = self.layout_grid_style_browser_open;
-        let binding = self.node.layout_grid_style_binding.clone();
+        let active = self.overlays.layout_grid_style_browser_open();
+        let binding = self.host.inspected_node().layout_grid_style_binding.clone();
         let can_edit = self.can_edit();
-        let can_create = can_edit && !self.node.layout_grids.is_empty() && binding.is_none();
+        let can_create =
+            can_edit && !self.host.inspected_node().layout_grids.is_empty() && binding.is_none();
         let query = self.normalized_style_browser_query(cx);
-        let source_filter = self.style_browser_source_filter.clone();
-        let view_mode = self.style_browser_view_mode;
-        let catalog_is_empty = self.layout_grid_style_view_data.page_styles.is_empty()
+        let source_filter = self.features.style_browser.source_filter.clone();
+        let view_mode = self.features.style_browser.view_mode;
+        let catalog_is_empty = self.resources.layout_grid_styles.page_styles.is_empty()
             && self
-                .layout_grid_style_view_data
+                .resources
+                .layout_grid_styles
                 .libraries
                 .iter()
                 .all(|library| library.styles.is_empty());
         let page_styles = if source_filter.includes_page() {
-            self.layout_grid_style_view_data
+            self.resources
+                .layout_grid_styles
                 .page_styles
                 .iter()
                 .map(|style| {
@@ -503,7 +678,8 @@ impl DesignPanel {
             Vec::new()
         };
         let libraries = self
-            .layout_grid_style_view_data
+            .resources
+            .layout_grid_styles
             .libraries
             .iter()
             .filter(|library| source_filter.includes_library(library.id.as_ref()))
@@ -542,9 +718,10 @@ impl DesignPanel {
             })
             .filter(|(_, styles)| !styles.is_empty())
             .collect::<Vec<_>>();
-        let style_browser_search = self.style_browser_search.clone();
+        let style_browser_search = self.retained.inputs.style_browser_search.clone();
         let style_browser_library_sources = self
-            .layout_grid_style_view_data
+            .resources
+            .layout_grid_styles
             .libraries
             .iter()
             .map(|library| (library.id.clone(), library.name.clone()))
@@ -579,13 +756,21 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(active)
         .overlay_closable(true)
-        .on_open_change(move |open, _, cx| {
+        .on_open_change(move |open, window, cx| {
             panel_for_open.update(cx, |this, cx| {
                 if *open {
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::LayoutGridStyle,
+                        window,
+                        cx,
+                    );
                     this.open_layout_grid_style_browser(cx);
-                } else if this.layout_grid_style_browser_open {
-                    this.layout_grid_style_browser_open = false;
-                    cx.notify();
+                } else if this.overlays.layout_grid_style_browser_open() {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::LayoutGridStyle,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -780,7 +965,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn layout_grid_variable_targets_match(
+    fn layout_grid_variable_targets_match(
         left: &DesignLayoutGridVariableTarget,
         right: &DesignLayoutGridVariableTarget,
     ) -> bool {
@@ -794,10 +979,7 @@ impl DesignPanel {
             && left.property.with_layout_grid_index(0) == right.property.with_layout_grid_index(0)
     }
 
-    pub(super) fn layout_grid_variable_label(
-        &self,
-        target: &DesignLayoutGridVariableTarget,
-    ) -> &'static str {
+    fn layout_grid_variable_label(&self, target: &DesignLayoutGridVariableTarget) -> &'static str {
         match target.property.with_layout_grid_index(0) {
             DesignPanelProperty::LayoutGridCount(_) => "Count",
             DesignPanelProperty::LayoutGridOffset(_) => "Offset",
@@ -805,7 +987,8 @@ impl DesignPanel {
             DesignPanelProperty::LayoutGridGutter(_) => "Gutter",
             DesignPanelProperty::LayoutGridSize(_) => {
                 match self
-                    .node
+                    .host
+                    .inspected_node()
                     .layout_grids
                     .get(target.index)
                     .map(|guide| guide.kind())
@@ -819,7 +1002,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_layout_grid_variable_cell(
+    fn render_layout_grid_variable_cell(
         &self,
         index: usize,
         property: DesignPanelProperty,
@@ -838,7 +1021,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_layout_grid_variable_button(
+    fn render_layout_grid_variable_button(
         &self,
         target: DesignLayoutGridVariableTarget,
         value: DesignLayoutGridVariableValue,
@@ -846,12 +1029,13 @@ impl DesignPanel {
     ) -> AnyElement {
         let binding = self.layout_grid_variable_binding(&target).cloned();
         let active = self
-            .layout_grid_count_variable_target
+            .overlays
+            .layout_grid_count_variable_target()
             .as_ref()
             .is_some_and(|current| Self::layout_grid_variable_targets_match(current, &target));
         let can_change = self.layout_grid_variable_can_change(&target);
-        let variables = self.layout_grid_variable_view_data.variables.clone();
-        let create_state = self.layout_grid_variable_view_data.create_state.clone();
+        let variables = self.resources.layout_grid_variables.variables.clone();
+        let create_state = self.resources.layout_grid_variables.create_state.clone();
         let panel = cx.entity();
         let panel_for_open = panel.clone();
         let panel_for_content = panel;
@@ -865,7 +1049,12 @@ impl DesignPanel {
         let title = SharedString::from(format!("{label} variables"));
         let change_reason = if !self.can_edit() {
             Some(SharedString::from("View only"))
-        } else if self.node.layout_grid_style_binding.is_some() {
+        } else if self
+            .host
+            .inspected_node()
+            .layout_grid_style_binding
+            .is_some()
+        {
             Some(SharedString::from(
                 "Detach the Grid style before binding a variable",
             ))
@@ -875,7 +1064,8 @@ impl DesignPanel {
         {
             Some(reason)
         } else {
-            self.property_value_states
+            self.host
+                .property_states
                 .get(&target.property)
                 .and_then(|state| match state {
                     DesignPanelPropertyValueState::ReadOnly(value) => value
@@ -914,7 +1104,11 @@ impl DesignPanel {
         .w(px(24.))
         .h(px(24.))
         .selected(active || binding.is_some())
-        .child(div().text_xs().child("◇"))
+        .child(render_lucide_icon(
+            LucideIcon::Variable,
+            cx.theme().foreground,
+            14.,
+        ))
         .on_activate(cx.listener(move |this, _, _, cx| {
             cx.stop_propagation();
             this.open_layout_grid_variable_browser(target_for_open.clone(), cx);
@@ -926,20 +1120,29 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(active)
         .overlay_closable(true)
-        .on_open_change(move |open, _, cx| {
+        .on_open_change(move |open, window, cx| {
             let target = target.clone();
             panel_for_open.update(cx, |this, cx| {
                 if *open {
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::LayoutGridCountVariable,
+                        window,
+                        cx,
+                    );
                     this.open_layout_grid_variable_browser(target, cx);
                 } else if this
-                    .layout_grid_count_variable_target
+                    .overlays
+                    .layout_grid_count_variable_target()
                     .as_ref()
                     .is_some_and(|current| {
                         Self::layout_grid_variable_targets_match(current, &target)
                     })
                 {
-                    this.layout_grid_count_variable_target = None;
-                    cx.notify();
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::LayoutGridCountVariable,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -1117,11 +1320,19 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_layout_grids(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        (self.node.supports_layout_guides()
-            && self.node.supports_section(DesignPanelSection::LayoutGrid))
+    fn render_layout_grids_retained(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        (self.host.inspected_node().supports_layout_guides()
+            && self
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::LayoutGrid))
         .then(|| {
-            if let Some(binding) = self.node.layout_grid_style_binding.as_ref() {
+            if let Some(binding) = self
+                .host
+                .inspected_node()
+                .layout_grid_style_binding
+                .as_ref()
+            {
                 let content =
                     v_flex()
                         .px(px(PANEL_PADDING))
@@ -1139,7 +1350,7 @@ impl DesignPanel {
                 );
             }
             let mut content = v_flex().px(px(PANEL_PADDING)).pb_4().gap_2();
-            for (index, grid) in self.node.layout_grids.iter().enumerate() {
+            for (index, grid) in self.host.inspected_node().layout_grids.iter().enumerate() {
                 let next_kind = match grid.kind() {
                     DesignGridKind::Uniform => DesignGridKind::Columns,
                     DesignGridKind::Columns => DesignGridKind::Rows,
@@ -1174,7 +1385,7 @@ impl DesignPanel {
                             )
                             .child(self.render_value_cell(
                                 format!("layout-guide-kind-{index}"),
-                                "▦",
+                                "Grid",
                                 grid.kind().label(),
                                 DesignPanelProperty::LayoutGridKind(index),
                                 DesignPanelValue::GridKind(next_kind),
@@ -1424,7 +1635,7 @@ impl DesignPanel {
                                 format!("#{}", grid.color.hex()),
                                 grid.color,
                                 AuxiliaryColorPickerTarget::LayoutGrid {
-                                    node_id: self.node.id.clone(),
+                                    node_id: self.host.inspected_node().id.clone(),
                                     guide_id: grid.id.clone(),
                                     index,
                                 },
@@ -1442,7 +1653,7 @@ impl DesignPanel {
                 );
                 content = content.child(editor);
             }
-            if self.node.layout_grids.is_empty() {
+            if self.host.inspected_node().layout_grids.is_empty() {
                 content = content.child(empty_collection("No layout guides", cx));
             }
             self.render_section(
@@ -1452,5 +1663,9 @@ impl DesignPanel {
                 cx,
             )
         })
+    }
+
+    fn render_layout_grids(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        sections::layout_guides::render(&projection(self), self, cx)
     }
 }

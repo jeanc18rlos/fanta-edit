@@ -1,9 +1,10 @@
 use super::super::{
     DESIGN_SCRUB_DOUBLE_SPEED_Y_THRESHOLD, DESIGN_SCRUB_HALF_SPEED_Y_THRESHOLD,
-    DESIGN_SCRUB_QUARTER_SPEED_Y_THRESHOLD, DesignArcData, DesignComponentResetState,
-    DesignLayoutGrid, DesignPanelNodeCapabilities, DesignPanelPropertyBinding,
-    DesignRepeatModifier, DesignSectionDevStatus, DesignShaderDefinition, DesignShaderEffect,
-    DesignShaderProperty, DesignShaderPropertyDefinition, DesignStroke,
+    DESIGN_SCRUB_QUARTER_SPEED_Y_THRESHOLD, DesignArcData, DesignColorStyle,
+    DesignComponentResetState, DesignLayoutGrid, DesignPanelNodeCapabilities,
+    DesignPanelPropertyBinding, DesignRepeatModifier, DesignSectionDevStatus,
+    DesignShaderDefinition, DesignShaderEffect, DesignShaderProperty,
+    DesignShaderPropertyDefinition, DesignStroke,
 };
 use super::*;
 use std::{cell::RefCell, rc::Rc};
@@ -100,14 +101,17 @@ fn style_browser_controls_are_transient_and_leave_host_catalogs_untouched(cx: &m
         panel.set_style_browser_source_filter(StyleBrowserSourceFilter::Libraries, cx);
         panel.set_style_browser_view_mode(StyleBrowserViewMode::Grid, cx);
         assert_eq!(
-            panel.style_browser_source_filter,
+            panel.features.style_browser.source_filter,
             StyleBrowserSourceFilter::Libraries
         );
-        assert_eq!(panel.style_browser_view_mode, StyleBrowserViewMode::Grid);
+        assert_eq!(
+            panel.features.style_browser.view_mode,
+            StyleBrowserViewMode::Grid
+        );
         assert_eq!(panel.paint_style_view_data(), &catalog);
     });
 
-    let search = visual_cx.read(|app| panel.read(app).style_browser_search.clone());
+    let search = visual_cx.read(|app| panel.read(app).retained.inputs.style_browser_search.clone());
     visual_cx.update(|window, app| {
         search.update(app, |search, cx| {
             search.set_value("  MARKETING  ", window, cx);
@@ -157,12 +161,12 @@ fn active_specific_library_filter_tracks_host_rename_and_removal(cx: &mut TestAp
     panel.update(visual_cx, |panel, cx| {
         panel.set_paint_style_view_data(catalog("Marketing system"), cx);
         assert_eq!(
-            panel.style_browser_source_filter,
+            panel.features.style_browser.source_filter,
             StyleBrowserSourceFilter::library("marketing", "Marketing system")
         );
         panel.set_paint_style_view_data(DesignPaintStyleViewData::default(), cx);
         assert_eq!(
-            panel.style_browser_source_filter,
+            panel.features.style_browser.source_filter,
             StyleBrowserSourceFilter::All
         );
     });
@@ -337,7 +341,8 @@ fn alignment_grid_keyboard_emits_atomic_host_intents_and_gates_each_leaf(cx: &mu
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .layout
                 .as_ref()
                 .expect("controlled layout")
@@ -493,7 +498,7 @@ fn grid_controls_validate_counts_tracks_and_host_track_intents(cx: &mut TestAppC
             cx,
         );
 
-        let mut fixed_axis = panel.node.clone();
+        let mut fixed_axis = panel.host.inspected_node().clone();
         fixed_axis
             .layout
             .as_mut()
@@ -512,7 +517,7 @@ fn grid_controls_validate_counts_tracks_and_host_track_intents(cx: &mut TestAppC
                 ))
         );
 
-        let mut auto_rows = panel.node.clone();
+        let mut auto_rows = panel.host.inspected_node().clone();
         auto_rows
             .layout
             .as_mut()
@@ -585,7 +590,8 @@ fn grid_dimensions_picker_is_atomic_keyboard_accessible_and_stale_safe(cx: &mut 
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .layout
                 .as_ref()
                 .and_then(DesignLayout::grid_dimensions)
@@ -731,7 +737,7 @@ fn grid_dimensions_picker_is_atomic_keyboard_accessible_and_stale_safe(cx: &mut 
             cx,
         );
         panel.open_grid_dimensions_picker(cx);
-        assert!(panel.grid_dimensions_picker.is_none());
+        assert!(panel.overlays.grid_dimensions_picker().is_none());
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
                 automatic_rows,
@@ -741,10 +747,165 @@ fn grid_dimensions_picker_is_atomic_keyboard_accessible_and_stale_safe(cx: &mut 
             cx,
         );
         panel.open_grid_dimensions_picker(cx);
-        assert!(panel.grid_dimensions_picker.is_none());
+        assert!(panel.overlays.grid_dimensions_picker().is_none());
     });
     visual_cx.run_until_parked();
     assert!(captured.borrow().is_empty());
+}
+
+#[gpui::test]
+fn grid_dimensions_host_echo_preserves_latest_preview_and_cancels_stale_value_once(
+    cx: &mut TestAppContext,
+) {
+    let mut node = DesignPanelNode::new("grid", "Grid", DesignPanelNodeKind::Frame)
+        .with_layout_mode(DesignLayoutMode::Grid);
+    let layout = node.layout.as_mut().expect("Grid layout");
+    layout.grid_columns = vec![DesignGridTrack::hug(), DesignGridTrack::hug()];
+    layout.grid_rows = vec![DesignGridTrack::hug(), DesignGridTrack::hug()];
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.emit_property_edit(
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelValue::Integer(2),
+            DesignPanelEditPhase::Begin,
+            cx,
+        );
+        panel.emit_property_edit(
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelValue::Integer(4),
+            DesignPanelEditPhase::Preview,
+            cx,
+        );
+
+        let mut accepted = node.clone();
+        accepted.layout.as_mut().expect("Grid layout").grid_columns =
+            vec![DesignGridTrack::hug(); 4];
+        panel.set_node(accepted.clone(), cx);
+
+        let mut stale = accepted;
+        stale.layout.as_mut().expect("Grid layout").grid_columns = vec![DesignGridTrack::hug(); 3];
+        panel.set_node(stale.clone(), cx);
+        panel.set_node(stale, cx);
+    });
+    visual_cx.run_until_parked();
+
+    assert_eq!(
+        captured.borrow().as_slice(),
+        [
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 2,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Begin,
+            },
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 4,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Preview,
+            },
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 2,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Cancel,
+            },
+        ],
+        "an accepted echo stays active, while an unrelated echo restores the Begin snapshot once"
+    );
+}
+
+#[gpui::test]
+fn grid_dimensions_access_and_context_changes_each_emit_one_terminal_cancel(
+    cx: &mut TestAppContext,
+) {
+    let mut node = DesignPanelNode::new("grid", "Grid", DesignPanelNodeKind::Frame)
+        .with_layout_mode(DesignLayoutMode::Grid);
+    let layout = node.layout.as_mut().expect("Grid layout");
+    layout.grid_columns = vec![DesignGridTrack::hug(), DesignGridTrack::hug()];
+    layout.grid_rows = vec![DesignGridTrack::hug(), DesignGridTrack::hug()];
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.emit_property_edit(
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelValue::Integer(2),
+            DesignPanelEditPhase::Begin,
+            cx,
+        );
+        panel.set_property_value_state(
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Integer(2)).read_only(),
+            cx,
+        );
+        panel.set_property_value_state(
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Integer(2)),
+            cx,
+        );
+        panel.emit_property_edit(
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelValue::Integer(2),
+            DesignPanelEditPhase::Begin,
+            cx,
+        );
+
+        let mut replacement = node;
+        replacement.id = "replacement-grid".into();
+        panel.set_node(replacement.clone(), cx);
+        panel.set_node(replacement, cx);
+    });
+    visual_cx.run_until_parked();
+
+    assert_eq!(
+        captured.borrow().as_slice(),
+        [
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 2,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Begin,
+            },
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 2,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Cancel,
+            },
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 2,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Begin,
+            },
+            DesignPanelAction::GridDimensionsEditRequested {
+                node_id: "grid".into(),
+                dimensions: DesignGridDimensions {
+                    columns: 2,
+                    rows: 2,
+                },
+                phase: DesignPanelEditPhase::Cancel,
+            },
+        ],
+        "access loss and target replacement each balance Begin exactly once"
+    );
 }
 
 #[test]
@@ -821,12 +982,16 @@ fn grouped_frame_presets_emit_exact_available_identity_and_stay_controlled(
         panel.toggle_frame_preset_group(&phone_group_id, cx);
         assert!(
             panel
+                .features
+                .layout
                 .collapsed_frame_preset_groups
                 .contains(&phone_group_id)
         );
         panel.set_frame_preset_view_data(catalog.clone(), cx);
         assert!(
             panel
+                .features
+                .layout
                 .collapsed_frame_preset_groups
                 .contains(&phone_group_id),
             "same-target echoes preserve disclosure state by stable group id"
@@ -834,6 +999,8 @@ fn grouped_frame_presets_emit_exact_available_identity_and_stay_controlled(
         panel.toggle_frame_preset_group(&phone_group_id, cx);
         assert!(
             !panel
+                .features
+                .layout
                 .collapsed_frame_preset_groups
                 .contains(&phone_group_id)
         );
@@ -844,7 +1011,13 @@ fn grouped_frame_presets_emit_exact_available_identity_and_stay_controlled(
 
         panel.emit_frame_preset_apply(pro.clone(), cx);
         panel.emit_frame_preset_apply(legacy.clone(), cx);
-        assert_eq!((panel.node.width, panel.node.height), (320., 180.));
+        assert_eq!(
+            (
+                panel.host.inspected_node().width,
+                panel.host.inspected_node().height
+            ),
+            (320., 180.)
+        );
 
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
@@ -892,13 +1065,13 @@ fn frame_preset_catalog_is_target_bound_and_hidden_for_non_frames(cx: &mut TestA
         panel.set_frame_preset_view_data(DesignFramePresetViewData::new("frame", [group]), cx);
         assert!(panel.frame_preset_view_data_for_context().is_some());
 
-        panel.frame_preset_browser_open = true;
+        panel.overlays.set_frame_preset_open(true);
         panel.set_node(
             DesignPanelNode::new("frame", "Converted group", DesignPanelNodeKind::Group),
             cx,
         );
         assert!(panel.frame_preset_view_data_for_context().is_none());
-        assert!(!panel.frame_preset_browser_open);
+        assert!(!panel.overlays.frame_preset_is_open());
     });
 }
 
@@ -925,7 +1098,7 @@ fn color_contrast_catalog_is_bound_to_exact_paint_and_selection_targets(cx: &mut
     );
 
     panel.update(visual_cx, |panel, cx| {
-        panel.active_picker = Some(PaintPickerTarget {
+        *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
             collection: DesignPanelCollection::Fill,
             index: 0,
             paint_id: "fill".into(),
@@ -950,10 +1123,11 @@ fn color_contrast_catalog_is_bound_to_exact_paint_and_selection_targets(cx: &mut
         let stale_target = DesignPanelTarget::Nodes {
             node_ids: vec!["second".into(), "shape".into()],
         };
-        panel.auxiliary_color_picker = Some(AuxiliaryColorPickerTarget::SelectionColor {
-            target: stale_target.clone(),
-            selection_color_id: "aggregate".into(),
-        });
+        *panel.overlays.auxiliary_color_picker_test_slot() =
+            Some(AuxiliaryColorPickerTarget::SelectionColor {
+                target: stale_target.clone(),
+                selection_color_id: "aggregate".into(),
+            });
         panel.set_color_contrast_view_data(
             DesignColorContrastViewData::new([DesignColorContrastPaintViewData::new(
                 DesignColorContrastPaintTarget::selection_color(stale_target, "aggregate"),
@@ -963,10 +1137,11 @@ fn color_contrast_catalog_is_bound_to_exact_paint_and_selection_targets(cx: &mut
         );
         assert!(panel.active_color_contrast_view_data().is_none());
 
-        panel.auxiliary_color_picker = Some(AuxiliaryColorPickerTarget::SelectionColor {
-            target: current_target.clone(),
-            selection_color_id: "aggregate".into(),
-        });
+        *panel.overlays.auxiliary_color_picker_test_slot() =
+            Some(AuxiliaryColorPickerTarget::SelectionColor {
+                target: current_target.clone(),
+                selection_color_id: "aggregate".into(),
+            });
         panel.set_color_contrast_view_data(
             DesignColorContrastViewData::new([DesignColorContrastPaintViewData::new(
                 DesignColorContrastPaintTarget::selection_color(current_target, "aggregate"),
@@ -1015,6 +1190,7 @@ impl Render for TestHost {
         // host renders it; an ephemeral `visual_cx.draw` frame does not keep
         // dispatch state past the next refresh.
         let mut content = div()
+            .debug_selector(|| "design-test-panel-viewport".to_owned())
             .relative()
             .w(px(self.panel_width))
             .h(px(720.))
@@ -1029,11 +1205,11 @@ impl Render for TestHost {
             let (editing, invalid, input) = {
                 let panel = self.panel.read(cx);
                 (
-                    panel.property_editor.as_ref().is_some_and(|editor| {
+                    panel.edit.property.as_ref().is_some_and(|editor| {
                         editor.property == DesignPanelProperty::ParagraphSpacing
                     }),
-                    panel.property_editor_invalid,
-                    panel.property_input.clone(),
+                    panel.edit.property_invalid,
+                    panel.retained.inputs.property.clone(),
                 )
             };
             let probe = DesignPanel::render_type_setting_number_field(
@@ -1100,6 +1276,137 @@ fn key_downs(host: &Entity<TestHost>, cx: &VisualTestContext) -> Rc<RefCell<Vec<
     cx.read(|app| host.read(app).key_downs.clone())
 }
 
+#[gpui::test]
+fn real_design_inspector_specimen_is_stable_at_supported_widths(cx: &mut TestAppContext) {
+    let frame = DesignPanelNode::new("frame", "Frame", DesignPanelNodeKind::Frame)
+        .with_layout_mode(DesignLayoutMode::Horizontal);
+    let (host, visual_cx) = setup(frame, cx);
+
+    let mut previous_coordinate_width = None;
+    let mut previous_dimension_width = None;
+    for width in [320., 400., 472.] {
+        host.update(visual_cx, |host, cx| {
+            host.panel_width = width;
+            cx.notify();
+        });
+        visual_cx.run_until_parked();
+
+        let viewport = visual_cx
+            .debug_bounds("design-test-panel-viewport")
+            .expect("the real Design inspector viewport should render");
+        assert_eq!(viewport.size.width, px(width));
+
+        let design_tab = visual_cx
+            .debug_bounds("design-tab-design-active")
+            .expect("the extracted Design header should render");
+        let prototype_tab = visual_cx
+            .debug_bounds("design-tab-prototype")
+            .expect("the extracted Design header should render its peer tab");
+        assert_eq!(design_tab.top(), prototype_tab.top());
+        assert_eq!(design_tab.size.height, prototype_tab.size.height);
+
+        let x = visual_cx
+            .debug_bounds("design-x")
+            .expect("the extracted Position section should render X");
+        let y = visual_cx
+            .debug_bounds("design-y")
+            .expect("the extracted Position section should render Y");
+        let width_field = visual_cx
+            .debug_bounds("design-width")
+            .expect("the extracted Layout section should render width");
+        let height_field = visual_cx
+            .debug_bounds("design-height")
+            .expect("the extracted Layout section should render height");
+        let opacity = visual_cx
+            .debug_bounds("design-opacity-value")
+            .expect("the extracted Appearance section should render opacity");
+        let add_fill = visual_cx
+            .debug_bounds("design-add-fill")
+            .expect("the extracted Fill section should render its action");
+
+        for (selector, bounds) in [
+            ("Design tab", design_tab),
+            ("Prototype tab", prototype_tab),
+            ("X field", x),
+            ("Y field", y),
+            ("Width field", width_field),
+            ("Height field", height_field),
+            ("Opacity field", opacity),
+            ("Fill action", add_fill),
+        ] {
+            assert!(
+                bounds.left() >= viewport.left() && bounds.right() <= viewport.right(),
+                "{selector} escaped the {width}px Design inspector: {bounds:?} vs {viewport:?}",
+            );
+        }
+
+        for (left, right, row) in [
+            (x, y, "Position coordinates"),
+            (width_field, height_field, "Layout dimensions"),
+        ] {
+            assert_eq!(left.top(), right.top(), "{row} must remain row-aligned");
+            assert_eq!(
+                left.size.height, right.size.height,
+                "{row} must use one row height"
+            );
+            assert_eq!(left.size.height, px(InspectorMetrics::ROW_HEIGHT));
+            assert!(
+                right.left() - left.right() >= px(InspectorMetrics::CONTROL_GAP),
+                "{row} fields retain explicit space for intervening chrome, so their reserved borders never overlap",
+            );
+            assert_eq!(
+                left.size.width, right.size.width,
+                "{row} columns divide the available viewport evenly",
+            );
+        }
+        assert_eq!(opacity.size.height, px(InspectorMetrics::ROW_HEIGHT));
+
+        if let Some(previous) = previous_coordinate_width {
+            assert!(
+                x.size.width > previous,
+                "Position fields should consume newly available viewport width"
+            );
+        }
+        if let Some(previous) = previous_dimension_width {
+            assert!(
+                width_field.size.width > previous,
+                "Layout fields should consume newly available viewport width"
+            );
+        }
+        previous_coordinate_width = Some(x.size.width);
+        previous_dimension_width = Some(width_field.size.width);
+
+        let stable_geometry = [
+            ("design-x", x),
+            ("design-y", y),
+            ("design-width", width_field),
+            ("design-height", height_field),
+            ("design-opacity-value", opacity),
+        ];
+        visual_cx.simulate_mouse_move(x.center(), None, Modifiers::none());
+        visual_cx.run_until_parked();
+        for (selector, before_hover) in stable_geometry.iter().copied() {
+            assert_eq!(
+                visual_cx.debug_bounds(selector),
+                Some(before_hover),
+                "hover chrome must not shift real inspector geometry at {width}px",
+            );
+        }
+
+        visual_cx.simulate_click(x.center(), Modifiers::none());
+        visual_cx.run_until_parked();
+        for (selector, before_focus) in stable_geometry.iter().copied() {
+            assert_eq!(
+                visual_cx.debug_bounds(selector),
+                Some(before_focus),
+                "focused edit chrome must not shift real inspector geometry at {width}px",
+            );
+        }
+        visual_cx.simulate_keystrokes("escape");
+        visual_cx.run_until_parked();
+    }
+}
+
 fn rendered_tab_stop_count(panel: &Entity<DesignPanel>, cx: &mut VisualTestContext) -> usize {
     cx.update(|window, app| {
         panel.read(app).focus_handle.clone().focus(window, app);
@@ -1137,6 +1444,666 @@ fn right_sidebar_surface_sets_are_permission_specific() {
         assert!(surface.is_available(false));
         assert!(!surface.is_available(true));
     }
+}
+
+#[gpui::test]
+fn complete_view_data_matches_the_existing_granular_setters(cx: &mut TestAppContext) {
+    let initial = DesignPanelNode::new("initial", "Initial", DesignPanelNodeKind::Rectangle);
+    let selected = DesignPanelNode::new("snapshot-node", "Snapshot", DesignPanelNodeKind::Frame)
+        .with_layout_mode(DesignLayoutMode::Horizontal);
+    let editor_context = DesignPanelInspectionContext::single(
+        selected.clone(),
+        DesignPanelParentLayout::Freeform,
+        DesignPanelPermissions::editor(),
+    );
+    let viewer_context = DesignPanelInspectionContext::single(
+        selected.clone(),
+        DesignPanelParentLayout::Freeform,
+        DesignPanelPermissions::viewer(),
+    );
+    let target = DesignPanelTarget::Nodes {
+        node_ids: vec![selected.id.clone()],
+    };
+    let nudge_settings = DesignNudgeSettings::new(0.5, 8.).expect("valid nudge settings");
+    let color_styles = DesignColorStyleViewData {
+        page_styles: vec![DesignColorStyle::new("brand", "Brand", DesignColor::BLUE)],
+        libraries: Vec::new(),
+    };
+    let header = DesignSelectionHeaderViewData::new("Snapshot header", []);
+
+    let (host, visual_cx) = setup(initial.clone(), cx);
+    let granular_panel = panel(&host, visual_cx);
+    granular_panel.update(visual_cx, |panel, cx| {
+        panel.set_inspection_context(editor_context.clone(), cx);
+        assert!(panel.set_active_surface(DesignPanelSurface::Prototype, cx));
+        panel.set_inspection_context(viewer_context, cx);
+        assert!(panel.set_active_surface(DesignPanelSurface::Comment, cx));
+        panel.set_inspection_context(editor_context, cx);
+        panel.set_workspace_mode(DesignPanelWorkspaceMode::Draw, cx);
+        panel.set_additional_labels(true, cx);
+        panel.set_nudge_settings(nudge_settings, cx);
+        panel.set_variables_entry_point(
+            DesignVariablesEntryPoint::LegacyRightSidebar {
+                disabled_reason: None,
+            },
+            cx,
+        );
+        panel.set_color_style_view_data(color_styles, cx);
+        panel.set_add_auto_layout_view_data(
+            DesignAddAutoLayoutViewData::eligible(target.clone()),
+            cx,
+        );
+        panel.set_selection_header_view_data_for_target(target, header, cx);
+        panel.set_property_value_states(
+            [(
+                DesignPanelProperty::Width,
+                DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(123.)),
+            )],
+            cx,
+        );
+    });
+    let expected = granular_panel.read_with(visual_cx, |panel, _| panel.view_data());
+
+    let snapshot_panel = visual_cx
+        .update(|window, app| app.new(|cx| DesignPanel::new("snapshot", initial, window, cx)));
+    snapshot_panel.update(visual_cx, |panel, cx| {
+        panel.set_view_data(expected.clone(), cx);
+    });
+
+    assert_eq!(
+        snapshot_panel.read_with(visual_cx, |panel, _| panel.view_data()),
+        expected
+    );
+    assert!(actions(&host, visual_cx).borrow().is_empty());
+}
+
+#[gpui::test]
+fn complete_view_data_round_trips_every_projection_resource_and_property_state(
+    cx: &mut TestAppContext,
+) {
+    let node = DesignPanelNode::new(
+        "complete-snapshot",
+        "Complete snapshot",
+        DesignPanelNodeKind::Frame,
+    );
+    let target = DesignPanelTarget::Nodes {
+        node_ids: vec![node.id.clone()],
+    };
+    let mut snapshot = DesignPanelViewData::for_node(node.clone());
+    snapshot.navigation = DesignPanelNavigationViewData::new(
+        DesignPanelSurface::Prototype,
+        DesignPanelSurface::Comment,
+        DesignPanelWorkspaceMode::Draw,
+    );
+    snapshot.preferences = DesignPanelPreferencesViewData {
+        additional_labels: true,
+        nudge_settings: DesignNudgeSettings::new(0.5, 8.).expect("valid nudge settings"),
+        variables_entry_point: DesignVariablesEntryPoint::LegacyRightSidebar {
+            disabled_reason: Some("Managed by the host".into()),
+        },
+    };
+    snapshot.projections = DesignPanelProjectionViewData {
+        export: Some(DesignExportViewData {
+            target: target.clone(),
+            configurations: vec![DesignExportConfiguration::new(
+                "complete-png",
+                DesignExportFormat::Png,
+            )],
+            mode: DesignExportMode::Static,
+            static_capabilities: Default::default(),
+            preview: None,
+            animated: None,
+        }),
+        add_auto_layout: Some(DesignAddAutoLayoutViewData::eligible(target.clone())),
+        draw_appearance: Some(DesignDrawAppearanceViewData::new(
+            target.clone(),
+            super::super::DesignDrawSliderRange::new(0., 240., 1.)
+                .expect("valid Draw slider range"),
+        )),
+        frame_presets: Some(DesignFramePresetViewData::new(
+            node.id.clone(),
+            [super::super::DesignFramePresetGroup::new(
+                "desktop",
+                "Desktop",
+                [super::super::DesignFramePreset::new(
+                    "desktop-1440",
+                    "Desktop 1440",
+                    1440.,
+                    1024.,
+                )],
+            )],
+        )),
+        smart_selection: Some(DesignSmartSelectionViewData::horizontal(
+            DesignPanelTarget::Nodes {
+                node_ids: vec!["smart-a".into(), "smart-b".into()],
+            },
+            super::super::DesignSmartSelectionSpacingViewData::uniform(24.),
+        )),
+        page: Some(DesignPageViewData::canonical(
+            "complete-page",
+            super::super::DesignPageBackground::new(DesignColor::PURPLE),
+        )),
+        page_local_styles: Some(DesignPageLocalStylesViewData::for_page("complete-page", [])),
+        variable_modes: Some(DesignVariableModeViewData::new(target.clone(), [])),
+        viewer_properties: Some(DesignViewerPropertiesViewData::new(target.clone(), [])),
+        selection_header: Some(DesignPanelTargetedSelectionHeader::new(
+            target.clone(),
+            DesignSelectionHeaderViewData::new("Complete header", []),
+        )),
+    };
+    snapshot.resources = DesignPanelResourcesViewData {
+        color_styles: DesignColorStyleViewData::new(
+            [DesignColorStyle::new(
+                "complete-color-style",
+                "Complete color",
+                DesignColor::PURPLE,
+            )],
+            [],
+        ),
+        color_style_samples: super::super::DesignColorStyleSampleViewData::new(
+            [super::super::DesignColorStyleSample::new(
+                "complete-color-sample",
+                "Complete sample",
+                DesignColor::BLUE,
+            )],
+            [],
+        ),
+        color_contrast: DesignColorContrastViewData::new([DesignColorContrastPaintViewData::new(
+            DesignColorContrastPaintTarget::paint(
+                node.id.clone(),
+                DesignPanelCollection::Fill,
+                "complete-fill",
+                0,
+            ),
+            [super::super::DesignColorContrastLeafViewData::new(
+                DesignPaintColorTarget::Solid,
+                DesignColor::WHITE,
+                4.5,
+                super::super::DesignColorContrastCategory::NormalText,
+            )],
+        )]),
+        paint_variables: DesignPaintVariableViewData::new([super::super::DesignVariable::page(
+            "complete-paint-variable",
+            "Complete paint variable",
+            "colors",
+            "Colors",
+            super::super::DesignVariableResolvedType::Color,
+        )
+        .with_resolved_value(super::super::DesignVariableResolvedValue::Color(
+            DesignColor::PURPLE,
+        ))]),
+        paint_styles: DesignPaintStyleViewData::new(
+            [super::super::DesignPaintStyle::new(
+                "complete-paint-style",
+                "Complete paint style",
+                [DesignPaint::solid(DesignColor::PURPLE)],
+            )],
+            [],
+        ),
+        media_paints: DesignMediaPaintViewData::new([super::super::DesignMediaPaintView::new(
+            DesignPanelCollection::Fill,
+            "complete-media-paint",
+            0,
+        )]),
+        shaders: DesignShaderViewData::new(
+            [DesignShaderDefinition::new(
+                "complete-shader",
+                "Complete shader",
+                true,
+                [],
+            )],
+            [],
+        ),
+        typography_styles: DesignTypographyStyleViewData::new(
+            [super::super::DesignTypographyStyle::new(
+                "complete-text-style",
+                "Complete text style",
+                "Inter",
+                "Regular",
+                16.,
+            )],
+            [],
+        ),
+        fonts: super::super::DesignFontViewData::ready([super::super::DesignFontFamily::local(
+            "inter",
+            "Inter",
+            [super::super::DesignFontStyle::imported(
+                "regular", "Regular",
+            )],
+        )]),
+        effect_styles: DesignEffectStyleViewData::new(
+            [super::super::DesignEffectStyle::new(
+                "complete-effect-style",
+                "Complete effect style",
+                [DesignEffectKind::DropShadow],
+            )],
+            [],
+        ),
+        effect_variables: DesignEffectVariableViewData::new([
+            super::super::DesignEffectVariable::new(
+                "complete-effect-variable",
+                "Complete effect variable",
+                "Effects",
+                super::super::DesignEffectVariableKind::Float,
+            ),
+        ]),
+        property_variables: DesignVariableViewData::new([super::super::DesignVariable::page(
+            "complete-property-variable",
+            "Complete property variable",
+            "numbers",
+            "Numbers",
+            super::super::DesignVariableResolvedType::Float,
+        )
+        .with_resolved_value(super::super::DesignVariableResolvedValue::Float(42.))]),
+        component_swaps: DesignComponentSwapViewData::new([
+            super::super::DesignComponentSwapCandidate::local(
+                super::super::DesignComponentReference::local(
+                    "complete-component",
+                    "Complete component",
+                ),
+                "complete-component-key",
+                "complete-page",
+                "Complete page",
+            ),
+        ]),
+        layout_grid_styles: DesignLayoutGridStyleViewData::new(
+            [super::super::DesignLayoutGridStyle::new(
+                "complete-grid-style",
+                "Complete grid style",
+                [DesignLayoutGrid::uniform(8., DesignColor::BLUE)],
+            )],
+            [],
+        ),
+        layout_grid_variables: DesignLayoutGridVariableViewData::new([
+            super::super::DesignVariable::page(
+                "complete-grid-variable",
+                "Complete grid variable",
+                "numbers",
+                "Numbers",
+                super::super::DesignVariableResolvedType::Float,
+            )
+            .with_resolved_value(super::super::DesignVariableResolvedValue::Float(12.)),
+        ])
+        .with_create_state(super::super::DesignLayoutGridVariableCreateState::Enabled),
+        layout_grid_count_variables: DesignLayoutGridCountVariableViewData::new([
+            super::super::DesignLayoutGridCountVariable::new(
+                "complete-count-variable",
+                "Complete count variable",
+                "Grid counts",
+                DesignLayoutGridCount::number(12),
+            ),
+        ]),
+    };
+    snapshot.property_states = [
+        (
+            DesignPanelProperty::Width,
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(320.)),
+        ),
+        (
+            DesignPanelProperty::Height,
+            DesignPanelPropertyValueState::Mixed,
+        ),
+        (DesignPanelProperty::X, DesignPanelPropertyValueState::Unset),
+        (
+            DesignPanelProperty::Y,
+            DesignPanelPropertyValueState::bound(DesignPanelPropertyBinding::new(
+                "complete-binding",
+                "Complete binding",
+                DesignPanelBindingKind::Variable,
+                DesignPanelValue::Number(24.),
+            )),
+        ),
+        (
+            DesignPanelProperty::Opacity,
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(75.))
+                .read_only_with_reason("Managed opacity"),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let (host, visual_cx) = setup(
+        DesignPanelNode::new("initial", "Initial", DesignPanelNodeKind::Text),
+        cx,
+    );
+    let panel = panel(&host, visual_cx);
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_view_data(snapshot.clone(), cx);
+    });
+
+    assert_eq!(
+        panel.read_with(visual_cx, |panel, _| panel.view_data()),
+        snapshot,
+        "every grouped host-owned field must survive the bulk setter/getter round trip",
+    );
+    assert!(
+        actions(&host, visual_cx).borrow().is_empty(),
+        "installing an idle host snapshot must not synthesize document intents",
+    );
+}
+
+#[gpui::test]
+fn complete_view_data_keeps_page_targets_and_no_selection_fallbacks_consistent(
+    cx: &mut TestAppContext,
+) {
+    let page_id: SharedString = "snapshot-page".into();
+    let page_target = DesignPanelTarget::Page {
+        page_id: page_id.clone(),
+    };
+    let mut page_snapshot = DesignPanelViewData::new(DesignPanelInspectionContext::page(
+        DesignPanelPermissions::editor(),
+    ));
+    page_snapshot.projections.page = Some(DesignPageViewData::canonical(
+        page_id.clone(),
+        super::super::DesignPageBackground::new(DesignColor::PURPLE),
+    ));
+    page_snapshot.projections.page_local_styles =
+        Some(DesignPageLocalStylesViewData::for_page(page_id.clone(), []));
+    page_snapshot.projections.variable_modes =
+        Some(DesignVariableModeViewData::new(page_target.clone(), []));
+    page_snapshot.projections.export = Some(DesignExportViewData {
+        target: page_target.clone(),
+        configurations: vec![DesignExportConfiguration::new(
+            "page-png",
+            DesignExportFormat::Png,
+        )],
+        mode: DesignExportMode::Static,
+        static_capabilities: Default::default(),
+        preview: None,
+        animated: None,
+    });
+
+    let (host, visual_cx) = setup(
+        DesignPanelNode::new(
+            "unrelated-node",
+            "Unrelated node",
+            DesignPanelNodeKind::Text,
+        ),
+        cx,
+    );
+    let panel = panel(&host, visual_cx);
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_view_data(page_snapshot.clone(), cx);
+        assert_eq!(panel.command_target(), page_target);
+        assert!(panel.page_view_data_for_context().is_some());
+        assert!(panel.page_local_styles_view_data_for_context().is_some());
+        assert!(panel.variable_mode_view_data_for_context().is_some());
+        assert!(panel.active_export_view_data().is_some());
+        assert_eq!(
+            panel.resolved_selection_header_view_data().title.as_ref(),
+            "Page",
+        );
+    });
+    assert_eq!(
+        panel.read_with(visual_cx, |panel, _| panel.view_data()),
+        page_snapshot,
+    );
+
+    let bare_page_snapshot = DesignPanelViewData::new(DesignPanelInspectionContext::page(
+        DesignPanelPermissions::editor(),
+    ));
+    assert!(bare_page_snapshot.selected_node().is_none());
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_view_data(bare_page_snapshot.clone(), cx);
+        assert!(panel.page_view_data_for_context().is_none());
+        assert!(panel.page_local_styles_view_data_for_context().is_none());
+        assert!(panel.variable_mode_view_data_for_context().is_none());
+        assert!(panel.active_export_view_data().is_none());
+        assert_eq!(
+            panel.resolved_selection_header_view_data().title.as_ref(),
+            "Page",
+            "Page chrome must not inherit the previous selected-node fallback",
+        );
+    });
+    assert_eq!(
+        panel.read_with(visual_cx, |panel, _| panel.view_data()),
+        bare_page_snapshot,
+    );
+
+    let direct_page_panel = visual_cx.update(|window, app| {
+        app.new(|cx| {
+            DesignPanel::new_with_context(
+                "direct-page",
+                DesignPanelInspectionContext::page(DesignPanelPermissions::editor()),
+                window,
+                cx,
+            )
+        })
+    });
+    assert_eq!(
+        direct_page_panel.read_with(visual_cx, |panel, _| panel.view_data()),
+        bare_page_snapshot,
+        "direct page construction and bulk no-selection installation must expose one snapshot",
+    );
+    assert_eq!(
+        direct_page_panel.read_with(visual_cx, |panel, _| {
+            panel.resolved_selection_header_view_data().title
+        }),
+        SharedString::from("Page"),
+    );
+    assert!(actions(&host, visual_cx).borrow().is_empty());
+}
+
+#[gpui::test]
+fn complete_view_data_round_trips_the_page_compatibility_node_and_implicit_target(
+    cx: &mut TestAppContext,
+) {
+    let (host, visual_cx) = setup(
+        DesignPanelNode::new("constructor-a", "Constructor A", DesignPanelNodeKind::Text),
+        cx,
+    );
+    let source = panel(&host, visual_cx);
+    let mut page_snapshot = DesignPanelViewData::new(DesignPanelInspectionContext::page(
+        DesignPanelPermissions::editor(),
+    ));
+    page_snapshot.page_node_fallback = DesignPanelNode::new(
+        "canonical-page-fallback",
+        "Canonical Page",
+        DesignPanelNodeKind::Frame,
+    );
+    source.update(visual_cx, |panel, cx| {
+        panel.set_view_data(page_snapshot, cx);
+    });
+    let round_tripped = source.read_with(visual_cx, |panel, _| panel.view_data());
+
+    let target = visual_cx.update(|window, app| {
+        app.new(|cx| {
+            DesignPanel::new(
+                "page-roundtrip-target",
+                DesignPanelNode::new("constructor-b", "Constructor B", DesignPanelNodeKind::Text),
+                window,
+                cx,
+            )
+        })
+    });
+    target.update(visual_cx, |panel, cx| {
+        panel.set_view_data(round_tripped.clone(), cx);
+        assert_eq!(panel.node().id.as_ref(), "canonical-page-fallback");
+        assert_eq!(
+            panel.command_target(),
+            DesignPanelTarget::Page {
+                page_id: "canonical-page-fallback".into(),
+            },
+        );
+    });
+    assert_eq!(
+        target.read_with(visual_cx, |panel, _| panel.view_data()),
+        round_tripped,
+        "the complete snapshot must not retain constructor-dependent Page state",
+    );
+}
+
+#[gpui::test]
+fn complete_view_data_preserves_rendered_sections_and_action_sequence(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new(
+        "snapshot-parity",
+        "Snapshot parity",
+        DesignPanelNodeKind::Group,
+    );
+    let target = DesignPanelTarget::Nodes {
+        node_ids: vec![node.id.clone()],
+    };
+    let inspection_context = DesignPanelInspectionContext::single(
+        node.clone(),
+        DesignPanelParentLayout::Freeform,
+        DesignPanelPermissions::editor(),
+    );
+    let export_view_data = DesignExportViewData {
+        target: target.clone(),
+        configurations: vec![DesignExportConfiguration::new(
+            "snapshot-png",
+            DesignExportFormat::Png,
+        )],
+        mode: DesignExportMode::Static,
+        static_capabilities: Default::default(),
+        preview: None,
+        animated: None,
+    };
+    let section_selectors = [
+        "design-x",
+        "design-add-auto-layout",
+        "design-appearance-visible",
+        "design-add-fill",
+        "design-add-stroke",
+        "design-add-effect",
+        "design-add-export",
+    ];
+    let action_selectors = ["design-add-auto-layout", "design-appearance-visible"];
+
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_inspection_context(inspection_context, cx);
+        panel.set_additional_labels(true, cx);
+        panel.set_nudge_settings(
+            DesignNudgeSettings::new(0.5, 8.).expect("valid nudge settings"),
+            cx,
+        );
+        panel.set_color_style_view_data(
+            DesignColorStyleViewData {
+                page_styles: vec![DesignColorStyle::new(
+                    "snapshot-brand",
+                    "Snapshot brand",
+                    DesignColor::BLUE,
+                )],
+                libraries: Vec::new(),
+            },
+            cx,
+        );
+        panel.set_add_auto_layout_view_data(
+            DesignAddAutoLayoutViewData::eligible(target.clone()),
+            cx,
+        );
+        panel.set_export_view_data(export_view_data, cx);
+        panel.set_selection_header_view_data_for_target(
+            target.clone(),
+            DesignSelectionHeaderViewData::new("Snapshot parity", []),
+            cx,
+        );
+        panel.set_property_value_states(
+            [
+                (
+                    DesignPanelProperty::Visible,
+                    DesignPanelPropertyValueState::Uniform(DesignPanelValue::Bool(true)),
+                ),
+                (
+                    DesignPanelProperty::Opacity,
+                    DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(64.)),
+                ),
+            ],
+            cx,
+        );
+    });
+    let snapshot = panel.read_with(visual_cx, |panel, _| panel.view_data());
+    visual_cx.run_until_parked();
+
+    let legacy_sections =
+        section_selectors.map(|selector| visual_cx.debug_bounds(selector).is_some());
+    assert!(
+        legacy_sections.iter().filter(|visible| **visible).count() >= 4,
+        "the representative legacy batch should render selectors from several inspector sections: {legacy_sections:?}",
+    );
+    for selector in action_selectors {
+        let bounds = visual_cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("legacy setters should render {selector}"));
+        visual_cx.simulate_click(bounds.center(), Modifiers::none());
+        visual_cx.run_until_parked();
+    }
+    let legacy_actions = captured.borrow().clone();
+    assert_eq!(
+        legacy_actions,
+        [
+            DesignPanelAction::AddAutoLayoutRequested {
+                target: target.clone(),
+            },
+            DesignPanelAction::PropertyChangeRequested {
+                node_id: node.id.clone(),
+                property: DesignPanelProperty::Visible,
+                value: DesignPanelValue::Bool(false),
+            },
+        ],
+    );
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_view_data(
+            DesignPanelViewData::for_node(DesignPanelNode::new(
+                "unrelated",
+                "Unrelated",
+                DesignPanelNodeKind::Text,
+            )),
+            cx,
+        );
+        panel.set_view_data(snapshot.clone(), cx);
+    });
+    captured.borrow_mut().clear();
+    visual_cx.run_until_parked();
+
+    let snapshot_sections =
+        section_selectors.map(|selector| visual_cx.debug_bounds(selector).is_some());
+    assert_eq!(snapshot_sections, legacy_sections);
+    for selector in action_selectors {
+        let bounds = visual_cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("set_view_data should render {selector}"));
+        visual_cx.simulate_click(bounds.center(), Modifiers::none());
+        visual_cx.run_until_parked();
+    }
+
+    assert_eq!(captured.borrow().as_slice(), legacy_actions);
+    assert_eq!(
+        panel.read_with(visual_cx, |panel, _| panel.view_data()),
+        snapshot
+    );
+}
+
+#[gpui::test]
+fn complete_view_data_clears_omitted_optional_projections(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new("frame", "Frame", DesignPanelNodeKind::Frame);
+    let target = DesignPanelTarget::Nodes {
+        node_ids: vec![node.id.clone()],
+    };
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_add_auto_layout_view_data(
+            DesignAddAutoLayoutViewData::eligible(target.clone()),
+            cx,
+        );
+        panel.set_selection_header_view_data_for_target(
+            target,
+            DesignSelectionHeaderViewData::new("Frame", []),
+            cx,
+        );
+        panel.set_view_data(DesignPanelViewData::for_node(node), cx);
+    });
+
+    let view_data = panel.read_with(visual_cx, |panel, _| panel.view_data());
+    assert_eq!(
+        view_data.projections,
+        DesignPanelProjectionViewData::default()
+    );
 }
 
 #[gpui::test]
@@ -1397,15 +2364,16 @@ fn surface_changes_balance_active_edits_and_dismiss_design_overlays(cx: &mut Tes
                 window,
                 cx,
             );
-            panel.selection_header_overlay = Some(SelectionHeaderOverlay::More);
-            panel.appearance_blend_mode_open = true;
-            panel.type_settings_open = true;
+            *panel.overlays.selection_header_overlay_test_slot() =
+                Some(SelectionHeaderOverlay::More);
+            *panel.overlays.appearance_blend_mode_open_test_slot() = true;
+            *panel.overlays.type_settings_open_test_slot() = true;
 
             assert!(
                 !panel.set_active_surface(DesignPanelSurface::Properties, cx),
                 "an unavailable surface must not disturb the active Design interaction",
             );
-            assert!(panel.property_editor.is_some());
+            assert!(panel.edit.property.is_some());
             assert!(panel.set_active_surface(DesignPanelSurface::Prototype, cx));
         });
     });
@@ -1430,10 +2398,10 @@ fn surface_changes_balance_active_edits_and_dismiss_design_overlays(cx: &mut Tes
     visual_cx.read(|app| {
         let panel = panel.read(app);
         assert_eq!(panel.active_surface(), DesignPanelSurface::Prototype);
-        assert!(panel.property_editor.is_none());
-        assert!(panel.selection_header_overlay.is_none());
-        assert!(!panel.appearance_blend_mode_open);
-        assert!(!panel.type_settings_open);
+        assert!(panel.edit.property.is_none());
+        assert!(panel.overlays.selection_header_overlay().is_none());
+        assert!(!panel.overlays.appearance_blend_mode_open());
+        assert!(!panel.overlays.type_settings_open());
     });
 }
 
@@ -1551,7 +2519,7 @@ fn workspace_changes_balance_an_active_property_transaction(cx: &mut TestAppCont
         [DesignPanelEditPhase::Begin, DesignPanelEditPhase::Cancel]
     );
     assert!(
-        visual_cx.read(|app| panel.read(app).property_editor.is_none()),
+        visual_cx.read(|app| panel.read(app).edit.property.is_none()),
         "the replaced Design editor must not retain a hidden draft"
     );
 }
@@ -1585,8 +2553,8 @@ fn mixed_visibility_resolves_to_show_all_with_the_exact_target_on_draw_surface(
             DesignPanelPropertyValueState::Mixed,
             cx,
         );
-        panel.expanded_sections.clear();
-        panel.expanded_sections.insert(DesignPanelSection::Layer);
+        panel.sections.clear_expanded();
+        panel.sections.expand(DesignPanelSection::Layer);
         panel.set_workspace_mode(DesignPanelWorkspaceMode::Draw, cx);
     });
     visual_cx.run_until_parked();
@@ -1597,9 +2565,10 @@ fn mixed_visibility_resolves_to_show_all_with_the_exact_target_on_draw_surface(
         "Draw must mount the shared visibility control",
     );
     assert_eq!(
-        visual_cx.read(|app| panel
-            .read(app)
-            .visibility_control_state(DesignPanelProperty::Visible, panel.read(app).node.visible,)),
+        visual_cx.read(|app| panel.read(app).visibility_control_state(
+            DesignPanelProperty::Visible,
+            panel.read(app).host.inspected_node().visible,
+        )),
         VisibilityControlState::Mixed,
     );
 
@@ -1636,9 +2605,10 @@ fn mixed_visibility_resolves_to_show_all_with_the_exact_target_on_draw_surface(
     });
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel
-            .read(app)
-            .visibility_control_state(DesignPanelProperty::Visible, panel.read(app).node.visible,)),
+        visual_cx.read(|app| panel.read(app).visibility_control_state(
+            DesignPanelProperty::Visible,
+            panel.read(app).host.inspected_node().visible,
+        )),
         VisibilityControlState::Mixed,
     );
     visual_cx.simulate_click(visibility, Modifiers::none());
@@ -1700,7 +2670,7 @@ fn draw_opacity_slider_uses_balanced_phases_and_strict_keyboard_propagation(
         ]
     );
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.opacity),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().opacity),
         rectangle.opacity,
         "the slider must wait for a host echo"
     );
@@ -2072,13 +3042,13 @@ fn numeric_pointer_scrub_emits_one_typed_lifecycle_with_modifier_precision(
         ]
     );
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.x),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().x),
         10.,
         "pointer previews remain host controlled"
     );
     assert!(visual_cx.read(|app| {
         let panel = panel.read(app);
-        panel.property_editor.is_none() && panel.numeric_property_scrub.is_none()
+        panel.edit.property.is_none() && panel.edit.numeric_scrub.is_none()
     }));
 }
 
@@ -2117,7 +3087,8 @@ fn numeric_scrub_focus_is_captured_after_mouse_down_and_rebases_with_its_guide(
     let return_handle = visual_cx.read(|app| {
         let panel = panel.read(app);
         let return_focus = panel
-            .editor_focus_return
+            .edit
+            .focus_return
             .as_ref()
             .expect("the deferred mouse-down phase should retain the row");
         assert_eq!(
@@ -2130,7 +3101,8 @@ fn numeric_scrub_focus_is_captured_after_mouse_down_and_rebases_with_its_guide(
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             let (origin_x, origin_y) = panel
-                .numeric_property_scrub
+                .edit
+                .numeric_scrub
                 .as_ref()
                 .map(|scrub| (scrub.origin_x, scrub.origin_y))
                 .expect("mousedown should seed a scrub");
@@ -2147,14 +3119,16 @@ fn numeric_scrub_focus_is_captured_after_mouse_down_and_rebases_with_its_guide(
             panel.set_node(node.clone(), cx);
             assert_eq!(
                 panel
-                    .numeric_property_scrub
+                    .edit
+                    .numeric_scrub
                     .as_ref()
                     .map(|scrub| scrub.property),
                 Some(DesignPanelProperty::LayoutGridSize(0))
             );
             assert_eq!(
                 panel
-                    .editor_focus_return
+                    .edit
+                    .focus_return
                     .as_ref()
                     .map(|return_focus| return_focus.origin.clone()),
                 Some(EditorFocusOrigin::ValueCell(
@@ -2173,7 +3147,8 @@ fn numeric_scrub_focus_is_captured_after_mouse_down_and_rebases_with_its_guide(
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .property_editor
+                .edit
+                .property
                 .as_ref()
                 .map(|editor| editor.property)
         }),
@@ -2366,7 +3341,10 @@ fn host_nudge_preferences_drive_numeric_lifecycle_without_mutating_the_node(
             (18.5, DesignPanelEditPhase::Commit),
         ]
     );
-    assert_eq!(visual_cx.read(|app| panel.read(app).node.x), 10.);
+    assert_eq!(
+        visual_cx.read(|app| panel.read(app).host.inspected_node().x),
+        10.
+    );
 }
 
 #[gpui::test]
@@ -2385,12 +3363,12 @@ fn arrow_nudge_rejects_invalid_auto_none_and_nonnumeric_drafts(cx: &mut TestAppC
                 window,
                 cx,
             );
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("not-a-number", window, cx);
             });
             assert!(!panel.step_property_editor(ArrowStep::Increase, false, window, cx));
             assert_eq!(
-                panel.property_input.read(cx).value().as_ref(),
+                panel.retained.inputs.property.read(cx).value().as_ref(),
                 "not-a-number"
             );
             panel.finish_property_edit(false, window, cx);
@@ -2406,7 +3384,7 @@ fn arrow_nudge_rejects_invalid_auto_none_and_nonnumeric_drafts(cx: &mut TestAppC
                 window,
                 cx,
             );
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "");
+            assert_eq!(panel.retained.inputs.property.read(cx).value().as_ref(), "");
             assert!(!panel.step_property_editor(ArrowStep::Increase, false, window, cx));
             panel.finish_property_edit(false, window, cx);
             panel.set_property_value_states([], cx);
@@ -2422,7 +3400,7 @@ fn arrow_nudge_rejects_invalid_auto_none_and_nonnumeric_drafts(cx: &mut TestAppC
                 window,
                 cx,
             );
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "");
+            assert_eq!(panel.retained.inputs.property.read(cx).value().as_ref(), "");
             assert!(!panel.step_property_editor(ArrowStep::Increase, false, window, cx));
             panel.finish_property_edit(false, window, cx);
             panel.set_property_value_states([], cx);
@@ -2436,7 +3414,7 @@ fn arrow_nudge_rejects_invalid_auto_none_and_nonnumeric_drafts(cx: &mut TestAppC
                 window,
                 cx,
             );
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "");
+            assert_eq!(panel.retained.inputs.property.read(cx).value().as_ref(), "");
             assert!(!panel.step_property_editor(ArrowStep::Increase, false, window, cx));
             panel.finish_property_edit(false, window, cx);
 
@@ -2458,7 +3436,10 @@ fn arrow_nudge_rejects_invalid_auto_none_and_nonnumeric_drafts(cx: &mut TestAppC
                 window,
                 cx,
             );
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "Auto");
+            assert_eq!(
+                panel.retained.inputs.property.read(cx).value().as_ref(),
+                "Auto"
+            );
             assert!(!panel.step_property_editor(ArrowStep::Increase, false, window, cx));
             panel.finish_property_edit(false, window, cx);
 
@@ -2534,31 +3515,40 @@ fn export_nudge_preserves_discriminator_stable_id_and_clamp(cx: &mut TestAppCont
     visual_cx.run_until_parked();
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("2x", window, cx);
             });
             assert!(!panel.step_property_editor(ArrowStep::Increase, false, window, cx));
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "2x");
+            assert_eq!(
+                panel.retained.inputs.property.read(cx).value().as_ref(),
+                "2x"
+            );
         });
     });
     visual_cx.run_until_parked();
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("320w", window, cx);
             });
             assert!(panel.step_property_editor(ArrowStep::Increase, false, window, cx));
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "320.5w");
+            assert_eq!(
+                panel.retained.inputs.property.read(cx).value().as_ref(),
+                "320.5w"
+            );
         });
     });
     visual_cx.run_until_parked();
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("0.01w", window, cx);
             });
             assert!(panel.step_property_editor(ArrowStep::Decrease, true, window, cx));
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "0.01w");
+            assert_eq!(
+                panel.retained.inputs.property.read(cx).value().as_ref(),
+                "0.01w"
+            );
         });
     });
     visual_cx.run_until_parked();
@@ -2635,7 +3625,7 @@ fn numeric_scrub_is_gated_for_mixed_bound_read_only_and_viewer_values(cx: &mut T
             cx,
         );
         assert!(!panel.start_numeric_property_scrub(DesignPanelProperty::X, 0., 0., cx));
-        assert!(panel.numeric_property_scrub.is_none());
+        assert!(panel.edit.numeric_scrub.is_none());
     });
     visual_cx.run_until_parked();
     assert!(captured.borrow().is_empty());
@@ -2699,8 +3689,67 @@ fn numeric_scrub_state_downgrade_cancels_once_before_replacement(cx: &mut TestAp
     );
     assert!(visual_cx.read(|app| {
         let panel = panel.read(app);
-        panel.property_editor.is_none() && panel.numeric_property_scrub.is_none()
+        panel.edit.property.is_none() && panel.edit.numeric_scrub.is_none()
     }));
+}
+
+#[gpui::test]
+fn property_edit_host_invalidation_has_one_terminal_cancel(cx: &mut TestAppContext) {
+    let mut node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+    node.width = 100.;
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.activate_property(
+                DesignPanelProperty::Width,
+                DesignPanelValue::Number(100.),
+                window,
+                cx,
+            );
+            panel.retained.inputs.property.update(cx, |input, cx| {
+                input.set_value("120", window, cx);
+            });
+            panel.validate_property_draft(cx);
+
+            panel.set_property_value_state(
+                DesignPanelProperty::Width,
+                DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(120.))
+                    .read_only_with_reason("Locked by host"),
+                cx,
+            );
+            panel.cancel_property_editor_transaction(cx);
+            panel.finish_property_edit(false, window, cx);
+
+            assert!(!panel.edit.has_property_edit());
+            assert!(panel.edit.property.is_none());
+        });
+    });
+    visual_cx.run_until_parked();
+
+    let edits = captured
+        .borrow()
+        .iter()
+        .filter_map(|action| match action {
+            DesignPanelAction::PropertyEditRequested {
+                property: DesignPanelProperty::Width,
+                value: DesignPanelValue::Number(value),
+                phase,
+                ..
+            } => Some((*value, *phase)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edits,
+        vec![
+            (100., DesignPanelEditPhase::Begin),
+            (120., DesignPanelEditPhase::Preview),
+            (100., DesignPanelEditPhase::Cancel),
+        ]
+    );
 }
 
 #[gpui::test]
@@ -2901,7 +3950,7 @@ fn variable_font_axes_use_custom_nudges_and_reject_invalid_drafts(cx: &mut TestA
     visual_cx.run_until_parked();
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("invalid", window, cx);
             });
             assert!(!panel.step_variable_font_axis_input(
@@ -2910,7 +3959,10 @@ fn variable_font_axes_use_custom_nudges_and_reject_invalid_drafts(cx: &mut TestA
                 window,
                 cx
             ));
-            assert_eq!(panel.property_input.read(cx).value().as_ref(), "invalid");
+            assert_eq!(
+                panel.retained.inputs.property.read(cx).value().as_ref(),
+                "invalid"
+            );
             panel.finish_variable_font_axis_edit(false, window, cx);
         });
     });
@@ -2970,7 +4022,7 @@ fn variable_font_axis_input_and_slider_keyboard_share_phased_intents(cx: &mut Te
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.activate_variable_font_axis_input("wdth".into(), window, cx);
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("102.25", window, cx);
             });
         });
@@ -3043,13 +4095,15 @@ fn variable_font_axis_transaction_survives_same_tag_reorder_and_echo(cx: &mut Te
             panel.set_node(node.clone(), cx);
             assert_eq!(
                 panel
-                    .variable_font_axis_editor
+                    .edit
+                    .variable_font_axis
                     .as_ref()
                     .map(|editor| editor.tag.as_ref()),
                 Some("wght")
             );
             assert!(
                 panel
+                    .edit
                     .variable_font_axis_scrub
                     .as_ref()
                     .is_some_and(|scrub| scrub.active)
@@ -3121,7 +4175,7 @@ fn variable_font_axis_range_revision_and_permission_changes_cancel_captured_targ
         .with_text_range_revision(8)
         .expect("next exact range");
         panel.set_inspection_context(second_range, cx);
-        assert!(panel.variable_font_axis_editor.is_none());
+        assert!(panel.edit.variable_font_axis.is_none());
 
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
@@ -3182,7 +4236,12 @@ fn variable_font_axis_gates_read_only_unavailable_bound_invalid_and_duplicate_ta
             assert!(!panel.begin_variable_font_axis_edit(tag.into(), cx));
             assert!(!panel.start_variable_font_axis_scrub(tag.into(), 0., 0., cx));
         }
-        let typography = panel.node.typography.as_ref().expect("typography");
+        let typography = panel
+            .host
+            .inspected_node()
+            .typography
+            .as_ref()
+            .expect("typography");
         drop(panel.render_type_settings_popover(typography, cx));
     });
     visual_cx.run_until_parked();
@@ -3863,7 +4922,11 @@ fn page_local_style_folders_collapse_and_prune_stale_presentation_state(cx: &mut
     visual_cx.run_until_parked();
     panel.update(visual_cx, |panel, _| {
         assert!(
-            panel.collapsed_local_style_folders.contains("folder-type"),
+            panel
+                .features
+                .page
+                .collapsed_local_style_folders
+                .contains("folder-type"),
             "folder disclosure button must update transient state"
         );
     });
@@ -3882,7 +4945,7 @@ fn page_local_style_folders_collapse_and_prune_stale_presentation_state(cx: &mut
             DesignPageLocalStylesViewData::for_page("storybook-page", []),
             cx,
         );
-        assert!(panel.collapsed_local_style_folders.is_empty());
+        assert!(panel.features.page.collapsed_local_style_folders.is_empty());
     });
 }
 
@@ -4541,7 +5604,8 @@ fn selection_change_and_escape_close_transient_header_menus(cx: &mut TestAppCont
                 DesignSelectionHeaderViewData::for_node_kind(DesignPanelNodeKind::Rectangle),
                 cx,
             );
-            panel.selection_header_overlay = Some(SelectionHeaderOverlay::More);
+            *panel.overlays.selection_header_overlay_test_slot() =
+                Some(SelectionHeaderOverlay::More);
             panel.focus_handle.focus(window, cx);
             cx.notify();
         });
@@ -4550,19 +5614,309 @@ fn selection_change_and_escape_close_transient_header_menus(cx: &mut TestAppCont
     visual_cx.simulate_keystrokes("escape");
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).selection_header_overlay.clone()),
+        visual_cx.read(|app| panel.read(app).overlays.selection_header_overlay().clone()),
         None
     );
 
     panel.update(visual_cx, |panel, cx| {
-        panel.selection_header_overlay = Some(SelectionHeaderOverlay::Title);
+        *panel.overlays.selection_header_overlay_test_slot() = Some(SelectionHeaderOverlay::Title);
         panel.set_node(
             DesignPanelNode::new("ellipse", "Ellipse", DesignPanelNodeKind::Ellipse),
             cx,
         );
         assert!(panel.selection_header_view_data().is_none());
-        assert!(panel.selection_header_overlay.is_none());
+        assert!(panel.overlays.selection_header_overlay().is_none());
     });
+}
+
+#[gpui::test]
+fn selection_change_dismisses_every_context_bound_overlay_family(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+    let replacement = DesignPanelNode::new("ellipse", "Ellipse", DesignPanelNodeKind::Ellipse);
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+
+    panel.update(visual_cx, |panel, cx| {
+        *panel.overlays.component_property_context_menu_test_slot() = Some("property".into());
+        *panel.overlays.selection_header_overlay_test_slot() = Some(SelectionHeaderOverlay::More);
+        *panel.overlays.page_resource_browser_test_slot() =
+            Some(DesignLocalResourceCategory::Styles);
+        *panel.overlays.export_choice_overlay_test_slot() = Some("export".into());
+        *panel.overlays.appearance_blend_mode_open_test_slot() = true;
+        *panel.overlays.type_settings_open_test_slot() = true;
+
+        assert!(panel.overlays.topmost().is_some());
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::single(
+                replacement,
+                DesignPanelParentLayout::Freeform,
+                DesignPanelPermissions::editor(),
+            ),
+            cx,
+        );
+
+        assert_eq!(panel.overlays.topmost(), None);
+        assert!(panel.overlays.component_property_context_menu().is_none());
+        assert!(panel.overlays.selection_header_overlay().is_none());
+        assert!(panel.overlays.page_resource_browser().is_none());
+        assert!(panel.overlays.export_choice_overlay().is_none());
+        assert!(!panel.overlays.appearance_blend_mode_open());
+        assert!(!panel.overlays.type_settings_open());
+    });
+}
+
+#[gpui::test]
+fn escape_dismisses_one_topmost_overlay_at_a_time(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            *panel.overlays.preview_option_menu_open_test_slot() =
+                Some(DesignPanelProperty::Opacity);
+            *panel.overlays.appearance_blend_mode_open_test_slot() = true;
+            *panel.overlays.type_settings_open_test_slot() = true;
+            panel.focus_handle.focus(window, cx);
+            cx.notify();
+        });
+    });
+    visual_cx.run_until_parked();
+
+    visual_cx.simulate_keystrokes("escape");
+    visual_cx.run_until_parked();
+    visual_cx.read(|app| {
+        let panel = panel.read(app);
+        assert!(panel.overlays.preview_option_menu_open().is_none());
+        assert!(panel.overlays.appearance_blend_mode_open());
+        assert!(panel.overlays.type_settings_open());
+    });
+
+    visual_cx.simulate_keystrokes("escape");
+    visual_cx.run_until_parked();
+    visual_cx.read(|app| {
+        let panel = panel.read(app);
+        assert!(!panel.overlays.appearance_blend_mode_open());
+        assert!(panel.overlays.type_settings_open());
+    });
+
+    visual_cx.simulate_keystrokes("escape");
+    visual_cx.run_until_parked();
+    assert!(!visual_cx.read(|app| panel.read(app).overlays.type_settings_open()));
+}
+
+#[gpui::test]
+fn coordinated_overlay_dismissal_restores_the_registered_focus_target(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.open_property_variable_picker(DesignPanelProperty::Width, window, cx);
+            assert_eq!(
+                panel.overlays.property_variable_picker(),
+                Some(DesignPanelProperty::Width)
+            );
+        });
+    });
+    visual_cx.run_until_parked();
+
+    visual_cx.simulate_keystrokes("escape");
+    visual_cx.run_until_parked();
+
+    assert!(visual_cx.read(|app| {
+        panel
+            .read(app)
+            .overlays
+            .property_variable_picker()
+            .is_none()
+    }));
+    assert!(visual_cx.update(|window, app| panel.read(app).focus_handle.is_focused(window)));
+}
+
+#[gpui::test]
+fn grid_overlay_restores_focus_but_context_change_drops_a_stale_return(cx: &mut TestAppContext) {
+    let mut node = DesignPanelNode::new("grid", "Grid", DesignPanelNodeKind::Frame)
+        .with_layout_mode(DesignLayoutMode::Grid);
+    let layout = node.layout.as_mut().expect("Grid layout");
+    layout.grid_columns = vec![DesignGridTrack::hug()];
+    layout.grid_rows = vec![DesignGridTrack::hug()];
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.focus_handle.focus(window, cx);
+            panel.open_grid_dimensions_picker(cx);
+            panel.remember_overlay_focus_return(DesignOpenOverlay::GridDimensions, window, cx);
+            panel.overlays.type_settings_focus().focus(window, cx);
+            assert!(panel.dismiss_overlay_from_escape(
+                DesignOpenOverlay::GridDimensions,
+                window,
+                cx,
+            ));
+        });
+    });
+    visual_cx.run_until_parked();
+    assert!(visual_cx.update(|window, app| panel.read(app).focus_handle.is_focused(window)));
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.open_grid_dimensions_picker(cx);
+            panel.remember_overlay_focus_return(DesignOpenOverlay::GridDimensions, window, cx);
+            let stale_dismissal = panel
+                .overlays
+                .escape_dismissal_intent_for(DesignOpenOverlay::GridDimensions)
+                .expect("open Grid dimensions has an Escape intent");
+            panel.overlays.type_settings_focus().focus(window, cx);
+
+            let mut replacement = node.clone();
+            replacement.id = "replacement-grid".into();
+            panel.set_node(replacement, cx);
+            assert!(panel.overlays.grid_dimensions_picker().is_none());
+
+            panel.dismiss_overlay(stale_dismissal, window, cx);
+            assert!(
+                panel.overlays.type_settings_focus().is_focused(window),
+                "a context-cleared focus return must not restore into the old projection"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn exact_overlay_escape_respects_priority_and_each_focus_return(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.focus_handle.focus(window, cx);
+            panel.remember_overlay_focus_return(DesignOpenOverlay::AppearanceBlendMode, window, cx);
+            *panel.overlays.appearance_blend_mode_open_test_slot() = true;
+
+            panel
+                .overlays
+                .dimension_menu_focus(DesignLayoutDimensionAxis::Width)
+                .focus(window, cx);
+            panel.remember_overlay_focus_return(DesignOpenOverlay::PreviewOptionMenu, window, cx);
+            *panel.overlays.preview_option_menu_open_test_slot() =
+                Some(DesignPanelProperty::Opacity);
+
+            panel.overlays.type_settings_focus().focus(window, cx);
+            assert!(
+                !panel.dismiss_overlay_from_escape(
+                    DesignOpenOverlay::AppearanceBlendMode,
+                    window,
+                    cx,
+                ),
+                "a lower-priority item handler must not clear its overlay"
+            );
+            assert!(panel.overlays.appearance_blend_mode_open());
+            assert!(panel.overlays.preview_option_menu_open().is_some());
+            assert!(panel.overlays.type_settings_focus().is_focused(window));
+
+            assert!(panel.dismiss_overlay_from_escape(
+                DesignOpenOverlay::PreviewOptionMenu,
+                window,
+                cx,
+            ));
+        });
+    });
+    visual_cx.run_until_parked();
+
+    visual_cx.read(|app| {
+        let panel = panel.read(app);
+        assert!(panel.overlays.preview_option_menu_open().is_none());
+        assert!(panel.overlays.appearance_blend_mode_open());
+    });
+    assert!(visual_cx.update(|window, app| {
+        panel
+            .read(app)
+            .overlays
+            .dimension_menu_focus(DesignLayoutDimensionAxis::Width)
+            .is_focused(window)
+    }));
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            assert!(panel.dismiss_overlay_from_escape(
+                DesignOpenOverlay::AppearanceBlendMode,
+                window,
+                cx,
+            ));
+        });
+    });
+    visual_cx.run_until_parked();
+
+    assert!(!visual_cx.read(|app| panel.read(app).overlays.appearance_blend_mode_open()));
+    assert!(visual_cx.update(|window, app| panel.read(app).focus_handle.is_focused(window)));
+}
+
+#[gpui::test]
+fn outside_click_dismissal_is_topmost_balances_preview_and_restores_focus(cx: &mut TestAppContext) {
+    let node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.focus_handle.focus(window, cx);
+            panel.remember_overlay_focus_return(DesignOpenOverlay::AppearanceBlendMode, window, cx);
+            *panel.overlays.appearance_blend_mode_open_test_slot() = true;
+            *panel.overlays.type_settings_open_test_slot() = true;
+            panel.set_property_menu_preview(
+                DesignPanelProperty::BlendMode,
+                DesignPanelValue::BlendMode(DesignBlendMode::Multiply),
+                true,
+                cx,
+            );
+            panel.overlays.type_settings_focus().focus(window, cx);
+
+            assert!(
+                !panel.dismiss_overlay_from_outside_click(
+                    DesignOpenOverlay::TypeSettings,
+                    window,
+                    cx,
+                ),
+                "a covered ancestor must not consume the outside click"
+            );
+            assert!(panel.dismiss_overlay_from_outside_click(
+                DesignOpenOverlay::AppearanceBlendMode,
+                window,
+                cx,
+            ));
+        });
+    });
+    visual_cx.run_until_parked();
+
+    visual_cx.read(|app| {
+        let panel = panel.read(app);
+        assert!(!panel.overlays.appearance_blend_mode_open());
+        assert!(panel.overlays.type_settings_open());
+        assert!(panel.overlays.active_menu_preview().is_none());
+    });
+    assert!(visual_cx.update(|window, app| panel.read(app).focus_handle.is_focused(window)));
+
+    let captured = captured.borrow();
+    assert_eq!(captured.len(), 2);
+    let (
+        DesignPanelAction::MenuPreviewRequested {
+            preview: begin,
+            phase: DesignMenuPreviewPhase::Begin,
+        },
+        DesignPanelAction::MenuPreviewRequested {
+            preview: end,
+            phase: DesignMenuPreviewPhase::End,
+        },
+    ) = (&captured[0], &captured[1])
+    else {
+        panic!("outside-click dismissal must balance the active menu preview");
+    };
+    assert_eq!(begin, end);
 }
 
 #[test]
@@ -4673,8 +6027,8 @@ fn native_shape_rows_render_inside_design_and_draw_appearance(cx: &mut TestAppCo
     let panel = panel(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        panel.expanded_sections.clear();
-        panel.expanded_sections.insert(DesignPanelSection::Layer);
+        panel.sections.clear_expanded();
+        panel.sections.expand(DesignPanelSection::Layer);
         cx.notify();
     });
     visual_cx.run_until_parked();
@@ -4737,9 +6091,19 @@ fn boolean_property_is_legacy_geometry_only(cx: &mut TestAppContext) {
     let panel = panel(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        assert!(!panel.node.supports_section(DesignPanelSection::Geometry));
+        assert!(
+            !panel
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Geometry)
+        );
         assert!(!panel.property_is_editable(DesignPanelProperty::BooleanOperation));
-        assert!(panel.render_geometry(cx).is_none());
+        let projection = sections::shape::ShapeProjection::from_node(
+            panel.id.clone(),
+            panel.can_edit(),
+            panel.host.inspected_node(),
+        );
+        assert!(sections::shape::render_geometry(&projection, panel, cx).is_none());
 
         let legacy =
             DesignPanelNode::new("boolean", "Union", DesignPanelNodeKind::BooleanOperation)
@@ -4755,7 +6119,12 @@ fn boolean_property_is_legacy_geometry_only(cx: &mut TestAppContext) {
                 );
         panel.set_node(legacy, cx);
         assert!(panel.property_is_editable(DesignPanelProperty::BooleanOperation));
-        assert!(panel.render_geometry(cx).is_some());
+        let projection = sections::shape::ShapeProjection::from_node(
+            panel.id.clone(),
+            panel.can_edit(),
+            panel.host.inspected_node(),
+        );
+        assert!(sections::shape::render_geometry(&projection, panel, cx).is_some());
     });
 }
 
@@ -4768,13 +6137,28 @@ fn canonical_mask_section_omits_use_as_mask_but_legacy_geometry_retains_it(
     let panel = panel(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        panel.expanded_sections.clear();
-        panel.expanded_sections.insert(DesignPanelSection::Mask);
+        panel.sections.clear_expanded();
+        panel.sections.expand(DesignPanelSection::Mask);
         panel.set_additional_labels(true, cx);
-        assert!(panel.node.supports_section(DesignPanelSection::Mask));
-        assert!(!panel.node.supports_section(DesignPanelSection::Geometry));
+        assert!(
+            panel
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Mask)
+        );
+        assert!(
+            !panel
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Geometry)
+        );
         assert!(panel.render_mask(cx).is_some());
-        assert!(panel.render_geometry(cx).is_none());
+        let projection = sections::shape::ShapeProjection::from_node(
+            panel.id.clone(),
+            panel.can_edit(),
+            panel.host.inspected_node(),
+        );
+        assert!(sections::shape::render_geometry(&projection, panel, cx).is_none());
         cx.notify();
     });
     visual_cx.run_until_parked();
@@ -4799,11 +6183,21 @@ fn canonical_mask_section_omits_use_as_mask_but_legacy_geometry_retains_it(
                     ]),
             );
         panel.set_node(legacy, cx);
-        panel.expanded_sections.clear();
-        panel.expanded_sections.insert(DesignPanelSection::Geometry);
+        panel.sections.clear_expanded();
+        panel.sections.expand(DesignPanelSection::Geometry);
         panel.set_additional_labels(true, cx);
-        assert!(!panel.node.supports_section(DesignPanelSection::Mask));
-        assert!(panel.render_geometry(cx).is_some());
+        assert!(
+            !panel
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Mask)
+        );
+        let projection = sections::shape::ShapeProjection::from_node(
+            panel.id.clone(),
+            panel.can_edit(),
+            panel.host.inspected_node(),
+        );
+        assert!(sections::shape::render_geometry(&projection, panel, cx).is_some());
         cx.notify();
     });
     visual_cx.run_until_parked();
@@ -4837,7 +6231,7 @@ fn ellipse_editors_display_degrees_and_percent_but_emit_canonical_units(cx: &mut
             );
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("180", window, cx);
@@ -4932,7 +6326,7 @@ fn section_visibility_is_independent_from_rotation_and_layer_appearance(cx: &mut
     let captured = actions(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        let hostile_parent = panel.node.clone();
+        let hostile_parent = panel.host.inspected_node().clone();
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
                 hostile_parent,
@@ -4951,10 +6345,10 @@ fn section_visibility_is_independent_from_rotation_and_layer_appearance(cx: &mut
             }),
             cx,
         );
-        assert!(panel.node.supports_visibility());
-        assert!(!panel.node.supports_transforms());
-        assert!(!panel.node.supports_auto_layout_child());
-        assert!(!panel.node.supports_add_auto_layout());
+        assert!(panel.host.inspected_node().supports_visibility());
+        assert!(!panel.host.inspected_node().supports_transforms());
+        assert!(!panel.host.inspected_node().supports_auto_layout_child());
+        assert!(!panel.host.inspected_node().supports_add_auto_layout());
         assert!(panel.property_is_editable(DesignPanelProperty::Visible));
         assert!(!panel.property_is_editable(DesignPanelProperty::Rotation));
         assert!(!panel.property_is_editable(DesignPanelProperty::Opacity));
@@ -5034,17 +6428,21 @@ fn section_and_transform_intent_guards_reject_stale_host_echoes(cx: &mut TestApp
         );
 
         {
-            let section = panel.node.section.as_mut().expect("Section properties");
+            let mut next_node = panel.node().clone();
+            let section = next_node.section.as_mut().expect("Section properties");
             section.capabilities.share = false;
             section.capabilities.resolve_changed_status = false;
+            panel.set_node(next_node, cx);
         }
         assert!(!panel.node_capability_allows_action(&share));
         assert!(!panel.node_capability_allows_action(&resolve));
         {
-            let section = panel.node.section.as_mut().expect("Section properties");
+            let mut next_node = panel.node().clone();
+            let section = next_node.section.as_mut().expect("Section properties");
             section.capabilities.share = true;
             section.capabilities.resolve_changed_status = true;
             section.dev_status.as_mut().expect("status").changed = false;
+            panel.set_node(next_node, cx);
         }
         assert!(!panel.node_capability_allows_action(&resolve));
 
@@ -5103,10 +6501,11 @@ fn section_and_transform_intent_guards_reject_stale_host_echoes(cx: &mut TestApp
             }
         ));
 
-        panel
-            .node
+        let mut next_node = panel.node().clone();
+        next_node
             .transform_modifiers
             .insert(0, DesignRepeatModifier::radial("host-inserted-before"));
+        panel.set_node(next_node, cx);
         assert!(
             !panel.node_capability_allows_action(&remove),
             "a retained index hint is rejected after host reorder"
@@ -5119,7 +6518,7 @@ fn section_and_transform_intent_guards_reject_stale_host_echoes(cx: &mut TestApp
             }
         ));
 
-        let viewer_node = panel.node.clone();
+        let viewer_node = panel.host.inspected_node().clone();
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
                 viewer_node,
@@ -5154,7 +6553,16 @@ fn section_and_transform_controls_follow_capabilities_and_emit_stable_intents(
         assert!(!panel.property_is_editable(DesignPanelProperty::BlendMode));
         assert!(panel.property_is_editable(DesignPanelProperty::CornerRadius));
         assert!(panel.property_is_editable(DesignPanelProperty::CornerSmoothing));
-        assert!(panel.render_section_properties(cx).is_some());
+        let projection = sections::shape::ShapeProjection::from_node(
+            panel.id.clone(),
+            panel.can_edit(),
+            panel.host.inspected_node(),
+        );
+        let panel_entity = cx.entity();
+        assert!(
+            sections::shape::render_section_properties(&projection, panel, &panel_entity, cx,)
+                .is_some()
+        );
         assert!(
             panel
                 .property_options(DesignPanelProperty::SectionDevStatus)
@@ -5195,7 +6603,7 @@ fn section_and_transform_controls_follow_capabilities_and_emit_stable_intents(
             cx,
         );
 
-        let mut radial = panel.node.clone();
+        let mut radial = panel.host.inspected_node().clone();
         radial.transform_modifiers[0] = DesignRepeatModifier::radial("radial-stable");
         panel.set_node(radial, cx);
         assert_eq!(
@@ -5357,7 +6765,7 @@ fn layout_guide_detach_intents_retain_bound_identity(cx: &mut TestAppContext) {
 
     panel.update(visual_cx, |panel, cx| {
         panel.emit_layout_grid_style_detach(cx);
-        let mut detached_style = panel.node.clone();
+        let mut detached_style = panel.host.inspected_node().clone();
         detached_style.layout_grid_style_binding = None;
         panel.set_node(detached_style, cx);
         let (target, _) = panel
@@ -5486,7 +6894,7 @@ fn layout_guide_resource_browsers_emit_atomic_styles_and_stable_variable_targets
             .expect("stable columns count target");
         panel.emit_layout_grid_variable_apply(columns_target.clone(), "columns-auto".into(), cx);
 
-        let mut reordered = panel.node.clone();
+        let mut reordered = panel.host.inspected_node().clone();
         reordered.layout_grids.swap(0, 1);
         panel.set_node(reordered, cx);
         panel.emit_layout_grid_variable_apply(columns_target, "columns-12".into(), cx);
@@ -5652,7 +7060,7 @@ fn layout_guide_count_editor_emits_auto_as_a_typed_value(cx: &mut TestAppContext
                 window,
                 cx,
             );
-            panel.property_input.update(cx, |input, cx| {
+            panel.retained.inputs.property.update(cx, |input, cx| {
                 input.set_value("Auto", window, cx);
             });
             panel.finish_property_edit(true, window, cx);
@@ -5696,11 +7104,11 @@ fn layout_guide_edit_and_remove_intents_follow_stable_ids_across_host_reorder(
                 cx,
             );
 
-            let mut reordered = panel.node.clone();
+            let mut reordered = panel.host.inspected_node().clone();
             reordered.layout_grids.swap(0, 1);
             panel.set_node(reordered, cx);
             assert_eq!(
-                panel.property_editor.as_ref().map(|editor| editor.property),
+                panel.edit.property.as_ref().map(|editor| editor.property),
                 Some(DesignPanelProperty::LayoutGridSize(1))
             );
             panel.emit_property_edit(
@@ -5787,12 +7195,15 @@ fn auxiliary_layout_guide_color_edits_resolve_stable_identity_after_reorder(
     let captured = actions(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        panel.auxiliary_color_picker = Some(AuxiliaryColorPickerTarget::LayoutGrid {
-            node_id: "frame".into(),
-            guide_id: "guide-a".into(),
-            index: 0,
-        });
-        panel.node.layout_grids.swap(0, 1);
+        *panel.overlays.auxiliary_color_picker_test_slot() =
+            Some(AuxiliaryColorPickerTarget::LayoutGrid {
+                node_id: "frame".into(),
+                guide_id: "guide-a".into(),
+                index: 0,
+            });
+        let mut next_node = panel.node().clone();
+        next_node.layout_grids.swap(0, 1);
+        panel.set_node(next_node, cx);
         panel.emit_auxiliary_color_edit(
             &DesignPaintEdit {
                 property: DesignPaintProperty::Opacity,
@@ -5882,7 +7293,7 @@ fn layout_guide_picker_keeps_color_and_opacity_permissions_independent(cx: &mut 
                 .read_only_with_reason("Color is bound"),
                 cx,
             );
-            assert!(panel.active_paint_edit.is_some());
+            assert!(panel.edit.active_paint_edit().is_some());
             panel.sync_paint_picker(window, cx);
             assert_eq!(
                 panel.paint_picker.read(cx).color_only_editability(),
@@ -5912,8 +7323,11 @@ fn layout_guide_picker_keeps_color_and_opacity_permissions_independent(cx: &mut 
                     .read_only_with_reason("Opacity is bound"),
                 cx,
             );
-            assert!(panel.active_paint_edit.is_none());
-            assert_eq!(panel.auxiliary_color_picker.as_ref(), Some(&target));
+            assert!(panel.edit.active_paint_edit().is_none());
+            assert_eq!(
+                panel.overlays.auxiliary_color_picker().as_ref(),
+                Some(&target)
+            );
             panel.sync_paint_picker(window, cx);
             assert_eq!(
                 panel.paint_picker.read(cx).color_only_editability(),
@@ -5969,13 +7383,16 @@ fn auxiliary_effect_color_edits_resolve_kind_and_stable_identity_after_reorder(
     let captured = actions(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        panel.auxiliary_color_picker = Some(AuxiliaryColorPickerTarget::Effect {
-            node_id: "shape".into(),
-            effect_id: "noise-a".into(),
-            index: 0,
-            property: DesignPanelProperty::EffectNoiseSecondaryColor(0),
-        });
-        panel.node.effects.swap(0, 1);
+        *panel.overlays.auxiliary_color_picker_test_slot() =
+            Some(AuxiliaryColorPickerTarget::Effect {
+                node_id: "shape".into(),
+                effect_id: "noise-a".into(),
+                index: 0,
+                property: DesignPanelProperty::EffectNoiseSecondaryColor(0),
+            });
+        let mut next_node = panel.node().clone();
+        next_node.effects.swap(0, 1);
+        panel.set_node(next_node, cx);
         panel.emit_auxiliary_color_edit(
             &DesignPaintEdit {
                 property: DesignPaintProperty::Color,
@@ -6015,7 +7432,7 @@ fn replacing_selection_closes_the_picker(cx: &mut TestAppContext) {
     };
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(target.clone());
+            *panel.overlays.active_picker_test_slot() = Some(target.clone());
             panel.sync_paint_picker(window, cx);
         });
     });
@@ -6027,7 +7444,7 @@ fn replacing_selection_closes_the_picker(cx: &mut TestAppContext) {
             DesignPanelNode::new("b", "Text", DesignPanelNodeKind::Text),
             cx,
         );
-        assert!(panel.active_picker.is_none());
+        assert!(panel.overlays.active_picker().is_none());
     });
     visual_cx.run_until_parked();
 
@@ -6050,7 +7467,7 @@ fn removing_the_active_paint_clears_picker_state(cx: &mut TestAppContext) {
     };
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(target.clone());
+            *panel.overlays.active_picker_test_slot() = Some(target.clone());
             panel.sync_paint_picker(window, cx);
         });
     });
@@ -6060,7 +7477,7 @@ fn removing_the_active_paint_clears_picker_state(cx: &mut TestAppContext) {
     without_fills.fills.clear();
     panel.update(visual_cx, |panel, cx| {
         panel.set_node(without_fills, cx);
-        assert!(panel.active_picker.is_none());
+        assert!(panel.overlays.active_picker().is_none());
     });
     visual_cx.run_until_parked();
 
@@ -6086,7 +7503,7 @@ fn numeric_edits_emit_one_controlled_transaction(cx: &mut TestAppContext) {
             );
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("+10", window, cx);
@@ -6134,7 +7551,7 @@ fn numeric_edits_emit_one_controlled_transaction(cx: &mut TestAppContext) {
         ]
     );
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.width),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().width),
         100.,
         "the controlled panel must not mutate host view data"
     );
@@ -6159,11 +7576,12 @@ fn value_cell_focus_round_trips_and_blur_transfer_is_never_stolen(cx: &mut TestA
     let x_return_handle = visual_cx.read(|app| {
         let panel = panel.read(app);
         assert_eq!(
-            panel.property_editor.as_ref().map(|editor| editor.property),
+            panel.edit.property.as_ref().map(|editor| editor.property),
             Some(DesignPanelProperty::X)
         );
         let return_focus = panel
-            .editor_focus_return
+            .edit
+            .focus_return
             .as_ref()
             .expect("control activation should retain X");
         assert_eq!(
@@ -6183,7 +7601,8 @@ fn value_cell_focus_round_trips_and_blur_transfer_is_never_stolen(cx: &mut TestA
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .property_editor
+                .edit
+                .property
                 .as_ref()
                 .map(|editor| editor.property)
         }),
@@ -6196,13 +7615,14 @@ fn value_cell_focus_round_trips_and_blur_transfer_is_never_stolen(cx: &mut TestA
     visual_cx.read(|app| {
         let panel = panel.read(app);
         assert_eq!(
-            panel.property_editor.as_ref().map(|editor| editor.property),
+            panel.edit.property.as_ref().map(|editor| editor.property),
             Some(DesignPanelProperty::Y),
             "the Input blur must allow the newly clicked row to take over"
         );
         assert!(matches!(
             panel
-                .editor_focus_return
+                .edit
+                .focus_return
                 .as_ref()
                 .map(|return_focus| &return_focus.origin),
             Some(EditorFocusOrigin::ValueCell(DesignPanelProperty::Y))
@@ -6232,7 +7652,7 @@ fn cancel_restores_the_original_controlled_value(cx: &mut TestAppContext) {
             );
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("+25", window, cx);
@@ -6280,7 +7700,7 @@ fn permission_downgrade_terminates_active_numeric_edit_before_gating(cx: &mut Te
                 ),
                 cx,
             );
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -6313,9 +7733,8 @@ fn dimension_menu_opens_from_keyboard_and_emits_sizing_selection(cx: &mut TestAp
     let width_menu_focus = visual_cx.read(|app| {
         panel
             .read(app)
-            .dimension_menu_focus
-            .first()
-            .expect("Width menu focus")
+            .overlays
+            .dimension_menu_focus(DesignLayoutDimensionAxis::Width)
             .clone()
     });
 
@@ -6325,7 +7744,7 @@ fn dimension_menu_opens_from_keyboard_and_emits_sizing_selection(cx: &mut TestAp
     visual_cx.simulate_keystrokes("enter");
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).dimension_menu_open),
+        visual_cx.read(|app| panel.read(app).overlays.dimension_menu_open()),
         Some(DesignLayoutDimensionAxis::Width)
     );
     assert!(
@@ -6355,7 +7774,8 @@ fn dimension_menu_opens_from_keyboard_and_emits_sizing_selection(cx: &mut TestAp
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .layout
                 .as_ref()
                 .expect("frame layout")
@@ -6664,16 +8084,19 @@ fn dimension_limit_add_remove_stays_controlled_and_gates_each_leaf(cx: &mut Test
         panel.update(app, |panel, cx| {
             assert!(
                 panel
+                    .features
+                    .layout
                     .dimension_limit_fields_disclosed
                     .contains(&DesignPanelProperty::MinWidth)
             );
-            assert!(panel.property_editor.as_ref().is_some_and(|editor| {
+            assert!(panel.edit.property.as_ref().is_some_and(|editor| {
                 editor.property == DesignPanelProperty::MinWidth
                     && editor.original == DesignPanelValue::OptionalNumber(None)
             }));
             assert_eq!(
                 panel
-                    .node
+                    .host
+                    .inspected_node()
                     .layout
                     .as_ref()
                     .expect("controlled layout")
@@ -6760,7 +8183,8 @@ fn dimension_limit_add_remove_stays_controlled_and_gates_each_leaf(cx: &mut Test
         visual_cx.read(|app| {
             let layout = panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .layout
                 .as_ref()
                 .expect("controlled layout");
@@ -6874,16 +8298,21 @@ fn dimension_limit_icon_supports_pointer_keyboard_hover_and_selection_reset(
             ),
             cx,
         );
-        assert!(panel.dimension_limit_fields_disclosed.is_empty());
-        assert_eq!(panel.dimension_menu_open, None);
+        assert!(
+            panel
+                .features
+                .layout
+                .dimension_limit_fields_disclosed
+                .is_empty()
+        );
+        assert_eq!(panel.overlays.dimension_menu_open(), None);
     });
     visual_cx.run_until_parked();
     let width_menu_focus = visual_cx.read(|app| {
         panel
             .read(app)
-            .dimension_menu_focus
-            .first()
-            .expect("Width menu focus")
+            .overlays
+            .dimension_menu_focus(DesignLayoutDimensionAxis::Width)
             .clone()
     });
     visual_cx.update(|window, cx| width_menu_focus.focus(window, cx));
@@ -6893,12 +8322,16 @@ fn dimension_limit_icon_supports_pointer_keyboard_hover_and_selection_reset(
         visual_cx.read(|app| {
             let panel = panel.read(app);
             panel
+                .features
+                .layout
                 .dimension_limit_fields_disclosed
                 .contains(&DesignPanelProperty::MinWidth)
                 && panel
+                    .features
+                    .layout
                     .dimension_limit_fields_disclosed
                     .contains(&DesignPanelProperty::MaxWidth)
-                && panel.dimension_menu_open == Some(DesignLayoutDimensionAxis::Width)
+                && panel.overlays.dimension_menu_open() == Some(DesignLayoutDimensionAxis::Width)
         }),
         "Enter on the focused dimension trigger follows the pointer disclosure path"
     );
@@ -6914,7 +8347,10 @@ fn padding_supports_axis_individual_and_css_shorthand_modes(cx: &mut TestAppCont
     let captured_actions = actions(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        assert_eq!(panel.padding_editor_mode, PaddingEditorMode::Axes);
+        assert_eq!(
+            panel.features.layout.padding_editor_mode,
+            PaddingEditorMode::Axes
+        );
         assert_eq!(
             panel.current_property_value(DesignPanelProperty::PaddingVertical),
             Some(DesignPanelValue::Number(8.))
@@ -6971,7 +8407,8 @@ fn padding_supports_axis_individual_and_css_shorthand_modes(cx: &mut TestAppCont
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .layout
                 .as_ref()
                 .expect("controlled layout")
@@ -7062,9 +8499,11 @@ fn wrap_counter_axis_guards_values_allows_cancel_and_never_emits_for_viewers(
             cx,
         );
 
-        let layout = panel.node.layout.as_mut().expect("frame layout");
+        let mut next_node = panel.node().clone();
+        let layout = next_node.layout.as_mut().expect("frame layout");
         layout.counter_axis_align_content = DesignCounterAxisAlignContent::SpaceBetween;
         layout.counter_axis_gap = None;
+        panel.set_node(next_node, cx);
         assert!(!panel.property_is_editable(DesignPanelProperty::CounterAxisGap));
         panel.emit_property(
             DesignPanelProperty::CounterAxisGap,
@@ -7190,7 +8629,7 @@ fn viewer_and_page_contexts_never_emit_edit_intents(cx: &mut TestAppContext) {
 
     assert!(captured_actions.borrow().is_empty());
     assert_eq!(
-        visual_cx.read(|app| { panel.read(app).inspection_context.selection().kind() }),
+        visual_cx.read(|app| { panel.read(app).host.inspection_context.selection().kind() }),
         DesignPanelSelectionKind::None
     );
 }
@@ -7310,7 +8749,8 @@ fn viewer_generic_value_cells_emit_exact_copy_intents_from_pointer_and_keyboard(
             );
             assert!(
                 panel
-                    .property_editor
+                    .edit
+                    .property
                     .as_ref()
                     .is_some_and(|editor| editor.property == DesignPanelProperty::X),
                 "editor mode must retain its existing value-editor activation"
@@ -7439,8 +8879,14 @@ fn viewer_ui3_projection_uses_exact_section_copy_and_representation_intents(
     );
 
     panel.update(visual_cx, |panel, cx| {
-        panel.emit_viewer_section_copy("typography".into(), typography_copy.clone(), cx);
-        panel.emit_viewer_section_representation_change(
+        sections::viewer::emit_section_copy(
+            panel,
+            "typography".into(),
+            typography_copy.clone(),
+            cx,
+        );
+        sections::viewer::emit_section_representation_change(
+            panel,
             "borders".into(),
             DesignViewerColorRepresentation::Hex,
             cx,
@@ -7474,8 +8920,9 @@ fn viewer_ui3_projection_uses_exact_section_copy_and_representation_intents(
             ),
             cx,
         );
-        panel.emit_viewer_section_copy("borders".into(), borders_copy.clone(), cx);
-        panel.emit_viewer_section_representation_change(
+        sections::viewer::emit_section_copy(panel, "borders".into(), borders_copy.clone(), cx);
+        sections::viewer::emit_section_representation_change(
+            panel,
             "borders".into(),
             DesignViewerColorRepresentation::Rgb,
             cx,
@@ -7497,8 +8944,9 @@ fn viewer_ui3_projection_uses_exact_section_copy_and_representation_intents(
             cx,
         );
         panel.set_viewer_properties_view_data(view_data, cx);
-        panel.emit_viewer_section_copy("borders".into(), borders_copy, cx);
-        panel.emit_viewer_section_representation_change(
+        sections::viewer::emit_section_copy(panel, "borders".into(), borders_copy, cx);
+        sections::viewer::emit_section_representation_change(
+            panel,
             "borders".into(),
             DesignViewerColorRepresentation::Hsl,
             cx,
@@ -7571,6 +9019,7 @@ fn ignored_auto_layout_child_restores_constraints_and_keeps_a_flow_escape(cx: &m
         assert!(panel.can_show_constraints());
         assert!(
             panel
+                .host
                 .inspection_context
                 .parent_layout()
                 .is_ignored_by_auto_layout()
@@ -7662,7 +9111,7 @@ fn ordinary_multiple_selection_intents_use_the_exact_target_and_keep_leaf_states
             ],
             cx,
         );
-        let controlled_states = panel.property_value_states.clone();
+        let controlled_states = panel.host.property_states.clone();
 
         panel.emit_property(
             DesignPanelProperty::Width,
@@ -7672,7 +9121,7 @@ fn ordinary_multiple_selection_intents_use_the_exact_target_and_keep_leaf_states
         panel.emit_add(DesignPanelCollection::Fill, cx);
 
         assert_eq!(
-            panel.property_value_states, controlled_states,
+            panel.host.property_states, controlled_states,
             "emitting candidates must not synthesize uniform, unset, or binding state"
         );
     });
@@ -7765,7 +9214,12 @@ fn selection_color_edits_preserve_aggregate_and_occurrence_identity(cx: &mut Tes
             && paint_references == &vec![first_reference.clone(), second_reference.clone()]
     )));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.resolved_selection_colors()[0].color),
+        visual_cx.read(|app| panel
+            .read(app)
+            .host
+            .inspected_node()
+            .resolved_selection_colors()[0]
+            .color),
         DesignColor::PURPLE,
         "selection-color edits remain host controlled"
     );
@@ -7824,7 +9278,7 @@ fn selection_paint_edits_and_occurrence_selection_preserve_exact_targeting(
             ),
             cx,
         );
-        panel.auxiliary_color_picker = Some(target);
+        *panel.overlays.auxiliary_color_picker_test_slot() = Some(target);
         panel.emit_auxiliary_color_edit(
             &DesignPaintEdit {
                 property: DesignPaintProperty::Opacity,
@@ -7910,7 +9364,11 @@ fn selection_paint_edits_and_occurrence_selection_preserve_exact_targeting(
         }
     ));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.resolved_selection_colors()[0]
+        visual_cx.read(|app| panel
+            .read(app)
+            .host
+            .inspected_node()
+            .resolved_selection_colors()[0]
             .paint
             .clone()),
         representative,
@@ -7957,7 +9415,7 @@ fn selection_paint_picker_rebases_references_on_same_target_host_echo(cx: &mut T
             ),
             cx,
         );
-        panel.auxiliary_color_picker = Some(target.clone());
+        *panel.overlays.auxiliary_color_picker_test_slot() = Some(target.clone());
 
         let echoed_row = super::super::DesignSelectionColor::new(
             row.id.clone(),
@@ -7974,7 +9432,10 @@ fn selection_paint_picker_rebases_references_on_same_target_host_echo(cx: &mut T
             ),
             cx,
         );
-        assert_eq!(panel.auxiliary_color_picker.as_ref(), Some(&target));
+        assert_eq!(
+            panel.overlays.auxiliary_color_picker().as_ref(),
+            Some(&target)
+        );
         panel.emit_auxiliary_color_edit(
             &DesignPaintEdit {
                 property: DesignPaintProperty::Opacity,
@@ -8032,12 +9493,13 @@ fn selection_occurrence_target_remains_viewer_safe_while_paint_edits_are_gated(
             ),
             cx,
         );
-        panel.auxiliary_color_picker = Some(AuxiliaryColorPickerTarget::SelectionColor {
-            target: DesignPanelTarget::Nodes {
-                node_ids: vec!["one".into(), "two".into()],
-            },
-            selection_color_id: row.id.clone(),
-        });
+        *panel.overlays.auxiliary_color_picker_test_slot() =
+            Some(AuxiliaryColorPickerTarget::SelectionColor {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec!["one".into(), "two".into()],
+                },
+                selection_color_id: row.id.clone(),
+            });
         panel.emit_auxiliary_color_edit(
             &DesignPaintEdit {
                 property: DesignPaintProperty::Opacity,
@@ -8369,12 +9831,13 @@ fn host_echo_preserves_viewer_and_multiple_inspection_context(cx: &mut TestAppCo
         echo.opacity = 72.;
         panel.set_node(echo, cx);
         assert_eq!(
-            panel.inspection_context.selection().kind(),
+            panel.host.inspection_context.selection().kind(),
             DesignPanelSelectionKind::Multiple
         );
         assert!(
             panel
-                .property_value_states
+                .host
+                .property_states
                 .get(&DesignPanelProperty::Width)
                 .is_some_and(DesignPanelPropertyValueState::is_mixed)
         );
@@ -8390,7 +9853,7 @@ fn host_echo_preserves_viewer_and_multiple_inspection_context(cx: &mut TestAppCo
         panel.set_node(first, cx);
         assert!(!panel.can_edit());
         assert_eq!(
-            panel.inspection_context.permissions().access_mode(),
+            panel.host.inspection_context.permissions().access_mode(),
             super::super::DesignPanelAccessMode::View
         );
     });
@@ -8417,7 +9880,7 @@ fn typography_rules_gate_vertical_alignment_and_max_lines(cx: &mut TestAppContex
         assert!(!panel.property_is_editable(DesignPanelProperty::TextMaxLines));
         assert!(!panel.text_max_lines_are_available());
 
-        let mut auto_height = panel.node.clone();
+        let mut auto_height = panel.host.inspected_node().clone();
         let typography = auto_height.typography.as_mut().expect("text typography");
         typography.resize = DesignTextResize::AutoHeight;
         panel.set_node(auto_height.clone(), cx);
@@ -8766,8 +10229,8 @@ fn typography_details_are_lossless_host_controlled_and_respect_read_only_states(
             cx,
         );
         assert!(!panel.property_is_editable(DesignPanelProperty::TextDecorationColor));
-        panel.type_settings_open = true;
-        panel.type_settings_tab = TypographySettingsTab::Details;
+        *panel.overlays.type_settings_open_test_slot() = true;
+        panel.features.typography.settings_tab = TypographySettingsTab::Details;
         drop(panel.render_typography(cx));
 
         for (property, value) in [
@@ -8885,7 +10348,8 @@ fn typography_details_are_lossless_host_controlled_and_respect_read_only_states(
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .typography
                 .as_ref()
                 .expect("text typography")
@@ -8917,7 +10381,7 @@ fn paragraph_indent_uses_the_continuous_typography_edit_lifecycle(cx: &mut TestA
             );
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("+4", window, cx);
@@ -8972,7 +10436,8 @@ fn paragraph_indent_uses_the_continuous_typography_edit_lifecycle(cx: &mut TestA
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .typography
                 .as_ref()
                 .expect("text typography")
@@ -8996,7 +10461,7 @@ fn paragraph_indent_and_list_spacing_follow_current_text_context_gates(cx: &mut 
         assert!(!panel.property_is_editable(DesignPanelProperty::ParagraphIndent));
         assert!(!panel.property_is_editable(DesignPanelProperty::ListSpacing));
 
-        let mut next = panel.node.clone();
+        let mut next = panel.host.inspected_node().clone();
         let typography = next.typography.as_mut().expect("text typography");
         typography.horizontal_alignment = DesignTextHorizontalAlignment::Left;
         typography.list = DesignTextList::Numbered;
@@ -9037,7 +10502,7 @@ fn list_spacing_cancel_emits_a_complete_selected_range_edit_lifecycle(cx: &mut T
             );
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("+4", window, cx);
@@ -9094,11 +10559,11 @@ fn typography_style_picker_is_retained_but_closes_when_entering_native_viewer_pr
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.open_typography_style_picker(window, cx);
-            assert!(panel.typography_style_picker_open);
+            assert!(panel.overlays.typography_style_picker_open());
             drop(panel.render_typography(cx));
 
             panel.set_node(node.clone(), cx);
-            assert!(panel.typography_style_picker_open);
+            assert!(panel.overlays.typography_style_picker_open());
             assert_eq!(panel.typography_style_picker, picker);
 
             panel.set_inspection_context(
@@ -9111,7 +10576,7 @@ fn typography_style_picker_is_retained_but_closes_when_entering_native_viewer_pr
             );
             panel.sync_typography_style_picker(cx);
             assert!(
-                !panel.typography_style_picker_open,
+                !panel.overlays.typography_style_picker_open(),
                 "the viewer projection cannot retain an unreachable editor popover"
             );
             assert_eq!(
@@ -9125,7 +10590,7 @@ fn typography_style_picker_is_retained_but_closes_when_entering_native_viewer_pr
     visual_cx.simulate_keystrokes("escape");
     visual_cx.run_until_parked();
 
-    assert!(!visual_cx.read(|app| panel.read(app).typography_style_picker_open));
+    assert!(!visual_cx.read(|app| panel.read(app).overlays.typography_style_picker_open()));
 }
 
 #[gpui::test]
@@ -9233,7 +10698,8 @@ fn typography_style_picker_emits_exact_host_controlled_apply_and_detach_intents(
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .typography
                 .as_ref()
                 .expect("text typography")
@@ -9350,10 +10816,10 @@ fn type_settings_renders_both_interactive_tabs_and_preserves_secondary_intents(
     let captured_actions = actions(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        panel.type_settings_open = true;
-        panel.type_settings_tab = TypographySettingsTab::Basics;
+        *panel.overlays.type_settings_open_test_slot() = true;
+        panel.features.typography.settings_tab = TypographySettingsTab::Basics;
         drop(panel.render_typography(cx));
-        panel.type_settings_tab = TypographySettingsTab::Details;
+        panel.features.typography.settings_tab = TypographySettingsTab::Details;
         drop(panel.render_typography(cx));
 
         for (property, value) in [
@@ -9423,8 +10889,8 @@ fn type_setting_number_field_keeps_its_native_trigger_and_restores_it(cx: &mut T
         cx.notify();
     });
     panel.update(visual_cx, |panel, cx| {
-        panel.type_settings_open = true;
-        panel.type_settings_tab = TypographySettingsTab::Basics;
+        *panel.overlays.type_settings_open_test_slot() = true;
+        panel.features.typography.settings_tab = TypographySettingsTab::Basics;
         cx.notify();
     });
     visual_cx.run_until_parked();
@@ -9439,11 +10905,12 @@ fn type_setting_number_field_keeps_its_native_trigger_and_restores_it(cx: &mut T
     let return_handle = visual_cx.read(|app| {
         let panel = panel.read(app);
         assert_eq!(
-            panel.property_editor.as_ref().map(|editor| editor.property),
+            panel.edit.property.as_ref().map(|editor| editor.property),
             Some(DesignPanelProperty::ParagraphSpacing)
         );
         let return_focus = panel
-            .editor_focus_return
+            .edit
+            .focus_return
             .as_ref()
             .expect("Type Setting activation should retain its Button");
         assert_eq!(
@@ -9471,7 +10938,7 @@ fn type_setting_number_field_keeps_its_native_trigger_and_restores_it(cx: &mut T
                 cx,
             );
             assert_eq!(
-                panel.property_editor.as_ref().map(|editor| editor.property),
+                panel.edit.property.as_ref().map(|editor| editor.property),
                 Some(DesignPanelProperty::ParagraphSpacing)
             );
         });
@@ -9495,8 +10962,8 @@ fn escape_closes_transient_type_settings(cx: &mut TestAppContext) {
 
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.type_settings_open = true;
-            panel.type_settings_tab = TypographySettingsTab::Details;
+            *panel.overlays.type_settings_open_test_slot() = true;
+            panel.features.typography.settings_tab = TypographySettingsTab::Details;
             panel.focus_handle.focus(window, cx);
             cx.notify();
         });
@@ -9505,9 +10972,9 @@ fn escape_closes_transient_type_settings(cx: &mut TestAppContext) {
     visual_cx.simulate_keystrokes("escape");
     visual_cx.run_until_parked();
 
-    assert!(!visual_cx.read(|app| panel.read(app).type_settings_open));
+    assert!(!visual_cx.read(|app| panel.read(app).overlays.type_settings_open()));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).type_settings_tab),
+        visual_cx.read(|app| panel.read(app).features.typography.settings_tab),
         TypographySettingsTab::Basics
     );
 }
@@ -9547,7 +11014,7 @@ fn mixed_numeric_state_opens_an_empty_controlled_editor(cx: &mut TestAppContext)
             );
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     assert_eq!(
         visual_cx.read(|app| input.read(app).value().to_string()),
         ""
@@ -9577,7 +11044,7 @@ fn mixed_numeric_state_opens_an_empty_controlled_editor(cx: &mut TestAppContext)
         )) if node_ids == &vec![SharedString::from("one"), SharedString::from("two")]
     )));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.width),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().width),
         100.,
         "mixed edits must remain host controlled"
     );
@@ -9628,7 +11095,7 @@ fn retained_picker_syncs_and_emits_host_controlled_paint_changes(cx: &mut TestAp
 
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(target.clone());
+            *panel.overlays.active_picker_test_slot() = Some(target.clone());
             panel.sync_paint_picker(window, cx);
         });
     });
@@ -9693,7 +11160,7 @@ fn retained_picker_syncs_and_emits_host_controlled_paint_changes(cx: &mut TestAp
         } if node_id.as_ref() == "rectangle" && *payload == candidate.payload
     )));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.fills[0].clone()),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().fills[0].clone()),
         original,
         "picker candidates must not mutate host view data"
     );
@@ -9724,7 +11191,7 @@ fn paint_shader_edits_revalidate_current_definition_id_and_value_kind(cx: &mut T
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.set_shader_view_data(shader_view_data, cx);
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "shader-fill".into(),
@@ -9791,7 +11258,7 @@ fn paint_shader_edits_revalidate_current_definition_id_and_value_kind(cx: &mut T
         } if definition_id.as_ref() == "scale" && *value == 2.
     )));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.fills[0].clone()),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().fills[0].clone()),
         DesignPaint::shader("noise", "Noise").with_id("shader-fill"),
         "validated shader intents must remain host controlled"
     );
@@ -9822,7 +11289,7 @@ fn retained_auxiliary_color_picker_preserves_rgba_phases_and_page_identity(
     });
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.page_background_picker_open = true;
+            *panel.overlays.page_background_picker_open_test_slot() = true;
             panel.open_auxiliary_color_picker(
                 AuxiliaryColorPickerTarget::PageBackground {
                     page_id: "page-stable".into(),
@@ -9911,20 +11378,22 @@ fn retained_auxiliary_color_picker_preserves_rgba_phases_and_page_identity(
     preview_page.background.color = rgba_preview;
     panel.update(visual_cx, |panel, cx| {
         panel.set_page_view_data(preview_page, cx);
-        assert!(panel.auxiliary_color_picker.is_some());
-        assert!(panel.active_paint_edit.is_some());
-        assert!(panel.auxiliary_color_picker.as_ref().is_some_and(|target| {
-            target.matches_picker_target(
-                &panel
-                    .active_paint_edit
-                    .as_ref()
-                    .expect("active edit")
-                    .target,
-            )
-        }));
+        assert!(panel.overlays.auxiliary_color_picker().is_some());
+        assert!(panel.edit.active_paint_edit().is_some());
+        assert!(
+            panel
+                .overlays
+                .auxiliary_color_picker()
+                .as_ref()
+                .is_some_and(|target| {
+                    target.matches_picker_target(
+                        &panel.edit.active_paint_edit().expect("active edit").target,
+                    )
+                })
+        );
         panel.prepare_paint_picker_for_dismissal(cx);
         panel.cancel_active_paint_edit(cx);
-        assert!(panel.active_paint_edit.is_none());
+        assert!(panel.edit.active_paint_edit().is_none());
     });
     visual_cx.run_until_parked();
     let last_action = captured_actions.borrow().last().cloned();
@@ -9960,8 +11429,8 @@ fn retained_auxiliary_color_picker_preserves_rgba_phases_and_page_identity(
 
     let action_count = captured_actions.borrow().len();
     panel.update(visual_cx, |panel, cx| {
-        panel.auxiliary_color_picker = None;
-        panel.page_background_picker_open = false;
+        *panel.overlays.auxiliary_color_picker_test_slot() = None;
+        *panel.overlays.page_background_picker_open_test_slot() = false;
         panel.set_inspection_context(
             DesignPanelInspectionContext::page(DesignPanelPermissions::viewer()),
             cx,
@@ -9976,7 +11445,7 @@ fn retained_auxiliary_color_picker_preserves_rgba_phases_and_page_identity(
                 window,
                 cx,
             );
-            assert!(panel.auxiliary_color_picker.is_some());
+            assert!(panel.overlays.auxiliary_color_picker().is_some());
             assert_eq!(
                 panel.paint_picker.read(cx).color_only_editability(),
                 (false, false)
@@ -9985,6 +11454,97 @@ fn retained_auxiliary_color_picker_preserves_rgba_phases_and_page_identity(
         });
     });
     assert_eq!(captured_actions.borrow().len(), action_count);
+}
+
+#[gpui::test]
+fn media_crop_commit_then_picker_close_has_no_extra_cancel(cx: &mut TestAppContext) {
+    let mut node = DesignPanelNode::new("media-node", "Media", DesignPanelNodeKind::Rectangle);
+    let mut paint = DesignPaint::image(super::super::DesignPaintSource::new(
+        "image-source",
+        "Image",
+    ))
+    .with_id("image-fill");
+    let DesignPaintPayload::Image(image) = &mut paint.payload else {
+        panic!("image payload");
+    };
+    image.placement = super::super::DesignMediaPaintPlacement::Crop {
+        transform: super::super::DesignPaintTransform::IDENTITY,
+    };
+    node.fills = vec![paint];
+
+    let (host, visual_cx) = setup(node, cx);
+    let panel = panel(&host, visual_cx);
+    let captured_actions = actions(&host, visual_cx);
+    let target = PaintPickerTarget {
+        collection: DesignPanelCollection::Fill,
+        index: 0,
+        paint_id: "image-fill".into(),
+    };
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_media_paint_view_data(
+            DesignMediaPaintViewData::new([super::super::DesignMediaPaintView::new(
+                DesignPanelCollection::Fill,
+                "image-fill",
+                0,
+            )
+            .with_capabilities(
+                super::super::DesignMediaPaintCapabilities::property_editor_only(),
+            )]),
+            cx,
+        );
+        *panel.overlays.active_picker_test_slot() = Some(target.clone());
+        panel.emit_media_crop_action(&target, DesignMediaCropAction::Begin, cx);
+        panel.set_media_paint_view_data(
+            DesignMediaPaintViewData::new([super::super::DesignMediaPaintView::new(
+                DesignPanelCollection::Fill,
+                "image-fill",
+                0,
+            )
+            .with_capabilities(super::super::DesignMediaPaintCapabilities::property_editor_only())
+            .with_crop_tool(super::super::DesignMediaCropToolState {
+                active: true,
+                ..super::super::DesignMediaCropToolState::default()
+            })]),
+            cx,
+        );
+        panel.emit_media_crop_action(
+            &target,
+            DesignMediaCropAction::Preview {
+                transform: super::super::DesignPaintTransform::IDENTITY,
+                zoom: 1.25,
+                aspect_ratio: super::super::DesignMediaCropAspectRatio::Free,
+            },
+            cx,
+        );
+        panel.emit_media_crop_action(
+            &target,
+            DesignMediaCropAction::Commit {
+                transform: super::super::DesignPaintTransform::IDENTITY,
+                zoom: 1.25,
+                aspect_ratio: super::super::DesignMediaCropAspectRatio::Free,
+            },
+            cx,
+        );
+        panel.emit_crop_cancel_if_active(&target, cx);
+    });
+    visual_cx.run_until_parked();
+
+    let phases = captured_actions
+        .borrow()
+        .iter()
+        .filter_map(|action| match action {
+            DesignPanelAction::PaintMediaCropActionRequested { action, .. } => Some(match action {
+                DesignMediaCropAction::Begin => "begin",
+                DesignMediaCropAction::Preview { .. } => "preview",
+                DesignMediaCropAction::Commit { .. } => "commit",
+                DesignMediaCropAction::Cancel => "cancel",
+                DesignMediaCropAction::ResizeToFit => "resize-to-fit",
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phases, ["begin", "preview", "commit"]);
 }
 
 #[gpui::test]
@@ -10036,7 +11596,7 @@ fn media_capabilities_crop_cancel_and_video_preview_keep_stable_identity(cx: &mu
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.set_media_paint_view_data(media_view_data, cx);
-            panel.active_picker = Some(image_target.clone());
+            *panel.overlays.active_picker_test_slot() = Some(image_target.clone());
             panel.sync_paint_picker(window, cx);
         });
     });
@@ -10048,25 +11608,9 @@ fn media_capabilities_crop_cancel_and_video_preview_keep_stable_identity(cx: &mu
     }
 
     panel.update(visual_cx, |panel, cx| {
-        panel.emit_crop_cancel_if_active(&image_target, cx);
-    });
-    visual_cx.run_until_parked();
-    assert!(captured_actions.borrow().iter().any(|action| matches!(
-        action,
-        DesignPanelAction::PaintMediaCropActionRequested {
-            node_id,
-            paint_id,
-            index: 0,
-            action: DesignMediaCropAction::Cancel,
-            ..
-        } if node_id.as_ref() == "media-node" && paint_id.as_ref() == "image-fill"
-    )));
-
-    captured_actions.borrow_mut().clear();
-    panel.update(visual_cx, |panel, cx| {
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
-                panel.node.clone(),
+                panel.host.inspected_node().clone(),
                 DesignPanelParentLayout::Freeform,
                 DesignPanelPermissions::viewer(),
             ),
@@ -10074,25 +11618,33 @@ fn media_capabilities_crop_cancel_and_video_preview_keep_stable_identity(cx: &mu
         );
     });
     visual_cx.run_until_parked();
-    assert!(captured_actions.borrow().iter().any(|action| matches!(
-        action,
-        DesignPanelAction::PaintMediaCropActionRequested {
+    assert!(matches!(
+        captured_actions.borrow().as_slice(),
+        [DesignPanelAction::PaintMediaCropActionRequested {
+            node_id,
             paint_id,
+            index: 0,
             action: DesignMediaCropAction::Cancel,
             ..
-        } if paint_id.as_ref() == "image-fill"
-    )));
+        }] if node_id.as_ref() == "media-node" && paint_id.as_ref() == "image-fill"
+    ));
     panel.update(visual_cx, |panel, cx| {
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
-                panel.node.clone(),
+                panel.host.inspected_node().clone(),
                 DesignPanelParentLayout::Freeform,
                 DesignPanelPermissions::editor(),
             ),
             cx,
         );
+        panel.emit_crop_cancel_if_active(&image_target, cx);
     });
     visual_cx.run_until_parked();
+    assert_eq!(
+        captured_actions.borrow().len(),
+        1,
+        "permission loss followed by picker close must emit one Cancel"
+    );
     captured_actions.borrow_mut().clear();
     let video_target = super::super::paint_picker::PaintPickerTarget {
         node_id: "media-node".into(),
@@ -10101,7 +11653,7 @@ fn media_capabilities_crop_cancel_and_video_preview_keep_stable_identity(cx: &mu
         paint_id: "video-fill".into(),
     };
     panel.update(visual_cx, |panel, cx| {
-        panel.active_picker = Some(PaintPickerTarget {
+        *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
             collection: DesignPanelCollection::Fill,
             index: 1,
             paint_id: "video-fill".into(),
@@ -10160,7 +11712,7 @@ fn media_source_actions_preserve_source_identity_type_and_independent_permission
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.set_media_paint_view_data(media_view_data, cx);
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "image-fill".into(),
@@ -10233,7 +11785,7 @@ fn media_source_actions_preserve_source_identity_type_and_independent_permission
 
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 1,
                 paint_id: "video-fill".into(),
@@ -10299,7 +11851,7 @@ fn media_source_actions_preserve_source_identity_type_and_independent_permission
     panel.update(visual_cx, |panel, cx| {
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
-                panel.node.clone(),
+                panel.host.inspected_node().clone(),
                 DesignPanelParentLayout::Freeform,
                 DesignPanelPermissions::viewer(),
             ),
@@ -10319,7 +11871,7 @@ fn media_source_actions_preserve_source_identity_type_and_independent_permission
     visual_cx.run_until_parked();
     assert_eq!(captured_actions.borrow().len(), action_count);
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.fills.clone()),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().fills.clone()),
         controlled,
         "media source workflows remain host controlled until echoed"
     );
@@ -10427,7 +11979,7 @@ fn media_file_drop_revalidates_stable_identity_source_kind_format_and_permission
             && file.kind == super::super::DesignMediaFileKind::Webm
     ));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.fills.clone()),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().fills.clone()),
         controlled,
         "the panel emits a file intent without mutating its controlled paint"
     );
@@ -10436,7 +11988,7 @@ fn media_file_drop_revalidates_stable_identity_source_kind_format_and_permission
     panel.update(visual_cx, |panel, cx| {
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
-                panel.node.clone(),
+                panel.host.inspected_node().clone(),
                 DesignPanelParentLayout::Freeform,
                 DesignPanelPermissions::viewer(),
             ),
@@ -10477,7 +12029,7 @@ fn paint_variable_view_data_emits_a_stable_leaf_binding_intent(cx: &mut TestAppC
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.set_paint_variable_view_data(view_data.clone(), cx);
-            panel.active_picker = Some(target);
+            *panel.overlays.active_picker_test_slot() = Some(target);
             panel.sync_paint_picker(window, cx);
         });
     });
@@ -10516,7 +12068,7 @@ fn paint_variable_view_data_emits_a_stable_leaf_binding_intent(cx: &mut TestAppC
             && variable_id.as_ref() == "remote-brand"
     )));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.fills[0].color),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().fills[0].color),
         DesignColor::WHITE,
         "variable selection remains host controlled"
     );
@@ -10544,7 +12096,7 @@ fn picker_creation_menu_revalidates_the_active_leaf_before_whole_style_creation(
     let captured_actions = actions(&host, visual_cx);
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "gradient".into(),
@@ -10570,7 +12122,7 @@ fn picker_creation_menu_revalidates_the_active_leaf_before_whole_style_creation(
 
     captured_actions.borrow_mut().clear();
     panel.update(visual_cx, |panel, _| {
-        panel.active_picker = Some(PaintPickerTarget {
+        *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
             collection: DesignPanelCollection::Fill,
             index: 1,
             paint_id: "solid".into(),
@@ -10618,7 +12170,7 @@ fn a_bound_color_does_not_disable_unrelated_picker_controls(cx: &mut TestAppCont
                 ]),
                 cx,
             );
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "bound-fill".into(),
@@ -10672,7 +12224,7 @@ fn picker_host_requests_preserve_stable_leaf_identity_and_exact_editability_gate
     let captured_actions = actions(&host, visual_cx);
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "stable-gradient".into(),
@@ -10723,7 +12275,9 @@ fn picker_host_requests_preserve_stable_leaf_identity_and_exact_editability_gate
             && *color == resolved_bound_color
     ));
     assert!(
-        visual_cx.read(|app| { panel.read(app).node.fills[0].selected_color_is_bound(0) }),
+        visual_cx.read(|app| {
+            panel.read(app).host.inspected_node().fills[0].selected_color_is_bound(0)
+        }),
         "creating a style must not detach the existing binding"
     );
 
@@ -10833,6 +12387,7 @@ fn stable_paint_id_keeps_the_picker_open_after_host_reorder(cx: &mut TestAppCont
     let active_id = node.fills[0].id.clone();
     let (host, visual_cx) = setup(node.clone(), cx);
     let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
     let target = PaintPickerTarget {
         collection: DesignPanelCollection::Fill,
         index: 0,
@@ -10841,8 +12396,25 @@ fn stable_paint_id_keeps_the_picker_open_after_host_reorder(cx: &mut TestAppCont
 
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
-            panel.active_picker = Some(target.clone());
+            *panel.overlays.active_picker_test_slot() = Some(target.clone());
             panel.sync_paint_picker(window, cx);
+            let picker_target = PickerEventTarget {
+                node_id: "rectangle".into(),
+                collection: DesignPanelCollection::Fill,
+                index: 0,
+                paint_id: active_id.clone(),
+            };
+            for (opacity, phase) in [
+                (90., DesignPanelEditPhase::Begin),
+                (75., DesignPanelEditPhase::Preview),
+            ] {
+                let edit = DesignPaintEdit {
+                    property: DesignPaintProperty::Opacity,
+                    value: DesignPaintValue::Number(opacity),
+                };
+                assert!(panel.track_paint_edit(&picker_target, &edit, phase));
+                panel.emit_paint_edit(target.clone(), edit, phase, cx);
+            }
         });
     });
 
@@ -10851,7 +12423,17 @@ fn stable_paint_id_keeps_the_picker_open_after_host_reorder(cx: &mut TestAppCont
         panel.update(app, |panel, cx| {
             panel.set_node(node, cx);
             panel.sync_paint_picker(window, cx);
-            assert!(panel.active_picker.is_some());
+            assert!(panel.overlays.active_picker().is_some());
+            assert_eq!(
+                panel
+                    .edit
+                    .active_paint_edit()
+                    .expect("the stable transaction survives the reorder")
+                    .target
+                    .index,
+                1
+            );
+            panel.cancel_active_paint_edit(cx);
         });
     });
 
@@ -10859,6 +12441,103 @@ fn stable_paint_id_keeps_the_picker_open_after_host_reorder(cx: &mut TestAppCont
     let picker_target = visual_cx.read(|app| picker.read(app).target().cloned().expect("target"));
     assert_eq!(picker_target.paint_id, active_id);
     assert_eq!(picker_target.index, 1);
+    let paint_phases = captured
+        .borrow()
+        .iter()
+        .filter_map(|action| match action {
+            DesignPanelAction::PaintEditRequested {
+                paint_id,
+                index,
+                phase,
+                ..
+            } if *paint_id == active_id => Some((*index, *phase)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paint_phases,
+        vec![
+            (0, DesignPanelEditPhase::Begin),
+            (0, DesignPanelEditPhase::Preview),
+            (1, DesignPanelEditPhase::Cancel),
+        ]
+    );
+}
+
+#[gpui::test]
+fn selection_order_change_cancels_one_active_paint_transaction(cx: &mut TestAppContext) {
+    let mut first = DesignPanelNode::new("first", "First", DesignPanelNodeKind::Rectangle);
+    first.fills = vec![DesignPaint::solid(DesignColor::BLACK).with_id("first-fill")];
+    let mut second = DesignPanelNode::new("second", "Second", DesignPanelNodeKind::Rectangle);
+    second.fills = vec![DesignPaint::solid(DesignColor::WHITE).with_id("second-fill")];
+    let (host, visual_cx) = setup(first.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+    let panel_target = PaintPickerTarget {
+        collection: DesignPanelCollection::Fill,
+        index: 0,
+        paint_id: "first-fill".into(),
+    };
+    let picker_target = PickerEventTarget {
+        node_id: "first".into(),
+        collection: DesignPanelCollection::Fill,
+        index: 0,
+        paint_id: "first-fill".into(),
+    };
+    let edit = DesignPaintEdit {
+        property: DesignPaintProperty::Opacity,
+        value: DesignPaintValue::Number(50.),
+    };
+
+    panel.update(visual_cx, |panel, cx| {
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::multiple(
+                DesignPanelMultipleSelection::new(first.clone(), second.clone()),
+                DesignPanelParentLayout::Mixed,
+                DesignPanelPermissions::editor(),
+            ),
+            cx,
+        );
+        assert!(panel.track_paint_edit(&picker_target, &edit, DesignPanelEditPhase::Begin,));
+        panel.emit_paint_edit(panel_target, edit, DesignPanelEditPhase::Begin, cx);
+
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::multiple(
+                DesignPanelMultipleSelection::new(second, first),
+                DesignPanelParentLayout::Mixed,
+                DesignPanelPermissions::editor(),
+            ),
+            cx,
+        );
+        assert!(panel.edit.active_paint_edit().is_none());
+        panel.cancel_active_paint_edit(cx);
+    });
+    visual_cx.run_until_parked();
+
+    let phases = captured
+        .borrow()
+        .iter()
+        .filter_map(|action| {
+            let action = action
+                .targeted_node_action()
+                .map_or(action, |(_, nested)| nested);
+            match action {
+                DesignPanelAction::PaintEditRequested {
+                    node_id,
+                    paint_id,
+                    phase,
+                    ..
+                } if node_id.as_ref() == "first" && paint_id.as_ref() == "first-fill" => {
+                    Some(*phase)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        vec![DesignPanelEditPhase::Begin, DesignPanelEditPhase::Cancel]
+    );
 }
 
 #[gpui::test]
@@ -10873,7 +12552,9 @@ fn paint_reorder_emits_a_stable_host_intent_without_mutating_view_data(cx: &mut 
 
     panel.update(visual_cx, |panel, cx| {
         panel.emit_paint_reorder(DesignPanelCollection::Fill, &first, 0, 1, cx);
-        panel.node.fills[0].read_only = true;
+        let mut next_node = panel.node().clone();
+        next_node.fills[0].read_only = true;
+        panel.set_node(next_node, cx);
         panel.emit_paint_reorder(DesignPanelCollection::Fill, &first, 0, 1, cx);
     });
     visual_cx.run_until_parked();
@@ -10889,7 +12570,7 @@ fn paint_reorder_emits_a_stable_host_intent_without_mutating_view_data(cx: &mut 
         } if *paint_id == first.id
     )));
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.fills[0].id.clone()),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().fills[0].id.clone()),
         first.id
     );
 }
@@ -11166,12 +12847,12 @@ fn shader_complex_leaf_edits_are_phased_and_rebase_by_effect_and_definition_id(
             shader.properties.swap(0, 1);
             panel.set_node(next, cx);
             assert!(matches!(
-                panel.property_editor.as_ref().map(|editor| editor.property),
+                panel.edit.property.as_ref().map(|editor| editor.property),
                 Some(DesignPanelProperty::EffectShaderProperty(1, 0))
             ));
         });
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("+0.25", window, cx);
@@ -11277,7 +12958,8 @@ fn shader_field_focus_rebases_and_reopens_the_exact_leaf(cx: &mut TestAppContext
     let return_handle = visual_cx.read(|app| {
         let panel = panel.read(app);
         let return_focus = panel
-            .editor_focus_return
+            .edit
+            .focus_return
             .as_ref()
             .expect("Shader field activation should retain its exact cell");
         assert_eq!(
@@ -11299,7 +12981,8 @@ fn shader_field_focus_rebases_and_reopens_the_exact_leaf(cx: &mut TestAppContext
         panel.set_node(node.clone(), cx);
         assert_eq!(
             panel
-                .editor_focus_return
+                .edit
+                .focus_return
                 .as_ref()
                 .map(|return_focus| return_focus.origin.clone()),
             Some(EditorFocusOrigin::ShaderField {
@@ -11326,7 +13009,7 @@ fn shader_field_focus_rebases_and_reopens_the_exact_leaf(cx: &mut TestAppContext
                 window,
                 cx,
             );
-            assert!(panel.property_editor.as_ref().is_some_and(|editor| {
+            assert!(panel.edit.property.as_ref().is_some_and(|editor| {
                 editor.property == DesignPanelProperty::EffectShaderProperty(1, 0)
                     && matches!(
                         editor.kind,
@@ -11382,7 +13065,7 @@ fn shader_semantic_kind_echo_cancels_the_original_typed_transaction(cx: &mut Tes
             shader.properties[0].value =
                 DesignShaderPropertyValue::Point(super::super::DesignEffectVector::new(0.5, 0.5));
             panel.set_node(next, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -11576,7 +13259,7 @@ fn stable_effect_settings_target_survives_host_reorder_and_capabilities_gate_lea
     let panel = panel(&host, visual_cx);
 
     panel.update(visual_cx, |panel, cx| {
-        panel.active_effect_settings = Some(EffectSettingsTarget {
+        *panel.overlays.active_effect_settings_test_slot() = Some(EffectSettingsTarget {
             index: 1,
             effect_id: "shadow-b".into(),
         });
@@ -11588,7 +13271,8 @@ fn stable_effect_settings_target_survives_host_reorder_and_capabilities_gate_lea
         panel.set_node(node.clone(), cx);
         assert_eq!(
             panel
-                .active_effect_settings
+                .overlays
+                .active_effect_settings()
                 .as_ref()
                 .map(|target| target.index),
             Some(0)
@@ -11633,7 +13317,7 @@ fn effect_style_and_variable_intents_remain_controlled(cx: &mut TestAppContext) 
     visual_cx.run_until_parked();
 
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.effects.clone()),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().effects.clone()),
         original
     );
     let actions = captured_actions.borrow();
@@ -11709,7 +13393,17 @@ fn stroke_panel_indexes_only_paints_and_gates_shared_geometry(cx: &mut TestAppCo
                 .len(),
             3
         );
-        assert_eq!(panel.node.stroke.as_ref().expect("stroke").paints.len(), 2);
+        assert_eq!(
+            panel
+                .host
+                .inspected_node()
+                .stroke
+                .as_ref()
+                .expect("stroke")
+                .paints
+                .len(),
+            2
+        );
     });
 
     panel.update(visual_cx, |panel, cx| {
@@ -11817,7 +13511,7 @@ fn lossless_draw_strokes_expose_exact_forms_domains_and_topology_gates(cx: &mut 
             cx,
         );
 
-        let mut branching = panel.node.clone();
+        let mut branching = panel.host.inspected_node().clone();
         branching
             .stroke
             .as_mut()
@@ -11922,18 +13616,18 @@ fn appearance_defaults_to_the_compact_summary_and_resets_disclosures(cx: &mut Te
 
     visual_cx.read(|app| {
         let panel = panel.read(app);
-        assert!(!panel.appearance_blend_mode_open);
+        assert!(!panel.overlays.appearance_blend_mode_open());
         assert!(!panel.appearance_corner_details_are_visible());
     });
 
     panel.update(visual_cx, |panel, cx| {
-        panel.appearance_blend_mode_open = true;
-        panel.appearance_corner_details_open = true;
+        *panel.overlays.appearance_blend_mode_open_test_slot() = true;
+        panel.sections.toggle_appearance_details();
         panel.set_node(
             DesignPanelNode::new("ellipse", "Ellipse", DesignPanelNodeKind::Ellipse),
             cx,
         );
-        assert!(!panel.appearance_blend_mode_open);
+        assert!(!panel.overlays.appearance_blend_mode_open());
         assert!(!panel.appearance_corner_details_are_visible());
         drop(panel.render_layer(cx));
     });
@@ -11962,7 +13656,7 @@ fn appearance_visibility_is_host_controlled_and_emits_a_typed_property_intent(
             cx,
         );
         assert!(
-            !panel.node.visible,
+            !panel.host.inspected_node().visible,
             "the reusable panel waits for the host echo"
         );
     });
@@ -12006,9 +13700,12 @@ fn mixed_visibility_resolves_to_show_all_and_uniform_states_toggle_on_design_sur
             DesignPanelPropertyValueState::Mixed,
             cx,
         );
-        panel.expanded_sections.clear();
+        panel.sections.clear_expanded();
         assert_eq!(
-            panel.visibility_control_state(DesignPanelProperty::Visible, panel.node.visible),
+            panel.visibility_control_state(
+                DesignPanelProperty::Visible,
+                panel.host.inspected_node().visible
+            ),
             VisibilityControlState::Mixed,
         );
     });
@@ -12045,12 +13742,13 @@ fn mixed_visibility_resolves_to_show_all_and_uniform_states_toggle_on_design_sur
     visual_cx.read(|app| {
         let panel = panel.read(app);
         assert!(
-            panel.node.visible,
+            panel.host.inspected_node().visible,
             "activation must not mutate the host-controlled first-node snapshot",
         );
         assert!(
             panel
-                .property_value_states
+                .host
+                .property_states
                 .get(&DesignPanelProperty::Visible)
                 .is_some_and(DesignPanelPropertyValueState::is_mixed),
             "activation must wait for a uniform host echo",
@@ -12067,9 +13765,10 @@ fn mixed_visibility_resolves_to_show_all_and_uniform_states_toggle_on_design_sur
     });
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel
-            .read(app)
-            .visibility_control_state(DesignPanelProperty::Visible, panel.read(app).node.visible,)),
+        visual_cx.read(|app| panel.read(app).visibility_control_state(
+            DesignPanelProperty::Visible,
+            panel.read(app).host.inspected_node().visible,
+        )),
         VisibilityControlState::Visible,
     );
     visual_cx.simulate_click(visibility, Modifiers::none());
@@ -12098,9 +13797,10 @@ fn mixed_visibility_resolves_to_show_all_and_uniform_states_toggle_on_design_sur
     });
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel
-            .read(app)
-            .visibility_control_state(DesignPanelProperty::Visible, panel.read(app).node.visible,)),
+        visual_cx.read(|app| panel.read(app).visibility_control_state(
+            DesignPanelProperty::Visible,
+            panel.read(app).host.inspected_node().visible,
+        )),
         VisibilityControlState::Hidden,
     );
     visual_cx.simulate_click(visibility, Modifiers::none());
@@ -12129,9 +13829,10 @@ fn mixed_visibility_resolves_to_show_all_and_uniform_states_toggle_on_design_sur
     });
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel
-            .read(app)
-            .visibility_control_state(DesignPanelProperty::Visible, panel.read(app).node.visible,)),
+        visual_cx.read(|app| panel.read(app).visibility_control_state(
+            DesignPanelProperty::Visible,
+            panel.read(app).host.inspected_node().visible,
+        )),
         VisibilityControlState::Mixed,
     );
     visual_cx.simulate_click(visibility, Modifiers::none());
@@ -12185,10 +13886,10 @@ fn fill_header_style_action_opens_the_whole_collection_style_browser(cx: &mut Te
         panel.update(app, |panel, cx| {
             panel.open_paint_style_browser(DesignPanelCollection::Fill, window, cx);
             assert_eq!(
-                panel.paint_style_browser_open,
+                panel.overlays.paint_style_browser_open(),
                 Some(DesignPanelCollection::Fill)
             );
-            assert!(panel.active_picker.is_none());
+            assert!(panel.overlays.active_picker().is_none());
         });
     });
 }
@@ -12321,8 +14022,14 @@ fn corner_controls_follow_figmas_exact_supported_node_matrix(cx: &mut TestAppCon
             DesignPanelNodeKind::BooleanOperation,
         ] {
             panel.set_node(DesignPanelNode::new("text", kind.label(), kind), cx);
-            let expected_radius = panel.node.corner_radii[0];
-            assert!(panel.node.corner_capabilities.uniform_radius);
+            let expected_radius = panel.host.inspected_node().corner_radii[0];
+            assert!(
+                panel
+                    .host
+                    .inspected_node()
+                    .corner_capabilities
+                    .uniform_radius
+            );
             assert!(panel.property_is_editable(DesignPanelProperty::CornerRadius));
             assert_eq!(
                 panel.current_property_value(DesignPanelProperty::CornerRadius),
@@ -12341,7 +14048,7 @@ fn corner_controls_follow_figmas_exact_supported_node_matrix(cx: &mut TestAppCon
             DesignPanelNodeKind::Other,
         ] {
             panel.set_node(DesignPanelNode::new("text", kind.label(), kind), cx);
-            assert!(!panel.node.corner_capabilities.has_any());
+            assert!(!panel.host.inspected_node().corner_capabilities.has_any());
             assert!(!panel.property_is_editable(DesignPanelProperty::CornerRadius));
             assert_eq!(
                 panel.current_property_value(DesignPanelProperty::CornerRadius),
@@ -12369,7 +14076,10 @@ fn frame_fill_show_in_exports_is_controlled_and_capability_gated(cx: &mut TestAp
             DesignPanelValue::Bool(false),
             cx,
         );
-        assert_eq!(panel.node.fill_shows_in_exports, Some(true));
+        assert_eq!(
+            panel.host.inspected_node().fill_shows_in_exports,
+            Some(true)
+        );
     });
     visual_cx.run_until_parked();
 
@@ -12691,7 +14401,10 @@ fn component_property_variables_emit_exact_apply_import_and_detach_intents(
     });
     visual_cx.run_until_parked();
 
-    assert_eq!(visual_cx.read(|app| panel.read(app).node.clone()), original);
+    assert_eq!(
+        visual_cx.read(|app| panel.read(app).host.inspected_node().clone()),
+        original
+    );
     let captured = captured.borrow();
     assert_eq!(captured.len(), 3);
     assert!(matches!(
@@ -12779,7 +14492,10 @@ fn component_swap_browser_intents_preserve_catalog_identity_and_controlled_state
     });
     visual_cx.run_until_parked();
 
-    assert_eq!(visual_cx.read(|app| panel.read(app).node.clone()), original);
+    assert_eq!(
+        visual_cx.read(|app| panel.read(app).host.inspected_node().clone()),
+        original
+    );
     let captured = captured.borrow();
     assert!(captured.iter().any(|action| matches!(
         action,
@@ -12837,9 +14553,16 @@ fn multiline_component_text_emits_begin_preview_commit_and_cancel_without_local_
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.open_component_multiline_editor(label_index, window, cx);
-            panel.component_multiline_input.update(cx, |input, cx| {
-                input.set_value("Line one\nLine two", window, cx);
-            });
+            // Re-entrant command delivery must not replace the active draft
+            // or emit a second unmatched Begin.
+            panel.open_component_multiline_editor(label_index, window, cx);
+            panel
+                .retained
+                .inputs
+                .component_multiline
+                .update(cx, |input, cx| {
+                    input.set_value("Line one\nLine two", window, cx);
+                });
             panel.preview_component_multiline(cx);
             panel.finish_component_multiline_editor(true, window, cx);
         });
@@ -12848,17 +14571,39 @@ fn multiline_component_text_emits_begin_preview_commit_and_cancel_without_local_
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.open_component_multiline_editor(label_index, window, cx);
-            panel.component_multiline_input.update(cx, |input, cx| {
-                input.set_value("Temporary\ncopy", window, cx);
-            });
+            panel
+                .retained
+                .inputs
+                .component_multiline
+                .update(cx, |input, cx| {
+                    input.set_value("Temporary\ncopy", window, cx);
+                });
             panel.preview_component_multiline(cx);
             panel.finish_component_multiline_editor(false, window, cx);
         });
     });
     visual_cx.run_until_parked();
 
-    assert_eq!(visual_cx.read(|app| panel.read(app).node.clone()), original);
+    assert_eq!(
+        visual_cx.read(|app| panel.read(app).host.inspected_node().clone()),
+        original
+    );
     let captured = captured.borrow();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|action| matches!(
+                action,
+                DesignPanelAction::ComponentPropertyEditRequested {
+                    property_id,
+                    phase: DesignPanelEditPhase::Begin,
+                    ..
+                } if property_id.as_ref() == "label"
+            ))
+            .count(),
+        2,
+        "each of the two completed sessions must have exactly one Begin"
+    );
     assert!(captured.iter().any(|action| matches!(
         action,
         DesignPanelAction::ComponentPropertyEditRequested {
@@ -12916,7 +14661,8 @@ fn multiline_focus_survives_reorder_and_restores_after_save_and_cancel(cx: &mut 
     let return_handle = visual_cx.read(|app| {
         let panel = panel.read(app);
         let return_focus = panel
-            .editor_focus_return
+            .edit
+            .focus_return
             .as_ref()
             .expect("multiline activation should retain its row");
         assert_eq!(
@@ -12932,7 +14678,8 @@ fn multiline_focus_survives_reorder_and_restores_after_save_and_cancel(cx: &mut 
         panel.set_node(node.clone(), cx);
         assert_eq!(
             panel
-                .component_multiline_editor
+                .edit
+                .component_multiline
                 .as_ref()
                 .map(|editor| editor.property_id.as_ref()),
             Some("label")
@@ -12961,7 +14708,8 @@ fn multiline_focus_survives_reorder_and_restores_after_save_and_cancel(cx: &mut 
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .component_multiline_editor
+                .edit
+                .component_multiline
                 .as_ref()
                 .map(|editor| editor.property_id.clone())
         }),
@@ -13017,8 +14765,8 @@ fn permission_downgrade_cancels_multiline_and_clears_swap_preview(cx: &mut TestA
                 ),
                 cx,
             );
-            assert!(panel.component_multiline_editor.is_none());
-            assert!(panel.component_swap_hovered.is_none());
+            assert!(panel.edit.component_multiline.is_none());
+            assert!(panel.features.component.swap_hovered.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -13181,7 +14929,12 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.begin_component_property_create(DesignComponentPropertyKind::Boolean, window, cx);
-            assert!(panel.component_authoring_dialog_open);
+            assert!(panel.overlays.component_authoring_dialog_open());
+            assert_eq!(
+                panel.overlays.topmost(),
+                Some(DesignOpenOverlay::ComponentPropertyEdit),
+                "the native authoring dialog participates in overlay priority"
+            );
             assert!(!panel.component_authoring_uses_inline_modal_fallback());
         });
         assert!(window.has_active_dialog(app));
@@ -13194,7 +14947,7 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
     visual_cx.run_until_parked();
     panel.update(visual_cx, |panel, _| {
         assert_eq!(
-            panel.component_authoring_dialog_last_rendered_kind,
+            panel.component_authoring.dialog_last_rendered_kind,
             Some(DesignComponentPropertyKind::Boolean),
             "the native Dialog builder renders the Boolean draft",
         );
@@ -13202,7 +14955,8 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
 
     panel.update(visual_cx, |panel, cx| {
         let draft = panel
-            .component_property_create_draft
+            .component_authoring
+            .create_draft
             .as_mut()
             .expect("live create draft");
         draft.kind = DesignComponentPropertyKind::Slot;
@@ -13221,7 +14975,7 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
     visual_cx.run_until_parked();
     panel.update(visual_cx, |panel, _| {
         assert_eq!(
-            panel.component_authoring_dialog_last_rendered_kind,
+            panel.component_authoring.dialog_last_rendered_kind,
             Some(DesignComponentPropertyKind::Slot),
             "the Dialog builder rereads the current typed draft every render",
         );
@@ -13230,9 +14984,13 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
     visual_cx.simulate_keystrokes("escape");
     visual_cx.run_until_parked();
     panel.update(visual_cx, |panel, _| {
-        assert!(panel.component_property_create_draft.is_none());
-        assert!(panel.component_property_edit_modal.is_none());
-        assert!(!panel.component_authoring_dialog_open);
+        assert!(panel.component_authoring.create_draft.is_none());
+        assert!(panel.component_authoring.edit_draft.is_none());
+        assert!(!panel.overlays.component_authoring_dialog_open());
+        assert_ne!(
+            panel.overlays.topmost(),
+            Some(DesignOpenOverlay::ComponentPropertyEdit)
+        );
         assert!(!panel.component_authoring_uses_inline_modal_fallback());
     });
     visual_cx.update(|window, app| {
@@ -13242,7 +15000,7 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
             panel.open_component_property_edit("label".into(), window, cx);
-            assert!(panel.component_authoring_dialog_open);
+            assert!(panel.overlays.component_authoring_dialog_open());
             assert!(!panel.component_authoring_uses_inline_modal_fallback());
         });
         assert!(window.has_active_dialog(app));
@@ -13256,9 +15014,9 @@ fn component_authoring_dialog_is_live_modal_and_escape_clears_each_draft(cx: &mu
     visual_cx.simulate_keystrokes("escape");
     visual_cx.run_until_parked();
     panel.update(visual_cx, |panel, _| {
-        assert!(panel.component_property_create_draft.is_none());
-        assert!(panel.component_property_edit_modal.is_none());
-        assert!(!panel.component_authoring_dialog_open);
+        assert!(panel.component_authoring.create_draft.is_none());
+        assert!(panel.component_authoring.edit_draft.is_none());
+        assert!(!panel.overlays.component_authoring_dialog_open());
     });
     visual_cx.update(|window, app| {
         assert!(!window.has_active_dialog(app));
@@ -13314,22 +15072,26 @@ fn component_property_edit_modal_emits_one_atomic_combined_slot_intent(cx: &mut 
         panel.update(app, |panel, cx| {
             panel.open_component_property_edit(property_id.clone(), window, cx);
             panel
-                .component_authoring_default_input
+                .component_authoring
+                .default_input
                 .update(cx, |input, cx| {
                     input.set_value("Updated Slot guidance", window, cx);
                 });
             panel
-                .component_authoring_slot_minimum_input
+                .component_authoring
+                .slot_minimum_input
                 .update(cx, |input, cx| {
                     input.set_value("", window, cx);
                 });
             panel
-                .component_authoring_slot_maximum_input
+                .component_authoring
+                .slot_maximum_input
                 .update(cx, |input, cx| {
                     input.set_value("2", window, cx);
                 });
             let draft = panel
-                .component_property_edit_modal
+                .component_authoring
+                .edit_draft
                 .as_mut()
                 .expect("open Edit property modal");
             draft
@@ -13350,8 +15112,8 @@ fn component_property_edit_modal_emits_one_atomic_combined_slot_intent(cx: &mut 
     });
     visual_cx.run_until_parked();
     panel.update(visual_cx, |panel, _| {
-        assert!(!panel.component_authoring_dialog_open);
-        assert!(panel.component_property_edit_modal.is_none());
+        assert!(!panel.overlays.component_authoring_dialog_open());
+        assert!(panel.component_authoring.edit_draft.is_none());
     });
     visual_cx.update(|window, app| {
         assert!(
@@ -13541,7 +15303,7 @@ fn component_authoring_intents_preserve_stable_identity_and_variant_partition(
             panel
                 .component_authoring_view_data()
                 .expect("authoring projection")
-                .preserves_variant_partition(&panel.node.component_properties)
+                .preserves_variant_partition(&panel.host.inspected_node().component_properties)
         );
 
         drop(panel.render_component_definition_authoring(cx));
@@ -13556,9 +15318,13 @@ fn component_authoring_intents_preserve_stable_identity_and_variant_partition(
         panel.emit_component_authoring_action(option_rename.clone(), cx);
         panel.emit_component_authoring_action(preview(true), cx);
         panel.emit_component_authoring_action(preview(false), cx);
-        assert_eq!(panel.node, original, "the panel must wait for host echoes");
+        assert_eq!(
+            panel.host.inspected_node(),
+            &original,
+            "the panel must wait for host echoes"
+        );
 
-        let mut echoed = panel.node.clone();
+        let mut echoed = panel.host.inspected_node().clone();
         echoed
             .component_properties
             .retain(|property| property.id.as_ref() != "label");
@@ -13629,12 +15395,14 @@ fn component_authoring_native_create_inline_rename_and_drag_are_balanced_and_hos
 
             panel.begin_component_property_create(DesignComponentPropertyKind::Text, window, cx);
             panel
-                .component_authoring_name_input
+                .component_authoring
+                .name_input
                 .update(cx, |input, cx| {
                     input.set_value("Supporting text", window, cx);
                 });
             panel
-                .component_authoring_default_input
+                .component_authoring
+                .default_input
                 .update(cx, |input, cx| {
                     input.set_value("Details", window, cx);
                 });
@@ -13642,7 +15410,8 @@ fn component_authoring_native_create_inline_rename_and_drag_are_balanced_and_hos
 
             panel.begin_component_property_rename("label".into(), window, cx);
             panel
-                .component_authoring_name_input
+                .component_authoring
+                .name_input
                 .update(cx, |input, cx| {
                     input.set_value("Primary label", window, cx);
                 });
@@ -13652,7 +15421,7 @@ fn component_authoring_native_create_inline_rename_and_drag_are_balanced_and_hos
             let original_order =
                 panel.component_property_partition_order(DesignComponentPropertyPartition::Regular);
             let drag = ComponentPropertyDefinitionDrag {
-                node_id: panel.node.id.clone(),
+                node_id: panel.host.inspected_node().id.clone(),
                 property_id: "content".into(),
                 property_name: "Content".into(),
                 partition: DesignComponentPropertyPartition::Regular,
@@ -13663,12 +15432,13 @@ fn component_authoring_native_create_inline_rename_and_drag_are_balanced_and_hos
             panel.finish_component_property_reorder(false, cx);
 
             assert_eq!(
-                panel.node, original,
+                panel.host.inspected_node(),
+                &original,
                 "native authoring presentation must wait for every host echo"
             );
-            assert!(panel.component_property_create_draft.is_none());
-            assert!(panel.component_authoring_name_editor.is_none());
-            assert!(panel.component_property_reorder.is_none());
+            assert!(panel.component_authoring.create_draft.is_none());
+            assert!(!panel.edit.component_authoring.has_name_editor());
+            assert!(!panel.edit.component_authoring.has_property_reorder());
         });
     });
     visual_cx.run_until_parked();
@@ -13723,6 +15493,196 @@ fn component_authoring_native_create_inline_rename_and_drag_are_balanced_and_hos
             DesignPanelEditPhase::Preview,
             DesignPanelEditPhase::Cancel,
         ]
+    );
+}
+
+#[gpui::test]
+fn component_authoring_rename_echo_and_capability_loss_emit_one_terminal_cancel(
+    cx: &mut TestAppContext,
+) {
+    let node = component_authoring_test_node();
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.begin_component_property_rename("label".into(), window, cx);
+            panel
+                .component_authoring
+                .name_input
+                .update(cx, |input, cx| {
+                    input.set_value("Primary label", window, cx);
+                });
+            panel.preview_component_authoring_name(cx);
+        });
+    });
+    panel.update(visual_cx, |panel, cx| {
+        let mut accepted = node.clone();
+        accepted
+            .component_properties
+            .iter_mut()
+            .find(|property| property.id.as_ref() == "label")
+            .expect("label property")
+            .name = "Primary label".into();
+        panel.set_node(accepted.clone(), cx);
+        assert!(panel.edit.component_authoring.has_name_editor());
+
+        accepted
+            .component_context
+            .as_mut()
+            .and_then(|context| context.authoring.as_mut())
+            .and_then(|authoring| {
+                authoring
+                    .definitions
+                    .iter_mut()
+                    .find(|definition| definition.property_id.as_ref() == "label")
+            })
+            .expect("label authoring definition")
+            .capabilities = super::super::DesignComponentPropertyDefinitionCapabilities::READ_ONLY;
+        panel.set_node(accepted, cx);
+        assert!(!panel.edit.component_authoring.has_name_editor());
+    });
+    visual_cx.update(|window, app| {
+        panel.update(app, |panel, cx| {
+            panel.finish_component_authoring_name_edit(true, window, cx);
+        });
+    });
+    visual_cx.run_until_parked();
+
+    let phases = captured
+        .borrow()
+        .iter()
+        .filter_map(|action| match action {
+            DesignPanelAction::ComponentPropertyDefinitionRenameRequested {
+                property_id,
+                expected_name,
+                name,
+                phase,
+                ..
+            } if property_id.as_ref() == "label" => {
+                Some((*phase, expected_name.clone(), name.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases
+            .iter()
+            .map(|(phase, _, _)| *phase)
+            .collect::<Vec<_>>(),
+        vec![
+            DesignPanelEditPhase::Begin,
+            DesignPanelEditPhase::Preview,
+            DesignPanelEditPhase::Cancel,
+        ]
+    );
+    assert_eq!(phases[2].1.as_ref(), "Primary label");
+    assert_eq!(phases[2].2.as_ref(), "Label");
+}
+
+#[gpui::test]
+fn component_authoring_reorders_cancel_once_for_access_and_stale_member_echoes(
+    cx: &mut TestAppContext,
+) {
+    let node = component_authoring_test_node();
+    let (host, visual_cx) = setup(node.clone(), cx);
+    let panel = panel(&host, visual_cx);
+    let captured = actions(&host, visual_cx);
+
+    panel.update(visual_cx, |panel, cx| {
+        let regular_order =
+            panel.component_property_partition_order(DesignComponentPropertyPartition::Regular);
+        panel.begin_component_property_reorder(
+            &ComponentPropertyDefinitionDrag {
+                node_id: "button-main".into(),
+                property_id: "content".into(),
+                property_name: "Content".into(),
+                partition: DesignComponentPropertyPartition::Regular,
+                original_order: regular_order,
+            },
+            cx,
+        );
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::single(
+                node.clone(),
+                DesignPanelParentLayout::Freeform,
+                DesignPanelPermissions::viewer(),
+            ),
+            cx,
+        );
+        assert!(!panel.edit.component_authoring.has_property_reorder());
+        panel.finish_component_property_reorder(false, cx);
+
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::single(
+                node.clone(),
+                DesignPanelParentLayout::Freeform,
+                DesignPanelPermissions::editor(),
+            ),
+            cx,
+        );
+        let option_order = panel
+            .component_variant_option_order("state")
+            .expect("variant option order");
+        panel.begin_component_variant_option_reorder(
+            &ComponentVariantOptionDrag {
+                node_id: "button-main".into(),
+                property_id: "state".into(),
+                option_id: "state-hover".into(),
+                option_name: "Hover".into(),
+                original_order: option_order,
+            },
+            cx,
+        );
+        let mut stale = node.clone();
+        stale
+            .component_context
+            .as_mut()
+            .and_then(|context| context.authoring.as_mut())
+            .and_then(|authoring| {
+                authoring
+                    .definitions
+                    .iter_mut()
+                    .find(|definition| definition.property_id.as_ref() == "state")
+            })
+            .expect("state authoring definition")
+            .variant_options
+            .retain(|option| option.id.as_ref() != "state-hover");
+        panel.set_node(stale, cx);
+        assert!(!panel.edit.component_authoring.has_variant_option_reorder());
+        panel.finish_component_variant_option_reorder(false, cx);
+    });
+    visual_cx.run_until_parked();
+
+    let captured = captured.borrow();
+    let property_phases = captured
+        .iter()
+        .filter_map(|action| match action {
+            DesignPanelAction::ComponentPropertyDefinitionReorderRequested {
+                property_id,
+                phase,
+                ..
+            } if property_id.as_ref() == "content" => Some(*phase),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        property_phases,
+        vec![DesignPanelEditPhase::Begin, DesignPanelEditPhase::Cancel]
+    );
+    let option_phases = captured
+        .iter()
+        .filter_map(|action| match action {
+            DesignPanelAction::ComponentVariantOptionReorderRequested {
+                option_id, phase, ..
+            } if option_id.as_ref() == "state-hover" => Some(*phase),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        option_phases,
+        vec![DesignPanelEditPhase::Begin, DesignPanelEditPhase::Cancel]
     );
 }
 
@@ -13948,7 +15908,8 @@ fn component_actions_honor_role_reset_availability_and_advisory_slot_limits(
         );
         assert!(
             panel
-                .node
+                .host
+                .inspected_node()
                 .component_properties
                 .first()
                 .and_then(|property| property.slot_state.as_ref())
@@ -13960,7 +15921,7 @@ fn component_actions_honor_role_reset_availability_and_advisory_slot_limits(
                     }
                 )))
         );
-        let warning = panel.node.component_properties[0]
+        let warning = panel.host.inspected_node().component_properties[0]
             .slot_state
             .as_ref()
             .and_then(|state| {
@@ -14175,7 +16136,7 @@ fn slot_limits_disclosure_emits_exact_view_layers_and_reconciles_host_echo(
     visual_cx.simulate_click(limits.center(), Modifiers::none());
     visual_cx.run_until_parked();
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).open_slot_limits.clone()),
+        visual_cx.read(|app| panel.read(app).component_authoring.open_slot_limits.clone()),
         Some(SharedString::from("content")),
     );
 
@@ -14196,6 +16157,7 @@ fn slot_limits_disclosure_emits_exact_view_layers_and_reconciles_host_echo(
         panel.set_node(node.clone(), cx);
         assert!(
             panel
+                .component_authoring
                 .open_slot_limits
                 .as_ref()
                 .is_some_and(|property_id| property_id.as_ref() == "content")
@@ -14204,21 +16166,24 @@ fn slot_limits_disclosure_emits_exact_view_layers_and_reconciles_host_echo(
         panel.set_node(node, cx);
         assert!(
             panel
+                .component_authoring
                 .open_slot_limits
                 .as_ref()
                 .is_some_and(|property_id| property_id.as_ref() == "content"),
             "unknown validation remains inspectable as a neutral guideline",
         );
+        let mut next_node = panel.node().clone();
         let DesignComponentPropertyDefinition::Slot { settings, .. } =
-            &mut panel.node.component_properties[0].definition
+            &mut next_node.component_properties[0].definition
         else {
             panic!("Slot definition");
         };
         settings.minimum_children = None;
         settings.maximum_children = None;
         settings.preferred_values_only = false;
+        panel.set_node(next_node, cx);
         panel.reconcile_slot_limits_state();
-        assert!(panel.open_slot_limits.is_none());
+        assert!(panel.component_authoring.open_slot_limits.is_none());
     });
 }
 
@@ -14362,7 +16327,7 @@ fn generic_property_variables_emit_controlled_apply_import_and_detach_intents(
     visual_cx.run_until_parked();
 
     assert_eq!(
-        visual_cx.read(|app| panel.read(app).node.width),
+        visual_cx.read(|app| panel.read(app).host.inspected_node().width),
         original_width
     );
     let captured = captured.borrow();
@@ -14644,7 +16609,7 @@ fn font_weight_uses_the_selected_range_continuous_edit_lifecycle(cx: &mut TestAp
             target
         })
     });
-    let input = visual_cx.read(|app| panel.read(app).property_input.clone());
+    let input = visual_cx.read(|app| panel.read(app).retained.inputs.property.clone());
     visual_cx.update(|window, app| {
         input.update(app, |input, cx| {
             input.set_value("+100", window, cx);
@@ -14696,7 +16661,8 @@ fn font_weight_uses_the_selected_range_continuous_edit_lifecycle(cx: &mut TestAp
         visual_cx.read(|app| {
             panel
                 .read(app)
-                .node
+                .host
+                .inspected_node()
                 .typography
                 .as_ref()
                 .expect("text typography")
@@ -14730,7 +16696,7 @@ fn selected_text_range_revision_terminates_the_previous_range_transaction(cx: &m
             let mut same_range_echo = node.clone();
             same_range_echo.opacity = 88.;
             panel.set_node(same_range_echo, cx);
-            assert_eq!(panel.inspection_context.text_range_revision(), Some(7));
+            assert_eq!(panel.host.inspection_context.text_range_revision(), Some(7));
             panel.activate_property(
                 DesignPanelProperty::FontWeight,
                 DesignPanelValue::Number(400.),
@@ -14748,8 +16714,8 @@ fn selected_text_range_revision_terminates_the_previous_range_transaction(cx: &m
             .with_text_range_revision(8)
             .expect("next exact range");
             panel.set_inspection_context(second_range, cx);
-            assert!(panel.property_editor.is_none());
-            assert_eq!(panel.inspection_context.text_range_revision(), Some(8));
+            assert!(panel.edit.property.is_none());
+            assert_eq!(panel.host.inspection_context.text_range_revision(), Some(8));
             panel.emit_property(
                 DesignPanelProperty::FontWeight,
                 DesignPanelValue::Number(500.),
@@ -14833,7 +16799,7 @@ fn fill_intents_follow_exact_text_range_revisions_while_stroke_stays_layer_wide(
             .with_text_range_revision(8)
             .expect("next exact Fill range");
             panel.set_inspection_context(second_range, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
             panel.emit_property(
                 DesignPanelProperty::PaintOpacity {
                     collection: DesignPanelCollection::Fill,
@@ -15097,7 +17063,7 @@ fn vector_edit_emits_stable_id_phases_without_mutating_controlled_vertices(
             DesignPanelEditPhase::Commit,
             cx,
         );
-        assert_eq!(panel.node.vector_edit, original);
+        assert_eq!(panel.host.inspected_node().vector_edit, original);
     });
     visual_cx.run_until_parked();
 
@@ -15322,7 +17288,7 @@ fn same_id_echo_cancels_repeat_offset_when_its_unit_changes(cx: &mut TestAppCont
             let mut next = node;
             next.transform_modifiers[0].unit = DesignTransformUnit::Pixels;
             panel.set_node(next, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -15369,10 +17335,11 @@ fn same_id_echo_cancels_when_the_underlying_figma_field_changes(cx: &mut TestApp
             let mut next = node;
             next.layout.as_mut().expect("layout").mode = DesignLayoutMode::Grid;
             panel.set_node(next, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
             assert!(
                 panel
-                    .node
+                    .host
+                    .inspected_node()
                     .layout
                     .as_ref()
                     .and_then(DesignLayout::grid_dimensions)
@@ -15384,10 +17351,17 @@ fn same_id_echo_cancels_when_the_underlying_figma_field_changes(cx: &mut TestApp
                     && !panel.property_is_editable(DesignPanelProperty::GridRowCount),
                 "atomic dimensions stay disabled until both host vectors are positive"
             );
-            drop(panel.render_grid_dimensions_picker(
-                panel.node.layout.as_ref().expect("Grid layout"),
-                cx,
-            ));
+            drop(
+                panel.render_grid_dimensions_picker(
+                    panel
+                        .host
+                        .inspected_node()
+                        .layout
+                        .as_ref()
+                        .expect("Grid layout"),
+                    cx,
+                ),
+            );
         });
     });
     visual_cx.run_until_parked();
@@ -15446,7 +17420,7 @@ fn same_id_echo_terminates_the_original_vector_selection(cx: &mut TestAppContext
                 super::super::DesignVectorVertexViewData::new("vertex-b", 48., 20.).selected(true),
             ]));
             panel.set_node(next, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -15504,7 +17478,7 @@ fn same_id_paint_payload_change_terminates_an_active_crop(cx: &mut TestAppContex
             })]),
             cx,
         );
-        panel.active_picker = Some(PaintPickerTarget {
+        *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
             collection: DesignPanelCollection::Fill,
             index: 0,
             paint_id: "media-fill".into(),
@@ -15550,7 +17524,7 @@ fn host_reorder_without_stable_leaf_ids_cancels_indexed_numeric_edit(cx: &mut Te
                 .grid_columns
                 .swap(0, 1);
             panel.set_node(next, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -15658,10 +17632,10 @@ fn read_only_paint_locks_row_controls_and_terminates_an_active_opacity_edit(
             assert!(panel.property_is_editable(opacity));
             assert!(panel.property_is_editable(visibility));
             panel.activate_property(opacity, DesignPanelValue::Number(100.), window, cx);
-            assert!(panel.property_editor.is_some());
+            assert!(panel.edit.property.is_some());
 
             panel.set_node(read_only_node, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
             assert!(!panel.property_is_editable(opacity));
             assert!(!panel.property_is_editable(visibility));
 
@@ -15735,7 +17709,7 @@ fn controlled_leaf_state_downgrade_terminates_an_active_editor(cx: &mut TestAppC
                 ),
                 cx,
             );
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -15795,14 +17769,14 @@ fn export_editor_rebases_by_configuration_id_and_cancels_if_format_invalidates_i
             reordered.configurations.swap(0, 1);
             panel.set_export_view_data(reordered.clone(), cx);
             assert_eq!(
-                panel.property_editor.as_ref().map(|editor| editor.property),
+                panel.edit.property.as_ref().map(|editor| editor.property),
                 Some(DesignPanelProperty::ExportSizing(1))
             );
 
             reordered.configurations[1] =
                 DesignExportConfiguration::new("export-a", DesignExportFormat::Svg);
             panel.set_export_view_data(reordered, cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
         });
     });
     visual_cx.run_until_parked();
@@ -15851,7 +17825,7 @@ fn component_swap_catalog_invalidation_clears_the_host_preview(cx: &mut TestAppC
         panel.set_component_swap_view_data(DesignComponentSwapViewData::new([candidate]), cx);
         panel.set_component_swap_preview(swap_index, Some(selection.clone()), cx);
         panel.set_component_swap_view_data(DesignComponentSwapViewData::default(), cx);
-        assert!(panel.component_swap_hovered.is_none());
+        assert!(panel.features.component.swap_hovered.is_none());
     });
     visual_cx.run_until_parked();
 
@@ -15892,20 +17866,21 @@ fn media_capability_echo_cancels_an_active_paint_transaction(cx: &mut TestAppCon
             .with_capabilities(super::super::DesignMediaPaintCapabilities::editor())]),
             cx,
         );
-        panel.active_paint_edit = Some(ActivePaintEdit {
-            target: PickerEventTarget {
+        assert!(panel.track_paint_edit(
+            &PickerEventTarget {
                 node_id: "media".into(),
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "media-fill".into(),
             },
-            edit: DesignPaintEdit {
+            &DesignPaintEdit {
                 property: DesignPaintProperty::MediaFilter(
                     super::super::DesignImageFilter::Exposure,
                 ),
                 value: DesignPaintValue::Number(0.5),
             },
-        });
+            DesignPanelEditPhase::Begin,
+        ));
         panel.set_media_paint_view_data(
             DesignMediaPaintViewData::new([super::super::DesignMediaPaintView::new(
                 DesignPanelCollection::Fill,
@@ -15915,7 +17890,7 @@ fn media_capability_echo_cancels_an_active_paint_transaction(cx: &mut TestAppCon
             .with_capabilities(super::super::DesignMediaPaintCapabilities::viewer())]),
             cx,
         );
-        assert!(panel.active_paint_edit.is_none());
+        assert!(panel.edit.active_paint_edit().is_none());
     });
     visual_cx.run_until_parked();
 
@@ -15962,20 +17937,21 @@ fn page_background_read_only_echo_terminates_the_color_transaction(cx: &mut Test
             ),
             cx,
         );
-        panel.auxiliary_color_picker = Some(target.clone());
-        panel.page_background_picker_open = true;
-        panel.active_paint_edit = Some(ActivePaintEdit {
-            target: PickerEventTarget {
+        *panel.overlays.auxiliary_color_picker_test_slot() = Some(target.clone());
+        *panel.overlays.page_background_picker_open_test_slot() = true;
+        assert!(panel.track_paint_edit(
+            &PickerEventTarget {
                 node_id: AuxiliaryColorPickerTarget::PICKER_NODE_ID.into(),
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: target.picker_paint_id(),
             },
-            edit: DesignPaintEdit {
+            &DesignPaintEdit {
                 property: DesignPaintProperty::Color,
                 value: DesignPaintValue::Color(DesignColor::WHITE),
             },
-        });
+            DesignPanelEditPhase::Begin,
+        ));
         panel.set_page_view_data(
             DesignPageViewData::new(
                 "page",
@@ -15984,9 +17960,12 @@ fn page_background_read_only_echo_terminates_the_color_transaction(cx: &mut Test
             ),
             cx,
         );
-        assert!(panel.active_paint_edit.is_none());
-        assert_eq!(panel.auxiliary_color_picker.as_ref(), Some(&target));
-        assert!(panel.page_background_picker_open);
+        assert!(panel.edit.active_paint_edit().is_none());
+        assert_eq!(
+            panel.overlays.auxiliary_color_picker().as_ref(),
+            Some(&target)
+        );
+        assert!(panel.overlays.page_background_picker_open());
     });
     visual_cx.update(|window, app| {
         panel.update(app, |panel, cx| {
@@ -16537,10 +18516,10 @@ fn smart_selection_host_echo_cancels_the_active_exact_target_draft(cx: &mut Test
                 window,
                 cx,
             );
-            assert!(panel.property_editor.is_some());
+            assert!(panel.edit.property.is_some());
 
             panel.set_smart_selection_view_data(projection(32.), cx);
-            assert!(panel.property_editor.is_none());
+            assert!(panel.edit.property.is_none());
             assert_eq!(
                 panel.current_property_value(DesignPanelProperty::SmartSelectionHorizontalSpacing),
                 Some(DesignPanelValue::Number(32.))
@@ -16598,7 +18577,7 @@ fn smart_selection_host_echo_cancels_the_active_exact_target_draft(cx: &mut Test
                     cx,
                 );
                 panel.set_inspection_context(context.clone(), cx);
-                assert!(panel.property_editor.is_none());
+                assert!(panel.edit.property.is_none());
             });
         });
         visual_cx.run_until_parked();
@@ -16647,8 +18626,11 @@ fn menu_preview_is_balanced_and_cleans_up_before_commit(cx: &mut TestAppContext)
         panel.emit_property(DesignPanelProperty::BlendMode, candidate.clone(), cx);
         panel.set_property_menu_preview(DesignPanelProperty::BlendMode, candidate, false, cx);
         panel.cancel_menu_preview(cx);
-        assert!(panel.active_menu_preview.is_none());
-        assert_eq!(panel.node.blend_mode, DesignBlendMode::Normal);
+        assert!(panel.overlays.active_menu_preview().is_none());
+        assert_eq!(
+            panel.host.inspected_node().blend_mode,
+            DesignBlendMode::Normal
+        );
     });
     visual_cx.run_until_parked();
 
@@ -16705,7 +18687,7 @@ fn menu_preview_stale_echo_and_exact_paint_effect_targets(cx: &mut TestAppContex
             let mut echoed = node.clone();
             echoed.opacity = 92.;
             panel.set_node(echoed, cx);
-            panel.active_picker = Some(PaintPickerTarget {
+            *panel.overlays.active_picker_test_slot() = Some(PaintPickerTarget {
                 collection: DesignPanelCollection::Fill,
                 index: 0,
                 paint_id: "stable-paint".into(),
@@ -16808,7 +18790,7 @@ fn menu_preview_stale_echo_and_exact_paint_effect_targets(cx: &mut TestAppContex
             )>(),
             cx,
         );
-        let viewer_node = panel.node.clone();
+        let viewer_node = panel.host.inspected_node().clone();
         panel.set_inspection_context(
             DesignPanelInspectionContext::single(
                 viewer_node,

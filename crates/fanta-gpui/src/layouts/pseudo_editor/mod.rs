@@ -8,12 +8,11 @@ use gpui::{
 use gpui_component::{ActiveTheme as _, StyledExt as _, h_flex, v_flex};
 
 use crate::atoms::{
-    CONTROL_KEY_CONTEXT, ControlExt as _, ControlIcon, icon_button, render_control_icon,
+    CONTROL_KEY_CONTEXT, ControlExt as _, LucideIcon, icon_button, render_lucide_icon, tokens,
 };
 use crate::{
-    assets::AssetsPanel, design::DesignPanel, layers::LayersPanel, pages::PagesPanel,
-    prototype::PrototypePanel, timeline::Timeline, toolbar::EditorToolbar,
-    variables::VariablesPage,
+    design::DesignPanel, layers::LayersPanel, pages::PagesPanel, prototype::PrototypePanel,
+    timeline::Timeline, toolbar::EditorToolbar, variables::VariablesScreen,
 };
 
 /// Reference design width of the left rail (§14).
@@ -53,10 +52,9 @@ pub const PSEUDO_EDITOR_PREFERRED_WIDTH: f32 =
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PseudoEditorLeftSurface {
+    #[default]
     Pages,
     Layers,
-    #[default]
-    Assets,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -70,12 +68,11 @@ pub enum PseudoEditorRightSurface {
 pub struct PseudoEditorChildren {
     pub pages: Entity<PagesPanel>,
     pub layers: Entity<LayersPanel>,
-    pub assets: Entity<AssetsPanel>,
     pub design: Entity<DesignPanel>,
     pub prototype: Entity<PrototypePanel>,
     pub timeline: Entity<Timeline>,
     pub toolbar: Entity<EditorToolbar>,
-    pub variables: Entity<VariablesPage>,
+    pub variables: Entity<VariablesScreen>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -150,7 +147,7 @@ impl PseudoEditor {
             .items_center()
             .rounded(px(5.))
             .cursor_pointer()
-            .text_size(px(10.))
+            .text_size(px(tokens::TypeScale::MICRO))
             .border_1()
             .border_color(cx.theme().transparent)
             .when(selected, |tab| {
@@ -169,7 +166,6 @@ impl PseudoEditor {
         let panel = match self.left_surface {
             PseudoEditorLeftSurface::Pages => self.children.pages.clone().into_any_element(),
             PseudoEditorLeftSurface::Layers => self.children.layers.clone().into_any_element(),
-            PseudoEditorLeftSurface::Assets => self.children.assets.clone().into_any_element(),
         };
         div()
             .debug_selector(|| "pseudo-editor-left-rail".to_owned())
@@ -231,10 +227,15 @@ impl PseudoEditor {
                     .bg(cx.theme().background)
                     .text_color(cx.theme().foreground)
                     .when(cx.theme().shadow, |card| card.shadow_lg())
-                    .child(div().text_size(px(20.)).font_semibold().child("Fanta"))
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(tokens::TypeScale::DISPLAY))
+                            .font_semibold()
+                            .child("Fanta"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens::TypeScale::BODY))
                             .text_color(cx.theme().muted_foreground)
                             .child("A simulated editor canvas"),
                     ),
@@ -280,7 +281,12 @@ impl Render for PseudoEditor {
                     .gap(px(10.))
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().font_semibold().text_size(px(12.)).child("Untitled"))
+                    .child(
+                        div()
+                            .font_semibold()
+                            .text_size(px(tokens::TypeScale::BODY))
+                            .child("Untitled"),
+                    )
                     .child(self.small_tab(
                         SharedString::from(format!("{}-left-pages", self.id)),
                         "pseudo-editor-left-pages",
@@ -304,20 +310,6 @@ impl Render for PseudoEditor {
                             this.left_surface = PseudoEditorLeftSurface::Layers;
                             cx.emit(PseudoEditorAction::LeftSurfaceChanged {
                                 surface: PseudoEditorLeftSurface::Layers,
-                            });
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(self.small_tab(
-                        SharedString::from(format!("{}-left-assets", self.id)),
-                        "pseudo-editor-left-assets",
-                        "Assets",
-                        self.left_surface == PseudoEditorLeftSurface::Assets,
-                        |this, cx| {
-                            this.left_surface = PseudoEditorLeftSurface::Assets;
-                            cx.emit(PseudoEditorAction::LeftSurfaceChanged {
-                                surface: PseudoEditorLeftSurface::Assets,
                             });
                             cx.notify();
                         },
@@ -363,7 +355,7 @@ impl Render for PseudoEditor {
                             .items_center()
                             .rounded(px(5.))
                             .cursor_pointer()
-                            .text_size(px(10.))
+                            .text_size(px(tokens::TypeScale::MICRO))
                             .border_1()
                             .border_color(cx.theme().transparent)
                             .hover(|style| style.bg(cx.theme().accent))
@@ -388,7 +380,7 @@ impl Render for PseudoEditor {
                             .items_center()
                             .rounded(px(5.))
                             .cursor_pointer()
-                            .text_size(px(10.))
+                            .text_size(px(tokens::TypeScale::MICRO))
                             .border_1()
                             .border_color(cx.theme().transparent)
                             .hover(|style| style.bg(cx.theme().accent))
@@ -412,7 +404,7 @@ impl Render for PseudoEditor {
                             .text_color(cx.theme().primary_foreground)
                             .cursor_pointer()
                             .font_semibold()
-                            .text_size(px(10.))
+                            .text_size(px(tokens::TypeScale::MICRO))
                             .border_1()
                             .border_color(cx.theme().transparent)
                             .hover(|style| style.bg(cx.theme().primary_hover))
@@ -484,13 +476,11 @@ impl Render for PseudoEditor {
                                         });
                                         cx.notify();
                                     }))
-                                    .child(
-                                        render_control_icon(
-                                            ControlIcon::Close,
-                                            cx.theme().foreground,
-                                            12.,
-                                        ),
-                                    ),
+                                    .child(render_lucide_icon(
+                                        LucideIcon::X,
+                                        cx.theme().foreground,
+                                        12.,
+                                    )),
                                 ),
                         )
                         .child(

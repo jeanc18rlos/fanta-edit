@@ -16,8 +16,8 @@ use gpui_component::{
 };
 
 use crate::atoms::{
-    ActivateControl, CONTROL_KEY_CONTEXT, ControlExt as _, ControlIcon, icon_button,
-    render_control_icon, track_bounds, truncating_label,
+    ActivateControl, CONTROL_KEY_CONTEXT, ControlExt as _, icon_button, tokens, track_bounds,
+    truncating_label,
 };
 use crate::molecules::list_row;
 
@@ -29,6 +29,7 @@ use super::{
 };
 
 mod events;
+mod icons;
 mod menu;
 #[cfg(test)]
 mod tests;
@@ -41,14 +42,14 @@ pub const LAYERS_PANEL_MIN_WIDTH: f32 = 240.;
 /// Shortest height the expanded panel stays useful at; the tree scrolls.
 pub const LAYERS_PANEL_MIN_HEIGHT: f32 = 400.;
 
-const HEADER_HEIGHT: f32 = 40.;
+const HEADER_HEIGHT: f32 = tokens::RowHeight::SECTION_HEADER;
 /// Every tree row — plain, editing, or dragging preview — is this tall. The
 /// tree is virtualized with `uniform_list`, which measures the first row and
 /// positions the rest arithmetically, so the height must be uniform.
-const LAYER_ROW_HEIGHT: f32 = 28.;
+const LAYER_ROW_HEIGHT: f32 = tokens::RowHeight::LIST;
 /// Indent per nesting level. Figma uses a compact step so deep trees keep a
 /// legible title column inside a narrow rail.
-const LAYER_INDENT: f32 = 12.;
+const LAYER_INDENT: f32 = tokens::Space::MD;
 /// Horizontal room a row always keeps for its icon slots, title, and
 /// satellites: the indent is capped so a deeply nested row never pushes its
 /// content out of the panel.
@@ -137,8 +138,6 @@ impl LayerArena {
         self.index_by_id.contains_key(id)
     }
 
-    /// Whether the row shows a disclosure arrow: it has children in the
-    /// arena, or the host says it has children it did not include.
     pub(super) fn has_children(&self, index: usize) -> bool {
         self.nodes
             .get(index)
@@ -429,19 +428,9 @@ impl LayersPanel {
             .flex_shrink_0()
             .px_3()
             .justify_between()
-            .border_b_1()
-            .border_color(if expanded {
-                cx.theme().border
-            } else {
-                cx.theme().transparent
-            })
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.55)))
-            .focus(|style| {
-                style
-                    .bg(cx.theme().sidebar_accent.opacity(0.55))
-                    .border_color(cx.theme().selection)
-            })
+            .focus(|style| style.bg(cx.theme().sidebar_accent.opacity(0.75)))
             .on_activate(cx.listener(|this, _, _, cx| {
                 this.toggle_panel_expanded(cx);
             }))
@@ -450,14 +439,9 @@ impl LayersPanel {
                     .flex_1()
                     .min_w(px(0.))
                     .gap_1()
-                    .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .xsmall(),
-                    )
+                    .when(!expanded, |title| {
+                        title.child(Icon::new(IconName::ChevronRight).xsmall())
+                    })
                     .child(div().text_sm().font_semibold().child("Layers")),
             )
             .child(

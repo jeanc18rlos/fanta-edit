@@ -2,11 +2,13 @@ use std::ops::Range;
 
 use gpui::{ClickEvent, Hsla, InteractiveElement as _, MouseButton, MouseDownEvent, uniform_list};
 
-use crate::toolbar::{ToolbarTool, render_tool_icon};
+use crate::atoms::tokens;
+
+use super::icons::{layer_kind_icon, render_lock_icon};
 
 use super::*;
 
-const LAYER_KIND_ICON_SIZE: f32 = 12.;
+const LAYER_KIND_ICON_SIZE: f32 = tokens::IconSize::XS;
 
 struct LayerDragPreview {
     drag: LayerDrag,
@@ -283,11 +285,13 @@ impl LayersPanel {
         .debug_selector(move || row_selector)
         .group(group_name.clone())
         .track_focus(&row_focus_handle)
+        .border_0()
         .pl(self.row_indent(node.depth) + px(4.))
         .pr_1()
         .text_xs()
         .cursor_move()
         .hover(|style| style.bg(cx.theme().sidebar_accent.opacity(0.7)))
+        .focus(|style| style.bg(cx.theme().sidebar_accent.opacity(0.82)))
         .when(within_hovered_group, |row| {
             row.bg(cx.theme().sidebar_accent.opacity(0.32))
         })
@@ -342,7 +346,10 @@ impl LayersPanel {
                 })
             })
             .drag_over::<LayerDrag>(move |style, _, _, _| {
-                style.bg(drop_background).border_color(drop_border)
+                style
+                    .bg(drop_background)
+                    .border_1()
+                    .border_color(drop_border)
             })
             .on_drop(cx.listener(move |this, drag: &LayerDrag, window, cx| {
                 cx.stop_propagation();
@@ -510,12 +517,8 @@ impl LayersPanel {
                 cx.stop_propagation();
                 this.request_lock(&node, cx);
             }))
-            .child(render_control_icon(
-                if locked {
-                    ControlIcon::Lock
-                } else {
-                    ControlIcon::Unlock
-                },
+            .child(render_lock_icon(
+                locked,
                 if locked {
                     cx.theme().sidebar_foreground
                 } else {
@@ -567,15 +570,15 @@ impl LayersPanel {
                 cx.stop_propagation();
                 this.request_visibility(&node, cx);
             }))
-            .child(render_control_icon(
-                if visible {
-                    ControlIcon::Eye
+            .child(
+                Icon::new(if visible {
+                    IconName::Eye
                 } else {
-                    ControlIcon::EyeClosed
-                },
-                cx.theme().sidebar_foreground,
-                LAYER_KIND_ICON_SIZE,
-            ))
+                    IconName::EyeOff
+                })
+                .with_size(px(LAYER_KIND_ICON_SIZE))
+                .text_color(cx.theme().sidebar_foreground),
+            )
             .into_any_element()
     }
 }
@@ -591,49 +594,4 @@ fn layer_kind_color(kind: LayersPanelNodeKind, cx: &App) -> Hsla {
     } else {
         cx.theme().muted_foreground
     }
-}
-
-fn layer_kind_icon(kind: LayersPanelNodeKind, color: Hsla, size: f32) -> AnyElement {
-    use LayersPanelNodeKind as Kind;
-
-    let control_icon = match kind {
-        Kind::Frame => Some(ControlIcon::Frame),
-        Kind::Group => Some(ControlIcon::Group),
-        Kind::Section => Some(ControlIcon::Section),
-        // A component set is drawn with the single-component diamond until a
-        // dedicated icon exists.
-        Kind::Component | Kind::ComponentSet => Some(ControlIcon::Component),
-        Kind::Instance => Some(ControlIcon::Instance),
-        Kind::Text => Some(ControlIcon::Text),
-        Kind::Image => Some(ControlIcon::Image),
-        Kind::Video => Some(ControlIcon::Video),
-        Kind::Mask => Some(ControlIcon::Mask),
-        Kind::BooleanOperation => Some(ControlIcon::BooleanOperation),
-        _ => None,
-    };
-    if let Some(icon) = control_icon {
-        return render_control_icon(icon, color, size);
-    }
-
-    let tool = match kind {
-        Kind::Rectangle => Some(ToolbarTool::Rectangle),
-        Kind::Ellipse => Some(ToolbarTool::Ellipse),
-        Kind::Polygon => Some(ToolbarTool::Polygon),
-        Kind::Star => Some(ToolbarTool::Star),
-        Kind::Line => Some(ToolbarTool::Line),
-        Kind::Arrow => Some(ToolbarTool::Arrow),
-        Kind::Vector => Some(ToolbarTool::NodeEdit),
-        Kind::Slice => Some(ToolbarTool::Slice),
-        Kind::Pen => Some(ToolbarTool::Pen),
-        Kind::Pencil => Some(ToolbarTool::Pencil),
-        _ => None,
-    };
-    if let Some(tool) = tool {
-        return render_tool_icon(tool, color, size);
-    }
-
-    div()
-        .text_color(color)
-        .child(Icon::new(IconName::Ellipsis).xsmall())
-        .into_any_element()
 }

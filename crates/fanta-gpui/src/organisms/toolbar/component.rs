@@ -22,17 +22,18 @@ use super::{
     ZoomCanvasToSelection,
     commands::{TOOLBAR_KEY_CONTEXT, TOOLBAR_TEXT_ENTRY_KEY_CONTEXT},
 };
+use crate::atoms::tokens;
 use crate::molecules::EdgeFades;
 
 mod overlays;
 mod rows;
 mod state;
 
-const TOOL_SIZE: f32 = 32.;
-const POPOVER_GAP: f32 = 8.;
+const TOOL_SIZE: f32 = tokens::ControlSize::TOOL;
+const POPOVER_GAP: f32 = tokens::Space::SM;
 /// Square size of one host chrome control in the utility row's trailing
 /// capsule; the capsule adds `px_1` around them and 2 px between them.
-const CHROME_CONTROL_SIZE: f32 = 28.;
+const CHROME_CONTROL_SIZE: f32 = tokens::ControlSize::CHROME;
 
 /// Utility-row width the full row needs, excluding any host chrome capsule:
 /// the three-tile mode tray, the − / + steppers, the percent trigger, and

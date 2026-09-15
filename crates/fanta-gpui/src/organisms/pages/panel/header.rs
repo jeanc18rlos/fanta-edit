@@ -25,21 +25,12 @@ impl PagesPanel {
             .h(px(HEADER_HEIGHT))
             .w_full()
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(cx.theme().transparent)
             .cursor_pointer()
             .occlude()
             .when(self.header_hovered, |header| {
                 header.bg(cx.theme().sidebar_accent.opacity(0.55))
             })
-            .focus(|style| {
-                style
-                    .bg(cx.theme().sidebar_accent.opacity(0.55))
-                    .border_color(cx.theme().selection)
-            })
-            .when(expanded, |header| {
-                header.border_b_1().border_color(cx.theme().border)
-            })
+            .focus(|style| style.bg(cx.theme().sidebar_accent.opacity(0.75)))
             .on_hover(cx.listener(|this, hovered, _, cx| {
                 if this.header_hovered != *hovered {
                     this.header_hovered = *hovered;
@@ -62,17 +53,15 @@ impl PagesPanel {
                     .min_w(px(0.))
                     .overflow_hidden()
                     .gap_1()
-                    .px_2()
+                    .px_3()
+                    .when(!expanded, |title| {
+                        title.child(Icon::new(IconName::ChevronRight).xsmall())
+                    })
                     .child(
-                        Icon::new(if expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .xsmall(),
-                    )
-                    .child(
-                        truncating_label(title).debug_selector(|| "pages-header-title".to_owned()),
+                        truncating_label(title)
+                            .text_sm()
+                            .font_semibold()
+                            .debug_selector(|| "pages-header-title".to_owned()),
                     ),
             )
             .child(

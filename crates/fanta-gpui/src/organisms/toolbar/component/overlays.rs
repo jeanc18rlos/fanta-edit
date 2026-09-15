@@ -14,7 +14,7 @@ use gpui_component::{
 
 use super::state::CommandMatch;
 use super::{CommandScope, EditorToolbar, POPOVER_GAP, TOOL_SIZE, ZoomMenuEntry};
-use crate::atoms::{CONTROL_KEY_CONTEXT, ControlExt as _, icon_button};
+use crate::atoms::{CONTROL_KEY_CONTEXT, ControlExt as _, icon_button, tokens};
 use crate::molecules::{
     POPUP_SAFE_MARGIN, anchored_popup, popup_height, popup_max_height, popup_surface, popup_width,
 };
@@ -23,13 +23,15 @@ use crate::toolbar::{ToolbarAction, ToolbarSecondaryControl, ToolbarToolGroup};
 
 /// Tool flyout rows are 38 px tall; the preferred flyout height mirrors the
 /// row stack exactly.
-const TOOL_FLYOUT_ROW_HEIGHT: f32 = 38.;
-/// The flyout surface wraps its rows in `p_2` (8 px above plus 8 px below).
-const TOOL_FLYOUT_VERTICAL_PADDING: f32 = 16.;
+const TOOL_FLYOUT_ROW_HEIGHT: f32 = tokens::RowHeight::FLYOUT;
+/// The flyout surface wraps its rows in `p_2`: one `Space::SM` step above
+/// plus one below, so the height tracks that padding instead of merely
+/// coinciding with it.
+const TOOL_FLYOUT_VERTICAL_PADDING: f32 = 2. * tokens::Space::SM;
 /// Zoom-menu and option-editor rows are 30 px tall inside the same `p_2`
 /// surface padding as the tool flyout.
-const MENU_ROW_HEIGHT: f32 = 30.;
-const MENU_VERTICAL_PADDING: f32 = 16.;
+const MENU_ROW_HEIGHT: f32 = tokens::RowHeight::MENU;
+const MENU_VERTICAL_PADDING: f32 = 2. * tokens::Space::SM;
 /// Palette chrome around the results viewport: 54 px header + 38 px scope
 /// switcher + 34 px footer + the surface's top and bottom 1 px borders.
 const ACTIONS_PALETTE_CHROME_HEIGHT: f32 = 128.;

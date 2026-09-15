@@ -1,30 +1,291 @@
 use super::*;
 
-impl DesignPanel {
-    pub(super) fn is_active_auto_layout_owner(&self) -> bool {
-        self.node.supports_auto_layout_container()
+/// Build the immutable read model consumed by the extracted Layout section.
+/// Complex retained editors remain facade-owned during migration, but every
+/// value that determines section composition is captured here.
+pub(super) fn projection(panel: &DesignPanel) -> sections::layout::LayoutProjection {
+    let parent_layout = panel.host.inspection_context.parent_layout();
+    let participates_in_auto_layout = panel.host.inspected_node().supports_auto_layout_child()
+        && parent_layout.participates_in_auto_layout();
+    let ignored_by_auto_layout = panel.host.inspected_node().supports_auto_layout_child()
+        && parent_layout.is_ignored_by_auto_layout();
+    let limits_are_applicable = panel.dimension_limits_are_applicable();
+    let limits_disclosed = |axis| {
+        let [minimum, maximum] = DesignPanel::dimension_limit_fields_for_axis(axis);
+        (
+            limits_are_applicable
+                && panel
+                    .features
+                    .layout
+                    .dimension_limit_fields_disclosed
+                    .contains(&minimum),
+            limits_are_applicable
+                && panel
+                    .features
+                    .layout
+                    .dimension_limit_fields_disclosed
+                    .contains(&maximum),
+        )
+    };
+    let layout = panel
+        .host
+        .inspected_node()
+        .layout
+        .clone()
+        .unwrap_or_default();
+    let (minimum_width, maximum_width) = DesignPanel::dimension_limits_for_node(
+        panel.host.inspected_node(),
+        DesignLayoutDimensionAxis::Width,
+    );
+    let (minimum_height, maximum_height) = DesignPanel::dimension_limits_for_node(
+        panel.host.inspected_node(),
+        DesignLayoutDimensionAxis::Height,
+    );
+    let (show_minimum_width, show_maximum_width) =
+        limits_disclosed(DesignLayoutDimensionAxis::Width);
+    let (show_minimum_height, show_maximum_height) =
+        limits_disclosed(DesignLayoutDimensionAxis::Height);
+
+    sections::layout::LayoutProjection::new(
+        sections::layout::LayoutIdentity::new(panel.id.clone(), panel.command_target()),
+        layout.clone(),
+        sections::layout::LayoutCapabilities::new(
+            panel.can_edit(),
+            panel.property_is_editable(DesignPanelProperty::LayoutMode),
+            panel
+                .host
+                .inspected_node()
+                .typography
+                .as_ref()
+                .map(|value| value.resize),
+            panel.host.inspected_node().supports_resize_to_fit(),
+            panel.host.inspected_node().supports_clip_content(),
+        ),
+        sections::layout::LayoutAutoLayoutProjection::new(
+            panel.host.inspected_node().supports_auto_layout_container(),
+            participates_in_auto_layout,
+            ignored_by_auto_layout,
+            parent_layout.auto_layout_direction(),
+            panel.add_auto_layout_view_data_for_context().cloned(),
+        ),
+        sections::layout::LayoutGridProjection::new(
+            panel.host.inspected_node().supports_grid_auto_layout(),
+            &layout,
+        ),
+        sections::layout::LayoutAuxiliaryProjection::new(
+            sections::layout::LayoutDimensionProjection::new(
+                panel.node_capability_allows_property(DesignPanelProperty::LockAspectRatio),
+                panel.host.inspected_node().lock_aspect_ratio,
+                panel.property_is_editable(DesignPanelProperty::LockAspectRatio),
+                sections::layout::LayoutAxisLimitsProjection::new(
+                    panel.host.inspected_node().width,
+                    minimum_width,
+                    maximum_width,
+                    show_minimum_width,
+                    show_maximum_width,
+                ),
+                sections::layout::LayoutAxisLimitsProjection::new(
+                    panel.host.inspected_node().height,
+                    minimum_height,
+                    maximum_height,
+                    show_minimum_height,
+                    show_maximum_height,
+                ),
+            ),
+            sections::layout::LayoutPresetProjection::new(
+                panel.frame_preset_view_data_for_context().cloned(),
+            ),
+        ),
+        sections::layout::LayoutPresentation::new(
+            panel.renders_draw_workspace(),
+            panel.sections.is_expanded(DesignPanelSection::Layout),
+            panel.features.layout.padding_editor_mode,
+        ),
+    )
+}
+
+/// Internal Layout controller surface used by the thin `DesignPanel` facade.
+pub(super) trait DesignLayoutController: Sized + 'static {
+    fn is_active_auto_layout_owner(&self) -> bool;
+    fn add_auto_layout_view_data_for_context(&self) -> Option<&DesignAddAutoLayoutViewData>;
+    fn emit_add_auto_layout(&mut self, cx: &mut Context<Self>) -> bool;
+    fn frame_preset_view_data_for_context(&self) -> Option<&DesignFramePresetViewData>;
+    fn frame_preset_action_is_applicable(
+        &self,
+        selection: &DesignFramePresetSelection,
+        width: f32,
+        height: f32,
+    ) -> bool;
+    fn toggle_frame_preset_group(&mut self, group_id: &SharedString, cx: &mut Context<Self>);
+    fn emit_frame_preset_apply(
+        &mut self,
+        selection: DesignFramePresetSelection,
+        cx: &mut Context<Self>,
+    );
+    fn layout_property_is_applicable(&self, property: DesignPanelProperty) -> bool;
+    fn layout_property_value_is_applicable(
+        &self,
+        property: DesignPanelProperty,
+        value: &DesignPanelValue,
+    ) -> bool;
+    fn render_grid_auto_rows_toggle(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn render_counter_axis_spacing_controls(
+        &self,
+        spacing: Option<f32>,
+        primary_gap: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_padding_mode_button(
+        &self,
+        mode: PaddingEditorMode,
+        label: &'static str,
+        tooltip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn open_grid_dimensions_picker(&mut self, cx: &mut Context<Self>);
+    fn set_grid_dimensions_candidate(
+        &mut self,
+        candidate: DesignGridDimensions,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn commit_grid_dimensions_candidate(&mut self, cx: &mut Context<Self>) -> bool;
+    fn step_grid_dimensions_candidate(&mut self, key: &str, cx: &mut Context<Self>) -> bool;
+    fn handle_grid_dimensions_picker_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn render_grid_dimensions_picker(
+        &self,
+        layout: &DesignLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_grid_track_controls(
+        &self,
+        axis: DesignGridTrackAxis,
+        layout: &DesignLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_frame_preset_browser(&self, cx: &mut Context<Self>) -> Option<AnyElement>;
+    fn dimension_properties(
+        axis: DesignLayoutDimensionAxis,
+    ) -> (
+        DesignPanelProperty,
+        DesignPanelProperty,
+        DesignPanelProperty,
+        DesignPanelProperty,
+    );
+    fn dimension_limits_for_node(
+        node: &DesignPanelNode,
+        axis: DesignLayoutDimensionAxis,
+    ) -> (Option<f32>, Option<f32>);
+    fn dimension_limits_are_applicable_for(
+        node: &DesignPanelNode,
+        context: &DesignPanelInspectionContext,
+    ) -> bool;
+    fn dimension_limits_are_applicable(&self) -> bool;
+    fn dimension_limit_fields_for_axis(axis: DesignLayoutDimensionAxis)
+    -> [DesignPanelProperty; 2];
+    fn disclose_existing_dimension_limits(
+        &mut self,
+        axis: DesignLayoutDimensionAxis,
+        cx: &mut Context<Self>,
+    );
+    fn reveal_dimension_limit_field(
+        &mut self,
+        axis: DesignLayoutDimensionAxis,
+        property: DesignPanelProperty,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    );
+    fn remove_dimension_limits(
+        &mut self,
+        axis: DesignLayoutDimensionAxis,
+        cx: &mut Context<Self>,
+    ) -> bool;
+    fn set_dimension_limits_preview(
+        &mut self,
+        axis: DesignLayoutDimensionAxis,
+        preview: bool,
+        cx: &mut Context<Self>,
+    );
+    fn cancel_dimension_limits_preview(&mut self, cx: &mut Context<Self>);
+    fn toggle_dimension_menu(&mut self, axis: DesignLayoutDimensionAxis, cx: &mut Context<Self>);
+    fn dimension_limits_tooltip(
+        &self,
+        axis: DesignLayoutDimensionAxis,
+        sizing: DesignSizingMode,
+    ) -> SharedString;
+    fn render_dimension_menu_trigger(
+        &self,
+        axis: DesignLayoutDimensionAxis,
+        sizing: DesignSizingMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_dimension_control(
+        &self,
+        axis: DesignLayoutDimensionAxis,
+        layout: &DesignLayout,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    #[cfg(test)]
+    fn render_dimension_limit_fields(
+        &self,
+        axis: DesignLayoutDimensionAxis,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement>;
+    fn render_add_auto_layout(
+        &self,
+        view_data: &DesignAddAutoLayoutViewData,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_draw_add_auto_layout(
+        &self,
+        view_data: &DesignAddAutoLayoutViewData,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn render_draw_layout_header(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn render_layout(&self, cx: &mut Context<Self>) -> AnyElement;
+    fn render_grid_track_action_button(
+        &self,
+        id_suffix: impl Into<SharedString>,
+        icon: IconName,
+        action: DesignPanelAction,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement;
+    fn grid_track_action_is_applicable(&self, action: &DesignPanelAction) -> bool;
+    fn grid_dimensions_action_is_applicable(&self, action: &DesignPanelAction) -> bool;
+}
+
+impl DesignLayoutController for DesignPanel {
+    fn is_active_auto_layout_owner(&self) -> bool {
+        self.host.inspected_node().supports_auto_layout_container()
             && self
-                .node
+                .host
+                .inspected_node()
                 .layout
                 .as_ref()
                 .is_some_and(|layout| layout.mode != DesignLayoutMode::None)
     }
 
-    pub(super) fn add_auto_layout_view_data_for_context(
-        &self,
-    ) -> Option<&DesignAddAutoLayoutViewData> {
-        let view_data = self.add_auto_layout_view_data.as_ref()?;
+    fn add_auto_layout_view_data_for_context(&self) -> Option<&DesignAddAutoLayoutViewData> {
+        let view_data = self.host.projections.add_auto_layout.as_ref()?;
         (view_data.is_valid()
             && view_data.structurally_eligible
             && view_data.target == self.command_target()
-            && !self.inspection_context.selection().is_empty()
-            && self.node.supports_add_auto_layout()
-            && self.node.supports_section(DesignPanelSection::Layout)
+            && !self.host.inspection_context.selection().is_empty()
+            && self.host.inspected_node().supports_add_auto_layout()
+            && self
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Layout)
             && !self.is_active_auto_layout_owner())
         .then_some(view_data)
     }
 
-    pub(super) fn emit_add_auto_layout(&mut self, cx: &mut Context<Self>) -> bool {
+    fn emit_add_auto_layout(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.can_edit() {
             return false;
         }
@@ -39,18 +300,21 @@ impl DesignPanel {
         true
     }
 
-    pub(super) fn frame_preset_view_data_for_context(&self) -> Option<&DesignFramePresetViewData> {
-        let view_data = self.frame_preset_view_data.as_ref()?;
-        (self.inspection_context.selection().kind() == DesignPanelSelectionKind::Single
-            && self.node.kind == DesignPanelNodeKind::Frame
-            && self.node.supports_dimensions()
-            && self.node.supports_section(DesignPanelSection::Layout)
-            && view_data.target_node_id == self.node.id
+    fn frame_preset_view_data_for_context(&self) -> Option<&DesignFramePresetViewData> {
+        let view_data = self.host.projections.frame_presets.as_ref()?;
+        (self.host.inspection_context.selection().kind() == DesignPanelSelectionKind::Single
+            && self.host.inspected_node().kind == DesignPanelNodeKind::Frame
+            && self.host.inspected_node().supports_dimensions()
+            && self
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Layout)
+            && view_data.target_node_id == self.host.inspected_node().id
             && view_data.is_valid())
         .then_some(view_data)
     }
 
-    pub(super) fn frame_preset_action_is_applicable(
+    fn frame_preset_action_is_applicable(
         &self,
         selection: &DesignFramePresetSelection,
         width: f32,
@@ -68,24 +332,28 @@ impl DesignPanel {
             .is_some_and(|(_, preset)| preset.width == width && preset.height == height)
     }
 
-    pub(super) fn toggle_frame_preset_group(
-        &mut self,
-        group_id: &SharedString,
-        cx: &mut Context<Self>,
-    ) {
+    fn toggle_frame_preset_group(&mut self, group_id: &SharedString, cx: &mut Context<Self>) {
         let group_exists = self
             .frame_preset_view_data_for_context()
             .is_some_and(|view_data| view_data.groups.iter().any(|group| group.id == *group_id));
         if !group_exists {
             return;
         }
-        if !self.collapsed_frame_preset_groups.remove(group_id) {
-            self.collapsed_frame_preset_groups.insert(group_id.clone());
+        if !self
+            .features
+            .layout
+            .collapsed_frame_preset_groups
+            .remove(group_id)
+        {
+            self.features
+                .layout
+                .collapsed_frame_preset_groups
+                .insert(group_id.clone());
         }
         cx.notify();
     }
 
-    pub(super) fn emit_frame_preset_apply(
+    fn emit_frame_preset_apply(
         &mut self,
         selection: DesignFramePresetSelection,
         cx: &mut Context<Self>,
@@ -100,11 +368,11 @@ impl DesignPanel {
         if !self.frame_preset_action_is_applicable(&selection, width, height) {
             return;
         }
-        self.frame_preset_browser_open = false;
+        self.overlays.discard(DesignOpenOverlay::FramePreset);
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::FramePresetApplyRequested {
-                node_id: self.node.id.clone(),
+                node_id: self.host.inspected_node().id.clone(),
                 selection,
                 width,
                 height,
@@ -113,13 +381,13 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn layout_property_is_applicable(&self, property: DesignPanelProperty) -> bool {
-        let layout = self.node.layout.as_ref();
+    fn layout_property_is_applicable(&self, property: DesignPanelProperty) -> bool {
+        let layout = self.host.inspected_node().layout.as_ref();
         let mode = layout.map_or(DesignLayoutMode::None, |layout| layout.mode);
-        let owns_layout = self.node.supports_auto_layout_container();
-        let parent = self.inspection_context.parent_layout();
-        let participates =
-            self.node.supports_auto_layout_child() && parent.participates_in_auto_layout();
+        let owns_layout = self.host.inspected_node().supports_auto_layout_container();
+        let parent = self.host.inspection_context.parent_layout();
+        let participates = self.host.inspected_node().supports_auto_layout_child()
+            && parent.participates_in_auto_layout();
         let parent_direction = parent.auto_layout_direction();
         match property {
             DesignPanelProperty::LayoutMode => owns_layout,
@@ -184,7 +452,7 @@ impl DesignPanel {
                 (owns_layout && mode != DesignLayoutMode::None) || participates
             }
             DesignPanelProperty::LayoutPositioning => {
-                self.node.supports_auto_layout_child() && parent.is_auto_layout()
+                self.host.inspected_node().supports_auto_layout_child() && parent.is_auto_layout()
             }
             DesignPanelProperty::LayoutAlignSelf | DesignPanelProperty::LayoutGrow => participates,
             DesignPanelProperty::GridAutoTracks
@@ -196,7 +464,7 @@ impl DesignPanel {
             | DesignPanelProperty::GridColumnTrackValue(_)
             | DesignPanelProperty::GridRowTrackValue(_) => {
                 owns_layout
-                    && self.node.supports_grid_auto_layout()
+                    && self.host.inspected_node().supports_grid_auto_layout()
                     && mode == DesignLayoutMode::Grid
             }
             DesignPanelProperty::GridRowIndex
@@ -207,18 +475,19 @@ impl DesignPanel {
             | DesignPanelProperty::GridVerticalAlignment => {
                 participates && parent_direction == Some(DesignPanelAutoLayoutDirection::Grid)
             }
-            DesignPanelProperty::ClipContent => self.node.supports_clip_content(),
+            DesignPanelProperty::ClipContent => self.host.inspected_node().supports_clip_content(),
             _ => true,
         }
     }
 
-    pub(super) fn layout_property_value_is_applicable(
+    fn layout_property_value_is_applicable(
         &self,
         property: DesignPanelProperty,
         value: &DesignPanelValue,
     ) -> bool {
         let mode = self
-            .node
+            .host
+            .inspected_node()
             .layout
             .as_ref()
             .map_or(DesignLayoutMode::None, |layout| layout.mode);
@@ -257,9 +526,10 @@ impl DesignPanel {
                 _,
             ) => false,
             (DesignPanelProperty::LayoutMode, DesignPanelValue::LayoutMode(candidate)) => {
-                (*candidate == DesignLayoutMode::None || self.node.supports_auto_layout_container())
+                (*candidate == DesignLayoutMode::None
+                    || self.host.inspected_node().supports_auto_layout_container())
                     && (*candidate != DesignLayoutMode::Grid
-                        || self.node.supports_grid_auto_layout())
+                        || self.host.inspected_node().supports_grid_auto_layout())
             }
             (DesignPanelProperty::Wrap, DesignPanelValue::Bool(true)) => {
                 mode == DesignLayoutMode::Horizontal
@@ -297,36 +567,46 @@ impl DesignPanel {
                 DesignPanelValue::CounterAxisAlignContent(_),
             ) => {
                 mode == DesignLayoutMode::Horizontal
-                    && self.node.layout.as_ref().is_some_and(|layout| layout.wrap)
+                    && self
+                        .host
+                        .inspected_node()
+                        .layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.wrap)
             }
             (DesignPanelProperty::CounterAxisAlignContent, _) => false,
             (DesignPanelProperty::CounterAxisGap, DesignPanelValue::OptionalNumber(spacing)) => {
-                self.node.layout.as_ref().is_some_and(|layout| {
-                    if layout.mode == DesignLayoutMode::Grid {
-                        spacing.is_some_and(|spacing| spacing.is_finite() && spacing >= 0.)
-                    } else {
-                        layout.mode == DesignLayoutMode::Horizontal
-                            && layout.wrap
-                            && layout.counter_axis_align_content
-                                == DesignCounterAxisAlignContent::Auto
-                            && spacing.is_none_or(|spacing| spacing.is_finite() && spacing > 0.)
-                    }
-                })
+                self.host
+                    .inspected_node()
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| {
+                        if layout.mode == DesignLayoutMode::Grid {
+                            spacing.is_some_and(|spacing| spacing.is_finite() && spacing >= 0.)
+                        } else {
+                            layout.mode == DesignLayoutMode::Horizontal
+                                && layout.wrap
+                                && layout.counter_axis_align_content
+                                    == DesignCounterAxisAlignContent::Auto
+                                && spacing.is_none_or(|spacing| spacing.is_finite() && spacing > 0.)
+                        }
+                    })
             }
             (DesignPanelProperty::CounterAxisGap, _) => false,
             (
                 DesignPanelProperty::HorizontalSizing | DesignPanelProperty::VerticalSizing,
                 DesignPanelValue::SizingMode(candidate),
             ) => {
-                let layout = self.node.layout.as_ref();
-                let owns_active_flow =
-                    self.node.supports_auto_layout_container() && mode != DesignLayoutMode::None;
+                let layout = self.host.inspected_node().layout.as_ref();
+                let owns_active_flow = self.host.inspected_node().supports_auto_layout_container()
+                    && mode != DesignLayoutMode::None;
                 let is_text = matches!(
-                    self.node.kind,
+                    self.host.inspected_node().kind,
                     DesignPanelNodeKind::Text | DesignPanelNodeKind::TextPath
                 );
-                let participates = self.node.supports_auto_layout_child()
+                let participates = self.host.inspected_node().supports_auto_layout_child()
                     && self
+                        .host
                         .inspection_context
                         .parent_layout()
                         .participates_in_auto_layout();
@@ -335,6 +615,7 @@ impl DesignPanel {
                     DesignPanelProperty::VerticalSizing => layout.item.grid_row_span > 1,
                     _ => false,
                 }) && self
+                    .host
                     .inspection_context
                     .parent_layout()
                     .auto_layout_direction()
@@ -376,7 +657,8 @@ impl DesignPanel {
                 track.is_valid()
                     && !(track.sizing == DesignGridTrackSizing::Fraction
                         && self
-                            .node
+                            .host
+                            .inspected_node()
                             .layout
                             .as_ref()
                             .is_some_and(|layout| match property {
@@ -398,7 +680,8 @@ impl DesignPanel {
                 minimum.is_finite()
                     && *minimum > 0.
                     && self
-                        .node
+                        .host
+                        .inspected_node()
                         .layout
                         .as_ref()
                         .and_then(|layout| layout.item.max_width)
@@ -408,7 +691,8 @@ impl DesignPanel {
                 minimum.is_finite()
                     && *minimum > 0.
                     && self
-                        .node
+                        .host
+                        .inspected_node()
                         .layout
                         .as_ref()
                         .and_then(|layout| layout.item.max_height)
@@ -418,7 +702,8 @@ impl DesignPanel {
                 maximum.is_finite()
                     && *maximum > 0.
                     && self
-                        .node
+                        .host
+                        .inspected_node()
                         .layout
                         .as_ref()
                         .and_then(|layout| layout.item.min_width)
@@ -428,7 +713,8 @@ impl DesignPanel {
                 maximum.is_finite()
                     && *maximum > 0.
                     && self
-                        .node
+                        .host
+                        .inspected_node()
                         .layout
                         .as_ref()
                         .and_then(|layout| layout.item.min_height)
@@ -438,32 +724,38 @@ impl DesignPanel {
                 DesignPanelProperty::GridRowSpan | DesignPanelProperty::GridColumnSpan,
                 DesignPanelValue::Integer(span),
             ) => {
-                let fills_spanned_axis =
-                    self.node
-                        .layout
-                        .as_ref()
-                        .is_some_and(|layout| match property {
-                            DesignPanelProperty::GridRowSpan => {
-                                *span <= 1 || layout.vertical_sizing == DesignSizingMode::Fill
-                            }
-                            DesignPanelProperty::GridColumnSpan => {
-                                *span <= 1 || layout.horizontal_sizing == DesignSizingMode::Fill
-                            }
-                            _ => false,
-                        });
+                let fills_spanned_axis = self.host.inspected_node().layout.as_ref().is_some_and(
+                    |layout| match property {
+                        DesignPanelProperty::GridRowSpan => {
+                            *span <= 1 || layout.vertical_sizing == DesignSizingMode::Fill
+                        }
+                        DesignPanelProperty::GridColumnSpan => {
+                            *span <= 1 || layout.horizontal_sizing == DesignSizingMode::Fill
+                        }
+                        _ => false,
+                    },
+                );
                 *span >= 1 && fills_spanned_axis
             }
             (DesignPanelProperty::EffectKind(index), DesignPanelValue::EffectKind(candidate)) => {
-                self.node.effects.get(index).is_some_and(|effect| {
-                    effect.settings.kind() == *candidate
-                        || self.node.can_use_effect_kind(*candidate, Some(index))
-                })
+                self.host
+                    .inspected_node()
+                    .effects
+                    .get(index)
+                    .is_some_and(|effect| {
+                        effect.settings.kind() == *candidate
+                            || self
+                                .host
+                                .inspected_node()
+                                .can_use_effect_kind(*candidate, Some(index))
+                    })
             }
             (
                 DesignPanelProperty::EffectShaderProperty(index, property_index),
                 DesignPanelValue::ShaderProperty(value),
             ) => self
-                .node
+                .host
+                .inspected_node()
                 .effects
                 .get(index)
                 .and_then(|effect| {
@@ -482,12 +774,15 @@ impl DesignPanel {
                         && value.is_compatible_with(property.kind)
                 }),
             (DesignPanelProperty::StrokeDashMode, DesignPanelValue::StrokeDashMode(_)) => true,
-            (DesignPanelProperty::StrokeDashPattern, DesignPanelValue::NumberList(pattern)) => {
-                self.node.stroke.as_ref().is_some_and(|stroke| {
+            (DesignPanelProperty::StrokeDashPattern, DesignPanelValue::NumberList(pattern)) => self
+                .host
+                .inspected_node()
+                .stroke
+                .as_ref()
+                .is_some_and(|stroke| {
                     let mut candidate = stroke.dashes.clone();
                     candidate.set_pattern(pattern.clone())
-                })
-            }
+                }),
             (
                 DesignPanelProperty::StrokeVariableWidth,
                 DesignPanelValue::StrokeVariableWidth(variable_width),
@@ -560,9 +855,10 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_grid_auto_rows_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_grid_auto_rows_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
         let checked = self
-            .node
+            .host
+            .inspected_node()
             .layout
             .as_ref()
             .is_some_and(|layout| layout.grid_auto_tracks == DesignGridAutoTracks::Rows);
@@ -622,7 +918,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_counter_axis_spacing_controls(
+    fn render_counter_axis_spacing_controls(
         &self,
         spacing: Option<f32>,
         primary_gap: f32,
@@ -679,7 +975,7 @@ impl DesignPanel {
                     .w(px(12.))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(if custom { "⛓" } else { "↕" }),
+                    .child(if custom { "Custom" } else { "V" }),
             )
             .child(div().flex_1().truncate().text_xs().child(if custom {
                 "Custom"
@@ -694,7 +990,7 @@ impl DesignPanel {
             .when_some(spacing, |row, spacing| {
                 row.child(self.render_value_cell(
                     "layout-counter-axis-spacing-value",
-                    "↕",
+                    "V",
                     format_number(spacing),
                     DesignPanelProperty::CounterAxisGap,
                     DesignPanelValue::OptionalNumber(Some(spacing + 2.)),
@@ -704,7 +1000,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_padding_mode_button(
+    fn render_padding_mode_button(
         &self,
         mode: PaddingEditorMode,
         label: &'static str,
@@ -723,20 +1019,21 @@ impl DesignPanel {
         .compact()
         .ghost()
         .h(px(22.))
-        .selected(self.padding_editor_mode == mode)
+        .selected(self.features.layout.padding_editor_mode == mode)
         .disabled(!self.can_edit())
         .on_activate(move |_, _, cx| {
             panel.update(cx, |this, cx| {
-                this.padding_editor_mode = mode;
+                this.features.layout.padding_editor_mode = mode;
                 cx.notify();
             });
         })
         .into_any_element()
     }
 
-    pub(super) fn open_grid_dimensions_picker(&mut self, cx: &mut Context<Self>) {
+    fn open_grid_dimensions_picker(&mut self, cx: &mut Context<Self>) {
         let Some(dimensions) = self
-            .node
+            .host
+            .inspected_node()
             .layout
             .as_ref()
             .and_then(DesignLayout::grid_dimensions)
@@ -745,45 +1042,31 @@ impl DesignPanel {
                     || self.property_is_editable(DesignPanelProperty::GridRowCount)
             })
         else {
-            self.grid_dimensions_picker = None;
+            self.overlays.discard(DesignOpenOverlay::GridDimensions);
             return;
         };
         self.cancel_property_editor_transaction(cx);
-        self.grid_dimensions_picker = Some(GridDimensionsPicker {
-            node_id: self.node.id.clone(),
+        self.overlays.open_grid_dimensions(GridDimensionsPicker {
+            node_id: self.host.inspected_node().id.clone(),
             candidate: dimensions,
         });
         self.cancel_menu_preview(cx);
-        self.active_picker = None;
-        self.auxiliary_color_picker = None;
-        self.active_effect_settings = None;
-        self.paint_style_browser_open = None;
-        self.effect_style_browser_open = false;
-        self.property_variable_picker = None;
-        self.component_property_variable_picker = None;
-        self.component_swap_browser = None;
-        self.layout_grid_style_browser_open = false;
-        self.frame_preset_browser_open = false;
-        self.typography_style_picker_open = false;
-        self.font_browser_open = false;
-        self.type_settings_open = false;
-        self.selection_header_overlay = None;
         cx.notify();
     }
 
-    pub(super) fn set_grid_dimensions_candidate(
+    fn set_grid_dimensions_candidate(
         &mut self,
         candidate: DesignGridDimensions,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(node_id) = self
-            .grid_dimensions_picker
-            .as_ref()
+            .overlays
+            .grid_dimensions_picker()
             .map(|picker| picker.node_id.clone())
         else {
             return false;
         };
-        if node_id != self.node.id || !candidate.is_valid() {
+        if node_id != self.host.inspected_node().id || !candidate.is_valid() {
             return false;
         }
         let action = DesignPanelAction::GridDimensionsEditRequested {
@@ -794,19 +1077,14 @@ impl DesignPanel {
         if !self.grid_dimensions_action_is_applicable(&action) {
             return false;
         }
-        let picker = self
-            .grid_dimensions_picker
-            .as_mut()
-            .expect("validated retained Grid picker remains present");
-        if picker.candidate != candidate {
-            picker.candidate = candidate;
+        if self.overlays.update_grid_dimensions_candidate(candidate) {
             cx.notify();
         }
         true
     }
 
-    pub(super) fn commit_grid_dimensions_candidate(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(picker) = self.grid_dimensions_picker.clone() else {
+    fn commit_grid_dimensions_candidate(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = self.overlays.grid_dimensions_picker().cloned() else {
             return false;
         };
         let action = DesignPanelAction::GridDimensionsEditRequested {
@@ -817,23 +1095,20 @@ impl DesignPanel {
         if !self.grid_dimensions_action_is_applicable(&action) {
             return false;
         }
-        self.grid_dimensions_picker = None;
+        self.overlays.discard(DesignOpenOverlay::GridDimensions);
         cx.emit_design_panel_action(self, action);
         cx.notify();
         true
     }
 
-    pub(super) fn step_grid_dimensions_candidate(
-        &mut self,
-        key: &str,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(picker) = self.grid_dimensions_picker.as_ref() else {
+    fn step_grid_dimensions_candidate(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = self.overlays.grid_dimensions_picker() else {
             return false;
         };
         let candidate = picker.candidate;
         let automatic_rows = self
-            .node
+            .host
+            .inspected_node()
             .layout
             .as_ref()
             .is_some_and(|layout| layout.grid_auto_tracks == DesignGridAutoTracks::Rows);
@@ -860,7 +1135,7 @@ impl DesignPanel {
         self.set_grid_dimensions_candidate(next, cx)
     }
 
-    pub(super) fn handle_grid_dimensions_picker_key_down(
+    fn handle_grid_dimensions_picker_key_down(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
@@ -874,11 +1149,7 @@ impl DesignPanel {
             "left" | "right" | "up" | "down" => self.step_grid_dimensions_candidate(key, cx),
             "enter" | "space" => self.commit_grid_dimensions_candidate(cx),
             "escape" => {
-                let was_open = self.grid_dimensions_picker.take().is_some();
-                if was_open {
-                    cx.notify();
-                }
-                was_open
+                self.dismiss_overlay_from_escape(DesignOpenOverlay::GridDimensions, window, cx)
             }
             _ => false,
         };
@@ -888,7 +1159,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_grid_dimensions_picker(
+    fn render_grid_dimensions_picker(
         &self,
         layout: &DesignLayout,
         cx: &mut Context<Self>,
@@ -917,13 +1188,15 @@ impl DesignPanel {
             .into_any_element();
         };
         let open = self
-            .grid_dimensions_picker
-            .as_ref()
-            .is_some_and(|picker| picker.node_id == self.node.id && picker.candidate.is_valid());
+            .overlays
+            .grid_dimensions_picker()
+            .is_some_and(|picker| {
+                picker.node_id == self.host.inspected_node().id && picker.candidate.is_valid()
+            });
         let candidate = self
-            .grid_dimensions_picker
-            .as_ref()
-            .filter(|picker| picker.node_id == self.node.id)
+            .overlays
+            .grid_dimensions_picker()
+            .filter(|picker| picker.node_id == self.host.inspected_node().id)
             .map_or(current, |picker| picker.candidate);
         let automatic_rows = layout.grid_auto_tracks == DesignGridAutoTracks::Rows;
         let columns_editable = self.property_is_editable(DesignPanelProperty::GridColumnCount);
@@ -958,8 +1231,8 @@ impl DesignPanel {
             move |_, cx| {
                 panel.update(cx, |this, cx| {
                     if open {
-                        if this.grid_dimensions_picker.is_some() {
-                            this.grid_dimensions_picker = None;
+                        if this.overlays.grid_dimensions_picker().is_some() {
+                            this.overlays.discard(DesignOpenOverlay::GridDimensions);
                             cx.notify();
                         }
                     } else {
@@ -976,13 +1249,21 @@ impl DesignPanel {
         .anchor(Anchor::TopRight)
         .open(open)
         .overlay_closable(true)
-        .on_open_change(move |is_open, _, cx| {
+        .on_open_change(move |is_open, window, cx| {
             panel_for_open.update(cx, |this, cx| {
                 if *is_open {
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::GridDimensions,
+                        window,
+                        cx,
+                    );
                     this.open_grid_dimensions_picker(cx);
-                } else if this.grid_dimensions_picker.is_some() {
-                    this.grid_dimensions_picker = None;
-                    cx.notify();
+                } else if this.overlays.grid_dimensions_picker().is_some() {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::GridDimensions,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -1104,7 +1385,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_grid_track_controls(
+    fn render_grid_track_controls(
         &self,
         axis: DesignGridTrackAxis,
         layout: &DesignLayout,
@@ -1146,7 +1427,7 @@ impl DesignPanel {
                     format!("grid-{}-add", label.to_ascii_lowercase()),
                     IconName::Plus,
                     DesignPanelAction::GridTrackAddRequested {
-                        node_id: self.node.id.clone(),
+                        node_id: self.host.inspected_node().id.clone(),
                         axis,
                         insertion_index: tracks.len(),
                     },
@@ -1208,7 +1489,7 @@ impl DesignPanel {
                         format!("grid-{}-track-{index}-up", label.to_ascii_lowercase()),
                         IconName::ChevronUp,
                         DesignPanelAction::GridTracksReorderRequested {
-                            node_id: self.node.id.clone(),
+                            node_id: self.host.inspected_node().id.clone(),
                             axis,
                             from_indices: vec![index],
                             insertion_index: index.saturating_sub(1),
@@ -1220,7 +1501,7 @@ impl DesignPanel {
                         format!("grid-{}-track-{index}-down", label.to_ascii_lowercase()),
                         IconName::ChevronDown,
                         DesignPanelAction::GridTracksReorderRequested {
-                            node_id: self.node.id.clone(),
+                            node_id: self.host.inspected_node().id.clone(),
                             axis,
                             from_indices: vec![index],
                             insertion_index: index.saturating_add(2).min(tracks.len()),
@@ -1232,7 +1513,7 @@ impl DesignPanel {
                         format!("grid-{}-track-{index}-delete", label.to_ascii_lowercase()),
                         IconName::Minus,
                         DesignPanelAction::GridTrackDeleteRequested {
-                            node_id: self.node.id.clone(),
+                            node_id: self.host.inspected_node().id.clone(),
                             axis,
                             index,
                         },
@@ -1245,10 +1526,13 @@ impl DesignPanel {
         controls.into_any_element()
     }
 
-    pub(super) fn render_frame_preset_browser(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_frame_preset_browser(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let view_data = self.frame_preset_view_data_for_context()?.clone();
-        let open = self.frame_preset_browser_open;
-        let selected = view_data.matching_dimensions(self.node.width, self.node.height);
+        let open = self.overlays.frame_preset_is_open();
+        let selected = view_data.matching_dimensions(
+            self.host.inspected_node().width,
+            self.host.inspected_node().height,
+        );
         let trigger_label = selected
             .as_ref()
             .and_then(|selection| {
@@ -1264,7 +1548,7 @@ impl DesignPanel {
         let panel_for_content = panel;
         let panel_id = self.id.clone();
         let target_node_id = view_data.target_node_id.clone();
-        let collapsed_groups = self.collapsed_frame_preset_groups.clone();
+        let collapsed_groups = self.features.layout.collapsed_frame_preset_groups.clone();
         let trigger = Button::new(SharedString::from(format!(
             "{}-frame-preset-browser",
             self.id
@@ -1285,21 +1569,11 @@ impl DesignPanel {
                     let has_current_catalog = this
                         .frame_preset_view_data_for_context()
                         .is_some_and(|current| current.target_node_id == target_node_id);
-                    this.frame_preset_browser_open = !open && has_current_catalog;
-                    if this.frame_preset_browser_open {
+                    this.overlays
+                        .set_frame_preset_open(!open && has_current_catalog);
+                    if this.overlays.frame_preset_is_open() {
                         this.cancel_menu_preview(cx);
                         this.cancel_active_paint_edit(cx);
-                        this.active_picker = None;
-                        this.auxiliary_color_picker = None;
-                        this.active_effect_settings = None;
-                        this.effect_style_browser_open = false;
-                        this.property_variable_picker = None;
-                        this.component_property_variable_picker = None;
-                        this.component_swap_browser = None;
-                        this.typography_style_picker_open = false;
-                        this.font_browser_open = false;
-                        this.type_settings_open = false;
-                        this.selection_header_overlay = None;
                     }
                     cx.notify();
                 });
@@ -1314,28 +1588,28 @@ impl DesignPanel {
             .anchor(Anchor::TopRight)
             .open(open)
             .overlay_closable(true)
-            .on_open_change(move |is_open, _, cx| {
+            .on_open_change(move |is_open, window, cx| {
                 panel_for_open.update(cx, |this, cx| {
                     let has_current_catalog = this
                         .frame_preset_view_data_for_context()
                         .is_some_and(|current| current.target_node_id == target_node_id);
-                    this.frame_preset_browser_open = *is_open && has_current_catalog;
-                    if this.frame_preset_browser_open {
+                    if *is_open && has_current_catalog {
+                        this.remember_overlay_focus_return(
+                            DesignOpenOverlay::FramePreset,
+                            window,
+                            cx,
+                        );
+                        this.overlays.set_frame_preset_open(true);
                         this.cancel_menu_preview(cx);
                         this.cancel_active_paint_edit(cx);
-                        this.active_picker = None;
-                        this.auxiliary_color_picker = None;
-                        this.active_effect_settings = None;
-                        this.effect_style_browser_open = false;
-                        this.property_variable_picker = None;
-                        this.component_property_variable_picker = None;
-                        this.component_swap_browser = None;
-                        this.typography_style_picker_open = false;
-                        this.font_browser_open = false;
-                        this.type_settings_open = false;
-                        this.selection_header_overlay = None;
+                        cx.notify();
+                    } else if this.overlays.frame_preset_is_open() {
+                        let _ = this.dismiss_overlay_from_outside_click(
+                            DesignOpenOverlay::FramePreset,
+                            window,
+                            cx,
+                        );
                     }
-                    cx.notify();
                 });
             })
             .trigger(trigger)
@@ -1462,7 +1736,7 @@ impl DesignPanel {
         )
     }
 
-    const fn dimension_properties(
+    fn dimension_properties(
         axis: DesignLayoutDimensionAxis,
     ) -> (
         DesignPanelProperty,
@@ -1486,7 +1760,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn dimension_limits_for_node(
+    fn dimension_limits_for_node(
         node: &DesignPanelNode,
         axis: DesignLayoutDimensionAxis,
     ) -> (Option<f32>, Option<f32>) {
@@ -1499,7 +1773,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn dimension_limits_are_applicable_for(
+    fn dimension_limits_are_applicable_for(
         node: &DesignPanelNode,
         context: &DesignPanelInspectionContext,
     ) -> bool {
@@ -1513,18 +1787,21 @@ impl DesignPanel {
                 && context.parent_layout().participates_in_auto_layout())
     }
 
-    pub(super) fn dimension_limits_are_applicable(&self) -> bool {
-        Self::dimension_limits_are_applicable_for(&self.node, &self.inspection_context)
+    fn dimension_limits_are_applicable(&self) -> bool {
+        Self::dimension_limits_are_applicable_for(
+            self.host.inspected_node(),
+            &self.host.inspection_context,
+        )
     }
 
-    pub(super) fn dimension_limit_fields_for_axis(
+    fn dimension_limit_fields_for_axis(
         axis: DesignLayoutDimensionAxis,
     ) -> [DesignPanelProperty; 2] {
         let (_, _, minimum, maximum) = Self::dimension_properties(axis);
         [minimum, maximum]
     }
 
-    pub(super) fn disclose_existing_dimension_limits(
+    fn disclose_existing_dimension_limits(
         &mut self,
         axis: DesignLayoutDimensionAxis,
         cx: &mut Context<Self>,
@@ -1532,20 +1809,24 @@ impl DesignPanel {
         if !self.dimension_limits_are_applicable() {
             return;
         }
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         let [minimum_property, maximum_property] = Self::dimension_limit_fields_for_axis(axis);
         if minimum.is_some() {
-            self.dimension_limit_fields_disclosed
+            self.features
+                .layout
+                .dimension_limit_fields_disclosed
                 .insert(minimum_property);
         }
         if maximum.is_some() {
-            self.dimension_limit_fields_disclosed
+            self.features
+                .layout
+                .dimension_limit_fields_disclosed
                 .insert(maximum_property);
         }
         cx.notify();
     }
 
-    pub(super) fn reveal_dimension_limit_field(
+    fn reveal_dimension_limit_field(
         &mut self,
         axis: DesignLayoutDimensionAxis,
         property: DesignPanelProperty,
@@ -1558,7 +1839,7 @@ impl DesignPanel {
         {
             return;
         }
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         let already_exists = match property {
             DesignPanelProperty::MinWidth | DesignPanelProperty::MinHeight => minimum.is_some(),
             DesignPanelProperty::MaxWidth | DesignPanelProperty::MaxHeight => maximum.is_some(),
@@ -1569,17 +1850,22 @@ impl DesignPanel {
         }
         let (_, sizing_property, _, _) = Self::dimension_properties(axis);
         self.cancel_menu_preview_for_property(sizing_property, cx);
-        self.dimension_menu_open = None;
-        self.dimension_limit_fields_disclosed.insert(property);
+        self.overlays.discard(DesignOpenOverlay::DimensionMenu);
+        self.features
+            .layout
+            .dimension_limit_fields_disclosed
+            .insert(property);
         let fallback = match property {
             DesignPanelProperty::MinWidth | DesignPanelProperty::MinHeight => {
                 DesignPanelValue::OptionalNumber(Some(1.))
             }
             DesignPanelProperty::MaxWidth => DesignPanelValue::OptionalNumber(Some(
-                self.node
+                self.host
+                    .inspected_node()
                     .width
                     .max(
-                        self.node
+                        self.host
+                            .inspected_node()
                             .layout
                             .as_ref()
                             .and_then(|layout| layout.item.min_width)
@@ -1588,10 +1874,12 @@ impl DesignPanel {
                     .max(1.),
             )),
             DesignPanelProperty::MaxHeight => DesignPanelValue::OptionalNumber(Some(
-                self.node
+                self.host
+                    .inspected_node()
                     .height
                     .max(
-                        self.node
+                        self.host
+                            .inspected_node()
                             .layout
                             .as_ref()
                             .and_then(|layout| layout.item.min_height)
@@ -1605,7 +1893,7 @@ impl DesignPanel {
         cx.notify();
     }
 
-    pub(super) fn remove_dimension_limits(
+    fn remove_dimension_limits(
         &mut self,
         axis: DesignLayoutDimensionAxis,
         cx: &mut Context<Self>,
@@ -1613,7 +1901,7 @@ impl DesignPanel {
         if !self.dimension_limits_are_applicable() {
             return false;
         }
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         let [minimum_property, maximum_property] = Self::dimension_limit_fields_for_axis(axis);
         let mut emitted = false;
         for (property, value) in [(minimum_property, minimum), (maximum_property, maximum)] {
@@ -1623,17 +1911,21 @@ impl DesignPanel {
             }
         }
         if emitted {
-            self.dimension_menu_open = None;
-            self.dimension_limit_fields_disclosed
+            self.overlays.discard(DesignOpenOverlay::DimensionMenu);
+            self.features
+                .layout
+                .dimension_limit_fields_disclosed
                 .remove(&minimum_property);
-            self.dimension_limit_fields_disclosed
+            self.features
+                .layout
+                .dimension_limit_fields_disclosed
                 .remove(&maximum_property);
             cx.notify();
         }
         emitted
     }
 
-    pub(super) fn set_dimension_limits_preview(
+    fn set_dimension_limits_preview(
         &mut self,
         axis: DesignLayoutDimensionAxis,
         preview: bool,
@@ -1641,6 +1933,8 @@ impl DesignPanel {
     ) {
         if !preview {
             let Some(active) = self
+                .features
+                .layout
                 .dimension_limits_preview
                 .take()
                 .filter(|active| active.axis == axis)
@@ -1660,25 +1954,25 @@ impl DesignPanel {
             return;
         }
         if !self.can_edit()
-            || self.inspection_context.selection().kind() != DesignPanelSelectionKind::Single
+            || self.host.inspection_context.selection().kind() != DesignPanelSelectionKind::Single
             || !self.dimension_limits_are_applicable()
         {
             return;
         }
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         if minimum.is_none() && maximum.is_none() {
             return;
         }
         let next = DimensionLimitsPreview {
-            node_id: self.node.id.clone(),
+            node_id: self.host.inspected_node().id.clone(),
             axis,
             minimum,
             maximum,
         };
-        if self.dimension_limits_preview.as_ref() == Some(&next) {
+        if self.features.layout.dimension_limits_preview.as_ref() == Some(&next) {
             return;
         }
-        if let Some(active) = self.dimension_limits_preview.take() {
+        if let Some(active) = self.features.layout.dimension_limits_preview.take() {
             cx.emit_design_panel_action(
                 self,
                 DesignPanelAction::DimensionLimitsPreviewRequested {
@@ -1690,7 +1984,7 @@ impl DesignPanel {
                 },
             );
         }
-        self.dimension_limits_preview = Some(next.clone());
+        self.features.layout.dimension_limits_preview = Some(next.clone());
         cx.emit_design_panel_action(
             self,
             DesignPanelAction::DimensionLimitsPreviewRequested {
@@ -1703,8 +1997,8 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn cancel_dimension_limits_preview(&mut self, cx: &mut Context<Self>) {
-        let Some(active) = self.dimension_limits_preview.take() else {
+    fn cancel_dimension_limits_preview(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.features.layout.dimension_limits_preview.take() else {
             return;
         };
         cx.emit_design_panel_action(
@@ -1719,34 +2013,30 @@ impl DesignPanel {
         );
     }
 
-    pub(super) fn toggle_dimension_menu(
-        &mut self,
-        axis: DesignLayoutDimensionAxis,
-        cx: &mut Context<Self>,
-    ) {
+    fn toggle_dimension_menu(&mut self, axis: DesignLayoutDimensionAxis, cx: &mut Context<Self>) {
         if !self.dimension_limits_are_applicable() {
             self.cancel_menu_preview(cx);
-            self.dimension_menu_open = None;
+            self.overlays.discard(DesignOpenOverlay::DimensionMenu);
             return;
         }
-        if self.dimension_menu_open == Some(axis) {
+        if self.overlays.dimension_menu_open() == Some(axis) {
             let (_, sizing_property, _, _) = Self::dimension_properties(axis);
             self.cancel_menu_preview_for_property(sizing_property, cx);
-            self.dimension_menu_open = None;
+            self.overlays.discard(DesignOpenOverlay::DimensionMenu);
         } else {
             self.cancel_menu_preview(cx);
-            self.dimension_menu_open = Some(axis);
+            self.overlays.open(DesignOverlayState::DimensionMenu(axis));
             self.disclose_existing_dimension_limits(axis, cx);
         }
         cx.notify();
     }
 
-    pub(super) fn dimension_limits_tooltip(
+    fn dimension_limits_tooltip(
         &self,
         axis: DesignLayoutDimensionAxis,
         sizing: DesignSizingMode,
     ) -> SharedString {
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         let format_limit = |label: &str, value: Option<f32>| {
             value.map(|value| format!("{label} {}", format_number(value)))
         };
@@ -1762,14 +2052,14 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn render_dimension_menu_trigger(
+    fn render_dimension_menu_trigger(
         &self,
         axis: DesignLayoutDimensionAxis,
         sizing: DesignSizingMode,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.dimension_menu_open == Some(axis);
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let open = self.overlays.dimension_menu_open() == Some(axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         let has_limits = minimum.is_some() || maximum.is_some();
         let (_, sizing_property, minimum_property, maximum_property) =
             Self::dimension_properties(axis);
@@ -1790,11 +2080,7 @@ impl DesignPanel {
             SharedString::from(format!("{}-{axis_name}-dimension-icon", self.id));
         let tooltip = self.dimension_limits_tooltip(axis, sizing);
         let tooltip_for_trigger = tooltip.clone();
-        let focus_handle = self.dimension_menu_focus[match axis {
-            DesignLayoutDimensionAxis::Width => 0,
-            DesignLayoutDimensionAxis::Height => 1,
-        }]
-        .clone();
+        let focus_handle = self.overlays.dimension_menu_focus(axis).clone();
         let icon = if has_limits {
             match axis {
                 DesignLayoutDimensionAxis::Width => "┤W├",
@@ -1857,15 +2143,22 @@ impl DesignPanel {
         .anchor(Anchor::TopLeft)
         .open(open)
         .overlay_closable(true)
-        .on_open_change(move |is_open, _, cx| {
+        .on_open_change(move |is_open, window, cx| {
             panel_for_open.update(cx, |this, cx| {
                 if *is_open && this.dimension_limits_are_applicable() {
-                    this.dimension_menu_open = Some(axis);
+                    this.remember_overlay_focus_return(
+                        DesignOpenOverlay::DimensionMenu,
+                        window,
+                        cx,
+                    );
+                    this.overlays.open(DesignOverlayState::DimensionMenu(axis));
                     this.disclose_existing_dimension_limits(axis, cx);
-                } else if this.dimension_menu_open == Some(axis) {
-                    this.cancel_menu_preview_for_property(sizing_property, cx);
-                    this.dimension_menu_open = None;
-                    cx.notify();
+                } else if this.overlays.dimension_menu_open() == Some(axis) {
+                    let _ = this.dismiss_overlay_from_outside_click(
+                        DesignOpenOverlay::DimensionMenu,
+                        window,
+                        cx,
+                    );
                 }
             });
         })
@@ -1928,7 +2221,7 @@ impl DesignPanel {
                                 match event.keystroke.key.as_str() {
                                     "enter" | "space" => {
                                         this.cancel_menu_preview(cx);
-                                        this.dimension_menu_open = None;
+                                        this.overlays.discard(DesignOpenOverlay::DimensionMenu);
                                         this.emit_property(
                                             sizing_property,
                                             DesignPanelValue::SizingMode(mode),
@@ -1937,9 +2230,13 @@ impl DesignPanel {
                                         window.prevent_default();
                                         cx.stop_propagation();
                                     }
-                                    "escape" => {
-                                        this.cancel_menu_preview(cx);
-                                        this.dimension_menu_open = None;
+                                    "escape"
+                                        if this.dismiss_overlay_from_escape(
+                                            DesignOpenOverlay::DimensionMenu,
+                                            window,
+                                            cx,
+                                        ) =>
+                                    {
                                         window.prevent_default();
                                         cx.stop_propagation();
                                     }
@@ -1951,7 +2248,7 @@ impl DesignPanel {
                         .on_activate(move |_, _, cx| {
                             panel.update(cx, |this, cx| {
                                 this.cancel_menu_preview(cx);
-                                this.dimension_menu_open = None;
+                                this.overlays.discard(DesignOpenOverlay::DimensionMenu);
                                 this.emit_property(
                                     sizing_property,
                                     DesignPanelValue::SizingMode(mode),
@@ -2031,7 +2328,7 @@ impl DesignPanel {
         .into_any_element()
     }
 
-    pub(super) fn render_dimension_control(
+    fn render_dimension_control(
         &self,
         axis: DesignLayoutDimensionAxis,
         layout: &DesignLayout,
@@ -2041,14 +2338,14 @@ impl DesignPanel {
         let (id, value, next, sizing) = match axis {
             DesignLayoutDimensionAxis::Width => (
                 "width",
-                self.node.width,
-                self.node.width + 8.,
+                self.host.inspected_node().width,
+                self.host.inspected_node().width + 8.,
                 layout.horizontal_sizing,
             ),
             DesignLayoutDimensionAxis::Height => (
                 "height",
-                self.node.height,
-                self.node.height + 8.,
+                self.host.inspected_node().height,
+                self.host.inspected_node().height + 8.,
                 layout.vertical_sizing,
             ),
         };
@@ -2091,7 +2388,8 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_dimension_limit_fields(
+    #[cfg(test)]
+    fn render_dimension_limit_fields(
         &self,
         axis: DesignLayoutDimensionAxis,
         cx: &mut Context<Self>,
@@ -2099,12 +2397,16 @@ impl DesignPanel {
         if !self.dimension_limits_are_applicable() {
             return None;
         }
-        let (minimum, maximum) = Self::dimension_limits_for_node(&self.node, axis);
+        let (minimum, maximum) = Self::dimension_limits_for_node(self.host.inspected_node(), axis);
         let [minimum_property, maximum_property] = Self::dimension_limit_fields_for_axis(axis);
         let show_minimum = self
+            .features
+            .layout
             .dimension_limit_fields_disclosed
             .contains(&minimum_property);
         let show_maximum = self
+            .features
+            .layout
             .dimension_limit_fields_disclosed
             .contains(&maximum_property);
         if !show_minimum && !show_maximum {
@@ -2116,14 +2418,14 @@ impl DesignPanel {
                 "layout-max-width",
                 "W≥",
                 "W≤",
-                self.node.width,
+                self.host.inspected_node().width,
             ),
             DesignLayoutDimensionAxis::Height => (
                 "layout-min-height",
                 "layout-max-height",
                 "H≥",
                 "H≤",
-                self.node.height,
+                self.host.inspected_node().height,
             ),
         };
         let minimum_next = DesignPanelValue::OptionalNumber(Some(1.));
@@ -2157,7 +2459,7 @@ impl DesignPanel {
         )
     }
 
-    pub(super) fn render_add_auto_layout(
+    fn render_add_auto_layout(
         &self,
         view_data: &DesignAddAutoLayoutViewData,
         cx: &mut Context<Self>,
@@ -2190,7 +2492,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_draw_add_auto_layout(
+    fn render_draw_add_auto_layout(
         &self,
         view_data: &DesignAddAutoLayoutViewData,
         cx: &mut Context<Self>,
@@ -2223,7 +2525,7 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_draw_layout_header(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_draw_layout_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let section = DesignPanelSection::Layout;
         let id = SharedString::from(format!("{}-section-layout", self.id));
         let mut actions = h_flex()
@@ -2233,7 +2535,7 @@ impl DesignPanel {
             )))
             .gap_1()
             .on_click(|_, _, cx| cx.stop_propagation());
-        if self.node.supports_resize_to_fit() {
+        if self.host.inspected_node().supports_resize_to_fit() {
             actions = actions.child(div().size(px(24.)).flex_none().child(
                 self.render_icon_action_button(
                     "draw-resize-to-fit",
@@ -2278,653 +2580,13 @@ impl DesignPanel {
             .into_any_element()
     }
 
-    pub(super) fn render_layout(&self, cx: &mut Context<Self>) -> AnyElement {
-        let layout = self.node.layout.clone().unwrap_or_default();
-        let owns_auto_layout = self.node.supports_auto_layout_container();
-        let parent_layout = self.inspection_context.parent_layout();
-        let participates_in_auto_layout =
-            self.node.supports_auto_layout_child() && parent_layout.participates_in_auto_layout();
-        let ignored_by_auto_layout =
-            self.node.supports_auto_layout_child() && parent_layout.is_ignored_by_auto_layout();
-        let layout_mode_editable = self.property_is_editable(DesignPanelProperty::LayoutMode);
-        let direction_buttons = [
-            (DesignLayoutMode::None, IconName::Frame),
-            (DesignLayoutMode::Horizontal, IconName::ArrowRight),
-            (DesignLayoutMode::Vertical, IconName::ArrowDown),
-            (DesignLayoutMode::Grid, IconName::LayoutDashboard),
-        ];
-        let mut directions = h_flex()
-            .h(px(ROW_HEIGHT))
-            .w_full()
-            .rounded(px(4.))
-            .bg(cx.theme().secondary);
-        for (mode, icon) in direction_buttons.into_iter().filter(|(mode, _)| {
-            *mode != DesignLayoutMode::Grid || self.node.supports_grid_auto_layout()
-        }) {
-            directions = directions.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "{}-layout-{}",
-                        self.id,
-                        mode.label().to_lowercase()
-                    )))
-                    .flex_1()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(4.))
-                    .when(!layout_mode_editable, |button| button.opacity(0.62))
-                    .when(layout.mode == mode, |button| {
-                        button
-                            .bg(cx.theme().accent)
-                            .border_1()
-                            .border_color(cx.theme().selection)
-                    })
-                    .when(layout_mode_editable, |button| {
-                        button
-                            .key_context(CONTROL_KEY_CONTEXT)
-                            .tab_index(0)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(cx.theme().accent))
-                            .focus(|style| {
-                                style
-                                    .bg(cx.theme().accent)
-                                    .border_1()
-                                    .border_color(cx.theme().selection)
-                            })
-                            .on_activate(cx.listener(move |this, _, _, cx| {
-                                this.emit_property(
-                                    DesignPanelProperty::LayoutMode,
-                                    DesignPanelValue::LayoutMode(mode),
-                                    cx,
-                                );
-                            }))
-                    })
-                    .child(Icon::new(icon).xsmall()),
-            );
-        }
-
-        let mut content = v_flex().pl(px(PANEL_PADDING)).pr_2().pb_4().gap_1();
-        if !self.renders_draw_workspace()
-            && let Some(view_data) = self.add_auto_layout_view_data_for_context()
-        {
-            content = content.child(self.render_add_auto_layout(view_data, cx));
-        }
-        if owns_auto_layout {
-            if self.renders_draw_workspace() {
-                let flow_id = SharedString::from(format!("{}-draw-layout-flow-label", self.id));
-                let flow_selector = flow_id.to_string();
-                content = content.child(
-                    div()
-                        .id(flow_id)
-                        .debug_selector(move || flow_selector.clone())
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Flow"),
-                );
-            }
-            content = content.child(directions);
-        }
-        if let Some(typography) = self.node.typography.as_ref()
-            && !owns_auto_layout
-        {
-            content = content
-                .child(self.render_group_label("Resizing", cx))
-                .child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .child(self.render_text_resize_control(typography.resize, cx)),
-                        )
-                        .child(div().size(px(24.)).flex_none()),
-                );
-        }
-        if let Some(frame_presets) = self.render_frame_preset_browser(cx) {
-            content = content
-                .child(self.render_group_label("Frame", cx))
-                .child(frame_presets);
-        }
-        content = content
-            .child(self.render_group_label("Dimensions", cx))
-            .child(
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .gap_2()
-                            .child(self.render_dimension_control(
-                                DesignLayoutDimensionAxis::Width,
-                                &layout,
-                                cx,
-                            ))
-                            .child(self.render_dimension_control(
-                                DesignLayoutDimensionAxis::Height,
-                                &layout,
-                                cx,
-                            )),
-                    )
-                    .when(
-                        self.node_capability_allows_property(DesignPanelProperty::LockAspectRatio),
-                        |row| {
-                            row.child(
-                                div()
-                                    .w(px(24.))
-                                    .flex_none()
-                                    .rounded(px(4.))
-                                    .when(self.node.lock_aspect_ratio, |button| {
-                                        button
-                                            .bg(cx.theme().selection.opacity(0.22))
-                                            .text_color(cx.theme().selection)
-                                    })
-                                    .child(self.render_position_action_button_with_enabled(
-                                        "lock-aspect-ratio",
-                                        PositionActionIcon::LockAspectRatio,
-                                        DesignPanelAction::PropertyChangeRequested {
-                                            node_id: self.node.id.clone(),
-                                            property: DesignPanelProperty::LockAspectRatio,
-                                            value: DesignPanelValue::Bool(
-                                                !self.node.lock_aspect_ratio,
-                                            ),
-                                        },
-                                        self.property_is_editable(
-                                            DesignPanelProperty::LockAspectRatio,
-                                        ),
-                                        cx,
-                                    )),
-                            )
-                        },
-                    )
-                    .when(
-                        !self.renders_draw_workspace() && self.node.supports_resize_to_fit(),
-                        |row| {
-                            row.child(div().w(px(24.)).flex_none().child(
-                                self.render_icon_action_button(
-                                    "resize-to-fit",
-                                    IconName::Maximize,
-                                    DesignPanelAction::ResizeToFitRequested {
-                                        target: self.command_target(),
-                                    },
-                                    cx,
-                                ),
-                            ))
-                        },
-                    ),
-            );
-        if let Some(width_limits) =
-            self.render_dimension_limit_fields(DesignLayoutDimensionAxis::Width, cx)
-        {
-            content = content.child(width_limits);
-        }
-        if let Some(height_limits) =
-            self.render_dimension_limit_fields(DesignLayoutDimensionAxis::Height, cx)
-        {
-            content = content.child(height_limits);
-        }
-        if owns_auto_layout && layout.mode != DesignLayoutMode::None {
-            let gap_controls = h_flex()
-                .w_full()
-                .gap_2()
-                .when(layout.mode != DesignLayoutMode::Grid, |controls| {
-                    controls.child(self.render_value_cell(
-                        "layout-item-spacing-mode",
-                        "⇔",
-                        layout.item_spacing_mode.label(),
-                        DesignPanelProperty::ItemSpacingMode,
-                        DesignPanelValue::ItemSpacingMode(match layout.item_spacing_mode {
-                            DesignItemSpacingMode::Fixed => DesignItemSpacingMode::Auto,
-                            DesignItemSpacingMode::Auto => DesignItemSpacingMode::Fixed,
-                        }),
-                        cx,
-                    ))
-                })
-                .when(
-                    layout.mode == DesignLayoutMode::Grid
-                        || layout.item_spacing_mode == DesignItemSpacingMode::Fixed,
-                    |controls| {
-                        controls.child(self.render_value_cell(
-                            "layout-gap",
-                            "↔",
-                            format_number(layout.gap),
-                            DesignPanelProperty::Gap,
-                            DesignPanelValue::Number(layout.gap + 2.),
-                            cx,
-                        ))
-                    },
-                )
-                .when(layout.mode == DesignLayoutMode::Grid, |controls| {
-                    controls.child(self.render_value_cell(
-                        "layout-counter-axis-gap",
-                        "↕",
-                        format_optional_number(layout.counter_axis_gap),
-                        DesignPanelProperty::CounterAxisGap,
-                        DesignPanelValue::OptionalNumber(Some(
-                            layout.counter_axis_gap.unwrap_or(0.) + 2.,
-                        )),
-                        cx,
-                    ))
-                });
-            if layout.mode == DesignLayoutMode::Grid {
-                content = content
-                    .child(self.render_group_label("Gap", cx))
-                    .child(gap_controls);
-            } else {
-                content = content
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .w(px(88.))
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Alignment"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Gap"),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_start()
-                            .child(self.render_alignment_grid(cx))
-                            .child(v_flex().flex_1().gap_2().child(gap_controls)),
-                    );
-                if layout.mode == DesignLayoutMode::Horizontal && layout.wrap {
-                    let next_alignment = match layout.counter_axis_align_content {
-                        DesignCounterAxisAlignContent::Auto => {
-                            DesignCounterAxisAlignContent::SpaceBetween
-                        }
-                        DesignCounterAxisAlignContent::SpaceBetween => {
-                            DesignCounterAxisAlignContent::Auto
-                        }
-                    };
-                    content = content
-                        .child(self.render_group_label("Wrapped tracks", cx))
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .gap_1()
-                                .child(self.render_value_cell(
-                                    "layout-counter-axis-align-content",
-                                    "↕",
-                                    layout.counter_axis_align_content.label(),
-                                    DesignPanelProperty::CounterAxisAlignContent,
-                                    DesignPanelValue::CounterAxisAlignContent(next_alignment),
-                                    cx,
-                                ))
-                                .when(
-                                    layout.counter_axis_align_content
-                                        == DesignCounterAxisAlignContent::Auto,
-                                    |controls| {
-                                        controls.child(self.render_counter_axis_spacing_controls(
-                                            layout.counter_axis_gap,
-                                            layout.gap,
-                                            cx,
-                                        ))
-                                    },
-                                ),
-                        );
-                }
-            }
-            let padding_controls = match self.padding_editor_mode {
-                PaddingEditorMode::Axes => h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(self.render_value_cell(
-                        "layout-padding-vertical",
-                        "↕",
-                        format_number(layout.padding[0]),
-                        DesignPanelProperty::PaddingVertical,
-                        DesignPanelValue::Number(layout.padding[0] + 4.),
-                        cx,
-                    ))
-                    .child(self.render_value_cell(
-                        "layout-padding-horizontal",
-                        "↔",
-                        format_number(layout.padding[3]),
-                        DesignPanelProperty::PaddingHorizontal,
-                        DesignPanelValue::Number(layout.padding[3] + 4.),
-                        cx,
-                    ))
-                    .into_any_element(),
-                PaddingEditorMode::Individual => h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(self.render_value_cell(
-                        "layout-padding-top",
-                        "T",
-                        format_number(layout.padding[0]),
-                        DesignPanelProperty::PaddingTop,
-                        DesignPanelValue::Number(layout.padding[0] + 4.),
-                        cx,
-                    ))
-                    .child(self.render_value_cell(
-                        "layout-padding-right",
-                        "R",
-                        format_number(layout.padding[1]),
-                        DesignPanelProperty::PaddingRight,
-                        DesignPanelValue::Number(layout.padding[1] + 4.),
-                        cx,
-                    ))
-                    .child(self.render_value_cell(
-                        "layout-padding-bottom",
-                        "B",
-                        format_number(layout.padding[2]),
-                        DesignPanelProperty::PaddingBottom,
-                        DesignPanelValue::Number(layout.padding[2] + 4.),
-                        cx,
-                    ))
-                    .child(self.render_value_cell(
-                        "layout-padding-left",
-                        "L",
-                        format_number(layout.padding[3]),
-                        DesignPanelProperty::PaddingLeft,
-                        DesignPanelValue::Number(layout.padding[3] + 4.),
-                        cx,
-                    ))
-                    .into_any_element(),
-                PaddingEditorMode::Shorthand => h_flex()
-                    .w_full()
-                    .gap_2()
-                    .child(self.render_value_cell(
-                        "layout-padding-shorthand",
-                        "CSS",
-                        format_padding_shorthand(layout.padding),
-                        DesignPanelProperty::PaddingShorthand,
-                        DesignPanelValue::NumberList(
-                            layout.padding.iter().map(|value| value + 4.).collect(),
-                        ),
-                        cx,
-                    ))
-                    .into_any_element(),
-            };
-            content = content
-                .child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .child(self.render_group_label("Padding", cx))
-                        .child(
-                            h_flex()
-                                .gap_0p5()
-                                .child(self.render_padding_mode_button(
-                                    PaddingEditorMode::Axes,
-                                    "↔↕",
-                                    "Horizontal and vertical padding",
-                                    cx,
-                                ))
-                                .child(self.render_padding_mode_button(
-                                    PaddingEditorMode::Individual,
-                                    "TRBL",
-                                    "Individual top, right, bottom, and left padding",
-                                    cx,
-                                ))
-                                .child(self.render_padding_mode_button(
-                                    PaddingEditorMode::Shorthand,
-                                    "CSS",
-                                    "Uniform or CSS shorthand padding",
-                                    cx,
-                                )),
-                        ),
-                )
-                .child(padding_controls)
-                .when(layout.mode == DesignLayoutMode::Horizontal, |content| {
-                    content.child(self.render_toggle_row(
-                        "wrap",
-                        "Wrap",
-                        layout.wrap,
-                        DesignPanelProperty::Wrap,
-                        cx,
-                    ))
-                })
-                .child(self.render_toggle_row(
-                    "include-strokes",
-                    "Include strokes in layout",
-                    layout.include_strokes,
-                    DesignPanelProperty::IncludeStrokes,
-                    cx,
-                ));
-            if layout.mode != DesignLayoutMode::Grid {
-                content = content.child(
-                    h_flex()
-                        .gap_2()
-                        .child(self.render_value_cell(
-                            "stacking-order",
-                            "Z",
-                            layout.stacking_order.label(),
-                            DesignPanelProperty::StackingOrder,
-                            DesignPanelValue::StackingOrder(match layout.stacking_order {
-                                DesignStackingOrder::LastOnTop => DesignStackingOrder::FirstOnTop,
-                                DesignStackingOrder::FirstOnTop => DesignStackingOrder::LastOnTop,
-                            }),
-                            cx,
-                        ))
-                        .when(layout.mode == DesignLayoutMode::Horizontal, |row| {
-                            row.child(self.render_value_cell(
-                                "baseline-alignment",
-                                "A",
-                                layout.baseline_alignment.label(),
-                                DesignPanelProperty::BaselineAlignment,
-                                DesignPanelValue::BaselineAlignment(
-                                    match layout.baseline_alignment {
-                                        DesignBaselineAlignment::Bounds => {
-                                            DesignBaselineAlignment::Baseline
-                                        }
-                                        DesignBaselineAlignment::Baseline => {
-                                            DesignBaselineAlignment::Bounds
-                                        }
-                                    },
-                                ),
-                                cx,
-                            ))
-                        }),
-                );
-            }
-            if layout.mode == DesignLayoutMode::Grid {
-                content = content
-                    .child(div().pt_1().text_xs().font_semibold().child("Grid"))
-                    .child(self.render_grid_dimensions_picker(&layout, cx))
-                    .child(self.render_grid_auto_rows_toggle(cx))
-                    .child(self.render_group_label("Positioning", cx))
-                    .child(self.render_value_cell(
-                        "grid-items-positioning",
-                        "↳",
-                        layout.grid_items_positioning.label(),
-                        DesignPanelProperty::GridItemsPositioning,
-                        DesignPanelValue::GridItemsPositioning(
-                            match layout.grid_items_positioning {
-                                DesignGridItemsPositioning::Manual => {
-                                    DesignGridItemsPositioning::RowAutoFlow
-                                }
-                                DesignGridItemsPositioning::RowAutoFlow => {
-                                    DesignGridItemsPositioning::Manual
-                                }
-                            },
-                        ),
-                        cx,
-                    ))
-                    .child(self.render_grid_track_controls(
-                        DesignGridTrackAxis::Column,
-                        &layout,
-                        cx,
-                    ))
-                    .child(self.render_grid_track_controls(DesignGridTrackAxis::Row, &layout, cx));
-            }
-        }
-        if let Some(direction) = parent_layout
-            .auto_layout_direction()
-            .filter(|_| participates_in_auto_layout)
-        {
-            content = content
-                .child(
-                    div()
-                        .pt_1()
-                        .text_xs()
-                        .font_semibold()
-                        .child("Auto-layout child"),
-                )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(self.render_value_cell(
-                            "layout-positioning",
-                            "P",
-                            layout.item.positioning.label(),
-                            DesignPanelProperty::LayoutPositioning,
-                            DesignPanelValue::LayoutPositioning(match layout.item.positioning {
-                                DesignLayoutPositioning::InFlow => {
-                                    DesignLayoutPositioning::Absolute
-                                }
-                                DesignLayoutPositioning::Absolute => {
-                                    DesignLayoutPositioning::InFlow
-                                }
-                            }),
-                            cx,
-                        ))
-                        .child(self.render_value_cell(
-                            "layout-align-self",
-                            "↔",
-                            layout.item.align_self.label(),
-                            DesignPanelProperty::LayoutAlignSelf,
-                            DesignPanelValue::LayoutAlignSelf(match layout.item.align_self {
-                                DesignLayoutAlignSelf::Inherit => DesignLayoutAlignSelf::Stretch,
-                                DesignLayoutAlignSelf::Stretch => DesignLayoutAlignSelf::Inherit,
-                            }),
-                            cx,
-                        )),
-                )
-                .child(h_flex().gap_2().child(self.render_value_cell(
-                    "layout-grow",
-                    "↗",
-                    format_number(layout.item.layout_grow),
-                    DesignPanelProperty::LayoutGrow,
-                    DesignPanelValue::Number(layout.item.layout_grow + 1.),
-                    cx,
-                )));
-            if direction == DesignPanelAutoLayoutDirection::Grid {
-                content = content
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(
-                                self.render_value_cell(
-                                    "grid-row-index",
-                                    "R",
-                                    (layout.item.grid_row_index + 1).to_string(),
-                                    DesignPanelProperty::GridRowIndex,
-                                    DesignPanelValue::Integer(
-                                        i64::try_from(layout.item.grid_row_index)
-                                            .unwrap_or(i64::MAX)
-                                            .saturating_add(2),
-                                    ),
-                                    cx,
-                                ),
-                            )
-                            .child(
-                                self.render_value_cell(
-                                    "grid-column-index",
-                                    "C",
-                                    (layout.item.grid_column_index + 1).to_string(),
-                                    DesignPanelProperty::GridColumnIndex,
-                                    DesignPanelValue::Integer(
-                                        i64::try_from(layout.item.grid_column_index)
-                                            .unwrap_or(i64::MAX)
-                                            .saturating_add(2),
-                                    ),
-                                    cx,
-                                ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(self.render_value_cell(
-                                "grid-row-span",
-                                "R×",
-                                layout.item.grid_row_span.to_string(),
-                                DesignPanelProperty::GridRowSpan,
-                                DesignPanelValue::Integer(i64::from(
-                                    layout.item.grid_row_span.saturating_add(1),
-                                )),
-                                cx,
-                            ))
-                            .child(self.render_value_cell(
-                                "grid-column-span",
-                                "C×",
-                                layout.item.grid_column_span.to_string(),
-                                DesignPanelProperty::GridColumnSpan,
-                                DesignPanelValue::Integer(i64::from(
-                                    layout.item.grid_column_span.saturating_add(1),
-                                )),
-                                cx,
-                            )),
-                    );
-            }
-        }
-        if ignored_by_auto_layout {
-            content = content
-                .child(
-                    div()
-                        .pt_1()
-                        .text_xs()
-                        .font_semibold()
-                        .child("Auto-layout child"),
-                )
-                .child(self.render_value_cell(
-                    "layout-positioning",
-                    "P",
-                    DesignLayoutPositioning::Absolute.label(),
-                    DesignPanelProperty::LayoutPositioning,
-                    DesignPanelValue::LayoutPositioning(DesignLayoutPositioning::InFlow),
-                    cx,
-                ));
-        }
-        if self.node.supports_clip_content() {
-            content = content.child(self.render_checkbox_row(
-                "clip-content",
-                "Clip content",
-                layout.clip_content,
-                DesignPanelProperty::ClipContent,
-                cx,
-            ));
-        }
-        if self.renders_draw_workspace() {
-            let expanded = self.expanded_sections.contains(&DesignPanelSection::Layout);
-            v_flex()
-                .w_full()
-                .flex_none()
-                .border_b_1()
-                .border_color(cx.theme().sidebar_border)
-                .child(self.render_draw_layout_header(cx))
-                .when(expanded, |section| {
-                    section.child(content.into_any_element())
-                })
-                .into_any_element()
-        } else {
-            self.render_section(
-                DesignPanelSection::Layout,
-                None,
-                content.into_any_element(),
-                cx,
-            )
-        }
+    fn render_layout(&self, cx: &mut Context<Self>) -> AnyElement {
+        let projection = projection(self);
+        let events = sections::layout::LayoutEventSink::new(cx.entity());
+        sections::layout::render(&projection, self, &events, cx)
     }
 
-    pub(super) fn render_grid_track_action_button(
+    fn render_grid_track_action_button(
         &self,
         id_suffix: impl Into<SharedString>,
         icon: IconName,
@@ -2972,15 +2634,19 @@ impl DesignPanel {
         button.child(Icon::new(icon).xsmall()).into_any_element()
     }
 
-    pub(super) fn grid_track_action_is_applicable(&self, action: &DesignPanelAction) -> bool {
+    fn grid_track_action_is_applicable(&self, action: &DesignPanelAction) -> bool {
         if !self.can_edit()
-            || !self.node.supports_grid_auto_layout()
-            || !self.node.supports_section(DesignPanelSection::Layout)
+            || !self.host.inspected_node().supports_grid_auto_layout()
+            || !self
+                .host
+                .inspected_node()
+                .supports_section(DesignPanelSection::Layout)
         {
             return false;
         }
         let Some(layout) = self
-            .node
+            .host
+            .inspected_node()
             .layout
             .as_ref()
             .filter(|layout| layout.mode == DesignLayoutMode::Grid)
@@ -2993,7 +2659,7 @@ impl DesignPanel {
                 axis,
                 insertion_index,
             } => {
-                node_id == &self.node.id
+                node_id == &self.host.inspected_node().id
                     && layout.grid_track_count_is_editable(*axis)
                     && *insertion_index <= layout.grid_track_count(*axis)
             }
@@ -3002,7 +2668,7 @@ impl DesignPanel {
                 axis,
                 index,
             } => {
-                node_id == &self.node.id
+                node_id == &self.host.inspected_node().id
                     && layout.can_delete_grid_track(*axis)
                     && *index < layout.grid_track_count(*axis)
             }
@@ -3014,7 +2680,7 @@ impl DesignPanel {
             } => {
                 let count = layout.grid_track_count(*axis);
                 let unique = from_indices.iter().copied().collect::<HashSet<_>>();
-                node_id == &self.node.id
+                node_id == &self.host.inspected_node().id
                     && !from_indices.is_empty()
                     && unique.len() == from_indices.len()
                     && from_indices.iter().all(|index| *index < count)
@@ -3024,7 +2690,7 @@ impl DesignPanel {
         }
     }
 
-    pub(super) fn grid_dimensions_action_is_applicable(&self, action: &DesignPanelAction) -> bool {
+    fn grid_dimensions_action_is_applicable(&self, action: &DesignPanelAction) -> bool {
         let DesignPanelAction::GridDimensionsEditRequested {
             node_id,
             dimensions,
@@ -3033,11 +2699,12 @@ impl DesignPanel {
         else {
             return false;
         };
-        if node_id != &self.node.id || !dimensions.is_valid() {
+        if node_id != &self.host.inspected_node().id || !dimensions.is_valid() {
             return false;
         }
         let Some(layout) = self
-            .node
+            .host
+            .inspected_node()
             .layout
             .as_ref()
             .filter(|layout| layout.mode == DesignLayoutMode::Grid)
@@ -3045,18 +2712,18 @@ impl DesignPanel {
             return false;
         };
         let cancel_matches_active = *phase == DesignPanelEditPhase::Cancel
-            && self
-                .active_grid_dimensions_edit
-                .as_ref()
-                .is_some_and(|edit| &edit.node_id == node_id);
+            && self.edit.grid_dimensions_target_is_active(node_id, None);
         let dimensions_are_editable = dimensions.columns == layout.grid_columns.len()
             || self.property_is_editable(DesignPanelProperty::GridColumnCount);
         let rows_are_editable = dimensions.rows == layout.grid_rows.len()
             || self.property_is_editable(DesignPanelProperty::GridRowCount);
         cancel_matches_active
             || (self.can_edit()
-                && self.node.supports_grid_auto_layout()
-                && self.node.supports_section(DesignPanelSection::Layout)
+                && self.host.inspected_node().supports_grid_auto_layout()
+                && self
+                    .host
+                    .inspected_node()
+                    .supports_section(DesignPanelSection::Layout)
                 && dimensions_are_editable
                 && rows_are_editable
                 && (layout.grid_auto_tracks == DesignGridAutoTracks::None
