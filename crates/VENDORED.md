@@ -7,7 +7,7 @@ shipped binary is satisfied by this repository alone.
 | Crate(s) | Upstream | Commit |
 |---|---|---|
 | `fanta-canvas`, `fanta-doc`, `fanta-fig-interop`, `fanta-fnx`, `fanta-format`, `fanta-present`, `fanta-render`, `fanta-text`, `fanta-tools` | `squidred-dev/fantaisa-engine` | `9370fa2` |
-| `fanta-gpui` | `squidred-dev/fanta-ui` | `6c197a9` |
+| `fanta-gpui` | `squidred-dev/fanta-ui` | `9183fa3` |
 
 Upstream crates not vendored because nothing here uses them: `fanta-engine`,
 `fanta-harness`, `fanta-psd-interop`, `fanta-illustrator-interop`,
@@ -89,7 +89,7 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   `<Ellipse>` whose viewport matches its extent (see the `fanta-fnx` sugar
   divergence above).
 
-- `fanta-gpui`: resynced to upstream `6c197a9`, which brings the atomic-design
+- `fanta-gpui`: resynced to upstream `9183fa3`, which brings the atomic-design
   tiers, the Design-inspector decomposition and `atoms::tokens`. Two host-only
   changes that had only ever existed in this copy were pushed upstream first and
   are now part of that commit rather than divergences: the toolbar's

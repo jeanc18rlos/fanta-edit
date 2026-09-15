@@ -1800,3 +1800,346 @@ pub(in super::super) fn render(
         .child(page_body)
         .into_any_element()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::organisms::design::{
+        DesignLocalStyleItem, DesignLocalStyleSection, DesignPageBackground, DesignVariableMode,
+        DesignVariableModeCollection,
+    };
+
+    const PAGE_ID: &str = "page-1";
+    const NODE_ID: &str = "node-1";
+
+    fn page_target() -> DesignPanelTarget {
+        DesignPanelTarget::Page {
+            page_id: PAGE_ID.into(),
+        }
+    }
+
+    fn node_target() -> DesignPanelTarget {
+        DesignPanelTarget::Nodes {
+            node_ids: vec![NODE_ID.into()],
+        }
+    }
+
+    fn page() -> DesignPageViewData {
+        DesignPageViewData::canonical(PAGE_ID, DesignPageBackground::new(DesignColor::WHITE))
+    }
+
+    fn color_style() -> DesignLocalStyleEntry {
+        DesignLocalStyleEntry::style(DesignLocalStyleItem::new(
+            "color-a",
+            "A",
+            DesignLocalStylePreview::Color(vec![DesignPaint::solid(DesignColor::BLUE)]),
+        ))
+    }
+
+    fn local_styles(target: DesignPanelTarget) -> DesignPageLocalStylesViewData {
+        DesignPageLocalStylesViewData::new(
+            target,
+            [DesignLocalStyleSection::new(
+                DesignLocalStyleKind::Color,
+                [color_style()],
+            )],
+        )
+    }
+
+    fn color_style_target() -> DesignLocalStyleTarget {
+        DesignLocalStyleTarget::new(PAGE_ID, DesignLocalStyleKind::Color, "color-a", None, 0)
+    }
+
+    fn variable_modes(target: DesignPanelTarget) -> DesignVariableModeViewData {
+        DesignVariableModeViewData::new(
+            target,
+            [DesignVariableModeCollection::new(
+                "theme",
+                "Theme",
+                DesignLocalResourceSource::Local,
+                [
+                    DesignVariableMode::new("light", "Light"),
+                    DesignVariableMode::new("dark", "Dark"),
+                ],
+                "light",
+                "light",
+            )
+            .explicit("dark")],
+        )
+    }
+
+    fn projection(
+        selection_kind: DesignPanelSelectionKind,
+        permissions: DesignPanelPermissions,
+        host: PageHostProjection,
+    ) -> PageProjection {
+        PageProjection::new(
+            "design".into(),
+            PageContextProjection::new(selection_kind, permissions, NODE_ID.into()),
+            host,
+            PagePresentationProjection::new(
+                DesignVariablesEntryPoint::NavigationBarOnly,
+                None,
+                false,
+                HashSet::new(),
+            ),
+        )
+    }
+
+    #[test]
+    fn page_projection_hides_page_data_for_node_selection() {
+        let page_selection = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(
+                Some(page()),
+                Some(local_styles(page_target())),
+                Some(variable_modes(page_target())),
+            ),
+        );
+        assert_eq!(
+            page_selection.page_view_data_for_context(),
+            Some(&page()),
+            "an empty canvas selection is the only context that inspects the Page"
+        );
+        assert!(
+            page_selection
+                .page_local_styles_view_data_for_context()
+                .is_some(),
+            "Page local styles ride along with the projected Page"
+        );
+        assert!(page_selection.can_edit_page());
+
+        let node_selection = projection(
+            DesignPanelSelectionKind::Single,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(
+                Some(page()),
+                Some(local_styles(page_target())),
+                Some(variable_modes(node_target())),
+            ),
+        );
+        assert!(
+            node_selection.page_view_data_for_context().is_none(),
+            "a selected node must never project Page data the host scoped to the Page"
+        );
+        assert!(
+            node_selection
+                .page_local_styles_view_data_for_context()
+                .is_none(),
+            "without a projected Page there is no anchor for Page local styles"
+        );
+        assert!(!node_selection.can_edit_page());
+        assert!(
+            local_resource_create_action(&node_selection, DesignLocalResourceKind::PaintStyle)
+                .is_none(),
+            "Page-scoped intents cannot be emitted while a node is selected"
+        );
+        assert!(
+            node_selection
+                .variable_mode_view_data_for_context()
+                .is_some(),
+            "node-targeted variable modes still project, so the missing Page data is the \
+             selection gate and not an empty host projection"
+        );
+
+        let multiple_selection = projection(
+            DesignPanelSelectionKind::Multiple,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(
+                Some(page()),
+                Some(local_styles(page_target())),
+                Some(variable_modes(page_target())),
+            ),
+        );
+        assert!(
+            multiple_selection.page_view_data_for_context().is_none(),
+            "a multi-selection is not a Page context either"
+        );
+        assert!(
+            multiple_selection
+                .variable_mode_view_data_for_context()
+                .is_none(),
+            "a multi-selection has no single variable-mode target to match"
+        );
+    }
+
+    #[test]
+    fn stale_local_styles_target_is_filtered() {
+        let current = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(Some(page()), Some(local_styles(page_target())), None),
+        );
+        assert!(
+            current.page_local_styles_view_data_for_context().is_some(),
+            "a local-styles projection whose target is the projected Page survives"
+        );
+        assert!(current.local_style_target_is_enabled(&color_style_target()));
+        assert!(
+            local_style_create_action(&current, DesignLocalStyleKind::Color, None).is_some(),
+            "the control case must reach the intent, or the stale cases prove nothing"
+        );
+
+        let stale_page = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(
+                Some(page()),
+                Some(local_styles(DesignPanelTarget::Page {
+                    page_id: "page-removed".into(),
+                })),
+                None,
+            ),
+        );
+        assert!(
+            stale_page
+                .page_local_styles_view_data_for_context()
+                .is_none(),
+            "local styles targeting a Page that is no longer projected must be dropped"
+        );
+        assert!(!stale_page.local_style_target_is_enabled(&color_style_target()));
+        assert!(
+            local_style_create_action(&stale_page, DesignLocalStyleKind::Color, None).is_none(),
+            "a dropped local-styles projection cannot emit create intents"
+        );
+        assert!(
+            local_styles_delete_action(&stale_page, vec![color_style_target()]).is_none(),
+            "a dropped local-styles projection cannot emit delete intents"
+        );
+
+        let node_scoped = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(Some(page()), Some(local_styles(node_target())), None),
+        );
+        assert!(
+            node_scoped
+                .page_local_styles_view_data_for_context()
+                .is_none(),
+            "a node-shaped local-styles target is never a Page target"
+        );
+
+        let page_absent = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(None, Some(local_styles(page_target())), None),
+        );
+        assert!(
+            page_absent
+                .page_local_styles_view_data_for_context()
+                .is_none(),
+            "with no Page there is no target for local styles to match"
+        );
+
+        let invalid = DesignPageLocalStylesViewData::new(
+            page_target(),
+            [
+                DesignLocalStyleSection::new(DesignLocalStyleKind::Color, [color_style()]),
+                DesignLocalStyleSection::new(DesignLocalStyleKind::Color, [color_style()]),
+            ],
+        );
+        assert!(
+            !invalid.is_valid(),
+            "duplicate family sections are an invalid host tree"
+        );
+        let invalid_tree = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            PageHostProjection::new(Some(page()), Some(invalid), None),
+        );
+        assert!(
+            invalid_tree
+                .page_local_styles_view_data_for_context()
+                .is_none(),
+            "an on-target but invalid local-styles tree is filtered out as well"
+        );
+    }
+
+    #[test]
+    fn viewer_permissions_disable_page_and_variable_mode_edits() {
+        let host = || {
+            PageHostProjection::new(
+                Some(page()),
+                Some(local_styles(page_target())),
+                Some(variable_modes(page_target())),
+            )
+        };
+
+        let viewer = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::viewer(),
+            host(),
+        );
+        assert!(
+            viewer.page_view_data_for_context().is_some(),
+            "a viewer still inspects the Page"
+        );
+        assert!(
+            viewer.variable_mode_view_data_for_context().is_some(),
+            "a viewer still reads the projected variable modes"
+        );
+        assert!(
+            !viewer.can_edit_page(),
+            "view-only access cannot edit the Page"
+        );
+        assert!(
+            !viewer.can_edit_variable_modes(),
+            "view-only access cannot edit variable modes"
+        );
+        assert!(
+            local_resource_create_action(&viewer, DesignLocalResourceKind::PaintStyle).is_none()
+        );
+        assert!(local_style_create_action(&viewer, DesignLocalStyleKind::Color, None).is_none());
+        assert!(local_styles_delete_action(&viewer, vec![color_style_target()]).is_none());
+        assert!(
+            local_style_command_action(
+                &viewer,
+                color_style_target(),
+                DesignLocalStyleCommand::Edit,
+            )
+            .is_none()
+        );
+        assert!(
+            variable_mode_apply_action(&viewer, "theme".into(), "light".into()).is_none(),
+            "a viewer cannot apply an explicit variable mode"
+        );
+        assert!(
+            variable_mode_clear_action(&viewer, "theme".into(), "dark".into()).is_none(),
+            "a viewer cannot clear an explicit variable mode"
+        );
+        assert!(
+            local_style_command_action(
+                &viewer,
+                color_style_target(),
+                DesignLocalStyleCommand::Copy,
+            )
+            .is_some(),
+            "copy stays available, so the gate is the edit permission and not a blanket deny"
+        );
+
+        let editor = projection(
+            DesignPanelSelectionKind::None,
+            DesignPanelPermissions::editor(),
+            host(),
+        );
+        assert!(editor.can_edit_page());
+        assert!(editor.can_edit_variable_modes());
+        assert!(
+            local_resource_create_action(&editor, DesignLocalResourceKind::PaintStyle).is_some()
+        );
+        assert!(local_style_create_action(&editor, DesignLocalStyleKind::Color, None).is_some());
+        assert!(local_styles_delete_action(&editor, vec![color_style_target()]).is_some());
+        assert!(
+            local_style_command_action(
+                &editor,
+                color_style_target(),
+                DesignLocalStyleCommand::Edit,
+            )
+            .is_some()
+        );
+        assert!(variable_mode_apply_action(&editor, "theme".into(), "light".into()).is_some());
+        assert!(variable_mode_clear_action(&editor, "theme".into(), "dark".into()).is_some());
+    }
+}

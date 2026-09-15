@@ -1922,3 +1922,466 @@ impl PositionPanelCompat for DesignPanel {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
+    use crate::design::{
+        DesignPanelAutoLayoutWrap, DesignPanelNodeCapabilities, DesignSmartSelectionSpacingViewData,
+    };
+    use crate::test_support::{Mounted, ProbeHost, mount_component};
+
+    use super::*;
+    // The renderer's gates are only reachable through the projection the facade
+    // derives from live host state, so every test below drives that factory
+    // rather than hand-building a `PositionProjection`.
+    use super::super::super::position::projection as position_projection;
+
+    type Host = Entity<ProbeHost<DesignPanel, DesignPanelAction>>;
+
+    /// The constraint cells are option cells, and an editable option cell is a
+    /// retained `Select` whose only debug selector is the one the labelled
+    /// presentation carries (`options::render_option_cell`). Every test that
+    /// looks at the painted constraint block therefore turns the inspector's
+    /// Additional labels preference on first and reads these selectors, which
+    /// name the same cells in the read-only presentation too.
+    const HORIZONTAL_CONSTRAINT_CELL: &str = "design-horizontal-constraint-additional-label";
+    const VERTICAL_CONSTRAINT_CELL: &str = "design-vertical-constraint-additional-label";
+
+    /// The panel facade's own harness (`panel::tests::setup`) is private to
+    /// that module, so Position mounts the real `DesignPanel` through the
+    /// shared crate probe host instead. Same contract: one real panel in a
+    /// rooted window, rendered at least once before the test looks at it.
+    fn setup(
+        node: DesignPanelNode,
+        cx: &mut TestAppContext,
+    ) -> Mounted<'_, DesignPanel, DesignPanelAction> {
+        let (host, actions, visual_cx) = mount_component(cx, move |window, cx| {
+            DesignPanel::new("design", node, window, cx)
+        });
+        visual_cx.run_until_parked();
+        (host, actions, visual_cx)
+    }
+
+    fn panel(host: &Host, cx: &VisualTestContext) -> Entity<DesignPanel> {
+        cx.read(|app| host.read(app).component.clone())
+    }
+
+    fn grid_parent(participation: DesignPanelAutoLayoutParticipation) -> DesignPanelParentLayout {
+        DesignPanelParentLayout::auto_layout(
+            DesignPanelAutoLayoutDirection::Grid,
+            DesignPanelAutoLayoutWrap::NoWrap,
+            participation,
+        )
+    }
+
+    fn inspect(
+        panel: &mut DesignPanel,
+        node: DesignPanelNode,
+        parent_layout: DesignPanelParentLayout,
+        permissions: DesignPanelPermissions,
+        cx: &mut Context<DesignPanel>,
+    ) {
+        panel.set_inspection_context(
+            DesignPanelInspectionContext::single(node, parent_layout, permissions),
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn constraints_hidden_without_constrain_capability(cx: &mut TestAppContext) {
+        let node = DesignPanelNode::new("rect", "Rectangle", DesignPanelNodeKind::Rectangle);
+        let (host, _actions, visual_cx) = setup(node.clone(), cx);
+        let panel = panel(&host, visual_cx);
+        // Makes the constraint cells observable at all; see the selector
+        // constants above.
+        panel.update(visual_cx, |panel, cx| panel.set_additional_labels(true, cx));
+        visual_cx.run_until_parked();
+
+        // Positive control first: everything below asserts an absence, which
+        // proves nothing unless this exact surface really paints when the
+        // capability and the disclosure both say yes.
+        assert!(
+            visual_cx.debug_bounds(HORIZONTAL_CONSTRAINT_CELL).is_some(),
+            "a freeform child the host can constrain paints the horizontal constraint cell",
+        );
+        assert!(
+            visual_cx.debug_bounds(VERTICAL_CONSTRAINT_CELL).is_some(),
+            "a freeform child the host can constrain paints the vertical constraint cell",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            assert!(
+                can_show_constraints(panel),
+                "a freeform rectangle carries the host's constrain capability",
+            );
+            let projection = position_projection(panel);
+            assert!(projection.can_constrain && projection.constraints_expanded);
+            dispatch(panel, PositionEvent::ToggleConstraints, cx);
+            assert!(
+                !panel.sections.constraints_expanded(),
+                "the disclosure a capable node owns is togglable",
+            );
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            visual_cx.debug_bounds(HORIZONTAL_CONSTRAINT_CELL).is_none(),
+            "the collapsed disclosure takes the constraint controls with it",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            dispatch(panel, PositionEvent::ToggleConstraints, cx);
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            visual_cx.debug_bounds(HORIZONTAL_CONSTRAINT_CELL).is_some(),
+            "re-opening the disclosure restores the same controls",
+        );
+
+        let unconstrained = DesignPanelNode::new(
+            "unconstrained",
+            "Unconstrained",
+            DesignPanelNodeKind::Rectangle,
+        )
+        .with_capabilities(
+            DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::Rectangle)
+                .with_constraints(false),
+        );
+        panel.update(visual_cx, |panel, cx| {
+            inspect(
+                panel,
+                unconstrained,
+                DesignPanelParentLayout::Freeform,
+                DesignPanelPermissions::editor(),
+                cx,
+            );
+            assert!(
+                !can_show_constraints(panel),
+                "a node the host refuses constraints for never reports the constrain capability",
+            );
+            assert!(!position_projection(panel).can_constrain);
+            assert!(
+                panel.sections.constraints_expanded(),
+                "the retained disclosure state is presentation only, so it stays expanded while \
+                 the capability alone hides the surface",
+            );
+            dispatch(panel, PositionEvent::ToggleConstraints, cx);
+            assert!(
+                panel.sections.constraints_expanded(),
+                "a node without the capability cannot toggle a disclosure it does not own",
+            );
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            visual_cx.debug_bounds(HORIZONTAL_CONSTRAINT_CELL).is_none(),
+            "an expanded disclosure never resurrects constraints the host withheld",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            inspect(
+                panel,
+                node.clone(),
+                DesignPanelParentLayout::auto_layout(
+                    DesignPanelAutoLayoutDirection::Vertical,
+                    DesignPanelAutoLayoutWrap::NoWrap,
+                    DesignPanelAutoLayoutParticipation::InFlow,
+                ),
+                DesignPanelPermissions::editor(),
+                cx,
+            );
+            assert!(
+                !can_show_constraints(panel),
+                "an in-flow auto-layout child is positioned by its parent, so the same capable \
+                 node reports no constrain capability there",
+            );
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            visual_cx.debug_bounds(HORIZONTAL_CONSTRAINT_CELL).is_none(),
+            "the parent layout hides the constraint controls without any capability change",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            inspect(
+                panel,
+                node.clone(),
+                DesignPanelParentLayout::Freeform,
+                DesignPanelPermissions::viewer(),
+                cx,
+            );
+            // A read-only inspection is projected by the Viewer band rather
+            // than this renderer, so the guarantee here is the projection's:
+            // the constrain answer is structural and never an alias of the
+            // write permission.
+            let projection = position_projection(panel);
+            assert!(!projection.can_edit);
+            assert!(
+                projection.can_constrain,
+                "constraints stay reachable for a read-only inspection",
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn grid_alignment_editable_only_when_access_and_value_present(cx: &mut TestAppContext) {
+        let mut node =
+            DesignPanelNode::new("grid-child", "Grid child", DesignPanelNodeKind::Rectangle);
+        let layout = node
+            .layout
+            .as_mut()
+            .expect("an auto-layout child carries grid item data");
+        layout.item.grid_horizontal_alignment = DesignGridItemAlignment::Center;
+        layout.item.grid_vertical_alignment = DesignGridItemAlignment::End;
+        let (host, actions, visual_cx) = setup(node.clone(), cx);
+        let panel = panel(&host, visual_cx);
+
+        panel.update(visual_cx, |panel, _| {
+            let projection = position_projection(panel);
+            assert_eq!(
+                projection.grid_horizontal_alignment, None,
+                "a freeform child is not a grid child, so it keeps the arrange buttons even \
+                 though the node still carries grid item data",
+            );
+            assert_eq!(projection.grid_vertical_alignment, None);
+            assert!(
+                !projection.grid_horizontal_editable && !projection.grid_vertical_editable,
+                "the access answer follows the same applicability rule as the value: an editor's \
+                 write permission alone never grants grid alignment access to a child that no \
+                 grid parent positions",
+            );
+        });
+
+        panel.update(visual_cx, |panel, cx| {
+            inspect(
+                panel,
+                node.clone(),
+                grid_parent(DesignPanelAutoLayoutParticipation::InFlow),
+                DesignPanelPermissions::editor(),
+                cx,
+            );
+            let projection = position_projection(panel);
+            assert_eq!(
+                projection.grid_horizontal_alignment,
+                Some(DesignGridItemAlignment::Center),
+                "an in-flow child of a grid parent reads its own alignment out of the node",
+            );
+            assert_eq!(
+                projection.grid_vertical_alignment,
+                Some(DesignGridItemAlignment::End),
+                "each axis keeps its own alignment value",
+            );
+            assert!(projection.grid_horizontal_editable && projection.grid_vertical_editable);
+            dispatch(
+                panel,
+                PositionEvent::Property(
+                    DesignPanelProperty::GridHorizontalAlignment,
+                    DesignPanelValue::GridItemAlignment(DesignGridItemAlignment::Start),
+                ),
+                cx,
+            );
+            assert_eq!(
+                position_projection(panel).grid_horizontal_alignment,
+                Some(DesignGridItemAlignment::Center),
+                "the control is fully host controlled: the request never edits the projection",
+            );
+        });
+        visual_cx.run_until_parked();
+        assert_eq!(
+            actions.borrow().as_slice(),
+            [DesignPanelAction::PropertyChangeRequested {
+                node_id: "grid-child".into(),
+                property: DesignPanelProperty::GridHorizontalAlignment,
+                value: DesignPanelValue::GridItemAlignment(DesignGridItemAlignment::Start),
+            }],
+            "an editable grid alignment control emits exactly one exact-identity intent",
+        );
+        actions.borrow_mut().clear();
+
+        panel.update(visual_cx, |panel, cx| {
+            inspect(
+                panel,
+                node.clone(),
+                grid_parent(DesignPanelAutoLayoutParticipation::Ignored),
+                DesignPanelPermissions::editor(),
+                cx,
+            );
+            assert_eq!(
+                position_projection(panel).grid_horizontal_alignment,
+                None,
+                "a child excluded from its parent's flow is not a grid item, so the alignment \
+                 value disappears with the participation and not with the value on the node",
+            );
+            inspect(
+                panel,
+                node.clone(),
+                DesignPanelParentLayout::auto_layout(
+                    DesignPanelAutoLayoutDirection::Horizontal,
+                    DesignPanelAutoLayoutWrap::NoWrap,
+                    DesignPanelAutoLayoutParticipation::InFlow,
+                ),
+                DesignPanelPermissions::editor(),
+                cx,
+            );
+            assert_eq!(
+                position_projection(panel).grid_horizontal_alignment,
+                None,
+                "only a grid parent produces grid alignment: a stacked auto-layout child keeps \
+                 the arrange buttons",
+            );
+        });
+
+        panel.update(visual_cx, |panel, cx| {
+            inspect(
+                panel,
+                node.clone(),
+                grid_parent(DesignPanelAutoLayoutParticipation::InFlow),
+                DesignPanelPermissions::viewer(),
+                cx,
+            );
+            let projection = position_projection(panel);
+            assert_eq!(
+                projection.grid_horizontal_alignment,
+                Some(DesignGridItemAlignment::Center),
+                "the locked control still reads out the current alignment",
+            );
+            assert!(
+                !projection.grid_horizontal_editable && !projection.grid_vertical_editable,
+                "enablement follows the per-property access answer, which a read-only inspection \
+                 withholds on both axes",
+            );
+            dispatch(
+                panel,
+                PositionEvent::Property(
+                    DesignPanelProperty::GridHorizontalAlignment,
+                    DesignPanelValue::GridItemAlignment(DesignGridItemAlignment::Start),
+                ),
+                cx,
+            );
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            actions.borrow().is_empty(),
+            "a present alignment value alone never authorises an edit: the terminal dispatch \
+             re-checks the access answer the disabled control reported",
+        );
+    }
+
+    #[gpui::test]
+    fn multiple_selection_hides_smart_selection_when_projection_absent(cx: &mut TestAppContext) {
+        let first = DesignPanelNode::new("first", "First", DesignPanelNodeKind::Rectangle);
+        let second = DesignPanelNode::new("second", "Second", DesignPanelNodeKind::Ellipse);
+        let selection_target = DesignPanelTarget::Nodes {
+            node_ids: vec!["first".into(), "second".into()],
+        };
+        let other_target = DesignPanelTarget::Nodes {
+            node_ids: vec!["first".into(), "third".into()],
+        };
+        let view_data = |target: DesignPanelTarget| {
+            DesignSmartSelectionViewData::horizontal(
+                target,
+                DesignSmartSelectionSpacingViewData::uniform(12.),
+            )
+            .with_operation(
+                DesignSmartSelectionOperation::DistributeHorizontal,
+                DesignSmartSelectionAvailability::Available,
+            )
+        };
+        let (host, _actions, visual_cx) = setup(first.clone(), cx);
+        let panel = panel(&host, visual_cx);
+
+        panel.update(visual_cx, |panel, cx| {
+            panel.set_inspection_context(
+                DesignPanelInspectionContext::multiple(
+                    DesignPanelMultipleSelection::new(first.clone(), second.clone()),
+                    DesignPanelParentLayout::Mixed,
+                    DesignPanelPermissions::editor(),
+                ),
+                cx,
+            );
+            let projection = position_projection(panel);
+            assert!(
+                projection.selection_is_multiple && projection.supports_arrange,
+                "this multiple selection supports arrange, so only the host projection can \
+                 decide which arrange surface it gets",
+            );
+            assert!(
+                !projection.smart_selection_projection_present
+                    && projection.smart_selection.is_none(),
+                "a host that publishes no smart-selection projection keeps the legacy arrange \
+                 buttons",
+            );
+            panel.set_smart_selection_view_data(view_data(selection_target.clone()), cx);
+            assert!(position_projection(panel).smart_selection.is_some());
+        });
+        visual_cx.run_until_parked();
+        // Positive control: the two absences asserted below are only evidence
+        // because this exact selection paints both leaves here.
+        assert!(
+            visual_cx
+                .debug_bounds("design-smart-selection-horizontal-spacing")
+                .is_some(),
+            "a matching host projection reaches the renderer and paints Space between",
+        );
+        assert!(
+            visual_cx
+                .debug_bounds("design-smart-selection-distribute-horizontal")
+                .is_some(),
+            "a matching host projection paints the Arrange operations it published",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            panel.set_smart_selection_view_data(view_data(other_target.clone()), cx);
+            let projection = position_projection(panel);
+            assert!(
+                projection.smart_selection_projection_present,
+                "the presence flag records that the host owns smart selection independently of \
+                 whether it answered for this selection, and that is what suppresses the legacy \
+                 fallback",
+            );
+            assert!(
+                projection.smart_selection.is_none(),
+                "a projection that answers for a different selection never reaches the renderer",
+            );
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            visual_cx
+                .debug_bounds("design-smart-selection-horizontal-spacing")
+                .is_none(),
+            "Space between belongs to the exact selection the host answered for",
+        );
+        assert!(
+            visual_cx
+                .debug_bounds("design-smart-selection-distribute-horizontal")
+                .is_none(),
+            "Arrange belongs to the exact selection the host answered for",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            panel.set_smart_selection_view_data(view_data(selection_target.clone()), cx);
+            panel.set_inspection_context(
+                DesignPanelInspectionContext::single(
+                    first.clone(),
+                    DesignPanelParentLayout::Freeform,
+                    DesignPanelPermissions::editor(),
+                ),
+                cx,
+            );
+            let projection = position_projection(panel);
+            assert!(!projection.selection_is_multiple);
+            assert!(
+                projection.smart_selection.is_none(),
+                "smart-selection view data never implies a multiple selection",
+            );
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            visual_cx
+                .debug_bounds("design-smart-selection-horizontal-spacing")
+                .is_none(),
+            "a single selection hides the smart-selection block even when the host left view \
+             data behind",
+        );
+    }
+}

@@ -444,3 +444,359 @@ impl DesignPanelShellController for DesignPanel {
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    use crate::design::{DesignPanelNodeCapabilities, DesignTypography};
+    use crate::test_support::{Mounted, ProbeHost, mount_component};
+
+    use super::*;
+
+    type Host = Entity<ProbeHost<DesignPanel, DesignPanelAction>>;
+
+    /// Every section this shell dispatches for a fully capable node, paired
+    /// with the leaves that only paint when the shell actually mounted that
+    /// section.
+    ///
+    /// Section headers themselves carry no debug selector, so each entry names
+    /// controls the section body owns. An entry may list alternatives because
+    /// the same property renders either as a plain value cell or as a retained
+    /// option menu depending on editability; with the one exception below, a
+    /// section that stopped being dispatched paints none of them.
+    ///
+    /// The constraint entry names the labelled cell rather than the cell
+    /// itself: an editable option cell is a retained `Select` and only its
+    /// labelled presentation carries a debug selector, which is why [`setup`]
+    /// turns the Additional labels preference on.
+    ///
+    /// That exception is the Constraints row, which is not exclusive on its
+    /// own: the Position section paints the same cells inline while its own
+    /// constraints disclosure is open
+    /// (`sections::position::render` -> `render_constraints_controls`), so the
+    /// Constraints row only distinguishes the dispatch once that disclosure is
+    /// collapsed. Every presence assertion against this table collapses it
+    /// first.
+    const DISPATCHED_SECTION_LEAVES: &[(DesignPanelSection, &[&str])] = &[
+        (DesignPanelSection::Position, &["design-x", "design-y"]),
+        (
+            DesignPanelSection::Layout,
+            &["design-width", "design-height"],
+        ),
+        (
+            DesignPanelSection::Constraints,
+            &["design-horizontal-constraint-additional-label"],
+        ),
+        (DesignPanelSection::Layer, &["design-opacity-value"]),
+        (DesignPanelSection::Typography, &["design-font-size"]),
+        (DesignPanelSection::Fill, &["design-add-fill"]),
+        (DesignPanelSection::Stroke, &["design-add-stroke"]),
+        (DesignPanelSection::Effects, &["design-add-effect"]),
+        (DesignPanelSection::LayoutGrid, &["design-add-layout-guide"]),
+        (DesignPanelSection::Export, &["design-add-export"]),
+    ];
+
+    /// Compatibility-only identifiers the shell still resolves but must never
+    /// project: `Media` was retired into the paint picker and `Geometry` only
+    /// carries legacy table/mask leaves.
+    const COMPATIBILITY_SECTIONS: &[DesignPanelSection] =
+        &[DesignPanelSection::Geometry, DesignPanelSection::Media];
+
+    /// The panel facade's own harness (`panel::tests::setup`) is private to
+    /// that module, so the shell mounts the real `DesignPanel` through the
+    /// shared crate probe host instead. Same contract: one real panel in a
+    /// rooted window, rendered at least once before the test looks at it.
+    fn setup(
+        node: DesignPanelNode,
+        cx: &mut TestAppContext,
+    ) -> Mounted<'_, DesignPanel, DesignPanelAction> {
+        let (host, actions, visual_cx) = mount_component(cx, move |window, cx| {
+            DesignPanel::new("design", node, window, cx)
+        });
+        visual_cx.run_until_parked();
+        // Additional labels only add a label beside each control, so every
+        // other selector in the table is unchanged; the constraint cells are
+        // observable at no other setting. See DISPATCHED_SECTION_LEAVES.
+        let component = visual_cx.read(|app| host.read(app).component.clone());
+        component.update(visual_cx, |panel, cx| panel.set_additional_labels(true, cx));
+        visual_cx.run_until_parked();
+        (host, actions, visual_cx)
+    }
+
+    fn panel(host: &Host, cx: &VisualTestContext) -> Entity<DesignPanel> {
+        cx.read(|app| host.read(app).component.clone())
+    }
+
+    /// A node whose host capabilities claim every band the shell can
+    /// dispatch, including the two compatibility identifiers.
+    fn full_capability_node() -> DesignPanelNode {
+        let sections = DISPATCHED_SECTION_LEAVES
+            .iter()
+            .map(|(section, _)| *section)
+            .chain(COMPATIBILITY_SECTIONS.iter().copied());
+        let mut node = DesignPanelNode::new("full", "Full capability", DesignPanelNodeKind::Frame);
+        node.typography = Some(DesignTypography::default());
+        node.with_capabilities(
+            DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::Frame)
+                .with_sections(sections)
+                .with_dimensions(true)
+                .with_position_coordinates(true)
+                .with_constraints(true)
+                .with_visibility(true)
+                .with_layer_appearance(true)
+                .with_fill(true)
+                .with_stroke(true)
+                .with_effects(true)
+                .with_layout_guides(true),
+        )
+    }
+
+    /// The same fixture with the Constraints band withheld from the host's
+    /// ordered section list. The node can still be constrained, so the only
+    /// remaining painter of the constraint cells is the Position section's own
+    /// inline disclosure.
+    fn node_without_the_constraints_band() -> DesignPanelNode {
+        let mut node = full_capability_node();
+        let capabilities = node
+            .capabilities
+            .clone()
+            .expect("the fixture carries an explicit capability snapshot");
+        let sections = capabilities
+            .sections
+            .iter()
+            .copied()
+            .filter(|section| *section != DesignPanelSection::Constraints)
+            .collect::<Vec<_>>();
+        node.capabilities = Some(capabilities.with_sections(sections));
+        node
+    }
+
+    fn resolved_sections(
+        panel: &Entity<DesignPanel>,
+        cx: &VisualTestContext,
+    ) -> Vec<DesignPanelSection> {
+        panel.read_with(cx, |panel, _| {
+            panel
+                .sections
+                .resolve(
+                    panel.host.inspected_node(),
+                    panel.workspace_mode(),
+                    panel.can_export(),
+                )
+                .into_iter()
+                .map(|projection| projection.section)
+                .collect()
+        })
+    }
+
+    /// Closes the Position section's own constraints disclosure so the
+    /// constraint cells can only come from the dispatched Constraints section.
+    ///
+    /// Without this the Constraints row of `DISPATCHED_SECTION_LEAVES` proves
+    /// nothing: `sections::position::render` paints the very same cells inline
+    /// whenever the node can be constrained and that disclosure is open.
+    fn collapse_position_constraints_disclosure(
+        panel: &Entity<DesignPanel>,
+        cx: &mut VisualTestContext,
+    ) {
+        panel.update(cx, |panel, cx| {
+            assert!(
+                panel.sections.constraints_expanded(),
+                "the disclosure starts open, so this really is the state that would let the \
+                 Position section answer for the Constraints section",
+            );
+            panel.sections.toggle_constraints();
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn shell_renders_every_resolved_section_for_a_full_capability_node(cx: &mut TestAppContext) {
+        let (host, _actions, visual_cx) = setup(full_capability_node(), cx);
+        let panel = panel(&host, visual_cx);
+
+        let expected = DISPATCHED_SECTION_LEAVES
+            .iter()
+            .map(|(section, _)| *section)
+            .chain(COMPATIBILITY_SECTIONS.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resolved_sections(&panel, visual_cx),
+            expected,
+            "the fixture must really resolve every dispatched band, otherwise the render \
+             assertions below are vacuous",
+        );
+
+        collapse_position_constraints_disclosure(&panel, visual_cx);
+
+        for (section, candidates) in DISPATCHED_SECTION_LEAVES {
+            assert!(
+                candidates
+                    .iter()
+                    .copied()
+                    .any(|selector| visual_cx.debug_bounds(selector).is_some()),
+                "the shell resolved the {} section but mounted none of {candidates:?}",
+                section.label(),
+            );
+        }
+
+        panel.update(visual_cx, |panel, cx| {
+            assert!(
+                DesignPanelShellController::render_media(&*panel, cx).is_none(),
+                "the retired Media path stays inert: image and video controls belong to the \
+                 canonical paint picker, so the panel must not project node-level media here",
+            );
+            let shape = sections::shape::ShapeProjection::from_node(
+                panel.id.clone(),
+                panel.can_edit(),
+                panel.host.inspected_node(),
+            );
+            assert!(
+                sections::shape::render_geometry(&shape, &*panel, cx).is_none(),
+                "a resolved Geometry identifier with no legacy table or mask leaf must project \
+                 nothing rather than an empty section",
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn constraint_cells_follow_the_position_disclosure_when_the_band_is_not_dispatched(
+        cx: &mut TestAppContext,
+    ) {
+        let (host, _actions, visual_cx) = setup(node_without_the_constraints_band(), cx);
+        let panel = panel(&host, visual_cx);
+
+        assert!(
+            !resolved_sections(&panel, visual_cx).contains(&DesignPanelSection::Constraints),
+            "the fixture must really withhold the band, otherwise the shell's own dispatch would \
+             answer for the cells below",
+        );
+        assert!(
+            visual_cx
+                .debug_bounds("design-horizontal-constraint-additional-label")
+                .is_some(),
+            "a constrainable node paints the constraint cells from the Position section's inline \
+             disclosure even with no Constraints band dispatched: that shared leaf is exactly why \
+             the Constraints row of DISPATCHED_SECTION_LEAVES is only read with the disclosure \
+             collapsed",
+        );
+
+        collapse_position_constraints_disclosure(&panel, visual_cx);
+
+        let (_, constraint_leaves) = DISPATCHED_SECTION_LEAVES
+            .iter()
+            .find(|(section, _)| *section == DesignPanelSection::Constraints)
+            .expect("the table names the leaves the Constraints dispatch must own");
+        for selector in constraint_leaves.iter().copied() {
+            assert!(
+                visual_cx.debug_bounds(selector).is_none(),
+                "`{selector}` survived with neither the Constraints dispatch nor the Position \
+                 disclosure left to paint it, so its presence can never prove either one",
+            );
+        }
+        assert!(
+            visual_cx.debug_bounds("design-x").is_some(),
+            "only the constraint block closed: the rest of the Position section still renders",
+        );
+    }
+
+    #[gpui::test]
+    fn host_owned_surface_renders_no_inspector_projection(cx: &mut TestAppContext) {
+        let (host, _actions, visual_cx) = setup(full_capability_node(), cx);
+        let panel = panel(&host, visual_cx);
+
+        assert!(
+            panel.read_with(visual_cx, |panel, _| panel.renders_inspector_projection()),
+            "the editor's Design surface is the inspector projection",
+        );
+        collapse_position_constraints_disclosure(&panel, visual_cx);
+        for (section, candidates) in DISPATCHED_SECTION_LEAVES {
+            assert!(
+                candidates
+                    .iter()
+                    .copied()
+                    .any(|selector| visual_cx.debug_bounds(selector).is_some()),
+                "the {} section must be mounted before the surface change, otherwise its \
+                 absence afterwards proves nothing",
+                section.label(),
+            );
+        }
+
+        panel.update(visual_cx, |panel, cx| {
+            assert!(panel.set_active_surface(DesignPanelSurface::Prototype, cx));
+        });
+        visual_cx.run_until_parked();
+
+        assert!(
+            !panel.read_with(visual_cx, |panel, _| panel.renders_inspector_projection()),
+            "a host-owned surface is not an inspector projection",
+        );
+        assert!(
+            visual_cx
+                .debug_bounds("design-surface-prototype-host-owned")
+                .is_some(),
+            "the shell must say the surface is host owned rather than render an empty body",
+        );
+        assert!(
+            visual_cx
+                .debug_bounds("design-tab-prototype-active")
+                .is_some(),
+            "the shared sidebar header survives: only the body below it is surrendered",
+        );
+        for (section, candidates) in DISPATCHED_SECTION_LEAVES {
+            for selector in candidates.iter().copied() {
+                assert!(
+                    visual_cx.debug_bounds(selector).is_none(),
+                    "`{selector}` from the {} section leaked into a host-owned surface",
+                    section.label(),
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn scroll_reset_arms_once_per_context_change(cx: &mut TestAppContext) {
+        let first = DesignPanelNode::new("first", "First", DesignPanelNodeKind::Rectangle);
+        let second = DesignPanelNode::new("second", "Second", DesignPanelNodeKind::Rectangle);
+        let (host, _actions, visual_cx) = setup(first, cx);
+        let panel = panel(&host, visual_cx);
+
+        assert!(
+            !panel.read_with(visual_cx, |panel, _| panel.shell.reset_after_render),
+            "the mount frame consumes the initial arm; a panel that is already at the top must \
+             not keep asking to be scrolled there",
+        );
+
+        panel.update(visual_cx, |panel, cx| {
+            panel.set_inspection_context(
+                DesignPanelInspectionContext::single(
+                    second,
+                    DesignPanelParentLayout::Freeform,
+                    DesignPanelPermissions::editor(),
+                ),
+                cx,
+            );
+            assert!(
+                panel.shell.reset_after_render,
+                "a new inspection context invalidates the content the offset referred to, so \
+                 the shell must arm the return to the top",
+            );
+        });
+        visual_cx.run_until_parked();
+
+        assert!(
+            !panel.read_with(visual_cx, |panel, _| panel.shell.reset_after_render),
+            "the armed reset is spent by the frame that scheduled it",
+        );
+
+        panel.update(visual_cx, |_, cx| cx.notify());
+        visual_cx.run_until_parked();
+        assert!(
+            !panel.read_with(visual_cx, |panel, _| panel.shell.reset_after_render),
+            "later frames must not re-arm: a shell that stayed armed would drag the reader back \
+             to the top of the inspector on every unrelated redraw",
+        );
+    }
+}

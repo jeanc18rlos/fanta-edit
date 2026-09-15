@@ -950,3 +950,157 @@ impl DesignPanelFactory {
         panel
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, VisualContext as _};
+
+    use super::*;
+    use crate::test_support::mount_component;
+
+    /// Assembly is the single place the façade's retained children are wired,
+    /// so the retained-subscription count is part of the host contract: a
+    /// dropped entry silently stops one child from reaching the panel, and the
+    /// failure then surfaces as an unrelated section test that no longer sees
+    /// its intent.
+    ///
+    /// Thirteen subscriptions are retained in `_subscriptions`: the seven
+    /// retained inputs, the four component-authoring inputs, and the paint and
+    /// typography-style pickers. The two Draw slider subscriptions are
+    /// deliberately not counted here — they are retained inside
+    /// [`DesignDrawSliderStates`] beside the sliders they observe so a slider
+    /// rebuild drops exactly its own subscription.
+    ///
+    /// The per-property select children are absent at assembly on purpose:
+    /// they are built lazily from controlled host data while rendering, never
+    /// eagerly by the factory.
+    #[gpui::test]
+    fn assemble_retains_every_subscription_once(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::init(cx);
+        });
+        let visual_cx = cx.add_empty_window();
+        let node = DesignPanelNode::new("assembled", "Assembled", DesignPanelNodeKind::Rectangle);
+        let panel = visual_cx.new_window_entity(|window, cx| {
+            DesignPanelFactory::assemble("design-assembled-panel", node, window, cx)
+        });
+
+        let (subscriptions, option_states, option_subscriptions, option_snapshots) = visual_cx
+            .read(|app| {
+                let assembled = panel.read(app);
+                (
+                    assembled._subscriptions.len(),
+                    assembled.retained.options.states.len(),
+                    assembled.retained.options.subscriptions.len(),
+                    assembled.retained.options.snapshots.len(),
+                )
+            });
+
+        assert_eq!(
+            subscriptions, 13,
+            "assembly must retain exactly one subscription per retained child it observes; \
+             changing this number means a child gained or lost its host wiring"
+        );
+        assert_eq!(
+            option_states, 0,
+            "select children are built from controlled host data while rendering, never by the \
+             factory"
+        );
+        assert_eq!(
+            option_subscriptions, 0,
+            "a select child's subscription is retained with the child it observes, so neither may \
+             exist before a render"
+        );
+        assert_eq!(
+            option_snapshots, 0,
+            "an option snapshot may only record host data a select child was synchronized to"
+        );
+    }
+
+    /// Rebuilding the Draw corner-radius slider is the only path through
+    /// [`DesignDrawSliderStates::replace_corner_radius`], and the whole point
+    /// of routing the replacement through that method is that the previous
+    /// subscription dies with the child it observed. A replacement that kept
+    /// the old subscription alive would let a stale slider keep previewing
+    /// corner radii against a range the host has already retired.
+    #[gpui::test]
+    fn replace_corner_radius_drops_previous_subscription(cx: &mut TestAppContext) {
+        let node = DesignPanelNode::new("rectangle", "Rectangle", DesignPanelNodeKind::Rectangle);
+        let (host, actions, visual_cx) =
+            mount_component::<DesignPanel, DesignPanelAction>(cx, move |window, cx| {
+                DesignPanel::new("design-factory-panel", node, window, cx)
+            });
+        let panel = visual_cx.read(|app| host.read(app).component.clone());
+        let target = DesignPanelTarget::Nodes {
+            node_ids: vec!["rectangle".into()],
+        };
+
+        panel.update(visual_cx, |panel, cx| {
+            panel.set_workspace_mode(DesignPanelWorkspaceMode::Draw, cx);
+            assert!(panel.set_draw_appearance_view_data(
+                DesignDrawAppearanceViewData::new(
+                    target.clone(),
+                    DesignDrawSliderRange::new(0., 240., 1.).expect("valid first corner range"),
+                ),
+                cx,
+            ));
+        });
+        visual_cx.run_until_parked();
+        let replaced =
+            visual_cx.read(|app| panel.read(app).retained.draw_sliders.corner_radius.clone());
+
+        panel.update(visual_cx, |panel, cx| {
+            assert!(panel.set_draw_appearance_view_data(
+                DesignDrawAppearanceViewData::new(
+                    target.clone(),
+                    DesignDrawSliderRange::new(0., 120., 1.).expect("valid second corner range"),
+                ),
+                cx,
+            ));
+        });
+        visual_cx.run_until_parked();
+        let current =
+            visual_cx.read(|app| panel.read(app).retained.draw_sliders.corner_radius.clone());
+        assert_ne!(
+            replaced.entity_id(),
+            current.entity_id(),
+            "a new host corner range must build a fresh slider child rather than mutate the \
+             retained one"
+        );
+
+        actions.borrow_mut().clear();
+        replaced.update(visual_cx, |_, cx| {
+            cx.emit(SliderEvent::Change(SliderValue::Single(24.)));
+        });
+        visual_cx.run_until_parked();
+        assert!(
+            actions.borrow().is_empty(),
+            "the replaced slider's subscription must be dropped with it; a retired child may not \
+             keep previewing corner radii"
+        );
+
+        current.update(visual_cx, |_, cx| {
+            cx.emit(SliderEvent::Change(SliderValue::Single(24.)));
+        });
+        visual_cx.run_until_parked();
+        let phases = actions
+            .borrow()
+            .iter()
+            .filter_map(|action| match action {
+                DesignPanelAction::PropertyEditRequested {
+                    property: DesignPanelProperty::CornerRadius,
+                    phase,
+                    ..
+                } => Some(*phase),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            phases,
+            [DesignPanelEditPhase::Begin, DesignPanelEditPhase::Preview],
+            "the current slider must own the live subscription and open exactly one preview \
+             transaction"
+        );
+    }
+}
