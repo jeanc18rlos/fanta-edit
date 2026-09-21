@@ -220,7 +220,7 @@ function SignZedAndItsFriends {
 }
 
 function DownloadAMDGpuServices {
-    # If you update the AGS SDK version, please also update the version in `crates/gpui/src/platform/windows/directx_renderer.rs`
+    # If you update the AGS SDK version, please also update the GPUI renderer in squidred-dev/fanta-ui
     $url = "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/AGS_SDK/zip/refs/tags/v6.3.0"
     $zipPath = ".\AGS_SDK_v6.3.0.zip"
     # Download the AGS SDK zip file

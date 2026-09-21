@@ -1,13 +1,13 @@
 # Vendored Fanta crates
 
-The Fanta engine and UI-kit crates below are vendored into this repository so
+The Fanta engine crates below are vendored into this repository so
 the tree builds standalone and the GPL-3.0 corresponding-source offer for the
 shipped binary is satisfied by this repository alone.
 
 | Crate(s) | Upstream | Commit |
 |---|---|---|
 | `fanta-canvas`, `fanta-doc`, `fanta-fig-interop`, `fanta-fnx`, `fanta-format`, `fanta-present`, `fanta-render`, `fanta-text`, `fanta-tools` | `squidred-dev/fantaisa-engine` | `9370fa2` |
-| `fanta-gpui` | `squidred-dev/fanta-ui` | `a5edcd6` |
+| `fanta-gpui` (historical; now published) | `squidred-dev/fanta-ui` | `9183fa3` |
 
 Upstream crates not vendored because nothing here uses them: `fanta-engine`,
 `fanta-harness`, `fanta-psd-interop`, `fanta-illustrator-interop`,
@@ -89,17 +89,35 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   `<Ellipse>` whose viewport matches its extent (see the `fanta-fnx` sugar
   divergence above).
 
+- `fanta-gpui`: resynced to upstream `9183fa3`, which brings the atomic-design
+  tiers, the Design-inspector decomposition and `atoms::tokens`. Two host-only
+  changes that had only ever existed in this copy were pushed upstream first and
+  are now part of that commit rather than divergences: the toolbar's
+  `GenerateVideo`/`GenerateVector`/`GenerateMasks` commands with their palette
+  focus fixes, and `LayersPanelItem::has_children`, the hint that lets this host
+  keep pruning collapsed subtrees for large documents. The resync also adds
+  `lucide-static-svg` (MIT AND ISC), `roxmltree` and `svgtypes`: upstream now
+  renders the pinned Lucide catalog instead of the hand-drawn `vector_icon`
+  module this copy carried. `[package]` still omits `repository` and the
+  `[lints]` block still allows `redundant_clone`, per the rules above.
+
 All other source is byte-identical to upstream. Edits belong here now; the
 sibling checkouts are no longer part of the build.
 
-## Third-party crates
+## Published GPUI dependencies
 
-`gpui_component` is not ours: it is [`longbridge/gpui-component`][gpui-component],
-Apache-2.0, Copyright 2024 - 2025 Longbridge. Unlike the Fanta crates above it
-keeps its own `LICENSE-APACHE` as a real file rather than a symlink, because
-Apache-2.0 section 4 requires retaining the upstream copyright notice and this
-repository's own `LICENSE-APACHE` carries a different one. `script/check-licenses`
-knows about this through its `vendored_license_dirs` list and rejects turning
-that file back into a symlink.
+The workspace consumes the GPUI framework, supporting libraries, and reusable
+Fanta components from `squidred-dev/fanta-ui` as exact crates.io `=0.1.0`
+dependencies. Dependency aliases preserve existing Rust imports. `Cargo.lock`
+records the registry sources and checksums.
 
-[gpui-component]: https://github.com/longbridge/gpui-component
+The migrated local source copies have been removed. The `fanta-gpui` entries
+above record historical provenance and migration work, not the active source.
+Framework changes and native framework tests belong in
+https://github.com/squidred-dev/fanta-ui. Editor CI tests the host integration,
+including canvas rendering and editor video playback, against the published
+packages. The component fork retains its upstream Apache-2.0 license in its
+published package.
+
+`fanta_ui`, `fig_viewer`, their adapters, and the document and canvas engine
+crates remain owned here.

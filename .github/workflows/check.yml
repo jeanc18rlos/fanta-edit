@@ -14,4 +14,7 @@ jobs:
         run: ./script/check-licenses
 
       - name: Check the app builds
-        run: cargo check -p zed
+        run: cargo check --locked -p zed
+
+      - name: Test published component icon assets
+        run: cargo test --locked -p fig_viewer --lib every_gpui_component_icon_resolves_in_the_app_asset_source
