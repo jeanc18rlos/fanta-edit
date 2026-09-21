@@ -23,6 +23,7 @@ mod image;
 mod instance;
 mod layer_cache;
 mod masks;
+mod media;
 mod motion;
 mod shadows;
 mod shapes_basics;

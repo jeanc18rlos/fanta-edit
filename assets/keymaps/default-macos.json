@@ -1457,7 +1457,7 @@
     },
   },
   {
-    "context": "FigViewer && !Editor",
+    "context": "FigViewer && !Editor && !Input",
     "use_key_equivalents": true,
     "bindings": {
       "cmd-=": "fig_viewer::ZoomIn",
@@ -1492,6 +1492,7 @@
       "shift-down": "fig_viewer::NudgeDown",
       "v": "fig_viewer::ActivateSelectTool",
       "h": "fig_viewer::ActivateHandTool",
+      "k": "fig_viewer::ActivateScaleTool",
       "r": "fig_viewer::ActivateRectangleTool",
       "o": "fig_viewer::ActivateEllipseTool",
       "l": "fig_viewer::ActivateLineTool",
@@ -1506,7 +1507,7 @@
     },
   },
   {
-    "context": "FigViewerPrototype && !Editor",
+    "context": "FigViewerPrototype && !Editor && !Input",
     "use_key_equivalents": true,
     "bindings": {
       "escape": "fig_viewer::ExitPrototype",

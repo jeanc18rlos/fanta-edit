@@ -11,12 +11,12 @@ description: >-
 # Generating media with the Fanta backend
 
 Media generation runs on the `fanta` MCP server (`https://api.fantaisa.net/mcp`,
-authenticated with the user's `fnt_live_…` key). If its tools
+authenticated automatically with the user's signed-in Fanta account). If its tools
 (`generate_image`, `edit_image`, `upscale_image`, `vectorize`,
 `animate_image`, `plan_compose`, `get_generation`, `list_models`,
 `search_assets`, `upload_asset`, `get_credits`) are not available, the server
-is not configured — ask the user to add the `fanta` context server rather
-than guessing at endpoints.
+is disconnected — ask the user to sign in to Fanta and check that the `fanta`
+context server is enabled rather than guessing at endpoints.
 
 ## The loop
 

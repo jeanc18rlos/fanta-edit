@@ -63,10 +63,11 @@ use crate::properties_panel::FantaPropertiesPanel;
 use crate::prototype_panel::FantaPrototypePanel;
 use crate::prototype_player::PrototypePlayerState;
 use crate::text_edit::CanvasTextEdit;
+#[cfg(test)]
+use crate::timeline::TIMELINE_HEIGHT;
 use crate::timeline::{
-    TIMELINE_HEIGHT, TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection,
-    TimelineKeyframeViewModel, TimelineProperty, TimelineShell, TimelineTrackViewModel,
-    TimelineViewModel,
+    TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection, TimelineKeyframeViewModel,
+    TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
 };
 use crate::tools::{
     TOOLBAR_GROUPS, ToolKind, ToolShell, key_event, move_event, pointer_button, press_event,
@@ -75,7 +76,9 @@ use crate::tools::{
 use crate::variables_workspace::FantaVariablesWorkspace;
 
 #[cfg(target_os = "macos")]
-use crate::canvas::GpuCanvas;
+use crate::canvas::{CanvasVideoFrame, GpuCanvas};
+#[cfg(target_os = "macos")]
+use crate::video_playback::VideoPlaybackView;
 
 actions!(
     fig_viewer,
@@ -158,9 +161,9 @@ actions!(
         ActivateSectionTool,
         /// Activate the slice tool.
         ActivateSliceTool,
-        /// Activate the scale tool (placeholder).
+        /// Proportionally scale selected objects and their contents.
         ActivateScaleTool,
-        /// Activate the direct path-selection tool (placeholder).
+        /// Activate direct selection of vector anchors and segments.
         ActivatePathSelectTool,
         /// Activate the text-on-path tool (placeholder).
         ActivateTextPathTool,
@@ -302,6 +305,14 @@ pub struct FigView {
     /// `pub(crate)` because the canvas element drives it during paint.
     #[cfg(target_os = "macos")]
     pub(crate) gpu_canvas: Option<GpuCanvas>,
+    #[cfg(target_os = "macos")]
+    canvas_video: Option<CanvasVideoSession>,
+    #[cfg(target_os = "macos")]
+    canvas_video_generation: u64,
+    #[cfg(target_os = "macos")]
+    canvas_video_removed: std::cell::Cell<bool>,
+    #[cfg(target_os = "macos")]
+    canvas_video_active: std::cell::Cell<bool>,
     pub(crate) tools: ToolShell,
     pub(crate) comment_state: crate::comments_ui::CommentState,
     /// The last-used tool per toolbar group, so each group's button keeps
@@ -343,6 +354,42 @@ pub struct FigView {
 pub enum FigViewEvent {
     Edited,
     TitleChanged,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanvasVideoSource {
+    scene: u64,
+    node: NodeId,
+    asset: AssetId,
+    assets_identity: usize,
+    bytes_identity: Option<(usize, usize)>,
+    time_range_us: [i64; 2],
+    speed_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasVideoSession {
+    source: CanvasVideoSource,
+    loading: Option<Task<()>>,
+    playback: Option<Entity<VideoPlaybackView>>,
+    observation: Option<Subscription>,
+    error: Option<SharedString>,
+    audio: (bool, u32),
+    bytes: Option<std::sync::Arc<[u8]>>,
+    trim: Option<CanvasVideoTrim>,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasVideoTrim {
+    source: CanvasVideoSource,
+    expected: fanta_doc::VideoNode,
+    start: Entity<ui_input::InputField>,
+    end: Entity<ui_input::InputField>,
+    duration_us: u64,
+    task: std::cell::RefCell<Option<Task<()>>>,
+    cancelled: std::cell::Cell<bool>,
+    error: Option<SharedString>,
 }
 
 struct PrototypeRenderCache {
@@ -538,6 +585,14 @@ impl FigView {
             chrome_cache: std::cell::RefCell::new(None),
             #[cfg(target_os = "macos")]
             gpu_canvas: None,
+            #[cfg(target_os = "macos")]
+            canvas_video: None,
+            #[cfg(target_os = "macos")]
+            canvas_video_generation: 0,
+            #[cfg(target_os = "macos")]
+            canvas_video_removed: std::cell::Cell::new(false),
+            #[cfg(target_os = "macos")]
+            canvas_video_active: std::cell::Cell::new(true),
             tools: ToolShell::new(),
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
@@ -568,8 +623,27 @@ impl FigView {
         }
     }
 
+    fn reconcile_opened_entry_with_project_root(&mut self, cx: &App) {
+        if let Some(root) = self.item.read(cx).project_root() {
+            self.opened_entry_id = self.opened_entry_id.filter(|entry_id| {
+                let project = self.project.read(cx);
+                project
+                    .path_for_entry(*entry_id, cx)
+                    .and_then(|path| project.absolute_path(&path, cx))
+                    .is_some_and(|path| path.starts_with(root))
+            });
+        }
+    }
+
     fn subscribe_to_item(item: &Entity<FigItem>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(item, |this, _, event: &FigItemEvent, cx| {
+            #[cfg(target_os = "macos")]
+            if this.canvas_video.as_ref().is_some_and(|session| {
+                this.selected_canvas_video_source(cx).map(|source| source.0)
+                    != Some(session.source)
+            }) {
+                this.clear_canvas_video(cx);
+            }
             // Echo document state into the DesignPanel inspector. Preview
             // frames are skipped (the panel re-echoes on the committing
             // event); selection and text-selection changes must refresh even
@@ -604,15 +678,17 @@ impl FigView {
                     this.hover_resize_handle = None;
                 }
                 FigItemEvent::TextSelectionChanged => {}
-                // An autosave wrote the document without replacing it, so
+                // A save wrote the document without replacing it, so
                 // nothing view-side is stale: only the tab's dirty mark
                 // changes. Deliberately NOT `StateChanged`, which every
                 // listener reads as a reload and answers by dropping
                 // in-flight sessions.
                 FigItemEvent::Saved => {
+                    this.reconcile_opened_entry_with_project_root(cx);
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::StateChanged => {
+                    this.reconcile_opened_entry_with_project_root(cx);
                     // A reload replaces the document while prototype state
                     // contains node/variable IDs from the previous tree. Drop
                     // the session locally without trying to update the item
@@ -2167,19 +2243,13 @@ impl FigView {
         {
             edit.session.dragging = false;
         }
-        // Primary releases are normally handled by the window-level listener
-        // the canvas installs while a drag is live — but that listener only
-        // exists after the paint FOLLOWING the press. A fast click can
-        // release before that paint, which would strand `primary_pressed`
-        // and turn every later hover move into a drag. Both paths funnel
-        // through `handle_window_mouse_up`, which no-ops once the flag is
-        // cleared, so a release never dispatches twice.
+        // The canvas and window listeners share an idempotent release path:
+        // whichever runs first ends the gesture, so it never dispatches twice.
         self.handle_window_mouse_up(event, cx);
     }
 
-    /// Window-level fallback installed by the canvas while a primary drag is
-    /// in flight: element listeners stop firing once the cursor leaves the
-    /// canvas, which would strand the tool mid-gesture.
+    /// Element listeners stop firing once the cursor leaves the canvas, so
+    /// the window listener must also be able to end an active gesture.
     pub(crate) fn handle_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
         if event.button != MouseButton::Left {
             return;
@@ -2227,10 +2297,8 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Self-heal the gesture flag. The window-level release listener only
-        // exists while a TOOL drag is live, so a release outside the canvas
-        // during a text-selection or comment gesture is never delivered; a
-        // hover move with no button held proves the pointer came up.
+        // A hover with no button held also recovers a release missed while
+        // the window was inactive.
         if event.pressed_button.is_none() {
             self.canvas_pointer_down = false;
         }
@@ -2291,6 +2359,13 @@ impl FigView {
     }
 
     fn update_hover(&mut self, screen: DVec2, cx: &mut Context<Self>) {
+        if self.tools.kind() == ToolKind::Scale {
+            self.update_hover_resize_handle(screen, cx);
+            if self.hovered_node.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         if self.tools.kind() != ToolKind::Select {
             let had_handle = self.hover_resize_handle.take().is_some();
             if self.hovered_node.take().is_some() || had_handle {
@@ -2356,6 +2431,18 @@ impl FigView {
         let bounds = self.container_bounds?;
         let (width, height) = bounds_size(bounds);
         let document = self.item.read(cx).document()?;
+        if self.tools.kind() == ToolKind::Scale {
+            let (local, world) =
+                fanta_tools::ScaleTool::selection_frame(&document.doc, document.doc.active_page())?;
+            return fanta_canvas::handles::hit_test_resize_handle_oriented(
+                local,
+                &world,
+                screen,
+                &viewport,
+                DVec2::new(width, height),
+                fanta_canvas::handles::DEFAULT_HANDLE_THRESHOLD,
+            );
+        }
         let selection = document.doc.selection.as_slice();
         let [id] = selection else {
             return None;
@@ -2518,11 +2605,16 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.undo(cx) {
+        let changed = self.item.update(cx, |item, cx| match item.undo(cx) {
+            Ok(changed) => changed,
+            Err(error) => {
                 log::error!("fig_viewer undo failed: {error:#}");
+                false
             }
         });
+        if changed {
+            self.refresh_tool_overlays(cx);
+        }
     }
 
     fn redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2530,14 +2622,36 @@ impl FigView {
             return;
         }
         self.finish_document_edits(cx);
-        self.item.update(cx, |item, cx| {
-            if let Err(error) = item.redo(cx) {
+        let changed = self.item.update(cx, |item, cx| match item.redo(cx) {
+            Ok(changed) => changed,
+            Err(error) => {
                 log::error!("fig_viewer redo failed: {error:#}");
+                false
             }
         });
+        if changed {
+            self.refresh_tool_overlays(cx);
+        }
+    }
+
+    fn refresh_tool_overlays(&mut self, cx: &mut Context<Self>) {
+        if let Some(doc) = self.item.read(cx).doc()
+            && self.tools.refresh_overlays(doc)
+        {
+            cx.notify();
+        }
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self
+            .canvas_video
+            .as_ref()
+            .is_some_and(|session| session.trim.is_some())
+        {
+            self.cancel_video_trim(cx);
+            return;
+        }
         if self.prototype_player.is_some() {
             self.exit_prototype_session(cx);
             return;
@@ -2605,10 +2719,17 @@ impl FigView {
     fn delete_selection(
         &mut self,
         _: &DeleteSelection,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.delete_selected_nodes(cx);
+        if matches!(self.tools.kind(), ToolKind::NodeEdit | ToolKind::PathSelect) {
+            if self.is_editable(cx) {
+                self.finish_document_edits(cx);
+                self.dispatch_tool_event(key_event(LogicalKey::Delete, window.modifiers()), cx);
+            }
+        } else {
+            self.delete_selected_nodes(cx);
+        }
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3318,7 +3439,9 @@ impl FigView {
                 item.with_document(cx, |document| {
                     document.ensure_page_solved(index);
                     let root = document.pages.get(index).and_then(|page| page.root);
-                    document.doc.set_active_page(root);
+                    if document.doc.set_active_page(root) {
+                        document.doc.selection.clear();
+                    }
                     let prewarm = root.and_then(|root| document.take_page_prewarm(root));
                     ((root, prewarm), DocChange::Selection)
                 })
@@ -3682,12 +3805,9 @@ impl FigView {
         let view = cx.weak_entity();
 
         h_flex()
+            .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
-                TIMELINE_HEIGHT + px(16.)
-            } else {
-                px(16.)
-            })
+            .bottom(px(16.))
             .left_0()
             .right_0()
             .justify_center()
@@ -4281,6 +4401,676 @@ impl FigView {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl FigView {
+    fn selected_canvas_video_source(&self, cx: &App) -> Option<(CanvasVideoSource, bool, f32)> {
+        let document = self.item.read(cx).document()?;
+        let node = single_selection(&document.doc)?;
+        if !crate::clipboard::node_is_on_active_page(&document.doc, node) {
+            return None;
+        }
+        let NodeData::Video(video) = &document.doc.scene.get(node)?.data else {
+            return None;
+        };
+        Some((
+            CanvasVideoSource {
+                scene: document.doc.scene.instance_id(),
+                node,
+                asset: video.asset,
+                assets_identity: std::sync::Arc::as_ptr(&document.raw_assets) as usize,
+                bytes_identity: document
+                    .raw_assets
+                    .get(&video.asset)
+                    .map(|bytes| (bytes.as_ptr() as usize, bytes.len())),
+                time_range_us: video.time_range_us,
+                speed_bits: video.speed.to_bits(),
+            },
+            video.muted,
+            video.volume,
+        ))
+    }
+
+    fn clear_canvas_video(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_video.take() {
+            if let Some(playback) = session.playback {
+                playback.update(cx, |playback, cx| playback.close(cx));
+            }
+            self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+            self.rendered_canvas = None;
+            cx.notify();
+        }
+    }
+
+    fn set_canvas_video_active(&self, active: bool, cx: &mut Context<Self>) {
+        self.canvas_video_active.set(active);
+        if !active {
+            self.cancel_pending_video_trim();
+        }
+        if let Some(playback) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.playback.as_ref())
+        {
+            playback.update(cx, |playback, cx| playback.set_active(active, cx));
+        }
+    }
+
+    fn sync_canvas_video(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        if self.canvas_video_removed.get()
+            || self.prototype_player.is_some()
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+        {
+            self.set_canvas_video_active(false, cx);
+            return;
+        }
+        let source = self.selected_canvas_video_source(cx);
+        if self.canvas_video.as_ref().map(|session| session.source) != source.map(|source| source.0)
+        {
+            self.clear_canvas_video(cx);
+        }
+        let Some((source, muted, volume)) = source else {
+            return;
+        };
+        self.canvas_video_active.set(window_active);
+        if let Some(session) = self.canvas_video.as_mut() {
+            if session.audio != (muted, volume.to_bits()) {
+                session.audio = (muted, volume.to_bits());
+                if let Some(playback) = session.playback.as_ref() {
+                    playback.update(cx, |playback, cx| playback.set_audio(muted, volume, cx));
+                }
+            }
+            self.set_canvas_video_active(window_active, cx);
+            return;
+        }
+        let unsupported = source.time_range_us[0] < 0
+            || source.time_range_us[1] <= source.time_range_us[0]
+            || source.speed_bits != 1_f32.to_bits();
+        self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+        let generation = self.canvas_video_generation;
+        self.canvas_video = Some(CanvasVideoSession {
+            source,
+            loading: None,
+            playback: None,
+            observation: None,
+            error: unsupported.then(|| "Inline playback and trimming support normal-speed video with a valid source range.".into()),
+            audio: (muted, volume.to_bits()),
+            bytes: None,
+            trim: None,
+        });
+        if unsupported {
+            return;
+        }
+        let Some(document) = self.item.read(cx).document() else {
+            return;
+        };
+        let raw_assets = document.raw_assets.clone();
+        let resolver = document.asset_resolver.clone();
+        // Newly placed videos live in raw_assets before the load-time resolver
+        // knows about them. Copy the bounded source on a worker, not each paint.
+        let loading = cx.background_spawn(async move {
+            let resolved;
+            let bytes = if let Some(bytes) = raw_assets.get(&source.asset) {
+                bytes.as_slice()
+            } else {
+                resolved = resolver
+                    .as_ref()
+                    .and_then(|resolver| resolver.resolve_bytes(source.asset))
+                    .context("The video source is missing from this project.")?;
+                resolved.as_slice()
+            };
+            anyhow::ensure!(
+                !bytes.is_empty() && bytes.len() <= 100 * 1024 * 1024,
+                "The video must be nonempty and no larger than 100 MiB."
+            );
+            Ok(std::sync::Arc::<[u8]>::from(bytes))
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = loading.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.finish_canvas_video_load(source, generation, result, cx);
+            }) {
+                log::debug!("Canvas video owner was released: {error}");
+            }
+        });
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.loading = Some(task);
+        }
+    }
+
+    fn finish_canvas_video_load(
+        &mut self,
+        source: CanvasVideoSource,
+        generation: u64,
+        result: Result<std::sync::Arc<[u8]>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.canvas_video_removed.get()
+            || self.canvas_video_generation != generation
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(source)
+            || self.canvas_video.as_ref().map(|session| session.source) != Some(source)
+        {
+            return;
+        }
+        let playback = match result {
+            Ok(bytes) => {
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.bytes = Some(bytes.clone());
+                }
+                Some(cx.new(|cx| {
+                    VideoPlaybackView::new_with_range(
+                        bytes,
+                        2048,
+                        [
+                            source.time_range_us[0] as u64,
+                            source.time_range_us[1] as u64,
+                        ],
+                        cx,
+                    )
+                }))
+            }
+            Err(error) => {
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.loading = None;
+                    session.error = Some(format!("Could not load video: {error:#}").into());
+                }
+                cx.notify();
+                None
+            }
+        };
+        let Some(playback) = playback else {
+            return;
+        };
+        playback.update(cx, |playback, cx| {
+            playback.set_active(
+                self.canvas_video_active.get()
+                    && self.editor_workspace(cx) == EditorWorkspace::Canvas
+                    && self.prototype_player.is_none(),
+                cx,
+            )
+        });
+        let observation = cx.observe(&playback, |_, _, cx| cx.notify());
+        if let Some(session) = self.canvas_video.as_mut() {
+            let (muted, volume) = session.audio;
+            playback.update(cx, |playback, cx| {
+                playback.set_audio(muted, f32::from_bits(volume), cx)
+            });
+            session.loading = None;
+            session.playback = Some(playback);
+            session.observation = Some(observation);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn canvas_video_frame(&self, cx: &App) -> Option<CanvasVideoFrame> {
+        let session = self.canvas_video.as_ref()?;
+        if self.canvas_video_removed.get()
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(session.source)
+        {
+            return None;
+        }
+        let playback = session.playback.as_ref()?.read(cx);
+        let status = playback.status();
+        if !canvas_video_duration_supported(
+            session.source.time_range_us,
+            playback.source_duration_us(),
+        ) {
+            return None;
+        }
+        Some(CanvasVideoFrame {
+            node_id: session.source.node,
+            buffer: playback.frame()?,
+            progress: status.current_time_us as f32 / status.duration_us as f32,
+            revision: playback.frame_revision(),
+            session_revision: self.canvas_video_generation,
+        })
+    }
+
+    fn cancel_pending_video_trim(&self) {
+        if let Some(trim) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.trim.as_ref())
+        {
+            trim.cancelled.set(true);
+            trim.task.borrow_mut().take();
+        }
+    }
+
+    fn begin_video_trim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) || self.canvas_video_removed.get() {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let Some(session) = self.canvas_video.as_ref() else {
+            return;
+        };
+        let Some(playback) = session.playback.clone() else {
+            return;
+        };
+        let duration_us = playback.read(cx).source_duration_us();
+        if duration_us == 0
+            || session.bytes.is_none()
+            || session.source.speed_bits != 1_f32.to_bits()
+        {
+            return;
+        }
+        let source = session.source;
+        let Some(NodeData::Video(expected)) = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(source.node))
+            .map(|node| &node.data)
+        else {
+            return;
+        };
+        let expected = expected.clone();
+        let start = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "0")
+                .label("Start (seconds)")
+                .label_min_width(px(0.))
+        });
+        let end = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "0")
+                .label("End (seconds)")
+                .label_min_width(px(0.))
+        });
+        start.update(cx, |input, cx| {
+            input.set_text(&video_trim_time_text(expected.time_range_us[0]), window, cx)
+        });
+        end.update(cx, |input, cx| {
+            input.set_text(&video_trim_time_text(expected.time_range_us[1]), window, cx)
+        });
+        playback.update(cx, |playback, cx| playback.pause(cx));
+        self.canvas_video_generation = self.canvas_video_generation.wrapping_add(1);
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.trim = Some(CanvasVideoTrim {
+                source,
+                expected,
+                start,
+                end,
+                duration_us,
+                task: Default::default(),
+                cancelled: std::cell::Cell::new(false),
+                error: None,
+            });
+        }
+        cx.notify();
+    }
+
+    fn cancel_video_trim(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_video.as_mut() {
+            session.trim = None;
+        }
+        cx.notify();
+    }
+
+    fn apply_video_trim(&mut self, cx: &mut Context<Self>) {
+        self.apply_video_trim_with(
+            |bytes, range| Box::pin(crate::generation_media::prepare_video_trim(bytes, range)),
+            cx,
+        );
+    }
+
+    fn apply_video_trim_with(
+        &mut self,
+        prepare: impl FnOnce(
+            std::sync::Arc<[u8]>,
+            [i64; 2],
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::generation_media::PreparedVideoTrim>>
+                    + Send,
+            >,
+        >,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx)
+            || self.canvas_video_removed.get()
+            || !self.canvas_video_active.get()
+        {
+            return;
+        }
+        self.finish_document_edits(cx);
+        let Some(session) = self.canvas_video.as_ref() else {
+            return;
+        };
+        let Some(trim) = session.trim.as_ref() else {
+            return;
+        };
+        if trim.task.borrow().is_some() {
+            return;
+        }
+        let parsed = (|| {
+            let range = [
+                parse_video_trim_time(&trim.start.read(cx).text(cx))?,
+                parse_video_trim_time(&trim.end.read(cx).text(cx))?,
+            ];
+            crate::generation_media::validate_video_trim(range, i64::try_from(trim.duration_us)?)?;
+            Ok::<_, anyhow::Error>(range)
+        })();
+        let range = match parsed {
+            Ok(range) => range,
+            Err(error) => {
+                if let Some(trim) = self
+                    .canvas_video
+                    .as_mut()
+                    .and_then(|session| session.trim.as_mut())
+                {
+                    trim.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if range == trim.expected.time_range_us {
+            self.cancel_video_trim(cx);
+            return;
+        }
+        let Some(bytes) = session.bytes.clone() else {
+            return;
+        };
+        let source = trim.source;
+        let generation = self.canvas_video_generation;
+        let expected = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.scene.get(source.node))
+            .and_then(|node| match &node.data {
+                NodeData::Video(video) => Some(video.clone()),
+                _ => None,
+            });
+        let Some(expected) = expected else { return };
+        if let Some(trim) = self
+            .canvas_video
+            .as_mut()
+            .and_then(|session| session.trim.as_mut())
+        {
+            trim.expected = expected;
+            trim.cancelled.set(false);
+        }
+        let work = cx.background_spawn(prepare(bytes, range));
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(20));
+        let task = cx.spawn(async move |this, cx| {
+            let result = match futures::future::select(work, timer).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right(_) => Err(anyhow::anyhow!(
+                    "Preparing the trim preview took too long. The video was not changed."
+                )),
+            };
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.finish_video_trim(source, generation, result, cx)
+            }) {
+                log::debug!("Video trim owner was released: {error}");
+            }
+        });
+        if let Some(trim) = self
+            .canvas_video
+            .as_mut()
+            .and_then(|session| session.trim.as_mut())
+        {
+            trim.error = None;
+            *trim.task.borrow_mut() = Some(task);
+        }
+        cx.notify();
+    }
+
+    fn finish_video_trim(
+        &mut self,
+        source: CanvasVideoSource,
+        generation: u64,
+        result: Result<crate::generation_media::PreparedVideoTrim>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.canvas_video_removed.get()
+            || !self.canvas_video_active.get()
+            || generation != self.canvas_video_generation
+            || self.selected_canvas_video_source(cx).map(|source| source.0) != Some(source)
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+        {
+            return;
+        }
+        let Some(trim) = self
+            .canvas_video
+            .as_ref()
+            .and_then(|session| session.trim.as_ref())
+        else {
+            return;
+        };
+        if trim.cancelled.get() || trim.source != source {
+            return;
+        }
+        trim.task.borrow_mut().take();
+        let expected = trim.expected.clone();
+        let requested_range = (|| {
+            Ok::<_, anyhow::Error>([
+                parse_video_trim_time(&trim.start.read(cx).text(cx))?,
+                parse_video_trim_time(&trim.end.read(cx).text(cx))?,
+            ])
+        })();
+        let result = result.and_then(|prepared| {
+            anyhow::ensure!(
+                requested_range? == prepared.range_us,
+                "The trim times changed while the preview was loading. Apply the trim again."
+            );
+            anyhow::ensure!(
+                self.is_editable(cx),
+                "This document is currently read-only."
+            );
+            self.item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    crate::generation_media::trim_video(document, source.node, &expected, prepared)
+                })
+                .context("The video document was closed.")?
+            })
+        });
+        match result {
+            Ok(()) => {
+                self.clear_canvas_video(cx);
+                self.invalidate_canvas_cache();
+            }
+            Err(error) => {
+                if let Some(trim) = self
+                    .canvas_video
+                    .as_mut()
+                    .and_then(|session| session.trim.as_mut())
+                {
+                    trim.error = Some(format!("Could not trim video: {error:#}").into());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_video_trim_controls(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = self.canvas_video.as_ref()?;
+        if let Some(trim) = session.trim.as_ref() {
+            let busy = trim.task.borrow().is_some();
+            let error = trim.error.clone();
+            return Some(
+                v_flex()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        Label::new(format!(
+                            "Trim original video · {} seconds",
+                            video_trim_time_text(trim.duration_us as i64)
+                        ))
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .w_full()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .debug_selector(|| "video-trim-start".to_owned())
+                                    .child(trim.start.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(120.))
+                                    .debug_selector(|| "video-trim-end".to_owned())
+                                    .child(trim.end.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new(
+                                    "video-trim-apply",
+                                    if busy {
+                                        "Preparing preview…"
+                                    } else {
+                                        "Apply trim"
+                                    },
+                                )
+                                .disabled(busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_video_trim(cx))),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "video-trim-cancel-target".to_owned())
+                                    .child(Button::new("video-trim-cancel", "Cancel").on_click(
+                                        cx.listener(|this, _, _, cx| this.cancel_video_trim(cx)),
+                                    )),
+                            ),
+                    )
+                    .when_some(error, |element, error| {
+                        element.child(Label::new(error).color(Color::Error))
+                    })
+                    .into_any_element(),
+            );
+        }
+        let enabled = self.is_editable(cx)
+            && session.bytes.is_some()
+            && session.source.speed_bits == 1_f32.to_bits()
+            && session.playback.as_ref().is_some_and(|playback| {
+                playback.read(cx).source_duration_us() > 0 && playback.read(cx).error().is_none()
+            });
+        Some(
+            div()
+                .debug_selector(|| "video-trim-open-target".to_owned())
+                .child(
+                    Button::new("video-trim", "Trim video")
+                        .disabled(!enabled)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.begin_video_trim(window, cx)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_canvas_video_controls(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let session = self.canvas_video.as_ref()?;
+        let playback = session.playback.clone();
+        let mut error = session.error.clone();
+        let range = session.source.time_range_us;
+        let mut controls = None;
+        if let Some(playback) = playback {
+            let rendered = playback.update(cx, |playback, cx| playback.render_controls(window, cx));
+            let duration = playback.read(cx).source_duration_us();
+            if duration > 0 && !canvas_video_duration_supported(range, duration) {
+                playback.update(cx, |playback, cx| playback.close(cx));
+                error =
+                    Some("This video range extends beyond the original source duration.".into());
+                if let Some(session) = self.canvas_video.as_mut() {
+                    session.error = error.clone();
+                    session.playback = None;
+                    session.observation = None;
+                }
+            } else {
+                controls = Some(rendered);
+            }
+        }
+        let trim_controls = self.render_video_trim_controls(window, cx);
+        Some(
+            v_flex()
+                .id("canvas-video-controls")
+                .debug_selector(|| "canvas-video-controls".to_owned())
+                .w_full()
+                .flex_none()
+                .min_w_0()
+                .p_2()
+                .gap_1()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().panel_background)
+                .children(controls)
+                .children(trim_controls)
+                .when_some(error, |element, error| {
+                    element.child(Label::new(error).color(Color::Error))
+                })
+                .when(
+                    self.canvas_video
+                        .as_ref()
+                        .is_some_and(|session| session.loading.is_some()),
+                    |element| element.child(Label::new("Loading video…").color(Color::Muted)),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_video_trim_time(text: &str) -> Result<i64> {
+    let (seconds, fraction) = text.trim().split_once('.').unwrap_or((text.trim(), ""));
+    anyhow::ensure!(
+        !seconds.is_empty()
+            && seconds.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.len() <= 6
+            && fraction.bytes().all(|byte| byte.is_ascii_digit()),
+        "Enter seconds with up to six decimal places, such as 1.25."
+    );
+    let seconds: i64 = seconds.parse().context("The time is too large.")?;
+    let fraction: i64 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i64>()? * 10_i64.pow(6 - fraction.len() as u32)
+    };
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|time| time.checked_add(fraction))
+        .context("The time is too large.")
+}
+
+#[cfg(target_os = "macos")]
+fn video_trim_time_text(time: i64) -> String {
+    if time % 1_000_000 == 0 {
+        return (time / 1_000_000).to_string();
+    }
+    format!("{}.{:06}", time / 1_000_000, time % 1_000_000)
+        .trim_end_matches('0')
+        .to_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn canvas_video_duration_supported(range: [i64; 2], duration: u64) -> bool {
+    range[0] >= 0
+        && range[0] < range[1]
+        && duration > 0
+        && u64::try_from(range[1]).is_ok_and(|end| end <= duration)
+}
+
 impl Render for FigView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Deferred open from the text tool's commit, which arrives through a
@@ -4301,6 +5091,8 @@ impl Render for FigView {
         let is_loading = snapshot.loading_message.is_some();
         let editor_mode = self.editor_mode(cx);
         let editor_workspace = self.editor_workspace(cx);
+        #[cfg(target_os = "macos")]
+        self.sync_canvas_video(window.is_window_active(), cx);
         #[cfg(feature = "fanta-gpui-ui")]
         {
             let tool = self.tools.kind();
@@ -4665,8 +5457,21 @@ impl Render for FigView {
                                                                 c.push(render_empty_page_hint(cx));
                                                             }
                                                             c
-                                                        }),
-                                                ),
+                                                        })
+                                                        .child(self.render_toolbar_slot(cx)),
+                                                )
+                                                .children({
+                                                    #[cfg(target_os = "macos")]
+                                                    {
+                                                        self.render_canvas_video_controls(
+                                                            window, cx,
+                                                        )
+                                                    }
+                                                    #[cfg(not(target_os = "macos"))]
+                                                    {
+                                                        None::<AnyElement>
+                                                    }
+                                                }),
                                         )
                                         .children(
                                             self.inspector_sidebar_visible
@@ -4678,7 +5483,6 @@ impl Render for FigView {
                                         .then(|| self.timeline_shell.clone()),
                                 ),
                         )
-                        .child(self.render_toolbar_slot(cx))
                         .children(
                             self.item
                                 .read(cx)
@@ -4701,7 +5505,7 @@ fn single_selection(doc: &fanta_doc::Doc) -> Option<NodeId> {
 
 /// The layers a structural command (group, frame, ungroup) acts on: the
 /// selection, unless the command came from a layer row that is not part of
-/// it, in which case only that row's node. Switching pages keeps the
+/// it, in which case only that row's node. Scoped navigation can retain the
 /// selection, so layers left behind on another page are dropped here — a
 /// group built from them would land out of view, or pull them onto this page.
 fn structure_targets(doc: &Doc, clicked: Option<NodeId>) -> Vec<NodeId> {
@@ -4983,6 +5787,43 @@ fn motion_timeline_model(
 impl Item for FigView {
     type Event = FigViewEvent;
 
+    fn added_to_workspace(
+        &mut self,
+        _: &mut workspace::Workspace,
+        _: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        #[cfg(target_os = "macos")]
+        if self.canvas_video_removed.replace(false) {
+            self.clear_canvas_video(_cx);
+        }
+    }
+
+    fn deactivated(&mut self, _: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        self.set_canvas_video_active(false, _cx);
+    }
+
+    fn workspace_deactivated(&mut self, _: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        self.set_canvas_video_active(false, _cx);
+    }
+
+    fn on_removed(&self, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.canvas_video_removed.set(true);
+            self.cancel_pending_video_trim();
+            if let Some(playback) = self
+                .canvas_video
+                .as_ref()
+                .and_then(|session| session.playback.as_ref())
+            {
+                playback.update(_cx, |playback, cx| playback.close(cx));
+            }
+        }
+    }
+
     fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         match event {
             FigViewEvent::Edited => {
@@ -5010,9 +5851,16 @@ impl Item for FigView {
         // the entry this view was actually opened from instead.
         match self.opened_entry_id {
             Some(entry_id) => [entry_id].into_iter().collect(),
-            None => project::ProjectItem::entry_id(self.item.read(cx), cx)
-                .into_iter()
-                .collect(),
+            None => {
+                let project = self.project.read(cx);
+                project
+                    .find_project_path(self.item.read(cx).abs_path(), cx)
+                    .and_then(|path| project.entry_for_path(&path, cx))
+                    .map(|entry| entry.id)
+                    .or_else(|| project::ProjectItem::entry_id(self.item.read(cx), cx))
+                    .into_iter()
+                    .collect()
+            }
         }
     }
 
@@ -5064,6 +5912,50 @@ impl Item for FigView {
 
     fn can_save(&self, cx: &App) -> bool {
         self.item.read(cx).has_ready_document()
+    }
+
+    fn can_save_as(&self, cx: &App) -> bool {
+        self.item.read(cx).has_ready_document() && self.project.read(cx).is_local()
+    }
+
+    fn suggested_filename(&self, cx: &App) -> SharedString {
+        format!("{} Copy", self.item.read(cx).title()).into()
+    }
+
+    fn suggested_save_as_directory(&self, cx: &App) -> Option<std::path::PathBuf> {
+        let item = self.item.read(cx);
+        item.project_root()
+            .unwrap_or_else(|| item.abs_path())
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    }
+
+    fn validate_save_as(&self, path: std::path::PathBuf, cx: &App) -> Task<Result<()>> {
+        let source = self
+            .item
+            .read(cx)
+            .project_root()
+            .map(std::path::Path::to_path_buf);
+        cx.background_spawn(async move {
+            crate::document::validate_project_copy_destination(&path, source.as_deref())?;
+            Ok(())
+        })
+    }
+
+    fn save_as(
+        &mut self,
+        project: Entity<Project>,
+        path: project::ProjectPath,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.prototype_player.is_some() {
+            self.exit_prototype_session(cx);
+        }
+        self.finish_document_edits(cx);
+        self.autosave_task = None;
+        self.item
+            .update(cx, |item, cx| item.save_as(project, path, cx))
     }
 
     fn save(
@@ -5273,6 +6165,14 @@ impl Item for FigView {
                 chrome_cache: std::cell::RefCell::new(None),
                 #[cfg(target_os = "macos")]
                 gpu_canvas: None,
+                #[cfg(target_os = "macos")]
+                canvas_video: None,
+                #[cfg(target_os = "macos")]
+                canvas_video_generation: 0,
+                #[cfg(target_os = "macos")]
+                canvas_video_removed: std::cell::Cell::new(false),
+                #[cfg(target_os = "macos")]
+                canvas_video_active: std::cell::Cell::new(true),
                 tools: ToolShell::new(),
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
@@ -5395,6 +6295,670 @@ mod tests {
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
+
+    #[cfg(target_os = "macos")]
+    async fn canvas_video_fixture(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<FigItem>, Entity<FigView>) {
+        let (directory, _, item, view) = autosave_fixture(cx).await;
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut video = CanvasNode::new(NodeData::Video(fanta_doc::VideoNode {
+                    asset: AssetId::new(),
+                    natural_size: [16, 16],
+                    local_size: [80., 80.],
+                    time_range_us: [0, 3_000_000],
+                    speed: 1.,
+                    muted: true,
+                    volume: 1.,
+                    poster_frame_us: None,
+                    poster: None,
+                    fit: fanta_doc::ImageFitMode::Fit,
+                }));
+                video.parent = document.doc.active_page();
+                let node = video.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(video))
+                    .expect("create video");
+                document.doc.selection.replace_with([node]);
+                ((), DocChange::Selection)
+            });
+        });
+        (directory, item, view)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn video_trim_view_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        Entity<FigItem>,
+        gpui::WindowHandle<FigView>,
+    ) {
+        let (directory, item, previous_view) = canvas_video_fixture(cx).await;
+        let project = previous_view.read_with(cx, |view, _| view.project.clone());
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        let window = cx.add_window(|window, cx| FigView::new(item.clone(), project, window, cx));
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .expect("activate trim window");
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, cx| {
+                playback.update(cx, |playback, cx| playback.tick(window, cx));
+                let (source, muted, volume) = view.selected_canvas_video_source(cx).expect("video");
+                view.canvas_video = Some(CanvasVideoSession {
+                    source,
+                    loading: None,
+                    playback: Some(playback),
+                    observation: None,
+                    error: None,
+                    audio: (muted, volume.to_bits()),
+                    bytes: Some(std::sync::Arc::from(&b"original MP4 bytes"[..])),
+                    trim: None,
+                });
+                view.begin_video_trim(window, cx);
+                let trim = view
+                    .canvas_video
+                    .as_ref()
+                    .and_then(|session| session.trim.as_ref())
+                    .expect("trim controls");
+                trim.start
+                    .update(cx, |input, cx| input.set_text("0.5", window, cx));
+                trim.end
+                    .update(cx, |input, cx| input.set_text("2", window, cx));
+            })
+            .expect("trim controls");
+        (directory, item, window)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepared_trim_for_view(range_us: [i64; 2]) -> crate::generation_media::PreparedVideoTrim {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([225, 0, 225, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("poster");
+        crate::generation_media::PreparedVideoTrim {
+            range_us,
+            source_duration_us: 3_000_000,
+            poster: crate::generation_media::VideoPoster {
+                png: png.into_inner().into(),
+                time_us: range_us[0],
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_apply_waits_for_poster_and_commits_one_history_step(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            let id = single_selection(doc).expect("video");
+            (
+                id,
+                doc.scene.get(id).expect("video").clone(),
+                doc.history.undo_depth(),
+            )
+        });
+        let (send, receive) = futures::channel::oneshot::channel();
+        window
+            .update(cx, |view, _, cx| {
+                view.apply_video_trim_with(
+                    |bytes, range| {
+                        assert_eq!(bytes.as_ref(), b"original MP4 bytes");
+                        assert_eq!(range, [500_000, 2_000_000]);
+                        Box::pin(async move { receive.await.context("poster response")? })
+                    },
+                    cx,
+                )
+            })
+            .expect("apply");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            assert_eq!(
+                doc.scene.get(before.0),
+                Some(&before.1),
+                "no partial range mutation before the poster"
+            );
+            assert_eq!(doc.history.undo_depth(), before.2);
+        });
+        send.send(Ok(prepared_trim_for_view([500_000, 2_000_000])))
+            .unwrap_or_else(|_| panic!("pending poster"));
+        cx.run_until_parked();
+        item.update(cx, |item, cx| {
+            let doc = &item.document().expect("document").doc;
+            let NodeData::Video(video) = &doc.scene.get(before.0).expect("video").data else {
+                panic!("video")
+            };
+            assert_eq!(video.time_range_us, [500_000, 2_000_000]);
+            assert_eq!(video.poster_frame_us, Some(500_000));
+            assert!(video.poster.is_some());
+            assert_eq!(doc.history.undo_depth(), before.2 + 1);
+            assert!(item.undo(cx).expect("undo trim"));
+            assert_eq!(
+                item.document().expect("document").doc.scene.get(before.0),
+                Some(&before.1)
+            );
+            assert!(item.redo(cx).expect("redo trim"));
+            assert!(item.is_dirty());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_cancel_error_timeout_and_stale_target_preserve_document(
+        cx: &mut TestAppContext,
+    ) {
+        for case in [
+            "cancel",
+            "error",
+            "timeout",
+            "deactivate",
+            "remove",
+            "source-change",
+            "input-change",
+        ] {
+            let (_directory, item, window) = video_trim_view_fixture(cx).await;
+            let before = item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                let id = single_selection(&document.doc).expect("video");
+                (
+                    id,
+                    document.doc.scene.get(id).expect("video").clone(),
+                    document.raw_assets.clone(),
+                    document.doc.history.undo_depth(),
+                )
+            });
+            let (send, receive) = futures::channel::oneshot::channel::<
+                Result<crate::generation_media::PreparedVideoTrim>,
+            >();
+            let (source, generation) = window
+                .update(cx, |view, _, cx| {
+                    view.apply_video_trim_with(
+                        |_, _| Box::pin(async move { receive.await.context("poster response")? }),
+                        cx,
+                    );
+                    (
+                        view.canvas_video.as_ref().expect("session").source,
+                        view.canvas_video_generation,
+                    )
+                })
+                .expect("apply");
+            cx.run_until_parked();
+            match case {
+                "cancel" => window
+                    .update(cx, |view, _, cx| view.cancel_video_trim(cx))
+                    .expect("cancel"),
+                "deactivate" => window
+                    .update(cx, |view, _, cx| view.set_canvas_video_active(false, cx))
+                    .expect("deactivate"),
+                "remove" => window
+                    .update(cx, |view, _, cx| Item::on_removed(view, cx))
+                    .expect("remove"),
+                "timeout" => {
+                    cx.executor()
+                        .advance_clock(std::time::Duration::from_secs(21));
+                    cx.run_until_parked();
+                }
+                "input-change" => window
+                    .update(cx, |view, window, cx| {
+                        let trim = view
+                            .canvas_video
+                            .as_ref()
+                            .and_then(|session| session.trim.as_ref())
+                            .expect("trim");
+                        trim.start
+                            .update(cx, |input, cx| input.set_text("1", window, cx));
+                    })
+                    .expect("new trim time"),
+                "source-change" => item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.clear();
+                        ((), DocChange::Selection)
+                    });
+                }),
+                "error" => {
+                    send.send(Err(anyhow::anyhow!("injected poster decode failure")))
+                        .unwrap_or_else(|_| panic!("pending poster"));
+                    cx.run_until_parked();
+                }
+                _ => unreachable!(),
+            }
+            if case != "error" && case != "timeout" {
+                // Even an already queued completion must not mutate a cancelled or rebound view.
+                window
+                    .update(cx, |view, _, cx| {
+                        view.finish_video_trim(
+                            source,
+                            generation,
+                            Ok(prepared_trim_for_view([500_000, 2_000_000])),
+                            cx,
+                        )
+                    })
+                    .expect("late completion");
+            }
+            if matches!(case, "error" | "timeout" | "input-change") {
+                window
+                    .update(cx, |view, _, _| {
+                        let trim = view
+                            .canvas_video
+                            .as_ref()
+                            .and_then(|session| session.trim.as_ref())
+                            .expect("retryable trim inputs");
+                        assert!(trim.error.is_some(), "{case}");
+                        assert!(trim.task.borrow().is_none(), "{case}");
+                    })
+                    .expect("visible failure");
+            }
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(document.doc.scene.get(before.0), Some(&before.1), "{case}");
+                assert_eq!(document.raw_assets, before.2, "{case}");
+                assert_eq!(document.doc.history.undo_depth(), before.3, "{case}");
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_controls_open_cancel_and_fit_the_canvas_footer(cx: &mut TestAppContext) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let view = window.entity(cx).expect("view");
+        let depth = item.read_with(cx, |item, _| {
+            item.document().expect("document").doc.history.undo_depth()
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [1_000., 1_200.] {
+            visual.simulate_resize(size(px(width), px(900.)));
+            visual.update(|window, cx| window.draw(cx).clear());
+            let footer = visual
+                .debug_bounds("canvas-video-controls")
+                .expect("video controls");
+            for selector in [
+                "video-trim-start",
+                "video-trim-end",
+                "video-trim-cancel-target",
+            ] {
+                let bounds = visual.debug_bounds(selector).expect("visible trim control");
+                assert!(
+                    bounds.left() >= footer.left() && bounds.right() <= footer.right(),
+                    "{selector}: {bounds:?} outside {footer:?}"
+                );
+                assert!(
+                    bounds.top() >= footer.top() && bounds.bottom() <= footer.bottom(),
+                    "{selector}"
+                );
+            }
+        }
+        let cancel = visual
+            .debug_bounds("video-trim-cancel-target")
+            .expect("cancel");
+        visual.simulate_click(cancel.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(&visual, |view, _| {
+            assert!(view.canvas_video.as_ref().expect("session").trim.is_none())
+        });
+        let open = visual
+            .debug_bounds("video-trim-open-target")
+            .expect("trim button");
+        visual.simulate_click(open.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("video-trim-start").is_some());
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.document().expect("document").doc.history.undo_depth(),
+                depth
+            )
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_invalid_input_never_starts_preparation(cx: &mut TestAppContext) {
+        let (_directory, item, window) = video_trim_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            item.document().expect("document").doc.history.undo_depth()
+        });
+        for (start, end) in [
+            ("NaN", "2"),
+            ("-1", "2"),
+            ("2", "2"),
+            ("2", "1"),
+            ("0", "11"),
+        ] {
+            window
+                .update(cx, |view, window, cx| {
+                    let trim = view
+                        .canvas_video
+                        .as_ref()
+                        .and_then(|session| session.trim.as_ref())
+                        .expect("trim");
+                    trim.start
+                        .update(cx, |input, cx| input.set_text(start, window, cx));
+                    trim.end
+                        .update(cx, |input, cx| input.set_text(end, window, cx));
+                    view.apply_video_trim_with(|_, _| panic!("invalid input reached decoder"), cx);
+                    let trim = view
+                        .canvas_video
+                        .as_ref()
+                        .and_then(|session| session.trim.as_ref())
+                        .expect("trim");
+                    assert!(trim.error.is_some());
+                    assert!(trim.task.borrow().is_none());
+                })
+                .expect("validate input");
+        }
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .document()
+                .expect("document")
+                .doc
+                .history
+                .undo_depth()),
+            before
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_trim_decimal_times_preserve_microseconds_without_float_rounding() {
+        for (text, expected) in [
+            ("0", 0),
+            ("1.25", 1_250_000),
+            ("0.000001", 1),
+            ("9223372036854.775807", i64::MAX),
+        ] {
+            assert_eq!(parse_video_trim_time(text).expect("valid time"), expected);
+            assert_eq!(
+                parse_video_trim_time(&video_trim_time_text(expected)).expect("round trip"),
+                expected
+            );
+        }
+        for text in ["NaN", "-0.1", "1e3", "1.0000001", "9223372036854.775808"] {
+            assert!(parse_video_trim_time(text).is_err(), "{text}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_trim_authored_range_starts_canvas_loading(cx: &mut TestAppContext) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let id = single_selection(&document.doc).expect("selected video");
+                let old = document.doc.scene.get(id).expect("video").data.clone();
+                let mut new = old.clone();
+                let NodeData::Video(video) = &mut new else {
+                    panic!("video")
+                };
+                video.time_range_us = [500_000, 2_000_000];
+                document
+                    .doc
+                    .apply(Operation::ReplaceData {
+                        id,
+                        old: Box::new(old),
+                        new: Box::new(new),
+                    })
+                    .expect("author source range");
+                ((), DocChange::Content)
+            });
+        });
+        view.update(cx, |view, cx| {
+            view.sync_canvas_video(true, cx);
+            let session = view.canvas_video.as_ref().expect("video session");
+            assert!(
+                session.error.is_none(),
+                "valid authored trim must be playable"
+            );
+            assert!(
+                session.loading.is_some(),
+                "load the original source without rewriting it"
+            );
+            view.clear_canvas_video(cx);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_controls_remain_below_the_design_toolbar(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        #[cfg(feature = "fanta-gpui-ui")]
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        let mut video = CanvasNode::new(NodeData::Video(fanta_doc::VideoNode {
+            asset: AssetId::new(),
+            natural_size: [16, 16],
+            local_size: [80., 80.],
+            time_range_us: [0, 10_000_000],
+            speed: 1.,
+            muted: true,
+            volume: 1.,
+            poster_frame_us: None,
+            poster: None,
+            fit: fanta_doc::ImageFitMode::Fit,
+        }));
+        video.parent = document.active_page();
+        let node = video.id;
+        document
+            .apply(Operation::create_node(video))
+            .expect("video");
+        document.selection.replace_with([node]);
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Video-layout.fig"),
+            document,
+            cx,
+        );
+        let window = cx.add_window(move |window, cx| FigView::new(item, project, window, cx));
+        let view = window.entity(cx).expect("fig view");
+        #[cfg(feature = "fanta-gpui-ui")]
+        assert!(view.read_with(cx, |view, _| view.gpui_toolbar.is_some()));
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let (source, muted, volume) = view.selected_canvas_video_source(cx).expect("video");
+            view.canvas_video = Some(CanvasVideoSession {
+                source,
+                loading: None,
+                playback: Some(playback),
+                observation: None,
+                error: None,
+                audio: (muted, volume.to_bits()),
+                bytes: None,
+                trim: None,
+            });
+        });
+        let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
+        for width in [1_000., 1_400.] {
+            visual_context.simulate_resize(size(px(width), px(800.)));
+            visual_context.update(|window, cx| window.draw(cx).clear());
+            let canvas = visual_context
+                .debug_bounds("fig-container")
+                .expect("canvas");
+            let controls = visual_context
+                .debug_bounds("canvas-video-controls")
+                .expect("controls");
+            let toolbar = visual_context
+                .debug_bounds("fanta-canvas-toolbar")
+                .expect("toolbar");
+            assert!(
+                toolbar.bottom() <= canvas.bottom(),
+                "toolbar must stay in the canvas: {toolbar:?} vs {canvas:?}"
+            );
+            assert!(
+                toolbar.bottom() < controls.top(),
+                "toolbar covers video controls: {toolbar:?} vs {controls:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_rejects_late_loading_and_reports_missing_sources(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        let (source, generation) = view.update(cx, |view, cx| {
+            view.sync_canvas_video(true, cx);
+            (
+                view.canvas_video.as_ref().expect("loading video").source,
+                view.canvas_video_generation,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let session = view.canvas_video.as_ref().expect("failed video");
+            assert!(session.playback.is_none());
+            assert!(session.loading.is_none());
+            assert!(
+                session
+                    .error
+                    .as_ref()
+                    .expect("visible error")
+                    .contains("missing")
+            );
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([]);
+                ((), DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.canvas_video.is_none());
+            view.finish_canvas_video_load(
+                source,
+                generation,
+                Ok(std::sync::Arc::from([1_u8].as_slice())),
+                cx,
+            );
+            assert!(
+                view.canvas_video.is_none(),
+                "old source cannot install after deselection"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_video_removal_closes_retained_player_without_editing_document(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, item, view) = canvas_video_fixture(cx).await;
+        let before = item.read_with(cx, |item, _cx| {
+            (
+                serde_json::to_value(&item.document().expect("document").doc).expect("serialize"),
+                item.is_dirty(),
+            )
+        });
+        let playback = cx.update(crate::video_playback::fake_playback);
+        cx.run_until_parked();
+        let original_revision = playback.read_with(cx, |playback, _| playback.frame_revision());
+        view.update(cx, |view, cx| {
+            let (source, muted, volume) = view
+                .selected_canvas_video_source(cx)
+                .expect("selected video");
+            view.canvas_video = Some(CanvasVideoSession {
+                source,
+                loading: None,
+                playback: Some(playback.clone()),
+                observation: None,
+                error: None,
+                audio: (muted, volume.to_bits()),
+                bytes: None,
+                trim: None,
+            });
+            Item::on_removed(view, cx);
+            assert!(view.canvas_video_frame(cx).is_none());
+            view.finish_canvas_video_load(
+                source,
+                view.canvas_video_generation,
+                Ok(std::sync::Arc::from([1_u8].as_slice())),
+                cx,
+            );
+            assert_eq!(
+                view.canvas_video
+                    .as_ref()
+                    .and_then(|session| session.playback.as_ref())
+                    .map(Entity::entity_id),
+                Some(playback.entity_id())
+            );
+        });
+        playback.read_with(cx, |playback, _| {
+            assert!(playback.frame().is_none());
+            assert!(
+                playback.frame_revision() > original_revision,
+                "retained player was closed"
+            );
+        });
+        let project = view.read_with(cx, |view, _| view.project.clone());
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        scratch
+            .update(cx, |_, window, cx| {
+                let workspace = cx.new(|cx| workspace::Workspace::test_new(project, window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    view.update(cx, |view, cx| {
+                        Item::added_to_workspace(view, workspace, window, cx);
+                        assert!(
+                            view.canvas_video.is_none(),
+                            "moving a tab must discard its closed player"
+                        );
+                        assert!(!view.canvas_video_removed.get());
+                        view.sync_canvas_video(true, cx);
+                        assert!(
+                            view.canvas_video
+                                .as_ref()
+                                .is_some_and(|session| session.loading.is_some()),
+                            "re-added tab can prepare the selected source again"
+                        );
+                    });
+                });
+            })
+            .expect("re-add the same canvas tab");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                serde_json::to_value(&item.document().expect("document").doc).expect("serialize"),
+                before.0
+            );
+            assert_eq!(item.is_dirty(), before.1);
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_trim_source_validation_accepts_bounded_ranges_and_rejects_unknown_duration() {
+        assert!(canvas_video_duration_supported([0, 3_000_000], 3_000_000));
+        assert!(canvas_video_duration_supported(
+            [1_000_000, 3_000_000],
+            3_000_000
+        ));
+        assert!(canvas_video_duration_supported([0, 2_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported([0, 4_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported([-1, 2_000_000], 3_000_000));
+        assert!(!canvas_video_duration_supported(
+            [2_000_000, 2_000_000],
+            3_000_000
+        ));
+        assert!(!canvas_video_duration_supported([0, -1], 3_000_000));
+        assert!(!canvas_video_duration_supported([0, 3_000_000], 0));
+    }
 
     #[test]
     fn prototype_links_allow_web_urls_and_block_local_or_executable_schemes() {
@@ -5525,7 +7089,7 @@ mod tests {
         Entity<FigItem>,
         Entity<FigView>,
     ) {
-        init_test(cx);
+        init_visual_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("Design");
@@ -5564,6 +7128,367 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    #[gpui::test]
+    async fn save_as_updates_shared_views_and_their_project_entries(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Copy");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}}),
+                )
+                .await;
+            let project = Project::test(file_system.clone(), [directory.path()], cx).await;
+            let original_entry = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path(original.join("fanta.json"), cx)
+                    .expect("original path");
+                project
+                    .entry_for_path(&path, cx)
+                    .expect("original entry")
+                    .id
+            });
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&copy, cx))
+                .context("copy path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let views = scratch.update(cx, |_, window, cx| {
+                (0..2)
+                    .map(|_| {
+                        cx.new(|cx| {
+                            let mut view = FigView::new(item.clone(), project.clone(), window, cx);
+                            view.opened_entry_id = Some(original_entry);
+                            view
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            let view = views.first().context("first view")?;
+            view.read_with(cx, |view, cx| {
+                assert!(view.can_save_as(cx));
+                assert_eq!(view.suggested_filename(cx).as_ref(), "Original Copy");
+            });
+            add_rect(&item, cx);
+            scratch
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        Item::save_as(view, project.clone(), destination, window, cx)
+                    })
+                })?
+                .await?;
+            file_system
+                .insert_tree(&copy, serde_json::json!({"fanta.json": "{}"}))
+                .await;
+            cx.run_until_parked();
+            let copied_entry = project.read_with(cx, |project, cx| {
+                let path = project
+                    .find_project_path(copy.join("fanta.json"), cx)
+                    .expect("copied path");
+                project.entry_for_path(&path, cx).expect("copied entry").id
+            });
+            for view in &views {
+                view.read_with(cx, |view, cx| {
+                    assert_eq!(view.tab_content_text(0, cx).as_ref(), "Copy");
+                    assert_eq!(view.item.entity_id(), item.entity_id());
+                    assert_eq!(view.project_entry_ids(cx).as_slice(), &[copied_entry]);
+                    assert_ne!(copied_entry, original_entry);
+                    assert!(!view.is_dirty(cx));
+                });
+            }
+            let (original_document, _) = fanta_format::read_project_tree(&original)?;
+            let (copied_document, _) = fanta_format::read_project_tree(&copy)?;
+            assert_eq!(original_document.scene.len(), 1);
+            assert_eq!(copied_document.scene.len(), 2);
+            Ok(())
+        }
+        .await;
+        result.expect("Save As updates shared views and their project entries");
+    }
+
+    #[gpui::test]
+    async fn save_as_native_picker_starts_beside_the_original_project(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(&original, serde_json::json!({"fanta.json": "{}"}))
+                .await;
+            let project = Project::test(file_system, [original.as_path()], cx).await;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, cx| {
+                item.path = project
+                    .read(cx)
+                    .find_project_path(item.abs_path(), cx)
+                    .expect("original path");
+            });
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let (workspace, view) = scratch.update(cx, |_, window, cx| {
+                let workspace =
+                    cx.new(|cx| workspace::Workspace::test_new(project.clone(), window, cx));
+                let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    )
+                });
+                (workspace, view)
+            })?;
+            assert_eq!(
+                view.read_with(cx, |view, cx| view.suggested_filename(cx)),
+                "Original Copy"
+            );
+            let save = scratch.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::SaveAs, window, cx)
+                })
+            })?;
+            cx.run_until_parked();
+            assert!(
+                cx.did_prompt_for_new_path(),
+                "Save As reaches the native path prompt"
+            );
+            cx.simulate_new_path_selection(|initial_directory| {
+                assert_eq!(
+                    initial_directory,
+                    directory.path(),
+                    "a copied design belongs beside its original, not inside it"
+                );
+                None
+            });
+            save.await?;
+            assert_eq!(
+                item.read_with(cx, |item, _| item
+                    .project_root()
+                    .map(std::path::Path::to_path_buf)),
+                Some(original)
+            );
+            assert!(
+                !directory.path().join("Original Copy").exists(),
+                "cancel does not create a copy"
+            );
+            Ok(())
+        }
+        .await;
+        result.expect("Save As uses the project parent as its native initial directory");
+    }
+
+    #[gpui::test]
+    async fn save_as_rejects_existing_design_before_opening_its_worktree(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| {
+                workspace::register_project_item::<FigView>(cx);
+                crate::workspace_hooks::init(cx);
+            });
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let copy = directory.path().join("Original Copy");
+            let document = doc_with_one_page();
+            let page = document.active_page().context("active page")?;
+            for root in [&original, &copy] {
+                crate::document::write_project(root, &document, &BTreeMap::new())?;
+            }
+            let original_manifest = std::fs::read(original.join("fanta.json"))?;
+            let original_source =
+                fanta_format::locate_page_source(&original, page).context("original page")?;
+            let original_bytes = std::fs::read(&original_source)?;
+            let copy_source =
+                fanta_format::locate_page_source(&copy, page).context("copied page")?;
+            let copy_bytes = std::fs::read(&copy_source)?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({
+                        "Original": {"fanta.json": std::fs::read_to_string(original.join("fanta.json"))?},
+                        "Original Copy": {"fanta.json": std::fs::read_to_string(copy.join("fanta.json"))?},
+                    }),
+                )
+                .await;
+            let project = Project::test(file_system, [copy.as_path()], cx).await;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                copy.join("fanta.json"),
+                Some(copy.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, cx| {
+                item.path = project
+                    .read(cx)
+                    .find_project_path(item.abs_path(), cx)
+                    .expect("copied design path");
+            });
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let (workspace, view) = scratch.update(cx, |_, window, cx| {
+                let workspace =
+                    cx.new(|cx| workspace::Workspace::test_new(project.clone(), window, cx));
+                let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                (workspace, view)
+            })?;
+            cx.run_until_parked();
+            assert_eq!(
+                project.read_with(cx, |project, cx| project.worktrees(cx).count()),
+                1
+            );
+            assert_eq!(
+                workspace.read_with(cx, |workspace, cx| workspace.items_of_type::<FigView>(cx).count()),
+                1
+            );
+            add_rect(&item, cx);
+            let save = scratch.update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::SaveAs, window, cx)
+                })
+            })?;
+            cx.run_until_parked();
+            assert!(cx.did_prompt_for_new_path());
+            cx.simulate_new_path_selection(|_| Some(original.clone()));
+            let error = save.await.expect_err("an existing design rejects Save As");
+            assert!(error.to_string().contains("is not empty"));
+            cx.run_until_parked();
+            project.read_with(cx, |project, cx| {
+                assert_eq!(
+                    project.worktrees(cx).count(),
+                    1,
+                    "a rejected destination must not become a worktree"
+                );
+                assert!(project.find_project_path(&original, cx).is_none());
+            });
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.items_of_type::<FigView>(cx).count(),
+                    1,
+                    "the destination must not open a tab"
+                );
+                assert_eq!(
+                    workspace.active_item(cx).map(|item| item.item_id()),
+                    Some(view.entity_id())
+                );
+            });
+            assert_eq!(std::fs::read(original.join("fanta.json"))?, original_manifest);
+            assert_eq!(std::fs::read(original_source)?, original_bytes);
+            assert_eq!(std::fs::read(copy_source)?, copy_bytes);
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.item.read(cx).project_root(), Some(copy.as_path()));
+                assert!(view.is_dirty(cx));
+                assert!(view.autosave_task.is_some());
+            });
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            assert_eq!(fanta_format::read_project_tree(&copy)?.0.scene.len(), 2);
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 1);
+            Ok(())
+        }
+        .await;
+        result
+            .expect("rejected Save As preserves the active design without opening its destination");
+    }
+
+    #[gpui::test]
+    async fn save_as_failure_resumes_autosave_on_the_original_design(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            let directory = tempfile::tempdir()?;
+            let original = directory.path().join("Original");
+            let occupied = directory.path().join("Occupied");
+            let document = doc_with_one_page();
+            crate::document::write_project(&original, &document, &BTreeMap::new())?;
+            std::fs::create_dir(&occupied)?;
+            std::fs::write(occupied.join("keep.txt"), "untouched")?;
+            let file_system = FakeFs::new(cx.executor());
+            file_system
+                .insert_tree(
+                    directory.path(),
+                    serde_json::json!({"Original": {"fanta.json": "{}"}, "Occupied": {}}),
+                )
+                .await;
+            let project = Project::test(file_system, [directory.path()], cx).await;
+            let destination = project
+                .read_with(cx, |project, cx| project.find_project_path(&occupied, cx))
+                .context("occupied path")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                original.join("fanta.json"),
+                Some(original.clone()),
+                document,
+                cx,
+            );
+            let scratch = cx.add_window(|_, _| gpui::Empty);
+            let view = scratch.update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })?;
+            add_rect(&item, cx);
+            let save_as = scratch.update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    Item::save_as(view, project, destination, window, cx)
+                })
+            })?;
+            assert!(
+                save_as.await.is_err(),
+                "the occupied destination must reject Save As"
+            );
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert!(
+                    view.autosave_task.is_some(),
+                    "the failed copy re-arms autosave"
+                );
+                assert!(view.is_dirty(cx));
+                assert_eq!(view.item.read(cx).project_root(), Some(original.as_path()));
+            });
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 1);
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            assert_eq!(fanta_format::read_project_tree(&original)?.0.scene.len(), 2);
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(
+                std::fs::read_to_string(occupied.join("keep.txt"))?,
+                "untouched"
+            );
+            assert!(!occupied.join("fanta.json").exists());
+            Ok(())
+        }
+        .await;
+        result.expect("a failed Save As must not disable autosaving the original design");
     }
 
     /// The hero promise: an edit reaches the project tree on its own, so
@@ -7215,12 +9140,9 @@ impl FigView {
             return self.render_tool_pill(cx);
         };
         h_flex()
+            .debug_selector(|| "fanta-canvas-toolbar".to_owned())
             .absolute()
-            .bottom(if self.editor_mode(cx) == EditorMode::Motion {
-                TIMELINE_HEIGHT + px(16.)
-            } else {
-                px(16.)
-            })
+            .bottom(px(16.))
             .left_0()
             .right_0()
             .justify_center()
@@ -7284,8 +9206,8 @@ impl FigView {
             } => self.reveal_layers_sidebar(window, cx),
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
-                    // Scale, path-selection and text-on-path have a canvas
-                    // tool object but no behavior, so activating them would
+                    // Text-on-path has a canvas tool object but no
+                    // behavior, so activating it would
                     // arm a face that silently swallows every drag. The
                     // vendored toolbar has no host-side API to hide a tool
                     // (see `EditorToolbar`'s setters), so say so instead.
@@ -7309,6 +9231,29 @@ impl FigView {
                 self.zoom_to_percent(*percent, cx);
             }
             ToolbarAction::CommandInvoked { command } => match command {
+                ToolbarCommand::GenerateImage
+                | ToolbarCommand::GenerateVideo
+                | ToolbarCommand::GenerateVector
+                | ToolbarCommand::GenerateMasks
+                | ToolbarCommand::RemoveBackground
+                | ToolbarCommand::GenerateDesign => {
+                    use crate::generation_workspace::GenerationMode;
+                    let mode = match command {
+                        ToolbarCommand::GenerateVideo => GenerationMode::Video,
+                        ToolbarCommand::GenerateVector => GenerationMode::Vector,
+                        ToolbarCommand::GenerateMasks | ToolbarCommand::RemoveBackground => {
+                            GenerationMode::Masks
+                        }
+                        ToolbarCommand::GenerateDesign => GenerationMode::Design,
+                        _ => GenerationMode::Image,
+                    };
+                    crate::generation_workspace::open_from_canvas(
+                        mode,
+                        self.item.downgrade(),
+                        window,
+                        cx,
+                    );
+                }
                 ToolbarCommand::Undo => self.undo(&Undo, window, cx),
                 ToolbarCommand::Redo => self.redo(&Redo, window, cx),
                 ToolbarCommand::Cut => self.cut_selection(&CutSelection, window, cx),

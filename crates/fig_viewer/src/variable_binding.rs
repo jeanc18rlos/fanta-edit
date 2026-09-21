@@ -10,11 +10,16 @@ pub(crate) struct VariableBindingOption {
     pub(crate) label: SharedString,
 }
 
+/// What a binding control needs to draw its trigger. Deliberately holds no
+/// option list: the inspector and the variables workspace rebuild every
+/// binding control on each window redraw, and a UI kit's type-compatible
+/// variables number in the hundreds. The list is built by
+/// [`variable_binding_options`] when a menu opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VariableBindingModel {
     pub(crate) current: Option<VariableId>,
     pub(crate) current_label: Option<SharedString>,
-    pub(crate) options: Vec<VariableBindingOption>,
+    pub(crate) has_options: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,11 +29,13 @@ pub(crate) struct BindableProperty {
 }
 
 type BindingHandler = Rc<dyn Fn(Option<VariableId>, &mut Window, &mut App)>;
+type BindingOptionsProvider = Rc<dyn Fn(&mut App) -> Vec<VariableBindingOption>>;
 
 #[derive(IntoElement)]
 pub(crate) struct VariableBindingControl {
     id: ElementId,
     model: VariableBindingModel,
+    options: BindingOptionsProvider,
     disabled: bool,
     on_change: BindingHandler,
 }
@@ -37,11 +44,13 @@ impl VariableBindingControl {
     pub(crate) fn new(
         id: impl Into<ElementId>,
         model: VariableBindingModel,
+        options: impl Fn(&mut App) -> Vec<VariableBindingOption> + 'static,
         on_change: impl Fn(Option<VariableId>, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
             id: id.into(),
             model,
+            options: Rc::new(options),
             disabled: false,
             on_change: Rc::new(on_change),
         }
@@ -63,6 +72,7 @@ impl RenderOnce for VariableBindingControl {
             .map(|label| format!("Bound to {label}"))
             .unwrap_or_else(|| "Bind variable".to_owned());
         let model = self.model;
+        let options = self.options;
         let on_change = self.on_change;
         let trigger = IconButton::new(self.id.clone(), IconName::Link)
             .icon_size(IconSize::XSmall)
@@ -85,33 +95,37 @@ impl RenderOnce for VariableBindingControl {
                     .trigger(trigger)
                     .menu(move |window, cx| {
                         let on_change = on_change.clone();
-                        let model = model.clone();
+                        let current = model.current;
+                        // Read the option list here, not at render time: this
+                        // runs once per open, whereas the control itself is
+                        // rebuilt on every window redraw.
+                        let options = options(cx);
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            if model.current.is_some() {
+                            if current.is_some() {
                                 let on_change = on_change.clone();
                                 menu.push_item(
                                     ContextMenuEntry::new("Unbind variable")
                                         .icon(IconName::Link)
                                         .handler(move |window, cx| on_change(None, window, cx)),
                                 );
-                                if !model.options.is_empty() {
+                                if !options.is_empty() {
                                     menu = menu.separator();
                                 }
                             }
 
-                            if model.options.is_empty() {
+                            if options.is_empty() {
                                 menu.push_item(
                                     ContextMenuEntry::new("No compatible variables").disabled(true),
                                 );
                             } else {
-                                for option in &model.options {
+                                for option in &options {
                                     let on_change = on_change.clone();
                                     let variable = option.id;
                                     menu.push_item(
                                         ContextMenuEntry::new(option.label.clone())
                                             .toggleable(
                                                 IconPosition::End,
-                                                model.current == Some(variable),
+                                                current == Some(variable),
                                             )
                                             .handler(move |window, cx| {
                                                 on_change(Some(variable), window, cx)
@@ -136,14 +150,29 @@ pub(crate) fn variable_binding_model(
         return None;
     }
 
+    let current = node.bindings.get(&prop).copied();
+    let current_label = current
+        .map(|variable| variable_label(doc, variable).unwrap_or_else(|| "Missing variable".into()));
+    Some(VariableBindingModel {
+        current,
+        current_label,
+        has_options: doc
+            .variables
+            .variables
+            .values()
+            .any(|variable| binds_to(doc, prop, variable)),
+    })
+}
+
+/// Every variable `prop` can bind to, labelled and ordered for a menu. Walks
+/// the whole registry, so it belongs on the open of a binding menu — never in
+/// a `render`, which GPUI runs again on every window redraw.
+pub(crate) fn variable_binding_options(doc: &Doc, prop: BoundProp) -> Vec<VariableBindingOption> {
     let mut options: Vec<_> = doc
         .variables
         .variables
         .values()
-        .filter(|variable| {
-            prop.accepts_variable_type(variable.ty)
-                && doc.variables.collections.contains_key(&variable.collection)
-        })
+        .filter(|variable| binds_to(doc, prop, variable))
         .filter_map(|variable| {
             Some(VariableBindingOption {
                 id: variable.id,
@@ -152,15 +181,12 @@ pub(crate) fn variable_binding_model(
         })
         .collect();
     options.sort_by(|left, right| left.label.cmp(&right.label));
+    options
+}
 
-    let current = node.bindings.get(&prop).copied();
-    let current_label = current
-        .map(|variable| variable_label(doc, variable).unwrap_or_else(|| "Missing variable".into()));
-    Some(VariableBindingModel {
-        current,
-        current_label,
-        options,
-    })
+fn binds_to(doc: &Doc, prop: BoundProp, variable: &fanta_doc::Variable) -> bool {
+    prop.accepts_variable_type(variable.ty)
+        && doc.variables.collections.contains_key(&variable.collection)
 }
 
 pub(crate) fn bindable_properties(node: &CanvasNode) -> Vec<BindableProperty> {
@@ -431,9 +457,11 @@ mod tests {
 
         let model = variable_binding_model(&doc, node_id, BoundProp::FillColor { index: 0 })
             .expect("fill is bindable");
-        assert_eq!(model.options.len(), 1);
-        assert_eq!(model.options[0].id, color);
-        assert_eq!(model.options[0].label.as_ref(), "Tokens / Accent");
+        assert!(model.has_options);
+        let options = variable_binding_options(&doc, BoundProp::FillColor { index: 0 });
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].id, color);
+        assert_eq!(options[0].label.as_ref(), "Tokens / Accent");
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -447,15 +475,18 @@ mod tests {
 
     struct BindingHarness {
         model: VariableBindingModel,
+        options: Vec<VariableBindingOption>,
         changes: Rc<RefCell<Vec<Option<VariableId>>>>,
     }
 
     impl Render for BindingHarness {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let changes = self.changes.clone();
+            let options = self.options.clone();
             VariableBindingControl::new(
                 "test-variable-binding",
                 self.model.clone(),
+                move |_| options.clone(),
                 move |selected, _, _| changes.borrow_mut().push(selected),
             )
         }
@@ -471,11 +502,12 @@ mod tests {
             model: VariableBindingModel {
                 current: None,
                 current_label: None,
-                options: vec![VariableBindingOption {
-                    id: variable,
-                    label: "Tokens / Accent".into(),
-                }],
+                has_options: true,
             },
+            options: vec![VariableBindingOption {
+                id: variable,
+                label: "Tokens / Accent".into(),
+            }],
             changes: changes_for_view,
         });
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
@@ -503,11 +535,12 @@ mod tests {
             model: VariableBindingModel {
                 current: Some(variable),
                 current_label: Some("Tokens / Accent".into()),
-                options: vec![VariableBindingOption {
-                    id: variable,
-                    label: "Tokens / Accent".into(),
-                }],
+                has_options: true,
             },
+            options: vec![VariableBindingOption {
+                id: variable,
+                label: "Tokens / Accent".into(),
+            }],
             changes: changes_for_view,
         });
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);

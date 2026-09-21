@@ -10,9 +10,10 @@ use super::{
     apply_reactions, asset_id_for_image, build_components_and_sets, build_node, build_stroke,
     build_variables, clips_content, collect_motion_change, collect_motion_consumers,
     collect_prop_def_infos, guid_key, hide_master_variant_placeholders, image_hash_hex,
-    is_state_group, node_name, populate_instance_prop_values, read_component_prop_refs,
-    read_explicit_modes, read_fills, read_paint, read_paint_color_bindings, read_pending_variable,
-    read_prop_defs_raw, read_set_modes, resolve_style_references, tally_fidelity,
+    is_state_group, node_name, populate_instance_prop_values, prune_unreferenced_empty_collections,
+    read_component_prop_refs, read_explicit_modes, read_fills, read_paint,
+    read_paint_color_bindings, read_pending_variable, read_prop_defs_raw, read_set_modes,
+    resolve_style_references, tally_fidelity,
 };
 use std::collections::HashSet;
 
@@ -394,7 +395,11 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
         &pending_variables,
     );
     // Per-frame mode pins, now that the collection/mode guid→id maps exist.
-    apply_explicit_modes(&mut doc, &mut report, &pending_explicit_modes, &var_maps);
+    let pinned_collections =
+        apply_explicit_modes(&mut doc, &mut report, &pending_explicit_modes, &var_maps);
+    // Every mode pin is resolved by now, so a collection that is still empty and
+    // unpinned is a remote-library stub that resolved nothing — drop it.
+    prune_unreferenced_empty_collections(&mut doc, &mut report, &pinned_collections);
     apply_reactions(
         &mut doc,
         &mut report,

@@ -535,6 +535,23 @@ enum EntryShape {
     Terminal(TerminalId),
 }
 
+impl EntryShape {
+    fn matches_entry(&self, entry: &ListEntry) -> bool {
+        match (self, entry) {
+            (Self::ProjectHeader { key, .. }, ListEntry::ProjectHeader { key: other, .. }) => {
+                key == other
+            }
+            (Self::Thread(thread_id), ListEntry::Thread(thread)) => {
+                *thread_id == thread.metadata.thread_id
+            }
+            (Self::Terminal(terminal_id), ListEntry::Terminal(terminal)) => {
+                *terminal_id == terminal.metadata.terminal_id
+            }
+            _ => false,
+        }
+    }
+}
+
 impl SidebarContents {
     fn is_thread_notified(&self, thread_id: &agent_ui::ThreadId) -> bool {
         self.notified_threads.contains(thread_id)
@@ -860,8 +877,18 @@ impl Sidebar {
                     this.subscribe_to_workspace(workspace, window, cx);
                     this.schedule_update_entries(false, cx);
                 }
-                MultiWorkspaceEvent::WorkspaceRemoved(_)
-                | MultiWorkspaceEvent::ProjectGroupsChanged => {
+                MultiWorkspaceEvent::WorkspaceRemoved(workspace_id) => {
+                    if this
+                        .active_entry
+                        .as_ref()
+                        .is_some_and(|entry| entry.workspace().entity_id() == *workspace_id)
+                    {
+                        this.active_entry = None;
+                        this.sync_active_entry_from_active_workspace(cx);
+                    }
+                    this.schedule_update_entries(false, cx);
+                }
+                MultiWorkspaceEvent::ProjectGroupsChanged => {
                     this.schedule_update_entries(false, cx);
                 }
             },
@@ -1048,6 +1075,7 @@ impl Sidebar {
                 if let workspace::Event::PanelAdded(view) = event {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
+                        this.sync_active_entry_from_panel(&agent_panel, cx);
                         this.schedule_update_entries(false, cx);
                     }
                 }
@@ -1059,6 +1087,7 @@ impl Sidebar {
 
         if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
             self.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
+            self.sync_active_entry_from_panel(&agent_panel, cx);
         }
     }
 
@@ -1163,6 +1192,8 @@ impl Sidebar {
             .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx));
         if let Some(panel) = panel {
             self.sync_active_entry_from_panel(&panel, cx);
+        } else {
+            self.active_entry = None;
         }
     }
 
@@ -1209,6 +1240,16 @@ impl Sidebar {
             return false;
         }
 
+        // The replacement may never acquire a draft (for example, Close Project
+        // opens an empty workspace). Its selection must not own the old workspace.
+        if self
+            .active_entry
+            .as_ref()
+            .is_some_and(|entry| entry.workspace() != &active_workspace)
+        {
+            self.active_entry = None;
+        }
+
         let panel = agent_panel.read(cx);
 
         if let Some(pending_thread_id) = self.pending_thread_activation {
@@ -1251,7 +1292,11 @@ impl Sidebar {
                     session_id,
                     workspace: active_workspace,
                 });
+            } else {
+                self.active_entry = None;
             }
+        } else {
+            self.active_entry = None;
         }
 
         false
@@ -2040,6 +2085,23 @@ impl Sidebar {
             self.entry_shapes(multi_workspace.read(cx)).collect();
 
         self.rebuild_contents(cx);
+        self.selection = self.selection.and_then(|previous_index| {
+            previous_shapes
+                .get(previous_index)
+                .and_then(|selected| {
+                    self.contents
+                        .entries
+                        .iter()
+                        .position(|entry| selected.matches_entry(entry))
+                })
+                .or_else(|| {
+                    self.contents
+                        .entries
+                        .len()
+                        .checked_sub(1)
+                        .map(|last_index| previous_index.min(last_index))
+                })
+        });
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
 

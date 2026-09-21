@@ -11,6 +11,7 @@
 //! `gpui_component::ActiveTheme` OR Zed's `theme::ActiveTheme`, never both.
 
 pub(crate) mod design;
+pub(crate) mod design_snapshot;
 pub(crate) mod layers;
 pub(crate) mod pages;
 pub(crate) mod toolbar;

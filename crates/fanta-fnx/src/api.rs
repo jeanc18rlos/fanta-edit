@@ -204,9 +204,11 @@ fn push_element<'a>(
         parent,
     });
     for (child_position, child) in element.children.iter().enumerate() {
+        // Match the document's fractional IndexKey encoding so materializing
+        // an edited source does not rewrite integer indices on the next save.
         push_element(
             child,
-            Value::from(child_position as u64 + 1),
+            Value::from(child_position as f64 + 1.0),
             Some(position),
             elements,
         );

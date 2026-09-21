@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
+use std::rc::Rc;
 
 use editor::{Editor, EditorEvent};
 use fanta_doc::{
@@ -7,7 +9,8 @@ use fanta_doc::{
 };
 use gpui::{
     App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Render, SharedString, Subscription, Window, div, px,
+    KeyDownEvent, Render, SharedString, Subscription, UniformListScrollHandle, Window, div, px,
+    uniform_list,
 };
 use ui::{
     ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, Tooltip,
@@ -19,7 +22,8 @@ use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::inspector_components::{InspectorMessage, InspectorSectionHeader};
 use crate::mode_overrides::mode_override_operation;
 use crate::variable_binding::{
-    VariableBindingOption, bindable_properties, variable_binding_model, variable_binding_operation,
+    bindable_properties, variable_binding_model, variable_binding_operation,
+    variable_binding_options,
 };
 
 const COLLECTION_WIDTH: f32 = 220.0;
@@ -66,12 +70,17 @@ struct CollectionSnapshot {
     variables: Vec<VariableRowSnapshot>,
 }
 
+/// One bindable property of the selected layer. Holds no candidate list: the
+/// menu's entries are built when it opens, because a UI kit has hundreds of
+/// type-compatible variables and this snapshot is rebuilt on every selection
+/// change.
 #[derive(Debug, Clone)]
 struct BindingRowSnapshot {
     prop: BoundProp,
     label: SharedString,
     current: Option<VariableId>,
-    choices: Vec<VariableBindingOption>,
+    current_label: Option<SharedString>,
+    has_choices: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +90,7 @@ struct BindingSnapshot {
     rows: Vec<BindingRowSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct VariablesSnapshot {
     collections: Vec<CollectionSummary>,
     selected: Option<CollectionSnapshot>,
@@ -118,6 +127,20 @@ pub struct FantaVariablesWorkspace {
     rename_editor: Entity<Editor>,
     suppress_editor_events: bool,
     error_message: Option<SharedString>,
+    /// The table model, walked from the document only when it can have
+    /// changed. GPUI re-renders every visible view on every window redraw, so
+    /// building this in `render` walks the whole variable registry on each
+    /// canvas pan and caret blink — a 40-collection, 1,500-variable UI kit
+    /// hangs the window. The snapshot is a pure function of the document and
+    /// `selected_collection`, so every write to either invalidates it.
+    cached_snapshot: Option<Rc<VariablesSnapshot>>,
+    table_scroll_handle: UniformListScrollHandle,
+    #[cfg(test)]
+    snapshot_builds: usize,
+    #[cfg(test)]
+    rows_built: usize,
+    #[cfg(test)]
+    renders: usize,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -140,6 +163,18 @@ impl FantaVariablesWorkspace {
         );
         let item_subscription =
             cx.subscribe(&item, |this: &mut Self, item, event: &FigItemEvent, cx| {
+                // Drag previews and caret moves arrive per pointer move and
+                // can change neither the variable registry nor which layer is
+                // bound, so they must not pay for a registry walk. Every other
+                // event may have replaced document state, so it invalidates —
+                // a snapshot that outlives its document reads as a stale
+                // table, which is worse than a slow one.
+                if matches!(
+                    event,
+                    FigItemEvent::EditedTransient | FigItemEvent::TextSelectionChanged
+                ) {
+                    return;
+                }
                 if matches!(event, FigItemEvent::StateChanged) {
                     this.editing_cell = None;
                     this.value_edit_baseline = None;
@@ -156,15 +191,9 @@ impl FantaVariablesWorkspace {
                             .log_err();
                     });
                 }
-                if matches!(
-                    event,
-                    FigItemEvent::Edited
-                        | FigItemEvent::StateChanged
-                        | FigItemEvent::SelectionChanged
-                ) {
-                    this.reconcile_selection(cx);
-                    cx.notify();
-                }
+                this.reconcile_selection(cx);
+                this.invalidate_snapshot();
+                cx.notify();
             });
         let rename_editor_subscription = cx.subscribe_in(
             &rename_editor,
@@ -192,6 +221,14 @@ impl FantaVariablesWorkspace {
             rename_editor,
             suppress_editor_events: false,
             error_message: None,
+            cached_snapshot: None,
+            table_scroll_handle: UniformListScrollHandle::new(),
+            #[cfg(test)]
+            snapshot_builds: 0,
+            #[cfg(test)]
+            rows_built: 0,
+            #[cfg(test)]
+            renders: 0,
             _subscriptions: vec![
                 value_editor_subscription,
                 rename_editor_subscription,
@@ -213,6 +250,7 @@ impl FantaVariablesWorkspace {
                 .read(cx)
                 .doc()
                 .and_then(|doc| doc.variables.collections.keys().next().copied());
+            self.invalidate_snapshot();
         }
         if self.editing_cell.is_some_and(|cell| {
             self.item
@@ -237,11 +275,15 @@ impl FantaVariablesWorkspace {
         self.commit_rename(window, cx);
         self.selected_collection = Some(collection);
         self.error_message = None;
+        self.invalidate_snapshot();
         cx.notify();
     }
 
     fn apply_operation(&mut self, operation: Operation, cx: &mut Context<Self>) -> bool {
         let result = self.item.update(cx, |item, cx| item.apply(operation, cx));
+        // A failed apply can still have moved the document part of the way, so
+        // both outcomes drop the cached table.
+        self.invalidate_snapshot();
         match result {
             Ok(()) => {
                 self.error_message = None;
@@ -327,6 +369,7 @@ impl FantaVariablesWorkspace {
         };
         if self.apply_operation(operation, cx) {
             self.selected_collection = Some(collection);
+            self.invalidate_snapshot();
             cx.notify();
         }
     }
@@ -466,6 +509,7 @@ impl FantaVariablesWorkspace {
         if previewed {
             self.finish_content_preview(committed, cx);
         }
+        self.invalidate_snapshot();
         cx.notify();
     }
 
@@ -491,6 +535,7 @@ impl FantaVariablesWorkspace {
             }
         }
         self.error_message = None;
+        self.invalidate_snapshot();
         cx.notify();
     }
 
@@ -523,6 +568,9 @@ impl FantaVariablesWorkspace {
                 (result, change)
             })
         });
+        // The preview writes into the document behind an EditedTransient,
+        // the one event the item subscription skips, so it invalidates here.
+        self.invalidate_snapshot();
         match result {
             Some(Ok(true)) => {
                 self.value_edit_previewed = true;
@@ -562,6 +610,7 @@ impl FantaVariablesWorkspace {
                 ((), change)
             });
         });
+        self.invalidate_snapshot();
     }
 
     fn apply_built_operation(
@@ -656,15 +705,27 @@ impl FantaVariablesWorkspace {
         self.apply_built_operation(result, cx);
     }
 
-    fn snapshot(&self, cx: &App) -> VariablesSnapshot {
-        let Some(doc) = self.item.read(cx).doc() else {
-            return VariablesSnapshot {
-                collections: Vec::new(),
-                selected: None,
-                binding: None,
-            };
-        };
-        variables_snapshot(doc, self.selected_collection)
+    fn invalidate_snapshot(&mut self) {
+        self.cached_snapshot = None;
+    }
+
+    /// The cached table model, rebuilt only after an invalidation. Callers get
+    /// a handle rather than a clone: the selected collection can hold a
+    /// thousand rows, and this is read from `render`.
+    fn snapshot(&mut self, cx: &App) -> Rc<VariablesSnapshot> {
+        if let Some(snapshot) = self.cached_snapshot.clone() {
+            return snapshot;
+        }
+        let snapshot = Rc::new(match self.item.read(cx).doc() {
+            Some(doc) => variables_snapshot(doc, self.selected_collection),
+            None => VariablesSnapshot::default(),
+        });
+        #[cfg(test)]
+        {
+            self.snapshot_builds += 1;
+        }
+        self.cached_snapshot = Some(snapshot.clone());
+        snapshot
     }
 
     fn render_variable_type_dropdown(
@@ -823,6 +884,9 @@ impl FantaVariablesWorkspace {
             .w(px(COLLECTION_WIDTH))
             .h_full()
             .flex_none()
+            // A library file carries dozens of collections; without this the
+            // ones past the panel's height are drawn and simply unreachable.
+            .overflow_y_scroll()
             .border_r_1()
             .border_color(cx.theme().colors().border)
             .child(
@@ -1093,39 +1157,29 @@ impl FantaVariablesWorkspace {
                     .on_click(cx.listener(|workspace, _, _, cx| workspace.add_mode(cx))),
             );
 
-        let mut table = v_flex()
-            .id("fanta-variable-table")
-            .min_w(px(VARIABLE_NAME_WIDTH
-                + VARIABLE_TYPE_WIDTH
-                + MODE_WIDTH * collection.modes.len() as f32))
-            .child(self.render_table_header(collection, cx));
-        if collection.variables.is_empty() {
-            table = table.child(
-                h_flex().h(px(80.)).px_3().child(
+        let rows = if collection.variables.is_empty() {
+            h_flex()
+                .h(px(80.))
+                .px_3()
+                .child(
                     Label::new("No variables in this collection")
                         .size(LabelSize::Small)
                         .color(Color::Muted),
-                ),
-            );
+                )
+                .into_any_element()
         } else {
-            for (row_index, variable) in collection.variables.iter().enumerate() {
-                let mut row = h_flex()
-                    .h(px(TABLE_ROW_HEIGHT))
-                    .flex_none()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(self.render_variable_name_cell(row_index, variable, cx))
-                    .child(table_value_cell(
-                        variable_type_label(variable.variable_type),
-                        VARIABLE_TYPE_WIDTH,
-                    ));
-                for (mode_index, mode) in collection.modes.iter().enumerate() {
-                    row = row
-                        .child(self.render_value_cell(row_index, mode_index, variable, mode, cx));
-                }
-                table = table.child(row);
-            }
-        }
+            uniform_list(
+                "fanta-variable-rows",
+                collection.variables.len(),
+                cx.processor(|workspace, range: Range<usize>, _window, cx| {
+                    workspace.render_variable_rows(range, cx)
+                }),
+            )
+            .flex_1()
+            .min_h(px(0.))
+            .track_scroll(&self.table_scroll_handle)
+            .into_any_element()
+        };
         v_flex()
             .flex_1()
             .min_w_0()
@@ -1134,14 +1188,64 @@ impl FantaVariablesWorkspace {
             .child(toolbar)
             .child(self.render_mode_scope_bar(collection, window, cx))
             .child(
+                // The header and the virtualized rows share one horizontally
+                // scrolling column so the mode columns stay aligned; vertical
+                // scrolling belongs to the `uniform_list` itself.
                 div()
                     .id("fanta-variable-table-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .overflow_x_scroll()
-                    .child(table),
+                    .child(
+                        v_flex()
+                            .h_full()
+                            .min_w(px(VARIABLE_NAME_WIDTH
+                                + VARIABLE_TYPE_WIDTH
+                                + MODE_WIDTH * collection.modes.len() as f32))
+                            .child(self.render_table_header(collection, cx))
+                            .child(rows),
+                    ),
             )
+    }
+
+    /// Builds only the rows one visible range of the virtualized table asks
+    /// for. Row indices are positions in the selected collection, so the
+    /// element ids — and with them the mounted inline editors — stay put as
+    /// the list scrolls.
+    fn render_variable_rows(
+        &mut self,
+        range: Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let snapshot = self.snapshot(cx);
+        let Some(collection) = snapshot.selected.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::with_capacity(range.len());
+        for row_index in range {
+            let Some(variable) = collection.variables.get(row_index) else {
+                continue;
+            };
+            let mut row = h_flex()
+                .h(px(TABLE_ROW_HEIGHT))
+                .flex_none()
+                .border_b_1()
+                .border_color(cx.theme().colors().border)
+                .child(self.render_variable_name_cell(row_index, variable, cx))
+                .child(table_value_cell(
+                    variable_type_label(variable.variable_type),
+                    VARIABLE_TYPE_WIDTH,
+                ));
+            for (mode_index, mode) in collection.modes.iter().enumerate() {
+                row = row.child(self.render_value_cell(row_index, mode_index, variable, mode, cx));
+            }
+            #[cfg(test)]
+            {
+                self.rows_built += 1;
+            }
+            rows.push(row.into_any_element());
+        }
+        rows
     }
 
     fn render_binding_row(
@@ -1149,57 +1253,65 @@ impl FantaVariablesWorkspace {
         index: usize,
         binding: &BindingSnapshot,
         row: &BindingRowSnapshot,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let current_label = row
-            .current
-            .and_then(|current| {
-                row.choices
-                    .iter()
-                    .find(|choice| choice.id == current)
-                    .map(|choice| choice.label.clone())
-            })
-            .unwrap_or_else(|| {
-                if row.choices.is_empty() {
-                    "No compatible variables".into()
-                } else {
-                    "Unbound".into()
-                }
-            });
+        let current_label = row.current_label.clone().unwrap_or_else(|| {
+            if row.has_choices {
+                "Unbound".into()
+            } else {
+                "No compatible variables".into()
+            }
+        });
         let workspace = cx.weak_entity();
+        let item = self.item.downgrade();
         let node = binding.node;
         let prop = row.prop;
-        let current = row.current;
-        let choices = row.choices.clone();
-        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            if current.is_some() {
-                let workspace = workspace.clone();
-                menu.push_item(ContextMenuEntry::new("Unbind").handler(move |_, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.unbind_property(node, prop, cx)
-                        })
-                        .log_err();
-                }));
-            }
-            for choice in &choices {
-                let workspace = workspace.clone();
-                let variable = choice.id;
-                menu.push_item(
-                    ContextMenuEntry::new(choice.label.clone())
-                        .toggleable(IconPosition::End, current == Some(variable))
-                        .handler(move |_, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.bind_property(node, prop, variable, cx)
-                                })
-                                .log_err();
-                        }),
-                );
-            }
-            menu
-        });
+        // The candidate list is read when the menu opens rather than captured
+        // here: this row is rebuilt on every window redraw, and a UI kit's
+        // colour collection alone runs to hundreds of entries.
+        let menu = move |window: &mut Window, cx: &mut App| {
+            let (choices, current) = item
+                .read_with(cx, |item, _| {
+                    let Some(doc) = item.doc() else {
+                        return (Vec::new(), None);
+                    };
+                    let current = doc
+                        .scene
+                        .get(node)
+                        .and_then(|node| node.bindings.get(&prop).copied());
+                    (variable_binding_options(doc, prop), current)
+                })
+                .unwrap_or_else(|_| (Vec::new(), None));
+            let workspace = workspace.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                if current.is_some() {
+                    let workspace = workspace.clone();
+                    menu.push_item(ContextMenuEntry::new("Unbind").handler(move |_, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.unbind_property(node, prop, cx)
+                            })
+                            .log_err();
+                    }));
+                }
+                for choice in &choices {
+                    let workspace = workspace.clone();
+                    let variable = choice.id;
+                    menu.push_item(
+                        ContextMenuEntry::new(choice.label.clone())
+                            .toggleable(IconPosition::End, current == Some(variable))
+                            .handler(move |_, cx| {
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.bind_property(node, prop, variable, cx)
+                                    })
+                                    .log_err();
+                            }),
+                    );
+                }
+                menu
+            }))
+        };
         v_flex()
             .px_3()
             .py_1()
@@ -1210,11 +1322,11 @@ impl FantaVariablesWorkspace {
                     .color(Color::Muted),
             )
             .child(
-                DropdownMenu::new(("fanta-variable-binding", index), current_label, menu)
+                DropdownMenu::new_lazy(("fanta-variable-binding", index), current_label, menu)
                     .style(DropdownStyle::Outlined)
                     .trigger_size(ButtonSize::Compact)
                     .full_width(true)
-                    .disabled(row.choices.is_empty() && row.current.is_none())
+                    .disabled(!row.has_choices && row.current.is_none())
                     .aria_label(format!("Bind {}", row.label)),
             )
     }
@@ -1222,7 +1334,6 @@ impl FantaVariablesWorkspace {
     fn render_bindings(
         &self,
         binding: Option<&BindingSnapshot>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let root = v_flex()
@@ -1263,7 +1374,7 @@ impl FantaVariablesWorkspace {
                 .into_any_element();
         }
         for (index, row) in binding.rows.iter().enumerate() {
-            root = root.child(self.render_binding_row(index, binding, row, window, cx));
+            root = root.child(self.render_binding_row(index, binding, row, cx));
         }
         root.into_any_element()
     }
@@ -1271,6 +1382,10 @@ impl FantaVariablesWorkspace {
 
 impl Render for FantaVariablesWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         let snapshot = self.snapshot(cx);
         let mut root = v_flex()
             .key_context("FantaVariablesWorkspace")
@@ -1319,7 +1434,7 @@ impl Render for FantaVariablesWorkspace {
                     )
                     .into_any_element(),
                 })
-                .child(self.render_bindings(snapshot.binding.as_ref(), window, cx)),
+                .child(self.render_bindings(snapshot.binding.as_ref(), cx)),
         )
     }
 }
@@ -1333,6 +1448,10 @@ impl Focusable for FantaVariablesWorkspace {
 }
 
 fn variables_snapshot(doc: &Doc, selected: Option<VariableCollectionId>) -> VariablesSnapshot {
+    let mut variable_counts: BTreeMap<VariableCollectionId, usize> = BTreeMap::new();
+    for variable in doc.variables.variables.values() {
+        *variable_counts.entry(variable.collection).or_default() += 1;
+    }
     let collections = doc
         .variables
         .collections
@@ -1340,12 +1459,10 @@ fn variables_snapshot(doc: &Doc, selected: Option<VariableCollectionId>) -> Vari
         .map(|collection| CollectionSummary {
             id: collection.id,
             name: collection.name.clone().into(),
-            variable_count: doc
-                .variables
-                .variables
-                .values()
-                .filter(|variable| variable.collection == collection.id)
-                .count(),
+            variable_count: variable_counts
+                .get(&collection.id)
+                .copied()
+                .unwrap_or_default(),
         })
         .collect();
     let selected = selected
@@ -1470,7 +1587,8 @@ fn binding_snapshot(doc: &Doc) -> Option<BindingSnapshot> {
                 prop: candidate.prop,
                 label: candidate.label,
                 current: model.current,
-                choices: model.options,
+                current_label: model.current_label,
+                has_choices: model.has_options,
             })
         })
         .collect();
@@ -1855,7 +1973,7 @@ mod tests {
     use super::*;
     use crate::document::ready_item_for_test;
     use fanta_doc::{CanvasNode, GroupNode, NodeData, VectorNode};
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
     use settings::SettingsStore;
     use std::path::PathBuf;
@@ -2216,6 +2334,337 @@ mod tests {
                 .map(|row| row.id)
                 .collect::<Vec<_>>(),
             vec![first, second]
+        );
+    }
+
+    fn doc_with_many_variables(count: usize) -> (Doc, VariableCollectionId, ModeId) {
+        let (mut doc, collection, mode) = doc_with_collection();
+        let mut order = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = VariableId::from_u128(index as u128 + 1);
+            doc.variables.variables.insert(
+                id,
+                Variable {
+                    id,
+                    collection,
+                    name: format!("color/{index}"),
+                    ty: VariableType::Color,
+                    values_by_mode: BTreeMap::from([(
+                        mode,
+                        VarValue::Color {
+                            value: FantaColor::BLACK,
+                        },
+                    )]),
+                    scopes: Vec::new(),
+                },
+            );
+            order.push(id);
+        }
+        doc.variables
+            .collections
+            .get_mut(&collection)
+            .expect("the collection exists")
+            .variable_order = order;
+        (doc, collection, mode)
+    }
+
+    async fn workspace_for_doc(
+        doc: Doc,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FantaVariablesWorkspace>,
+        Entity<FigItem>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let roots: [&std::path::Path; 0] = [];
+        let project = Project::test(file_system, roots, cx).await;
+        let item = ready_item_for_test(&project, PathBuf::from("/tmp/Variables.fanta"), doc, cx);
+        let workspace_item = item.clone();
+        let (workspace, cx) = cx.add_window_view(move |window, cx| {
+            FantaVariablesWorkspace::new(workspace_item, window, cx)
+        });
+        cx.run_until_parked();
+        (workspace, item, cx.clone())
+    }
+
+    fn snapshot_builds(
+        workspace: &Entity<FantaVariablesWorkspace>,
+        cx: &mut VisualTestContext,
+    ) -> usize {
+        workspace.read_with(cx, |workspace, _| workspace.snapshot_builds)
+    }
+
+    fn cached_variable_names(
+        workspace: &Entity<FantaVariablesWorkspace>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        workspace.read_with(cx, |workspace, _| {
+            workspace
+                .cached_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.selected.as_ref())
+                .map(|collection| {
+                    collection
+                        .variables
+                        .iter()
+                        .map(|variable| variable.name.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    async fn redraws_reuse_the_cached_snapshot_while_every_mutation_refreshes_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (doc, collection, mode) = doc_with_many_variables(3);
+        let first_variable = VariableId::from_u128(1);
+        let (workspace, item, mut cx) = workspace_for_doc(doc, cx).await;
+        let cx = &mut cx;
+
+        assert_eq!(
+            snapshot_builds(&workspace, cx),
+            1,
+            "the first draw walks the registry once"
+        );
+        let renders = workspace.read_with(cx, |workspace, _| workspace.renders);
+
+        // A window redraw driven by anything else — a canvas pan, a blinking
+        // caret — still runs this view's render.
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        assert!(
+            workspace.read_with(cx, |workspace, _| workspace.renders) > renders,
+            "the workspace must have re-rendered for the reuse assertion to mean anything"
+        );
+        assert_eq!(
+            snapshot_builds(&workspace, cx),
+            1,
+            "a redraw with no change reuses the cached snapshot"
+        );
+
+        let mut expected_builds = 1;
+        let expect_refresh =
+            |cx: &mut VisualTestContext, expected_builds: &mut usize, what: &str| {
+                cx.run_until_parked();
+                *expected_builds += 1;
+                assert_eq!(
+                    snapshot_builds(&workspace, cx),
+                    *expected_builds,
+                    "{what} must rebuild the cached snapshot exactly once"
+                );
+            };
+
+        workspace.update(cx, |workspace, cx| workspace.create_collection(cx));
+        expect_refresh(cx, &mut expected_builds, "creating a collection");
+        assert!(
+            cached_variable_names(&workspace, cx).is_empty(),
+            "the new empty collection is the selected one"
+        );
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.select_collection(collection, window, cx)
+        });
+        expect_refresh(cx, &mut expected_builds, "selecting a collection");
+        assert_eq!(cached_variable_names(&workspace, cx).len(), 3);
+
+        workspace.update(cx, |workspace, cx| workspace.create_variable(cx));
+        expect_refresh(cx, &mut expected_builds, "creating a variable");
+        assert_eq!(cached_variable_names(&workspace, cx).len(), 4);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.start_rename(
+                VariableRenameTarget::Variable(first_variable),
+                "color/0".into(),
+                window,
+                cx,
+            );
+            workspace.rename_editor.update(cx, |editor, cx| {
+                editor.set_text("surface/base", window, cx);
+            });
+            workspace.commit_rename(window, cx);
+        });
+        expect_refresh(cx, &mut expected_builds, "renaming a variable");
+        assert!(
+            cached_variable_names(&workspace, cx).contains(&"surface/base".to_owned()),
+            "the refreshed snapshot shows the new name"
+        );
+
+        workspace.update(cx, |workspace, cx| workspace.add_mode(cx));
+        expect_refresh(cx, &mut expected_builds, "adding a mode");
+
+        let cell = VariableCell {
+            variable: first_variable,
+            mode,
+            variable_type: VariableType::Color,
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.start_value_edit(cell, "#000000".into(), window, cx);
+            workspace.value_editor.update(cx, |editor, cx| {
+                editor.set_text("#ffffff", window, cx);
+            });
+            workspace.finish_value_edit(cx);
+        });
+        expect_refresh(cx, &mut expected_builds, "committing a value edit");
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            assert_eq!(
+                document.doc.variables.variables[&first_variable].values_by_mode[&mode],
+                VarValue::Color {
+                    value: FantaColor::WHITE
+                }
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.start_value_edit(cell, "#ffffff".into(), window, cx);
+            workspace.value_editor.update(cx, |editor, cx| {
+                editor.set_text("#123456", window, cx);
+            });
+            workspace.cancel_value_edit(cx);
+        });
+        expect_refresh(cx, &mut expected_builds, "reverting a value edit");
+
+        let deleted = item.read_with(cx, |item, _| {
+            item.document()
+                .expect("ready document")
+                .doc
+                .variables
+                .variables[&first_variable]
+                .clone()
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::DeleteVariable {
+                    id: first_variable,
+                    variable: Box::new(deleted),
+                },
+                cx,
+            )
+        })
+        .expect("delete the variable outside the workspace");
+        expect_refresh(cx, &mut expected_builds, "a document edit from elsewhere");
+        assert!(
+            !cached_variable_names(&workspace, cx).contains(&"surface/base".to_owned()),
+            "a deletion applied elsewhere must not leave a stale row"
+        );
+    }
+
+    #[gpui::test]
+    async fn the_binding_column_costs_nothing_per_frame_on_a_large_registry(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _collection, _mode) = doc_with_many_variables(600);
+        let bound = VariableId::from_u128(1);
+        let node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            FantaColor::BLACK,
+        )));
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create node");
+        let bind = variable_binding_operation(
+            &doc,
+            node_id,
+            BoundProp::FillColor { index: 0 },
+            Some(bound),
+        )
+        .expect("the fill accepts a colour variable")
+        .expect("a new binding");
+        doc.apply(bind).expect("apply the binding");
+        doc.selection.replace_with(vec![node_id]);
+
+        let (workspace, _item, mut cx) = workspace_for_doc(doc, cx).await;
+        let cx = &mut cx;
+
+        let rows = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .cached_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.binding.clone())
+                .expect("the selected layer has a binding section")
+                .rows
+        });
+        let fill = rows
+            .iter()
+            .find(|row| row.prop == BoundProp::FillColor { index: 0 })
+            .expect("the fill is bindable");
+        assert_eq!(fill.current, Some(bound));
+        assert_eq!(
+            fill.current_label.as_deref(),
+            Some("Collection 1 / color/0"),
+            "the trigger label comes from the snapshot, not from a candidate search"
+        );
+        assert!(fill.has_choices);
+        let visible = rows
+            .iter()
+            .find(|row| row.prop == BoundProp::Visible)
+            .expect("visibility is always bindable");
+        assert!(
+            !visible.has_choices,
+            "a registry of colours offers nothing to a boolean property"
+        );
+
+        // The candidate list is the part that scales with the document, and it
+        // is deliberately absent from every row: the menu builds it when it
+        // opens. If it ever moves back into the snapshot this stops holding,
+        // because a redraw would then have to walk 600 variables per row.
+        let builds_before = snapshot_builds(&workspace, cx);
+        for _ in 0..5 {
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            snapshot_builds(&workspace, cx),
+            builds_before,
+            "redrawing a selected layer must not rebuild the binding rows"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_large_collection_only_builds_the_rows_the_viewport_shows(cx: &mut TestAppContext) {
+        let (doc, _collection, _mode) = doc_with_many_variables(600);
+        let (workspace, _item, mut cx) = workspace_for_doc(doc, cx).await;
+        let cx = &mut cx;
+
+        let (rows_built, builds, row_count) = workspace.read_with(cx, |workspace, _| {
+            (
+                workspace.rows_built,
+                workspace.snapshot_builds,
+                workspace
+                    .cached_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.selected.as_ref())
+                    .map(|collection| collection.variables.len())
+                    .unwrap_or_default(),
+            )
+        });
+        assert_eq!(row_count, 600, "the whole collection is in the snapshot");
+        assert!(rows_built > 0, "the visible rows are built");
+        assert!(
+            rows_built < row_count / 10,
+            "the table is virtualized: {rows_built} of {row_count} rows were built"
+        );
+        assert_eq!(builds, 1);
+
+        let before = workspace.read_with(cx, |workspace, _| workspace.rows_built);
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        let after = workspace.read_with(cx, |workspace, _| workspace.rows_built);
+        assert!(
+            after - before < row_count / 10,
+            "a redraw rebuilds only the visible rows"
+        );
+        assert_eq!(
+            snapshot_builds(&workspace, cx),
+            1,
+            "redrawing a large collection must not walk the registry again"
         );
     }
 }

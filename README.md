@@ -18,6 +18,14 @@ This is an **alpha**. It is rough in places, and
 [`docs/alpha/KNOWN_ISSUES.md`](docs/alpha/KNOWN_ISSUES.md) is honest rather than
 short.
 
+![The Fanta canvas, with the pages and layers rail, the inspector and the agent
+panel](docs/screenshots/canvas.png)
+
+The same page, as the source Fanta saves it. Edit either side; the other
+follows.
+
+![The Code tab showing the page's .fnx source](docs/screenshots/code.png)
+
 ```
 cargo run -p zed                     # build and run; the binary is named fanta
 claude mcp add -s user fanta -- \

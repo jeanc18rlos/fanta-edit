@@ -91,8 +91,15 @@ pub struct MapReport {
     pub derived_text_weight: usize,
     /// Number of [`Variable`]s built from VARIABLE changes.
     pub variables: usize,
-    /// Number of [`VariableCollection`]s built from VARIABLE_SET changes.
+    /// Number of [`VariableCollection`]s the document ended up with — the ones
+    /// built from VARIABLE_SET changes, less those pruned as empty and
+    /// unreferenced (see `variable_collections_pruned`).
     pub variable_collections: usize,
+    /// Number of VARIABLE_SET changes that produced a collection holding no
+    /// variables which nothing pinned a mode of, and so was dropped rather than
+    /// shown. These are the remote-library stubs a subscribing file carries —
+    /// one per consumed library version, hence the repeated names.
+    pub variable_collections_pruned: usize,
     /// Number of prototype reactions attached to nodes.
     pub reactions: usize,
     /// Number of prototype interactions whose `actions` array parsed to MORE

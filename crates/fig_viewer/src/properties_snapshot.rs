@@ -7,12 +7,14 @@ use std::collections::HashMap;
 
 use fanta_canvas::transform_angle;
 use fanta_doc::{
-    Action, AxisSizing, BlendMode, Blur, BlurKind, BoundProp, CanvasNode, Color as FantaColor,
-    ComponentDef, ComponentId, ComponentLibrary, ComponentPropId, ComponentPropKind, CounterAlign,
-    Doc, Fill, Gradient, ImageFitMode, InstanceNode, LayoutChild, LayoutMode, NodeData, NodeFlags,
-    NodeId, PrimaryAlign, Reaction, Shadow, ShadowKind, StrokeAlign, TextAlign, TextAutoResize,
-    Transform2D, Trigger, UnitInterval, VAlign as TextVAlign, VarValue,
+    Action, AxisSizing, BlendMode, Blur, BlurKind, BoundProp, Bounds, CanvasNode,
+    Color as FantaColor, ComponentDef, ComponentId, ComponentLibrary, ComponentPropId,
+    ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, InstanceNode, LayoutChild,
+    LayoutMode, NodeData, NodeFlags, NodeId, PrimaryAlign, Reaction, Shadow, ShadowKind,
+    StrokeAlign, TextAlign, TextAutoResize, Transform2D, Trigger, UnitInterval,
+    VAlign as TextVAlign, VarValue,
 };
+use glam::DVec2;
 use smallvec::SmallVec;
 use ui::prelude::*;
 
@@ -22,7 +24,7 @@ use crate::component_properties::{
 };
 use crate::document::FigDocument;
 use crate::inspector_widgets::AlignGlyph;
-use crate::properties_ops::{format_number, inspector_world_size};
+use crate::properties_ops::format_number;
 
 pub(crate) const MIXED_VALUE: &str = "–";
 
@@ -516,6 +518,12 @@ pub(crate) struct NodeSection {
     pub(crate) type_name: SharedString,
     pub(crate) type_icon: IconName,
     pub(crate) name: String,
+    /// The node's world box, or `None` for a node that has none at all — a
+    /// group with neither a stored box nor bounded content. `x`/`y`/`width`/
+    /// `height` below flatten that to zero because the panel fields need a
+    /// number; a surface that can say "no value" should read this instead, so
+    /// it does not present a boxless layer as one sitting at the origin.
+    pub(crate) geometry: Option<NodeGeometry>,
     pub(crate) x: f64,
     pub(crate) y: f64,
     pub(crate) width: f64,
@@ -905,6 +913,103 @@ pub(crate) fn classify_node_kind(node: &CanvasNode, is_master: bool) -> NodeKind
     }
 }
 
+/// The world-space box the inspector reports for one node: the position and
+/// size of the same rectangle the canvas draws around the selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct NodeGeometry {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
+}
+
+/// Whether a box has real extent on both axes. A stored box that collapsed to
+/// zero — an auto-layout Hug that measured no content, a solver that ran before
+/// its container had one — describes nothing on screen, so the inspector treats
+/// it as no box rather than as a 0×0 node.
+fn has_extent(bounds: &Bounds) -> bool {
+    bounds.width() > 0.0 && bounds.height() > 0.0
+}
+
+/// The node's box in its OWN space: the box `canvas::authored_selection_bounds`
+/// draws the selection rectangle around, so the inspector's numbers and that
+/// rectangle describe the same thing.
+///
+/// A group is the interesting case, because it stores a box only when it clips
+/// (`clip_size`) or was authored with one (`local_size`) and otherwise takes its
+/// extent from its children. Two departures from `Scene::local_bounds`, both
+/// about a stored box that collapsed to zero — which a plain group never clips
+/// to, so its children go on rendering at full size while the box claims 0×0:
+///
+/// * the collapsed box is ignored in favor of the content, instead of being
+///   reported as a sizeless node sitting at the group's origin;
+/// * the content union is walked here rather than read back from
+///   `Scene::local_bounds`, which unions the collapsed box *in* (dragging the
+///   reported corner back to the group's own 0,0) and short-circuits a clipping
+///   group straight to its clip rect.
+pub(crate) fn selection_local_bounds(doc: &Doc, id: NodeId) -> Option<Bounds> {
+    let node = doc.scene.get(id)?;
+    let NodeData::Group(group) = &node.data else {
+        return doc.scene.local_bounds(id);
+    };
+    let stored = group
+        .clip_size
+        .or(group.local_size)
+        .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height));
+    match stored {
+        Some(bounds) if has_extent(&bounds) => Some(bounds),
+        // Sizeless: the scene's memoized subtree union already IS the content
+        // box, and answers in O(1) once warm.
+        None => doc.scene.local_bounds(id),
+        // Collapsed: measure the content, keeping the collapsed box only when
+        // there is no content to measure.
+        collapsed => group_content_bounds(doc, id).or(collapsed),
+    }
+}
+
+/// Union of `id`'s children in `id`'s own space. Each child's bounds come from
+/// the scene's memo, so this is O(children) and not a subtree walk.
+fn group_content_bounds(doc: &Doc, id: NodeId) -> Option<Bounds> {
+    let mut content: Option<Bounds> = None;
+    for &child in doc.scene.children_of(Some(id)) {
+        let Some(child_node) = doc.scene.get(child) else {
+            continue;
+        };
+        let Some(child_bounds) = doc.scene.local_bounds(child) else {
+            continue;
+        };
+        let Some(in_group_space) = child_bounds.try_transformed(&child_node.transform) else {
+            continue;
+        };
+        content = Some(match content {
+            Some(content) => content.union(&in_group_space),
+            None => in_group_space,
+        });
+    }
+    content
+}
+
+/// Position and size for the inspector's X/Y/W/H, or `None` for a node with no
+/// box at all — a group with neither a stored box nor bounded content, such as
+/// an empty page root. The size is the box's ORIENTED edge lengths, so rotating
+/// a node does not change the W/H readout; the position is the corner of its
+/// axis-aligned world box, which is where the canvas's selection rectangle
+/// starts.
+pub(crate) fn selection_world_geometry(doc: &Doc, id: NodeId) -> Option<NodeGeometry> {
+    let local = selection_local_bounds(doc, id)?;
+    let transform = doc.scene.world_transform(id)?;
+    let world = local.try_transformed(&transform)?;
+    let top_left = transform.transform_point(DVec2::new(local.min_x, local.min_y));
+    let top_right = transform.transform_point(DVec2::new(local.max_x, local.min_y));
+    let bottom_left = transform.transform_point(DVec2::new(local.min_x, local.max_y));
+    Some(NodeGeometry {
+        x: world.min_x,
+        y: world.min_y,
+        width: (top_right - top_left).length(),
+        height: (bottom_left - top_left).length(),
+    })
+}
+
 pub(crate) fn node_section(
     doc: &Doc,
     id: NodeId,
@@ -913,14 +1018,11 @@ pub(crate) fn node_section(
     let node = doc.scene.get(id)?;
     let master_id = masters.get(&id).copied();
     let kind = classify_node_kind(node, master_id.is_some());
-    let bounds = doc.scene.world_bounds(id);
-    let (x, y) = bounds
-        .map(|bounds| (bounds.min_x, bounds.min_y))
-        .unwrap_or((0.0, 0.0));
-    let (width, height) = inspector_world_size(doc, id)
-        .or_else(|| bounds.map(|bounds| (bounds.width(), bounds.height())))
-        .unwrap_or((0.0, 0.0));
+    let geometry = selection_world_geometry(doc, id);
+    let (x, y) = geometry.map_or((0.0, 0.0), |geometry| (geometry.x, geometry.y));
+    let (width, height) = geometry.map_or((0.0, 0.0), |geometry| (geometry.width, geometry.height));
     Some(NodeSection {
+        geometry,
         id,
         kind,
         type_name: node_type_name(node, kind).into(),
@@ -1447,15 +1549,12 @@ pub(crate) fn multi_section(
     for &id in ids {
         // Each geometry read is skipped once every property it feeds is
         // already mixed — with many nodes the usual case after a handful.
-        if !(x.is_mixed() && y.is_mixed()) {
-            let bounds = doc.scene.world_bounds(id);
-            x.merge(bounds.map(|bounds| bounds.min_x));
-            y.merge(bounds.map(|bounds| bounds.min_y));
-        }
-        if !(width.is_mixed() && height.is_mixed()) {
-            let size = inspector_world_size(doc, id);
-            width.merge(size.map(|size| size.0));
-            height.merge(size.map(|size| size.1));
+        if !(x.is_mixed() && y.is_mixed() && width.is_mixed() && height.is_mixed()) {
+            let geometry = selection_world_geometry(doc, id);
+            x.merge(geometry.map(|geometry| geometry.x));
+            y.merge(geometry.map(|geometry| geometry.y));
+            width.merge(geometry.map(|geometry| geometry.width));
+            height.merge(geometry.map(|geometry| geometry.height));
         }
         if !rotation.is_mixed() {
             rotation.merge(
@@ -2106,5 +2205,178 @@ pub(crate) mod tests {
             &mut colors,
         );
         assert!(colors.is_empty());
+    }
+
+    /// A 200×80 rectangle parented to `parent`, offset by (`x`, `y`).
+    fn child_rect(parent: NodeId, x: f64, y: f64) -> CanvasNode {
+        let mut child = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            200.0,
+            80.0,
+            FantaColor::BLACK,
+        )));
+        child.parent = Some(parent);
+        child.transform = Transform2D::translation(x, y);
+        child
+    }
+
+    /// A doc holding one group (`data`) with `children` rectangles under it.
+    fn doc_with_group(data: NodeData, children: &[(f64, f64)]) -> (Doc, NodeId) {
+        let mut doc = Doc::new();
+        let group = CanvasNode::new(data);
+        let group_id = group.id;
+        doc.scene.insert(group).expect("insert group");
+        for (x, y) in children {
+            doc.scene
+                .insert(child_rect(group_id, *x, *y))
+                .expect("insert child");
+        }
+        (doc, group_id)
+    }
+
+    fn geometry(doc: &Doc, id: NodeId) -> (f64, f64, f64, f64) {
+        let section = node_section(doc, id, &HashMap::new()).expect("node section");
+        (section.x, section.y, section.width, section.height)
+    }
+
+    #[test]
+    fn an_unclipped_group_reports_the_box_its_children_span() {
+        let (doc, group_id) = doc_with_group(
+            NodeData::Group(GroupNode::default()),
+            &[(100.0, 50.0), (400.0, 50.0)],
+        );
+        assert_eq!(geometry(&doc, group_id), (100.0, 50.0, 500.0, 80.0));
+        assert!(
+            node_section(&doc, group_id, &HashMap::new())
+                .expect("node section")
+                .geometry
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_clipped_frame_reports_its_clip_box_even_when_content_overflows_it() {
+        let (doc, frame_id) = doc_with_group(
+            NodeData::Group(GroupNode {
+                clip_size: Some([300.0, 120.0]),
+                ..GroupNode::default()
+            }),
+            &[(-50.0, -40.0)],
+        );
+        assert_eq!(geometry(&doc, frame_id), (0.0, 0.0, 300.0, 120.0));
+    }
+
+    #[test]
+    fn a_frame_that_does_not_clip_still_reports_its_own_box_not_the_overflow() {
+        // "Clip content" off widens `Scene::local_bounds` to the union with the
+        // overflowing child, but the frame's position and size — and the
+        // rectangle the canvas draws around it — are still its own box.
+        let (mut doc, frame_id) = doc_with_group(
+            NodeData::Group(GroupNode {
+                clip_size: Some([300.0, 120.0]),
+                ..GroupNode::default()
+            }),
+            &[(-50.0, -40.0)],
+        );
+        doc.scene.get_mut(frame_id).expect("the frame").meta =
+            serde_json::json!({ "clip_content": false });
+        assert_eq!(
+            doc.scene.local_bounds(frame_id).map(|bounds| bounds.min_x),
+            Some(-50.0),
+            "precondition: the scene's local bounds swallow the overflow"
+        );
+        assert_eq!(geometry(&doc, frame_id), (0.0, 0.0, 300.0, 120.0));
+    }
+
+    #[test]
+    fn a_group_whose_stored_box_collapsed_reports_the_content_it_still_shows() {
+        // An auto-layout Hug that measured no content leaves a 0×0 box behind.
+        // A plain group never clips, so its children keep rendering at full
+        // size; reporting the collapsed box gave the inspector X/Y/W/H all zero
+        // for a group plainly sitting somewhere with a size.
+        let (doc, group_id) = doc_with_group(
+            NodeData::Group(GroupNode {
+                local_size: Some([0.0, 0.0]),
+                ..GroupNode::default()
+            }),
+            &[(100.0, 50.0)],
+        );
+        assert_eq!(geometry(&doc, group_id), (100.0, 50.0, 200.0, 80.0));
+    }
+
+    #[test]
+    fn a_rotated_group_keeps_its_size_and_reports_its_boxs_world_corner() {
+        let (mut doc, group_id) =
+            doc_with_group(NodeData::Group(GroupNode::default()), &[(0.0, 0.0)]);
+        doc.scene
+            .set_transform(group_id, Transform2D::rotation(std::f64::consts::FRAC_PI_2))
+            .expect("rotate the group");
+        let (x, y, width, height) = geometry(&doc, group_id);
+        // A quarter turn about the origin sends the 200×80 box to
+        // x ∈ [-80, 0], y ∈ [0, 200]; the size is the box's edge lengths, which
+        // rotation does not change.
+        assert!((x - -80.0).abs() < 1e-9, "x was {x}");
+        assert!(y.abs() < 1e-9, "y was {y}");
+        assert!((width - 200.0).abs() < 1e-9, "width was {width}");
+        assert!((height - 80.0).abs() < 1e-9, "height was {height}");
+    }
+
+    #[test]
+    fn a_scaled_group_reports_the_size_its_scale_draws() {
+        let (mut doc, group_id) =
+            doc_with_group(NodeData::Group(GroupNode::default()), &[(10.0, 20.0)]);
+        doc.scene
+            .set_transform(group_id, Transform2D::scale(2.0))
+            .expect("scale the group");
+        assert_eq!(geometry(&doc, group_id), (20.0, 40.0, 400.0, 160.0));
+    }
+
+    #[test]
+    fn a_page_root_reports_the_box_its_content_spans() {
+        // Page roots are deliberately unsized (the importer strips `local_size`
+        // and `clip_size`), so their box is whatever their content spans.
+        let (mut doc, page_id) = doc_with_group(
+            NodeData::Group(GroupNode::default()),
+            &[(120.0, 60.0), (520.0, 60.0)],
+        );
+        doc.add_page(page_id);
+        assert_eq!(geometry(&doc, page_id), (120.0, 60.0, 600.0, 80.0));
+    }
+
+    #[test]
+    fn a_page_root_with_no_content_has_no_box_at_all() {
+        let (mut doc, page_id) = doc_with_group(NodeData::Group(GroupNode::default()), &[]);
+        doc.add_page(page_id);
+        let section = node_section(&doc, page_id, &HashMap::new()).expect("node section");
+        assert_eq!(
+            section.geometry, None,
+            "an unsized empty page root has no box"
+        );
+        // The flattened fields still have to hold a number; surfaces that can
+        // say "no value" read `geometry` instead of these.
+        assert_eq!(
+            (section.x, section.y, section.width, section.height),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn multi_selection_geometry_reads_the_same_boxes_as_a_single_selection() {
+        let (doc, group_id) = doc_with_group(
+            NodeData::Group(GroupNode {
+                local_size: Some([0.0, 0.0]),
+                ..GroupNode::default()
+            }),
+            &[(100.0, 50.0)],
+        );
+        let child = doc.scene.children_of(Some(group_id))[0];
+        let section = multi_section(&doc, &[group_id, child], &HashMap::new());
+        // The collapsed group and its child span the same box, so every field
+        // reads as one shared value rather than mixed.
+        assert_eq!(section.x, Some(100.0));
+        assert_eq!(section.y, Some(50.0));
+        assert_eq!(section.width, Some(200.0));
+        assert_eq!(section.height, Some(80.0));
     }
 }

@@ -273,23 +273,23 @@ impl PathData {
         out
     }
 
-    /// Cheap AABB over only the explicit segment endpoints. **Does not** chase
-    /// Bézier extrema — control points can poke outside this rect. Sufficient
-    /// for hit-test fast rejection; render layer will compute the tight bbox
-    /// for cache-keying.
+    /// Conservative AABB over finite endpoints and Bézier control points.
+    /// A Bézier curve lies within its control-point convex hull; endpoint-only
+    /// bounds can exclude visible curve bodies from picking and culling.
     pub fn rough_bounds(&self) -> Option<crate::transform::Bounds> {
-        let mut points = self
-            .segments
-            .iter()
-            .filter_map(PathSegment::end_point)
-            .filter(|p| p.x.is_finite() && p.y.is_finite());
-        let first = points.next()?;
-        let (mut min, mut max) = (first, first);
-        for p in points {
-            min = min.min(p);
-            max = max.max(p);
+        let mut bounds: Option<crate::transform::Bounds> = None;
+        for mut segment in self.segments.iter().copied() {
+            segment.map_points(|point| {
+                let position = glam::DVec2::from(point);
+                if position.is_finite() {
+                    let point_bounds = crate::transform::Bounds::from_min_max(position, position);
+                    bounds =
+                        Some(bounds.map_or(point_bounds, |bounds| bounds.union(&point_bounds)));
+                }
+                point
+            });
         }
-        Some(crate::transform::Bounds::from_min_max(min, max))
+        bounds
     }
 
     // ---- SVG `d=` interop ---------------------------------------------------

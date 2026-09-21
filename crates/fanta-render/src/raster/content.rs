@@ -87,7 +87,11 @@ pub(crate) fn paint_node_content(
             // spills past it — chiefly a stroke thickened beyond the box — is
             // cropped instead of growing the shape. The canvas already carries the
             // node's transform, so `[0,0,w,h]` is the box in local coordinates.
-            let viewport = v.local_size;
+            let viewport = if node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR) {
+                None
+            } else {
+                v.local_size
+            };
             if let Some([w, h]) = viewport {
                 canvas.save();
                 canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);
@@ -391,11 +395,32 @@ fn paint_video(canvas: &Canvas, v: &VideoNode, scene_id: Option<NodeId>, ctx: &m
     // frame id degrades to the poster, never the blank card.
     let mut drawn = false;
     let mut showing_frame = false;
+    if let Some(image) = pb.and_then(|playback| playback.decoded_frame.as_ref()) {
+        canvas.save();
+        super::media::clip_media(canvas, v.local_size);
+        drawn = crate::image::blit_sk_image(
+            canvas,
+            image,
+            image.width() as u32,
+            image.height() as u32,
+            v.local_size,
+            None,
+            v.fit,
+            None,
+            1.0,
+            super::ImageFillMods::default(),
+        );
+        canvas.restore();
+        showing_frame = drawn;
+    }
     for (is_frame, asset) in frame
         .map(|a| (true, a))
         .into_iter()
         .chain(v.poster.map(|a| (false, a)))
     {
+        if drawn {
+            break;
+        }
         canvas.save();
         super::media::clip_media(canvas, v.local_size);
         let ok = draw_image_cached(

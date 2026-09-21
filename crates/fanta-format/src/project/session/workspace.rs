@@ -799,10 +799,9 @@ impl WorkspaceSession {
         let files = [
             ("graphics.fnx", ir.print().into_bytes()),
             ("graphics.ids.json", {
-                let mut b = serde_json::to_vec_pretty(ir.sidecar())
+                let sidecar_value = serde_json::to_value(ir.sidecar())
                     .map_err(|e| SessionError::other(e.to_string()))?;
-                b.push(b'\n');
-                b
+                crate::project::layout::json_bytes(&sidecar_value)?
             }),
             (
                 "graphics.json",

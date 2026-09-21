@@ -604,6 +604,96 @@ fn commit_text_to_scene_and_save() {
     assert_eq!(doc.scene.get(page).unwrap().name, "Landing");
 }
 
+fn assert_session_sidecar_uses_canonical_json(text_edit: bool) {
+    let (directory, page) = page_fixture();
+    let source_path = crate::locate_page_source(directory.path(), page).expect("page source");
+    let sidecar_path = source_path.with_file_name("page.ids.json");
+    let original: fanta_fnx::FnxSidecar =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).expect("original sidecar"))
+            .expect("original identities");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("open project");
+    let id = ArtifactId::Page(page);
+    workspace.open_artifact(id.clone()).expect("open page");
+    let artifact = workspace.artifact_mut(&id).expect("page session");
+    let child = *artifact
+        .doc()
+        .scene
+        .children_of(Some(page))
+        .first()
+        .expect("card node");
+    let authored_source = if text_edit {
+        let source = artifact.begin_text_edit().expect("begin code edit").clone();
+        let changed = source.replacen("name=\"Card\"", "name=\"Renamed\"", 1);
+        artifact.set_text(changed.clone()).expect("rename in code");
+        assert!(matches!(artifact.state, ArtifactDirty::DirtyText));
+        Some(changed)
+    } else {
+        artifact
+            .apply(Operation::SetName {
+                id: child,
+                old: "Card".into(),
+                new: "Renamed".into(),
+            })
+            .expect("rename on canvas");
+        assert!(matches!(artifact.state, ArtifactDirty::DirtyCanvas));
+        None
+    };
+    let files = artifact.project_to_files().expect("project edited page");
+    let (_, bytes) = files
+        .iter()
+        .find(|(name, _)| name == "page.ids.json")
+        .expect("projected sidecar");
+    let value: Value = serde_json::from_slice(bytes).expect("sidecar JSON");
+    assert_eq!(
+        *bytes,
+        crate::project::layout::json_bytes(&value).expect("canonical sidecar")
+    );
+    let projected: fanta_fnx::FnxSidecar =
+        serde_json::from_slice(bytes).expect("projected identities");
+    assert_eq!(
+        projected
+            .ids
+            .iter()
+            .map(|entry| &entry.id)
+            .collect::<Vec<_>>(),
+        original
+            .ids
+            .iter()
+            .map(|entry| &entry.id)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        projected
+            .ids
+            .iter()
+            .any(|entry| entry.name.as_deref() == Some("Renamed"))
+    );
+    if let Some(authored_source) = authored_source {
+        let (_, source) = files
+            .iter()
+            .find(|(name, _)| name == "page.fnx")
+            .expect("projected source");
+        assert_eq!(source.as_slice(), authored_source.as_bytes());
+    }
+    assert_eq!(
+        std::fs::read(&sidecar_path).expect("untouched disk sidecar"),
+        crate::project::layout::json_bytes(
+            &serde_json::to_value(&original).expect("original value")
+        )
+        .expect("original canonical bytes")
+    );
+}
+
+#[test]
+fn text_session_sidecar_matches_canonical_project_json() {
+    assert_session_sidecar_uses_canonical_json(true);
+}
+
+#[test]
+fn canvas_session_sidecar_matches_canonical_project_json() {
+    assert_session_sidecar_uses_canonical_json(false);
+}
+
 #[test]
 fn unknown_attribute_typo_commits_with_a_warning_and_resets_on_clean_commit() {
     let (dir, page) = page_fixture();
@@ -777,6 +867,38 @@ fn create_and_open_graphics() {
     let art = ws.artifact(&gid).unwrap();
     assert_eq!(art.kind, ArtifactKind::Graphics);
     assert!(matches!(art.state, ArtifactDirty::Clean));
+}
+
+#[test]
+fn new_graphics_sidecar_matches_canonical_project_json() {
+    let (directory, _page) = page_fixture();
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("open project");
+    let id = workspace
+        .create_graphics_artifact("canonical-icons", "Canonical Icons")
+        .expect("create graphics");
+    let bytes = std::fs::read(
+        directory
+            .path()
+            .join("graphics/canonical-icons/graphics.ids.json"),
+    )
+    .expect("graphics sidecar");
+    let value: Value = serde_json::from_slice(&bytes).expect("graphics sidecar JSON");
+    assert_eq!(
+        bytes,
+        crate::project::layout::json_bytes(&value).expect("canonical sidecar")
+    );
+    workspace
+        .open_artifact(id.clone())
+        .expect("open created graphics");
+    let artifact = workspace.artifact(&id).expect("graphics session");
+    let files = artifact
+        .project_to_files()
+        .expect("reproject created graphics");
+    let (_, projected) = files
+        .iter()
+        .find(|(name, _)| name == "graphics.ids.json")
+        .expect("reprojected sidecar");
+    assert_eq!(*projected, bytes);
 }
 
 #[test]

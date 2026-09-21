@@ -29,20 +29,19 @@ use fanta_gpui::design::{
     DesignComponentReference, DesignComponentRole, DesignCornerCapabilities, DesignEffect,
     DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop,
     DesignLayout, DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
-    DesignPageBackground, DesignPageViewData, DesignPaint, DesignPaintKind, DesignPaintProperty,
-    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
-    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
-    DesignPanelEditPhase, DesignPanelInspectionContext, DesignPanelMultipleSelection,
-    DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout,
-    DesignPanelPermissions, DesignPanelProperty, DesignPanelPropertyValueState, DesignPanelSection,
-    DesignPanelTarget, DesignPanelValue, DesignSizingMode, DesignStroke, DesignStrokeAlign,
-    DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeJoin,
-    DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
-    DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment,
-    DesignTransformOperation, DesignTypography,
+    DesignPaint, DesignPaintKind, DesignPaintProperty, DesignPaintValue, DesignPanel,
+    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
+    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
+    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
+    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelTarget, DesignPanelValue,
+    DesignSizingMode, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
+    DesignStrokeDashes, DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights,
+    DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
+    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 
+use super::design_snapshot::build_design_view_data;
 use crate::color_picker::GradientKind;
 use crate::document::{DocChange, FigDocument};
 use crate::properties_ops::{
@@ -56,7 +55,7 @@ use crate::properties_ops::{
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
     CornerRadiusValue, InspectorField, NodeSection, NodeSnapshot, PaintSnapshot, PropValueSnapshot,
-    TypographySnapshot, master_roots, multi_section, node_section, page_section,
+    TypographySnapshot, multi_section, node_section,
 };
 use crate::view::FigView;
 
@@ -528,12 +527,40 @@ fn gate_capabilities(
     capabilities
 }
 
-/// The complete controlled read model for one selected node.
+/// The X/Y/W/H states for a node the engine can derive no box for: a group with
+/// neither a stored box nor bounded content, an empty page root being the one
+/// that shows up in practice. Every panel field needs a number, so the read
+/// model carries zeros there — and "0, 0, 0×0" reads as a real layer sitting at
+/// the origin. `Unset` renders as "—" instead, and the read-only wrapper stops
+/// an edit whose base value would be a fiction.
+fn boxless_geometry_states(section: &NodeSection) -> PropertyStates {
+    if section.geometry.is_some() {
+        return Vec::new();
+    }
+    [
+        DesignPanelProperty::X,
+        DesignPanelProperty::Y,
+        DesignPanelProperty::Width,
+        DesignPanelProperty::Height,
+    ]
+    .into_iter()
+    .map(|property| {
+        (
+            property,
+            DesignPanelPropertyValueState::Unset
+                .read_only_with_reason("This layer has no size of its own"),
+        )
+    })
+    .collect()
+}
+
+/// The complete controlled read model for one selected node, paired with the
+/// property states that come from the node's geometry rather than a binding.
 pub(crate) fn design_node(
     document: &FigDocument,
     id: NodeId,
     masters: &HashMap<NodeId, ComponentId>,
-) -> Option<DesignPanelNode> {
+) -> Option<(DesignPanelNode, PropertyStates)> {
     let doc = &document.doc;
     let section = node_section(doc, id, masters)?;
     let node = doc.scene.get(id)?;
@@ -697,7 +724,8 @@ pub(crate) fn design_node(
         node.is_mask,
         out.corner_capabilities,
     ));
-    Some(out)
+    let states = boxless_geometry_states(&section);
+    Some((out, states))
 }
 
 /// Pass through is modeled from `ISOLATED_BLEND` inverted: a Normal-blend
@@ -715,7 +743,7 @@ fn display_blend_mode(kind: DesignPanelNodeKind, node: &fanta_doc::CanvasNode) -
     }
 }
 
-fn parent_layout_for(doc: &Doc, id: NodeId) -> DesignPanelParentLayout {
+pub(crate) fn parent_layout_for(doc: &Doc, id: NodeId) -> DesignPanelParentLayout {
     let Some(node) = doc.scene.get(id) else {
         return DesignPanelParentLayout::Canvas;
     };
@@ -751,7 +779,11 @@ fn parent_layout_for(doc: &Doc, id: NodeId) -> DesignPanelParentLayout {
 
 /// A minimal member node for the non-aggregate tail of a multiple selection:
 /// only its identity participates in target validation.
-fn member_node(doc: &Doc, id: NodeId, masters: &HashMap<NodeId, ComponentId>) -> DesignPanelNode {
+pub(crate) fn member_node(
+    doc: &Doc,
+    id: NodeId,
+    masters: &HashMap<NodeId, ComponentId>,
+) -> DesignPanelNode {
     let (name, kind) = doc
         .scene
         .get(id)
@@ -766,10 +798,10 @@ fn member_node(doc: &Doc, id: NodeId, masters: &HashMap<NodeId, ComponentId>) ->
     node
 }
 
-type PropertyStates = Vec<(DesignPanelProperty, DesignPanelPropertyValueState)>;
+pub(crate) type PropertyStates = Vec<(DesignPanelProperty, DesignPanelPropertyValueState)>;
 
 /// Aggregate visual model + mixed/uniform states for a multiple selection.
-fn aggregate_selection(
+pub(crate) fn aggregate_selection(
     document: &FigDocument,
     ids: &[NodeId],
     masters: &HashMap<NodeId, ComponentId>,
@@ -831,7 +863,7 @@ fn aggregate_selection(
 }
 
 /// Bound-state projection for the whole-node `BoundProp`s the panel displays.
-fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
+pub(crate) fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
     let Some(node) = doc.scene.get(id) else {
         return Vec::new();
     };
@@ -922,9 +954,25 @@ impl DesignAdapter {
 // =============================================================================
 
 impl FigView {
-    /// Echo document state into the DesignPanel: inspection context, property
-    /// value states, and Page view data, memoized on (selection identity,
-    /// render generation, editability, page).
+    /// Echo document state into the DesignPanel — inspection context, property
+    /// value states, and Page view data — built as one snapshot by
+    /// [`build_design_view_data`] and memoized on (selection identity, render
+    /// generation, editability, page).
+    ///
+    /// The snapshot is *applied* through the granular setters rather than
+    /// `DesignPanel::set_view_data`, because the complete-snapshot path is not
+    /// yet echo-safe for this host: it routes every `None` projection through
+    /// the matching `apply_clear_*`, and `apply_clear_export_view_data` is the
+    /// one sibling without an idempotence guard. This adapter gates exports
+    /// off, so its export projection is permanently `None` and that unguarded
+    /// clear would run on *every* echo — including one where only the render
+    /// generation moved — tearing down and rebuilding each per-property
+    /// `Entity<SelectState>` dropdown (`clear_option_interactions`) and losing
+    /// the transient state of an open popup. The granular setters touch only
+    /// what this adapter actually owns. Switch to `set_view_data` (and restore
+    /// the panel-owned-state retention it needs) once the library's
+    /// `apply_clear_export_view_data` early-returns when there is nothing to
+    /// clear.
     pub(crate) fn refresh_gpui_design(&mut self, cx: &mut Context<Self>) {
         if self.gpui_design.is_none() {
             return;
@@ -957,88 +1005,39 @@ impl FigView {
             {
                 return;
             }
-            let masters = master_roots(&doc.components);
-            let permissions = if editable {
-                DesignPanelPermissions::editor()
-            } else {
-                DesignPanelPermissions::viewer()
-            };
-            let (context, states) = match selection.as_slice() {
-                [] => (DesignPanelInspectionContext::page(permissions), Vec::new()),
-                [id] => match design_node(document, *id, &masters) {
-                    Some(node) => {
-                        let states = bound_states(doc, *id);
-                        (
-                            DesignPanelInspectionContext::single(
-                                node,
-                                parent_layout_for(doc, *id),
-                                permissions,
-                            ),
-                            states,
-                        )
-                    }
-                    None => (DesignPanelInspectionContext::page(permissions), Vec::new()),
-                },
-                ids => {
-                    let (aggregate, states) = aggregate_selection(document, ids, &masters);
-                    let mut members = ids.iter().skip(1).map(|id| member_node(doc, *id, &masters));
-                    let second = members
-                        .next()
-                        .unwrap_or_else(|| member_node(doc, ids[0], &masters));
-                    // Every member's parent layout must agree or the context
-                    // degrades to Mixed, matching the panel's contract.
-                    let mut layouts = ids.iter().map(|id| parent_layout_for(doc, *id));
-                    let first_layout = layouts.next().unwrap_or(DesignPanelParentLayout::Canvas);
-                    let parent_layout = if layouts.all(|layout| layout == first_layout) {
-                        first_layout
-                    } else {
-                        DesignPanelParentLayout::Mixed
-                    };
-                    (
-                        DesignPanelInspectionContext::multiple(
-                            DesignPanelMultipleSelection::with_remaining(
-                                aggregate, second, members,
-                            ),
-                            parent_layout,
-                            permissions,
-                        ),
-                        states,
-                    )
-                }
-            };
-            let page_data = selection.is_empty().then(|| {
-                let page = page_section(document, page_index);
-                let background = match page.background {
-                    Some(crate::properties_snapshot::PageBackgroundValue::Solid(color)) => {
-                        DesignPageBackground::new(design_color(color))
-                    }
-                    Some(_) => DesignPageBackground::new(DesignColor::WHITE)
-                        .read_only("Non-solid page backgrounds are edited on canvas"),
-                    None => DesignPageBackground::new(design_color(
-                        crate::properties_ops::DEFAULT_PAGE_BACKGROUND,
-                    )),
-                };
-                let page_id = page
-                    .id
-                    .map(|root| root.to_string())
-                    .unwrap_or_else(|| format!("page-{}", page_index.unwrap_or(0)));
-                DesignPageViewData::canonical(page_id, background)
-            });
-            Some((key, context, states, page_data))
+            // The document speaks for the inspection context, the property
+            // states, and — only for an empty selection — the Page
+            // projection. The panel keeps the Page projection it already has
+            // while a node is selected, so thread the live value back in.
+            let previous_page = self
+                .gpui_design
+                .as_ref()
+                .and_then(|adapter| adapter.panel.read(cx).page_view_data().cloned());
+            let view_data =
+                build_design_view_data(document, &selection, page_index, editable, previous_page);
+            Some((key, view_data))
         };
-        let Some((key, context, states, page_data)) = built else {
+        let Some((key, mut view_data)) = built else {
             return;
         };
+        // Granular, not `set_view_data` — see this method's docs. Page first,
+        // then context, then states: the order the panel's own setters were
+        // called in before the snapshot builder existed. Re-applying an
+        // unchanged Page projection is a no-op inside `apply_page_view_data`,
+        // so carrying the retained value forward costs nothing.
+        let page_view_data = view_data.projections.page.take();
+        let inspection_context = view_data.inspection_context;
+        let property_states = view_data.property_states;
         let Some(adapter) = self.gpui_design.as_mut() else {
             return;
         };
         adapter.last_echo = Some(key);
         adapter.panel.update(cx, |panel, cx| {
-            if let Some(page_data) = page_data {
-                panel.set_page_view_data(page_data, cx);
+            if let Some(page_view_data) = page_view_data {
+                panel.set_page_view_data(page_view_data, cx);
             }
-            panel.set_inspection_context(context, cx);
-            panel.set_property_value_states(states, cx);
+            panel.set_inspection_context(inspection_context, cx);
+            panel.set_property_value_states(property_states, cx);
         });
     }
 
@@ -2826,10 +2825,15 @@ mod tests {
     use std::path::PathBuf;
 
     use fanta_doc::{CanvasNode, Doc, GroupNode, VectorNode};
+    use fanta_gpui::design::{
+        DesignPageBackground, DesignPageViewData, DesignPanelInspectionContext,
+        DesignPanelPermissions, DesignPanelSurface,
+    };
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use project::{FakeFs, Project};
 
     use super::*;
+    use crate::properties_snapshot::master_roots;
     use crate::view::FigView;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -3294,6 +3298,303 @@ mod tests {
                     "one undo restores the whole multi-node edit"
                 );
             }
+        });
+    }
+    /// A page holding a group whose stored box collapsed to 0×0 (what an
+    /// auto-layout Hug leaves behind when it measures no content) around a
+    /// 200×100 rectangle at (10, 20) in the group's space. A plain group never
+    /// clips, so the rectangle keeps rendering at full size.
+    fn doc_with_collapsed_group() -> (Doc, NodeId) {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([0.0, 0.0]),
+            ..GroupNode::default()
+        }));
+        group.name = "Collapsed".to_owned();
+        group.parent = Some(page_id);
+        let group_id = group.id;
+        doc.scene.insert(group).expect("insert group");
+        let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            200.0,
+            100.0,
+            FantaColor::rgb(0xe0, 0x30, 0x30),
+        )));
+        rect.transform = Transform2D::translation(10.0, 20.0);
+        rect.parent = Some(group_id);
+        doc.scene.insert(rect).expect("insert rect");
+        (doc, group_id)
+    }
+
+    #[test]
+    fn a_layer_with_no_box_reports_no_value_rather_than_a_zero() {
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        doc.add_page(page_id);
+
+        let section = node_section(&doc, page_id, &HashMap::new()).expect("node section");
+        let states = boxless_geometry_states(&section);
+        assert_eq!(
+            states
+                .iter()
+                .map(|(property, _)| *property)
+                .collect::<Vec<_>>(),
+            vec![
+                DesignPanelProperty::X,
+                DesignPanelProperty::Y,
+                DesignPanelProperty::Width,
+                DesignPanelProperty::Height,
+            ]
+        );
+        for (property, state) in &states {
+            assert!(state.is_unset(), "{property:?} renders as no value");
+            assert!(state.is_read_only(), "{property:?} refuses an edit");
+        }
+    }
+
+    #[test]
+    fn a_layer_with_a_box_keeps_its_geometry_fields_live() {
+        let (doc, group_id) = doc_with_collapsed_group();
+        let section = node_section(&doc, group_id, &HashMap::new()).expect("node section");
+        assert!(
+            boxless_geometry_states(&section).is_empty(),
+            "a layer whose box is derivable keeps editable X/Y/W/H"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_collapsed_group_echoes_the_box_its_content_still_draws(cx: &mut TestAppContext) {
+        let (mut doc, group_id) = doc_with_collapsed_group();
+        doc.selection.replace_with([group_id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let node = panel.node();
+            assert_eq!(node.kind, DesignPanelNodeKind::Group);
+            // The stored box says 0×0; the group is plainly at (10, 20) with a
+            // 200×100 child that nothing clips.
+            assert_eq!((node.x, node.y), (10.0, 20.0));
+            assert_eq!((node.width, node.height), (200.0, 100.0));
+        });
+    }
+
+    /// The snapshot must carry exactly what the three granular setters carry —
+    /// inspection context, property value states, Page projection — and must
+    /// not drop the Page projection a selected node cannot derive. The granular
+    /// echo simply skips `set_page_view_data` there; a snapshot omitting
+    /// `projections.page` would wipe it instead.
+    ///
+    /// This exercises `DesignPanel::set_view_data` directly to pin the
+    /// snapshot's completeness. `refresh_gpui_design` deliberately does *not*
+    /// use that entry point yet — see its docs, and
+    /// `the_echo_keeps_the_page_projection_and_panel_owned_state` for the path
+    /// the host actually takes.
+    #[gpui::test]
+    async fn snapshot_round_trips_through_view_data(cx: &mut TestAppContext) {
+        let (mut doc, page_id, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let editable = item.read_with(cx, |item, _| item.is_editable());
+        assert!(editable, "the fixture item is editable");
+
+        // A Page projection the panel already holds, exactly as an earlier
+        // empty-selection echo would have left it behind.
+        let retained_page = DesignPageViewData::canonical(
+            page_id.to_string(),
+            DesignPageBackground::new(DesignColor::rgb(0x12, 0x34, 0x56)),
+        );
+
+        let (view_data, expected_context, expected_states) = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document ready");
+            let view_data = build_design_view_data(
+                document,
+                &[rect],
+                None,
+                editable,
+                Some(retained_page.clone()),
+            );
+            // What the granular path fed the three setters for this document.
+            let masters = master_roots(&document.doc.components);
+            let (node, mut states) =
+                design_node(document, rect, &masters).expect("the rect projects");
+            states.extend(bound_states(&document.doc, rect));
+            let context = DesignPanelInspectionContext::single(
+                node,
+                parent_layout_for(&document.doc, rect),
+                DesignPanelPermissions::editor(),
+            );
+            (view_data, context, states)
+        });
+        let expected_states: HashMap<_, _> = expected_states.into_iter().collect();
+
+        assert_eq!(
+            view_data.inspection_context, expected_context,
+            "the snapshot carries the context `set_inspection_context` carried"
+        );
+        assert_eq!(
+            view_data.property_states, expected_states,
+            "the snapshot carries every property state, bindings included"
+        );
+        assert_eq!(
+            view_data.projections.page.as_ref(),
+            Some(&retained_page),
+            "a selected node leaves the panel's Page projection standing"
+        );
+
+        // Round trip: the panel accepts the snapshot and reports it back.
+        panel.update_in(cx, |panel, _, cx| {
+            panel.set_view_data(view_data.clone(), cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.node().id.as_ref(),
+                rect.to_string(),
+                "the inspected node survives the snapshot"
+            );
+            assert_eq!(
+                panel.view_data().property_states,
+                expected_states,
+                "the property states survive the snapshot"
+            );
+            assert_eq!(
+                panel.page_view_data(),
+                Some(&retained_page),
+                "set_view_data kept the Page projection the snapshot carried"
+            );
+        });
+
+        // An empty selection derives the document's own Page projection, and
+        // that derived value wins over whatever the panel was holding.
+        let page_snapshot = item.read_with(cx, |item, _| {
+            build_design_view_data(
+                item.document().expect("document ready"),
+                &[],
+                None,
+                editable,
+                Some(retained_page.clone()),
+            )
+        });
+        let derived = page_snapshot
+            .projections
+            .page
+            .expect("an empty selection derives a Page projection");
+        assert_eq!(
+            derived.page_id.as_ref(),
+            page_id.to_string(),
+            "the derived projection names the selected page's root"
+        );
+        assert_ne!(
+            derived.background, retained_page.background,
+            "the document's own background replaces the retained one"
+        );
+        assert!(
+            page_snapshot.property_states.is_empty(),
+            "a Page context inspects no node and so carries no property states"
+        );
+    }
+
+    /// The echo applies the snapshot through the granular setters, so it
+    /// writes only the three halves this adapter owns.
+    ///
+    /// Two things must survive a selection change: the Page projection an
+    /// earlier empty-selection echo left behind (the document cannot re-derive
+    /// it while a node is selected), and panel-owned navigation the adapter
+    /// never wrote. Both would be cleared by a `set_view_data` handoff that
+    /// forgot to carry the panel's own half forward — and the complete-snapshot
+    /// handoff additionally drags in the unguarded
+    /// `apply_clear_export_view_data`, whose per-echo teardown of the option
+    /// dropdown entities is only observable from inside fanta-gpui.
+    #[gpui::test]
+    async fn the_echo_keeps_the_page_projection_and_panel_owned_state(cx: &mut TestAppContext) {
+        // No selection, so the first echo derives the document's own Page
+        // projection.
+        let (doc, page_id, rect) = doc_with_rect();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.page_view_data().map(|page| page.page_id.to_string()),
+                Some(page_id.to_string()),
+                "an empty selection echoes the document's Page projection"
+            );
+        });
+
+        // Panel-owned state: the adapter writes the active surface only from
+        // its own `SurfaceChangeRequested` handler, never from an echo.
+        panel.update_in(cx, |panel, _, cx| {
+            assert!(
+                panel.set_active_surface(DesignPanelSurface::Prototype, cx),
+                "Prototype is an editor surface"
+            );
+        });
+        cx.run_until_parked();
+
+        // Select the rectangle and echo again.
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([rect]);
+                ((), DocChange::Selection)
+            });
+        });
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let editable = item.read_with(cx, |item, _| item.is_editable());
+        let expected = item.read_with(cx, |item, _| {
+            // `page_index` only feeds the Page projection, which an occupied
+            // selection does not derive; the two halves compared below are
+            // independent of it.
+            build_design_view_data(
+                item.document().expect("document ready"),
+                &[rect],
+                None,
+                editable,
+                None,
+            )
+        });
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.inspection_context(),
+                &expected.inspection_context,
+                "the echo applied the inspection context"
+            );
+            assert_eq!(
+                panel.view_data().property_states,
+                expected.property_states,
+                "the echo applied the property value states"
+            );
+            assert_eq!(
+                panel.page_view_data().map(|page| page.page_id.to_string()),
+                Some(page_id.to_string()),
+                "a selected node leaves the panel's Page projection standing"
+            );
+            assert_eq!(
+                panel.active_surface(),
+                DesignPanelSurface::Prototype,
+                "the echo never writes panel-owned navigation"
+            );
         });
     }
 }

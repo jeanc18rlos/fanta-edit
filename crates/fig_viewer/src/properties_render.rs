@@ -46,7 +46,9 @@ use crate::properties_snapshot::{
 fn align_section_visible(selection_len: usize) -> bool {
     selection_len >= 2
 }
-use crate::variable_binding::{VariableBindingControl, variable_binding_model};
+use crate::variable_binding::{
+    VariableBindingControl, variable_binding_model, variable_binding_options,
+};
 
 /// Height of a boxed field / pill / control, the panel's vertical rhythm unit
 /// (the original's 30px `FIELD_BOX_H` translated to Zed density).
@@ -131,14 +133,28 @@ impl FantaPropertiesPanel {
             .doc()
             .and_then(|doc| variable_binding_model(doc, node, prop))?;
         let panel = cx.weak_entity();
+        let options_item = item.downgrade();
         Some(
-            VariableBindingControl::new(element_id, model, move |variable, _, cx| {
-                panel
-                    .update(cx, |panel, cx| {
-                        panel.set_variable_binding(node, prop, variable, cx)
-                    })
-                    .log_err();
-            })
+            VariableBindingControl::new(
+                element_id,
+                model,
+                move |cx| {
+                    options_item
+                        .read_with(cx, |item, _| {
+                            item.doc()
+                                .map(|doc| variable_binding_options(doc, prop))
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                },
+                move |variable, _, cx| {
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.set_variable_binding(node, prop, variable, cx)
+                        })
+                        .log_err();
+                },
+            )
             .disabled(!editable)
             .into_any_element(),
         )

@@ -24,6 +24,67 @@ fn group_node() -> CanvasNode {
 }
 
 #[test]
+fn curve_body_hits_survive_parent_transforms_and_spatial_index_refresh() {
+    for cubic in [false, true] {
+        let mut scene = Scene::new();
+        let mut parent = group_node();
+        parent.transform = Transform2D::rotation(0.3).then(&Transform2D::translation(200., 100.));
+        let parent_id = parent.id;
+        scene.insert(parent).expect("parent");
+        let mut path = crate::PathData::new();
+        path.move_to(0., 0.);
+        let midpoint = if cubic {
+            path.cubic_to(0., 60., 100., 60., 100., 0.);
+            DVec2::new(50., 45.)
+        } else {
+            path.quad_to(50., 80., 100., 0.);
+            DVec2::new(50., 40.)
+        };
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            ..Default::default()
+        }));
+        node.parent = Some(parent_id);
+        node.transform = Transform2D::scale_xy(2., 0.5);
+        let id = node.id;
+        scene.insert(node).expect("curve");
+        let old_point = scene
+            .world_transform(id)
+            .expect("transform")
+            .transform_point(midpoint);
+        for moved in [false, true] {
+            if moved {
+                scene.get_mut(id).expect("curve").transform =
+                    Transform2D::scale_xy(2., 0.5).then(&Transform2D::translation(300., 200.));
+                assert_eq!(scene.hit_test(old_point), None);
+            }
+            let world = scene
+                .world_transform(id)
+                .expect("transform")
+                .transform_point(midpoint);
+            assert!(
+                scene
+                    .world_bounds(id)
+                    .expect("curve bounds")
+                    .contains_point(world)
+            );
+            assert!(
+                scene
+                    .world_bounds(parent_id)
+                    .expect("parent bounds")
+                    .contains_point(world)
+            );
+            assert_eq!(scene.hit_test(world), Some(id));
+            let probe = Bounds::from_min_max(world - DVec2::splat(1.), world + DVec2::splat(1.));
+            assert_eq!(
+                scene.rect_query_where(probe, |_, bounds| bounds.intersects(&probe)),
+                vec![id]
+            );
+        }
+    }
+}
+
+#[test]
 fn insert_and_get() {
     let mut scene = Scene::new();
     let n = rect_node(0.0, 0.0, 10.0, 10.0);
@@ -1111,6 +1172,78 @@ fn clone_starts_without_a_spatial_index() {
     // And still answers hit-tests identically once it rebuilds.
     let probe = deep.scene.world_bounds(deep.b_leaf).unwrap().center();
     assert_eq!(cloned.hit_test(probe), deep.scene.hit_test(probe));
+}
+
+#[test]
+fn snapshot_stays_unchanged_across_node_and_hierarchy_edits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut deep = DeepScene::build();
+    deep.warm();
+    let snapshot = deep.scene.clone();
+    let expected = serde_json::to_value(&snapshot)?;
+    let expected_bounds = snapshot.world_bounds(deep.root_a);
+
+    deep.scene
+        .get_mut(deep.mid_leaf)
+        .ok_or(SceneError::NotFound(deep.mid_leaf))?
+        .name = "Renamed after snapshot".into();
+    deep.scene
+        .set_transform(deep.inner, Transform2D::translation(500.0, 250.0))?;
+    deep.scene.set_parent(
+        deep.sibling_leaf,
+        Some(deep.root_b),
+        deep.scene.next_child_index(Some(deep.root_b)),
+    )?;
+    deep.scene.set_index(deep.mid, IndexKey::from_raw(500.0))?;
+    let mut replacement = deep
+        .scene
+        .get(deep.b_leaf)
+        .ok_or(SceneError::NotFound(deep.b_leaf))?
+        .clone();
+    replacement.name = "Patched after snapshot".into();
+    deep.scene.patch_node(replacement, next_geometry_stamp())?;
+    let mut removed = deep.scene.remove(deep.inner)?;
+    removed.name = "Removed root is independently owned".into();
+    let mut shared_root_removed = deep.scene.remove(deep.root_a)?;
+    shared_root_removed.name = "Shared removed root is independently owned".into();
+    deep.scene
+        .insert_many([rect_node(0.0, 0.0, 20.0, 20.0), group_node()])?;
+    deep.scene.insert(rect_node(10.0, 10.0, 30.0, 30.0))?;
+
+    deep.scene.validate()?;
+    snapshot.validate()?;
+    assert_ne!(serde_json::to_value(&deep.scene)?, expected);
+    assert_eq!(serde_json::to_value(&snapshot)?, expected);
+    assert_eq!(snapshot.world_bounds(deep.root_a), expected_bounds);
+    assert_geometry_matches_cold_fold(&snapshot, &deep.all_ids());
+    Ok(())
+}
+
+#[test]
+fn snapshot_serializes_nodes_without_changing_the_document_shape()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut scene = Scene::new();
+    let node = rect_node(0.0, 0.0, 10.0, 10.0);
+    let id = node.id;
+    let expected_node = serde_json::to_value(&node)?;
+    scene.insert(node)?;
+    let snapshot = scene.clone();
+    let serialized = serde_json::to_value(&snapshot)?;
+    assert_eq!(
+        serialized
+            .get("nodes")
+            .and_then(|nodes| nodes.get(id.0.to_string())),
+        Some(&expected_node)
+    );
+
+    let mut restored: Scene = serde_json::from_value(serialized)?;
+    restored.rebuild_child_index();
+    restored.validate()?;
+    assert_eq!(restored.get(id), scene.get(id));
+    restored.get_mut(id).ok_or(SceneError::NotFound(id))?.name = "Restored edit".into();
+    assert_eq!(snapshot.get(id), scene.get(id));
+    assert_ne!(restored.get(id), snapshot.get(id));
+    Ok(())
 }
 
 #[test]

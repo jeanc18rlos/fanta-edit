@@ -5,6 +5,7 @@ use super::{
     PendingVariable, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
     VariableType, guid_key, node_name, read_color,
 };
+use std::collections::HashSet;
 
 /// Read a VARIABLE_SET's modes: (mode guid, mode name) in declaration order.
 pub(crate) fn read_set_modes(change: &KiwiValue) -> Vec<(String, String)> {
@@ -279,13 +280,18 @@ pub(crate) fn read_explicit_modes(change: &KiwiValue) -> Vec<(String, String)> {
 /// a non-group node, or one naming an unknown collection/mode, is silently
 /// skipped (partial-import resilience). Counts each applied pin in the report.
 ///
+/// Returns the collections a pin actually landed on, so
+/// [`prune_unreferenced_empty_collections`] can keep a variable-less collection
+/// that a frame pins a mode of.
+///
 /// [`GroupNode::explicit_modes`]: fanta_doc::node::GroupNode::explicit_modes
 pub(crate) fn apply_explicit_modes(
     doc: &mut Doc,
     report: &mut MapReport,
     pending: &[(NodeId, Vec<(String, String)>)],
     maps: &VariableGuidMaps,
-) {
+) -> HashSet<VariableCollectionId> {
+    let mut pinned: HashSet<VariableCollectionId> = HashSet::new();
     for (node_id, pins) in pending {
         let Some(node) = doc.scene.get_mut(*node_id) else {
             continue;
@@ -301,9 +307,44 @@ pub(crate) fn apply_explicit_modes(
                 continue; // names a collection/mode we didn't import
             };
             g.explicit_modes.insert(cid, mid);
+            pinned.insert(cid);
             report.explicit_modes_imported += 1;
         }
     }
+    pinned
+}
+
+/// Drop the variable collections that ended up holding nothing and that nothing
+/// points at.
+///
+/// A `.fig` saved from a file that subscribes to shared libraries carries a
+/// VARIABLE_SET node change for every *remote* collection it consumes, and one
+/// per library version it has seen — Figma's UI kit ships ten separate "Colors"
+/// sets and six "Typography" sets this way. The variables themselves stay in the
+/// publishing library, so every one of those stubs resolves zero variables;
+/// minting a collection per VARIABLE_SET therefore buries the file's three real
+/// collections under ~26 identically-named empty ones.
+///
+/// A collection survives when it owns at least one variable, or when something
+/// still points at it — a frame's `explicitVariableModes` pin (`pinned`, from
+/// [`apply_explicit_modes`]) or a document-level active-mode entry. Dropping one
+/// of those would leave the reference dangling. Emptiness is the only test:
+/// two genuinely distinct collections that share a NAME both survive.
+pub(crate) fn prune_unreferenced_empty_collections(
+    doc: &mut Doc,
+    report: &mut MapReport,
+    pinned: &HashSet<VariableCollectionId>,
+) {
+    let before = doc.variables.collections.len();
+    let active_modes = &doc.active_modes;
+    doc.variables.collections.retain(|id, collection| {
+        !collection.variable_order.is_empty()
+            || pinned.contains(id)
+            || active_modes.contains_key(id)
+    });
+    let pruned = before - doc.variables.collections.len();
+    report.variable_collections = report.variable_collections.saturating_sub(pruned);
+    report.variable_collections_pruned += pruned;
 }
 
 /// Stable fallback collection/mode ids for variables whose set isn't known.

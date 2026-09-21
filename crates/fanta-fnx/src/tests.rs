@@ -63,6 +63,50 @@ fn full_subtree_round_trips_losslessly() {
 }
 
 #[test]
+fn embedded_objects_print_identically_across_insertion_orders() {
+    let unsorted = r#"{"z":[{"z":9,"a":"$Colors/Accent"},null,3,false],"a":{"z":21.762165069580078,"a":"literal reference"}}"#;
+    let sorted = r#"{"a":{"a":"literal reference","z":21.762165069580078},"z":[{"a":"$Colors/Accent","z":9},null,3,false]}"#;
+    let mut root = FnxElement::new("Frame");
+    root.attrs.insert(
+        "meta".to_owned(),
+        serde_json::from_str(unsorted).expect("unsorted metadata"),
+    );
+    root.attrs.insert(
+        "background".to_owned(),
+        serde_json::from_str(r#"{"kind":"solid","color":{"r":37,"g":99,"b":235,"a":255}}"#)
+            .expect("solid fill"),
+    );
+    let mut instance = FnxElement::new("Instance");
+    instance.attrs.insert(
+        "component".to_owned(),
+        Value::String("COMP0000000000000000000000".to_owned()),
+    );
+    root.children.push(instance);
+    let original_metadata = serde_json::to_string(&root.attrs["meta"]).expect("original metadata");
+    let source = print_doc("Ordering", &root);
+    assert_eq!(parse_doc(&source).expect("printed source parses"), root);
+    assert_eq!(
+        serde_json::to_string(&root.attrs["meta"]).expect("metadata after print"),
+        original_metadata,
+        "printing must not reorder the caller's opaque metadata"
+    );
+    assert!(source.contains(r##"background={{"color": fnxColor("#2563EB"), "kind": "solid"}}"##));
+    assert!(source.contains(r#"meta={{"a": {"a": "literal reference", "z": 21.762165069580078}, "z": [{"a": "$Colors/Accent", "z": 9}, null, 3, false]}}"#));
+    assert!(source.contains(r#"component="COMP0000000000000000000000""#));
+
+    root.attrs.insert(
+        "meta".to_owned(),
+        serde_json::from_str(sorted).expect("sorted metadata"),
+    );
+    root.attrs.insert(
+        "background".to_owned(),
+        serde_json::from_str(r#"{"color":{"a":255,"b":235,"g":99,"r":37},"kind":"solid"}"#)
+            .expect("reordered solid fill"),
+    );
+    assert_eq!(print_doc("Ordering", &root), source);
+}
+
+#[test]
 fn duplicate_node_ids_are_rejected_before_tree_indexing() {
     let mut nodes = sample();
     let duplicate = nodes[0]["id"].clone();
@@ -350,9 +394,9 @@ fn sidecar_reconciliation_assigns_ids_and_source_order_to_added_elements() {
     assert_eq!(reconciled.ids[0].id, "ROOT0000000000000000000000");
     assert_eq!(reconciled.ids[0].index, json!(7.0));
     assert_eq!(reconciled.ids[1].id, "OLD00000000000000000000000");
-    assert_eq!(reconciled.ids[1].index, json!(1));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
     assert_eq!(reconciled.ids[2].id, "NEW00000000000000000000000");
-    assert_eq!(reconciled.ids[2].index, json!(2));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
 
     let decoded = decode_subtree(&source, &reconciled).unwrap();
     assert_eq!(
@@ -383,6 +427,54 @@ fn reconcile_fixture() -> (String, FnxSidecar) {
         }),
     ];
     encode_subtree(&nodes, "Page").expect("encode fixture")
+}
+
+#[test]
+fn reconciled_sidecar_indices_match_document_index_serialization() {
+    let (source, sidecar) = reconcile_fixture();
+    let edited = source.replace(
+        "<Vector name=\"A\" />",
+        "<Vector name=\"A\" />\n      <Vector name=\"Added\" />",
+    );
+    assert_ne!(edited, source);
+    let reconciled =
+        reconcile_sidecar(&edited, &sidecar, sequential_minter()).expect("reconcile inserted node");
+    assert_eq!(reconciled.ids.len(), sidecar.ids.len() + 1);
+    for (position, entry) in reconciled.ids.iter().skip(1).enumerate() {
+        let native_index = fanta_doc::IndexKey::from_raw(position as f64 + 1.0);
+        assert_eq!(
+            serde_json::to_vec(&entry.index).expect("sidecar index bytes"),
+            serde_json::to_vec(&native_index).expect("document index bytes"),
+            "a reconciled index must survive materialization and ordinary Save byte-identically"
+        );
+    }
+}
+
+#[test]
+fn sidecar_attribute_edit_preserves_fractional_index_bytes() {
+    let (source, mut sidecar) = reconcile_fixture();
+    for (entry, index) in sidecar
+        .ids
+        .iter_mut()
+        .zip([7.125, 0.125, 1.0000000000000002, 9.75])
+    {
+        entry.index = json!(index);
+    }
+    let original_bytes = serde_json::to_vec(&sidecar).expect("fractional sidecar bytes");
+    let edited = source.replacen("name=\"Page\"", "name=\"Page\" opacity={0.75}", 1);
+    assert_ne!(edited, source);
+    let mut minted = false;
+    let reconciled = reconcile_sidecar(&edited, &sidecar, || {
+        minted = true;
+        "unexpected new identity".to_owned()
+    })
+    .expect("reconcile attribute edit");
+    assert!(!minted);
+    assert_eq!(reconciled, sidecar);
+    assert_eq!(
+        serde_json::to_vec(&reconciled).expect("unchanged fractional sidecar bytes"),
+        original_bytes
+    );
 }
 
 fn sequential_minter() -> impl FnMut() -> String {
@@ -457,10 +549,10 @@ fn inserting_a_mid_tree_element_keeps_every_existing_id() {
     );
     // Indices are normalized to source order on structural change.
     assert_eq!(reconciled.ids[0].index, json!(7.0));
-    assert_eq!(reconciled.ids[1].index, json!(1));
-    assert_eq!(reconciled.ids[2].index, json!(2));
-    assert_eq!(reconciled.ids[3].index, json!(3));
-    assert_eq!(reconciled.ids[4].index, json!(4));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
+    assert_eq!(reconciled.ids[3].index, json!(3.0));
+    assert_eq!(reconciled.ids[4].index, json!(4.0));
 
     // Fingerprints stay in the sidecar only — decoded nodes carry none of them.
     let decoded = decode_subtree(&edited, &reconciled).unwrap();
@@ -616,8 +708,8 @@ fn preorder_preserving_reparent_normalizes_indices_and_keeps_ids() {
     );
     // Sibling indices are normalized to source order (A before B under the
     // page), so the decoded z-order matches the edited source.
-    assert_eq!(reconciled.ids[1].index, json!(1));
-    assert_eq!(reconciled.ids[2].index, json!(2));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
+    assert_eq!(reconciled.ids[2].index, json!(2.0));
     assert_eq!(reconciled.ids[1].parent_index, Some(0));
     assert_eq!(reconciled.ids[2].parent_index, Some(0));
 }
@@ -738,7 +830,7 @@ fn replacing_the_root_tag_keeps_the_pinned_id_but_rebuilds_the_sidecar() {
         Some("Boolean"),
         "the persisted root fingerprint must track the new tag"
     );
-    assert_eq!(reconciled.ids[1].index, json!(1));
+    assert_eq!(reconciled.ids[1].index, json!(1.0));
 }
 
 #[test]
@@ -2092,4 +2184,177 @@ fn seventeen_digit_floats_survive_the_text_boundary() {
         print_doc("P", &reparsed),
         "print must be a fixpoint over parse"
     );
+}
+
+/// The headline defect from a real session: `pages/typography/page.fnx`
+/// rendered a flush-left frame as `x={1.1368683772161603e-13}`. That is an
+/// `f32` coordinate widened to `f64` and pushed through a layout solve — dust
+/// standing in for the zero the designer sees — and this file is meant to be
+/// read and hand-edited in a diff, so the printer clamps it.
+#[test]
+fn import_dust_prints_as_a_flush_zero() {
+    const DUST: f64 = 1.1368683772161603e-13;
+    let nodes = vec![json!({
+        "type": "group", "id": "ROOT0000000000000000000000", "parent": null, "index": 1.0,
+        "name": "Typography",
+        "transform": [1.0, 0.0, 0.0, 1.0, DUST, 40.0],
+        "clip_size": [DUST, 320.0]
+    })];
+    let tree = tree_from_nodes(&nodes).unwrap();
+    let text = print_doc("Typography", &tree.root);
+
+    assert!(text.contains("x={0.0}"), "dust must read as zero:\n{text}");
+    assert!(text.contains("y={40.0}"), "the real offset stays:\n{text}");
+    assert!(
+        text.contains("clip_size={[0.0, 320.0]}"),
+        "sizes are clamped the same way:\n{text}"
+    );
+    assert!(
+        !text.contains("1.1368683772161603"),
+        "dust leaked into the source:\n{text}"
+    );
+}
+
+/// The clamp is applied to every float the printer emits, not just the sugared
+/// `x`/`y`: a raw `transform={[a, b, c, d, tx, ty]}` and a size array carry the
+/// same dust from the same import, and a reader compares them side by side.
+#[test]
+fn dust_is_clamped_inside_raw_transforms_and_sizes() {
+    let nodes = vec![json!({
+        "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
+        "name": "Spun",
+        "transform": [0.0, -1.0, 1.0, 1.1368683772161603e-13, 5.0, 7.0],
+        "local_size": [120.0, 5.684341886080802e-14],
+        "meta": { "gap": -2.842170943040401e-14 }
+    })];
+    let tree = tree_from_nodes(&nodes).unwrap();
+    let text = print_doc("Spun", &tree.root);
+
+    assert!(
+        text.contains("transform={[0.0, -1.0, 1.0, 0.0, 5.0, 7.0]}"),
+        "raw transform dust:\n{text}"
+    );
+    assert!(
+        text.contains("local_size={[120.0, 0.0]}"),
+        "size dust:\n{text}"
+    );
+    assert!(
+        text.contains(r#"meta={{"gap": 0.0}}"#),
+        "dust nested in an opaque blob:\n{text}"
+    );
+}
+
+/// The clamp is a floor, not a rounder. Everything from the epsilon upwards
+/// keeps all of its digits, and prints as a plain decimal — a designer reading
+/// `0.0000025` can tell it from `0`, which is the whole point.
+#[test]
+fn values_at_and_above_the_clamp_survive_in_full() {
+    use crate::print::render_float;
+
+    for (value, spelling) in [
+        (1e-9_f64, "0.000000001"),
+        (-1e-9, "-0.000000001"),
+        (1.25e-8, "0.0000000125"),
+        (-2.5e-6, "-0.0000025"),
+        (0.000123, "0.000123"),
+        (0.5, "0.5"),
+        (21.762165069580078, "21.762165069580078"),
+        (1440.0, "1440.0"),
+    ] {
+        assert_eq!(render_float(value), spelling, "printing {value:e}");
+        assert_eq!(
+            spelling.parse::<f64>().ok(),
+            Some(value),
+            "{spelling} must parse back to the value it was printed from"
+        );
+    }
+
+    // Only what is smaller than the epsilon collapses — including a `-0.0`,
+    // which is dust with a sign and must not print as `-0.0`.
+    for value in [
+        1.1368683772161603e-13,
+        -1.1368683772161603e-13,
+        9.99e-10,
+        0.0,
+        -0.0,
+    ] {
+        assert_eq!(render_float(value), "0.0", "clamping {value:e}");
+    }
+}
+
+/// No value in the range a design actually occupies may reach the reader as
+/// scientific notation: `e-` and `e+` are noise a designer cannot act on and a
+/// diff turns over for nothing.
+#[test]
+fn no_design_scale_value_prints_in_scientific_notation() {
+    let nodes = vec![json!({
+        "type": "group", "id": "ROOT0000000000000000000000", "parent": null, "index": 1.0,
+        "name": "Page",
+        "clip_size": [1440.0, 0.00000025],
+        "opacity": 0.0000005,
+        "transform": [1.0, 0.0, 0.0, 1.0, 21.762165069580078, 1.1368683772161603e-13],
+        "meta": { "ratio": 0.000003, "span": 1234567.0, "dust": -5.684341886080802e-14 }
+    })];
+    let tree = tree_from_nodes(&nodes).unwrap();
+    let text = print_doc("Page", &tree.root);
+
+    assert!(!text.contains("e-"), "negative exponent leaked:\n{text}");
+    assert!(!text.contains("e+"), "positive exponent leaked:\n{text}");
+    assert!(
+        text.contains("opacity={0.0000005}"),
+        "plain decimal:\n{text}"
+    );
+    assert!(
+        text.contains("clip_size={[1440.0, 0.00000025]}"),
+        "plain decimal in an array:\n{text}"
+    );
+}
+
+/// The clamp is the one place the text boundary is deliberately lossy, and the
+/// loss is bounded: dust decodes back as an exact zero, every other coordinate
+/// is untouched, and the next save writes the identical bytes — so the file
+/// settles instead of churning.
+#[test]
+fn clamped_dust_decodes_as_zero_and_the_next_print_is_a_fixpoint() {
+    let nodes = vec![json!({
+        "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
+        "name": "Rule",
+        "transform": [1.0, 0.0, 0.0, 1.0, 1.1368683772161603e-13, 40.0],
+        "local_size": [120.0, 21.762165069580078]
+    })];
+    let decoded = round_trip(&nodes);
+    assert_same_nodes(
+        &decoded,
+        &[json!({
+            "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
+            "name": "Rule",
+            "transform": [1.0, 0.0, 0.0, 1.0, 0.0, 40.0],
+            "local_size": [120.0, 21.762165069580078]
+        })],
+    );
+
+    let first = print_doc("Rule", &tree_from_nodes(&nodes).unwrap().root);
+    let second = print_doc("Rule", &tree_from_nodes(&decoded).unwrap().root);
+    assert_eq!(first, second, "a second save must not rewrite the file");
+    let reparsed = parse_doc(&first).expect("reparse");
+    assert_eq!(
+        first,
+        print_doc("Rule", &reparsed),
+        "print must stay a fixpoint over parse"
+    );
+}
+
+/// Integers are printed verbatim, never routed through `f64`: the clamp must
+/// not cost the codec the integers past 2^53 that have no `f64` spelling, and
+/// an integer cannot carry dust in the first place.
+#[test]
+fn integer_attributes_keep_their_own_spelling() {
+    use crate::print::render_attr;
+
+    assert_eq!(
+        render_attr(&json!(9007199254740993u64)),
+        "{9007199254740993}"
+    );
+    assert_eq!(render_attr(&json!(0)), "{0}");
+    assert_eq!(render_attr(&json!(-7)), "{-7}");
 }

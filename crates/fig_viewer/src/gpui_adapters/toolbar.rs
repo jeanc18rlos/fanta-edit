@@ -40,6 +40,12 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Present,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::GenerateImage,
+    ToolbarCommand::GenerateVideo,
+    ToolbarCommand::GenerateVector,
+    ToolbarCommand::GenerateDesign,
+    ToolbarCommand::GenerateMasks,
+    ToolbarCommand::RemoveBackground,
 ];
 
 /// The entrance presets fig_viewer's Motion inspector can author — the same
@@ -646,7 +652,7 @@ mod tests {
 
 #[cfg(test)]
 mod echo_tests {
-    use std::path::PathBuf;
+    use std::{cell::RefCell, path::PathBuf, rc::Rc};
 
     use fanta_doc::{
         AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, Operation, TextNode,
@@ -732,6 +738,1162 @@ mod echo_tests {
         });
         let cx = cx.clone();
         (view, toolbar, cx)
+    }
+
+    #[gpui::test]
+    async fn path_selection_toolbar_drag_edits_segment_endpoints_and_undoes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = test_doc();
+        let mut original = fanta_doc::PathData::new();
+        original
+            .move_to(0., 0.)
+            .line_to(100., 0.)
+            .line_to(100., 100.);
+        let mut vector = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: original.clone(),
+            fills: Default::default(),
+            strokes: [fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 2.)]
+                .into_iter()
+                .collect(),
+            corner_radius: None,
+            corner_radii: None,
+            corner_smoothing: 0.,
+            local_size: None,
+            parametric: None,
+        }));
+        vector.parent = doc.active_page();
+        vector.transform = Transform2D::translation(-100., 100.);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create editable path");
+        doc.selection.clear();
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Path-selection.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::PathSelect,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::PathSelect
+        );
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [-50., 150.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center() + point(px(0.), px(-50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        let edited = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.contains(vector_id));
+            assert_eq!(doc.history.undo_depth(), 1);
+            let path = &doc
+                .scene
+                .get(vector_id)
+                .expect("vector")
+                .data
+                .as_vector()
+                .expect("path")
+                .path;
+            let mut expected = fanta_doc::PathData::new();
+            expected
+                .move_to(20., 30.)
+                .line_to(120., 30.)
+                .line_to(100., 100.);
+            assert_eq!(path, &expected);
+            path.clone()
+        });
+        for (command, expected) in [
+            (ToolbarCommand::Undo, original),
+            (ToolbarCommand::Redo, edited),
+        ] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let actual = &item
+                    .doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector")
+                    .data
+                    .as_vector()
+                    .expect("path")
+                    .path;
+                assert_eq!(actual, &expected);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn toolbar_scale_resizes_text_contents_with_undo_redo_and_escape(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut text = TextNode::new("Scale this text", 100., 50.);
+        text.style.size_px = 20.;
+        let mut layer = CanvasNode::new(NodeData::Text(text));
+        layer.parent = Some(page_id);
+        let text_id = layer.id;
+        doc.apply(Operation::create_node(layer))
+            .expect("create text");
+        doc.selection.select_only(text_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Scale-tool.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::Scale,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_tool()),
+            ToolKind::Scale
+        );
+        assert!(!ToolKind::Scale.is_stub());
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [50., 25.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let original_handle = bounds.center() + point(px(50.), px(25.));
+        let scaled_handle = original_handle + point(px(100.), px(50.));
+        cx.simulate_mouse_down(original_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_id).expect("text layer").data else {
+                panic!("text remains editable text");
+            };
+            assert_eq!(text.local_size, [200., 100.]);
+            assert_eq!(
+                text.style.size_px, 40.,
+                "Scale changes font size as well as its box"
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        cx.simulate_mouse_up(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 1);
+        });
+        for (command, expected_size, expected_font) in [
+            (ToolbarCommand::Undo, [100., 50.], 20.),
+            (ToolbarCommand::Redo, [200., 100.], 40.),
+        ] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(text_id).expect("text layer");
+                let NodeData::Text(text) = &node.data else {
+                    panic!("text remains text")
+                };
+                assert_eq!(text.local_size, expected_size);
+                assert_eq!(text.style.size_px, expected_font);
+                assert_eq!(node.transform, Transform2D::IDENTITY);
+            });
+        }
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load shipped keymap");
+            app.bind_keys(bindings);
+        });
+        let enlarged_handle = scaled_handle + point(px(100.), px(50.));
+        cx.simulate_mouse_down(scaled_handle, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(enlarged_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("document")
+                .scene
+                .get(text_id)
+                .expect("text")
+                .data
+            else {
+                panic!("text remains text")
+            };
+            assert_eq!(text.style.size_px, 60.);
+        });
+        cx.simulate_keystrokes("escape");
+        cx.simulate_mouse_up(enlarged_handle, gpui::MouseButton::Left, Modifiers::none());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_id).expect("text").data else {
+                panic!("text remains text")
+            };
+            assert_eq!(text.local_size, [200., 100.]);
+            assert_eq!(text.style.size_px, 40.);
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "cancelled drag creates no undo step"
+            );
+        });
+    }
+
+    async fn assert_path_edit_viewport_pixels(cx: &mut TestAppContext, delta: f32) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut path = fanta_doc::PathData::new();
+        path.move_to(0., 160.).quad_to(100., 0., 200., 160.);
+        let mut curve = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path,
+            local_size: Some([200., 160.]),
+            strokes: [fanta_doc::Stroke::solid(
+                fanta_doc::Color::rgb(46, 125, 255),
+                6.,
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        curve.meta = if delta > 0. {
+            serde_json::json!(["opaque", 42])
+        } else {
+            serde_json::json!("opaque extension")
+        };
+        curve.parent = Some(page_id);
+        curve.transform = Transform2D::translation(60., 60.);
+        let curve_id = curve.id;
+        let original = curve.clone();
+        doc.apply(Operation::create_node(curve))
+            .expect("create imported curve");
+        doc.selection.select_only(curve_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Path-viewport.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::PathSelect,
+            });
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [160., 140.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = bounds.center();
+        let end = start + point(px(delta), px(delta));
+        let mut renderer = fanta_render::RasterRenderer::new(400, 400).expect("CPU renderer");
+        // At t=0.1, the shifted curve is outside the old viewport: below it for
+        // +40 and left of it for -40. A geometry-only assertion misses this clip.
+        let samples = if delta > 0. {
+            [(120_usize, 231_usize), (298, 260)]
+        } else {
+            [(40, 151), (218, 180)]
+        };
+        let assert_pixel = |item: &Entity<crate::document::FigItem>,
+                            cx: &VisualTestContext,
+                            renderer: &mut fanta_render::RasterRenderer,
+                            painted: bool| {
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                renderer.render_page(
+                    &doc.scene,
+                    &Viewport {
+                        center: [200., 200.],
+                        zoom: 1.,
+                    },
+                    doc.active_page(),
+                );
+                let pixels = renderer.copy_rgba();
+                for sample in samples {
+                    let offset = (sample.1 * 400 + sample.0) * 4;
+                    let pixel = pixels.get(offset..offset + 4).expect("sample pixel");
+                    let blue = pixel[0] < 100
+                        && pixel[1] > 80
+                        && pixel[1] < 180
+                        && pixel[2] > 220
+                        && pixel[3] > 200;
+                    assert_eq!(
+                        blue, painted,
+                        "curve pixel at {sample:?}, delta {delta}: {pixel:?}"
+                    );
+                }
+            });
+        };
+        assert_pixel(&item, cx, &mut renderer, false);
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        assert_pixel(&item, cx, &mut renderer, true);
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0)
+        });
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        assert_pixel(&item, cx, &mut renderer, true);
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let curve = doc.scene.get(curve_id).expect("curve");
+            assert_eq!(curve.transform, original.transform);
+            assert_eq!(curve.meta, original.meta);
+            assert_eq!(
+                curve.flags,
+                original.flags | fanta_doc::NodeFlags::UNCLIPPED_VECTOR
+            );
+            assert_eq!(curve.data.as_vector().expect("vector").local_size, None);
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+        for (command, painted) in [(ToolbarCommand::Undo, false), (ToolbarCommand::Redo, true)] {
+            toolbar.update(cx, |_, cx| {
+                cx.emit(ToolbarAction::CommandInvoked { command })
+            });
+            cx.run_until_parked();
+            assert_pixel(&item, cx, &mut renderer, painted);
+            if !painted {
+                item.read_with(cx, |item, _| {
+                    let node = item
+                        .doc()
+                        .expect("document")
+                        .scene
+                        .get(curve_id)
+                        .expect("restored curve");
+                    assert_eq!(node.data, original.data);
+                    assert_eq!(node.meta, original.meta);
+                    assert_eq!(node.flags, original.flags);
+                    assert_eq!(node.transform, original.transform);
+                });
+            }
+        }
+
+        let saved_doc = item.read_with(cx, |item, _| item.doc().expect("saved doc").clone());
+        let saved_curve = saved_doc.scene.get(curve_id).expect("saved curve").clone();
+        let temporary = tempfile::tempdir().expect("temporary project");
+        crate::document::write_project(temporary.path(), &saved_doc, &Default::default())
+            .expect("write edited FNX project");
+        let (reopened_doc, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("read edited FNX project");
+        assert!(assets.is_empty());
+        let reopened_item = crate::document::ready_item_for_test(
+            &project,
+            temporary.path().join("page.fnx"),
+            reopened_doc,
+            cx,
+        );
+        reopened_item.read_with(cx, |item, _| {
+            let node = item
+                .doc()
+                .expect("reopened document")
+                .scene
+                .get(curve_id)
+                .expect("reopened curve");
+            assert_eq!(
+                node.data.as_vector().expect("vector").local_size,
+                None,
+                "FigDocument load must not backfill an explicitly edited viewport"
+            );
+            assert_eq!(node.data, saved_curve.data);
+            assert_eq!(node.meta, original.meta);
+            assert_eq!(node.meta, saved_curve.meta);
+            assert_eq!(node.flags, saved_curve.flags);
+            assert!(node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR));
+            assert_eq!(node.transform, saved_curve.transform);
+        });
+        assert_pixel(&reopened_item, cx, &mut renderer, true);
+    }
+
+    #[gpui::test]
+    async fn path_edit_viewport_positive_segment_drag_renders_outside_old_clip(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_viewport_pixels(cx, 40.).await;
+    }
+
+    #[gpui::test]
+    async fn path_edit_viewport_negative_segment_drag_renders_outside_old_clip(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_edit_viewport_pixels(cx, -40.).await;
+    }
+
+    #[test]
+    fn path_edit_viewport_explicit_flag_overrides_a_remaining_box() {
+        let mut doc = Doc::new();
+        let mut node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: fanta_doc::PathData::rect(0., 0., 20., 20.),
+            local_size: Some([20., 20.]),
+            strokes: [fanta_doc::Stroke::solid(
+                fanta_doc::Color::rgb(0, 0, 255),
+                16.,
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }));
+        node.flags.insert(fanta_doc::NodeFlags::UNCLIPPED_VECTOR);
+        doc.apply(Operation::create_node(node))
+            .expect("create flagged SVG viewport");
+        let mut renderer = fanta_render::RasterRenderer::new(64, 64).expect("CPU renderer");
+        renderer.render(&doc.scene, &doc.viewport);
+        let pixels = renderer.copy_rgba();
+        let offset = (42 * 64 + 56) * 4;
+        let pixel = pixels
+            .get(offset..offset + 4)
+            .expect("stroke outside viewport");
+        assert!(
+            pixel[2] > 200 && pixel[3] > 200,
+            "explicit flag must override its remaining viewport: {pixel:?}"
+        );
+    }
+
+    struct CanvasGestureFixture {
+        view: Entity<FigView>,
+        item: Entity<crate::document::FigItem>,
+        toolbar: Entity<EditorToolbar>,
+        cx: VisualTestContext,
+        vector_id: fanta_doc::NodeId,
+        original: fanta_doc::PathData,
+    }
+
+    async fn canvas_gesture_fixture(
+        cx: &mut TestAppContext,
+        tool: ToolbarTool,
+    ) -> CanvasGestureFixture {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut original = fanta_doc::PathData::new();
+        original
+            .move_to(0., 0.)
+            .line_to(100., 0.)
+            .line_to(100., 100.)
+            .line_to(0., 100.)
+            .close();
+        let mut vector = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: original.clone(),
+            fills: [fanta_doc::Fill::solid(fanta_doc::Color::BLACK)]
+                .into_iter()
+                .collect(),
+            strokes: Default::default(),
+            corner_radius: None,
+            corner_radii: None,
+            corner_smoothing: 0.,
+            local_size: None,
+            parametric: None,
+        }));
+        vector.parent = Some(page_id);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector))
+            .expect("create vector");
+        doc.selection.select_only(vector_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Canvas-gesture.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter().expect("toolbar").panel.clone()
+        });
+        toolbar.update(cx, |_, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool,
+            });
+        });
+        view.update(cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [50., 50.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            cx: cx.clone(),
+            vector_id,
+            original,
+        }
+    }
+
+    async fn assert_path_overlays_follow_history(cx: &mut TestAppContext, tool: ToolbarTool) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            ..
+        } = canvas_gesture_fixture(cx, tool).await;
+        let original = item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let node = document
+                    .doc
+                    .scene
+                    .get_mut(vector_id)
+                    .expect("curve fixture");
+                let vector = node.data.as_vector_mut().expect("vector fixture");
+                let mut path = fanta_doc::PathData::new();
+                path.move_to(0., 100.).quad_to(50., 0., 100., 100.);
+                vector.path = path;
+                vector.local_size = Some([100., 100.]);
+                node.transform = Transform2D::translation(20., 30.);
+                node.meta = serde_json::json!(["preserve", 42]);
+                let original = node.clone();
+                document.doc.history = Default::default();
+                (original, crate::document::DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        view.update(&mut cx, |view, cx| {
+            view.set_viewport_silent(Viewport {
+                center: [70., 80.],
+                zoom: 1.,
+            });
+            cx.notify();
+        });
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("shipped key bindings");
+            app.bind_keys(bindings);
+        });
+        cx.run_until_parked();
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas"));
+        let start = bounds.center() + point(px(-50.), px(50.));
+        let end = start + point(px(20.), px(30.));
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        let edited = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            let node = doc.scene.get(vector_id).expect("edited curve");
+            assert_ne!(node.data, original.data);
+            node.clone()
+        });
+        let assert_overlays = |cx: &VisualTestContext| {
+            let expected = item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(vector_id).expect("curve");
+                let anchors = fanta_tools::node_math::enumerate_anchors(
+                    &node.data.as_vector().expect("vector").path,
+                );
+                assert_eq!(anchors.len(), 2);
+                let transform = doc
+                    .scene
+                    .world_transform(vector_id)
+                    .expect("world transform");
+                let mut expected = Vec::new();
+                for anchor in &anchors {
+                    for control in [anchor.ctrl_in, anchor.ctrl_out].into_iter().flatten() {
+                        expected.push(fanta_tools::ToolOverlay::PathHandle {
+                            world_anchor: transform.transform_point(anchor.pos).to_array(),
+                            world_ctrl: transform.transform_point(control).to_array(),
+                        });
+                    }
+                }
+                for (index, anchor) in anchors.iter().enumerate() {
+                    expected.push(fanta_tools::ToolOverlay::PathAnchor {
+                        world: transform.transform_point(anchor.pos).to_array(),
+                        selected: index == 0,
+                    });
+                }
+                expected
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.tools().overlays, expected,
+                    "every anchor/control overlay must follow document history without pointer input");
+            });
+        };
+        assert_overlays(&cx);
+        for from_toolbar in [false, true] {
+            for (command, expected_node, expected_depth) in [
+                (ToolbarCommand::Undo, &original, 0),
+                (ToolbarCommand::Redo, &edited, 1),
+            ] {
+                if from_toolbar {
+                    toolbar.update(&mut cx, |_, cx| {
+                        cx.emit(ToolbarAction::CommandInvoked { command });
+                    });
+                    cx.run_until_parked();
+                } else {
+                    cx.simulate_keystrokes(match command {
+                        ToolbarCommand::Undo => "secondary-z",
+                        ToolbarCommand::Redo => "secondary-shift-z",
+                        _ => unreachable!(),
+                    });
+                }
+                item.read_with(&cx, |item, _| {
+                    let doc = item.doc().expect("document");
+                    let node = doc.scene.get(vector_id).expect("restored curve");
+                    assert_eq!(node.data, expected_node.data);
+                    assert_eq!(node.flags, expected_node.flags);
+                    assert_eq!(node.meta, original.meta);
+                    assert_eq!(node.transform, original.transform);
+                    assert_eq!(doc.history.undo_depth(), expected_depth);
+                    assert_eq!(doc.selection.len(), 1);
+                    assert!(doc.selection.contains(vector_id));
+                });
+                assert_overlays(&cx);
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn path_overlays_follow_keyboard_and_toolbar_history_in_path_selection(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_overlays_follow_history(cx, ToolbarTool::PathSelect).await;
+    }
+
+    #[gpui::test]
+    async fn path_overlays_follow_keyboard_and_toolbar_history_in_node_edit(
+        cx: &mut TestAppContext,
+    ) {
+        assert_path_overlays_follow_history(cx, ToolbarTool::NodeEdit).await;
+    }
+
+    async fn assert_fast_canvas_drag(
+        cx: &mut TestAppContext,
+        tool: ToolbarTool,
+        release_outside: bool,
+    ) {
+        use gpui::InputEvent as _;
+
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            original,
+        } = canvas_gesture_fixture(cx, tool).await;
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let start = if tool == ToolbarTool::PathSelect {
+            bounds.center() + point(px(0.), px(-50.))
+        } else {
+            bounds.center()
+        };
+        let delta = if release_outside {
+            point(bounds.right() - start.x + px(20.), px(30.))
+        } else {
+            point(px(20.), px(30.))
+        };
+        let end = start + delta;
+        assert_eq!(bounds.contains(&end), !release_outside);
+        // simulate_mouse_* pumps the executor after every event, hiding a listener
+        // installed only by the repaint following the press.
+        cx.update(|window, app| {
+            window.dispatch_event(
+                gpui::MouseDownEvent {
+                    position: start,
+                    button: gpui::MouseButton::Left,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                app,
+            );
+            window.dispatch_event(
+                gpui::MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(gpui::MouseButton::Left),
+                    modifiers: Modifiers::none(),
+                }
+                .to_platform_input(),
+                app,
+            );
+            window.dispatch_event(
+                gpui::MouseUpEvent {
+                    position: end,
+                    button: gpui::MouseButton::Left,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                app,
+            );
+        });
+        cx.run_until_parked();
+        let edited = item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let node = doc.scene.get(vector_id).expect("dragged vector");
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "one drag must commit one undo entry"
+            );
+            if tool == ToolbarTool::PathSelect {
+                let mut expected = fanta_doc::PathData::new();
+                expected
+                    .move_to(20., 30.)
+                    .line_to(120., 30.)
+                    .line_to(100., 100.)
+                    .line_to(0., 100.)
+                    .close();
+                assert_eq!(node.data.as_vector().expect("vector").path, expected);
+                assert_eq!(node.transform, Transform2D::IDENTITY);
+            } else {
+                assert_eq!(node.data.as_vector().expect("vector").path, original);
+                assert_eq!(
+                    node.transform,
+                    Transform2D::translation(
+                        f64::from(f32::from(delta.x)),
+                        f64::from(f32::from(delta.y))
+                    )
+                );
+            }
+            node.clone()
+        });
+        cx.simulate_mouse_move(
+            bounds.center() + point(px(-30.), px(20.)),
+            None,
+            Modifiers::none(),
+        );
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(vector_id)
+                    .expect("vector"),
+                &edited,
+                "the release must end the gesture, including outside the canvas"
+            );
+        });
+        toolbar.update(&mut cx, |_, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::Undo,
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let node = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(vector_id)
+                .expect("vector");
+            assert_eq!(node.transform, Transform2D::IDENTITY);
+            assert_eq!(node.data.as_vector().expect("vector").path, original);
+        });
+    }
+
+    #[gpui::test]
+    async fn fast_drag_without_repaint_moves_selected_layer(cx: &mut TestAppContext) {
+        assert_fast_canvas_drag(cx, ToolbarTool::Move, false).await;
+    }
+
+    #[gpui::test]
+    async fn fast_drag_without_repaint_moves_path_segment(cx: &mut TestAppContext) {
+        assert_fast_canvas_drag(cx, ToolbarTool::PathSelect, false).await;
+    }
+
+    #[gpui::test]
+    async fn fast_drag_without_repaint_releases_outside_canvas(cx: &mut TestAppContext) {
+        assert_fast_canvas_drag(cx, ToolbarTool::Move, true).await;
+    }
+
+    async fn assert_anchor_delete_uses_editing_tool(cx: &mut TestAppContext, tool: ToolbarTool) {
+        let CanvasGestureFixture {
+            view,
+            item,
+            toolbar,
+            mut cx,
+            vector_id,
+            original,
+        } = canvas_gesture_fixture(cx, tool).await;
+        cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load the shipped key bindings");
+            app.bind_keys(bindings);
+        });
+        let bounds = view.read_with(&cx, |view, _| view.container_bounds.expect("canvas bounds"));
+        let anchor = bounds.center() + point(px(-50.), px(-50.));
+        for from_toolbar in [false, true] {
+            cx.simulate_click(anchor, Modifiers::none());
+            view.read_with(&cx, |view, _| {
+                assert_eq!(
+                    view.tools()
+                        .overlays
+                        .iter()
+                        .filter(|overlay| matches!(
+                            overlay,
+                            fanta_tools::ToolOverlay::PathAnchor { selected: true, .. }
+                        ))
+                        .count(),
+                    1,
+                    "click must select exactly one anchor"
+                );
+            });
+            if from_toolbar {
+                toolbar.update(&mut cx, |_, cx| {
+                    cx.emit(ToolbarAction::CommandInvoked {
+                        command: ToolbarCommand::Delete,
+                    });
+                });
+                cx.run_until_parked();
+            } else {
+                cx.simulate_keystrokes("backspace");
+            }
+            item.read_with(&cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc
+                    .scene
+                    .get(vector_id)
+                    .expect("anchor deletion must preserve the layer");
+                let anchors = fanta_tools::node_math::enumerate_anchors(
+                    &node.data.as_vector().expect("vector").path,
+                );
+                assert_eq!(anchors.len(), 3);
+                assert!(anchors.iter().all(|anchor| anchor.pos != glam::DVec2::ZERO));
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+            view.read_with(&cx, |view, _| {
+                let anchors = view
+                    .tools()
+                    .overlays
+                    .iter()
+                    .filter_map(|overlay| match overlay {
+                        fanta_tools::ToolOverlay::PathAnchor { world, selected } => {
+                            Some((world, selected))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    anchors.len(),
+                    3,
+                    "deleted anchor must disappear from overlays"
+                );
+                assert!(
+                    anchors
+                        .iter()
+                        .all(|(world, selected)| **world != [0., 0.] && !**selected)
+                );
+            });
+            cx.simulate_keystrokes("secondary-z");
+            item.read_with(&cx, |item, _| {
+                let doc = item.doc().expect("document");
+                let node = doc.scene.get(vector_id).expect("restored vector");
+                assert_eq!(node.data.as_vector().expect("vector").path, original);
+                assert_eq!(doc.history.undo_depth(), 0);
+            });
+        }
+        view.update(&mut cx, |view, cx| view.delete_selected_nodes(cx));
+        item.read_with(&cx, |item, _| {
+            assert!(
+                item.doc().expect("document").scene.get(vector_id).is_none(),
+                "explicit layer deletion must retain its object-level meaning"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn anchor_delete_keymap_and_toolbar_preserve_path_selection_layer(
+        cx: &mut TestAppContext,
+    ) {
+        assert_anchor_delete_uses_editing_tool(cx, ToolbarTool::PathSelect).await;
+    }
+
+    #[gpui::test]
+    async fn anchor_delete_keymap_and_toolbar_preserve_node_edit_layer(cx: &mut TestAppContext) {
+        assert_anchor_delete_uses_editing_tool(cx, ToolbarTool::NodeEdit).await;
+    }
+
+    #[gpui::test]
+    async fn toolbar_actions_query_keeps_text_input_with_canvas_keybindings(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let query = Rc::new(RefCell::new(gpui::SharedString::default()));
+        let query_changes = query.clone();
+        let _subscription = cx.update(|_, app| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                app,
+            )
+            .expect("load the app's default key bindings");
+            app.bind_keys(bindings);
+            app.subscribe(&toolbar, move |_, action: &ToolbarAction, _| {
+                if let ToolbarAction::CommandQueryChanged { query } = action {
+                    *query_changes.borrow_mut() = query.clone();
+                }
+            })
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.run_until_parked();
+        let trigger = cx
+            .debug_bounds("toolbar-tool-actions")
+            .expect("the Actions trigger should render");
+        cx.simulate_click(trigger.center(), Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("g e n e r a t e space i m a g e");
+        cx.run_until_parked();
+
+        assert_eq!(query.borrow().as_ref(), "generate image");
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Select
+        );
+
+        let palette = cx
+            .debug_bounds("toolbar-actions-palette")
+            .expect("typing must keep the palette open");
+        cx.simulate_click(
+            point(palette.left() + px(100.), palette.top() + px(27.)),
+            Modifiers::none(),
+        );
+        cx.simulate_keystrokes("secondary-a r e c t a n g l e");
+        cx.run_until_parked();
+        assert_eq!(query.borrow().as_ref(), "rectangle");
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_some());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Select
+        );
+
+        cx.simulate_keystrokes("escape r");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("toolbar-actions-palette").is_none());
+        assert_eq!(
+            view.read_with(cx, |view, _| view.tools().kind()),
+            ToolKind::Rect
+        );
+    }
+
+    #[gpui::test]
+    async fn generation_actions_are_searchable_and_open_native_workspace_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("default key bindings");
+            cx.bind_keys(bindings);
+        });
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Generation-toolbar.fig"),
+            test_doc(),
+            cx,
+        );
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item, project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+        let toolbar = view.read_with(cx, |view, _| {
+            view.gpui_toolbar_adapter()
+                .expect("canvas toolbar")
+                .panel
+                .clone()
+        });
+        let invoked = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let invoked = invoked.clone();
+            cx.subscribe(&toolbar, move |_, event: &ToolbarAction, _| {
+                if let ToolbarAction::CommandInvoked { command } = event {
+                    invoked.borrow_mut().push(*command);
+                }
+            })
+        });
+        for (query, command, selector, expected_tab) in [
+            (
+                "generate image",
+                ToolbarCommand::GenerateImage,
+                "toolbar-command-generate-an-image",
+                "AI · Image",
+            ),
+            (
+                "GENERATE VIDEO",
+                ToolbarCommand::GenerateVideo,
+                "toolbar-command-generate-a-video",
+                "AI · Video",
+            ),
+            (
+                "generate vector",
+                ToolbarCommand::GenerateVector,
+                "toolbar-command-generate-vectors",
+                "AI · Create from prompt",
+            ),
+            (
+                "generate design",
+                ToolbarCommand::GenerateDesign,
+                "toolbar-command-generate-a-design",
+                "AI · Design",
+            ),
+            (
+                "generate masks",
+                ToolbarCommand::GenerateMasks,
+                "toolbar-command-generate-masks",
+                "AI · Masks",
+            ),
+            (
+                "remove background",
+                ToolbarCommand::RemoveBackground,
+                "toolbar-command-remove-background",
+                "AI · Masks",
+            ),
+        ] {
+            cx.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(&view, true, true, window, cx));
+                });
+            });
+            cx.run_until_parked();
+            let trigger = cx
+                .debug_bounds("toolbar-tool-actions")
+                .expect("Actions trigger");
+            cx.simulate_click(trigger.center(), Modifiers::none());
+            cx.simulate_keystrokes("secondary-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+            let result = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("'{query}' must offer {command:?}"));
+            if command == ToolbarCommand::GenerateImage {
+                cx.simulate_keystrokes("enter");
+            } else {
+                cx.simulate_click(result.center(), Modifiers::none());
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                invoked.borrow().last().copied(),
+                Some(command),
+                "activate the matching result"
+            );
+            workspace.read_with(cx, |workspace, cx| {
+                let item = workspace.active_item(cx).expect("generation tab");
+                assert_eq!(
+                    item.tab_content_text(0, cx).as_ref(),
+                    expected_tab,
+                    "'{query}' opens the corresponding native tab"
+                );
+                assert_ne!(item.item_id(), view.entity_id());
+            });
+        }
     }
 
     #[gpui::test]

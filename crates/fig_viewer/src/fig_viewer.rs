@@ -15,6 +15,9 @@ mod design_panel;
 mod document;
 mod editor_session;
 mod export;
+mod generation_journal;
+mod generation_media;
+mod generation_workspace;
 #[cfg(feature = "fanta-gpui-ui")]
 mod gpui_adapters;
 mod inspector_components;
@@ -40,6 +43,8 @@ mod timeline;
 mod tools;
 mod variable_binding;
 mod variables_workspace;
+#[cfg(target_os = "macos")]
+mod video_playback;
 mod view;
 mod view_text;
 mod workspace_hooks;

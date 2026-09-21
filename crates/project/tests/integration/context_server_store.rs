@@ -1554,6 +1554,59 @@ struct FakeContextServerDescriptor {
     path: PathBuf,
 }
 
+#[gpui::test]
+async fn test_fanta_mcp_follows_account_sign_in_and_sign_out(cx: &mut TestAppContext) {
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let client = project.read_with(cx, |project, _| project.client());
+    cx.update(|cx| client::Client::set_global(client.clone(), cx));
+    client.override_authenticate(|_| {
+        Task::ready(Ok(client::Credentials {
+            user_id: 1,
+            access_token: "fnt_live_test_account".into(),
+        }))
+    });
+
+    let executor = cx.executor();
+    let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
+    let store = cx.new(|cx| {
+        ContextServerStore::test_maintain_server_loop(
+            Some(Box::new(move |id, _| {
+                Arc::new(ContextServer::new(
+                    id.clone(),
+                    Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+                ))
+            })),
+            registry,
+            project.read(cx).worktree_store(),
+            Some(project.downgrade()),
+            cx,
+        )
+    });
+    let server_id = ContextServerId("fanta".into());
+    cx.run_until_parked();
+    assert_eq!(
+        store.read_with(cx, |store, _| store.status_for_server(&server_id)),
+        None
+    );
+
+    client
+        .sign_in(false, &cx.to_async())
+        .await
+        .expect("test account sign-in failed");
+    cx.run_until_parked();
+    assert_eq!(
+        store.read_with(cx, |store, _| store.status_for_server(&server_id)),
+        Some(ContextServerStatus::Running),
+    );
+
+    client.sign_out(&cx.to_async()).await;
+    cx.run_until_parked();
+    assert_eq!(
+        store.read_with(cx, |store, _| store.status_for_server(&server_id)),
+        Some(ContextServerStatus::Stopped),
+    );
+}
+
 impl FakeContextServerDescriptor {
     fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }

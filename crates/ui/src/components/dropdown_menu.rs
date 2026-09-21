@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use gpui::{Anchor, AnyView, Entity, Pixels, Point, Role};
 
 use crate::{ButtonLike, ContextMenu, PopoverMenu, prelude::*};
@@ -18,6 +20,14 @@ enum LabelKind {
     Element(AnyElement),
 }
 
+/// Where the popover's menu comes from. A dropdown is rebuilt on every window
+/// redraw, so a menu whose entry count scales with the data behind it must be
+/// [`MenuSource::Lazy`]: the builder then runs once, when the menu opens.
+enum MenuSource {
+    Ready(Entity<ContextMenu>),
+    Lazy(Rc<dyn Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>>>),
+}
+
 #[derive(IntoElement, RegisterComponent)]
 pub struct DropdownMenu {
     id: ElementId,
@@ -26,7 +36,7 @@ pub struct DropdownMenu {
     trigger_tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
     trigger_icon: Option<IconName>,
     style: DropdownStyle,
-    menu: Entity<ContextMenu>,
+    menu: MenuSource,
     full_width: bool,
     disabled: bool,
     handle: Option<PopoverMenuHandle<ContextMenu>>,
@@ -43,23 +53,7 @@ impl DropdownMenu {
         label: impl Into<SharedString>,
         menu: Entity<ContextMenu>,
     ) -> Self {
-        Self {
-            id: id.into(),
-            label: LabelKind::Text(label.into()),
-            trigger_size: ButtonSize::Default,
-            trigger_tooltip: None,
-            trigger_icon: Some(IconName::ChevronUpDown),
-            style: DropdownStyle::default(),
-            menu,
-            full_width: false,
-            disabled: false,
-            handle: None,
-            attach: None,
-            offset: None,
-            tab_index: None,
-            chevron: true,
-            aria_label: None,
-        }
+        Self::from_parts(id, LabelKind::Text(label.into()), MenuSource::Ready(menu))
     }
 
     pub fn new_with_element(
@@ -67,9 +61,28 @@ impl DropdownMenu {
         label: AnyElement,
         menu: Entity<ContextMenu>,
     ) -> Self {
+        Self::from_parts(id, LabelKind::Element(label), MenuSource::Ready(menu))
+    }
+
+    /// A dropdown whose menu is built only when it opens. Use this whenever
+    /// the entry count grows with the document: building the menu eagerly
+    /// costs that walk on every window redraw, not just on every open.
+    pub fn new_lazy(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        menu: impl Fn(&mut Window, &mut App) -> Option<Entity<ContextMenu>> + 'static,
+    ) -> Self {
+        Self::from_parts(
+            id,
+            LabelKind::Text(label.into()),
+            MenuSource::Lazy(Rc::new(menu)),
+        )
+    }
+
+    fn from_parts(id: impl Into<ElementId>, label: LabelKind, menu: MenuSource) -> Self {
         Self {
             id: id.into(),
-            label: LabelKind::Element(label),
+            label,
             trigger_size: ButtonSize::Default,
             trigger_tooltip: None,
             trigger_icon: Some(IconName::ChevronUpDown),
@@ -240,10 +253,14 @@ impl RenderOnce for DropdownMenu {
             ),
         };
 
+        let menu_source = self.menu;
         let mut popover = PopoverMenu::new((self.id.clone(), "popover"))
             .full_width(self.full_width)
             .with_handle(handle)
-            .menu(move |_window, _cx| Some(self.menu.clone()));
+            .menu(move |window, cx| match &menu_source {
+                MenuSource::Ready(menu) => Some(menu.clone()),
+                MenuSource::Lazy(build) => build(window, cx),
+            });
 
         popover = match (text_button, element_button, self.trigger_tooltip) {
             (Some(text_button), None, Some(tooltip)) => {

@@ -434,3 +434,196 @@ fn explicit_variable_modes_accept_wrapped_guid_shape() {
     let frame = group_named(&doc, "Card");
     assert_eq!(frame.explicit_modes.get(&coll.id), Some(&light_mode));
 }
+
+// =============================================================================
+// Remote-library collection stubs
+// =============================================================================
+
+/// A VARIABLE_SET stub for a collection whose variables live in a subscribed
+/// library: it carries a name and modes but no VARIABLE resolves into it. A real
+/// file carries one per consumed library VERSION, which is why the same name
+/// repeats.
+fn remote_collection_stub(local_id: u32, name: &str) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, local_id)),
+            ("type", KiwiValue::Enum("VARIABLE_SET".into())),
+            ("name", KiwiValue::String(name.to_owned())),
+            (
+                "variableSetModes",
+                KiwiValue::array(vec![var_set_mode(0, 100 + local_id, "Mode 1")]),
+            ),
+        ],
+    )
+}
+
+/// A FLOAT VARIABLE owned by the VARIABLE_SET at `0:set_local_id`.
+fn float_variable(local_id: u32, set_local_id: u32, name: &str, value: f32) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, local_id)),
+            ("type", KiwiValue::Enum("VARIABLE".into())),
+            ("name", KiwiValue::String(name.to_owned())),
+            ("variableSetID", variable_id(0, set_local_id)),
+            ("variableResolvedType", KiwiValue::Enum("FLOAT".into())),
+            (
+                "variableDataValues",
+                o(
+                    "VariableDataValues",
+                    vec![(
+                        "entries",
+                        KiwiValue::array(vec![o(
+                            "VariableDataValuesEntry",
+                            vec![
+                                ("modeID", guid(0, 100 + set_local_id)),
+                                ("variableData", var_float_value(value)),
+                            ],
+                        )]),
+                    )],
+                ),
+            ),
+        ],
+    )
+}
+
+/// A file that subscribes to shared libraries carries a VARIABLE_SET change for
+/// every remote collection it consumes — repeated per library version, so the
+/// same name appears many times — while the variables stay in the publishing
+/// library. Minting a collection per VARIABLE_SET buried the file's real
+/// collections under dozens of identically-named empty ones (Figma's UI kit
+/// imported ~40 collections of which ~35 were empty). A stub that resolves no
+/// variable and that nothing pins must not reach the document.
+#[test]
+fn remote_library_collection_stubs_do_not_import_as_empty_duplicates() {
+    let fig = doc_from(vec![
+        remote_collection_stub(1, "Colors"),
+        remote_collection_stub(2, "Colors"),
+        remote_collection_stub(3, "Sizing"),
+        remote_collection_stub(4, "Typography"),
+        // Only the first "Colors" set actually owns a variable in this file.
+        float_variable(20, 1, "space/md", 16.0),
+    ]);
+    let (doc, report, _) = fig_to_doc(&fig).unwrap();
+
+    assert_eq!(doc.variables.collections.len(), 1);
+    assert_eq!(report.variable_collections, 1);
+    assert_eq!(report.variable_collections_pruned, 3);
+    let coll = doc.variables.collections.values().next().unwrap();
+    assert_eq!(coll.name, "Colors");
+    assert_eq!(coll.variable_order.len(), 1);
+    // The surviving variable still resolves through its collection.
+    let var_id = guid_to_variable_id("0:20");
+    assert_eq!(
+        doc.variables.collection_of(var_id).map(|c| c.id),
+        Some(coll.id)
+    );
+}
+
+/// Pruning keys off emptiness, never off the NAME: two collections that both
+/// hold variables survive even when they are called the same thing (a file can
+/// legitimately consume two different libraries' "Colors").
+#[test]
+fn distinct_collections_sharing_a_name_both_survive() {
+    let fig = doc_from(vec![
+        remote_collection_stub(1, "Colors"),
+        remote_collection_stub(2, "Colors"),
+        float_variable(20, 1, "a", 1.0),
+        float_variable(21, 2, "b", 2.0),
+    ]);
+    let (doc, report, _) = fig_to_doc(&fig).unwrap();
+
+    assert_eq!(doc.variables.collections.len(), 2);
+    assert_eq!(report.variable_collections, 2);
+    assert_eq!(report.variable_collections_pruned, 0);
+    for coll in doc.variables.collections.values() {
+        assert_eq!(coll.name, "Colors");
+        assert_eq!(coll.variable_order.len(), 1);
+    }
+}
+
+/// A collection with no variables of its own that a frame PINS a mode of must
+/// survive: the pin names it by id, and dropping it would leave the frame's
+/// `explicit_modes` entry pointing at nothing.
+#[test]
+fn empty_collection_referenced_by_a_mode_pin_survives() {
+    let fig = doc_from(vec![
+        remote_collection_stub(1, "Theme"),
+        // Same name, same emptiness, but nothing points at this one.
+        remote_collection_stub(2, "Theme"),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 5)),
+                ("type", KiwiValue::Enum("FRAME".into())),
+                ("name", KiwiValue::String("Card".to_owned())),
+                ("size", vector(100.0, 100.0)),
+                (
+                    "explicitVariableModes",
+                    KiwiValue::array(vec![o(
+                        "VariableModeBySet",
+                        vec![("variableSetID", guid(0, 1)), ("modeID", guid(0, 101))],
+                    )]),
+                ),
+            ],
+        ),
+    ]);
+    let (doc, report, _) = fig_to_doc(&fig).unwrap();
+
+    assert_eq!(report.explicit_modes_imported, 1);
+    assert_eq!(doc.variables.collections.len(), 1);
+    assert_eq!(report.variable_collections, 1);
+    assert_eq!(report.variable_collections_pruned, 1);
+
+    let coll = doc.variables.collections.values().next().unwrap();
+    assert!(coll.variable_order.is_empty());
+    let frame = group_named(&doc, "Card");
+    assert_eq!(frame.explicit_modes.get(&coll.id), Some(&coll.modes[0].id));
+}
+
+/// Opt-in: every collection a real export imports must earn its place — hold a
+/// variable, or be pinned by a frame. Guards the UI-kit defect (≈35 empty
+/// duplicate collections) against any file. Run with:
+///   FANTA_FIG_FIXTURE=/path/to/file.fig \
+///     cargo test -p fanta-fig-interop empty_collections -- --ignored --nocapture
+#[test]
+#[ignore = "requires FANTA_FIG_FIXTURE pointing at a real .fig"]
+fn imports_real_fig_fixture_without_empty_collections() {
+    let Ok(path) = std::env::var("FANTA_FIG_FIXTURE") else {
+        eprintln!("FANTA_FIG_FIXTURE not set; skipping");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let fig = crate::fig::read_fig(&bytes).expect("real .fig must parse");
+    let (doc, report, _assets) = fig_to_doc(&fig).expect("map to doc");
+
+    let mut pinned: std::collections::HashSet<fanta_doc::VariableCollectionId> =
+        std::collections::HashSet::new();
+    for root in doc.scene.roots() {
+        for id in std::iter::once(*root).chain(doc.scene.descendants_of(*root)) {
+            if let Some(node) = doc.scene.get(id)
+                && let NodeData::Group(group) = &node.data
+            {
+                pinned.extend(group.explicit_modes.keys().copied());
+            }
+        }
+    }
+    eprintln!(
+        "  VARIABLE COLLECTIONS: {} kept, {} pruned as empty+unreferenced, \
+             {} variables, {} frames pin a mode",
+        report.variable_collections,
+        report.variable_collections_pruned,
+        report.variables,
+        pinned.len(),
+    );
+    for coll in doc.variables.collections.values() {
+        assert!(
+            !coll.variable_order.is_empty() || pinned.contains(&coll.id),
+            "collection {:?} ({}) is empty and unreferenced",
+            coll.name,
+            coll.id
+        );
+    }
+    assert_eq!(report.variable_collections, doc.variables.collections.len());
+}

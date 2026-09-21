@@ -15,7 +15,7 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Layers Sidebar", fig_viewer::ToggleLayersSidebar),
         MenuItem::action("Inspector Sidebar", fig_viewer::ToggleInspectorSidebar),
         MenuItem::separator(),
-        MenuItem::action("Toggle Agent Panel", zed_actions::assistant::ToggleFocus),
+        MenuItem::action("Toggle Agent Panel", zed_actions::assistant::Toggle),
         MenuItem::action("Toggle Threads Rail", workspace::ToggleWorkspaceSidebar),
         MenuItem::separator(),
         MenuItem::action("Command Palette...", zed_actions::command_palette::Toggle),

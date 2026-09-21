@@ -1613,13 +1613,18 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if workspace
-            .panel::<Self>(cx)
-            .is_some_and(|panel| panel.read(cx).enabled(cx))
-        {
-            if !workspace.toggle_panel_focus::<Self>(window, cx) {
-                workspace.close_panel::<Self>(window, cx);
-            }
+        let Some(panel) = workspace.panel::<Self>(cx) else {
+            return;
+        };
+        let panel = panel.read(cx);
+        if !panel.enabled(cx) {
+            return;
+        }
+        if panel.is_active {
+            workspace.close_panel::<Self>(window, cx);
+            workspace.focus_center_pane(window, cx);
+        } else {
+            workspace.focus_panel::<Self>(window, cx);
         }
     }
 
@@ -9065,6 +9070,78 @@ mod tests {
         cx: &mut TestAppContext,
     ) -> (Entity<AgentPanel>, VisualTestContext) {
         setup_visible_panel_with_sidebar(cx, true).await
+    }
+
+    #[gpui::test]
+    async fn test_toggle_closes_visible_agent_panel_when_center_pane_has_focus(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let workspace = panel
+            .read_with(&cx, |panel, _| panel.workspace.upgrade())
+            .expect("visible panel should have a workspace");
+        let center_item = workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.register_action(AgentPanel::toggle);
+                workspace.open_abs_path(
+                    PathBuf::from("/project/file.txt"),
+                    workspace::OpenOptions {
+                        focus: Some(true),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("center document should open");
+        cx.run_until_parked();
+
+        let dock = cx.update(|window, cx| {
+            assert!(panel.read(cx).is_active);
+            assert!(!panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+            assert!(
+                center_item
+                    .item_focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+            workspace
+                .read(cx)
+                .dock_at_position(panel.read(cx).position(window, cx))
+                .clone()
+        });
+
+        cx.dispatch_action(Toggle);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!dock.read(cx).is_open());
+            assert!(!panel.read(cx).is_active);
+            assert!(
+                center_item
+                    .item_focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
+
+        cx.dispatch_action(Toggle);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(dock.read(cx).is_open());
+            assert!(panel.read(cx).is_active);
+            assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        cx.dispatch_action(Toggle);
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!dock.read(cx).is_open());
+            assert!(!panel.read(cx).is_active);
+            assert!(
+                center_item
+                    .item_focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
+        });
     }
 
     async fn setup_visible_panel_with_sidebar(
