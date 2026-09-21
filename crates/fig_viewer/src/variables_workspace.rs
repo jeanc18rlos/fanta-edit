@@ -100,6 +100,7 @@ pub struct FantaVariablesWorkspace {
     error_message: Option<SharedString>,
     cached_snapshot: Option<Rc<VariablesSnapshot>>,
     projected_snapshot: Option<Rc<VariablesSnapshot>>,
+    projected_project_name: Option<SharedString>,
     screen: Option<Entity<VariablesScreen>>,
     screen_subscription: Option<Subscription>,
     context_subscription: Option<Subscription>,
@@ -145,6 +146,7 @@ impl FantaVariablesWorkspace {
             error_message: None,
             cached_snapshot: None,
             projected_snapshot: None,
+            projected_project_name: None,
             screen: None,
             screen_subscription: None,
             context_subscription: None,
@@ -202,11 +204,6 @@ impl FantaVariablesWorkspace {
             VariablesAction::HelpRequested => {
                 self.error_message = Some("Create a collection, then add variables and modes. Use slash-separated names to create groups; edit a value or choose an alias from its menu.".into());
             }
-            VariablesAction::ImportVariablesRequested => {
-                self.error_message = Some(
-                    "Open a Figma .fig file to import its variables with the document.".into(),
-                );
-            }
             VariablesAction::ColorEyedropperRequested { .. } => {
                 self.error_message = Some("Screen color sampling is not available here yet; enter a hex color or use the picker.".into());
             }
@@ -231,26 +228,21 @@ impl FantaVariablesWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<VariablesScreen> {
+        let name = self.item.read(cx).title();
         if let Some(screen) = &self.screen
             && self
                 .projected_snapshot
                 .as_ref()
                 .is_some_and(|old| Rc::ptr_eq(old, snapshot))
+            && self.projected_project_name.as_ref() == Some(&name)
         {
             return screen.clone();
         }
-        let name = self
-            .item
-            .read(cx)
-            .abs_path()
-            .file_stem()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into());
         let data = screen_view_data(
             self.item.read(cx).doc(),
             snapshot,
             &self.selected_group,
-            name.into(),
+            name.clone(),
         );
         let screen = if let Some(screen) = &self.screen {
             screen.update(cx, |screen, cx| screen.set_view_data(data, cx));
@@ -272,6 +264,7 @@ impl FantaVariablesWorkspace {
         let context = variables_context_data(self.item.read(cx).doc(), snapshot);
         screen.update(cx, |screen, cx| screen.set_context_data(context, cx));
         self.projected_snapshot = Some(snapshot.clone());
+        self.projected_project_name = Some(name);
         screen
     }
 
