@@ -107,15 +107,17 @@ sibling checkouts are no longer part of the build.
 ## Published GPUI dependencies
 
 The workspace consumes the GPUI framework, supporting libraries, and reusable
-Fanta components from `squidred-dev/fanta-ui` as exact crates.io `=0.1.0`
-dependencies. Dependency aliases preserve existing Rust imports. `Cargo.lock`
-records the registry sources and checksums.
+Fanta components from `squidred-dev/fanta-ui` through a pinned Git review revision for the new Variables context controls.
+The packages retain version `0.1.0`; return these aliases to exact crates.io
+versions after the reviewed controls are published. Dependency aliases preserve
+existing Rust imports. `Cargo.lock`
+records the exact source revision and registry checksums.
 
 The migrated local source copies have been removed. The `fanta-gpui` entries
 above record historical provenance and migration work, not the active source.
 Framework changes and native framework tests belong in
 https://github.com/squidred-dev/fanta-ui. Editor CI tests the host integration,
-including canvas rendering and editor video playback, against the published
+including canvas rendering and editor video playback, against the pinned
 packages. The component fork retains its upstream Apache-2.0 license in its
 published package.
 

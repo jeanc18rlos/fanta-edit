@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::document::{FigItem, FigItemEvent};
-use crate::inspector_components::InspectorSectionHeader;
 use crate::mode_overrides::mode_override_operation;
 use crate::variable_binding::{
     bindable_properties, variable_binding_model, variable_binding_operation,
@@ -13,19 +12,17 @@ use fanta_doc::{
     VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
 };
 use fanta_gpui::variables::{
-    VariableKind, VariableModeValue, VariableRow, VariablesAction, VariablesCollection,
-    VariablesGroup, VariablesMode, VariablesScreen, VariablesViewData,
+    VariableKind, VariableModeValue, VariableRow, VariablesAction, VariablesBindingProperty,
+    VariablesChoice, VariablesCollection, VariablesContextAction, VariablesContextData,
+    VariablesGroup, VariablesLayerBindings, VariablesMode, VariablesModeScope, VariablesScreen,
+    VariablesViewData,
 };
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString,
-    Subscription, Window, px,
+    Subscription, Window,
 };
-use ui::{
-    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, prelude::*,
-};
-use util::ResultExt as _;
+use ui::prelude::*;
 
-const BINDINGS_WIDTH: f32 = 280.;
 const ALL_GROUPS: &str = "all";
 
 #[derive(Debug, Clone)]
@@ -105,6 +102,7 @@ pub struct FantaVariablesWorkspace {
     projected_snapshot: Option<Rc<VariablesSnapshot>>,
     screen: Option<Entity<VariablesScreen>>,
     screen_subscription: Option<Subscription>,
+    context_subscription: Option<Subscription>,
     #[cfg(test)]
     snapshot_builds: usize,
     #[cfg(test)]
@@ -128,6 +126,7 @@ impl FantaVariablesWorkspace {
                 // A replaced or locked document must not receive an old editor's draft.
                 this.screen = None;
                 this.screen_subscription = None;
+                this.context_subscription = None;
             }
             this.reconcile_selection(cx);
             this.invalidate_snapshot();
@@ -148,6 +147,7 @@ impl FantaVariablesWorkspace {
             projected_snapshot: None,
             screen: None,
             screen_subscription: None,
+            context_subscription: None,
             #[cfg(test)]
             snapshot_builds: 0,
             #[cfg(test)]
@@ -260,9 +260,17 @@ impl FantaVariablesWorkspace {
             self.screen_subscription = Some(cx.subscribe(&screen, |this, _, action, cx| {
                 this.handle_screen_action(action, cx)
             }));
+            self.context_subscription = Some(cx.subscribe(
+                &screen,
+                |this, _, action: &VariablesContextAction, cx| {
+                    this.handle_context_action(action, cx);
+                },
+            ));
             self.screen = Some(screen.clone());
             screen
         };
+        let context = variables_context_data(self.item.read(cx).doc(), snapshot);
+        screen.update(cx, |screen, cx| screen.set_context_data(context, cx));
         self.projected_snapshot = Some(snapshot.clone());
         screen
     }
@@ -307,6 +315,10 @@ impl FantaVariablesWorkspace {
     }
 
     fn create_variable(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_selection(cx);
+        if self.selected_collection.is_none() {
+            self.create_collection(cx);
+        }
         let Some(collection) = self.selected_collection else {
             return;
         };
@@ -447,246 +459,70 @@ impl FantaVariablesWorkspace {
         snapshot
     }
 
-    fn render_mode_scope_dropdown(
-        &self,
-        index: usize,
-        collection: &CollectionSnapshot,
-        scope: ModeScopeSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let inherited_label = match &scope.scope {
-            ModeScope::Doc => "Collection default",
-            ModeScope::Frame { .. } => "Inherit parent",
-        };
-        let current_name = scope
-            .current
-            .and_then(|current| {
-                collection
-                    .modes
-                    .iter()
-                    .find(|mode| mode.id == current)
-                    .map(|mode| mode.name.clone())
-            })
-            .unwrap_or_else(|| inherited_label.into());
-        let label: SharedString = format!("{} · {current_name}", scope.label).into();
-        let workspace = cx.weak_entity();
-        let collection_id = collection.id;
-        let selected = scope.current;
-        let mode_scope = scope.scope;
-        let modes = collection.modes.clone();
-        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            let workspace_for_default = workspace.clone();
-            let default_scope = mode_scope.clone();
-            menu.push_item(
-                ContextMenuEntry::new(inherited_label)
-                    .toggleable(IconPosition::End, selected.is_none())
-                    .handler(move |_, cx| {
-                        workspace_for_default
-                            .update(cx, |workspace, cx| {
-                                workspace.set_mode_scope(
-                                    default_scope.clone(),
-                                    collection_id,
-                                    None,
-                                    cx,
-                                )
-                            })
-                            .log_err();
-                    }),
-            );
-            for mode in &modes {
-                let workspace = workspace.clone();
-                let scope = mode_scope.clone();
-                let mode_id = mode.id;
-                menu.push_item(
-                    ContextMenuEntry::new(mode.name.clone())
-                        .toggleable(IconPosition::End, selected == Some(mode_id))
-                        .handler(move |_, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.set_mode_scope(
-                                        scope.clone(),
-                                        collection_id,
-                                        Some(mode_id),
-                                        cx,
-                                    )
-                                })
-                                .log_err();
-                        }),
-                );
-            }
-            menu
-        });
-        DropdownMenu::new(("fanta-variable-mode-scope", index), label, menu)
-            .style(DropdownStyle::Outlined)
-            .trigger_size(ButtonSize::Compact)
-            .aria_label("Variable mode scope")
-    }
-
-    fn render_mode_scope_bar(
-        &self,
-        collection: &CollectionSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let scopes = self
-            .item
-            .read(cx)
-            .doc()
-            .map(|doc| mode_scope_snapshots(doc, collection.id))
-            .unwrap_or_default();
-        let dropdowns: Vec<AnyElement> = scopes
-            .into_iter()
-            .enumerate()
-            .map(|(index, scope)| {
-                self.render_mode_scope_dropdown(index, collection, scope, window, cx)
-                    .into_any_element()
-            })
-            .collect();
-        h_flex()
-            .h(px(38.0))
-            .flex_none()
-            .px_3()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                Label::new("Modes")
-                    .size(LabelSize::XSmall)
-                    .weight(gpui::FontWeight::BOLD),
-            )
-            .children(dropdowns)
-    }
-
-    fn render_binding_row(
-        &self,
-        index: usize,
-        binding: &BindingSnapshot,
-        row: &BindingRowSnapshot,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let current_label = row.current_label.clone().unwrap_or_else(|| {
-            if row.has_choices {
-                "Unbound".into()
-            } else {
-                "No compatible variables".into()
-            }
-        });
-        let workspace = cx.weak_entity();
-        let item = self.item.downgrade();
-        let node = binding.node;
-        let prop = row.prop;
-        // The candidate list is read when the menu opens rather than captured
-        // here: this row is rebuilt on every window redraw, and a UI kit's
-        // colour collection alone runs to hundreds of entries.
-        let menu = move |window: &mut Window, cx: &mut App| {
-            let (choices, current) = item
-                .read_with(cx, |item, _| {
-                    let Some(doc) = item.doc() else {
-                        return (Vec::new(), None);
+    fn handle_context_action(&mut self, action: &VariablesContextAction, cx: &mut Context<Self>) {
+        if self.item.read(cx).source_edit_locked() {
+            return;
+        }
+        match action {
+            VariablesContextAction::ModeSelected {
+                collection_id,
+                scope_id,
+                mode_id,
+            } => {
+                let Ok(collection) = collection_id.parse() else {
+                    return;
+                };
+                if Some(collection) != self.selected_collection {
+                    return;
+                }
+                let scope = self.item.read(cx).doc().and_then(|doc| {
+                    mode_scope_snapshots(doc, collection)
+                        .into_iter()
+                        .find(|scope| mode_scope_id(&scope.scope) == *scope_id)
+                });
+                if let Some(scope) = scope {
+                    let mode = match mode_id {
+                        Some(id) => match id.parse() {
+                            Ok(id) => Some(id),
+                            Err(_) => return,
+                        },
+                        None => None,
                     };
-                    let current = doc
-                        .scene
-                        .get(node)
-                        .and_then(|node| node.bindings.get(&prop).copied());
-                    (variable_binding_options(doc, prop), current)
-                })
-                .unwrap_or_else(|_| (Vec::new(), None));
-            let workspace = workspace.clone();
-            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                if current.is_some() {
-                    let workspace = workspace.clone();
-                    menu.push_item(ContextMenuEntry::new("Unbind").handler(move |_, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.unbind_property(node, prop, cx)
-                            })
-                            .log_err();
-                    }));
+                    self.set_mode_scope(scope.scope, collection, mode, cx);
                 }
-                for choice in &choices {
-                    let workspace = workspace.clone();
-                    let variable = choice.id;
-                    menu.push_item(
-                        ContextMenuEntry::new(choice.label.clone())
-                            .toggleable(IconPosition::End, current == Some(variable))
-                            .handler(move |_, cx| {
-                                workspace
-                                    .update(cx, |workspace, cx| {
-                                        workspace.bind_property(node, prop, variable, cx)
-                                    })
-                                    .log_err();
-                            }),
-                    );
+            }
+            VariablesContextAction::BindingSelected {
+                node_id,
+                property_id,
+                variable_id,
+            } => {
+                let Ok(node) = node_id.parse() else {
+                    return;
+                };
+                let property = self
+                    .item
+                    .read(cx)
+                    .doc()
+                    .filter(|doc| doc.selection.anchor() == Some(node))
+                    .and_then(|doc| binding_snapshot(doc))
+                    .and_then(|binding| {
+                        binding
+                            .rows
+                            .into_iter()
+                            .find(|row| format!("{:?}", row.prop) == property_id.as_ref())
+                    });
+                if let Some(property) = property {
+                    if let Some(id) = variable_id {
+                        if let Ok(variable) = id.parse() {
+                            self.bind_property(node, property.prop, variable, cx);
+                        }
+                    } else {
+                        self.unbind_property(node, property.prop, cx);
+                    }
                 }
-                menu
-            }))
-        };
-        v_flex()
-            .px_3()
-            .py_1()
-            .gap_1()
-            .child(
-                Label::new(row.label.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                DropdownMenu::new_lazy(("fanta-variable-binding", index), current_label, menu)
-                    .style(DropdownStyle::Outlined)
-                    .trigger_size(ButtonSize::Compact)
-                    .full_width(true)
-                    .disabled(!row.has_choices && row.current.is_none())
-                    .aria_label(format!("Bind {}", row.label)),
-            )
-    }
-
-    fn render_bindings(
-        &self,
-        binding: Option<&BindingSnapshot>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let root = v_flex()
-            .w(px(BINDINGS_WIDTH))
-            .h_full()
-            .flex_none()
-            .border_l_1()
-            .border_color(cx.theme().colors().border)
-            .child(InspectorSectionHeader::new("Bind selected layer"));
-        let Some(binding) = binding else {
-            return root
-                .child(
-                    v_flex().px_3().child(
-                        Label::new("Select one layer on the Canvas to bind its properties.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-                .into_any_element();
-        };
-        let mut root = root
-            .child(
-                v_flex()
-                    .px_3()
-                    .pb_2()
-                    .child(Label::new(binding.node_name.clone()).single_line()),
-            )
-            .child(Divider::horizontal());
-        if binding.rows.is_empty() {
-            return root
-                .child(
-                    v_flex().px_3().py_2().child(
-                        Label::new("This layer has no supported bindable fields.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-                .into_any_element();
+            }
         }
-        for (index, row) in binding.rows.iter().enumerate() {
-            root = root.child(self.render_binding_row(index, binding, row, cx));
-        }
-        root.into_any_element()
+        cx.notify();
     }
 }
 
@@ -714,19 +550,7 @@ impl Render for FantaVariablesWorkspace {
                     .child(Label::new(error.clone()).size(LabelSize::Small)),
             );
         }
-        if let Some(collection) = &snapshot.selected {
-            root = root.child(self.render_mode_scope_bar(collection, window, cx));
-        }
-        root.child(
-            h_flex()
-                .flex_1()
-                .min_h_0()
-                .overflow_hidden()
-                .child(v_flex().flex_1().min_w_0().h_full().child(screen))
-                .when(snapshot.binding.is_some(), |body| {
-                    body.child(self.render_bindings(snapshot.binding.as_ref(), cx))
-                }),
-        )
+        root.child(v_flex().flex_1().min_w_0().min_h_0().child(screen))
     }
 }
 impl EventEmitter<()> for FantaVariablesWorkspace {}
@@ -1147,6 +971,95 @@ fn editor_variable_value(value: Option<&VarValue>, variable_type: VariableType) 
             VarValue::Boolean { value } => value.to_string(),
             VarValue::TextStyle { .. } | VarValue::Alias { .. } => String::new(),
         },
+    }
+}
+
+fn mode_scope_id(scope: &ModeScope) -> SharedString {
+    match scope {
+        ModeScope::Doc => "project".into(),
+        ModeScope::Frame { node } => node.to_string().into(),
+    }
+}
+
+fn variables_context_data(doc: Option<&Doc>, snapshot: &VariablesSnapshot) -> VariablesContextData {
+    let Some(doc) = doc else {
+        return VariablesContextData::default();
+    };
+    let mode_scopes = snapshot
+        .selected
+        .as_ref()
+        .map(|collection| {
+            mode_scope_snapshots(doc, collection.id)
+                .into_iter()
+                .map(|scope| {
+                    let mut choices = vec![VariablesChoice {
+                        id: None,
+                        label: match scope.scope {
+                            ModeScope::Doc => "Collection default".into(),
+                            ModeScope::Frame { .. } => "Inherit parent".into(),
+                        },
+                    }];
+                    choices.extend(collection.modes.iter().map(|mode| VariablesChoice {
+                        id: Some(mode.id.to_string().into()),
+                        label: mode.name.clone().into(),
+                    }));
+                    VariablesModeScope {
+                        id: mode_scope_id(&scope.scope),
+                        label: scope.label,
+                        selected: scope.current.map(|id| id.to_string().into()),
+                        choices,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let bindings = snapshot
+        .binding
+        .as_ref()
+        .map(|binding| VariablesLayerBindings {
+            node_id: binding.node.to_string().into(),
+            name: binding.node_name.clone(),
+            properties: binding
+                .rows
+                .iter()
+                .map(|row| {
+                    let mut choices = Vec::new();
+                    if row.current.is_some() {
+                        choices.push(VariablesChoice {
+                            id: None,
+                            label: "Unbind".into(),
+                        });
+                    }
+                    if row.has_choices {
+                        choices.extend(variable_binding_options(doc, row.prop).into_iter().map(
+                            |choice| VariablesChoice {
+                                id: Some(choice.id.to_string().into()),
+                                label: choice.label,
+                            },
+                        ));
+                    }
+                    let selected = row.current.map(|id| SharedString::from(id.to_string()));
+                    if selected.is_some() && !choices.iter().any(|choice| choice.id == selected) {
+                        choices.push(VariablesChoice {
+                            id: selected.clone(),
+                            label: row
+                                .current_label
+                                .clone()
+                                .unwrap_or_else(|| "Missing variable".into()),
+                        });
+                    }
+                    VariablesBindingProperty {
+                        id: format!("{:?}", row.prop).into(),
+                        label: row.label.clone(),
+                        selected,
+                        choices,
+                    }
+                })
+                .collect(),
+        });
+    VariablesContextData {
+        mode_scopes,
+        bindings,
     }
 }
 
@@ -1832,5 +1745,94 @@ mod tests {
             );
         });
         assert!(workspace.read_with(cx, |workspace, _| workspace.error_message.is_none()));
+    }
+    #[gpui::test]
+    async fn first_variable_creates_a_collection_and_mode(cx: &mut TestAppContext) {
+        let (workspace, item, mut cx) = workspace_for_doc(Doc::new(), cx).await;
+        let screen = workspace.read_with(&cx, |workspace, _| workspace.screen.clone().unwrap());
+        screen.update(&mut cx, |_, cx| {
+            cx.emit(VariablesAction::CreateTypedVariableRequested {
+                kind: VariableKind::Color,
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().unwrap();
+            assert_eq!(doc.variables.collections.len(), 1);
+            assert_eq!(doc.variables.variables.len(), 1);
+            let variable = doc.variables.variables.values().next().unwrap();
+            let collection = &doc.variables.collections[&variable.collection];
+            assert_eq!(collection.modes.len(), 1);
+            assert!(
+                variable
+                    .values_by_mode
+                    .contains_key(&collection.default_mode)
+            );
+        });
+    }
+    #[gpui::test]
+    async fn shared_context_events_apply_modes_and_layer_bindings(cx: &mut TestAppContext) {
+        let (mut doc, collection, mode) = doc_with_many_variables(1);
+        let variable = VariableId::from_u128(1);
+        let node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            10.,
+            10.,
+            FantaColor::BLACK,
+        )));
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node)).unwrap();
+        doc.selection.replace_with(vec![node_id]);
+        let (workspace, item, mut cx) = workspace_for_doc(doc, cx).await;
+        let screen = workspace.read_with(&cx, |workspace, _| workspace.screen.clone().unwrap());
+        screen.update(&mut cx, |_, cx| {
+            cx.emit(VariablesContextAction::ModeSelected {
+                collection_id: collection.to_string().into(),
+                scope_id: "project".into(),
+                mode_id: Some(mode.to_string().into()),
+            })
+        });
+        cx.run_until_parked();
+        screen.update(&mut cx, |_, cx| {
+            cx.emit(VariablesContextAction::BindingSelected {
+                node_id: node_id.to_string().into(),
+                property_id: format!("{:?}", BoundProp::FillColor { index: 0 }).into(),
+                variable_id: Some(variable.to_string().into()),
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().unwrap();
+            assert_eq!(doc.active_modes.get(&collection), Some(&mode));
+            assert_eq!(
+                doc.scene
+                    .get(node_id)
+                    .unwrap()
+                    .bindings
+                    .get(&BoundProp::FillColor { index: 0 }),
+                Some(&variable)
+            );
+        });
+        screen.update(&mut cx, |_, cx| {
+            cx.emit(VariablesContextAction::BindingSelected {
+                node_id: node_id.to_string().into(),
+                property_id: format!("{:?}", BoundProp::FillColor { index: 0 }).into(),
+                variable_id: None,
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert!(
+                !item
+                    .doc()
+                    .unwrap()
+                    .scene
+                    .get(node_id)
+                    .unwrap()
+                    .bindings
+                    .contains_key(&BoundProp::FillColor { index: 0 })
+            )
+        });
     }
 }
