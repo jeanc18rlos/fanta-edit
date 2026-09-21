@@ -491,22 +491,105 @@ mod tests {
     /// `assets/icons/**`), not gpui-component-assets. Every Lucide icon the
     /// toolbar can name — its own tool/mode faces and the host's chrome
     /// controls — must resolve there or the tile renders blank in the app.
-    /// The vendored `IconName::path` table is the exhaustive list of what
-    /// `gpui_component::IconName` can name, so scanning it covers the
-    /// toolbar's internal choices without pinning them here.
+    /// Enumerate the public variants from the pinned component release because
+    /// the published enum does not expose an iterator.
     #[test]
     fn every_gpui_component_icon_resolves_in_the_app_asset_source() {
         use gpui::AssetSource as _;
 
-        let icon_table = include_str!("../../../gpui_component/src/icon.rs");
-        let paths: Vec<&str> = icon_table
-            .match_indices("\"icons/")
-            .map(|(start, _)| {
-                let rest = &icon_table[start + 1..];
-                let end = rest.find('"').expect("closing quote");
-                &rest[..end]
-            })
-            .collect();
+        use gpui_component::IconNamed as _;
+
+        let paths: Vec<_> = [
+            IconName::ALargeSmall,
+            IconName::ArrowDown,
+            IconName::ArrowLeft,
+            IconName::ArrowRight,
+            IconName::ArrowUp,
+            IconName::Asterisk,
+            IconName::Bell,
+            IconName::BookOpen,
+            IconName::Bot,
+            IconName::Building2,
+            IconName::Calendar,
+            IconName::CaseSensitive,
+            IconName::ChartPie,
+            IconName::Check,
+            IconName::ChevronDown,
+            IconName::ChevronLeft,
+            IconName::ChevronRight,
+            IconName::ChevronsUpDown,
+            IconName::ChevronUp,
+            IconName::CircleCheck,
+            IconName::CircleUser,
+            IconName::CircleX,
+            IconName::Close,
+            IconName::Copy,
+            IconName::Dash,
+            IconName::Delete,
+            IconName::Ellipsis,
+            IconName::EllipsisVertical,
+            IconName::ExternalLink,
+            IconName::Eye,
+            IconName::EyeOff,
+            IconName::File,
+            IconName::Folder,
+            IconName::FolderClosed,
+            IconName::FolderOpen,
+            IconName::Frame,
+            IconName::GalleryVerticalEnd,
+            IconName::GitHub,
+            IconName::Globe,
+            IconName::Heart,
+            IconName::HeartOff,
+            IconName::Inbox,
+            IconName::Info,
+            IconName::Inspector,
+            IconName::LayoutDashboard,
+            IconName::Loader,
+            IconName::LoaderCircle,
+            IconName::Map,
+            IconName::Maximize,
+            IconName::Menu,
+            IconName::Minimize,
+            IconName::Minus,
+            IconName::Moon,
+            IconName::Palette,
+            IconName::PanelBottom,
+            IconName::PanelBottomOpen,
+            IconName::PanelLeft,
+            IconName::PanelLeftClose,
+            IconName::PanelLeftOpen,
+            IconName::PanelRight,
+            IconName::PanelRightClose,
+            IconName::PanelRightOpen,
+            IconName::Plus,
+            IconName::Redo,
+            IconName::Redo2,
+            IconName::Replace,
+            IconName::ResizeCorner,
+            IconName::Search,
+            IconName::Settings,
+            IconName::Settings2,
+            IconName::SortAscending,
+            IconName::SortDescending,
+            IconName::SquareTerminal,
+            IconName::Star,
+            IconName::StarOff,
+            IconName::Sun,
+            IconName::ThumbsDown,
+            IconName::ThumbsUp,
+            IconName::TriangleAlert,
+            IconName::Undo,
+            IconName::Undo2,
+            IconName::User,
+            IconName::WindowClose,
+            IconName::WindowMaximize,
+            IconName::WindowMinimize,
+            IconName::WindowRestore,
+        ]
+        .into_iter()
+        .map(|icon| icon.path())
+        .collect();
         assert!(
             paths.len() >= 80,
             "the IconName table should list the Lucide set, found {}",
@@ -515,13 +598,13 @@ mod tests {
         for control in chrome_controls(true, false, None) {
             let path = control.icon_path();
             assert!(
-                paths.contains(&path.as_ref()),
+                paths.contains(&path),
                 "{path} must come from the IconName table"
             );
         }
         for path in paths {
             let bytes = assets::Assets
-                .load(path)
+                .load(path.as_ref())
                 .unwrap_or_else(|error| panic!("{path}: {error:#}"))
                 .unwrap_or_else(|| panic!("{path} is missing from assets/icons"));
             assert!(

@@ -158,7 +158,7 @@ When your changes affect UI, consult this checklist:
 
 Zed is made up of several smaller crates - let's go over those you're most likely to interact with:
 
-- [`gpui`](/crates/gpui) is a GPU-accelerated UI framework which provides all of the building blocks for Zed. **We recommend familiarizing yourself with the root level GPUI documentation.**
+- [`gpui`](https://github.com/squidred-dev/fanta-ui/tree/main/crates/gpui) is a GPU-accelerated UI framework which provides all of the building blocks for Zed. **We recommend familiarizing yourself with the root level GPUI documentation.**
 - [`editor`](/crates/editor) contains the core `Editor` type that drives both the code editor and all various input fields within Zed. It also handles a display layer for LSP features such as Inlay Hints or code completions.
 - [`project`](/crates/project) manages files and navigation within the filetree. It is also Zed's side of communication with LSP.
 - [`workspace`](/crates/workspace) handles local state serialization and groups projects together.
