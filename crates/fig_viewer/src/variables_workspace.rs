@@ -1,51 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
 use std::rc::Rc;
 
-use editor::{Editor, EditorEvent};
-use fanta_doc::{
-    BoundProp, Color as FantaColor, Doc, Mode, ModeId, ModeScope, NodeData, NodeId, Operation,
-    VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
-};
-use gpui::{
-    App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
-    KeyDownEvent, Render, SharedString, Subscription, UniformListScrollHandle, Window, div, px,
-    uniform_list,
-};
-use ui::{
-    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, Tooltip,
-    prelude::*,
-};
-use util::ResultExt as _;
-
-use crate::document::{DocChange, FigItem, FigItemEvent};
-use crate::inspector_components::{InspectorMessage, InspectorSectionHeader};
+use crate::document::{FigItem, FigItemEvent};
+use crate::inspector_components::InspectorSectionHeader;
 use crate::mode_overrides::mode_override_operation;
 use crate::variable_binding::{
     bindable_properties, variable_binding_model, variable_binding_operation,
     variable_binding_options,
 };
+use fanta_doc::{
+    BoundProp, Color as FantaColor, Doc, Mode, ModeId, ModeScope, NodeData, NodeId, Operation,
+    VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
+};
+use fanta_gpui::variables::{
+    VariableKind, VariableModeValue, VariableRow, VariablesAction, VariablesCollection,
+    VariablesGroup, VariablesMode, VariablesScreen, VariablesViewData,
+};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, SharedString,
+    Subscription, Window, px,
+};
+use ui::{
+    ContextMenu, ContextMenuEntry, Divider, DropdownMenu, DropdownStyle, IconPosition, prelude::*,
+};
+use util::ResultExt as _;
 
-const COLLECTION_WIDTH: f32 = 220.0;
-const VARIABLE_NAME_WIDTH: f32 = 200.0;
-const VARIABLE_TYPE_WIDTH: f32 = 100.0;
-const MODE_WIDTH: f32 = 180.0;
-const BINDINGS_WIDTH: f32 = 280.0;
-const TABLE_ROW_HEIGHT: f32 = 36.0;
-
-const PRIMITIVE_VARIABLE_TYPES: [VariableType; 4] = [
-    VariableType::Color,
-    VariableType::Float,
-    VariableType::String,
-    VariableType::Boolean,
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VariableCell {
-    variable: VariableId,
-    mode: ModeId,
-    variable_type: VariableType,
-}
+const BINDINGS_WIDTH: f32 = 280.;
+const ALL_GROUPS: &str = "all";
 
 #[derive(Debug, Clone)]
 struct CollectionSummary {
@@ -65,7 +46,6 @@ struct VariableRowSnapshot {
 #[derive(Debug, Clone)]
 struct CollectionSnapshot {
     id: VariableCollectionId,
-    name: SharedString,
     modes: Vec<Mode>,
     variables: Vec<VariableRowSnapshot>,
 }
@@ -118,92 +98,41 @@ pub struct FantaVariablesWorkspace {
     item: Entity<FigItem>,
     focus_handle: FocusHandle,
     selected_collection: Option<VariableCollectionId>,
+    selected_group: SharedString,
     new_variable_type: VariableType,
-    editing_cell: Option<VariableCell>,
-    value_edit_baseline: Option<VarValue>,
-    value_edit_previewed: bool,
-    value_editor: Entity<Editor>,
-    rename_target: Option<VariableRenameTarget>,
-    rename_editor: Entity<Editor>,
-    suppress_editor_events: bool,
     error_message: Option<SharedString>,
-    /// The table model, walked from the document only when it can have
-    /// changed. GPUI re-renders every visible view on every window redraw, so
-    /// building this in `render` walks the whole variable registry on each
-    /// canvas pan and caret blink — a 40-collection, 1,500-variable UI kit
-    /// hangs the window. The snapshot is a pure function of the document and
-    /// `selected_collection`, so every write to either invalidates it.
     cached_snapshot: Option<Rc<VariablesSnapshot>>,
-    table_scroll_handle: UniformListScrollHandle,
+    projected_snapshot: Option<Rc<VariablesSnapshot>>,
+    screen: Option<Entity<VariablesScreen>>,
+    screen_subscription: Option<Subscription>,
     #[cfg(test)]
     snapshot_builds: usize,
-    #[cfg(test)]
-    rows_built: usize,
     #[cfg(test)]
     renders: usize,
     _subscriptions: Vec<Subscription>,
 }
 
 impl FantaVariablesWorkspace {
-    pub fn new(item: Entity<FigItem>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let value_editor = cx.new(|cx| Editor::single_line(window, cx));
-        let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
-        let value_editor_subscription = cx.subscribe_in(
-            &value_editor,
-            window,
-            |this: &mut Self, _, event: &EditorEvent, window, cx| match event {
-                EditorEvent::BufferEdited if this.editing_cell.is_some() => {
-                    this.preview_value_edit(cx);
-                }
-                EditorEvent::Blurred if this.editing_cell.is_some() => {
-                    this.commit_value_edit_and_focus(window, cx);
-                }
-                _ => {}
-            },
-        );
-        let item_subscription =
-            cx.subscribe(&item, |this: &mut Self, item, event: &FigItemEvent, cx| {
-                // Drag previews and caret moves arrive per pointer move and
-                // can change neither the variable registry nor which layer is
-                // bound, so they must not pay for a registry walk. Every other
-                // event may have replaced document state, so it invalidates —
-                // a snapshot that outlives its document reads as a stale
-                // table, which is worse than a slow one.
-                if matches!(
-                    event,
-                    FigItemEvent::EditedTransient | FigItemEvent::TextSelectionChanged
-                ) {
-                    return;
-                }
-                if matches!(event, FigItemEvent::StateChanged) {
-                    this.editing_cell = None;
-                    this.value_edit_baseline = None;
-                    this.value_edit_previewed = false;
-                    this.rename_target = None;
-                }
-                if matches!(event, FigItemEvent::SourceEditLockChanged)
-                    && item.read(cx).source_edit_locked()
-                {
-                    let workspace = cx.weak_entity();
-                    cx.defer(move |cx| {
-                        workspace
-                            .update(cx, |workspace, cx| workspace.cancel_value_edit(cx))
-                            .log_err();
-                    });
-                }
-                this.reconcile_selection(cx);
-                this.invalidate_snapshot();
-                cx.notify();
-            });
-        let rename_editor_subscription = cx.subscribe_in(
-            &rename_editor,
-            window,
-            |this: &mut Self, _, event: &EditorEvent, window, cx| {
-                if matches!(event, EditorEvent::Blurred) && this.rename_target.is_some() {
-                    this.commit_rename(window, cx);
-                }
-            },
-        );
+    pub fn new(item: Entity<FigItem>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.subscribe(&item, |this: &mut Self, _, event: &FigItemEvent, cx| {
+            if matches!(
+                event,
+                FigItemEvent::EditedTransient | FigItemEvent::TextSelectionChanged
+            ) {
+                return;
+            }
+            if matches!(
+                event,
+                FigItemEvent::StateChanged | FigItemEvent::SourceEditLockChanged
+            ) {
+                // A replaced or locked document must not receive an old editor's draft.
+                this.screen = None;
+                this.screen_subscription = None;
+            }
+            this.reconcile_selection(cx);
+            this.invalidate_snapshot();
+            cx.notify();
+        });
         let selected_collection = item
             .read(cx)
             .doc()
@@ -212,71 +141,130 @@ impl FantaVariablesWorkspace {
             item,
             focus_handle: cx.focus_handle(),
             selected_collection,
+            selected_group: ALL_GROUPS.into(),
             new_variable_type: VariableType::Color,
-            editing_cell: None,
-            value_edit_baseline: None,
-            value_edit_previewed: false,
-            value_editor,
-            rename_target: None,
-            rename_editor,
-            suppress_editor_events: false,
             error_message: None,
             cached_snapshot: None,
-            table_scroll_handle: UniformListScrollHandle::new(),
+            projected_snapshot: None,
+            screen: None,
+            screen_subscription: None,
             #[cfg(test)]
             snapshot_builds: 0,
             #[cfg(test)]
-            rows_built: 0,
-            #[cfg(test)]
             renders: 0,
-            _subscriptions: vec![
-                value_editor_subscription,
-                rename_editor_subscription,
-                item_subscription,
-            ],
+            _subscriptions: vec![subscription],
         }
     }
 
     fn reconcile_selection(&mut self, cx: &App) {
-        let selected_exists = self.selected_collection.is_some_and(|collection| {
-            self.item
-                .read(cx)
-                .doc()
-                .is_some_and(|doc| doc.variables.collections.contains_key(&collection))
-        });
-        if !selected_exists {
-            self.selected_collection = self
-                .item
-                .read(cx)
-                .doc()
-                .and_then(|doc| doc.variables.collections.keys().next().copied());
-            self.invalidate_snapshot();
-        }
-        if self.editing_cell.is_some_and(|cell| {
-            self.item
-                .read(cx)
-                .doc()
-                .and_then(|doc| doc.variables.variables.get(&cell.variable))
-                .is_none()
-        }) {
-            self.editing_cell = None;
-            self.value_edit_baseline = None;
-            self.value_edit_previewed = false;
+        let doc = self.item.read(cx).doc();
+        if !self
+            .selected_collection
+            .is_some_and(|id| doc.is_some_and(|doc| doc.variables.collections.contains_key(&id)))
+        {
+            self.selected_collection =
+                doc.and_then(|doc| doc.variables.collections.keys().next().copied());
+            self.selected_group = ALL_GROUPS.into();
         }
     }
 
-    fn select_collection(
+    fn handle_screen_action(&mut self, action: &VariablesAction, cx: &mut Context<Self>) {
+        if self.item.read(cx).source_edit_locked() {
+            self.error_message =
+                Some("Finish editing the document source before changing variables.".into());
+            cx.notify();
+            return;
+        }
+        match action {
+            VariablesAction::CollectionSelected { collection_id } => {
+                if let Ok(id) = collection_id.parse() {
+                    self.selected_collection = Some(id);
+                    self.selected_group = ALL_GROUPS.into();
+                    self.reconcile_selection(cx);
+                    self.invalidate_snapshot();
+                }
+            }
+            VariablesAction::GroupSelected { group_id } => {
+                self.selected_group = group_id.clone();
+                self.projected_snapshot = None;
+            }
+            VariablesAction::CreateCollectionRequested => self.create_collection(cx),
+            VariablesAction::CreateVariableRequested => self.create_variable(cx),
+            VariablesAction::CreateTypedVariableRequested { kind } => {
+                self.new_variable_type = host_variable_type(*kind);
+                self.create_variable(cx);
+            }
+            VariablesAction::AddModeRequested => self.add_mode(cx),
+            VariablesAction::SearchQueryChanged { .. }
+            | VariablesAction::SearchOptionsRequested
+            | VariablesAction::ValueEditRequested { .. }
+            | VariablesAction::VariableSettingsRequested { .. } => {}
+            VariablesAction::HelpRequested => {
+                self.error_message = Some("Create a collection, then add variables and modes. Use slash-separated names to create groups; edit a value or choose an alias from its menu.".into());
+            }
+            VariablesAction::ImportVariablesRequested => {
+                self.error_message = Some(
+                    "Open a Figma .fig file to import its variables with the document.".into(),
+                );
+            }
+            VariablesAction::ColorEyedropperRequested { .. } => {
+                self.error_message = Some("Screen color sampling is not available here yet; enter a hex color or use the picker.".into());
+            }
+            _ => {
+                let result = self
+                    .item
+                    .read(cx)
+                    .doc()
+                    .ok_or("The document is not ready")
+                    .and_then(|doc| screen_operation(doc, self.selected_collection, action));
+                self.apply_built_operation(result, cx);
+                // Echo the accepted value even when a rejected edit changed only presentation.
+                self.projected_snapshot = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn update_screen(
         &mut self,
-        collection: VariableCollectionId,
+        snapshot: &Rc<VariablesSnapshot>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.commit_value_edit_and_focus(window, cx);
-        self.commit_rename(window, cx);
-        self.selected_collection = Some(collection);
-        self.error_message = None;
-        self.invalidate_snapshot();
-        cx.notify();
+    ) -> Entity<VariablesScreen> {
+        if let Some(screen) = &self.screen
+            && self
+                .projected_snapshot
+                .as_ref()
+                .is_some_and(|old| Rc::ptr_eq(old, snapshot))
+        {
+            return screen.clone();
+        }
+        let name = self
+            .item
+            .read(cx)
+            .abs_path()
+            .file_stem()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        let data = screen_view_data(
+            self.item.read(cx).doc(),
+            snapshot,
+            &self.selected_group,
+            name.into(),
+        );
+        let screen = if let Some(screen) = &self.screen {
+            screen.update(cx, |screen, cx| screen.set_view_data(data, cx));
+            screen.clone()
+        } else {
+            let screen = cx.new(|cx| VariablesScreen::new("fanta-variables", data, window, cx));
+            self.screen_subscription = Some(cx.subscribe(&screen, |this, _, action, cx| {
+                this.handle_screen_action(action, cx)
+            }));
+            self.screen = Some(screen.clone());
+            screen
+        };
+        self.projected_snapshot = Some(snapshot.clone());
+        screen
     }
 
     fn apply_operation(&mut self, operation: Operation, cx: &mut Context<Self>) -> bool {
@@ -298,63 +286,6 @@ impl FantaVariablesWorkspace {
         }
     }
 
-    fn start_rename(
-        &mut self,
-        target: VariableRenameTarget,
-        initial: SharedString,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.commit_value_edit_and_focus(window, cx);
-        self.commit_rename(window, cx);
-        self.suppress_editor_events = true;
-        self.rename_editor.update(cx, |editor, cx| {
-            editor.set_text(initial, window, cx);
-            editor.select_all(&editor::actions::SelectAll, window, cx);
-        });
-        self.suppress_editor_events = false;
-        self.rename_target = Some(target);
-        self.error_message = None;
-        self.rename_editor.focus_handle(cx).focus(window, cx);
-        cx.notify();
-    }
-
-    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.rename_target.take() else {
-            return;
-        };
-        let new_name = self.rename_editor.read(cx).text(cx).trim().to_owned();
-        if new_name.is_empty() {
-            self.error_message = Some("Names cannot be empty".into());
-            self.focus_handle.focus(window, cx);
-            cx.notify();
-            return;
-        }
-        let operation = {
-            let item = self.item.read(cx);
-            let Some(doc) = item.doc() else {
-                return;
-            };
-            rename_operation(doc, target, new_name)
-        };
-        self.apply_built_operation(operation, cx);
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.rename_target = None;
-        self.error_message = None;
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    fn finish_content_preview(&self, committed: bool, cx: &mut Context<Self>) {
-        self.item.update(cx, |item, cx| {
-            item.finish_content_preview(committed, cx);
-        });
-    }
-
     fn create_collection(&mut self, cx: &mut Context<Self>) {
         let operation = {
             let item = self.item.read(cx);
@@ -369,6 +300,7 @@ impl FantaVariablesWorkspace {
         };
         if self.apply_operation(operation, cx) {
             self.selected_collection = Some(collection);
+            self.selected_group = ALL_GROUPS.into();
             self.invalidate_snapshot();
             cx.notify();
         }
@@ -383,7 +315,17 @@ impl FantaVariablesWorkspace {
             let Some(doc) = item.doc() else {
                 return;
             };
-            create_variable_operation(doc, collection, self.new_variable_type)
+            create_variable_operation(doc, collection, self.new_variable_type).map(
+                |mut operation| {
+                    if let Operation::CreateVariable { variable } = &mut operation
+                        && let Some(group) = self.selected_group.strip_prefix("group:")
+                        && !group.is_empty()
+                    {
+                        variable.name = format!("{group}/{}", variable.name);
+                    }
+                    operation
+                },
+            )
         };
         match operation {
             Ok(operation) => {
@@ -418,201 +360,6 @@ impl FantaVariablesWorkspace {
         }
     }
 
-    fn start_value_edit(
-        &mut self,
-        cell: VariableCell,
-        initial: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.commit_value_edit_and_focus(window, cx);
-        self.finish_content_preview(true, cx);
-        if cell.variable_type == VariableType::Boolean {
-            self.toggle_boolean_value(cell, cx);
-            return;
-        }
-        if cell.variable_type == VariableType::Typography {
-            self.error_message =
-                Some("Typography variables are read-only in this first slice".into());
-            cx.notify();
-            return;
-        }
-        let baseline = self
-            .item
-            .read(cx)
-            .doc()
-            .and_then(|doc| doc.variables.variables.get(&cell.variable))
-            .and_then(|variable| variable.values_by_mode.get(&cell.mode))
-            .cloned();
-        self.suppress_editor_events = true;
-        self.value_editor.update(cx, |editor, cx| {
-            editor.set_text(initial, window, cx);
-            editor.select_all(&editor::actions::SelectAll, window, cx);
-        });
-        self.suppress_editor_events = false;
-        self.editing_cell = Some(cell);
-        self.value_edit_baseline = baseline;
-        self.value_edit_previewed = false;
-        self.error_message = None;
-        self.value_editor.focus_handle(cx).focus(window, cx);
-        cx.notify();
-    }
-
-    fn toggle_boolean_value(&mut self, cell: VariableCell, cx: &mut Context<Self>) {
-        let result = {
-            let item = self.item.read(cx);
-            let Some(doc) = item.doc() else {
-                return;
-            };
-            let current = doc
-                .variables
-                .variables
-                .get(&cell.variable)
-                .and_then(|variable| variable.values_by_mode.get(&cell.mode));
-            let next = !matches!(current, Some(VarValue::Boolean { value: true }));
-            set_variable_value_operation(
-                doc,
-                cell.variable,
-                cell.mode,
-                VarValue::Boolean { value: next },
-            )
-        };
-        self.apply_built_operation(result, cx);
-    }
-
-    pub(crate) fn finish_value_edit(&mut self, cx: &mut Context<Self>) {
-        if self.suppress_editor_events {
-            return;
-        }
-        let Some(cell) = self.editing_cell.take() else {
-            return;
-        };
-        let baseline = self.value_edit_baseline.take();
-        let previewed = std::mem::take(&mut self.value_edit_previewed);
-        let text = self.value_editor.read(cx).text(cx);
-        let parsed = parse_primitive_value(cell.variable_type, text.trim());
-        if previewed {
-            // Rewinding a transient preview changes what the renderer must
-            // resolve even when the final text cannot produce an operation.
-            // A valid commit immediately emits its own content change too, but
-            // invalid input has no later event to invalidate the preview.
-            self.restore_value_preview(cell, baseline, true, cx);
-        }
-        let result = parsed.and_then(|value| {
-            let item = self.item.read(cx);
-            let Some(doc) = item.doc() else {
-                return Err("The document is no longer available");
-            };
-            set_variable_value_operation(doc, cell.variable, cell.mode, value)
-        });
-        let committed = self.apply_built_operation(result, cx);
-        if previewed {
-            self.finish_content_preview(committed, cx);
-        }
-        self.invalidate_snapshot();
-        cx.notify();
-    }
-
-    fn commit_value_edit_and_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish_value_edit(cx);
-        if self
-            .value_editor
-            .focus_handle(cx)
-            .contains_focused(window, cx)
-        {
-            self.focus_handle.focus(window, cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn cancel_value_edit(&mut self, cx: &mut Context<Self>) {
-        if let Some(cell) = self.editing_cell.take() {
-            let baseline = self.value_edit_baseline.take();
-            let previewed = std::mem::take(&mut self.value_edit_previewed);
-            if previewed {
-                self.restore_value_preview(cell, baseline, true, cx);
-                self.finish_content_preview(false, cx);
-            }
-        }
-        self.error_message = None;
-        self.invalidate_snapshot();
-        cx.notify();
-    }
-
-    fn preview_value_edit(&mut self, cx: &mut Context<Self>) {
-        if self.suppress_editor_events {
-            return;
-        }
-        let Some(cell) = self.editing_cell else {
-            return;
-        };
-        let text = self.value_editor.read(cx).text(cx);
-        let value = match parse_primitive_value(cell.variable_type, text.trim()) {
-            Ok(value) => value,
-            Err(error) => {
-                self.error_message = Some(error.into());
-                cx.notify();
-                return;
-            }
-        };
-        let result = self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                let result = preview_variable_value(&mut document.doc, cell, value);
-                let change = match result {
-                    Ok(true) => {
-                        document.mark_variables_changed();
-                        DocChange::ContentPreview
-                    }
-                    Ok(false) | Err(_) => DocChange::None,
-                };
-                (result, change)
-            })
-        });
-        // The preview writes into the document behind an EditedTransient,
-        // the one event the item subscription skips, so it invalidates here.
-        self.invalidate_snapshot();
-        match result {
-            Some(Ok(true)) => {
-                self.value_edit_previewed = true;
-                self.error_message = None;
-            }
-            Some(Ok(false)) => {
-                self.error_message = None;
-            }
-            Some(Err(error)) => {
-                self.error_message = Some(error.into());
-            }
-            None => {
-                self.error_message = Some("The document is no longer available".into());
-            }
-        }
-        cx.notify();
-    }
-
-    fn restore_value_preview(
-        &mut self,
-        cell: VariableCell,
-        baseline: Option<VarValue>,
-        notify: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                let changed = restore_variable_value(&mut document.doc, cell, baseline);
-                if changed {
-                    document.mark_variables_changed();
-                }
-                let change = if changed && notify {
-                    DocChange::ContentPreview
-                } else {
-                    DocChange::None
-                };
-                ((), change)
-            });
-        });
-        self.invalidate_snapshot();
-    }
-
     fn apply_built_operation(
         &mut self,
         result: Result<Option<Operation>, &'static str>,
@@ -629,34 +376,6 @@ impl FantaVariablesWorkspace {
                 cx.notify();
                 false
             }
-        }
-    }
-
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event.keystroke.key.as_str() {
-            "enter" if self.rename_target.is_some() => {
-                cx.stop_propagation();
-                self.commit_rename(window, cx);
-            }
-            "escape" if self.rename_target.is_some() => {
-                cx.stop_propagation();
-                self.cancel_rename(window, cx);
-            }
-            "enter" if self.editing_cell.is_some() => {
-                cx.stop_propagation();
-                self.commit_value_edit_and_focus(window, cx);
-            }
-            "escape" if self.editing_cell.is_some() => {
-                cx.stop_propagation();
-                self.cancel_value_edit(cx);
-                self.focus_handle.focus(window, cx);
-            }
-            _ => {}
         }
     }
 
@@ -726,41 +445,6 @@ impl FantaVariablesWorkspace {
         }
         self.cached_snapshot = Some(snapshot.clone());
         snapshot
-    }
-
-    fn render_variable_type_dropdown(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let workspace = cx.weak_entity();
-        let selected = self.new_variable_type;
-        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            for variable_type in PRIMITIVE_VARIABLE_TYPES {
-                let workspace = workspace.clone();
-                menu.push_item(
-                    ContextMenuEntry::new(variable_type_label(variable_type))
-                        .toggleable(IconPosition::End, variable_type == selected)
-                        .handler(move |_, cx| {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.new_variable_type = variable_type;
-                                    cx.notify();
-                                })
-                                .log_err();
-                        }),
-                );
-            }
-            menu
-        });
-        DropdownMenu::new(
-            "fanta-variable-type",
-            variable_type_label(self.new_variable_type),
-            menu,
-        )
-        .style(DropdownStyle::Outlined)
-        .trigger_size(ButtonSize::Compact)
-        .aria_label("New variable type")
     }
 
     fn render_mode_scope_dropdown(
@@ -872,380 +556,6 @@ impl FantaVariablesWorkspace {
                     .weight(gpui::FontWeight::BOLD),
             )
             .children(dropdowns)
-    }
-
-    fn render_collections(
-        &self,
-        snapshot: &VariablesSnapshot,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let mut list = v_flex()
-            .id("fanta-variable-collections")
-            .w(px(COLLECTION_WIDTH))
-            .h_full()
-            .flex_none()
-            // A library file carries dozens of collections; without this the
-            // ones past the panel's height are drawn and simply unreachable.
-            .overflow_y_scroll()
-            .border_r_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                InspectorSectionHeader::new("Collections").action(
-                    IconButton::new("fanta-variable-add-collection", IconName::Plus)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Create collection"))
-                        .on_click(
-                            cx.listener(|workspace, _, _, cx| workspace.create_collection(cx)),
-                        ),
-                ),
-            );
-        if snapshot.collections.is_empty() {
-            return list
-                .child(
-                    v_flex().px_3().py_2().child(
-                        Label::new("Create a collection to start defining reusable values.")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-                .into_any_element();
-        }
-        for (index, collection) in snapshot.collections.iter().enumerate() {
-            let collection_id = collection.id;
-            let collection_name = collection.name.clone();
-            let selected = self.selected_collection == Some(collection_id);
-            list = list.child(
-                Button::new(
-                    ("fanta-variable-collection", index),
-                    format!("{} ({})", collection.name, collection.variable_count),
-                )
-                .style(ButtonStyle::Subtle)
-                .toggle_state(selected)
-                .full_width()
-                .on_click(cx.listener(
-                    move |workspace, event: &ClickEvent, window, cx| {
-                        if event.click_count() >= 2 {
-                            workspace.start_rename(
-                                VariableRenameTarget::Collection(collection_id),
-                                collection_name.clone(),
-                                window,
-                                cx,
-                            );
-                        } else {
-                            workspace.select_collection(collection_id, window, cx);
-                        }
-                    },
-                )),
-            );
-        }
-        list.into_any_element()
-    }
-
-    fn render_table_header(
-        &self,
-        collection: &CollectionSnapshot,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let mut row = h_flex()
-            .h(px(TABLE_ROW_HEIGHT))
-            .flex_none()
-            .border_b_1()
-            .child(table_header_cell("Name", VARIABLE_NAME_WIDTH))
-            .child(table_header_cell("Type", VARIABLE_TYPE_WIDTH));
-        for (mode_index, mode) in collection.modes.iter().enumerate() {
-            let target = VariableRenameTarget::Mode {
-                collection: collection.id,
-                mode: mode.id,
-            };
-            if self.rename_target == Some(target) {
-                row = row.child(
-                    div()
-                        .w(px(MODE_WIDTH))
-                        .h(px(TABLE_ROW_HEIGHT))
-                        .flex_none()
-                        .px_1()
-                        .py_1()
-                        .border_l_1()
-                        .child(self.rename_editor.clone()),
-                );
-            } else {
-                let initial: SharedString = mode.name.clone().into();
-                row = row.child(
-                    div()
-                        .id(("fanta-variable-mode-name", mode_index))
-                        .w(px(MODE_WIDTH))
-                        .h(px(TABLE_ROW_HEIGHT))
-                        .flex_none()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .border_l_1()
-                        .border_color(cx.theme().colors().border)
-                        .cursor_text()
-                        .tooltip(Tooltip::text("Double-click to rename mode"))
-                        .on_click(
-                            cx.listener(move |workspace, event: &ClickEvent, window, cx| {
-                                if event.click_count() >= 2 {
-                                    workspace.start_rename(target, initial.clone(), window, cx);
-                                }
-                            }),
-                        )
-                        .child(
-                            Label::new(mode.name.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line(),
-                        ),
-                );
-            }
-        }
-        row
-    }
-
-    fn render_variable_name_cell(
-        &self,
-        row_index: usize,
-        variable: &VariableRowSnapshot,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let target = VariableRenameTarget::Variable(variable.id);
-        if self.rename_target == Some(target) {
-            return div()
-                .w(px(VARIABLE_NAME_WIDTH))
-                .h(px(TABLE_ROW_HEIGHT))
-                .flex_none()
-                .px_1()
-                .py_1()
-                .child(self.rename_editor.clone())
-                .into_any_element();
-        }
-        let initial = variable.name.clone();
-        div()
-            .id(("fanta-variable-name", row_index))
-            .w(px(VARIABLE_NAME_WIDTH))
-            .h(px(TABLE_ROW_HEIGHT))
-            .flex_none()
-            .px_2()
-            .flex()
-            .items_center()
-            .cursor_text()
-            .tooltip(Tooltip::text("Double-click to rename variable"))
-            .hover(|cell| cell.bg(cx.theme().colors().element_hover))
-            .on_click(
-                cx.listener(move |workspace, event: &ClickEvent, window, cx| {
-                    if event.click_count() >= 2 {
-                        workspace.start_rename(target, initial.clone(), window, cx);
-                    }
-                }),
-            )
-            .child(
-                Label::new(variable.name.clone())
-                    .size(LabelSize::Small)
-                    .single_line(),
-            )
-            .into_any_element()
-    }
-
-    fn render_value_cell(
-        &self,
-        row_index: usize,
-        mode_index: usize,
-        variable: &VariableRowSnapshot,
-        mode: &Mode,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let cell = VariableCell {
-            variable: variable.id,
-            mode: mode.id,
-            variable_type: variable.variable_type,
-        };
-        if self.editing_cell == Some(cell) {
-            return div()
-                .w(px(MODE_WIDTH))
-                .h(px(TABLE_ROW_HEIGHT))
-                .flex_none()
-                .px_1()
-                .py_1()
-                .border_l_1()
-                .child(self.value_editor.clone())
-                .into_any_element();
-        }
-        let value = variable.values.get(&mode.id);
-        let display = display_variable_value(value, variable.variable_type);
-        let initial = editor_variable_value(value, variable.variable_type);
-        div()
-            .id((
-                "fanta-variable-value",
-                row_index.saturating_mul(1_000).saturating_add(mode_index),
-            ))
-            .w(px(MODE_WIDTH))
-            .h(px(TABLE_ROW_HEIGHT))
-            .flex_none()
-            .px_2()
-            .flex()
-            .items_center()
-            .border_l_1()
-            .border_color(cx.theme().colors().border)
-            .hover(|cell| cell.bg(cx.theme().colors().element_hover))
-            .cursor_pointer()
-            .on_click(cx.listener(move |workspace, _, window, cx| {
-                workspace.start_value_edit(cell, initial.clone(), window, cx)
-            }))
-            .child(
-                Label::new(display)
-                    .size(LabelSize::Small)
-                    .single_line()
-                    .when(value.is_none(), |label| label.color(Color::Muted)),
-            )
-            .into_any_element()
-    }
-
-    fn render_variable_table(
-        &self,
-        collection: &CollectionSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let collection_target = VariableRenameTarget::Collection(collection.id);
-        let collection_name = if self.rename_target == Some(collection_target) {
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(self.rename_editor.clone())
-                .into_any_element()
-        } else {
-            let initial = collection.name.clone();
-            v_flex()
-                .id("fanta-variable-collection-name")
-                .flex_1()
-                .min_w_0()
-                .cursor_text()
-                .tooltip(Tooltip::text("Double-click to rename collection"))
-                .on_click(
-                    cx.listener(move |workspace, event: &ClickEvent, window, cx| {
-                        if event.click_count() >= 2 {
-                            workspace.start_rename(collection_target, initial.clone(), window, cx);
-                        }
-                    }),
-                )
-                .child(Label::new(collection.name.clone()).single_line())
-                .child(
-                    Label::new(format!("{} variables", collection.variables.len()))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .into_any_element()
-        };
-        let toolbar = h_flex()
-            .h(px(44.))
-            .flex_none()
-            .px_3()
-            .gap_2()
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(collection_name)
-            .child(self.render_variable_type_dropdown(window, cx))
-            .child(
-                Button::new("fanta-variable-add-variable", "Create variable")
-                    .size(ButtonSize::Compact)
-                    .start_icon(Icon::new(IconName::Plus).size(IconSize::XSmall))
-                    .on_click(cx.listener(|workspace, _, _, cx| workspace.create_variable(cx))),
-            )
-            .child(
-                Button::new("fanta-variable-add-mode", "Add mode")
-                    .size(ButtonSize::Compact)
-                    .on_click(cx.listener(|workspace, _, _, cx| workspace.add_mode(cx))),
-            );
-
-        let rows = if collection.variables.is_empty() {
-            h_flex()
-                .h(px(80.))
-                .px_3()
-                .child(
-                    Label::new("No variables in this collection")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .into_any_element()
-        } else {
-            uniform_list(
-                "fanta-variable-rows",
-                collection.variables.len(),
-                cx.processor(|workspace, range: Range<usize>, _window, cx| {
-                    workspace.render_variable_rows(range, cx)
-                }),
-            )
-            .flex_1()
-            .min_h(px(0.))
-            .track_scroll(&self.table_scroll_handle)
-            .into_any_element()
-        };
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_hidden()
-            .child(toolbar)
-            .child(self.render_mode_scope_bar(collection, window, cx))
-            .child(
-                // The header and the virtualized rows share one horizontally
-                // scrolling column so the mode columns stay aligned; vertical
-                // scrolling belongs to the `uniform_list` itself.
-                div()
-                    .id("fanta-variable-table-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_x_scroll()
-                    .child(
-                        v_flex()
-                            .h_full()
-                            .min_w(px(VARIABLE_NAME_WIDTH
-                                + VARIABLE_TYPE_WIDTH
-                                + MODE_WIDTH * collection.modes.len() as f32))
-                            .child(self.render_table_header(collection, cx))
-                            .child(rows),
-                    ),
-            )
-    }
-
-    /// Builds only the rows one visible range of the virtualized table asks
-    /// for. Row indices are positions in the selected collection, so the
-    /// element ids — and with them the mounted inline editors — stay put as
-    /// the list scrolls.
-    fn render_variable_rows(
-        &mut self,
-        range: Range<usize>,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let snapshot = self.snapshot(cx);
-        let Some(collection) = snapshot.selected.as_ref() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::with_capacity(range.len());
-        for row_index in range {
-            let Some(variable) = collection.variables.get(row_index) else {
-                continue;
-            };
-            let mut row = h_flex()
-                .h(px(TABLE_ROW_HEIGHT))
-                .flex_none()
-                .border_b_1()
-                .border_color(cx.theme().colors().border)
-                .child(self.render_variable_name_cell(row_index, variable, cx))
-                .child(table_value_cell(
-                    variable_type_label(variable.variable_type),
-                    VARIABLE_TYPE_WIDTH,
-                ));
-            for (mode_index, mode) in collection.modes.iter().enumerate() {
-                row = row.child(self.render_value_cell(row_index, mode_index, variable, mode, cx));
-            }
-            #[cfg(test)]
-            {
-                self.rows_built += 1;
-            }
-            rows.push(row.into_any_element());
-        }
-        rows
     }
 
     fn render_binding_row(
@@ -1387,63 +697,45 @@ impl Render for FantaVariablesWorkspace {
             self.renders += 1;
         }
         let snapshot = self.snapshot(cx);
+        let screen = self.update_screen(&snapshot, window, cx);
         let mut root = v_flex()
             .key_context("FantaVariablesWorkspace")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
             .overflow_hidden()
-            .bg(cx.theme().colors().panel_background)
-            .child(
-                h_flex()
-                    .h(px(40.))
-                    .flex_none()
-                    .px_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border)
-                    .child(Label::new("Variables").size(LabelSize::Large))
-                    .child(
-                        Label::new("Collections, modes, values, and bindings")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-            );
-        if let Some(error) = self.error_message.clone() {
+            .bg(cx.theme().colors().panel_background);
+        if let Some(error) = &self.error_message {
             root = root.child(
                 h_flex()
                     .flex_none()
                     .px_3()
                     .py_1()
                     .bg(cx.theme().status().error_background)
-                    .child(Label::new(error).size(LabelSize::Small)),
+                    .child(Label::new(error.clone()).size(LabelSize::Small)),
             );
+        }
+        if let Some(collection) = &snapshot.selected {
+            root = root.child(self.render_mode_scope_bar(collection, window, cx));
         }
         root.child(
             h_flex()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .child(self.render_collections(&snapshot, cx))
-                .child(match snapshot.selected.as_ref() {
-                    Some(collection) => self
-                        .render_variable_table(collection, window, cx)
-                        .into_any_element(),
-                    None => InspectorMessage::new(
-                        "Create or select a collection to edit its variables.",
-                    )
-                    .into_any_element(),
-                })
-                .child(self.render_bindings(snapshot.binding.as_ref(), cx)),
+                .child(v_flex().flex_1().min_w_0().h_full().child(screen))
+                .when(snapshot.binding.is_some(), |body| {
+                    body.child(self.render_bindings(snapshot.binding.as_ref(), cx))
+                }),
         )
     }
 }
-
 impl EventEmitter<()> for FantaVariablesWorkspace {}
-
 impl Focusable for FantaVariablesWorkspace {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.screen
+            .as_ref()
+            .map(|screen| screen.focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle.clone())
     }
 }
 
@@ -1570,7 +862,6 @@ fn collection_snapshot(doc: &Doc, collection: &VariableCollection) -> Collection
         .collect();
     CollectionSnapshot {
         id: collection.id,
-        name: collection.name.clone().into(),
         modes: collection.modes.clone(),
         variables,
     }
@@ -1745,7 +1036,9 @@ fn set_variable_value_operation(
     if !collection.has_mode(mode_id) {
         return Err("The mode no longer exists");
     }
-    if new_value.variable_type() != Some(variable.ty) {
+    if let VarValue::Alias { variable: target } = &new_value {
+        validate_alias(doc, variable_id, *target)?;
+    } else if new_value.variable_type() != Some(variable.ty) {
         return Err("The value does not match the variable type");
     }
     let old = variable.values_by_mode.get(&mode_id).cloned();
@@ -1758,57 +1051,6 @@ fn set_variable_value_operation(
         old,
         new: Some(new_value),
     }))
-}
-
-fn preview_variable_value(
-    doc: &mut Doc,
-    cell: VariableCell,
-    value: VarValue,
-) -> Result<bool, &'static str> {
-    let variable = doc
-        .variables
-        .variables
-        .get(&cell.variable)
-        .ok_or("The variable no longer exists")?;
-    let collection = doc
-        .variables
-        .collections
-        .get(&variable.collection)
-        .ok_or("The variable's collection no longer exists")?;
-    if !collection.has_mode(cell.mode) {
-        return Err("The mode no longer exists");
-    }
-    if variable.ty != cell.variable_type || value.variable_type() != Some(variable.ty) {
-        return Err("The value does not match the variable type");
-    }
-    if variable.values_by_mode.get(&cell.mode) == Some(&value) {
-        return Ok(false);
-    }
-    let variable = doc
-        .variables
-        .variables
-        .get_mut(&cell.variable)
-        .ok_or("The variable no longer exists")?;
-    variable.values_by_mode.insert(cell.mode, value);
-    Ok(true)
-}
-
-fn restore_variable_value(doc: &mut Doc, cell: VariableCell, baseline: Option<VarValue>) -> bool {
-    let Some(variable) = doc.variables.variables.get_mut(&cell.variable) else {
-        return false;
-    };
-    if variable.values_by_mode.get(&cell.mode) == baseline.as_ref() {
-        return false;
-    }
-    match baseline {
-        Some(value) => {
-            variable.values_by_mode.insert(cell.mode, value);
-        }
-        None => {
-            variable.values_by_mode.remove(&cell.mode);
-        }
-    }
-    true
 }
 
 fn unique_collection_name(doc: &Doc) -> String {
@@ -1892,41 +1134,15 @@ fn parse_primitive_value(
     }
 }
 
-fn variable_type_label(variable_type: VariableType) -> &'static str {
-    match variable_type {
-        VariableType::Color => "Color",
-        VariableType::Float => "Number",
-        VariableType::String => "String",
-        VariableType::Boolean => "Boolean",
-        VariableType::Typography => "Typography",
-    }
-}
-
-fn display_variable_value(value: Option<&VarValue>, variable_type: VariableType) -> SharedString {
-    match value {
-        Some(VarValue::Color { value }) => value.to_hex().into(),
-        Some(VarValue::Float { value }) => format_float(*value).into(),
-        Some(VarValue::String { value }) if value.is_empty() => "Empty string".into(),
-        Some(VarValue::String { value }) => value.clone().into(),
-        Some(VarValue::Boolean { value }) => value.to_string().into(),
-        Some(VarValue::TextStyle { .. }) => "Typography style".into(),
-        Some(VarValue::Alias { .. }) => "Alias".into(),
-        None => match variable_type {
-            VariableType::Boolean => "false".into(),
-            _ => "Unset".into(),
-        },
-    }
-}
-
 fn editor_variable_value(value: Option<&VarValue>, variable_type: VariableType) -> String {
     match value {
         Some(VarValue::Color { value }) => value.to_hex(),
-        Some(VarValue::Float { value }) => format_float(*value),
+        Some(VarValue::Float { value }) => value.to_string(),
         Some(VarValue::String { value }) => value.clone(),
         Some(VarValue::Boolean { value }) => value.to_string(),
         _ => match default_variable_value(variable_type) {
             VarValue::Color { value } => value.to_hex(),
-            VarValue::Float { value } => format_float(value),
+            VarValue::Float { value } => value.to_string(),
             VarValue::String { value } => value,
             VarValue::Boolean { value } => value.to_string(),
             VarValue::TextStyle { .. } | VarValue::Alias { .. } => String::new(),
@@ -1934,38 +1150,277 @@ fn editor_variable_value(value: Option<&VarValue>, variable_type: VariableType) 
     }
 }
 
-fn format_float(value: f64) -> String {
-    if value.fract().abs() <= f64::EPSILON {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.3}")
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_owned()
+fn host_variable_type(kind: VariableKind) -> VariableType {
+    match kind {
+        VariableKind::Color => VariableType::Color,
+        VariableKind::Number => VariableType::Float,
+        VariableKind::String => VariableType::String,
+        VariableKind::Boolean => VariableType::Boolean,
     }
 }
 
-fn table_header_cell(label: impl Into<SharedString>, width: f32) -> impl IntoElement {
-    h_flex()
-        .w(px(width))
-        .h_full()
-        .flex_none()
-        .px_2()
-        .border_l_1()
-        .child(
-            Label::new(label.into())
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .single_line(),
-        )
+fn screen_variable_kind(kind: VariableType) -> Option<VariableKind> {
+    match kind {
+        VariableType::Color => Some(VariableKind::Color),
+        VariableType::Float => Some(VariableKind::Number),
+        VariableType::String => Some(VariableKind::String),
+        VariableType::Boolean => Some(VariableKind::Boolean),
+        VariableType::Typography => None,
+    }
 }
 
-fn table_value_cell(label: impl Into<SharedString>, width: f32) -> impl IntoElement {
-    h_flex().w(px(width)).h_full().flex_none().px_2().child(
-        Label::new(label.into())
-            .size(LabelSize::Small)
-            .single_line(),
+fn resolved_cell_value(doc: &Doc, variable: &Variable, mode: ModeId) -> Option<VarValue> {
+    let mut modes = doc.active_modes.clone();
+    modes.insert(variable.collection, mode);
+    fanta_doc::resolve_bound_value(
+        &doc.variables,
+        &doc.scene,
+        NodeId::from_u128(0),
+        &modes,
+        variable.id,
     )
+    .map(|value| value.to_var_value())
+}
+
+fn screen_view_data(
+    doc: Option<&Doc>,
+    snapshot: &VariablesSnapshot,
+    selected_group: &SharedString,
+    document_name: SharedString,
+) -> VariablesViewData {
+    let selected = snapshot.selected.as_ref();
+    let mut group_counts = BTreeMap::<String, usize>::new();
+    let mut variables = Vec::new();
+    if let (Some(doc), Some(collection)) = (doc, selected) {
+        for row in &collection.variables {
+            let Some(kind) = screen_variable_kind(row.variable_type) else {
+                continue;
+            };
+            let group = row
+                .name
+                .rsplit_once('/')
+                .map(|(group, _)| group)
+                .unwrap_or("");
+            let group_id = format!("group:{group}");
+            *group_counts.entry(group.to_owned()).or_default() += 1;
+            let Some(variable) = doc.variables.variables.get(&row.id) else {
+                continue;
+            };
+            let values = collection.modes.iter().map(|mode| {
+                let resolved = resolved_cell_value(doc, variable, mode.id);
+                let mut value = VariableModeValue::new(
+                    mode.id.to_string(),
+                    editor_variable_value(resolved.as_ref(), row.variable_type),
+                );
+                if let Some(VarValue::Color { value: color }) = resolved {
+                    value.color_hex = Some(color.to_hex().into());
+                }
+                if let Some(VarValue::Alias { variable }) = row.values.get(&mode.id) {
+                    value.alias_id = Some(variable.to_string().into());
+                }
+                value
+            });
+            variables.push(VariableRow::new(
+                row.id.to_string(),
+                row.name.clone(),
+                group_id,
+                kind,
+                values,
+            ));
+        }
+    }
+    let mut groups =
+        vec![VariablesGroup::new(ALL_GROUPS, "All variables", variables.len()).aggregate()];
+    groups.extend(group_counts.into_iter().map(|(name, count)| {
+        VariablesGroup::new(
+            format!("group:{name}"),
+            if name.is_empty() {
+                "Ungrouped".to_owned()
+            } else {
+                name
+            },
+            count,
+        )
+    }));
+    let selected_group_id = groups
+        .iter()
+        .find(|group| group.id == *selected_group)
+        .map(|group| group.id.clone())
+        .unwrap_or_else(|| ALL_GROUPS.into());
+    VariablesViewData {
+        document_name,
+        collections: snapshot
+            .collections
+            .iter()
+            .map(|collection| {
+                VariablesCollection::new(
+                    collection.id.to_string(),
+                    collection.name.clone(),
+                    collection.variable_count,
+                )
+            })
+            .collect(),
+        selected_collection_id: selected
+            .map(|collection| collection.id.to_string().into())
+            .unwrap_or_default(),
+        groups,
+        selected_group_id,
+        modes: selected
+            .map(|collection| {
+                let default = doc
+                    .and_then(|doc| doc.variables.collections.get(&collection.id))
+                    .map(|collection| collection.default_mode);
+                let mut modes = collection.modes.clone();
+                modes.sort_by_key(|mode| Some(mode.id) != default);
+                modes
+                    .into_iter()
+                    .map(|mode| VariablesMode::new(mode.id.to_string(), mode.name))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        variables,
+    }
+}
+
+fn screen_operation(
+    doc: &Doc,
+    selected: Option<VariableCollectionId>,
+    action: &VariablesAction,
+) -> Result<Option<Operation>, &'static str> {
+    let collection = || selected.ok_or("Select a collection first");
+    let variable_id = |id: &SharedString| -> Result<VariableId, &'static str> {
+        let id = id.parse().map_err(|_| "Invalid variable identifier")?;
+        let variable = doc
+            .variables
+            .variables
+            .get(&id)
+            .ok_or("The variable no longer exists")?;
+        if Some(variable.collection) != selected {
+            return Err("The selected collection has changed");
+        }
+        Ok(id)
+    };
+    let mode_id = |id: &SharedString| id.parse::<ModeId>().map_err(|_| "Invalid mode identifier");
+    let nonempty_name = |name: &SharedString| {
+        let name = name.trim();
+        if name.is_empty() {
+            Err("Names cannot be empty")
+        } else {
+            Ok(name.to_owned())
+        }
+    };
+    match action {
+        VariablesAction::CollectionRenameRequested {
+            collection_id,
+            name,
+        } => {
+            let id = collection_id
+                .parse()
+                .map_err(|_| "Invalid collection identifier")?;
+            rename_operation(
+                doc,
+                VariableRenameTarget::Collection(id),
+                nonempty_name(name)?,
+            )
+        }
+        VariablesAction::VariableRenameRequested {
+            variable_id: id,
+            name,
+        } => rename_operation(
+            doc,
+            VariableRenameTarget::Variable(variable_id(id)?),
+            nonempty_name(name)?,
+        ),
+        VariablesAction::ModeRenameRequested { mode_id: id, name } => rename_operation(
+            doc,
+            VariableRenameTarget::Mode {
+                collection: collection()?,
+                mode: mode_id(id)?,
+            },
+            nonempty_name(name)?,
+        ),
+        VariablesAction::ValueChanged {
+            variable_id: id,
+            mode_id: mode,
+            value,
+        } => {
+            let id = variable_id(id)?;
+            let variable = doc
+                .variables
+                .variables
+                .get(&id)
+                .ok_or("The variable no longer exists")?;
+            set_variable_value_operation(
+                doc,
+                id,
+                mode_id(mode)?,
+                parse_primitive_value(variable.ty, value)?,
+            )
+        }
+        VariablesAction::AliasChanged {
+            variable_id: id,
+            mode_id: mode,
+            alias_id,
+        } => {
+            let id = variable_id(id)?;
+            let mode = mode_id(mode)?;
+            let source = doc
+                .variables
+                .variables
+                .get(&id)
+                .ok_or("The variable no longer exists")?;
+            let value = if let Some(alias) = alias_id {
+                let target = alias.parse().map_err(|_| "Invalid alias identifier")?;
+                validate_alias(doc, id, target)?;
+                VarValue::Alias { variable: target }
+            } else {
+                resolved_cell_value(doc, source, mode)
+                    .ok_or("The alias cannot be resolved; choose a literal value instead")?
+            };
+            set_variable_value_operation(doc, id, mode, value)
+        }
+        VariablesAction::DescriptionChanged { .. } => {
+            Err("Variable descriptions are not supported by the document format yet")
+        }
+        _ => Ok(None),
+    }
+}
+
+fn validate_alias(doc: &Doc, source: VariableId, target: VariableId) -> Result<(), &'static str> {
+    let source_type = doc
+        .variables
+        .variables
+        .get(&source)
+        .ok_or("The variable no longer exists")?
+        .ty;
+    let mut pending = vec![target];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if id == source {
+            return Err("Variable aliases cannot form a cycle");
+        }
+        if !visited.insert(id) {
+            continue;
+        }
+        let variable = doc
+            .variables
+            .variables
+            .get(&id)
+            .ok_or("The alias target no longer exists")?;
+        if variable.ty != source_type {
+            return Err("The alias must have the same variable type");
+        }
+        pending.extend(
+            variable
+                .values_by_mode
+                .values()
+                .filter_map(|value| match value {
+                    VarValue::Alias { variable } => Some(*variable),
+                    _ => None,
+                }),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1987,6 +1442,8 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
         });
     }
 
@@ -2134,143 +1591,6 @@ mod tests {
     }
 
     #[test]
-    fn live_value_previews_commit_as_one_undoable_operation() {
-        let (mut doc, collection, mode) = doc_with_collection();
-        let create = create_variable_operation(&doc, collection, VariableType::Float)
-            .expect("create float variable");
-        let variable = match &create {
-            Operation::CreateVariable { variable } => variable.id,
-            _ => panic!("expected create variable operation"),
-        };
-        doc.apply(create).expect("apply create variable");
-        let cell = VariableCell {
-            variable,
-            mode,
-            variable_type: VariableType::Float,
-        };
-        let baseline = doc.variables.variables[&variable]
-            .values_by_mode
-            .get(&mode)
-            .cloned();
-
-        assert!(
-            preview_variable_value(&mut doc, cell, VarValue::Float { value: 12.0 })
-                .expect("first preview")
-        );
-        assert!(
-            preview_variable_value(&mut doc, cell, VarValue::Float { value: 24.0 })
-                .expect("second preview")
-        );
-        assert_eq!(
-            doc.variables.variables[&variable].values_by_mode[&mode],
-            VarValue::Float { value: 24.0 }
-        );
-
-        assert!(restore_variable_value(&mut doc, cell, baseline));
-        let operation =
-            set_variable_value_operation(&doc, variable, mode, VarValue::Float { value: 24.0 })
-                .expect("valid commit")
-                .expect("changed commit");
-        doc.apply(operation).expect("commit previewed value");
-        assert_eq!(
-            doc.variables.variables[&variable].values_by_mode[&mode],
-            VarValue::Float { value: 24.0 }
-        );
-
-        assert!(doc.undo().expect("undo value edit"));
-        assert_eq!(
-            doc.variables.variables[&variable].values_by_mode[&mode],
-            VarValue::Float { value: 0.0 }
-        );
-    }
-
-    #[gpui::test]
-    async fn invalid_final_text_rewinds_the_preview_and_invalidates_rendering(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-        let (mut doc, collection, mode) = doc_with_collection();
-        let create = create_variable_operation(&doc, collection, VariableType::Float)
-            .expect("create float variable");
-        let variable = match &create {
-            Operation::CreateVariable { variable } => variable.id,
-            _ => panic!("expected create variable operation"),
-        };
-        doc.apply(create).expect("apply create variable");
-        let baseline = doc.variables.variables[&variable]
-            .values_by_mode
-            .get(&mode)
-            .cloned();
-        let cell = VariableCell {
-            variable,
-            mode,
-            variable_type: VariableType::Float,
-        };
-
-        let file_system = FakeFs::new(cx.executor());
-        let roots: [&std::path::Path; 0] = [];
-        let project = Project::test(file_system, roots, cx).await;
-        let item = ready_item_for_test(&project, PathBuf::from("/tmp/Variables.fanta"), doc, cx);
-        let workspace_item = item.clone();
-        let workspace = cx
-            .add_window(move |window, cx| FantaVariablesWorkspace::new(workspace_item, window, cx));
-
-        workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.editing_cell = Some(cell);
-                workspace.value_edit_baseline = baseline.clone();
-                workspace.suppress_editor_events = true;
-                workspace.value_editor.update(cx, |editor, cx| {
-                    editor.set_text("12", window, cx);
-                });
-                workspace.suppress_editor_events = false;
-                workspace.preview_value_edit(cx);
-            })
-            .expect("preview a valid variable value");
-        cx.run_until_parked();
-
-        item.read_with(cx, |item, _| {
-            let document = item.document().expect("ready document");
-            assert_eq!(
-                document.doc.variables.variables[&variable].values_by_mode[&mode],
-                VarValue::Float { value: 12.0 }
-            );
-            assert!(item.is_dirty(), "a live preview marks the item dirty");
-        });
-        let preview_generation = item.read_with(cx, |item, _| {
-            item.document().expect("ready document").render_generation()
-        });
-
-        workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.suppress_editor_events = true;
-                workspace.value_editor.update(cx, |editor, cx| {
-                    editor.set_text("not-a-number", window, cx);
-                });
-                workspace.suppress_editor_events = false;
-                workspace.finish_value_edit(cx);
-            })
-            .expect("finish the invalid variable value");
-        cx.run_until_parked();
-
-        item.read_with(cx, |item, _| {
-            let document = item.document().expect("ready document");
-            assert_eq!(
-                document.doc.variables.variables[&variable].values_by_mode[&mode],
-                VarValue::Float { value: 0.0 }
-            );
-            assert!(
-                document.render_generation() > preview_generation,
-                "rewinding an invalid final value must invalidate the rendered preview"
-            );
-            assert!(
-                !item.is_dirty(),
-                "an invalid final value restores the clean pre-preview state"
-            );
-        });
-    }
-
-    #[test]
     fn binding_builder_filters_types_and_unbind_bakes_the_resolved_value() {
         let (mut doc, collection, mode) = doc_with_collection();
         let create = create_variable_operation(&doc, collection, VariableType::Float)
@@ -2389,282 +1709,128 @@ mod tests {
         (workspace, item, cx.clone())
     }
 
-    fn snapshot_builds(
-        workspace: &Entity<FantaVariablesWorkspace>,
-        cx: &mut VisualTestContext,
-    ) -> usize {
-        workspace.read_with(cx, |workspace, _| workspace.snapshot_builds)
+    #[test]
+    fn shared_screen_projection_preserves_groups_modes_and_aliases() {
+        let (mut doc, collection, mode) = doc_with_many_variables(3);
+        let first = VariableId::from_u128(1);
+        let second = VariableId::from_u128(2);
+        doc.variables
+            .variables
+            .get_mut(&second)
+            .unwrap()
+            .values_by_mode
+            .insert(mode, VarValue::Alias { variable: first });
+        let snapshot = variables_snapshot(&doc, Some(collection));
+        let data = screen_view_data(Some(&doc), &snapshot, &ALL_GROUPS.into(), "Design".into());
+        assert_eq!(data.variables.len(), 3);
+        assert_eq!(data.groups.len(), 2);
+        assert_eq!(data.modes[0].id.as_ref(), mode.to_string());
+        assert_eq!(
+            data.variables[1].values[0].alias_id.as_deref(),
+            Some(first.to_string().as_str())
+        );
+        assert!(data.variables[1].values[0].color_hex.is_some());
+        assert_eq!(data.variables[0].group_id.as_ref(), "group:color");
     }
 
-    fn cached_variable_names(
-        workspace: &Entity<FantaVariablesWorkspace>,
-        cx: &mut VisualTestContext,
-    ) -> Vec<String> {
-        workspace.read_with(cx, |workspace, _| {
-            workspace
-                .cached_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.selected.as_ref())
-                .map(|collection| {
-                    collection
-                        .variables
-                        .iter()
-                        .map(|variable| variable.name.to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
+    #[test]
+    fn shared_screen_intents_validate_aliases_and_preserve_undo() {
+        let (mut doc, collection, mode) = doc_with_many_variables(3);
+        let first = VariableId::from_u128(1);
+        let second = VariableId::from_u128(2);
+        let alias = VariablesAction::AliasChanged {
+            variable_id: second.to_string().into(),
+            mode_id: mode.to_string().into(),
+            alias_id: Some(first.to_string().into()),
+        };
+        let operation = screen_operation(&doc, Some(collection), &alias)
+            .unwrap()
+            .unwrap();
+        doc.apply(operation).unwrap();
+        let cycle = VariablesAction::AliasChanged {
+            variable_id: first.to_string().into(),
+            mode_id: mode.to_string().into(),
+            alias_id: Some(second.to_string().into()),
+        };
+        assert!(screen_operation(&doc, Some(collection), &cycle).is_err());
+        let unlink = VariablesAction::AliasChanged {
+            variable_id: second.to_string().into(),
+            mode_id: mode.to_string().into(),
+            alias_id: None,
+        };
+        doc.apply(
+            screen_operation(&doc, Some(collection), &unlink)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.variables.variables[&second].values_by_mode[&mode],
+            VarValue::Color {
+                value: FantaColor::BLACK
+            }
+        );
+        doc.undo().unwrap();
+        assert_eq!(
+            doc.variables.variables[&second].values_by_mode[&mode],
+            VarValue::Alias { variable: first }
+        );
+        let stale = VariablesAction::ValueChanged {
+            variable_id: first.to_string().into(),
+            mode_id: ModeId::new().to_string().into(),
+            value: "#ffffff".into(),
+        };
+        assert!(screen_operation(&doc, Some(collection), &stale).is_err());
     }
 
     #[gpui::test]
-    async fn redraws_reuse_the_cached_snapshot_while_every_mutation_refreshes_it(
-        cx: &mut TestAppContext,
-    ) {
+    async fn shared_screen_events_update_document_and_reuse_snapshot(cx: &mut TestAppContext) {
         let (doc, collection, mode) = doc_with_many_variables(3);
-        let first_variable = VariableId::from_u128(1);
+        let variable = VariableId::from_u128(1);
         let (workspace, item, mut cx) = workspace_for_doc(doc, cx).await;
         let cx = &mut cx;
-
-        assert_eq!(
-            snapshot_builds(&workspace, cx),
-            1,
-            "the first draw walks the registry once"
-        );
-        let renders = workspace.read_with(cx, |workspace, _| workspace.renders);
-
-        // A window redraw driven by anything else — a canvas pan, a blinking
-        // caret — still runs this view's render.
+        let screen = workspace.read_with(cx, |workspace, _| {
+            workspace.screen.clone().expect("shared screen mounted")
+        });
+        let builds = workspace.read_with(cx, |workspace, _| workspace.snapshot_builds);
         cx.update(|window, _| window.refresh());
         cx.run_until_parked();
-        assert!(
-            workspace.read_with(cx, |workspace, _| workspace.renders) > renders,
-            "the workspace must have re-rendered for the reuse assertion to mean anything"
-        );
         assert_eq!(
-            snapshot_builds(&workspace, cx),
-            1,
-            "a redraw with no change reuses the cached snapshot"
+            workspace.read_with(cx, |workspace, _| workspace.snapshot_builds),
+            builds
         );
-
-        let mut expected_builds = 1;
-        let expect_refresh =
-            |cx: &mut VisualTestContext, expected_builds: &mut usize, what: &str| {
-                cx.run_until_parked();
-                *expected_builds += 1;
-                assert_eq!(
-                    snapshot_builds(&workspace, cx),
-                    *expected_builds,
-                    "{what} must rebuild the cached snapshot exactly once"
-                );
-            };
-
-        workspace.update(cx, |workspace, cx| workspace.create_collection(cx));
-        expect_refresh(cx, &mut expected_builds, "creating a collection");
-        assert!(
-            cached_variable_names(&workspace, cx).is_empty(),
-            "the new empty collection is the selected one"
-        );
-
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.select_collection(collection, window, cx)
+        screen.update(cx, |_, cx| {
+            cx.emit(VariablesAction::ValueChanged {
+                variable_id: variable.to_string().into(),
+                mode_id: mode.to_string().into(),
+                value: "#ffffff".into(),
+            })
         });
-        expect_refresh(cx, &mut expected_builds, "selecting a collection");
-        assert_eq!(cached_variable_names(&workspace, cx).len(), 3);
-
-        workspace.update(cx, |workspace, cx| workspace.create_variable(cx));
-        expect_refresh(cx, &mut expected_builds, "creating a variable");
-        assert_eq!(cached_variable_names(&workspace, cx).len(), 4);
-
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.start_rename(
-                VariableRenameTarget::Variable(first_variable),
-                "color/0".into(),
-                window,
-                cx,
-            );
-            workspace.rename_editor.update(cx, |editor, cx| {
-                editor.set_text("surface/base", window, cx);
-            });
-            workspace.commit_rename(window, cx);
-        });
-        expect_refresh(cx, &mut expected_builds, "renaming a variable");
-        assert!(
-            cached_variable_names(&workspace, cx).contains(&"surface/base".to_owned()),
-            "the refreshed snapshot shows the new name"
-        );
-
-        workspace.update(cx, |workspace, cx| workspace.add_mode(cx));
-        expect_refresh(cx, &mut expected_builds, "adding a mode");
-
-        let cell = VariableCell {
-            variable: first_variable,
-            mode,
-            variable_type: VariableType::Color,
-        };
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.start_value_edit(cell, "#000000".into(), window, cx);
-            workspace.value_editor.update(cx, |editor, cx| {
-                editor.set_text("#ffffff", window, cx);
-            });
-            workspace.finish_value_edit(cx);
-        });
-        expect_refresh(cx, &mut expected_builds, "committing a value edit");
+        cx.run_until_parked();
         item.read_with(cx, |item, _| {
-            let document = item.document().expect("ready document");
             assert_eq!(
-                document.doc.variables.variables[&first_variable].values_by_mode[&mode],
+                item.doc().unwrap().variables.variables[&variable].values_by_mode[&mode],
                 VarValue::Color {
                     value: FantaColor::WHITE
                 }
+            )
+        });
+        screen.update(cx, |_, cx| {
+            cx.emit(VariablesAction::CreateTypedVariableRequested {
+                kind: VariableKind::Boolean,
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().unwrap();
+            assert!(
+                doc.variables
+                    .variables
+                    .values()
+                    .any(|variable| variable.collection == collection
+                        && variable.ty == VariableType::Boolean)
             );
         });
-
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.start_value_edit(cell, "#ffffff".into(), window, cx);
-            workspace.value_editor.update(cx, |editor, cx| {
-                editor.set_text("#123456", window, cx);
-            });
-            workspace.cancel_value_edit(cx);
-        });
-        expect_refresh(cx, &mut expected_builds, "reverting a value edit");
-
-        let deleted = item.read_with(cx, |item, _| {
-            item.document()
-                .expect("ready document")
-                .doc
-                .variables
-                .variables[&first_variable]
-                .clone()
-        });
-        item.update(cx, |item, cx| {
-            item.apply(
-                Operation::DeleteVariable {
-                    id: first_variable,
-                    variable: Box::new(deleted),
-                },
-                cx,
-            )
-        })
-        .expect("delete the variable outside the workspace");
-        expect_refresh(cx, &mut expected_builds, "a document edit from elsewhere");
-        assert!(
-            !cached_variable_names(&workspace, cx).contains(&"surface/base".to_owned()),
-            "a deletion applied elsewhere must not leave a stale row"
-        );
-    }
-
-    #[gpui::test]
-    async fn the_binding_column_costs_nothing_per_frame_on_a_large_registry(
-        cx: &mut TestAppContext,
-    ) {
-        let (mut doc, _collection, _mode) = doc_with_many_variables(600);
-        let bound = VariableId::from_u128(1);
-        let node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
-            0.0,
-            0.0,
-            10.0,
-            10.0,
-            FantaColor::BLACK,
-        )));
-        let node_id = node.id;
-        doc.apply(Operation::create_node(node))
-            .expect("create node");
-        let bind = variable_binding_operation(
-            &doc,
-            node_id,
-            BoundProp::FillColor { index: 0 },
-            Some(bound),
-        )
-        .expect("the fill accepts a colour variable")
-        .expect("a new binding");
-        doc.apply(bind).expect("apply the binding");
-        doc.selection.replace_with(vec![node_id]);
-
-        let (workspace, _item, mut cx) = workspace_for_doc(doc, cx).await;
-        let cx = &mut cx;
-
-        let rows = workspace.read_with(cx, |workspace, _| {
-            workspace
-                .cached_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.binding.clone())
-                .expect("the selected layer has a binding section")
-                .rows
-        });
-        let fill = rows
-            .iter()
-            .find(|row| row.prop == BoundProp::FillColor { index: 0 })
-            .expect("the fill is bindable");
-        assert_eq!(fill.current, Some(bound));
-        assert_eq!(
-            fill.current_label.as_deref(),
-            Some("Collection 1 / color/0"),
-            "the trigger label comes from the snapshot, not from a candidate search"
-        );
-        assert!(fill.has_choices);
-        let visible = rows
-            .iter()
-            .find(|row| row.prop == BoundProp::Visible)
-            .expect("visibility is always bindable");
-        assert!(
-            !visible.has_choices,
-            "a registry of colours offers nothing to a boolean property"
-        );
-
-        // The candidate list is the part that scales with the document, and it
-        // is deliberately absent from every row: the menu builds it when it
-        // opens. If it ever moves back into the snapshot this stops holding,
-        // because a redraw would then have to walk 600 variables per row.
-        let builds_before = snapshot_builds(&workspace, cx);
-        for _ in 0..5 {
-            cx.update(|window, _| window.refresh());
-            cx.run_until_parked();
-        }
-        assert_eq!(
-            snapshot_builds(&workspace, cx),
-            builds_before,
-            "redrawing a selected layer must not rebuild the binding rows"
-        );
-    }
-
-    #[gpui::test]
-    async fn a_large_collection_only_builds_the_rows_the_viewport_shows(cx: &mut TestAppContext) {
-        let (doc, _collection, _mode) = doc_with_many_variables(600);
-        let (workspace, _item, mut cx) = workspace_for_doc(doc, cx).await;
-        let cx = &mut cx;
-
-        let (rows_built, builds, row_count) = workspace.read_with(cx, |workspace, _| {
-            (
-                workspace.rows_built,
-                workspace.snapshot_builds,
-                workspace
-                    .cached_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| snapshot.selected.as_ref())
-                    .map(|collection| collection.variables.len())
-                    .unwrap_or_default(),
-            )
-        });
-        assert_eq!(row_count, 600, "the whole collection is in the snapshot");
-        assert!(rows_built > 0, "the visible rows are built");
-        assert!(
-            rows_built < row_count / 10,
-            "the table is virtualized: {rows_built} of {row_count} rows were built"
-        );
-        assert_eq!(builds, 1);
-
-        let before = workspace.read_with(cx, |workspace, _| workspace.rows_built);
-        cx.update(|window, _| window.refresh());
-        cx.run_until_parked();
-        let after = workspace.read_with(cx, |workspace, _| workspace.rows_built);
-        assert!(
-            after - before < row_count / 10,
-            "a redraw rebuilds only the visible rows"
-        );
-        assert_eq!(
-            snapshot_builds(&workspace, cx),
-            1,
-            "redrawing a large collection must not walk the registry again"
-        );
+        assert!(workspace.read_with(cx, |workspace, _| workspace.error_message.is_none()));
     }
 }

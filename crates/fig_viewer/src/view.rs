@@ -934,8 +934,6 @@ impl FigView {
     fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
         self.inspector_sidebar
             .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
-        self.variables_workspace
-            .update(cx, |workspace, cx| workspace.finish_value_edit(cx));
         self.prototype_sidebar
             .update(cx, |panel, cx| panel.finish_parameter_edit(cx));
         #[cfg(feature = "fanta-gpui-ui")]
