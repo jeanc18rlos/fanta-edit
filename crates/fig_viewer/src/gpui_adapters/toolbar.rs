@@ -2200,6 +2200,43 @@ mod echo_tests {
     /// the tile's icon and raised state; `Resources` reveals (never hides)
     /// the left sidebar.
     #[gpui::test]
+    async fn file_inspector_toggle_releases_canvas_space_and_reopens(cx: &mut TestAppContext) {
+        let (_view, toolbar, mut cx) = setup(cx).await;
+        cx.simulate_resize(size(px(1_280.), px(800.)));
+        cx.run_until_parked();
+        let expanded_canvas = cx.debug_bounds("fig-container").expect("canvas");
+        assert!(cx.debug_bounds("file-inspector-sidebar").is_some());
+        let toggle = cx
+            .debug_bounds("file-inspector-toggle")
+            .expect("sidebar toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("file-inspector-sidebar").is_none());
+        assert!(cx.debug_bounds("file-inspector-floating-card").is_some());
+        assert!(
+            cx.debug_bounds("fig-container").expect("canvas").size.width
+                > expanded_canvas.size.width
+        );
+        toolbar.read_with(&cx, |toolbar, _| {
+            assert!(!toolbar.chrome_controls()[1].active)
+        });
+        let toggle = cx
+            .debug_bounds("file-inspector-toggle")
+            .expect("floating toggle");
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("file-inspector-floating-card").is_none());
+        assert!(cx.debug_bounds("file-inspector-sidebar").is_some());
+        assert_eq!(
+            cx.debug_bounds("fig-container").expect("canvas").size.width,
+            expanded_canvas.size.width
+        );
+        toolbar.read_with(&cx, |toolbar, _| {
+            assert!(toolbar.chrome_controls()[1].active)
+        });
+    }
+
+    #[gpui::test]
     async fn chrome_toggles_round_trip_through_the_sidebars(cx: &mut TestAppContext) {
         let (view, toolbar, mut cx) = setup(cx).await;
         let cx = &mut cx;

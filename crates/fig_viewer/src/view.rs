@@ -44,7 +44,7 @@ use crate::clipboard::{
 };
 use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
-use crate::design_panel::FantaDesignPanel;
+use crate::design_panel::{FantaDesignPanel, FileInspectorVisibilityChanged};
 use crate::document::{
     AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigScope, MAX_IMAGE_SOURCE_BYTES,
     SaveKind, ScopeRequester,
@@ -244,6 +244,7 @@ pub struct FigView {
     pub(crate) focus_handle: FocusHandle,
     editor_session: Entity<EditorSession>,
     layers_sidebar: Entity<FantaDesignPanel>,
+    _file_inspector_subscription: Subscription,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
     prototype_sidebar: Entity<FantaPrototypePanel>,
     motion_sidebar: Entity<FantaMotionPanel>,
@@ -486,6 +487,14 @@ impl FigView {
         }
         let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
         let (layers_sidebar, inspector_sidebar) = Self::new_embedded_sidebars(&project, window, cx);
+        let file_inspector_subscription = cx.subscribe(
+            &layers_sidebar,
+            |this, _, event: &FileInspectorVisibilityChanged, cx| {
+                this.layers_sidebar_visible = event.0;
+                this.persist_sidebar_layout(cx);
+                cx.notify();
+            },
+        );
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
         let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
         let motion_sidebar_subscription =
@@ -555,6 +564,7 @@ impl FigView {
             focus_handle,
             editor_session,
             layers_sidebar,
+            _file_inspector_subscription: file_inspector_subscription,
             inspector_sidebar,
             prototype_sidebar,
             motion_sidebar,
@@ -3606,18 +3616,37 @@ impl FigView {
     }
 
     fn render_layers_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        self.layers_sidebar.update(cx, |panel, cx| {
+            panel.set_file_inspector_collapsed(!self.layers_sidebar_visible, cx);
+        });
         let sidebar = div()
             .id("fanta-layers-sidebar")
             .relative()
-            .h_full()
-            .w(self.layers_sidebar_width)
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(cx.theme().colors().border)
+            .when(self.layers_sidebar_visible, |sidebar| {
+                sidebar
+                    .h_full()
+                    .w(self.layers_sidebar_width)
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(cx.theme().colors().border)
+            })
+            .when(!self.layers_sidebar_visible, |sidebar| {
+                sidebar
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(256.))
+                    .h(px(80.))
+                    .occlude()
+            })
             .child(self.layers_sidebar.clone())
-            .child(self.render_sidebar_resize_handle(SidebarKind::Layers));
+            .when(self.layers_sidebar_visible, |sidebar| {
+                sidebar.child(self.render_sidebar_resize_handle(SidebarKind::Layers))
+            });
         #[cfg(test)]
-        let sidebar = sidebar.debug_selector(|| "fanta-layers-sidebar".to_owned());
+        let sidebar = sidebar.when(self.layers_sidebar_visible, |sidebar| {
+            sidebar.debug_selector(|| "fanta-layers-sidebar".to_owned())
+        });
         sidebar.into_any_element()
     }
 
@@ -5481,6 +5510,9 @@ impl Render for FigView {
                                         .then(|| self.timeline_shell.clone()),
                                 ),
                         )
+                        .children((!self.layers_sidebar_visible).then(|| {
+                            gpui::deferred(self.render_layers_sidebar(cx)).with_priority(3)
+                        }))
                         .children(
                             self.item
                                 .read(cx)
@@ -6099,6 +6131,14 @@ impl Item for FigView {
             let editor_session_subscription = cx.observe(&editor_session, |_, _, cx| cx.notify());
             let (layers_sidebar, inspector_sidebar) =
                 Self::new_embedded_sidebars(&project, window, cx);
+            let file_inspector_subscription = cx.subscribe(
+                &layers_sidebar,
+                |this, _, event: &FileInspectorVisibilityChanged, cx| {
+                    this.layers_sidebar_visible = event.0;
+                    this.persist_sidebar_layout(cx);
+                    cx.notify();
+                },
+            );
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
             let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
             motion_sidebar.update(cx, |panel, cx| {
@@ -6133,6 +6173,7 @@ impl Item for FigView {
                 focus_handle: cx.focus_handle(),
                 editor_session,
                 layers_sidebar,
+                _file_inspector_subscription: file_inspector_subscription,
                 inspector_sidebar,
                 prototype_sidebar,
                 motion_sidebar,

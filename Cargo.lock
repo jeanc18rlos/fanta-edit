@@ -4297,8 +4297,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad78bed9a3f018d858848b574add53bb078f99187767ab3e43e520ab221bcbb7"
 dependencies = [
  "fanta-gpui-components",
  "fanta-gpui-core",
@@ -4310,8 +4311,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-async-process"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a249b625437b558397f05007bfbda22cd77321acfbceb8f24607bd843436c295"
 dependencies = [
  "async-channel 2.5.0",
  "async-io",
@@ -4327,8 +4329,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-collections"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef3948ba7ed20c0301e8ec5976c4282e5f8996facd043e470ec8b0a5924fb0a4"
 dependencies = [
  "fanta-gpui-gpui-util",
  "indexmap 2.14.0",
@@ -4337,8 +4340,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-components"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c7582aa26e33d677f93a091e1121faf7bf9d2bdc417ecf89810a2e916ac5d33"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4376,8 +4380,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-core"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a382dab55abb327514ce89da596d51dff731ec19e1aeeb195d0f36cdd1eb77c"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4461,8 +4466,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-derive-refineable"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3e4c4fc7e1b1d44a9ef862f0a0dc51175f5eea27f20de36a6c39349fa3ced86"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4471,8 +4477,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-linux"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c3b27a5efbf32869fb940a4d9c71af056daeb8b64c9b7adc4382f196bb07a9b"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -4522,8 +4529,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-macos"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be697c54aac0176d149bdb2350bfeb9e8582dac39fb98010a9ac0cc270653774"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4569,8 +4577,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-macros"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f088989f5c487b35265231f9198966aa6248bd6d14ffccdd388d4f8bffe3faca"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -4580,8 +4589,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-platform"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eb1b0b9828b361ed6487db3446bb4a752245def8182be76d776577802c987f7"
 dependencies = [
  "console_error_panic_hook",
  "fanta-gpui-core",
@@ -4593,8 +4603,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-shared-string"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a5402d1490f6671fb2d83ad1bd82de8bfa53d4576600ded2892b2148fc1b49a"
 dependencies = [
  "schemars 1.0.4",
  "serde",
@@ -4603,8 +4614,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-tokio"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4b2f2c22105ad0a6bbde7fa506b48bd0d2e18e50b8b4742d31d56c094d1fa69"
 dependencies = [
  "anyhow",
  "fanta-gpui-core",
@@ -4614,8 +4626,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-util"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f75556769aa676b507f7f1fac378aa1dc64fc162c7603b3a3420047f446a6bbb"
 dependencies = [
  "anyhow",
  "log",
@@ -4624,8 +4637,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-web"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a836aa108da3b38bc2c905bad978bf979062388b82f14640fb59fb6edbf9af3"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -4648,8 +4662,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-wgpu"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6cee83ef858b2d95852f50935cfcc31f8122f0d4e38c5e81ce33eb8755602d8"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4677,8 +4692,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-windows"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c1f28d41653157455e0aa0f1fdb6edd12d57cf5709aa457618f0fdbb9b19878"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -4706,8 +4722,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-http-client"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec2cef0215d241845e3812c3dddbe82ec078e86f8521d81fd18fd12344e6d1a9"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4731,8 +4748,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-http-client-tls"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46ffe7b89b3e70a153d9f3316922fb82c2ebeacad9c149537d26f6a531c01b58"
 dependencies = [
  "rustls",
  "rustls-platform-verifier",
@@ -4740,8 +4758,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-media"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73cbe289bdb6eee0c2cd3eab888c45483d0fe57055ff61d169332cbe9e77abee"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4758,8 +4777,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-perf"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8711fd33b84ec1da9dc627424eed85d3fa0ffe1ab24a4f7396dfdd5b39c64f5"
 dependencies = [
  "fanta-gpui-collections",
  "serde",
@@ -4768,8 +4788,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-proptest"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a21c1ce4fd114826287ca2ab551a2d1adad935a9d52140987f0c1e4027956e9"
 dependencies = [
  "bit-set 0.8.0",
  "bit-vec 0.8.0",
@@ -4787,8 +4808,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-proptest-macro"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cd99692b216a7c0e59142ba38fb1a44c1fe237f4a2b1f947e08d2575fab5b14"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -4798,16 +4820,18 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-refineable"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67250efe4887edd3888232c6556695d65a632acd9fbd01b2c24b65184e2a64e1"
 dependencies = [
  "fanta-gpui-derive-refineable",
 ]
 
 [[package]]
 name = "fanta-gpui-reqwest-client"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be30163fe80b2d4bb27c5f517e5ba66f33a43562e8a109fc871b8df2357532a2"
 dependencies = [
  "anyhow",
  "bytes 1.11.1",
@@ -4824,8 +4848,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-scheduler"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac1a9b47f40bd88a7b511080d25c594c6f65a62e2bef1c2e9e83674c97987419"
 dependencies = [
  "async-task",
  "backtrace",
@@ -4839,8 +4864,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-smol"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d20b6f3c953104ea96c2a35877c932a5f73e5d7215493a55a66f7a87957f383"
 dependencies = [
  "async-channel 2.5.0",
  "async-executor",
@@ -4855,8 +4881,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-sum-tree"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5b1174e494cf11eb0f41264e27e0c08ee2a7bec2ebdff613a0a293c0872b948"
 dependencies = [
  "fanta-gpui-ztracing",
  "heapless",
@@ -4867,8 +4894,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-util"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "409268a512b481358229c947912c349a5b8708781871e5f459c1c337d48cd7b4"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -4909,8 +4937,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-util-macros"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b0ea49b686d6695d4c1414a7c118df6aa37114ecc320ae6e8a7ce6783a45179"
 dependencies = [
  "fanta-gpui-perf",
  "quote",
@@ -4919,8 +4948,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-zlog"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8aceaae30d46c4deeabcec25cfef52949d6c0a9e18b7ca1349e9d1c87acf592c"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4930,8 +4960,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-ztracing"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f57fe4bf06ac2adad195e1632c007c67d6b826cd6ecb47c829c6472650458a7b"
 dependencies = [
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing-macro",
@@ -4943,8 +4974,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-ztracing-macro"
-version = "0.2.0"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=9709b7b885263f61b82051ca04aae4917d6991e2#9709b7b885263f61b82051ca04aae4917d6991e2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7985e45ed02aa00e1dd3038f3eaf81976b5dcbe7a449e9d57c42da38577904ae"
 
 [[package]]
 name = "fanta-present"

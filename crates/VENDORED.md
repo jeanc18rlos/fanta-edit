@@ -112,9 +112,7 @@ sibling checkouts are no longer part of the build.
 ## External GPUI dependencies
 
 The workspace consumes the GPUI framework, supporting libraries, and reusable
-Fanta components externally. The published baseline is crates.io `=0.2.0`;
-the context-menu integration currently uses the preview revision documented
-below. Dependency aliases preserve existing Rust imports, and `Cargo.lock`
+Fanta components externally. The workspace uses the coordinated crates.io release `=0.3.0`. Dependency aliases preserve existing Rust imports, and `Cargo.lock`
 records the exact source. The shared Variables screen includes project titles, mode selectors,
 layer bindings, and input handling that survives editor keymap reloads.
 
@@ -129,11 +127,10 @@ published package.
 `fanta_ui`, `fig_viewer`, their adapters, and the document and canvas engine
 crates remain owned here.
 
-### Context-menu preview
+### File inspector integration
 
-The host-controlled layer/page menus use upstream preview commit
-`9709b7b885263f61b82051ca04aae4917d6991e2` on `codex/context-menus`.
-All GPUI package aliases use that same Git revision so the host and components
-share one GPUI type identity. No migrated component copies are restored.
-This preview is not a crates.io release; switch the aliases together when the
-next published version includes these intents.
+The shared FileInspectorSidebar composes the Pages and Layers entities supplied
+by the editor. The old native Pages fallback, section divider, and sidebar
+layout have been removed. The editor owns document actions and persisted
+visibility; the shared sidebar owns header, theme, and floating-card rendering.
+All GPUI aliases resolve to crates.io `=0.3.0` with a single GPUI type identity.

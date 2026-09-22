@@ -1,33 +1,23 @@
-//! The Fanta design panel: the Pages and Layers sections for the active
-//! Figma canvas, mirroring the original Fanta left sidebar. Layers is the
-//! fanta-gpui `LayersPanel` (virtualized, so a 30k-node page costs the same
-//! per frame as a 30-node one); this file owns the host side of its
-//! contract — the read model, the intent → operation mapping, and the echo.
-//!
-//! Without the `fanta-gpui-ui` feature (a diagnostic build; the feature is
-//! on by default) there is no layers UI, so the layer-move machinery and the
-//! selection/drop paths have no caller.
+//! Host adapter for the shared GPUI FileInspectorSidebar and its Pages/Layers
+//! children. Document mutations and canvas navigation remain in the editor.
 #![cfg_attr(not(feature = "fanta-gpui-ui"), allow(dead_code))]
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
-use editor::{
-    Editor, EditorEvent,
-    actions::{Cancel, SelectAll},
-};
 use fanta_doc::{
     CanvasNode, Doc, GroupNode, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene,
 };
 use fs::Fs;
+#[cfg(test)]
+use gpui::px;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, Role, SharedString, Subscription, WeakEntity, Window, actions, deferred, px,
+    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Pixels, SharedString, Subscription, WeakEntity, Window, actions,
 };
 use settings::{Settings as _, update_settings_file};
-use ui::{ListHeader, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::prelude::*;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -47,62 +37,6 @@ actions!(
         ToggleFocus
     ]
 );
-
-/// The native (fallback) sections with a collapsible header and a filter
-/// field. Layers has no native section any more — the fanta-gpui panel owns
-/// its own header, collapse state, and (virtualized) tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Section {
-    Pages,
-}
-
-/// The design sidebar uses the same compact 28 px rhythm as Zed's outline and
-/// project panels.
-const SECTION_ROW_HEIGHT: f32 = 28.;
-const MIN_SECTION_HEIGHT: Pixels = px(56.);
-const DEFAULT_PAGES_HEIGHT: Pixels = px(168.);
-const DIVIDER_HITBOX_SIZE: Pixels = px(6.);
-/// Ceiling on any single section so the other section headers and a usable
-/// slice of the Layers list always stay visible while dragging.
-const SECTION_RESIZE_RESERVE: Pixels = px(160.);
-/// Base indent applied to every content row so rows align under their section
-/// header instead of sitting flush against the panel edge. The indent lives
-/// inside the row (`ListItem::indent_level`), keeping hover targets full width.
-const SECTION_INDENT_STEP: Pixels = px(12.);
-
-fn section_list_height(row_count: usize, row_height: f32, stored: Pixels) -> Pixels {
-    px((row_count as f32 * row_height).min(stored.as_f32()))
-}
-
-/// Keep the pages whose name contains `query` (already lowercased), preserving
-/// each survivor's true `index` into `document.pages` so a filtered row still
-/// selects, renames, and deletes the right page.
-fn filter_pages(pages: Vec<PageEntry>, query: Option<&str>) -> Vec<PageEntry> {
-    match query {
-        Some(query) => pages
-            .into_iter()
-            .filter(|entry| entry.name.to_lowercase().contains(query))
-            .collect(),
-        None => pages,
-    }
-}
-
-/// The draggable boundary between sidebar sections. It resizes the
-/// fixed-height Pages section above it while Layers (`flex_1`) absorbs the
-/// remaining space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SectionDivider {
-    PagesLayers,
-}
-
-#[derive(Clone)]
-struct DraggedSectionDivider(SectionDivider);
-
-impl Render for DraggedSectionDivider {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Empty
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerDropError {
@@ -354,13 +288,6 @@ fn layer_move_operations(
     Ok(normalization_operations)
 }
 
-#[derive(Clone, Copy)]
-struct DividerDragState {
-    divider: SectionDivider,
-    start_mouse_y: Pixels,
-    start_height: Pixels,
-}
-
 pub struct FantaDesignPanel {
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,
@@ -376,20 +303,14 @@ pub struct FantaDesignPanel {
     /// holds only the children of expanded containers, so it is memoized on
     /// this counter alongside the document's render generation.
     expansion_generation: u64,
-    collapsed_sections: HashSet<Section>,
-    // Cached section state, rebuilt on document events (never in render — see
-    // `render_sections`).
-    pages_cache: Vec<PageEntry>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_pages: Option<crate::gpui_adapters::pages::PagesAdapter>,
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_layers: Option<crate::gpui_adapters::layers::LayersAdapter>,
-    /// The gpui Layers panel's own header collapsed it: the section then
-    /// takes only its header height instead of flexing over the sidebar.
-    layers_collapsed: bool,
+    #[cfg(feature = "fanta-gpui-ui")]
+    file_inspector: Option<Entity<fanta_gpui::file_inspector::FileInspectorSidebar>>,
+    file_inspector_collapsed: bool,
     current_page_index: Option<usize>,
-    document_editable: bool,
-    document_ready: bool,
     /// The selection anchor the layer tree last revealed. When the anchor
     /// changes (typically from a canvas click) its ancestors are expanded
     /// and the row is scrolled into view; a repeat of the same anchor is
@@ -399,48 +320,62 @@ pub struct FantaDesignPanel {
     /// `rebuild_tree` when the reveal anchor changes, consumed by
     /// `refresh_gpui_layers` after the tree and expansion are echoed.
     pending_reveal: Option<NodeId>,
-    pages_height: Pixels,
-    divider_drag: Option<DividerDragState>,
-    filter_editor: Entity<Editor>,
-    filter_target: Option<Section>,
-    /// The page or layer being renamed inline, if any; the shared
-    /// `rename_editor` carries the edited text.
-    renaming: Option<RenameTarget>,
-    rename_editor: Entity<Editor>,
     _subscriptions: Vec<Subscription>,
     _active_view_subscription: Option<Subscription>,
 }
 
-/// A row in the Pages section. `index` is the true index into
-/// `document.pages` (preserved across a filter), and `root` is the page's scene
-/// node — `None` for the synthetic single page of a doc without explicit page
-/// roots, which cannot be renamed or deleted.
-#[derive(Clone)]
-struct PageEntry {
-    name: SharedString,
-    root: Option<NodeId>,
-    index: usize,
-}
-
-/// An inline rename in progress in the native Pages section: a page renames
-/// its root scene node (via `SetName`) and tracks its row index so the editor
-/// renders in the right Pages row. (Layer renames are the gpui panel's own
-/// inline editor, landing here as `RenameRequested`.)
-#[derive(Clone, Copy)]
-enum RenameTarget {
-    Page { index: usize, root: NodeId },
-}
-
-impl RenameTarget {
-    /// The scene node whose name is being edited.
-    fn node(&self) -> NodeId {
-        match *self {
-            RenameTarget::Page { root, .. } => root,
+impl FantaDesignPanel {
+    pub(crate) fn set_file_inspector_collapsed(&mut self, collapsed: bool, cx: &mut Context<Self>) {
+        if self.file_inspector_collapsed != collapsed {
+            self.file_inspector_collapsed = collapsed;
+            #[cfg(feature = "fanta-gpui-ui")]
+            if let Some(panel) = &self.file_inspector {
+                panel.update(cx, |panel, cx| panel.set_collapsed(collapsed, cx));
+            }
+            cx.notify();
         }
     }
-}
 
-impl FantaDesignPanel {
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn ensure_file_inspector(&mut self, cx: &mut Context<Self>) {
+        if self.file_inspector.is_none() {
+            let (Some(pages), Some(layers)) = (&self.gpui_pages, &self.gpui_layers) else {
+                return;
+            };
+            let pages = pages.panel.clone();
+            let layers = layers.panel.clone();
+            let inspector = cx.new(|cx| {
+                fanta_gpui::file_inspector::FileInspectorSidebar::new(
+                    "fanta-file-inspector",
+                    pages,
+                    layers,
+                    cx,
+                )
+            });
+            self._subscriptions.push(
+                cx.subscribe(&inspector, |this, _, event, cx| {
+                    let fanta_gpui::file_inspector::FileInspectorAction::CollapsedChanged {
+                        collapsed,
+                    } = event;
+                    this.file_inspector_collapsed = *collapsed;
+                    cx.emit(FileInspectorVisibilityChanged(!collapsed));
+                    cx.notify();
+                }),
+            );
+            self.file_inspector = Some(inspector);
+        }
+        let title = self
+            .active_view(cx)
+            .map(|view| view.read(cx).item().read(cx).title())
+            .unwrap_or_else(|| "Untitled".into());
+        if let Some(inspector) = &self.file_inspector {
+            inspector.update(cx, |inspector, cx| {
+                inspector.set_project_name(title, cx);
+                inspector.set_collapsed(self.file_inspector_collapsed, cx);
+            });
+        }
+    }
+
     pub async fn load(
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
@@ -498,33 +433,10 @@ impl FantaDesignPanel {
     fn build(
         fs: Arc<dyn Fs>,
         initial_view: Option<Entity<FigView>>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
-        mut subscriptions: Vec<Subscription>,
+        subscriptions: Vec<Subscription>,
     ) -> Self {
-        let filter_editor = cx.new(|cx| Editor::single_line(window, cx));
-        subscriptions.push(cx.subscribe(
-            &filter_editor,
-            |this: &mut Self, _, event: &EditorEvent, cx| {
-                if matches!(event, EditorEvent::BufferEdited) {
-                    this.rebuild_caches(cx);
-                    cx.notify();
-                }
-            },
-        ));
-        let rename_editor = cx.new(|cx| Editor::single_line(window, cx));
-        // Clicking away from the rename field keeps the typed name (Figma /
-        // Finder behavior). Enter/Escape empty `renaming_page` first, so the
-        // blur they trigger is a no-op.
-        subscriptions.push(cx.subscribe_in(
-            &rename_editor,
-            window,
-            |this: &mut Self, _, event: &EditorEvent, window, cx| {
-                if matches!(event, EditorEvent::Blurred) && this.renaming.is_some() {
-                    this.commit_rename(window, cx);
-                }
-            },
-        ));
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             fs,
@@ -532,24 +444,16 @@ impl FantaDesignPanel {
             width: None,
             expanded_nodes: HashSet::new(),
             expansion_generation: 0,
-            collapsed_sections: HashSet::new(),
-            pages_cache: Vec::new(),
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_pages: None,
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_layers: None,
-            layers_collapsed: false,
+            #[cfg(feature = "fanta-gpui-ui")]
+            file_inspector: None,
+            file_inspector_collapsed: false,
             current_page_index: None,
-            document_ready: false,
-            document_editable: false,
             last_reveal_anchor: None,
             pending_reveal: None,
-            pages_height: DEFAULT_PAGES_HEIGHT,
-            divider_drag: None,
-            filter_editor,
-            filter_target: None,
-            renaming: None,
-            rename_editor,
             _subscriptions: subscriptions,
             _active_view_subscription: None,
         };
@@ -651,142 +555,6 @@ impl FantaDesignPanel {
 
     fn active_view(&self, _cx: &App) -> Option<Entity<FigView>> {
         self.active_view.as_ref().and_then(|view| view.upgrade())
-    }
-
-    // === Section and tree state ===========================================
-
-    fn section_open(&self, section: Section) -> bool {
-        !self.collapsed_sections.contains(&section)
-    }
-
-    fn toggle_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
-        if self.collapsed_sections.remove(&section) {
-            cx.notify();
-            return;
-        }
-
-        if self.filter_target == Some(section) {
-            self.close_filter(window, cx);
-        }
-        self.collapsed_sections.insert(section);
-        cx.notify();
-    }
-
-    // === Search / filter ====================================================
-
-    /// The active, non-empty filter query for `section`, lowercased for
-    /// case-insensitive matching.
-    fn filter_query(&self, section: Section, cx: &App) -> Option<String> {
-        if self.filter_target != Some(section) {
-            return None;
-        }
-        let text = self.filter_editor.read(cx).text(cx);
-        let query = text.trim().to_lowercase();
-        (!query.is_empty()).then_some(query)
-    }
-
-    fn toggle_filter(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_target == Some(section) {
-            self.close_filter(window, cx);
-            return;
-        }
-        // A header remains actionable while collapsed. Reveal the editor before
-        // focusing it so keyboard input can never be captured by invisible UI.
-        self.collapsed_sections.remove(&section);
-        self.filter_target = Some(section);
-        self.filter_editor.update(cx, |editor, cx| {
-            editor.set_text("", window, cx);
-            // Exhaustive so a new section can't silently inherit the wrong hint.
-            let placeholder = match section {
-                Section::Pages => "Filter pages…",
-            };
-            editor.set_placeholder_text(placeholder, window, cx);
-        });
-        self.filter_editor.focus_handle(cx).focus(window, cx);
-        self.rebuild_caches(cx);
-        cx.notify();
-    }
-
-    fn close_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.filter_target.take().is_none() {
-            return;
-        }
-        self.filter_editor
-            .update(cx, |editor, cx| editor.set_text("", window, cx));
-        if self
-            .filter_editor
-            .focus_handle(cx)
-            .contains_focused(window, cx)
-        {
-            self.focus_handle.focus(window, cx);
-        }
-        self.rebuild_caches(cx);
-        cx.notify();
-    }
-
-    // === Section resizing ===================================================
-
-    fn divider_resizable(&self, divider: SectionDivider) -> bool {
-        // Each divider resizes exactly one fixed-height section; when that
-        // section is collapsed there is nothing to resize.
-        match divider {
-            SectionDivider::PagesLayers => self.section_open(Section::Pages),
-        }
-    }
-
-    /// The height the divider's section is currently rendered at, which can be
-    /// smaller than the stored height when the list is short. Starting drags
-    /// from this value keeps the divider tracking the pointer.
-    fn section_rendered_height(&self, divider: SectionDivider) -> Pixels {
-        match divider {
-            SectionDivider::PagesLayers => section_list_height(
-                self.pages_cache.len(),
-                SECTION_ROW_HEIGHT,
-                self.pages_height,
-            ),
-        }
-    }
-
-    fn set_section_height(&mut self, divider: SectionDivider, height: Pixels) {
-        match divider {
-            SectionDivider::PagesLayers => self.pages_height = height,
-        }
-    }
-
-    fn reset_section_height(&mut self, divider: SectionDivider, cx: &mut Context<Self>) {
-        let default_height = match divider {
-            SectionDivider::PagesLayers => DEFAULT_PAGES_HEIGHT,
-        };
-        self.set_section_height(divider, default_height);
-        cx.notify();
-    }
-
-    fn handle_divider_drag(
-        &mut self,
-        event: &DragMoveEvent<DraggedSectionDivider>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let dragged_divider = event.drag(cx).0;
-        let Some(drag_state) = self.divider_drag else {
-            return;
-        };
-        if drag_state.divider != dragged_divider {
-            return;
-        }
-        // Dragging the boundary down grows the section above it (Pages);
-        // Layers flexes.
-        let delta = event.event.position.y - drag_state.start_mouse_y;
-        let proposed = match dragged_divider {
-            SectionDivider::PagesLayers => drag_state.start_height + delta,
-        };
-        let max_height =
-            (event.bounds.size.height - SECTION_RESIZE_RESERVE).max(MIN_SECTION_HEIGHT);
-        self.set_section_height(
-            dragged_divider,
-            proposed.clamp(MIN_SECTION_HEIGHT, max_height),
-        );
-        cx.notify();
     }
 
     // === Document mutations ================================================
@@ -1182,15 +950,12 @@ impl FantaDesignPanel {
 
     // === Document caches ===================================================
 
-    /// Refresh the cached page rows, the current page index, and the reveal
+    /// Refresh the current page index and the reveal
     /// bookkeeping from the active view's document. Runs on document events,
     /// never in render.
     fn rebuild_caches(&mut self, cx: &mut App) {
         let rebuild_started = std::time::Instant::now();
-        self.pages_cache.clear();
         self.current_page_index = None;
-        self.document_editable = false;
-        self.document_ready = false;
         let Some(view) = self.active_view(cx) else {
             self.last_reveal_anchor = None;
             self.pending_reveal = None;
@@ -1212,16 +977,14 @@ impl FantaDesignPanel {
         })
     }
 
-    /// Refresh the Pages cache and the layer-tree reveal state. A pure read
+    /// Refresh page selection and the layer-tree reveal state. A pure read
     /// of the document.
     fn rebuild_tree(&mut self, view: &Entity<FigView>, cx: &App) {
         let view = view.read(cx);
         let fig_item = view.item().read(cx);
-        self.document_editable = fig_item.is_editable();
         let Some(document) = fig_item.document() else {
             return;
         };
-        self.document_ready = true;
         let doc = &document.doc;
         // Follow the same root the canvas renders and hit-tests. Deriving it
         // differently made the panel list a page the scoped canvas never
@@ -1245,37 +1008,6 @@ impl FantaDesignPanel {
                     .position(|page| page.root == Some(root))
             })
             .or_else(|| document.page_index(view.selected_page_index()));
-        // Read each real page's name live from its scene node so an inline
-        // rename (and its undo) reflects without maintaining the `FigPage`
-        // cache; the synthetic page (root `None`) falls back to its stored name.
-        self.pages_cache = document
-            .pages
-            .iter()
-            .enumerate()
-            // Hidden library pages (e.g. the Components page) stay navigable via
-            // the canvas but never appear in the Pages panel.
-            .filter(|(_, page)| !page.hidden)
-            .map(|(index, page)| {
-                let name = page
-                    .root
-                    .and_then(|root| doc.scene.get(root))
-                    .map(|node| SharedString::from(node.name.clone()))
-                    .unwrap_or_else(|| page.name.clone());
-                PageEntry {
-                    name,
-                    root: page.root,
-                    index,
-                }
-            })
-            .collect();
-        // Abandon an inline rename whose node no longer exists (deleted, or the
-        // document reloaded from disk).
-        if let Some(rename) = self.renaming
-            && doc.scene.get(rename.node()).is_none()
-        {
-            self.renaming = None;
-        }
-
         // Reveal the selection: when the anchor changes (typically from a
         // canvas click), expand its ancestor chain so its row exists, then
         // scroll it into view once the tree is echoed into the layers panel.
@@ -1296,404 +1028,6 @@ impl FantaDesignPanel {
             }
         }
     }
-
-    // === Rendering =========================================================
-
-    // GPUI re-renders every visible view on each window redraw, so render
-    // must consume the cached rows: rebuilding them here would run
-    // O(document) work on every canvas frame while the panel is open.
-    fn render_sections(&mut self, _view: &Entity<FigView>, cx: &mut Context<Self>) -> AnyElement {
-        let render_started = std::time::Instant::now();
-        let editable = self.document_editable;
-        if !self.document_ready {
-            return centered_message("The document is still loading");
-        }
-        let pages = self.pages_cache.clone();
-        let current_page_index = self.current_page_index;
-
-        let pages_open = self.section_open(Section::Pages);
-
-        let can_add_page = editable && pages.iter().all(|entry| entry.root.is_some());
-        let can_delete_page = editable && pages.len() > 1;
-
-        let pages_filter_open = self.filter_target == Some(Section::Pages);
-        let pages_query = self.filter_query(Section::Pages, cx);
-        let pages = filter_pages(pages, pages_query.as_deref());
-
-        #[cfg(feature = "fanta-gpui-ui")]
-        let gpui_pages_section: Option<AnyElement> = self.gpui_pages_section_element(cx);
-        #[cfg(not(feature = "fanta-gpui-ui"))]
-        let gpui_pages_section: Option<AnyElement> = None;
-        #[cfg(feature = "fanta-gpui-ui")]
-        let gpui_layers_section: Option<AnyElement> = self.gpui_layers_section_element(cx);
-        #[cfg(not(feature = "fanta-gpui-ui"))]
-        let gpui_layers_section: Option<AnyElement> = None;
-        let element = v_flex()
-            .size_full()
-            .overflow_hidden()
-            .child({
-                let native = v_flex()
-                    .flex_none()
-                    .child(
-                        ListHeader::new("Pages")
-                            .inset(true)
-                            .toggle(Some(pages_open))
-                            .on_toggle(cx.listener(|this, _, window, cx| {
-                                this.toggle_section(Section::Pages, window, cx)
-                            }))
-                            .end_slot(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        IconButton::new(
-                                            "fanta-pages-filter",
-                                            IconName::MagnifyingGlass,
-                                        )
-                                        .icon_size(IconSize::Small)
-                                        .toggle_state(pages_filter_open)
-                                        .aria_label("Filter pages")
-                                        .tooltip(Tooltip::text("Filter Pages"))
-                                        .on_click(
-                                            cx.listener(|this, _, window, cx| {
-                                                this.toggle_filter(Section::Pages, window, cx)
-                                            }),
-                                        ),
-                                    )
-                                    .when(can_add_page, |slot| {
-                                        slot.child(
-                                            IconButton::new("fanta-page-add", IconName::Plus)
-                                                .icon_size(IconSize::Small)
-                                                .aria_label("Add page")
-                                                .tooltip(Tooltip::text("Add Page"))
-                                                .on_click(
-                                                    cx.listener(|this, _, _, cx| this.add_page(cx)),
-                                                ),
-                                        )
-                                    }),
-                            ),
-                    )
-                    .when(pages_open && pages_filter_open, |section| {
-                        section.child(self.render_filter_row(cx))
-                    })
-                    .when(pages_open, |section| {
-                        if pages.is_empty() && pages_query.is_some() {
-                            section.child(empty_section_label(
-                                "fanta-pages-empty",
-                                "No pages match the filter",
-                            ))
-                        } else {
-                            section.child(
-                                div()
-                                    .id("fanta-pages-list")
-                                    .max_h(self.pages_height)
-                                    .overflow_y_scroll()
-                                    .child(v_flex().children(pages.iter().map(|entry| {
-                                        self.render_page_row(
-                                            entry,
-                                            current_page_index == Some(entry.index),
-                                            can_delete_page && entry.root.is_some(),
-                                            cx,
-                                        )
-                                    }))),
-                            )
-                        }
-                    });
-                match gpui_pages_section {
-                    Some(section) => section,
-                    None => native.into_any_element(),
-                }
-            })
-            .child(self.render_section_divider(SectionDivider::PagesLayers, cx))
-            .child(match gpui_layers_section {
-                Some(section) => section,
-                // The fanta-gpui LayersPanel is the only layers UI. It is
-                // absent only when the runtime is switched off (build without
-                // `fanta-gpui-ui`, `FANTA_GPUI_UI=0`, or a host that skipped
-                // `gpui_component::init`), which is a diagnostic state, not a
-                // mode: say so instead of rendering nothing.
-                None => v_flex()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(ListHeader::new("Layers").inset(true))
-                    .child(empty_section_label(
-                        "fanta-layers-unavailable",
-                        "Layers need the fanta-gpui UI runtime",
-                    ))
-                    .into_any_element(),
-            })
-            .into_any_element();
-        crate::report_slow("design panel render", render_started);
-        element
-    }
-
-    fn render_filter_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
-            .w_full()
-            .h(px(SECTION_ROW_HEIGHT))
-            .px_2()
-            .gap_1p5()
-            .on_action(cx.listener(|this, _: &Cancel, window, cx| this.close_filter(window, cx)))
-            .child(
-                Icon::new(IconName::MagnifyingGlass)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(div().flex_1().min_w_0().child(self.filter_editor.clone()))
-            .child(
-                IconButton::new("fanta-filter-close", IconName::Close)
-                    .icon_size(IconSize::XSmall)
-                    .icon_color(Color::Muted)
-                    .aria_label("Close filter")
-                    .tooltip(Tooltip::text("Close Filter"))
-                    .on_click(cx.listener(|this, _, window, cx| this.close_filter(window, cx))),
-            )
-            .into_any_element()
-    }
-
-    fn render_section_divider(
-        &self,
-        divider: SectionDivider,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let line = div()
-            .w_full()
-            .h_px()
-            .flex_none()
-            .bg(cx.theme().colors().border_variant);
-        if !self.divider_resizable(divider) {
-            return line.into_any_element();
-        }
-        // Mirrors the dock's resize handle: an invisible hitbox straddling the
-        // one-pixel divider line, deferred so it wins hit-testing over the
-        // list rows it overlaps.
-        line.relative()
-            .child(deferred(
-                div()
-                    .id(("fanta-section-divider", divider as usize))
-                    .absolute()
-                    .top(-DIVIDER_HITBOX_SIZE / 2.)
-                    .left_0()
-                    .w_full()
-                    .h(DIVIDER_HITBOX_SIZE)
-                    .cursor_ns_resize()
-                    .occlude()
-                    .on_drag(DraggedSectionDivider(divider), |dragged, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.new(|_| dragged.clone())
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            this.divider_drag = Some(DividerDragState {
-                                divider,
-                                start_mouse_y: event.position.y,
-                                start_height: this.section_rendered_height(divider),
-                            });
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
-                            if event.click_count == 2 {
-                                this.reset_section_height(divider, cx);
-                                cx.stop_propagation();
-                            }
-                        }),
-                    ),
-            ))
-            .into_any_element()
-    }
-
-    /// The inline rename field of a page row: Enter/Escape commit or cancel;
-    /// clicking away commits via the blur subscription.
-    fn render_rename_editor(&self, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .w_full()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                match event.keystroke.key.as_str() {
-                    "enter" => {
-                        cx.stop_propagation();
-                        this.commit_rename(window, cx);
-                    }
-                    "escape" => {
-                        cx.stop_propagation();
-                        this.cancel_rename(window, cx);
-                    }
-                    _ => {}
-                }
-            }))
-            .child(self.rename_editor.clone())
-            .into_any_element()
-    }
-
-    fn render_page_row(
-        &self,
-        entry: &PageEntry,
-        is_current: bool,
-        deletable: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let index = entry.index;
-        let renaming =
-            matches!(self.renaming, Some(RenameTarget::Page { index: i, .. }) if i == index);
-        if renaming {
-            return ListItem::new(("fanta-page", index))
-                .spacing(ListItemSpacing::ExtraDense)
-                .height(px(SECTION_ROW_HEIGHT))
-                .indent_level(1)
-                .indent_step_size(SECTION_INDENT_STEP)
-                .toggle_state(is_current)
-                .aria_role(Role::ListItem)
-                .aria_label(entry.name.clone())
-                .child(self.render_rename_editor(cx))
-                .into_any_element();
-        }
-
-        let root = entry.root;
-        let page_name = entry.name.clone();
-        ListItem::new(("fanta-page", index))
-            .spacing(ListItemSpacing::ExtraDense)
-            .height(px(SECTION_ROW_HEIGHT))
-            .indent_level(1)
-            .indent_step_size(SECTION_INDENT_STEP)
-            .toggle_state(is_current)
-            .aria_role(Role::ListItem)
-            .aria_label(page_name.clone())
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.focus_handle.focus(window, cx);
-                // Double-click a real page to rename it in place; a single click
-                // just switches to it.
-                if event.click_count() >= 2 {
-                    if let Some(root) = root {
-                        this.begin_page_rename(index, root, window, cx);
-                    }
-                } else {
-                    this.select_page(index, cx);
-                }
-            }))
-            .child(
-                div()
-                    .id(("fanta-page-name", index))
-                    .flex_1()
-                    .min_w_0()
-                    .tooltip(Tooltip::text(page_name.clone()))
-                    .child(Label::new(page_name).single_line().truncate()),
-            )
-            .when(deletable, |item| {
-                item.end_slot(
-                    IconButton::new(("fanta-page-delete", index), IconName::Close)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .aria_label("Delete page")
-                        .tooltip(Tooltip::text("Delete Page"))
-                        .visible_on_hover("list_item")
-                        .on_click(cx.listener(move |this, _, _, cx| this.delete_page(index, cx))),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn begin_page_rename(
-        &mut self,
-        index: usize,
-        root: NodeId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.begin_rename(RenameTarget::Page { index, root }, window, cx);
-    }
-
-    /// Enter inline-rename mode for a page: seed the shared editor with the
-    /// node's current name, select it all, and focus it.
-    fn begin_rename(&mut self, target: RenameTarget, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.active_view(cx) else {
-            return;
-        };
-        let item = view.read(cx).item().clone();
-        if !item.read(cx).is_editable() {
-            return;
-        }
-        let name = item
-            .read(cx)
-            .document()
-            .and_then(|document| document.doc.scene.get(target.node()))
-            .map(|node| node.name.clone())
-            .unwrap_or_default();
-        self.renaming = Some(target);
-        self.rename_editor.update(cx, |editor, cx| {
-            editor.set_text(name, window, cx);
-            editor.select_all(&SelectAll, window, cx);
-        });
-        self.rename_editor.focus_handle(cx).focus(window, cx);
-        cx.notify();
-    }
-
-    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.renaming.take().is_some() {
-            self.focus_handle.focus(window, cx);
-            cx.notify();
-        }
-    }
-
-    fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.renaming.take() else {
-            return;
-        };
-        self.focus_handle.focus(window, cx);
-        cx.notify();
-        let new_name = self.rename_editor.read(cx).text(cx).trim().to_string();
-        if new_name.is_empty() {
-            return;
-        }
-        let Some(view) = self.active_view(cx) else {
-            return;
-        };
-        let item = view.read(cx).item().clone();
-        if !item.read(cx).is_editable() {
-            return;
-        }
-        view.update(cx, |view, cx| {
-            view.finish_document_edits_for_external_change(cx);
-        });
-        let node = target.node();
-        let old_name = item
-            .read(cx)
-            .document()
-            .and_then(|document| document.doc.scene.get(node))
-            .map(|node| node.name.clone());
-        let Some(old_name) = old_name else {
-            return;
-        };
-        if old_name == new_name {
-            return;
-        }
-        let applied = item.update(cx, |item, cx| {
-            item.apply(
-                Operation::SetName {
-                    id: node,
-                    old: old_name,
-                    new: new_name,
-                },
-                cx,
-            )
-        });
-        if let Err(error) = applied {
-            log::error!("fanta design panel: failed to rename: {error:#}");
-        }
-    }
-}
-
-// A non-selectable list item keeps the placeholder aligned with real rows.
-fn empty_section_label(id: &'static str, text: &'static str) -> AnyElement {
-    ListItem::new(id)
-        .spacing(ListItemSpacing::ExtraDense)
-        .height(px(SECTION_ROW_HEIGHT))
-        .indent_level(1)
-        .indent_step_size(SECTION_INDENT_STEP)
-        .selectable(false)
-        .child(Label::new(text).size(LabelSize::Small).color(Color::Muted))
-        .into_any_element()
 }
 
 fn centered_message(text: impl Into<SharedString>) -> AnyElement {
@@ -1711,6 +1045,8 @@ impl Render for FantaDesignPanel {
         self.ensure_gpui_pages(_window, cx);
         #[cfg(feature = "fanta-gpui-ui")]
         self.ensure_gpui_layers(_window, cx);
+        #[cfg(feature = "fanta-gpui-ui")]
+        self.ensure_file_inspector(cx);
         let body = match self.active_view(cx) {
             None => centered_message("Open a Figma document to browse its layers"),
             Some(view) => {
@@ -1726,7 +1062,16 @@ impl Render for FantaDesignPanel {
                 } else if has_error {
                     centered_message("Could not open this document")
                 } else {
-                    self.render_sections(&view, cx)
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    let inspector = self
+                        .file_inspector
+                        .as_ref()
+                        .map(|panel| panel.clone().into_any_element());
+                    #[cfg(not(feature = "fanta-gpui-ui"))]
+                    let inspector: Option<AnyElement> = None;
+                    inspector.unwrap_or_else(|| {
+                        centered_message("File inspector needs the fanta-gpui UI runtime")
+                    })
                 }
             }
         };
@@ -1776,12 +1121,16 @@ impl Render for FantaDesignPanel {
             }))
             .size_full()
             .overflow_hidden()
-            .bg(cx.theme().colors().editor_background)
-            .on_drag_move(cx.listener(Self::handle_divider_drag))
+            .when(!self.file_inspector_collapsed, |panel| {
+                panel.bg(cx.theme().colors().editor_background)
+            })
             .child(body)
     }
 }
 
+pub(crate) struct FileInspectorVisibilityChanged(pub bool);
+
+impl EventEmitter<FileInspectorVisibilityChanged> for FantaDesignPanel {}
 impl EventEmitter<PanelEvent> for FantaDesignPanel {}
 
 impl Focusable for FantaDesignPanel {
@@ -1851,21 +1200,6 @@ mod tests {
 
     use super::*;
     use fanta_doc::{ComponentDef, ComponentId, InstanceNode, Transform2D, VectorNode};
-    use gpui::TestAppContext;
-    use project::FakeFs;
-
-    fn init_panel_test(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            zlog::init_test();
-            assets::Assets.load_test_fonts(cx);
-            let store = settings::SettingsStore::test(cx);
-            cx.set_global(store);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            release_channel::init(semver::Version::new(0, 0, 0), cx);
-            editor::init(cx);
-        });
-    }
-
     fn insert_node(doc: &mut Doc, mut node: CanvasNode) -> NodeId {
         node.index = doc.scene.next_child_index(node.parent);
         let id = node.id;
@@ -2203,64 +1537,6 @@ mod tests {
                 .expect_err("a component cannot contain an instance of itself"),
             LayerDropError::RecursiveComponentInstance
         );
-    }
-
-    #[gpui::test]
-    fn filtering_expands_its_section_and_collapsing_closes_the_editor(cx: &mut TestAppContext) {
-        init_panel_test(cx);
-        let fs: Arc<dyn Fs> = FakeFs::new(cx.executor());
-        let panel = cx.add_window(move |window, cx| {
-            FantaDesignPanel::build(fs, None, window, cx, Vec::new())
-        });
-
-        panel
-            .update(cx, |panel, window, cx| {
-                panel.collapsed_sections.insert(Section::Pages);
-                panel.toggle_filter(Section::Pages, window, cx);
-                assert!(panel.section_open(Section::Pages));
-                assert_eq!(panel.filter_target, Some(Section::Pages));
-
-                panel.filter_editor.update(cx, |editor, cx| {
-                    editor.set_text("cover", window, cx);
-                });
-                panel.toggle_section(Section::Pages, window, cx);
-
-                assert!(!panel.section_open(Section::Pages));
-                assert_eq!(panel.filter_target, None);
-                assert!(panel.filter_editor.read(cx).text(cx).is_empty());
-            })
-            .expect("design panel window remains available");
-    }
-
-    fn page(name: &str, index: usize) -> PageEntry {
-        PageEntry {
-            name: SharedString::from(name.to_owned()),
-            root: Some(NodeId::new()),
-            index,
-        }
-    }
-
-    #[test]
-    fn filter_pages_preserves_true_indices_and_matches_case_insensitively() {
-        let pages = vec![
-            page("Icons", 0),
-            page("Typography", 1),
-            page("Dark Theme", 2),
-        ];
-
-        // No query returns every page untouched.
-        assert_eq!(filter_pages(pages.clone(), None).len(), 3);
-
-        // The query is matched against the (already lowercased) name, and each
-        // survivor keeps its ORIGINAL index into `document.pages` — not its
-        // position in the filtered list — so actions still hit the right page.
-        let matched = filter_pages(pages.clone(), Some("theme"));
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].name.as_ref(), "Dark Theme");
-        assert_eq!(matched[0].index, 2);
-
-        // A non-matching query yields the empty-state list.
-        assert!(filter_pages(pages, Some("zzz")).is_empty());
     }
 }
 
@@ -3164,11 +2440,6 @@ mod gpui_layers_tests {
             &mut harness,
             LayersPanelAction::PanelExpansionChanged { expanded: false },
         );
-        assert!(
-            harness
-                .panel
-                .read_with(&harness.cx, |panel, _| panel.layers_collapsed)
-        );
         harness.layers.update_in(&mut harness.cx, |layers, _, cx| {
             layers.set_expanded(false, cx);
         });
@@ -3646,7 +2917,7 @@ impl FantaDesignPanel {
         }
     }
 
-    /// Renames a node with the SetName pattern the native rename editor uses.
+    /// Apply a page or layer rename as a document operation.
     fn rename_node_to(&mut self, node: NodeId, new_name: String, cx: &mut Context<Self>) {
         let Some(view) = self.active_view(cx) else {
             return;
@@ -3682,20 +2953,6 @@ impl FantaDesignPanel {
         if let Err(error) = applied {
             log::error!("fanta-gpui pages: rename failed: {error:#}");
         }
-    }
-
-    /// The mounted PagesPanel wrapped to respect the section height, or None
-    /// when the adapter is off (native section renders instead).
-    fn gpui_pages_section_element(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        let adapter = self.gpui_pages.as_ref()?;
-        Some(
-            v_flex()
-                .flex_none()
-                .max_h(self.pages_height + px(96.))
-                .overflow_hidden()
-                .child(adapter.panel.clone())
-                .into_any_element(),
-        )
     }
 }
 
@@ -3879,10 +3136,7 @@ impl FantaDesignPanel {
                 };
                 self.handle_layers_context_action(id, *action, window, cx);
             }
-            LayersPanelAction::PanelExpansionChanged { expanded } => {
-                self.layers_collapsed = !expanded;
-                cx.notify();
-            }
+            LayersPanelAction::PanelExpansionChanged { .. } => {}
         }
     }
 
@@ -4063,20 +3317,5 @@ impl FantaDesignPanel {
                 ((), DocChange::Selection)
             });
         });
-    }
-
-    /// The mounted LayersPanel, flexing over the sidebar remainder — or only
-    /// its header tall while the user collapsed it. None when the fanta-gpui
-    /// runtime is off (the section renders its unavailable notice instead).
-    fn gpui_layers_section_element(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        let adapter = self.gpui_layers.as_ref()?;
-        Some(
-            v_flex()
-                .when(!self.layers_collapsed, |section| section.flex_1())
-                .when(self.layers_collapsed, |section| section.flex_none())
-                .overflow_hidden()
-                .child(adapter.panel.clone())
-                .into_any_element(),
-        )
     }
 }
