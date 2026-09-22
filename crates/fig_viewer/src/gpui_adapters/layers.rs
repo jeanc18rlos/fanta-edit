@@ -34,6 +34,7 @@ pub(crate) struct LayersTreeKey {
     /// expanded containers, so a change in the expanded set changes the tree
     /// even when the document did not.
     pub expansion_generation: u64,
+    pub editable: bool,
 }
 
 /// The engine facts the kind mapping needs beyond a node's own data.
@@ -174,9 +175,85 @@ fn build_children(
                 has_children,
                 visible: !node.flags.contains(fanta_doc::NodeFlags::HIDDEN),
                 locked: node.flags.contains(fanta_doc::NodeFlags::LOCKED),
+                context_actions: Some(context_actions(doc, *child)),
             })
         })
         .collect()
+}
+
+pub(crate) fn context_actions(
+    doc: &Doc,
+    id: NodeId,
+) -> Vec<fanta_gpui::layers::LayersPanelContextAction> {
+    use fanta_gpui::layers::LayersPanelContextAction as Action;
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    if doc
+        .scene
+        .ancestors_of(id)
+        .any(|ancestor| ancestor.flags.contains(fanta_doc::NodeFlags::LOCKED))
+    {
+        return vec![Action::Copy];
+    }
+    let mut actions = vec![Action::Copy, Action::LockUnlock];
+    if node.flags.contains(fanta_doc::NodeFlags::LOCKED) {
+        return actions;
+    }
+    if doc.is_component_root(id) {
+        actions.extend([Action::Rename, Action::ShowHide]);
+        return actions;
+    }
+    actions.extend([
+        Action::Duplicate,
+        Action::Delete,
+        Action::Rename,
+        Action::ShowHide,
+        Action::BringToFront,
+        Action::SendToBack,
+        Action::GroupSelection,
+        Action::FrameSelection,
+    ]);
+    if doc.components.defs.values().any(|definition| {
+        doc.scene
+            .ancestors_of(definition.root)
+            .any(|ancestor| ancestor.id == id)
+    }) {
+        actions.retain(|action| !matches!(action, Action::Duplicate | Action::Delete));
+    }
+    match &node.data {
+        NodeData::Group(_) => {
+            if !doc
+                .components
+                .defs
+                .values()
+                .any(|definition| definition.root == id)
+            {
+                actions.extend([
+                    Action::Ungroup,
+                    Action::RemoveFrame,
+                    Action::CreateComponent,
+                ]);
+            }
+        }
+        NodeData::Instance(instance) => {
+            if doc.components.defs.contains_key(&instance.component) {
+                actions.extend([Action::DetachInstance, Action::GoToMainComponent]);
+            }
+        }
+        _ => {}
+    }
+    actions
+}
+
+pub(crate) fn restrict_read_only(items: &mut [LayersPanelItem]) {
+    use fanta_gpui::layers::LayersPanelContextAction as Action;
+    for item in items {
+        if let Some(actions) = &mut item.context_actions {
+            actions.retain(|action| matches!(action, Action::Copy | Action::GoToMainComponent));
+        }
+        restrict_read_only(&mut item.children);
+    }
 }
 
 /// Parses a panel row id back to the engine id. Row ids are always node

@@ -81,7 +81,12 @@ pub(crate) fn pages_view_data(
                 root: page.root,
             },
         );
-        items.push(PagesPanelItem { id, title: name });
+        items.push(PagesPanelItem {
+            id,
+            title: name,
+            editable: page.root.is_some(),
+            can_copy_link: false,
+        });
     }
     (items, id_map)
 }

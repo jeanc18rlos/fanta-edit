@@ -78,6 +78,8 @@ mod tests {
     /// A minimal owner of the doc slices an [`OpCtx`] borrows, for unit tests.
     struct TestDoc {
         scene: Scene,
+        pages: Vec<NodeId>,
+        active_page: Option<NodeId>,
         components: ComponentLibrary,
         variables: VariableRegistry,
         active_modes: BTreeMap<VariableCollectionId, ModeId>,
@@ -88,6 +90,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 scene: Scene::new(),
+                pages: Vec::new(),
+                active_page: None,
                 components: ComponentLibrary::new(),
                 variables: VariableRegistry::new(),
                 active_modes: BTreeMap::new(),
@@ -98,6 +102,8 @@ mod tests {
         fn ctx(&mut self) -> OpCtx<'_> {
             OpCtx {
                 scene: &mut self.scene,
+                pages: &mut self.pages,
+                active_page: &mut self.active_page,
                 components: &mut self.components,
                 variables: &mut self.variables,
                 active_modes: &mut self.active_modes,
@@ -937,5 +943,44 @@ mod tests {
             } if restored_target == target
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod page_operation_tests {
+    use crate::{CanvasNode, Doc, GroupNode, NodeData, Operation};
+    #[test]
+    fn page_order_undo_preserves_identity_and_rejects_invalid_roots() {
+        let mut doc = Doc::new();
+        let a = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let b = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let (first, second) = (a.id, b.id);
+        doc.apply(Operation::create_node(a)).expect("first");
+        doc.apply(Operation::create_node(b)).expect("second");
+        doc.add_page(first);
+        doc.add_page(second);
+        doc.set_active_page(Some(first));
+        doc.apply(Operation::SetPages {
+            old: vec![first, second],
+            new: vec![second, first],
+        })
+        .expect("move");
+        assert_eq!(doc.pages(), &[second, first]);
+        assert_eq!(doc.active_page(), Some(first));
+        doc.undo().expect("undo");
+        assert_eq!(doc.pages(), &[first, second]);
+        doc.redo().expect("redo");
+        assert_eq!(doc.pages(), &[second, first]);
+        assert!(
+            doc.apply(Operation::SetPages {
+                old: vec![second, first],
+                new: vec![first, first]
+            })
+            .is_err()
+        );
+        assert_eq!(doc.pages(), &[second, first]);
+        let restored: Doc = serde_json::from_str(&serde_json::to_string(&doc).expect("serialize"))
+            .expect("deserialize");
+        assert_eq!(restored.pages(), doc.pages());
     }
 }

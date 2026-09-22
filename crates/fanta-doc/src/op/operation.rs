@@ -26,6 +26,8 @@ use smallvec::SmallVec;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Operation {
+    /// Replace the ordered page registry as part of an undoable transaction.
+    SetPages { old: Vec<NodeId>, new: Vec<NodeId> },
     // ---- scene structure (pre-existing) -------------------------------------
     /// Add a new node. Reverts by removing it. Boxed because `CanvasNode` is
     /// large (~400 bytes) and we don't want every variant to inherit that.
@@ -448,6 +450,7 @@ impl Operation {
             Self::DeleteSubtree { .. } => "Delete",
             Self::Reparent { .. } => "Move",
             Self::SetIndex { .. } => "Reorder",
+            Self::SetPages { .. } => "Reorder pages",
             Self::SetTransform { .. } => "Transform",
             Self::SetName { .. } => "Rename",
             Self::SetMeta { .. } => "Edit",

@@ -282,6 +282,8 @@ impl Doc {
     pub fn apply(&mut self, op: Operation) -> Result<(), SceneError> {
         let mut ctx = OpCtx {
             scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
             components: &mut self.components,
             variables: &mut self.variables,
             active_modes: &mut self.active_modes,
@@ -302,6 +304,8 @@ impl Doc {
     pub fn apply_transaction(&mut self, tx: crate::history::Transaction) -> Result<(), SceneError> {
         let mut ctx = OpCtx {
             scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
             components: &mut self.components,
             variables: &mut self.variables,
             active_modes: &mut self.active_modes,
@@ -322,6 +326,8 @@ impl Doc {
     pub fn abort_transaction(&mut self) -> Result<(), SceneError> {
         let mut ctx = OpCtx {
             scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
             components: &mut self.components,
             variables: &mut self.variables,
             active_modes: &mut self.active_modes,
@@ -347,6 +353,8 @@ impl Doc {
     pub fn undo(&mut self) -> Result<bool, SceneError> {
         let mut ctx = OpCtx {
             scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
             components: &mut self.components,
             variables: &mut self.variables,
             active_modes: &mut self.active_modes,
@@ -364,6 +372,8 @@ impl Doc {
     pub fn redo(&mut self) -> Result<bool, SceneError> {
         let mut ctx = OpCtx {
             scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
             components: &mut self.components,
             variables: &mut self.variables,
             active_modes: &mut self.active_modes,

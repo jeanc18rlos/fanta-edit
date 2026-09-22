@@ -390,6 +390,120 @@ pub(crate) fn duplicate_operations(
     clipboard.instantiate_offset(doc, offset, ClipboardPlacement::Duplicate)
 }
 
+pub(crate) fn duplicate_page_operations(doc: &Doc, root: NodeId) -> Result<Vec<Operation>> {
+    let index = doc
+        .pages()
+        .iter()
+        .position(|id| *id == root)
+        .context("page no longer exists")?;
+    let clipboard = CanvasClipboard::capture_roots(doc, vec![root]).context("page is empty")?;
+    let mut pasted =
+        clipboard.instantiate_offset(doc, (0.0, 0.0), ClipboardPlacement::Duplicate)?;
+    let copy = *pasted.roots.first().context("missing duplicated page")?;
+    if let Some(node) = pasted.nodes.iter_mut().find(|node| node.id == copy) {
+        node.name = format!("{} Copy", node.name);
+    }
+    let nodes: HashMap<_, _> = clipboard
+        .nodes
+        .iter()
+        .zip(&pasted.nodes)
+        .map(|(source, copy)| (source.id, copy.id))
+        .collect();
+    let components: HashMap<_, _> = doc
+        .components
+        .defs
+        .values()
+        .filter(|definition| nodes.contains_key(&definition.root))
+        .map(|definition| (definition.id, fanta_doc::ComponentId::new()))
+        .collect();
+    let sets: HashMap<_, _> = doc
+        .components
+        .sets
+        .values()
+        .filter(|set| {
+            !set.members.is_empty()
+                && set
+                    .members
+                    .iter()
+                    .all(|member| components.contains_key(member))
+        })
+        .map(|set| (set.id, fanta_doc::ComponentId::new()))
+        .collect();
+    for node in &mut pasted.nodes {
+        if let NodeData::Instance(instance) = &mut node.data
+            && let Some(component) = components.get(&instance.component)
+        {
+            instance.component = *component;
+            for replacement in &mut instance.overrides {
+                for node in &mut replacement.target_path {
+                    remap_reference(node, &nodes);
+                }
+                if let fanta_doc::OverrideValue::SwapInstance { component } = &mut replacement.value
+                    && let Some(copy) = components.get(component)
+                {
+                    *component = *copy;
+                }
+            }
+            for derived in &mut instance.derived {
+                for node in &mut derived.path {
+                    remap_reference(node, &nodes);
+                }
+            }
+        }
+    }
+    let mut operations = create_operations(&pasted);
+    for definition in doc.components.defs.values() {
+        let Some(id) = components.get(&definition.id) else {
+            continue;
+        };
+        let mut copy = definition.clone();
+        copy.id = *id;
+        copy.root = *nodes
+            .get(&definition.root)
+            .context("missing copied component root")?;
+        copy.variant_of = definition.variant_of.as_ref().and_then(|membership| {
+            sets.get(&membership.set).map(|set| {
+                let mut copy = membership.clone();
+                copy.set = *set;
+                copy
+            })
+        });
+        for property in &mut copy.props {
+            for binding in &mut property.bindings {
+                for node in &mut binding.path {
+                    remap_reference(node, &nodes);
+                }
+            }
+        }
+        operations.push(Operation::DefineComponent {
+            def: Box::new(copy),
+        });
+    }
+    for set in doc.components.sets.values() {
+        let Some(id) = sets.get(&set.id) else {
+            continue;
+        };
+        let mut copy = set.clone();
+        copy.id = *id;
+        copy.members = set
+            .members
+            .iter()
+            .map(|member| components[member])
+            .collect();
+        copy.default_variant = *components
+            .get(&set.default_variant)
+            .context("missing copied default variant")?;
+        operations.push(Operation::DefineComponentSet {
+            set: Box::new(copy),
+        });
+    }
+    let old = doc.pages().to_vec();
+    let mut new = old.clone();
+    new.insert(index + 1, copy);
+    operations.push(Operation::SetPages { old, new });
+    Ok(operations)
+}
+
 pub(crate) fn delete_operations(doc: &Doc) -> Vec<Operation> {
     let mut deleted = HashSet::new();
     let mut operations = Vec::new();
@@ -767,6 +881,65 @@ mod tests {
         assert_eq!(duplicate.min_y - source.min_y, 5.0);
         assert_eq!(doc.scene.children_of(Some(copy)).len(), 2);
         assert!(doc.scene.get(frame_id).unwrap().index < doc.scene.get(copy).unwrap().index);
+    }
+
+    #[test]
+    fn page_duplicate_preserves_component_masters_and_local_instances() {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+        page.name = "Components".into();
+        let root = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(root);
+        let mut master = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+        master.parent = Some(root);
+        let master_id = master.id;
+        doc.apply(Operation::create_node(master)).expect("master");
+        let component = fanta_doc::ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(fanta_doc::ComponentDef::new(component, master_id, "Button")),
+        })
+        .expect("definition");
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [20.0, 20.0],
+        }));
+        instance.parent = Some(root);
+        doc.apply(Operation::create_node(instance))
+            .expect("instance");
+        let operations = duplicate_page_operations(&doc, root).expect("duplicate ops");
+        apply_transaction(&mut doc, "Duplicate page", operations).expect("apply");
+        let copy = doc.pages()[1];
+        let copied_component = doc
+            .components
+            .defs
+            .values()
+            .find(|definition| definition.id != component)
+            .expect("copied component");
+        assert_eq!(
+            doc.scene
+                .get(copied_component.root)
+                .expect("copied master")
+                .parent,
+            Some(copy)
+        );
+        let instance_component = doc
+            .scene
+            .children_of(Some(copy))
+            .iter()
+            .filter_map(|id| match &doc.scene.get(*id)?.data {
+                NodeData::Instance(instance) => Some(instance.component),
+                _ => None,
+            })
+            .next()
+            .expect("copied instance");
+        assert_eq!(instance_component, copied_component.id);
+        doc.undo().expect("undo page copy");
+        assert_eq!(doc.pages(), &[root]);
+        assert_eq!(doc.components.defs.len(), 1);
     }
 
     #[test]

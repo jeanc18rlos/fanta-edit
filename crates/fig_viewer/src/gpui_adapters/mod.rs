@@ -77,14 +77,8 @@ mod spike_tests {
                 PagesPanel::new(
                     "spike-pages",
                     vec![
-                        PagesPanelItem {
-                            id: "page-1".into(),
-                            title: "Cover".into(),
-                        },
-                        PagesPanelItem {
-                            id: "page-2".into(),
-                            title: "Components".into(),
-                        },
+                        PagesPanelItem::new("page-1", "Cover"),
+                        PagesPanelItem::new("page-2", "Components"),
                     ],
                     window,
                     cx,
@@ -166,13 +160,7 @@ mod spike_tests {
         // Pages panel echoes host data: replace the model, panel reflects it.
         host.update(cx, |host, cx| {
             host.pages.update(cx, |pages, cx| {
-                pages.set_pages(
-                    vec![PagesPanelItem {
-                        id: "page-3".into(),
-                        title: "Prototype".into(),
-                    }],
-                    cx,
-                );
+                pages.set_pages(vec![PagesPanelItem::new("page-3", "Prototype")], cx);
             });
         });
         cx.run_until_parked();

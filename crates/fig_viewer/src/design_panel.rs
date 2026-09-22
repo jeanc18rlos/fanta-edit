@@ -33,7 +33,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::document::{DocChange, FigDocument, FigPage, page_bounds};
+use crate::document::{DocChange, FigDocument};
 use crate::panel_settings::FantaDesignPanelSettings;
 use crate::view::{
     CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, FrameSelection,
@@ -1081,7 +1081,7 @@ impl FantaDesignPanel {
         view.update(cx, |view, cx| {
             view.finish_document_edits_for_external_change(cx);
         });
-        let Some((page_node, page_name)) = ({
+        let Some(page_node) = ({
             let fig_item = item.read(cx);
             fig_item.document().and_then(|document| {
                 // A doc without explicit page roots renders every root as one
@@ -1094,37 +1094,34 @@ impl FantaDesignPanel {
                 let visible_count = document.pages.iter().filter(|page| !page.hidden).count();
                 page_node.name = format!("Page {}", visible_count + 1);
                 page_node.index = document.doc.scene.next_root_index();
-                let page_name = SharedString::from(page_node.name.clone());
-                Some((page_node, page_name))
+                Some(page_node)
             })
         }) else {
             return;
         };
         let root = page_node.id;
 
-        let applied = item.update(cx, |item, cx| {
-            item.apply(Operation::create_node(page_node), cx)
+        self.apply_document_ops(
+            "Add page",
+            |doc| {
+                let old = doc.pages().to_vec();
+                let mut new = old.clone();
+                new.push(root);
+                vec![
+                    Operation::create_node(page_node),
+                    Operation::SetPages { old, new },
+                ]
+            },
+            cx,
+        );
+        let new_page_index = item.read(cx).document().and_then(|document| {
+            document
+                .pages
+                .iter()
+                .position(|page| page.root == Some(root))
         });
-        if let Err(error) = applied {
-            log::error!("fanta design panel: failed to add a page: {error:#}");
-            return;
-        }
-        let new_page_index = item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.add_page(root);
-                document.doc.set_active_page(Some(root));
-                let bounds = page_bounds(&document.doc, Some(root));
-                document.pages.push(FigPage {
-                    root: Some(root),
-                    name: page_name,
-                    bounds,
-                    hidden: false,
-                });
-                (document.pages.len() - 1, DocChange::Content)
-            })
-        });
-        if let Some(new_page_index) = new_page_index {
-            view.update(cx, |view, cx| view.select_page(new_page_index, cx));
+        if let Some(index) = new_page_index {
+            view.update(cx, |view, cx| view.select_page(index, cx));
         }
     }
 
@@ -1142,7 +1139,7 @@ impl FantaDesignPanel {
         let Some((root, snapshot)) = ({
             let fig_item = item.read(cx);
             fig_item.document().and_then(|document| {
-                if document.pages.len() <= 1 {
+                if document.pages.iter().filter(|page| !page.hidden).count() <= 1 {
                     return None;
                 }
                 let root = document.pages.get(page_index)?.root?;
@@ -1160,30 +1157,26 @@ impl FantaDesignPanel {
             return;
         };
 
-        let applied = item.update(cx, |item, cx| {
-            item.apply(Operation::DeleteSubtree { snapshot }, cx)
+        self.apply_document_ops(
+            "Delete page",
+            |doc| {
+                let old = doc.pages().to_vec();
+                let new = old.iter().copied().filter(|id| *id != root).collect();
+                vec![
+                    Operation::SetPages { old, new },
+                    Operation::DeleteSubtree { snapshot },
+                ]
+            },
+            cx,
+        );
+        let next_page_index = item.read(cx).document().and_then(|document| {
+            document
+                .pages
+                .iter()
+                .position(|page| page.root == document.doc.active_page())
         });
-        if let Err(error) = applied {
-            log::error!("fanta design panel: failed to delete the page: {error:#}");
-            return;
-        }
-        let next_page_index = item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.remove_page(root);
-                if page_index < document.pages.len() {
-                    document.pages.remove(page_index);
-                }
-                let active_root = document.doc.active_page();
-                let next_page_index = document
-                    .pages
-                    .iter()
-                    .position(|page| page.root == active_root)
-                    .unwrap_or(0);
-                (next_page_index, DocChange::Content)
-            })
-        });
-        if let Some(next_page_index) = next_page_index {
-            view.update(cx, |view, cx| view.select_page(next_page_index, cx));
+        if let Some(index) = next_page_index {
+            view.update(cx, |view, cx| view.select_page(index, cx));
         }
     }
 
@@ -2380,6 +2373,74 @@ mod gpui_pages_tests {
     }
 
     #[gpui::test]
+    async fn page_menu_moves_duplicates_and_deletes_round_trip_through_undo(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_gpui::pages::{PagesPanelAction, PagesPanelMoveDirection};
+        let (_panel, view, pages, first, second, mut cx) = setup_panel(cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let order = |cx: &VisualTestContext| {
+            item.read_with(cx, |item, _| {
+                item.document().expect("ready").doc.pages().to_vec()
+            })
+        };
+        pages.update_in(&mut cx, |_, _, cx| {
+            cx.emit(PagesPanelAction::MoveRequested {
+                page_id: second.to_string().into(),
+                direction: PagesPanelMoveDirection::Top,
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(order(&cx), vec![second, first]);
+        assert_eq!(
+            pages.read_with(&cx, |pages, _| pages.selected_page().cloned()),
+            Some(first.to_string().into())
+        );
+        item.update_in(&mut cx, |item, _, cx| item.undo(cx).expect("undo move"));
+        cx.run_until_parked();
+        assert_eq!(order(&cx), vec![first, second]);
+        pages.update_in(&mut cx, |_, _, cx| {
+            cx.emit(PagesPanelAction::DuplicateRequested {
+                page_id: first.to_string().into(),
+            })
+        });
+        cx.run_until_parked();
+        let copied = order(&cx);
+        assert_eq!(copied.len(), 3);
+        let copy = copied[1];
+        assert_ne!(copy, first);
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready").doc;
+            assert_eq!(doc.scene.get(copy).expect("copy").name, "Page 1 Copy");
+            assert_eq!(doc.scene.children_of(Some(copy)).len(), 1);
+            assert_ne!(
+                doc.scene.children_of(Some(copy)),
+                doc.scene.children_of(Some(first))
+            );
+        });
+        item.update_in(&mut cx, |item, _, cx| {
+            item.undo(cx).expect("undo duplicate")
+        });
+        cx.run_until_parked();
+        assert_eq!(order(&cx), vec![first, second]);
+        item.update_in(&mut cx, |item, _, cx| {
+            item.redo(cx).expect("redo duplicate")
+        });
+        cx.run_until_parked();
+        assert_eq!(order(&cx), copied);
+        pages.update_in(&mut cx, |_, _, cx| {
+            cx.emit(PagesPanelAction::DeleteRequested {
+                page_id: copy.to_string().into(),
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(order(&cx), vec![first, second]);
+        item.update_in(&mut cx, |item, _, cx| item.undo(cx).expect("undo delete"));
+        cx.run_until_parked();
+        assert_eq!(order(&cx), copied);
+    }
+
+    #[gpui::test]
     async fn typing_in_pages_search_returns_matches_from_the_document(cx: &mut TestAppContext) {
         let (panel, _view, pages_panel, _page_one, _page_two, mut cx) = setup_panel(cx).await;
         let cx = &mut cx;
@@ -2958,6 +3019,34 @@ mod gpui_layers_tests {
     }
 
     #[gpui::test]
+    async fn cast_duplicate_delete_and_unsupported_actions_use_the_addressed_layer(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 2).await;
+        let target = harness.fixture.leaves[0];
+        let other = harness.fixture.leaves[1];
+        let frame = harness.fixture.frame;
+        select_on_canvas(&mut harness, other);
+        context_action(&mut harness, target, LayersPanelContextAction::Duplicate);
+        let copied = selection(&harness)[0];
+        assert_ne!(copied, target);
+        assert_eq!(
+            with_doc(&harness, |doc| doc.scene.children_of(Some(frame)).len()),
+            3
+        );
+        select_on_canvas(&mut harness, other);
+        context_action(&mut harness, copied, LayersPanelContextAction::Delete);
+        assert!(!with_doc(&harness, |doc| doc.scene.contains(copied)));
+        assert!(with_doc(&harness, |doc| doc.scene.contains(other)));
+        context_action(
+            &mut harness,
+            target,
+            LayersPanelContextAction::SendToFigmaMake,
+        );
+        assert!(with_doc(&harness, |doc| doc.scene.contains(target)));
+    }
+
+    #[gpui::test]
     async fn context_menu_z_order_component_and_copy_actions_hit_real_operations(
         cx: &mut TestAppContext,
     ) {
@@ -3134,7 +3223,14 @@ impl FantaDesignPanel {
         let Some(document) = fig_item.document() else {
             return;
         };
-        let (items, id_map) = crate::gpui_adapters::pages::pages_view_data(document);
+        let (mut items, id_map) = crate::gpui_adapters::pages::pages_view_data(document);
+        for page in &mut items {
+            page.editable &= fig_item.is_editable();
+            page.can_copy_link = id_map
+                .get(&page.id)
+                .and_then(|page| page.root)
+                .is_some_and(|root| fig_item.has_saved_page(root));
+        }
         let selected = self
             .current_page_index
             .and_then(|index| document.pages.get(index).map(|page| (index, page.root)))
@@ -3192,7 +3288,7 @@ impl FantaDesignPanel {
         &mut self,
         _panel: &Entity<fanta_gpui::pages::PagesPanel>,
         action: &fanta_gpui::pages::PagesPanelAction,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use fanta_gpui::pages::PagesPanelAction;
@@ -3246,18 +3342,93 @@ impl FantaDesignPanel {
                     self.delete_page(index, cx);
                 }
             }
-            // Both of these are hard-coded entries in the vendored Pages
-            // panel's page menu, which offers the host no way to hide them.
-            // Duplicating a page has no document operation yet, and the
-            // `fanta://page/<id>` link the old Copy-link arm put on the
-            // clipboard resolves to nothing — `open_listener` answers every
-            // `fanta://` url by focusing the app. Handing the user a link that
-            // silently goes nowhere is worse than declining to make one.
-            PagesPanelAction::DuplicateRequested { .. } => {
-                crate::view::notify_unavailable("Duplicating a page", window, cx);
+            PagesPanelAction::MoveRequested { page_id, direction } => {
+                let root = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.id_map.get(page_id))
+                    .and_then(|page| page.root);
+                if let Some(root) = root {
+                    self.apply_document_ops(
+                        "Move page",
+                        |doc| {
+                            let old = doc.pages().to_vec();
+                            let visible: Vec<_> = old
+                                .iter()
+                                .copied()
+                                .filter(|id| {
+                                    doc.scene
+                                        .get(*id)
+                                        .and_then(|node| node.meta.get("hidden_page"))
+                                        .and_then(|value| value.as_bool())
+                                        != Some(true)
+                                })
+                                .collect();
+                            let Some(index) = visible.iter().position(|id| *id == root) else {
+                                return Vec::new();
+                            };
+                            let Some(target) = direction.destination(index, visible.len()) else {
+                                return Vec::new();
+                            };
+                            let mut reordered = visible.clone();
+                            reordered.remove(index);
+                            reordered.insert(target, root);
+                            let mut replacements = reordered.into_iter();
+                            let new = old
+                                .iter()
+                                .map(|id| {
+                                    if visible.contains(id) {
+                                        replacements.next().unwrap_or(*id)
+                                    } else {
+                                        *id
+                                    }
+                                })
+                                .collect();
+                            vec![Operation::SetPages { old, new }]
+                        },
+                        cx,
+                    );
+                }
             }
-            PagesPanelAction::CopyLinkRequested { .. } => {
-                crate::view::notify_unavailable("Links to a page", window, cx);
+            PagesPanelAction::DuplicateRequested { page_id } => {
+                let root = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.id_map.get(page_id))
+                    .and_then(|page| page.root);
+                if let Some(root) = root {
+                    self.apply_document_ops(
+                        "Duplicate page",
+                        |doc| match crate::clipboard::duplicate_page_operations(doc, root) {
+                            Ok(operations) => operations,
+                            Err(error) => {
+                                log::error!("Cannot duplicate page: {error:#}");
+                                Vec::new()
+                            }
+                        },
+                        cx,
+                    );
+                }
+            }
+            PagesPanelAction::CopyLinkRequested { page_id } => {
+                let root = self
+                    .gpui_pages
+                    .as_ref()
+                    .and_then(|adapter| adapter.id_map.get(page_id))
+                    .and_then(|page| page.root);
+                let path = root.and_then(|root| {
+                    self.active_view(cx).and_then(|view| {
+                        let item = view.read(cx).item().read(cx);
+                        item.project_root()
+                            .and_then(|path| fanta_format::locate_page_source(path, root))
+                    })
+                });
+                if let Some(path) = path
+                    && let Ok(url) = url::Url::from_file_path(path)
+                {
+                    let link = url.as_str().replacen("file://", "fanta://file", 1);
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(link));
+                }
             }
             PagesPanelAction::SearchRequested(request) => {
                 self.run_gpui_pages_search(request.clone(), cx);
@@ -3589,12 +3760,20 @@ impl FantaDesignPanel {
             page_root,
             render_generation: document.render_generation(),
             expansion_generation: self.expansion_generation,
+            editable: fig_item.is_editable(),
         };
         let tree = (self
             .gpui_layers
             .as_ref()
             .is_some_and(|adapter| adapter.tree_key != Some(tree_key)))
-        .then(|| crate::gpui_adapters::layers::layers_tree(doc, page_root, &self.expanded_nodes));
+        .then(|| {
+            let mut tree =
+                crate::gpui_adapters::layers::layers_tree(doc, page_root, &self.expanded_nodes);
+            if !fig_item.is_editable() {
+                crate::gpui_adapters::layers::restrict_read_only(&mut tree);
+            }
+            tree
+        });
         let selected: Vec<SharedString> = doc
             .selection
             .iter()
@@ -3718,7 +3897,44 @@ impl FantaDesignPanel {
         cx: &mut Context<Self>,
     ) {
         use fanta_gpui::layers::LayersPanelContextAction;
+        let allowed = self.active_view(cx).is_some_and(|view| {
+            let item = view.read(cx).item().read(cx);
+            item.document().is_some_and(|document| {
+                crate::gpui_adapters::layers::context_actions(&document.doc, id).contains(&action)
+            }) && (item.is_editable()
+                || matches!(
+                    action,
+                    LayersPanelContextAction::Copy | LayersPanelContextAction::GoToMainComponent
+                ))
+        });
+        if !allowed {
+            return;
+        }
+        if matches!(
+            action,
+            LayersPanelContextAction::Copy
+                | LayersPanelContextAction::Duplicate
+                | LayersPanelContextAction::Delete
+        ) && self.active_view(cx).is_some_and(|view| {
+            view.read(cx)
+                .item()
+                .read(cx)
+                .document()
+                .is_some_and(|document| !document.doc.selection.contains(id))
+        }) {
+            self.select_node(id, false, cx);
+        }
         match action {
+            LayersPanelContextAction::Duplicate => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.duplicate_selected_nodes(cx));
+                }
+            }
+            LayersPanelContextAction::Delete => {
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| view.delete_selected_nodes(cx));
+                }
+            }
             LayersPanelContextAction::ShowHide => self.toggle_node_flag(id, NodeFlags::HIDDEN, cx),
             LayersPanelContextAction::LockUnlock => {
                 self.toggle_node_flag(id, NodeFlags::LOCKED, cx)

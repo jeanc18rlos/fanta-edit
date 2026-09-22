@@ -153,9 +153,11 @@ impl OpenRequest {
                 this.parse_git_commit_url(commit_path)?
             } else if url.starts_with("ssh://") {
                 this.parse_ssh_file_path(&url, cx)?
+            } else if let Some(file) = url.strip_prefix("fanta://file/") {
+                this.parse_file_path(&format!("/{file}"));
             } else if url.starts_with("fanta://") {
-                // The app bundle registers the `fanta` URL scheme, but no route
-                // under it is implemented yet. Treat any such link as a request
+                // The app bundle registers the `fanta` URL scheme. Treat an
+                // unrecognized route as a request
                 // to focus the app rather than reporting it as unhandled.
                 log::warn!("unrecognized fanta:// url, focusing the app instead: {url}");
                 this.kind = Some(OpenRequestKind::FocusApp);

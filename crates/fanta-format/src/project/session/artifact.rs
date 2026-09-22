@@ -1886,7 +1886,8 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
     use ArtifactOpImpact as Impact;
     use Operation::*;
     match op {
-        CreateNode { .. }
+        SetPages { .. }
+        | CreateNode { .. }
         | DeleteSubtree { .. }
         | Reparent { .. }
         | SetIndex { .. }

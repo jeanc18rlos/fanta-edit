@@ -46,6 +46,33 @@ impl Operation {
     /// collapse into one match.
     fn run(&self, ctx: &mut OpCtx, dir: Dir) -> Result<(), SceneError> {
         match self {
+            Self::SetPages { old, new } => {
+                let pages = dir.pick(old, new);
+                let mut seen = std::collections::HashSet::new();
+                for id in pages {
+                    let node = ctx.scene.get(*id).ok_or(SceneError::NotFound(*id))?;
+                    if node.parent.is_some()
+                        || !matches!(node.data, NodeData::Group(_))
+                        || !seen.insert(*id)
+                    {
+                        return Err(SceneError::InvariantViolated(
+                            "pages must be unique root containers".into(),
+                        ));
+                    }
+                }
+                *ctx.pages = pages.clone();
+                if ctx.active_page.is_some_and(|id| {
+                    !pages.contains(&id)
+                        && !ctx
+                            .components
+                            .defs
+                            .values()
+                            .any(|definition| definition.root == id)
+                }) {
+                    *ctx.active_page = pages.first().copied();
+                }
+                Ok(())
+            }
             // ---- scene structure --------------------------------------------
             Self::CreateNode { node } | Self::CreateInstance { node } => match dir {
                 Dir::Apply => ctx.scene.insert((**node).clone()).map(|_| ()),

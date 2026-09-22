@@ -31,7 +31,7 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   `fanta_live_mcp.json` discovery file, and the five canvas tools), plus the
   save/reload timing an agent needs before committing. The `.fnx` authoring
   guidance around it is upstream's, corrected where the parser had moved on.
-  Nothing else in `fanta-format` diverges. A resync must keep the Fanta text:
+  A resync must keep the Fanta text:
   the constant is the only source of the file every project scaffolds, and a
   test pins the seeded file to it byte-for-byte.
 - `gpui_component`: `src/webview.rs` lost its `use crate::PixelsExt;`. This
@@ -40,6 +40,11 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   here and `script/clippy` (`--all-features`, which turns the `webview` feature
   on) rejects it. Behaviour is unchanged: an inherent method already wins over a
   trait method. Re-apply on a resync only if the fork drops `Pixels::as_f32`.
+
+- `fanta-doc`: `Operation::SetPages` makes page registration and ordering
+  undoable, validating unique root containers before replacing the registry.
+  `fanta-format` classifies this operation as a structural change. Preserve
+  both when resyncing until these changes land upstream.
 
 - `fanta-doc`: `tests/seam.rs` gained an `#[allow(clippy::disallowed_methods)]`
   on `skia_seam_is_enforced`. This workspace's `clippy.toml` denies
@@ -104,12 +109,13 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
 All other source is byte-identical to upstream. Edits belong here now; the
 sibling checkouts are no longer part of the build.
 
-## Published GPUI dependencies
+## External GPUI dependencies
 
 The workspace consumes the GPUI framework, supporting libraries, and reusable
-Fanta components from crates.io at exact version `=0.2.0`. Dependency aliases
-preserve existing Rust imports. `Cargo.lock` records the registry sources and
-checksums. The shared Variables screen includes project titles, mode selectors,
+Fanta components externally. The published baseline is crates.io `=0.2.0`;
+the context-menu integration currently uses the preview revision documented
+below. Dependency aliases preserve existing Rust imports, and `Cargo.lock`
+records the exact source. The shared Variables screen includes project titles, mode selectors,
 layer bindings, and input handling that survives editor keymap reloads.
 
 The migrated local source copies have been removed. The `fanta-gpui` entries
@@ -122,3 +128,12 @@ published package.
 
 `fanta_ui`, `fig_viewer`, their adapters, and the document and canvas engine
 crates remain owned here.
+
+### Context-menu preview
+
+The host-controlled layer/page menus use upstream preview commit
+`e0cc3d1366a0c70aed266f2d9a05bf137d03910c` on `codex/context-menus`.
+All GPUI package aliases use that same Git revision so the host and components
+share one GPUI type identity. No migrated component copies are restored.
+This preview is not a crates.io release; switch the aliases together when the
+next published version includes these intents.

@@ -21,6 +21,8 @@ use std::collections::BTreeMap;
 /// [`Operation`]: crate::op::Operation
 pub struct OpCtx<'a> {
     pub scene: &'a mut Scene,
+    pub pages: &'a mut Vec<NodeId>,
+    pub active_page: &'a mut Option<NodeId>,
     pub components: &'a mut ComponentLibrary,
     pub variables: &'a mut VariableRegistry,
     pub active_modes: &'a mut BTreeMap<VariableCollectionId, ModeId>,

@@ -197,8 +197,12 @@ impl History {
         let mut active_modes = std::collections::BTreeMap::new();
         let mut motion = crate::motion::MotionLibrary::new();
         let mut flow_start = None;
+        let mut pages = Vec::new();
+        let mut active_page = None;
         let mut ctx = OpCtx {
             scene,
+            pages: &mut pages,
+            active_page: &mut active_page,
             components: &mut components,
             variables: &mut variables,
             active_modes: &mut active_modes,
@@ -356,6 +360,8 @@ mod tests {
     /// call so `history.apply(..., &mut td.ctx())` reads naturally.
     struct TestDoc {
         scene: Scene,
+        pages: Vec<NodeId>,
+        active_page: Option<NodeId>,
         components: ComponentLibrary,
         variables: VariableRegistry,
         active_modes: BTreeMap<VariableCollectionId, ModeId>,
@@ -366,6 +372,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 scene: Scene::new(),
+                pages: Vec::new(),
+                active_page: None,
                 components: ComponentLibrary::new(),
                 variables: VariableRegistry::new(),
                 active_modes: BTreeMap::new(),
@@ -376,6 +384,8 @@ mod tests {
         fn ctx(&mut self) -> OpCtx<'_> {
             OpCtx {
                 scene: &mut self.scene,
+                pages: &mut self.pages,
+                active_page: &mut self.active_page,
                 components: &mut self.components,
                 variables: &mut self.variables,
                 active_modes: &mut self.active_modes,

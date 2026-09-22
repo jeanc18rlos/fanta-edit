@@ -753,6 +753,20 @@ impl FigDocument {
     /// and running it (with its text measurement) after every interaction
     /// dominates the frame budget on large pages.
     fn resolve_after_edit(&mut self, page_root: Option<NodeId>) {
+        if !self.doc.pages().is_empty()
+            && !self
+                .pages
+                .iter()
+                .filter_map(|page| page.root)
+                .eq(self.doc.pages().iter().copied())
+        {
+            self.pages = collect_pages(&self.doc, &visible_page_roots(&self.doc));
+            self.default_page_index = self
+                .pages
+                .iter()
+                .position(|page| page.root == self.doc.active_page())
+                .unwrap_or(0);
+        }
         if !self.uses_auto_layout {
             return;
         }
@@ -1187,6 +1201,14 @@ impl FigItem {
         self.source_edit_locked = source_edit_locked;
         cx.emit(FigItemEvent::SourceEditLockChanged);
         cx.notify();
+    }
+
+    pub(crate) fn has_saved_page(&self, root: NodeId) -> bool {
+        self.project_root.is_some()
+            && self
+                .merge_base
+                .as_ref()
+                .is_some_and(|doc| doc.pages().contains(&root))
     }
 
     pub fn project_root(&self) -> Option<&Path> {
