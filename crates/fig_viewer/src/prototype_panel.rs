@@ -360,6 +360,12 @@ pub struct FantaPrototypePanel {
     parameter_error: Option<SharedString>,
     parameter_editor_subscription: Option<Subscription>,
     _item_subscription: Subscription,
+    #[cfg(feature = "fanta-gpui-ui")]
+    shared: Option<Entity<fanta_gpui::properties_tabs::PrototypeInspector>>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    shared_subscription: Option<Subscription>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    selected_reaction: Option<ReactionId>,
 }
 
 impl FantaPrototypePanel {
@@ -399,6 +405,12 @@ impl FantaPrototypePanel {
             parameter_error: None,
             parameter_editor_subscription: None,
             _item_subscription: item_subscription,
+            #[cfg(feature = "fanta-gpui-ui")]
+            shared: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            shared_subscription: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            selected_reaction: None,
         }
     }
 
@@ -1783,8 +1795,8 @@ impl FantaPrototypePanel {
     }
 }
 
-impl Render for FantaPrototypePanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl FantaPrototypePanel {
+    fn render_legacy(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_parameter_editor(window, cx);
         let mut root = v_flex()
             .track_focus(&self.focus_handle)
@@ -3484,5 +3496,204 @@ mod tests {
             .expect("reaction remains");
             assert_eq!(reaction.trigger, Trigger::AfterDelay { delay_ms: 300 });
         });
+    }
+}
+
+impl Render for FantaPrototypePanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if crate::gpui_adapters::runtime_enabled(cx) {
+            return self.render_shared(window, cx);
+        }
+        self.render_legacy(window, cx).into_any_element()
+    }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+impl FantaPrototypePanel {
+    fn render_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use fanta_gpui::properties_tabs::{
+            PrototypeConnection, PrototypeInspector, PrototypeInspectorViewData,
+        };
+        self.ensure_parameter_editor(window, cx);
+        if self.shared.is_none() {
+            let panel = cx.new(|cx| {
+                PrototypeInspector::new("editor-prototype-inspector", Default::default(), cx)
+            });
+            self.shared_subscription =
+                Some(cx.subscribe_in(&panel, window, Self::handle_shared_action));
+            self.shared = Some(panel);
+        }
+        let mut data = PrototypeInspectorViewData {
+            read_only: true,
+            ..Default::default()
+        };
+        let snapshot = self.snapshot(cx);
+        let mut detail = None;
+        if let PrototypeSnapshot::Selection {
+            editable,
+            node,
+            name,
+            is_flow_start,
+            reactions,
+            frame_targets,
+            scroll_targets,
+            variables,
+            components,
+            clips,
+            ..
+        } = &snapshot
+        {
+            data.selection_name = name.clone();
+            data.read_only = !editable;
+            data.flow_name = is_flow_start.then(|| name.clone());
+            data.connections = reactions
+                .iter()
+                .map(|reaction| {
+                    let trigger_choice = TriggerChoice::from_trigger(&reaction.trigger);
+                    let trigger = TRIGGER_CHOICES
+                        .iter()
+                        .find(|(choice, _)| *choice == trigger_choice)
+                        .map(|(_, label)| *label)
+                        .unwrap_or("Trigger");
+                    PrototypeConnection {
+                        id: reaction.id.to_string().into(),
+                        trigger: trigger.into(),
+                        action: format!("{:?}", ActionChoice::from_action(&reaction.action)).into(),
+                        destination: action_target(&reaction.action)
+                            .and_then(|target| {
+                                frame_targets
+                                    .iter()
+                                    .chain(scroll_targets)
+                                    .find(|candidate| candidate.id == target)
+                                    .map(|candidate| candidate.name.clone())
+                            })
+                            .unwrap_or_default(),
+                        animation: reaction
+                            .transition
+                            .as_ref()
+                            .map(|transition| {
+                                format!("{:?} · {} ms", transition.style, transition.duration_ms)
+                                    .into()
+                            })
+                            .unwrap_or_else(|| "Instant".into()),
+                    }
+                })
+                .collect();
+            if let Some((index, reaction)) = reactions
+                .iter()
+                .enumerate()
+                .find(|(_, reaction)| Some(reaction.id) == self.selected_reaction)
+            {
+                detail = Some(self.render_reaction(
+                    index,
+                    *node,
+                    reaction,
+                    frame_targets,
+                    scroll_targets,
+                    variables,
+                    components,
+                    clips,
+                    *editable,
+                    window,
+                    cx,
+                ));
+            }
+        }
+        if let Some(panel) = &self.shared
+            && panel.read(cx).view_data() != &data
+        {
+            panel.update(cx, |panel, cx| panel.set_view_data(data, cx));
+        }
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(div().flex_1().min_h_0().children(self.shared.clone()))
+            .children(detail.map(|detail| {
+                div()
+                    .id("prototype-interaction-detail")
+                    .max_h(gpui::px(420.))
+                    .overflow_y_scroll()
+                    .child(detail)
+            }))
+            .into_any_element()
+    }
+
+    fn handle_shared_action(
+        &mut self,
+        _: &Entity<fanta_gpui::properties_tabs::PrototypeInspector>,
+        action: &fanta_gpui::properties_tabs::PrototypeInspectorAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fanta_gpui::properties_tabs::PrototypeInspectorAction as Intent;
+        let PrototypeSnapshot::Selection {
+            node,
+            editable,
+            can_start_flow,
+            ..
+        } = self.snapshot(cx)
+        else {
+            return;
+        };
+        if !editable
+            && !matches!(
+                action,
+                Intent::PresentRequested | Intent::ConnectionEditRequested { .. }
+            )
+        {
+            return;
+        }
+        match action {
+            Intent::ConnectionAddRequested => {
+                self.add_interaction(node, cx);
+                self.selected_reaction = self.item.read(cx).document().and_then(|document| {
+                    document
+                        .doc
+                        .scene
+                        .get(node)?
+                        .reactions
+                        .last()
+                        .map(|reaction| reaction.id)
+                });
+            }
+            Intent::ConnectionEditRequested { id } => {
+                self.finish_parameter_edit(cx);
+                self.selected_reaction = id.parse().ok();
+            }
+            Intent::ConnectionRemoveRequested { id } => {
+                if let Ok(id) = id.parse() {
+                    self.remove_interaction(node, id, cx);
+                    if self.selected_reaction == Some(id) {
+                        self.selected_reaction = None;
+                    }
+                }
+            }
+            Intent::FlowStartRequested if can_start_flow => self.set_flow_start(node, true, cx),
+            Intent::FlowStartRequested => {}
+            Intent::FlowRenameRequested { name } if !name.trim().is_empty() => {
+                self.apply_operation(
+                    |doc| {
+                        let current = doc.scene.get(node)?;
+                        Some(Operation::SetName {
+                            id: node,
+                            old: current.name.clone(),
+                            new: name.trim().to_owned(),
+                        })
+                    },
+                    cx,
+                );
+            }
+            Intent::FlowRenameRequested { .. } => {}
+            Intent::PresentRequested => window.dispatch_action(Box::new(PlayPrototype), cx),
+            Intent::DeviceChangeRequested { .. } | Intent::BackgroundChangeRequested { .. } => {
+                crate::view::notify_unavailable(
+                    "Prototype device and presentation background overrides",
+                    window,
+                    cx,
+                )
+            }
+        }
+        cx.notify();
     }
 }

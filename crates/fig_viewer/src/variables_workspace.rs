@@ -951,19 +951,13 @@ fn parse_primitive_value(
     }
 }
 
-fn editor_variable_value(value: Option<&VarValue>, variable_type: VariableType) -> String {
+fn editor_variable_value(value: Option<&VarValue>, _variable_type: VariableType) -> String {
     match value {
         Some(VarValue::Color { value }) => value.to_hex(),
         Some(VarValue::Float { value }) => value.to_string(),
         Some(VarValue::String { value }) => value.clone(),
         Some(VarValue::Boolean { value }) => value.to_string(),
-        _ => match default_variable_value(variable_type) {
-            VarValue::Color { value } => value.to_hex(),
-            VarValue::Float { value } => value.to_string(),
-            VarValue::String { value } => value,
-            VarValue::Boolean { value } => value.to_string(),
-            VarValue::TextStyle { .. } | VarValue::Alias { .. } => String::new(),
-        },
+        _ => "Unresolved".to_owned(),
     }
 }
 
@@ -1637,6 +1631,22 @@ mod tests {
         );
         assert!(data.variables[1].values[0].color_hex.is_some());
         assert_eq!(data.variables[0].group_id.as_ref(), "group:color");
+    }
+
+    #[test]
+    fn missing_imported_values_are_not_presented_as_real_defaults() {
+        let (mut doc, collection, _mode) = doc_with_many_variables(1);
+        doc.variables
+            .variables
+            .values_mut()
+            .next()
+            .expect("variable exists")
+            .values_by_mode
+            .clear();
+        let snapshot = variables_snapshot(&doc, Some(collection));
+        let data = screen_view_data(Some(&doc), &snapshot, &ALL_GROUPS.into(), "Design".into());
+        assert_eq!(data.variables[0].values[0].value.as_ref(), "Unresolved");
+        assert!(data.variables[0].values[0].color_hex.is_none());
     }
 
     #[test]

@@ -626,4 +626,90 @@ fn imports_real_fig_fixture_without_empty_collections() {
         );
     }
     assert_eq!(report.variable_collections, doc.variables.collections.len());
+    for variable in doc.variables.variables.values() {
+        let collection = &doc.variables.collections[&variable.collection];
+        assert!(
+            variable
+                .values_by_mode
+                .keys()
+                .all(|mode| collection.has_mode(*mode)),
+            "{} has a value mapped to another collection's mode",
+            variable.name
+        );
+    }
+}
+
+#[test]
+fn reused_library_mode_guids_stay_scoped_to_their_collection() {
+    let mut doc = Doc::new();
+    let mut report = MapReport::default();
+    let collections = ["local", "library"].map(|name| PendingCollection {
+        guid: name.into(),
+        name: name.into(),
+        modes: vec![
+            ("shared-light".into(), "Light".into()),
+            ("shared-dark".into(), "Dark".into()),
+        ],
+    });
+    let variables = ["local", "library"].map(|name| PendingVariable {
+        guid: format!("{name}-color"),
+        name: "yellow".into(),
+        set_guid: Some(name.into()),
+        ty: VariableType::Color,
+        values: vec![
+            (
+                "shared-light".into(),
+                VarValue::Color {
+                    value: Color::rgba(255, 251, 235, 255),
+                },
+            ),
+            (
+                "shared-dark".into(),
+                VarValue::Color {
+                    value: Color::rgba(253, 247, 221, 255),
+                },
+            ),
+        ],
+    });
+    let maps = build_variables(&mut doc, &mut report, &collections, &variables);
+    let frame = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    let frame_id = frame.id;
+    doc.scene.insert(frame).expect("insert frame");
+    apply_explicit_modes(
+        &mut doc,
+        &mut report,
+        &[(frame_id, vec![("local".into(), "shared-dark".into())])],
+        &maps,
+    );
+    for variable in doc.variables.variables.values() {
+        let collection = &doc.variables.collections[&variable.collection];
+        assert!(
+            variable
+                .values_by_mode
+                .keys()
+                .all(|mode| collection.has_mode(*mode))
+        );
+        assert_eq!(
+            variable.values_by_mode.get(&collection.default_mode),
+            Some(&VarValue::Color {
+                value: Color::rgba(255, 251, 235, 255)
+            })
+        );
+    }
+    let local = maps.coll_guid_to_id["local"];
+    let frame = doc.scene.get(frame_id).expect("frame exists");
+    let NodeData::Group(group) = &frame.data else {
+        panic!("frame must be a group")
+    };
+    let mode = group.explicit_modes[&local];
+    assert!(doc.variables.collections[&local].has_mode(mode));
+    assert_eq!(
+        doc.variables.collections[&local]
+            .modes
+            .iter()
+            .find(|m| m.id == mode)
+            .expect("owned mode")
+            .name,
+        "Dark"
+    );
 }

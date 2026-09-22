@@ -11,6 +11,8 @@ pub enum EditorMode {
     Design,
     Prototype,
     Motion,
+    Draw,
+    Code,
     Comments,
 }
 
@@ -43,13 +45,22 @@ impl EditorWorkspace {
 }
 
 impl EditorMode {
-    pub const ALL: [Self; 4] = [Self::Design, Self::Prototype, Self::Motion, Self::Comments];
+    pub const ALL: [Self; 6] = [
+        Self::Design,
+        Self::Motion,
+        Self::Draw,
+        Self::Code,
+        Self::Prototype,
+        Self::Comments,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Design => "Design",
             Self::Prototype => "Prototype",
             Self::Motion => "Motion",
+            Self::Draw => "Draw",
+            Self::Code => "Code",
             Self::Comments => "Comments",
         }
     }
@@ -59,6 +70,8 @@ impl EditorMode {
             Self::Design => IconName::Sliders,
             Self::Prototype => IconName::PlayOutlined,
             Self::Motion => IconName::FastForward,
+            Self::Draw => IconName::ToolPencil,
+            Self::Code => IconName::FileCode,
             Self::Comments => IconName::Chat,
         }
     }
@@ -227,7 +240,7 @@ mod tests {
     fn mode_order_and_labels_are_stable() {
         assert_eq!(
             EditorMode::ALL.map(EditorMode::label),
-            ["Design", "Prototype", "Motion", "Comments"]
+            ["Design", "Motion", "Draw", "Code", "Prototype", "Comments"]
         );
         assert_eq!(EditorMode::default(), EditorMode::Design);
         assert_eq!(

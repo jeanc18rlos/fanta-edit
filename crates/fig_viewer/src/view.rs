@@ -3,6 +3,11 @@
 //! and the `Item` integration that gives fanta projects text-editor-style
 //! dirty tracking and save.
 
+#[cfg(feature = "fanta-gpui-ui")]
+mod properties_inspector;
+#[cfg(feature = "fanta-gpui-ui")]
+mod timeline_adapter;
+
 use std::collections::HashSet;
 
 use anyhow::{Context as _, Result};
@@ -63,8 +68,6 @@ use crate::properties_panel::FantaPropertiesPanel;
 use crate::prototype_panel::FantaPrototypePanel;
 use crate::prototype_player::PrototypePlayerState;
 use crate::text_edit::CanvasTextEdit;
-#[cfg(test)]
-use crate::timeline::TIMELINE_HEIGHT;
 use crate::timeline::{
     TimelineEditPhase, TimelineEvent, TimelineKeyframeSelection, TimelineKeyframeViewModel,
     TimelineProperty, TimelineShell, TimelineTrackViewModel, TimelineViewModel,
@@ -327,6 +330,10 @@ pub struct FigView {
     /// the adapter's host methods live in `gpui_adapters::design`.
     #[cfg(feature = "fanta-gpui-ui")]
     pub(crate) gpui_design: Option<crate::gpui_adapters::design::DesignAdapter>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    gpui_properties: Option<properties_inspector::PropertiesAdapter>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    gpui_timeline: Option<timeline_adapter::TimelineAdapter>,
     /// Set once the document's fonts have been queued for background download,
     /// so the one-shot prewarm doesn't re-fire every frame.
     fonts_prewarmed: bool,
@@ -613,6 +620,10 @@ impl FigView {
             gpui_design: (crate::gpui_adapters::runtime_enabled(cx)
                 && crate::gpui_adapters::design::design_enabled())
             .then(|| crate::gpui_adapters::design::DesignAdapter::new(window, cx)),
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_properties: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            gpui_timeline: None,
             fonts_prewarmed: false,
             hovered_node: None,
             text_edit: None,
@@ -3651,6 +3662,21 @@ impl FigView {
     }
 
     fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = &self.gpui_properties {
+            return div()
+                .id("fanta-inspector-sidebar")
+                .debug_selector(|| "fanta-inspector-sidebar".to_owned())
+                .relative()
+                .h_full()
+                .w(self.inspector_sidebar_width)
+                .flex_shrink_0()
+                .border_l_1()
+                .border_color(cx.theme().colors().border)
+                .child(adapter.layout.clone())
+                .child(self.render_sidebar_resize_handle(SidebarKind::Inspector))
+                .into_any_element();
+        }
         let mode = self.editor_mode(cx);
         let view = cx.weak_entity();
         let tabs = EditorModeTabs::new(mode, move |mode, _, cx| {
@@ -3661,7 +3687,7 @@ impl FigView {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => self.render_comments_sidebar(cx),
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
-            EditorMode::Design => {
+            EditorMode::Design | EditorMode::Draw | EditorMode::Code => {
                 // The fanta-gpui DesignPanel replaces the legacy inspector
                 // when its adapter mounted; `FANTA_GPUI_DESIGN=0` (or the
                 // process-wide `FANTA_GPUI_UI=0`) keeps the legacy panel.
@@ -5106,7 +5132,10 @@ impl Render for FigView {
         if let Some(node) = self.pending_text_edit.take() {
             self.open_text_edit(node, TextEditSeed::SelectAll, window, cx);
         }
-        self.maybe_prewarm_fonts(cx);
+        let editor_workspace = self.editor_workspace(cx);
+        if editor_workspace == EditorWorkspace::Canvas {
+            self.maybe_prewarm_fonts(cx);
+        }
         let snapshot = {
             let item = self.item.read(cx);
             FigViewSnapshot {
@@ -5117,11 +5146,11 @@ impl Render for FigView {
         let has_error = snapshot.error.is_some();
         let is_loading = snapshot.loading_message.is_some();
         let editor_mode = self.editor_mode(cx);
-        let editor_workspace = self.editor_workspace(cx);
         #[cfg(target_os = "macos")]
         self.sync_canvas_video(window.is_window_active(), cx);
         #[cfg(feature = "fanta-gpui-ui")]
-        {
+        if editor_workspace == EditorWorkspace::Canvas {
+            // Hidden canvas inspectors must not project document data on table scrolls.
             let tool = self.tools.kind();
             let zoom_percent = self.current_zoom_percent(cx);
             let options = self.toolbar_option_inputs(window, cx);
@@ -5131,6 +5160,8 @@ impl Render for FigView {
             // Covers state that was already ready before the first item
             // event (a preloaded document); memoized, so later frames skip.
             self.refresh_gpui_design(cx);
+            self.refresh_properties_inspector(window, cx);
+            self.refresh_shared_timeline(window, cx);
         }
         let cursor_style = match &self.text_edit {
             // The I-beam over the edited text, an arrow elsewhere — clicking
@@ -5505,11 +5536,36 @@ impl Render for FigView {
                                                 .then(|| self.render_inspector_sidebar(cx)),
                                         ),
                                 )
-                                .children(
-                                    (editor_mode == EditorMode::Motion)
-                                        .then(|| self.timeline_shell.clone()),
-                                ),
+                                .children((editor_mode == EditorMode::Motion).then(|| {
+                                    #[cfg(feature = "fanta-gpui-ui")]
+                                    if let Some(adapter) = &self.gpui_timeline {
+                                        return adapter.panel.clone().into_any_element();
+                                    }
+                                    self.timeline_shell.clone().into_any_element()
+                                })),
                         )
+                        .children({
+                            #[cfg(feature = "fanta-gpui-ui")]
+                            {
+                                self.gpui_properties
+                                    .as_ref()
+                                    .filter(|_| !self.inspector_sidebar_visible)
+                                    .map(|adapter| {
+                                        gpui::deferred(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .child(adapter.layout.clone()),
+                                        )
+                                        .with_priority(3)
+                                    })
+                            }
+                            #[cfg(not(feature = "fanta-gpui-ui"))]
+                            {
+                                None::<AnyElement>
+                            }
+                        })
                         .children((!self.layers_sidebar_visible).then(|| {
                             gpui::deferred(self.render_layers_sidebar(cx)).with_priority(3)
                         }))
@@ -6222,6 +6278,10 @@ impl Item for FigView {
                 gpui_design: (crate::gpui_adapters::runtime_enabled(cx)
                     && crate::gpui_adapters::design::design_enabled())
                 .then(|| crate::gpui_adapters::design::DesignAdapter::new(window, cx)),
+                #[cfg(feature = "fanta-gpui-ui")]
+                gpui_properties: None,
+                #[cfg(feature = "fanta-gpui-ui")]
+                gpui_timeline: None,
                 fonts_prewarmed: false,
                 hovered_node: None,
                 text_edit: None,
@@ -8499,10 +8559,10 @@ mod tests {
             .debug_bounds("fanta-inspector-sidebar")
             .expect("inspector sidebar");
         let timeline = visual_context
-            .debug_bounds("fanta-motion-timeline-shell")
+            .debug_bounds("timeline")
             .expect("motion timeline");
         let motion_panel = visual_context
-            .debug_bounds("fanta-motion-panel")
+            .debug_bounds("properties-inspector-content")
             .expect("motion inspector panel");
         let close = |left: Pixels, right: Pixels| (left - right).abs() <= px(1.);
 
@@ -8510,7 +8570,7 @@ mod tests {
         assert!(close(timeline.right(), inspector.right()));
         assert!(close(timeline.top(), layers.bottom()));
         assert!(close(timeline.top(), inspector.bottom()));
-        assert_eq!(timeline.size.height, TIMELINE_HEIGHT);
+        assert_eq!(timeline.size.height, px(300.));
         assert!(close(motion_panel.left(), inspector.left()));
         assert!(close(motion_panel.right(), inspector.right()));
         assert!(close(motion_panel.bottom(), inspector.bottom()));
@@ -9071,34 +9131,10 @@ impl FigView {
             looping: timeline.loop_playback_enabled(),
             current_time_ms,
             duration_ms,
-            agent_context_label: self.toolbar_agent_context_label(cx),
             layers_sidebar_visible: self.layers_sidebar_visible,
             inspector_sidebar_visible: self.inspector_sidebar_visible,
             // Live keymap text, like the tooltip the old native button had.
             fit_to_view_shortcut: ui::text_for_action(&FitToView, window, cx).map(Into::into),
-        }
-    }
-
-    /// What the Agent composer's context chip names: the selected layer, a
-    /// selection count, or the current page when nothing is selected.
-    #[cfg(feature = "fanta-gpui-ui")]
-    fn toolbar_agent_context_label(&self, cx: &App) -> SharedString {
-        let Some(document) = self.item.read(cx).document() else {
-            return "Canvas".into();
-        };
-        match document.doc.selection.as_slice() {
-            [] => document
-                .page(self.selected_page_index)
-                .map(|page| page.name.clone())
-                .unwrap_or_else(|| "Canvas".into()),
-            [node] => document
-                .doc
-                .scene
-                .get(*node)
-                .filter(|node| !node.name.is_empty())
-                .map(|node| SharedString::from(node.name.clone()))
-                .unwrap_or_else(|| "1 layer".into()),
-            selection => format!("{} layers", selection.len()).into(),
         }
     }
 
@@ -9158,15 +9194,6 @@ impl FigView {
         self.gpui_toolbar.as_ref()
     }
 
-    /// Test-only: whether keyboard focus sits inside the left sidebar (the
-    /// Resources tile's reveal-and-focus contract).
-    #[cfg(all(test, feature = "fanta-gpui-ui"))]
-    pub(crate) fn layers_sidebar_is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.layers_sidebar
-            .focus_handle(cx)
-            .contains_focused(window, cx)
-    }
-
     fn render_toolbar_slot(&self, cx: &mut Context<Self>) -> AnyElement {
         #[cfg(feature = "fanta-gpui-ui")]
         if self.gpui_toolbar.is_some() {
@@ -9175,10 +9202,7 @@ impl FigView {
         self.render_tool_pill(cx)
     }
 
-    /// The dock is the whole bottom overlay: fit-to-view and the sidebar
-    /// toggles ride inside it as chrome controls (pushed by the adapter's
-    /// refresh), and the dock surface occludes the canvas beneath it, so a
-    /// press on any part of the toolbar never reaches `handle_mouse_down`.
+    /// Center the toolbar independently of the zoom and sidebar headers.
     #[cfg(feature = "fanta-gpui-ui")]
     fn render_gpui_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(adapter) = self.gpui_toolbar.as_ref() else {
@@ -9267,7 +9291,8 @@ impl FigView {
             ToolbarAction::ModeChangeRequested { mode } => match mode {
                 ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
-                ToolbarMode::Dev => notify_unavailable("Dev mode", window, cx),
+                ToolbarMode::Dev => self.set_editor_mode(EditorMode::Code, cx),
+                ToolbarMode::Draw => self.set_editor_mode(EditorMode::Draw, cx),
             },
             // The +/- steppers, the zoom menu's percent entries, typed
             // percentages, and the ZoomCanvasTo100 command action all arrive
@@ -9329,19 +9354,19 @@ impl FigView {
             ToolbarAction::SecondaryControlInvoked { control, .. } => {
                 self.handle_toolbar_secondary_control(*control, window, cx);
             }
-            ToolbarAction::AiPromptSubmitted { prompt } => {
-                self.route_toolbar_agent_prompt(prompt.as_ref(), window, cx);
+            ToolbarAction::DrawOptionsChangeRequested { options } => {
+                if let Some(adapter) = self.gpui_toolbar.as_mut() {
+                    adapter.draw_options = options.clone();
+                    adapter.panel.update(cx, |toolbar, cx| {
+                        toolbar.set_draw_options(options.clone(), cx)
+                    });
+                }
+                cx.notify();
             }
-            ToolbarAction::AgentAttachmentRequested => {
-                notify_unavailable("Attaching a file to the Agent from the toolbar", window, cx)
+            ToolbarAction::DrawActionInvoked { action } => {
+                notify_unavailable(&format!("{action:?}"), window, cx);
             }
-            ToolbarAction::AgentVoiceInputRequested => {
-                notify_unavailable("Voice input", window, cx)
-            }
-            // The palette's query text and the composer's own show/hide are
-            // component-internal state; the host has nothing to do for them.
-            ToolbarAction::CommandQueryChanged { .. }
-            | ToolbarAction::AgentVisibilityChanged { .. } => {}
+            ToolbarAction::CommandQueryChanged { .. } => {}
         }
     }
 

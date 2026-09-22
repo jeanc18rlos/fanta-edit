@@ -759,7 +759,7 @@ impl TimelineShell {
         cx.notify();
     }
 
-    fn set_playhead(&mut self, playhead_us: i64, cx: &mut Context<Self>) {
+    pub(crate) fn set_playhead(&mut self, playhead_us: i64, cx: &mut Context<Self>) {
         let playhead_us = playhead_us.clamp(0, self.model.duration_us);
         if playhead_us == self.playhead_us {
             return;

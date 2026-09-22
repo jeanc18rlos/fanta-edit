@@ -116,8 +116,8 @@ pub(crate) fn read_var_value(data: &KiwiValue) -> Option<VarValue> {
 pub(crate) struct VariableGuidMaps {
     /// VARIABLE_SET node guid (`"sessionID:localID"`) → its collection id.
     pub(crate) coll_guid_to_id: HashMap<String, VariableCollectionId>,
-    /// Mode guid (`"sessionID:localID"`) → its mode id, across all collections.
-    pub(crate) mode_guid_to_id: HashMap<String, ModeId>,
+    /// Mode GUIDs can repeat in imported library collections, so key by owner too.
+    pub(crate) mode_guid_to_id: HashMap<(VariableCollectionId, String), ModeId>,
 }
 
 /// Build [`Doc::variables`] from pending collections + variables. Returns the
@@ -130,7 +130,7 @@ pub(crate) fn build_variables(
 ) -> VariableGuidMaps {
     // guid string -> ids, so variables can reference their collection + mode.
     let mut coll_guid_to_id: HashMap<String, VariableCollectionId> = HashMap::new();
-    let mut mode_guid_to_id: HashMap<String, ModeId> = HashMap::new();
+    let mut mode_guid_to_id: HashMap<(VariableCollectionId, String), ModeId> = HashMap::new();
 
     for pc in pending_collections {
         let cid = VariableCollectionId::new();
@@ -138,7 +138,7 @@ pub(crate) fn build_variables(
         let mut modes: Vec<Mode> = Vec::new();
         for (mguid, mname) in &pc.modes {
             let mid = ModeId::new();
-            mode_guid_to_id.insert(mguid.clone(), mid);
+            mode_guid_to_id.insert((cid, mguid.clone()), mid);
             modes.push(Mode {
                 id: mid,
                 name: mname.clone(),
@@ -208,7 +208,7 @@ pub(crate) fn build_variables(
         let mut values_by_mode = std::collections::BTreeMap::new();
         for (mode_guid, vv) in &pv.values {
             let mode_id = mode_guid_to_id
-                .get(mode_guid)
+                .get(&(coll_id, mode_guid.clone()))
                 .copied()
                 .unwrap_or(default_mode);
             values_by_mode.insert(mode_id, vv.clone());
@@ -300,11 +300,11 @@ pub(crate) fn apply_explicit_modes(
             continue; // only groups (frames/sections/components) pin modes
         };
         for (set_guid, mode_guid) in pins {
-            let (Some(&cid), Some(&mid)) = (
-                maps.coll_guid_to_id.get(set_guid),
-                maps.mode_guid_to_id.get(mode_guid),
-            ) else {
-                continue; // names a collection/mode we didn't import
+            let Some(&cid) = maps.coll_guid_to_id.get(set_guid) else {
+                continue;
+            };
+            let Some(&mid) = maps.mode_guid_to_id.get(&(cid, mode_guid.clone())) else {
+                continue;
             };
             g.explicit_modes.insert(cid, mid);
             pinned.insert(cid);

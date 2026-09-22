@@ -231,6 +231,26 @@ impl FantaMotionPanel {
         }
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    pub(crate) fn apply_inspector_preset(&mut self, id: &str, cx: &mut Context<Self>) {
+        let property = match id {
+            "Slide in" => AnimationProperty::Position,
+            "Scale in" => AnimationProperty::Scale,
+            "Rotate in" => AnimationProperty::Rotation,
+            "Grow" => AnimationProperty::Size,
+            "Fade in" => AnimationProperty::Opacity,
+            _ => return,
+        };
+        if let MotionPanelSnapshot::Selection {
+            node,
+            editable: true,
+            ..
+        } = self.snapshot(cx)
+        {
+            self.add_animation(node, property, cx);
+        }
+    }
+
     fn add_animation(&mut self, node: NodeId, property: AnimationProperty, cx: &mut Context<Self>) {
         let active_clip = self.active_clip;
         let applied = self.apply_transaction(
