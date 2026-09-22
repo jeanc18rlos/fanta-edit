@@ -23,6 +23,8 @@ mod gpui_adapters;
 mod inspector_components;
 mod inspector_widgets;
 mod instance_text;
+#[cfg(feature = "fanta-gpui-ui")]
+mod layer_context_ops;
 mod live_mcp;
 mod mode_overrides;
 mod motion_edit;

@@ -1083,3 +1083,59 @@ mod tests {
         assert_eq!(names, ["Frame-2.png", "Frame.png"]);
     }
 }
+
+#[cfg(feature = "fanta-gpui-ui")]
+pub(crate) fn render_layer(
+    doc: &Doc,
+    resolver: Option<Arc<dyn AssetResolver>>,
+    id: NodeId,
+    format: ExportFormat,
+) -> Result<Vec<u8>> {
+    let mut selection = doc.clone();
+    selection.selection.replace_with([id]);
+    let preset = ExportPreset {
+        format,
+        scale: ExportScale::One,
+    };
+    let batch = prepare_export_jobs(&selection, resolver, None, PathBuf::new(), &[preset])?;
+    let target = batch
+        .targets
+        .first()
+        .context("The layer has no export target")?;
+    let resolved = resolve_export_bindings(&batch.doc);
+    render_export(&batch, resolved.as_ref(), target, preset)
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+pub(crate) fn render_thumbnail(
+    doc: &Doc,
+    resolver: Option<Arc<dyn AssetResolver>>,
+    id: NodeId,
+) -> Result<Vec<u8>> {
+    let document = resolve_export_bindings(doc);
+    let bounds = visual_world_bounds(&document.scene, id, 0.)
+        .context("The thumbnail layer has no bounds")?;
+    ensure_exportable_bounds("Project thumbnail", bounds)?;
+    let zoom = (512. / bounds.width()).min(512. / bounds.height()).min(1.);
+    let width = (bounds.width() * zoom).ceil().max(1.) as u32;
+    let height = (bounds.height() * zoom).ceil().max(1.) as u32;
+    let target = ExportTarget {
+        root: Some(id),
+        name: "Project thumbnail".into(),
+        bounds,
+    };
+    let mut renderer = RasterRenderer::new(width, height)
+        .map_err(|error| anyhow::anyhow!("Creating thumbnail surface: {error}"))?;
+    if let Some(resolver) = resolver {
+        renderer.set_asset_resolver(resolver);
+    }
+    renderer.render_page_with(
+        &document.scene,
+        &target_viewport(&target, zoom),
+        Some(id),
+        &render_inputs(&document),
+    );
+    renderer
+        .encode_png()
+        .map_err(|error| anyhow::anyhow!("Encoding thumbnail: {error}"))
+}

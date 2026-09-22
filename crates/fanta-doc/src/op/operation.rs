@@ -113,6 +113,9 @@ pub enum Operation {
         new: NodeFlags,
     },
 
+    /// Toggle whether this node masks following siblings.
+    SetMask { id: NodeId, old: bool, new: bool },
+
     /// Change how a node participates as a child of an auto-layout parent
     /// (FILL/grow, absolute positioning, per-child align-self).
     SetLayoutChild {
@@ -417,6 +420,7 @@ impl Operation {
             | Self::SetEffects { id, .. }
             | Self::SetBlurs { id, .. }
             | Self::SetFlags { id, .. }
+            | Self::SetMask { id, .. }
             | Self::SetLayoutChild { id, .. }
             | Self::ReplaceData { id, .. }
             | Self::SetInstanceOverride { id, .. }
@@ -459,6 +463,7 @@ impl Operation {
             Self::SetEffects { .. } => "Shadow",
             Self::SetBlurs { .. } => "Blur",
             Self::SetFlags { .. } => "Flags",
+            Self::SetMask { .. } => "Mask",
             Self::SetLayoutChild { .. } => "Layout Child",
             Self::ReplaceData { .. } => "Edit",
             Self::CreateInstance { .. } => "Insert Instance",

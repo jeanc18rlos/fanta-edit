@@ -2382,6 +2382,35 @@ pub(crate) fn write_project_cached(
         .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
     fanta_format::write_project_tree_cached(root, doc, raw_assets, cache)
         .with_context(|| format!("writing Fanta project at {}", root.display()))?;
+    #[cfg(feature = "fanta-gpui-ui")]
+    if let Some(thumbnail) = doc
+        .scene
+        .roots()
+        .iter()
+        .flat_map(|id| doc.scene.descendants_of(*id))
+        .find(|id| {
+            doc.scene.get(*id).is_some_and(|node| {
+                node.meta
+                    .get("fanta_project_thumbnail")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            })
+        })
+    {
+        let resolver = Arc::new(LazyAssetResolver::new(
+            Arc::new(raw_assets.clone()),
+            Arc::new(decode_embedded_image),
+        ));
+        let png = crate::export::render_thumbnail(doc, Some(resolver), thumbnail)
+            .context("Rendering the project thumbnail")?;
+        crate::generation_media::write_output(&root.join(".fant.preview.png"), &png)?;
+    } else {
+        match std::fs::remove_file(root.join(".fant.preview.png")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Removing the old project thumbnail"),
+        }
+    }
     git_init_if_needed(root);
     Ok(())
 }
@@ -5394,5 +5423,109 @@ mod tests {
                 "the second project's worktree events must reach the shared item"
             );
         });
+    }
+}
+
+#[cfg(all(test, feature = "fanta-gpui-ui"))]
+mod layer_menu_tests {
+    use super::*;
+    use fanta_doc::{BitmapNode, CanvasNode, ImageFitMode, NodeData, Transform2D, VectorNode};
+
+    fn png() -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            4,
+            2,
+            image::Rgba([22, 44, 66, 255]),
+        ))
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .expect("PNG");
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn layer_menu_media_replacement_preserves_geometry_and_undo_restores_original_asset() {
+        let mut doc = Doc::new();
+        let original = AssetId::new();
+        let mut image = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+            asset: original,
+            natural_size: [2, 2],
+            local_size: [200., 100.],
+            crop: Some([0.1, 0.1, 0.8, 0.8]),
+            tint: None,
+            fit: ImageFitMode::Fill,
+        }));
+        image.transform = Transform2D::translation(50., 30.);
+        let id = image.id;
+        doc.scene.insert(image.clone()).expect("insert");
+        let document_id = doc.id;
+        let mut document = FigDocument::from_doc(doc, BTreeMap::from([(original, png())]));
+        crate::layer_context_ops::replace_media(&mut document, document_id, id, png(), None)
+            .expect("replace");
+        let replaced = document.doc.scene.get(id).expect("image");
+        assert_eq!(replaced.transform, image.transform);
+        let NodeData::Bitmap(bitmap) = &replaced.data else {
+            panic!("image type");
+        };
+        assert_ne!(bitmap.asset, original);
+        assert_eq!(bitmap.natural_size, [4, 2]);
+        assert_eq!(bitmap.local_size, [200., 100.]);
+        assert_eq!(bitmap.crop, None);
+        assert!(document.raw_assets.contains_key(&bitmap.asset));
+        document.doc.undo().expect("undo");
+        assert_eq!(
+            document.doc.scene.get(id).expect("restored").data,
+            image.data
+        );
+        document.doc.redo().expect("redo");
+        let before = document.doc.scene.get(id).expect("image").clone();
+        let assets = document.raw_assets.clone();
+        assert!(
+            crate::layer_context_ops::replace_media(
+                &mut document,
+                document_id,
+                id,
+                b"corrupt image".to_vec(),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(document.doc.scene.get(id).expect("image").data, before.data);
+        assert_eq!(document.raw_assets, assets);
+        assert!(
+            crate::layer_context_ops::replace_media(
+                &mut document,
+                fanta_doc::DocId::new(),
+                id,
+                png(),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn layer_menu_project_thumbnail_is_written_from_the_selected_layer() {
+        let root = tempfile::tempdir().expect("temp project");
+        let mut doc = Doc::new();
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.,
+            0.,
+            40.,
+            20.,
+            fanta_doc::Color::BLACK,
+        )));
+        node.meta = serde_json::json!({"fanta_project_thumbnail": true});
+        doc.scene.insert(node).expect("thumbnail node");
+        write_project(root.path(), &doc, &BTreeMap::new()).expect("save thumbnail");
+        let preview = image::open(root.path().join(".fant.preview.png")).expect("preview image");
+        assert_eq!((preview.width(), preview.height()), (40, 20));
+        let id = *doc.scene.roots().first().expect("thumbnail");
+        if let NodeData::Vector(vector) = &mut doc.scene.get_mut(id).expect("node").data {
+            vector.path = fanta_doc::PathData::rect(0., 0., 14000., 10000.);
+        }
+        write_project(root.path(), &doc, &BTreeMap::new()).expect("save large thumbnail");
+        let preview = image::open(root.path().join(".fant.preview.png")).expect("large preview");
+        assert_eq!((preview.width(), preview.height()), (512, 366));
     }
 }

@@ -7039,6 +7039,12 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
         });
     }
 

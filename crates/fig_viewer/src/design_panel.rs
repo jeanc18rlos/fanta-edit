@@ -2,6 +2,10 @@
 //! children. Document mutations and canvas navigation remain in the editor.
 #![cfg_attr(not(feature = "fanta-gpui-ui"), allow(dead_code))]
 
+#[cfg(feature = "fanta-gpui-ui")]
+#[path = "layer_context_menu.rs"]
+mod context_menu;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -309,6 +313,8 @@ pub struct FantaDesignPanel {
     gpui_layers: Option<crate::gpui_adapters::layers::LayersAdapter>,
     #[cfg(feature = "fanta-gpui-ui")]
     file_inspector: Option<Entity<fanta_gpui::file_inspector::FileInspectorSidebar>>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    context_picker: Option<context_menu::ContextPicker>,
     file_inspector_collapsed: bool,
     current_page_index: Option<usize>,
     /// The selection anchor the layer tree last revealed. When the anchor
@@ -450,6 +456,8 @@ impl FantaDesignPanel {
             gpui_layers: None,
             #[cfg(feature = "fanta-gpui-ui")]
             file_inspector: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            context_picker: None,
             file_inspector_collapsed: false,
             current_page_index: None,
             last_reveal_anchor: None,
@@ -482,6 +490,10 @@ impl FantaDesignPanel {
                     .as_ref()
                     .is_some_and(|previous| previous.entity_id() == view.entity_id());
                 if !is_same {
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    {
+                        self.context_picker = None;
+                    }
                     // Subscribe to the item's event stream rather than
                     // observing the view: the view notifies on every pan and
                     // pointer-move frame. The caches are rebuilt HERE, on
@@ -684,40 +696,6 @@ impl FantaDesignPanel {
     /// Reorder `id` to the top (`front`) or bottom of its siblings — Figma's
     /// Bring to front / Send to back — through the same move path a drag uses,
     /// so undo, transform preservation, and the document rules are shared.
-    fn move_layer_to_extreme(&mut self, id: NodeId, front: bool, cx: &mut Context<Self>) {
-        let Some(view) = self.active_view(cx) else {
-            return;
-        };
-        let target = {
-            let item = view.read(cx).item().read(cx);
-            let Some(document) = item.document() else {
-                return;
-            };
-            let scene = &document.doc.scene;
-            let Some(node) = scene.get(id) else {
-                return;
-            };
-            // Siblings are bottom-first in paint order: the last child is
-            // the topmost row.
-            let siblings = scene.children_of(node.parent);
-            let extreme = if front {
-                siblings.last()
-            } else {
-                siblings.first()
-            };
-            match extreme.copied() {
-                Some(target) if target != id => target,
-                _ => return,
-            }
-        };
-        let placement = if front {
-            LayerDropPlacement::Above
-        } else {
-            LayerDropPlacement::Below
-        };
-        self.drop_layer(id, target, placement, cx);
-    }
-
     /// Apply the operations `build` derives from the document as one undo
     /// step. Empty operation lists are a no-op; failures roll back and log.
     fn apply_document_ops(
@@ -1076,6 +1054,10 @@ impl Render for FantaDesignPanel {
             }
         };
 
+        #[cfg(feature = "fanta-gpui-ui")]
+        let picker = Some(self.render_context_picker(_window, cx));
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        let picker: Option<AnyElement> = None;
         v_flex()
             .key_context("FantaDesignPanel")
             .track_focus(&self.focus_handle)
@@ -1125,6 +1107,7 @@ impl Render for FantaDesignPanel {
                 panel.bg(cx.theme().colors().editor_background)
             })
             .child(body)
+            .children(picker)
     }
 }
 
@@ -2455,6 +2438,53 @@ mod gpui_layers_tests {
             "the collapsed panel must give the sidebar back: {collapsed_height:?} < {expanded_height:?}"
         );
     }
+    #[gpui::test]
+    async fn layer_menu_cast_new_actions_edit_the_node_and_open_shared_choices(
+        cx: &mut TestAppContext,
+    ) {
+        let mut harness = setup(cx, 2).await;
+        let target = harness.fixture.leaves[0];
+        context_action(&mut harness, target, LayersPanelContextAction::UseAsMask);
+        assert!(with_doc(&harness, |doc| doc
+            .scene
+            .get(target)
+            .expect("node")
+            .is_mask));
+        context_action(&mut harness, target, LayersPanelContextAction::UseAsMask);
+        assert!(!with_doc(&harness, |doc| doc
+            .scene
+            .get(target)
+            .expect("node")
+            .is_mask));
+        context_action(&mut harness, target, LayersPanelContextAction::CopyPasteAs);
+        assert!(
+            harness
+                .panel
+                .read_with(&harness.cx, |panel, _| panel.context_picker.is_some())
+        );
+        assert!(harness.cx.debug_bounds("layer-command-picker").is_some());
+        let frame = harness.fixture.frame;
+        context_action(
+            &mut harness,
+            frame,
+            LayersPanelContextAction::ConvertToSection,
+        );
+        assert!(with_doc(&harness, |doc| {
+            crate::layer_context_ops::is_section(
+                doc.scene.get(harness.fixture.frame).expect("frame"),
+            )
+        }));
+        context_action(
+            &mut harness,
+            frame,
+            LayersPanelContextAction::ConvertToFrame,
+        );
+        assert!(!with_doc(&harness, |doc| {
+            crate::layer_context_ops::is_section(
+                doc.scene.get(harness.fixture.frame).expect("frame"),
+            )
+        }));
+    }
 }
 
 #[cfg(feature = "fanta-gpui-ui")]
@@ -3140,9 +3170,6 @@ impl FantaDesignPanel {
         }
     }
 
-    /// The context-menu entries the host has an operation for. Everything
-    /// else is Figma-only or has no engine op yet; those are declined out
-    /// loud rather than faked or silently dropped.
     fn handle_layers_context_action(
         &mut self,
         id: NodeId,
@@ -3158,12 +3185,15 @@ impl FantaDesignPanel {
             }) && (item.is_editable()
                 || matches!(
                     action,
-                    LayersPanelContextAction::Copy | LayersPanelContextAction::GoToMainComponent
+                    LayersPanelContextAction::Copy
+                        | LayersPanelContextAction::CopyPasteAs
+                        | LayersPanelContextAction::GoToMainComponent
                 ))
         });
         if !allowed {
             return;
         }
+        self.context_picker = None;
         if matches!(
             action,
             LayersPanelContextAction::Copy
@@ -3179,16 +3209,22 @@ impl FantaDesignPanel {
             self.select_node(id, false, cx);
         }
         match action {
-            LayersPanelContextAction::Duplicate => {
-                if let Some(view) = self.active_view(cx) {
-                    view.update(cx, |view, cx| view.duplicate_selected_nodes(cx));
-                }
-            }
-            LayersPanelContextAction::Delete => {
-                if let Some(view) = self.active_view(cx) {
-                    view.update(cx, |view, cx| view.delete_selected_nodes(cx));
-                }
-            }
+            LayersPanelContextAction::Duplicate => self.apply_layer_command_select(
+                "Duplicate layers",
+                |doc| {
+                    let operations = crate::clipboard::duplicate_layer_operations(doc, id)?;
+                    let roots = crate::layer_context_ops::created_roots(&operations);
+                    Ok((operations, Some(roots)))
+                },
+                window,
+                cx,
+            ),
+            LayersPanelContextAction::Delete => self.apply_layer_command(
+                "Delete layers",
+                |doc| crate::layer_context_ops::delete_layers(doc, id),
+                window,
+                cx,
+            ),
             LayersPanelContextAction::ShowHide => self.toggle_node_flag(id, NodeFlags::HIDDEN, cx),
             LayersPanelContextAction::LockUnlock => {
                 self.toggle_node_flag(id, NodeFlags::LOCKED, cx)
@@ -3201,15 +3237,18 @@ impl FantaDesignPanel {
                     view.update(cx, |view, cx| view.copy_selected_nodes(cx));
                 }
             }
-            LayersPanelContextAction::BringToFront => self.move_layer_to_extreme(id, true, cx),
-            LayersPanelContextAction::SendToBack => self.move_layer_to_extreme(id, false, cx),
-            LayersPanelContextAction::CreateComponent => {
-                self.apply_document_ops(
-                    "Create component",
-                    |doc| crate::properties_ops::create_component_operations(doc, id),
-                    cx,
-                );
-            }
+            LayersPanelContextAction::BringToFront => self.apply_layer_command(
+                "Bring to front",
+                |doc| crate::layer_context_ops::stack(doc, id, true),
+                window,
+                cx,
+            ),
+            LayersPanelContextAction::SendToBack => self.apply_layer_command(
+                "Send to back",
+                |doc| crate::layer_context_ops::stack(doc, id, false),
+                window,
+                cx,
+            ),
             LayersPanelContextAction::DetachInstance => {
                 self.apply_document_ops(
                     "Detach instance",
@@ -3254,7 +3293,59 @@ impl FantaDesignPanel {
                     view.update(cx, |view, cx| view.ungroup_nodes(Some(id), window, cx));
                 }
             }
-            other => crate::view::notify_unavailable(other.label(), window, cx),
+            LayersPanelContextAction::CopyPasteAs
+            | LayersPanelContextAction::MoveToPage
+            | LayersPanelContextAction::MoreLayoutOptions
+            | LayersPanelContextAction::CropImage => {
+                self.open_context_picker(id, action, window, cx)
+            }
+            LayersPanelContextAction::PasteToReplace => self.paste_layer_to_replace(id, window, cx),
+            LayersPanelContextAction::ReplaceMedia => self.replace_layer_media(id, window, cx),
+            LayersPanelContextAction::SetAsThumbnail => self.set_layer_thumbnail(id, window, cx),
+            LayersPanelContextAction::EditText => {
+                self.select_node(id, false, cx);
+                if let Some(view) = self.active_view(cx) {
+                    view.update(cx, |view, cx| {
+                        view.open_text_edit(id, crate::view::TextEditSeed::SelectAll, window, cx)
+                    });
+                }
+            }
+            LayersPanelContextAction::ConvertToFrame
+            | LayersPanelContextAction::ConvertToSection
+            | LayersPanelContextAction::Flatten
+            | LayersPanelContextAction::OutlineStroke
+            | LayersPanelContextAction::UseAsMask
+            | LayersPanelContextAction::AddAutoLayout
+            | LayersPanelContextAction::CreateComponent
+            | LayersPanelContextAction::ResetInstance
+            | LayersPanelContextAction::FlipHorizontal
+            | LayersPanelContextAction::FlipVertical => self.apply_layer_command_select(
+                action.label(),
+                |doc| {
+                    let operations = crate::layer_context_ops::simple(doc, id, action)?;
+                    let selection = if matches!(
+                        action,
+                        LayersPanelContextAction::CreateComponent
+                            | LayersPanelContextAction::AddAutoLayout
+                            | LayersPanelContextAction::Flatten
+                    ) {
+                        let roots = crate::layer_context_ops::created_roots(&operations);
+                        Some(if roots.is_empty() { vec![id] } else { roots })
+                    } else {
+                        None
+                    };
+                    Ok((operations, selection))
+                },
+                window,
+                cx,
+            ),
+            // Retained upstream for source compatibility; never offered by the shared menu.
+            LayersPanelContextAction::SendToFigmaMake
+            | LayersPanelContextAction::FindSimilarDesigns
+            | LayersPanelContextAction::AddMotion
+            | LayersPanelContextAction::RenameLayers
+            | LayersPanelContextAction::Plugins
+            | LayersPanelContextAction::Widgets => {}
         }
     }
 

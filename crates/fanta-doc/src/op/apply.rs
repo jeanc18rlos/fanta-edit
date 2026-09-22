@@ -122,6 +122,11 @@ impl Operation {
                 n.meta = dir.pick(old, new).clone();
                 Ok(())
             }
+            Self::SetMask { id, old, new } => {
+                let node = ctx.scene.get_mut(*id).ok_or(SceneError::NotFound(*id))?;
+                node.is_mask = *dir.pick(old, new);
+                Ok(())
+            }
             Self::SetOpacity { id, old, new } => {
                 let n = ctx.scene.get_mut(*id).ok_or(SceneError::NotFound(*id))?;
                 // Both values are UnitInterval, already in range — a plain pick,

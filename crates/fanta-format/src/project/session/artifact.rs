@@ -1902,6 +1902,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | SetEffects { .. }
         | SetBlurs { .. }
         | SetFlags { .. }
+        | SetMask { .. }
         | SetLayoutChild { .. }
         | ReplaceData { .. }
         | SetInstanceOverride { .. }

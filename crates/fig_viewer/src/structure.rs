@@ -332,7 +332,7 @@ pub(crate) fn image_layer_node(
 }
 
 /// The members of `ids` that survive grouping: present in the scene, not a
-/// page or component master, and without another member above them.
+/// page, and without another member above them.
 fn top_level_members(doc: &Doc, ids: &[NodeId]) -> Result<Vec<NodeId>> {
     if ids.is_empty() {
         bail!("select at least one layer");
@@ -344,15 +344,9 @@ fn top_level_members(doc: &Doc, ids: &[NodeId]) -> Result<Vec<NodeId>> {
         if !seen.insert(*id) {
             continue;
         }
-        let node = doc.scene.get(*id).context("a selected layer is gone")?;
+        doc.scene.get(*id).context("a selected layer is gone")?;
         if doc.pages().contains(id) {
             bail!("a page cannot be grouped");
-        }
-        if doc.is_component_root(*id) {
-            bail!(
-                "\"{}\" is a component master and cannot be grouped",
-                node.name
-            );
         }
         if doc
             .scene
@@ -731,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn grouping_refuses_pages_masters_and_empty_input() {
+    fn grouping_accepts_masters_but_refuses_pages_and_empty_input() {
         let (mut doc, page) = page_doc();
         let error = group_operations(&doc, &[], None).unwrap_err();
         assert!(error.to_string().contains("at least one layer"));
@@ -744,8 +738,18 @@ mod tests {
         doc.components
             .defs
             .insert(component, ComponentDef::new(component, master, "Button"));
-        let error = group_operations(&doc, &[master], None).unwrap_err();
-        assert!(error.to_string().contains("component master"));
+        let grouped = group_operations(&doc, &[master], None).expect("group component master");
+        for operation in grouped.operations {
+            doc.apply(operation).expect("group op");
+        }
+        assert_eq!(
+            doc.components.def(component).expect("definition").root,
+            master
+        );
+        assert_eq!(
+            doc.scene.get(master).expect("master").parent,
+            Some(grouped.group)
+        );
 
         let error = group_operations(&doc, &[NodeId::new()], None).unwrap_err();
         assert!(error.to_string().contains("gone"));

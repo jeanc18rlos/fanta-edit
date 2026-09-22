@@ -403,100 +403,7 @@ pub(crate) fn duplicate_page_operations(doc: &Doc, root: NodeId) -> Result<Vec<O
     if let Some(node) = pasted.nodes.iter_mut().find(|node| node.id == copy) {
         node.name = format!("{} Copy", node.name);
     }
-    let nodes: HashMap<_, _> = clipboard
-        .nodes
-        .iter()
-        .zip(&pasted.nodes)
-        .map(|(source, copy)| (source.id, copy.id))
-        .collect();
-    let components: HashMap<_, _> = doc
-        .components
-        .defs
-        .values()
-        .filter(|definition| nodes.contains_key(&definition.root))
-        .map(|definition| (definition.id, fanta_doc::ComponentId::new()))
-        .collect();
-    let sets: HashMap<_, _> = doc
-        .components
-        .sets
-        .values()
-        .filter(|set| {
-            !set.members.is_empty()
-                && set
-                    .members
-                    .iter()
-                    .all(|member| components.contains_key(member))
-        })
-        .map(|set| (set.id, fanta_doc::ComponentId::new()))
-        .collect();
-    for node in &mut pasted.nodes {
-        if let NodeData::Instance(instance) = &mut node.data
-            && let Some(component) = components.get(&instance.component)
-        {
-            instance.component = *component;
-            for replacement in &mut instance.overrides {
-                for node in &mut replacement.target_path {
-                    remap_reference(node, &nodes);
-                }
-                if let fanta_doc::OverrideValue::SwapInstance { component } = &mut replacement.value
-                    && let Some(copy) = components.get(component)
-                {
-                    *component = *copy;
-                }
-            }
-            for derived in &mut instance.derived {
-                for node in &mut derived.path {
-                    remap_reference(node, &nodes);
-                }
-            }
-        }
-    }
-    let mut operations = create_operations(&pasted);
-    for definition in doc.components.defs.values() {
-        let Some(id) = components.get(&definition.id) else {
-            continue;
-        };
-        let mut copy = definition.clone();
-        copy.id = *id;
-        copy.root = *nodes
-            .get(&definition.root)
-            .context("missing copied component root")?;
-        copy.variant_of = definition.variant_of.as_ref().and_then(|membership| {
-            sets.get(&membership.set).map(|set| {
-                let mut copy = membership.clone();
-                copy.set = *set;
-                copy
-            })
-        });
-        for property in &mut copy.props {
-            for binding in &mut property.bindings {
-                for node in &mut binding.path {
-                    remap_reference(node, &nodes);
-                }
-            }
-        }
-        operations.push(Operation::DefineComponent {
-            def: Box::new(copy),
-        });
-    }
-    for set in doc.components.sets.values() {
-        let Some(id) = sets.get(&set.id) else {
-            continue;
-        };
-        let mut copy = set.clone();
-        copy.id = *id;
-        copy.members = set
-            .members
-            .iter()
-            .map(|member| components[member])
-            .collect();
-        copy.default_variant = *components
-            .get(&set.default_variant)
-            .context("missing copied default variant")?;
-        operations.push(Operation::DefineComponentSet {
-            set: Box::new(copy),
-        });
-    }
+    let mut operations = clone_component_operations(doc, &clipboard, &mut pasted)?;
     let old = doc.pages().to_vec();
     let mut new = old.clone();
     new.insert(index + 1, copy);
@@ -574,7 +481,7 @@ pub(crate) fn apply_transaction(
     Ok(true)
 }
 
-fn editable_selection_roots(doc: &Doc) -> Vec<NodeId> {
+pub(crate) fn editable_selection_roots(doc: &Doc) -> Vec<NodeId> {
     let selected = doc.selection.iter().copied().collect::<HashSet<_>>();
     doc.selection
         .iter()
@@ -967,4 +874,205 @@ mod tests {
         assert!(doc.undo().unwrap());
         assert_eq!(doc.components.defs[&component].rev, 2);
     }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+pub(crate) fn paste_to_replace_operations(
+    doc: &Doc,
+    id: NodeId,
+    payload: &CanvasClipboard,
+) -> Result<Vec<Operation>> {
+    let targets = crate::layer_context_ops::targets(doc, id);
+    let mut scratch = doc.clone();
+    let mut operations = Vec::new();
+    for id in targets {
+        anyhow::ensure!(
+            crate::layer_context_ops::editable(&scratch, id),
+            "A selected layer is locked"
+        );
+        let target = scratch
+            .scene
+            .get(id)
+            .context("Missing replacement target")?
+            .clone();
+        let bounds = scratch
+            .scene
+            .world_bounds(id)
+            .context("The replacement target has no bounds")?;
+        scratch.selection.replace_with([id]);
+        let mut pasted = payload.instantiate(&scratch, 0., ClipboardPlacement::Paste)?;
+        let mut preview = scratch.clone();
+        for operation in create_operations(&pasted) {
+            preview.apply(operation)?;
+        }
+        let source = pasted
+            .roots
+            .iter()
+            .filter_map(|id| preview.scene.world_bounds(*id))
+            .reduce(|a, b| a.union(&b))
+            .context("The clipboard has no geometry")?;
+        let offset =
+            Transform2D::translation(bounds.min_x - source.min_x, bounds.min_y - source.min_y);
+        let parent = target
+            .parent
+            .and_then(|id| scratch.scene.world_transform(id))
+            .unwrap_or(Transform2D::IDENTITY);
+        let next = scratch
+            .scene
+            .children_of(target.parent)
+            .iter()
+            .filter_map(|id| scratch.scene.get(*id))
+            .find(|node| node.index > target.index)
+            .map(|node| node.index);
+        let mut index = target.index;
+        for node in &mut pasted.nodes {
+            if !pasted.roots.contains(&node.id) {
+                continue;
+            }
+            node.transform = preview
+                .scene
+                .world_transform(node.id)
+                .context("Missing clipboard transform")?
+                .then(&offset)
+                .then(&parent.inverse());
+            anyhow::ensure!(
+                node.transform.is_finite(),
+                "The target parent transform is singular"
+            );
+            node.parent = target.parent;
+            node.index = index;
+            index = if let Some(next) = next {
+                anyhow::ensure!(
+                    !IndexKey::near_precision_limit(index, next),
+                    "The stacking order needs rebalancing"
+                );
+                IndexKey::between(index, next)
+            } else {
+                IndexKey::after(index)
+            };
+        }
+        let mut edits = crate::layer_context_ops::delete_layers(&scratch, id)?;
+        edits.extend(clone_component_operations(&scratch, payload, &mut pasted)?);
+        for operation in &edits {
+            scratch.apply(operation.clone())?;
+        }
+        operations.extend(edits);
+    }
+    Ok(operations)
+}
+
+fn clone_component_operations(
+    doc: &Doc,
+    clipboard: &CanvasClipboard,
+    pasted: &mut PastedNodes,
+) -> Result<Vec<Operation>> {
+    let nodes: HashMap<_, _> = clipboard
+        .nodes
+        .iter()
+        .zip(&pasted.nodes)
+        .map(|(source, copy)| (source.id, copy.id))
+        .collect();
+    let components: HashMap<_, _> = doc
+        .components
+        .defs
+        .values()
+        .filter(|definition| nodes.contains_key(&definition.root))
+        .map(|definition| (definition.id, fanta_doc::ComponentId::new()))
+        .collect();
+    let sets: HashMap<_, _> = doc
+        .components
+        .sets
+        .values()
+        .filter(|set| {
+            !set.members.is_empty()
+                && set
+                    .members
+                    .iter()
+                    .all(|member| components.contains_key(member))
+        })
+        .map(|set| (set.id, fanta_doc::ComponentId::new()))
+        .collect();
+    for node in &mut pasted.nodes {
+        if let NodeData::Instance(instance) = &mut node.data
+            && let Some(component) = components.get(&instance.component)
+        {
+            instance.component = *component;
+            for replacement in &mut instance.overrides {
+                for node in &mut replacement.target_path {
+                    remap_reference(node, &nodes);
+                }
+                if let fanta_doc::OverrideValue::SwapInstance { component } = &mut replacement.value
+                    && let Some(copy) = components.get(component)
+                {
+                    *component = *copy;
+                }
+            }
+            for derived in &mut instance.derived {
+                for node in &mut derived.path {
+                    remap_reference(node, &nodes);
+                }
+            }
+        }
+    }
+    let mut operations = create_operations(&pasted);
+    for definition in doc.components.defs.values() {
+        let Some(id) = components.get(&definition.id) else {
+            continue;
+        };
+        let mut copy = definition.clone();
+        copy.id = *id;
+        copy.root = *nodes
+            .get(&definition.root)
+            .context("missing copied component root")?;
+        copy.variant_of = definition.variant_of.as_ref().and_then(|membership| {
+            sets.get(&membership.set).map(|set| {
+                let mut copy = membership.clone();
+                copy.set = *set;
+                copy
+            })
+        });
+        for property in &mut copy.props {
+            for binding in &mut property.bindings {
+                for node in &mut binding.path {
+                    remap_reference(node, &nodes);
+                }
+            }
+        }
+        operations.push(Operation::DefineComponent {
+            def: Box::new(copy),
+        });
+    }
+    for set in doc.components.sets.values() {
+        let Some(id) = sets.get(&set.id) else {
+            continue;
+        };
+        let mut copy = set.clone();
+        copy.id = *id;
+        copy.members = set
+            .members
+            .iter()
+            .map(|member| components[member])
+            .collect();
+        copy.default_variant = *components
+            .get(&set.default_variant)
+            .context("missing copied default variant")?;
+        operations.push(Operation::DefineComponentSet {
+            set: Box::new(copy),
+        });
+    }
+    Ok(operations)
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+pub(crate) fn duplicate_layer_operations(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
+    let targets = crate::layer_context_ops::targets(doc, id);
+    for target in &targets {
+        anyhow::ensure!(
+            crate::layer_context_ops::editable(doc, *target),
+            "A selected layer is locked"
+        );
+    }
+    let clipboard = CanvasClipboard::capture_roots(doc, targets).context("Nothing to duplicate")?;
+    let mut pasted = clipboard.instantiate(doc, 16., ClipboardPlacement::Duplicate)?;
+    clone_component_operations(doc, &clipboard, &mut pasted)
 }

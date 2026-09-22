@@ -86,6 +86,8 @@ pub(crate) fn layers_kind(
                 LayersPanelNodeKind::ComponentSet
             } else if context.component_roots.contains(&id) {
                 LayersPanelNodeKind::Component
+            } else if crate::layer_context_ops::is_section(node) {
+                LayersPanelNodeKind::Section
             } else if group.is_frame_surface() {
                 LayersPanelNodeKind::Frame
             } else {
@@ -175,7 +177,7 @@ fn build_children(
                 has_children,
                 visible: !node.flags.contains(fanta_doc::NodeFlags::HIDDEN),
                 locked: node.flags.contains(fanta_doc::NodeFlags::LOCKED),
-                context_actions: Some(context_actions(doc, *child)),
+                context_actions: Some(context_actions_with_kind(doc, *child, kind)),
             })
         })
         .collect()
@@ -185,64 +187,52 @@ pub(crate) fn context_actions(
     doc: &Doc,
     id: NodeId,
 ) -> Vec<fanta_gpui::layers::LayersPanelContextAction> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    context_actions_with_kind(doc, id, layers_kind(id, node, &KindContext::from_doc(doc)))
+}
+
+fn context_actions_with_kind(
+    doc: &Doc,
+    id: NodeId,
+    kind: LayersPanelNodeKind,
+) -> Vec<fanta_gpui::layers::LayersPanelContextAction> {
     use fanta_gpui::layers::LayersPanelContextAction as Action;
     let Some(node) = doc.scene.get(id) else {
         return Vec::new();
     };
-    if doc
+    let inherited_lock = doc
         .scene
         .ancestors_of(id)
-        .any(|ancestor| ancestor.flags.contains(fanta_doc::NodeFlags::LOCKED))
-    {
-        return vec![Action::Copy];
-    }
-    let mut actions = vec![Action::Copy, Action::LockUnlock];
-    if node.flags.contains(fanta_doc::NodeFlags::LOCKED) {
-        return actions;
-    }
-    if doc.is_component_root(id) {
-        actions.extend([Action::Rename, Action::ShowHide]);
-        return actions;
-    }
-    actions.extend([
-        Action::Duplicate,
-        Action::Delete,
-        Action::Rename,
-        Action::ShowHide,
-        Action::BringToFront,
-        Action::SendToBack,
-        Action::GroupSelection,
-        Action::FrameSelection,
-    ]);
-    if doc.components.defs.values().any(|definition| {
-        doc.scene
-            .ancestors_of(definition.root)
-            .any(|ancestor| ancestor.id == id)
-    }) {
-        actions.retain(|action| !matches!(action, Action::Duplicate | Action::Delete));
-    }
-    match &node.data {
-        NodeData::Group(_) => {
-            if !doc
-                .components
-                .defs
-                .values()
-                .any(|definition| definition.root == id)
-            {
-                actions.extend([
-                    Action::Ungroup,
-                    Action::RemoveFrame,
-                    Action::CreateComponent,
-                ]);
-            }
+        .any(|node| node.flags.contains(fanta_doc::NodeFlags::LOCKED));
+    let locked = node.flags.contains(fanta_doc::NodeFlags::LOCKED);
+    let master = doc.is_component_root(id);
+    let mut actions = fanta_gpui::layers::context_actions_for_kind(kind);
+    actions.retain(|action| {
+        if inherited_lock {
+            return matches!(action, Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent);
         }
-        NodeData::Instance(instance) => {
-            if doc.components.defs.contains_key(&instance.component) {
-                actions.extend([Action::DetachInstance, Action::GoToMainComponent]);
-            }
+        if locked {
+            return matches!(action, Action::Copy | Action::CopyPasteAs | Action::LockUnlock | Action::GoToMainComponent);
         }
-        _ => {}
-    }
+        match action {
+            Action::OutlineStroke => match &node.data {
+                NodeData::Text(_) => true,
+                NodeData::Vector(value) => !value.strokes.is_empty(),
+                NodeData::Group(value) => !value.strokes.is_empty(),
+                NodeData::Boolean(value) => !value.strokes.is_empty(),
+                _ => false,
+            },
+            Action::GoToMainComponent | Action::DetachInstance | Action::ResetInstance => {
+                matches!(&node.data, NodeData::Instance(instance) if doc.components.defs.contains_key(&instance.component))
+            }
+            Action::Ungroup | Action::RemoveFrame => !master && matches!(node.data, NodeData::Group(_)),
+            Action::MoveToPage => doc.pages().len() > 1,
+            Action::CreateComponent => !master && !matches!(kind, LayersPanelNodeKind::Other),
+            _ => true,
+        }
+    });
     actions
 }
 
@@ -250,7 +240,12 @@ pub(crate) fn restrict_read_only(items: &mut [LayersPanelItem]) {
     use fanta_gpui::layers::LayersPanelContextAction as Action;
     for item in items {
         if let Some(actions) = &mut item.context_actions {
-            actions.retain(|action| matches!(action, Action::Copy | Action::GoToMainComponent));
+            actions.retain(|action| {
+                matches!(
+                    action,
+                    Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent
+                )
+            });
         }
         restrict_read_only(&mut item.children);
     }
@@ -436,5 +431,84 @@ mod tests {
         assert_eq!(kind(set_frame), LayersPanelNodeKind::ComponentSet);
         assert_eq!(kind(variant_root), LayersPanelNodeKind::Component);
         assert_eq!(kind(page), LayersPanelNodeKind::Group);
+    }
+    #[test]
+    fn layer_menu_actions_follow_node_kind_and_current_capabilities() {
+        use fanta_gpui::layers::LayersPanelContextAction as Action;
+        let mut doc = Doc::new();
+        let frame = insert(
+            &mut doc,
+            CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([100., 100.]),
+                ..Default::default()
+            })),
+            None,
+        );
+        let text = insert(
+            &mut doc,
+            CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new("Hello", 100., 30.))),
+            Some(frame),
+        );
+        let rectangle = insert(&mut doc, rect(), Some(frame));
+        let image = insert(
+            &mut doc,
+            CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+                asset: fanta_doc::AssetId::new(),
+                natural_size: [100, 100],
+                local_size: [100., 100.],
+                crop: None,
+                tint: None,
+                fit: fanta_doc::ImageFitMode::Fill,
+            })),
+            Some(frame),
+        );
+        assert!(context_actions(&doc, text).contains(&Action::EditText));
+        assert!(!context_actions(&doc, rectangle).contains(&Action::EditText));
+        assert!(context_actions(&doc, image).contains(&Action::CropImage));
+        assert!(context_actions(&doc, image).contains(&Action::ReplaceMedia));
+        assert!(!context_actions(&doc, text).contains(&Action::CropImage));
+        assert!(context_actions(&doc, frame).contains(&Action::ConvertToSection));
+        assert!(!context_actions(&doc, rectangle).contains(&Action::OutlineStroke));
+        if let NodeData::Vector(vector) = &mut doc.scene.get_mut(rectangle).expect("rectangle").data
+        {
+            vector
+                .strokes
+                .push(fanta_doc::Stroke::solid(Color::BLACK, 2.));
+        }
+        assert!(context_actions(&doc, rectangle).contains(&Action::OutlineStroke));
+        doc.scene.get_mut(frame).expect("frame").meta =
+            serde_json::json!({"fanta_kind": "section"});
+        assert!(context_actions(&doc, frame).contains(&Action::ConvertToFrame));
+        assert!(!context_actions(&doc, frame).contains(&Action::ConvertToSection));
+        for id in [frame, text, rectangle, image] {
+            assert!(!context_actions(&doc, id).contains(&Action::SendToFigmaMake));
+        }
+    }
+
+    #[test]
+    fn layer_menu_read_only_and_inherited_locks_only_offer_safe_commands() {
+        use fanta_gpui::layers::LayersPanelContextAction as Action;
+        let mut doc = Doc::new();
+        let parent = insert(&mut doc, group(), None);
+        let child = insert(&mut doc, rect(), Some(parent));
+        doc.scene
+            .get_mut(parent)
+            .expect("parent")
+            .flags
+            .insert(fanta_doc::NodeFlags::LOCKED);
+        let actions = context_actions(&doc, child);
+        assert_eq!(actions, vec![Action::Copy, Action::CopyPasteAs]);
+        let parent_actions = context_actions(&doc, parent);
+        assert!(parent_actions.contains(&Action::LockUnlock));
+        let mut tree = layers_tree(&doc, None, &HashSet::from([parent]));
+        restrict_read_only(&mut tree);
+        assert!(
+            tree.iter()
+                .flat_map(|item| item.context_actions.as_ref().expect("policy"))
+                .all(|action| matches!(
+                    action,
+                    Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent
+                ))
+        );
     }
 }
