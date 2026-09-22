@@ -132,7 +132,7 @@ crates remain owned here.
 ### Context-menu preview
 
 The host-controlled layer/page menus use upstream preview commit
-`e0cc3d1366a0c70aed266f2d9a05bf137d03910c` on `codex/context-menus`.
+`9709b7b885263f61b82051ca04aae4917d6991e2` on `codex/context-menus`.
 All GPUI package aliases use that same Git revision so the host and components
 share one GPUI type identity. No migrated component copies are restored.
 This preview is not a crates.io release; switch the aliases together when the
