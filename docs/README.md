@@ -17,7 +17,9 @@ step: read the files here, or on GitHub.
   review findings, reproduced failures, completed Sol work, and remaining gaps.
 - [`fanta/`](./fanta) — notes on the app itself, including
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
-  the record of which inherited Zed services are switched off and why.
+  the record of which inherited Zed services are switched off and why, and
+  [`code-first-audit.md`](./fanta/code-first-audit.md), the project-file audit
+  and source-of-truth proposal awaiting approval.
 - [`live-mcp-v2.md`](./live-mcp-v2.md) and
   [`live-mcp-v2-implementation.md`](./live-mcp-v2-implementation.md) — the live
   MCP server agents connect to.

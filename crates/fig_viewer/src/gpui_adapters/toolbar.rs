@@ -35,18 +35,29 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Duplicate,
     ToolbarCommand::Delete,
     ToolbarCommand::SelectAll,
+    ToolbarCommand::DeselectAll,
     ToolbarCommand::ZoomToFit,
     ToolbarCommand::ZoomToSelection,
     ToolbarCommand::Export,
     ToolbarCommand::Present,
+    ToolbarCommand::OpenVariables,
     ToolbarCommand::OpenDesignMode,
     ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::OpenDrawMode,
+    ToolbarCommand::OpenDevMode,
+    ToolbarCommand::Group,
+    ToolbarCommand::Ungroup,
+    ToolbarCommand::FrameSelection,
     ToolbarCommand::GenerateImage,
     ToolbarCommand::GenerateVideo,
     ToolbarCommand::GenerateVector,
     ToolbarCommand::GenerateDesign,
     ToolbarCommand::GenerateMasks,
     ToolbarCommand::RemoveBackground,
+    ToolbarCommand::ReplaceContent,
+    ToolbarCommand::RewriteText,
+    ToolbarCommand::TranslateText,
+    ToolbarCommand::RenameLayers,
 ];
 
 /// The entrance presets fig_viewer's Motion inspector can author — the same
@@ -249,7 +260,13 @@ impl ToolbarAdapter {
         options: ToolbarOptionInputs,
         cx: &mut gpui::App,
     ) {
-        let next = (toolbar_mode(mode), toolbar_tool(tool), zoom_percent);
+        let mode = toolbar_mode(mode);
+        let selected_tool = if mode == ToolbarMode::Motion && tool == ToolKind::Select {
+            ToolbarTool::MotionSelect
+        } else {
+            toolbar_tool(tool)
+        };
+        let next = (mode, selected_tool, zoom_percent);
         if next != self.last_pushed {
             let last = self.last_pushed;
             self.last_pushed = next;

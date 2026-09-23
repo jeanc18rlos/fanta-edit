@@ -151,6 +151,9 @@ pub struct FantaMotionPanel {
 impl FantaMotionPanel {
     pub fn new(item: Entity<FigItem>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&item, |this, _, event: &FigItemEvent, cx| {
+            if matches!(event, FigItemEvent::EditedTransient) {
+                return;
+            }
             if matches!(event, FigItemEvent::StateChanged) {
                 let selected_still_exists = this
                     .selected_property

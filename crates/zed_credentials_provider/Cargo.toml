@@ -20,3 +20,4 @@ paths.workspace = true
 release_channel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+zed_env_vars.workspace = true
