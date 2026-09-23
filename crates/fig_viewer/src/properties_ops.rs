@@ -232,6 +232,7 @@ pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) ->
                                     color.a = (fraction * 255.0).round() as u8;
                                 }
                                 Fill::Image { opacity, .. } => *opacity = fraction as f32,
+                                Fill::Pattern { opacity, .. } => *opacity = fraction as f32,
                                 Fill::Gradient { .. } => {}
                             }
                         }
@@ -1363,9 +1364,10 @@ pub(crate) fn fill_slot_mut(data: &mut NodeData, index: usize) -> Option<&mut Fi
 
 pub(crate) fn paint_blend(fill: &Fill) -> BlendMode {
     match fill {
-        Fill::Solid { blend, .. } | Fill::Gradient { blend, .. } | Fill::Image { blend, .. } => {
-            *blend
-        }
+        Fill::Solid { blend, .. }
+        | Fill::Gradient { blend, .. }
+        | Fill::Image { blend, .. }
+        | Fill::Pattern { blend, .. } => *blend,
     }
 }
 
@@ -1427,7 +1429,7 @@ pub(crate) fn convert_paint_kind(
             let color = match paint {
                 Fill::Solid { color, .. } => *color,
                 Fill::Gradient { gradient, .. } => representative_gradient_color(gradient),
-                Fill::Image { .. } => return,
+                Fill::Image { .. } | Fill::Pattern { .. } => return,
             };
             *paint = solid_fill_with_blend(color, blend);
         }
@@ -1441,7 +1443,7 @@ pub(crate) fn convert_paint_kind(
                     &seed_gradient_from_color(*color),
                     gradient_kind,
                 ),
-                Fill::Image { .. } => return,
+                Fill::Image { .. } | Fill::Pattern { .. } => return,
             };
             *paint = Fill::Gradient { gradient, blend };
         }
@@ -2291,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn gradient_and_image_paints_can_be_hidden_too() {
+    fn gradient_image_and_pattern_paints_can_be_hidden_too() {
         let gradient = Gradient::Linear {
             start: [0.0, 0.0],
             end: [1.0, 0.0],
@@ -2350,6 +2352,36 @@ mod tests {
             paint_alpha(fill_at(&image, 0).expect("a fill")),
             HiddenPaintAlpha::Image(0.4)
         );
+
+        let mut pattern = vector_with_fill(Fill::Pattern {
+            pattern: Box::new(fanta_doc::PatternFill {
+                source_node_id: NodeId::new(),
+                tile_type: fanta_doc::PatternTileType::Rectangular,
+                scaling_factor: 1.0,
+                spacing: fanta_doc::PatternSpacing::default(),
+                horizontal_alignment: fanta_doc::PatternHorizontalAlignment::Center,
+            }),
+            opacity: 0.35,
+            blend: BlendMode::Screen,
+        });
+        let remembered = paint_alpha(fill_at(&pattern, 0).expect("a fill"));
+        assert_eq!(remembered, HiddenPaintAlpha::Pattern(0.35));
+        assert_eq!(
+            paint_blend(fill_at(&pattern, 0).expect("a fill")),
+            BlendMode::Screen
+        );
+        if let Some(paint) = paint_slot_mut(&mut pattern, 0, false) {
+            let zeroed = zeroed_paint_alpha(paint);
+            set_paint_alpha(paint, &zeroed);
+        }
+        assert!(!paint_is_visible(fill_at(&pattern, 0).expect("a fill")));
+        if let Some(paint) = paint_slot_mut(&mut pattern, 0, false) {
+            set_paint_alpha(paint, &remembered);
+        }
+        assert_eq!(
+            paint_alpha(fill_at(&pattern, 0).expect("a fill")),
+            HiddenPaintAlpha::Pattern(0.35)
+        );
     }
 
     #[test]
@@ -2365,6 +2397,10 @@ mod tests {
         assert_eq!(
             opaque_paint_alpha(&HiddenPaintAlpha::Image(0.0)),
             HiddenPaintAlpha::Image(1.0)
+        );
+        assert_eq!(
+            opaque_paint_alpha(&HiddenPaintAlpha::Pattern(0.0)),
+            HiddenPaintAlpha::Pattern(1.0)
         );
     }
 

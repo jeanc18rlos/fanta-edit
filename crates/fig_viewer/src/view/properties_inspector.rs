@@ -476,6 +476,35 @@ impl FigView {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::motion_preset_available;
+    use fanta_doc::{CanvasNode, Doc, GroupNode, NodeData, NodeFlags, Operation};
+
+    #[test]
+    fn motion_presets_require_one_editable_selected_layer() {
+        let mut doc = Doc::new();
+        let first = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let first_id = first.id;
+        doc.apply(Operation::create_node(first))
+            .expect("create first layer");
+        let mut locked = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        locked.flags.insert(NodeFlags::LOCKED);
+        let locked_id = locked.id;
+        doc.apply(Operation::create_node(locked))
+            .expect("create locked layer");
+
+        assert!(!motion_preset_available(&doc, true));
+        doc.selection.replace_with([first_id]);
+        assert!(motion_preset_available(&doc, true));
+        assert!(!motion_preset_available(&doc, false));
+        doc.selection.replace_with([first_id, locked_id]);
+        assert!(!motion_preset_available(&doc, true));
+        doc.selection.replace_with([locked_id]);
+        assert!(!motion_preset_available(&doc, true));
+    }
+}
+
 fn motion_view_data(
     item: &FigItem,
     active_clip: Option<AnimationClipId>,
@@ -491,15 +520,18 @@ fn motion_view_data(
             fanta_gpui::timeline::TimelinePlayback::Once
         },
         read_only: !item.is_editable(),
-        presets: crate::gpui_adapters::toolbar::motion_animation_styles()
-            .into_iter()
-            .map(|name| InspectorChoice::new(name.clone(), name))
-            .collect(),
+        timeline_open_available: false,
         ..Default::default()
     };
     let Some(document) = item.document() else {
         return data;
     };
+    if motion_preset_available(&document.doc, item.is_editable()) {
+        data.presets = crate::gpui_adapters::toolbar::motion_animation_styles()
+            .into_iter()
+            .map(|name| InspectorChoice::new(name.clone(), name))
+            .collect();
+    }
     data.selection_name = document
         .doc
         .selection
@@ -543,6 +575,12 @@ fn motion_view_data(
             .collect();
     }
     data
+}
+
+fn motion_preset_available(doc: &fanta_doc::Doc, item_editable: bool) -> bool {
+    item_editable
+        && super::single_selection(doc)
+            .is_some_and(|id| crate::layer_context_ops::editable(doc, id))
 }
 
 impl FigView {

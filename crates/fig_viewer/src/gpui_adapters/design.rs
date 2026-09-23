@@ -1,57 +1,56 @@
-//! DesignPanel adapter: builds the controlled inspector read model from the
-//! document snapshot library, maps `DesignPanelAction` intents onto the
-//! existing `properties_ops` builders, and echoes fresh inspection contexts
-//! from the host's `FigItemEvent` subscription.
-//!
-//! Wave-1 scope is deliberately honest rather than wide: sections the engine
-//! cannot edit are gated off through `DesignPanelNodeCapabilities` instead of
-//! half-wired. Live: position/size/rotation, appearance (visibility, opacity,
-//! blend with Pass-through modeling), corners, solid fills and strokes,
-//! stroke geometry, drop/inner shadows and layer/background blurs,
-//! single-axis auto layout, whole-layer typography, instance props, the
-//! Page background, the rotate/flip transforms, and multi-selection
-//! align/distribute. Gated off: layout grids, exports, style registries,
-//! aspect-ratio lock, smart selection, constraints, resize-to-fit, Tidy up,
-//! single-node align, text-path, and pattern/shader/media paint editing
-//! (image paints are displayed read-only).
+//! Connects the document model to the Design inspector read model and actions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use anyhow::Context as _;
 
 use fanta_doc::{
-    BlendMode, Blur, BlurKind, BoundProp, Color as FantaColor, ComponentId, Doc, Fill, Gradient,
-    LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, Shadow,
-    ShadowKind, StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, Transform2D,
+    BlendMode, Blur, BlurKind, BooleanOp, BoundProp, Color as FantaColor, ComponentId,
+    ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode,
+    MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, PatternFill,
+    PatternHorizontalAlignment, PatternSpacing, PatternTileType, PrimaryAlign, Shadow, ShadowKind,
+    StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, Transform2D,
     VAlign as TextVAlign, VarValue,
 };
 use fanta_gpui::design::{
-    DesignArrangeOperation, DesignAutoLayoutItem, DesignBlendMode, DesignColor,
-    DesignComponentContext, DesignComponentProperty, DesignComponentPropertyValue,
-    DesignComponentReference, DesignComponentRole, DesignCornerCapabilities, DesignEffect,
-    DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop,
-    DesignLayout, DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
-    DesignPaint, DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintTransform,
-    DesignPaintType, DesignPaintValue, DesignPanel, DesignPanelAction,
-    DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap,
-    DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities,
-    DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
-    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelTarget, DesignPanelValue,
-    DesignSelectionHeaderCommand, DesignSelectionHeaderControl, DesignSelectionHeaderControlKind,
-    DesignSelectionHeaderMenu, DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData,
-    DesignSizingMode, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
-    DesignStrokeDashes, DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights,
-    DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
-    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
+    DesignArcData, DesignArrangeOperation, DesignAutoLayoutItem, DesignBaselineAlignment,
+    DesignBlendMode, DesignBooleanOperation, DesignColor, DesignComponentContext,
+    DesignComponentProperty, DesignComponentPropertyValue, DesignComponentReference,
+    DesignComponentRole, DesignCornerCapabilities, DesignCounterAxisAlignContent, DesignEffect,
+    DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings,
+    DesignEffectStyleViewData, DesignFontFamily, DesignFontSource, DesignFontStyle,
+    DesignFontViewData, DesignGradientStop, DesignImageFilters, DesignItemSpacingMode,
+    DesignLayout, DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning,
+    DesignLetterSpacing, DesignLineHeight, DesignMaskType, DesignMediaCropAction,
+    DesignMediaCropToolState, DesignMediaPaintCapabilities, DesignMediaPaintPlacement,
+    DesignMediaPaintView, DesignMediaPaintViewData, DesignMediaQuarterTurn, DesignPaint,
+    DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
+    DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel,
+    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
+    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
+    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
+    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
+    DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
+    DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
+    DesignSelectionHeaderControl, DesignSelectionHeaderControlKind, DesignSelectionHeaderMenu,
+    DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShapeGeometry,
+    DesignSizingMode, DesignStackingOrder, DesignStarGeometry, DesignStroke, DesignStrokeAlign,
+    DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeEditContext,
+    DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
+    DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment,
+    DesignTransformOperation, DesignTypography,
 };
-use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
+use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, TaskExt as _, Window};
 
 use super::design_snapshot::build_design_view_data;
 use crate::color_picker::GradientKind;
-use crate::document::{DocChange, FigDocument};
+use crate::document::{AssetStores, DocChange, FigDocument, MAX_IMAGE_SOURCE_BYTES, PreparedImage};
 use crate::properties_ops::{
     apply_preview_operation, blurs_operations, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
     format_number, instance_prop_operations, layout_gap_operations, layout_limit_operations,
-    layout_padding_operations, parse_number, read_field_text, replace_data_operation,
+    layout_padding_operations, parse_color, parse_number, read_field_text, replace_data_operation,
     restore_snapshot, set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
     shadow_field_operations, stroke_list_mut,
 };
@@ -303,47 +302,143 @@ pub(crate) fn selection_header_for_doc(
 
 /// One panel paint from a snapshot row. Paint ids are index-derived and
 /// re-minted on every echo — the engine has no stable paint identity.
-/// Media paints are displayed read-only; solids and gradients accept edits.
 fn design_paint(
     node_id: NodeId,
     collection: &str,
     index: usize,
     snapshot: &PaintSnapshot,
+    fill: Option<&Fill>,
 ) -> DesignPaint {
-    let mut paint = match (&snapshot.kind, &snapshot.gradient) {
-        (Some(EnginePaintKind::Solid), _) => {
-            design_solid_paint(snapshot.color.unwrap_or(FantaColor::BLACK))
-        }
-        (Some(EnginePaintKind::Gradient(kind)), Some(gradient)) => {
-            let mut paint = DesignPaint::gradient(
-                match kind {
-                    GradientKind::Linear => DesignPaintKind::LinearGradient,
-                    GradientKind::Radial => DesignPaintKind::RadialGradient,
-                    GradientKind::Angular => DesignPaintKind::AngularGradient,
-                    GradientKind::Diamond => DesignPaintKind::DiamondGradient,
-                },
-                gradient_stops(gradient),
-            );
-            if let DesignPaintPayload::Gradient(payload) = &mut paint.payload {
-                payload.transform = design_gradient_transform(gradient);
+    let mut paint = match fill {
+        Some(Fill::Pattern { pattern, .. }) => {
+            let mut paint = DesignPaint::pattern(pattern.source_node_id.to_string());
+            if let DesignPaintPayload::Pattern(payload) = &mut paint.payload {
+                payload.tile_type = match pattern.tile_type {
+                    PatternTileType::Rectangular => DesignPatternTileType::Rectangular,
+                    PatternTileType::HorizontalHexagonal => {
+                        DesignPatternTileType::HorizontalHexagonal
+                    }
+                    PatternTileType::VerticalHexagonal => DesignPatternTileType::VerticalHexagonal,
+                };
+                payload.scaling_factor = pattern.scaling_factor;
+                payload.spacing = fanta_gpui::design::DesignPatternSpacing::new(
+                    pattern.spacing.x,
+                    pattern.spacing.y,
+                );
+                payload.horizontal_alignment = match pattern.horizontal_alignment {
+                    PatternHorizontalAlignment::Start => DesignPatternHorizontalAlignment::Start,
+                    PatternHorizontalAlignment::Center => DesignPatternHorizontalAlignment::Center,
+                    PatternHorizontalAlignment::End => DesignPatternHorizontalAlignment::End,
+                };
             }
-            paint.opacity = crate::color_picker::gradient_stops(gradient)
-                .iter()
-                .map(|stop| stop.color.a)
-                .max()
-                .map_or(0.0, |alpha| f32::from(alpha) / 255.0 * 100.0);
             paint
         }
-        _ => {
-            // An image/video fill (or a gradient whose payload went missing):
-            // inspectable, never editable through this adapter yet.
-            let mut paint = DesignPaint::image(fanta_gpui::design::DesignPaintSource::new(
-                format!("{node_id}-{collection}-{index}-source"),
-                snapshot.label.clone(),
-            ));
-            paint.read_only = true;
+        Some(Fill::Image {
+            asset,
+            mode,
+            crop,
+            scale,
+            rotation,
+            adjust,
+            ..
+        }) => {
+            let source_id = asset.to_string();
+            let mut source = DesignPaintSource::new(source_id.clone(), "Image");
+            source.reference = Some(source_id.into());
+            let mut paint = DesignPaint::image(source);
+            if let DesignPaintPayload::Image(payload) = &mut paint.payload {
+                let degrees = rotation.unwrap_or(0.0).rem_euclid(360.0);
+                let quarter_turn = match degrees {
+                    degrees if (degrees - 90.0).abs() < 0.001 => {
+                        DesignMediaQuarterTurn::Clockwise90
+                    }
+                    degrees if (degrees - 180.0).abs() < 0.001 => {
+                        DesignMediaQuarterTurn::Clockwise180
+                    }
+                    degrees if (degrees - 270.0).abs() < 0.001 => {
+                        DesignMediaQuarterTurn::Clockwise270
+                    }
+                    _ => DesignMediaQuarterTurn::None,
+                };
+                payload.placement = if let Some(crop) = crop {
+                    DesignMediaPaintPlacement::Crop {
+                        transform: DesignPaintTransform {
+                            m11: crop[2],
+                            m12: 0.0,
+                            m21: 0.0,
+                            m22: crop[3],
+                            tx: crop[0],
+                            ty: crop[1],
+                        },
+                    }
+                } else {
+                    match mode {
+                        ImageFitMode::Fill | ImageFitMode::Stretch => {
+                            DesignMediaPaintPlacement::Fill {
+                                rotation: quarter_turn,
+                            }
+                        }
+                        ImageFitMode::Fit => DesignMediaPaintPlacement::Fit {
+                            rotation: quarter_turn,
+                        },
+                        ImageFitMode::Tile => DesignMediaPaintPlacement::Tile {
+                            scaling_factor: scale.unwrap_or(1.0),
+                            rotation: quarter_turn,
+                        },
+                    }
+                };
+                payload.filters = DesignImageFilters {
+                    exposure: adjust.exposure,
+                    contrast: adjust.contrast,
+                    saturation: adjust.saturation,
+                    temperature: adjust.temperature,
+                    tint: adjust.tint,
+                    highlights: adjust.highlights,
+                    shadows: adjust.shadows,
+                };
+                if *mode == ImageFitMode::Stretch && crop.is_none()
+                    || degrees != 0.0 && quarter_turn == DesignMediaQuarterTurn::None
+                {
+                    paint.read_only = true;
+                }
+            }
             paint
         }
+        _ => match (&snapshot.kind, &snapshot.gradient) {
+            (Some(EnginePaintKind::Solid), _) => {
+                design_solid_paint(snapshot.color.unwrap_or(FantaColor::BLACK))
+            }
+            (Some(EnginePaintKind::Gradient(kind)), Some(gradient)) => {
+                let mut paint = DesignPaint::gradient(
+                    match kind {
+                        GradientKind::Linear => DesignPaintKind::LinearGradient,
+                        GradientKind::Radial => DesignPaintKind::RadialGradient,
+                        GradientKind::Angular => DesignPaintKind::AngularGradient,
+                        GradientKind::Diamond => DesignPaintKind::DiamondGradient,
+                    },
+                    gradient_stops(gradient),
+                );
+                if let DesignPaintPayload::Gradient(payload) = &mut paint.payload {
+                    payload.transform = design_gradient_transform(gradient);
+                }
+                paint.opacity = crate::color_picker::gradient_stops(gradient)
+                    .iter()
+                    .map(|stop| stop.color.a)
+                    .max()
+                    .map_or(0.0, |alpha| f32::from(alpha) / 255.0 * 100.0);
+                paint
+            }
+            _ => {
+                // An image/video fill (or a gradient whose payload went missing):
+                // inspectable, never editable through this adapter yet.
+                let mut paint = DesignPaint::image(fanta_gpui::design::DesignPaintSource::new(
+                    format!("{node_id}-{collection}-{index}-source"),
+                    snapshot.label.clone(),
+                ));
+                paint.read_only = true;
+                paint
+            }
+        },
     };
     paint.id = SharedString::from(format!("{node_id}-{collection}-{index}"));
     if let Some(opacity) = snapshot.opacity_percent
@@ -365,6 +460,58 @@ fn design_solid_paint(color: FantaColor) -> DesignPaint {
     // lossless because `PaintOpacity` edits write the alpha channel back.
     paint.opacity = f32::from(color.a) / 255.0 * 100.0;
     paint
+}
+
+fn media_paint_view_data(
+    context: &fanta_gpui::design::DesignPanelInspectionContext,
+    crop_session: Option<&DesignCropSession>,
+    pattern_sources: Vec<DesignPatternSource>,
+) -> DesignMediaPaintViewData {
+    let DesignPanelSelection::Single(node) = context.selection() else {
+        return DesignMediaPaintViewData::default();
+    };
+    let capabilities = DesignMediaPaintCapabilities::editor()
+        .with_source_actions(true, false, false)
+        .with_crop_rotation(false);
+    let fills = node.fills.iter().enumerate().filter_map(|(index, paint)| {
+        matches!(paint.payload, DesignPaintPayload::Image(_)).then(|| {
+            let mut view =
+                DesignMediaPaintView::new(DesignPanelCollection::Fill, paint.id.clone(), index)
+                    .with_capabilities(capabilities);
+            if let Some(session) = crop_session
+                && node_id(&node.id) == Some(session.node)
+                && !session.is_stroke
+                && session.index == index
+            {
+                view.crop_tool = session.state;
+            }
+            view
+        })
+    });
+    let strokes = node
+        .stroke
+        .as_ref()
+        .into_iter()
+        .flat_map(|stroke| stroke.paints.iter().enumerate())
+        .filter_map(|(index, paint)| {
+            matches!(paint.payload, DesignPaintPayload::Image(_)).then(|| {
+                let mut view = DesignMediaPaintView::new(
+                    DesignPanelCollection::Stroke,
+                    paint.id.clone(),
+                    index,
+                )
+                .with_capabilities(capabilities);
+                if let Some(session) = crop_session
+                    && node_id(&node.id) == Some(session.node)
+                    && session.is_stroke
+                    && session.index == index
+                {
+                    view.crop_tool = session.state;
+                }
+                view
+            })
+        });
+    DesignMediaPaintViewData::new(fills.chain(strokes)).with_pattern_sources(pattern_sources)
 }
 
 fn gradient_stops(gradient: &Gradient) -> Vec<DesignGradientStop> {
@@ -579,49 +726,151 @@ fn effect_ref(effect_id: &str) -> Option<EffectRef> {
     None
 }
 
-fn design_layout(section: &NodeSection) -> Option<DesignLayout> {
-    let layout = section.layout.as_ref()?;
-    let mut out = DesignLayout {
-        clip_content: layout.clip,
-        ..DesignLayout::default()
-    };
+fn design_layout(
+    doc: &Doc,
+    node: &fanta_doc::CanvasNode,
+    section: &NodeSection,
+) -> Option<DesignLayout> {
+    if section.layout.is_none() && section.layout_child.is_none() {
+        return None;
+    }
+    let mut out = DesignLayout::default();
+    if let Some(layout) = section.layout.as_ref() {
+        out.clip_content = layout.clip;
+    }
     out.mode = DesignLayoutMode::None;
     out.item = DesignAutoLayoutItem::default();
-    let Some(auto) = layout.auto_layout.as_ref() else {
-        return Some(out);
-    };
-    out.mode = match auto.mode {
-        LayoutMode::Horizontal => DesignLayoutMode::Horizontal,
-        LayoutMode::Vertical => DesignLayoutMode::Vertical,
-    };
-    let (primary_gap, counter_gap) = match auto.mode {
-        LayoutMode::Horizontal => (auto.gap_h, auto.gap_v),
-        LayoutMode::Vertical => (auto.gap_v, auto.gap_h),
-    };
-    out.gap = primary_gap as f32;
-    out.counter_axis_gap = auto.wrap.then_some(counter_gap as f32);
-    out.wrap = auto.wrap;
-    let sizing = |axis: fanta_doc::AxisSizing| match axis {
-        fanta_doc::AxisSizing::Fixed => DesignSizingMode::Fixed,
-        fanta_doc::AxisSizing::Hug => DesignSizingMode::Hug,
-    };
-    let (horizontal, vertical) = match auto.mode {
-        LayoutMode::Horizontal => (auto.primary_sizing, auto.counter_sizing),
-        LayoutMode::Vertical => (auto.counter_sizing, auto.primary_sizing),
-    };
-    out.horizontal_sizing = sizing(horizontal);
-    out.vertical_sizing = sizing(vertical);
-    // The snapshot collapses per-side padding to H/V pairs and reads `None`
-    // for a mixed pair; keep the readout mechanical by falling back to zero
-    // (the panel shows mixed states through property value states, which
-    // wave 1 does not supply for padding).
-    let pad_h = auto.pad_h.unwrap_or(0.0) as f32;
-    let pad_v = auto.pad_v.unwrap_or(0.0) as f32;
-    out.padding = [pad_v, pad_h, pad_v, pad_h];
-    out.item.min_width = auto.min_width.map(|value| value as f32);
-    out.item.max_width = auto.max_width.map(|value| value as f32);
-    out.item.min_height = auto.min_height.map(|value| value as f32);
-    out.item.max_height = auto.max_height.map(|value| value as f32);
+    if let Some(auto) = section
+        .layout
+        .as_ref()
+        .and_then(|layout| layout.auto_layout.as_ref())
+    {
+        out.mode = match auto.mode {
+            LayoutMode::Horizontal => DesignLayoutMode::Horizontal,
+            LayoutMode::Vertical => DesignLayoutMode::Vertical,
+        };
+        let (primary_gap, counter_gap) = match auto.mode {
+            LayoutMode::Horizontal => (auto.gap_h, auto.gap_v),
+            LayoutMode::Vertical => (auto.gap_v, auto.gap_h),
+        };
+        out.gap = primary_gap as f32;
+        out.counter_axis_gap = auto.wrap.then_some(counter_gap as f32);
+        out.wrap = auto.wrap;
+        let sizing = |axis: fanta_doc::AxisSizing| match axis {
+            fanta_doc::AxisSizing::Fixed => DesignSizingMode::Fixed,
+            fanta_doc::AxisSizing::Hug => DesignSizingMode::Hug,
+        };
+        let (horizontal, vertical) = match auto.mode {
+            LayoutMode::Horizontal => (auto.primary_sizing, auto.counter_sizing),
+            LayoutMode::Vertical => (auto.counter_sizing, auto.primary_sizing),
+        };
+        out.horizontal_sizing = sizing(horizontal);
+        out.vertical_sizing = sizing(vertical);
+        let primary_cell = match auto.primary_align {
+            PrimaryAlign::Start | PrimaryAlign::SpaceBetween | PrimaryAlign::SpaceEvenly => 0,
+            PrimaryAlign::Center => 1,
+            PrimaryAlign::End => 2,
+        };
+        let counter_cell = match auto.counter_align {
+            CounterAlign::Start | CounterAlign::Stretch | CounterAlign::Baseline => 0,
+            CounterAlign::Center => 1,
+            CounterAlign::End => 2,
+        };
+        (out.alignment_x, out.alignment_y) = match auto.mode {
+            LayoutMode::Horizontal => (primary_cell, counter_cell),
+            LayoutMode::Vertical => (counter_cell, primary_cell),
+        };
+        out.item_spacing_mode = if matches!(
+            auto.primary_align,
+            PrimaryAlign::SpaceBetween | PrimaryAlign::SpaceEvenly
+        ) {
+            DesignItemSpacingMode::Auto
+        } else {
+            DesignItemSpacingMode::Fixed
+        };
+        out.stacking_order = if auto.reverse_z {
+            DesignStackingOrder::FirstOnTop
+        } else {
+            DesignStackingOrder::LastOnTop
+        };
+        out.baseline_alignment = if auto.counter_align == CounterAlign::Baseline {
+            DesignBaselineAlignment::Baseline
+        } else {
+            DesignBaselineAlignment::Bounds
+        };
+        out.padding = match &node.data {
+            NodeData::Group(group) => group
+                .auto_layout
+                .map(|layout| layout.padding.map(|value| value as f32))
+                .unwrap_or_default(),
+            _ => [0.; 4],
+        };
+        out.item.min_width = auto.min_width.map(|value| value as f32);
+        out.item.max_width = auto.max_width.map(|value| value as f32);
+        out.item.min_height = auto.min_height.map(|value| value as f32);
+        out.item.max_height = auto.max_height.map(|value| value as f32);
+        if let NodeData::Group(group) = &node.data
+            && let Some(layout) = group.auto_layout
+        {
+            out.include_strokes = layout.include_strokes;
+            out.counter_axis_align_content = if layout.counter_auto_spacing {
+                DesignCounterAxisAlignContent::SpaceBetween
+            } else {
+                DesignCounterAxisAlignContent::Auto
+            };
+            if layout.counter_auto_spacing {
+                out.counter_axis_gap = None;
+            }
+        }
+    }
+    if section.layout_child.is_some() {
+        let child = node.layout_child.unwrap_or(LayoutChild {
+            grow: 0.0,
+            absolute: false,
+            align_self: None,
+        });
+        out.item.positioning = if child.absolute {
+            DesignLayoutPositioning::Absolute
+        } else {
+            DesignLayoutPositioning::InFlow
+        };
+        out.item.align_self = if child.align_self == Some(CounterAlign::Stretch) {
+            DesignLayoutAlignSelf::Stretch
+        } else {
+            DesignLayoutAlignSelf::Inherit
+        };
+        out.item.layout_grow = child.grow;
+        if let Some(parent_mode) = node
+            .parent
+            .and_then(|id| doc.scene.get(id))
+            .and_then(|parent| match &parent.data {
+                NodeData::Group(group) => group.auto_layout.map(|layout| layout.mode),
+                _ => None,
+            })
+        {
+            let (primary, counter) = if parent_mode == LayoutMode::Horizontal {
+                (&mut out.horizontal_sizing, &mut out.vertical_sizing)
+            } else {
+                (&mut out.vertical_sizing, &mut out.horizontal_sizing)
+            };
+            if child.grow > 0.0 {
+                *primary = DesignSizingMode::Fill;
+            }
+            if child.align_self == Some(CounterAlign::Stretch) {
+                *counter = DesignSizingMode::Fill;
+            }
+        }
+    }
+    if let NodeData::Text(text) = &node.data {
+        match text.auto_resize {
+            TextAutoResize::None => {}
+            TextAutoResize::Height => out.vertical_sizing = DesignSizingMode::Hug,
+            TextAutoResize::WidthAndHeight => {
+                out.horizontal_sizing = DesignSizingMode::Hug;
+                out.vertical_sizing = DesignSizingMode::Hug;
+            }
+        }
+    }
     Some(out)
 }
 
@@ -662,6 +911,51 @@ fn design_typography(snapshot: &TypographySnapshot) -> DesignTypography {
         },
         ..DesignTypography::default()
     }
+    .with_advanced_type_settings_enabled(false)
+}
+
+fn design_font_catalog(
+    system_families: impl IntoIterator<Item = SharedString>,
+) -> DesignFontViewData {
+    let mut seen = HashSet::new();
+    let mut names = system_families
+        .into_iter()
+        .map(|name| name.to_string())
+        .chain(fanta_text::bundled_family_names().map(str::to_owned))
+        .filter(|name| !name.is_empty() && !name.starts_with('.'))
+        .filter(|name| seen.insert(name.to_lowercase()))
+        .collect::<Vec<_>>();
+    names.sort_unstable_by_key(|name| name.to_lowercase());
+    DesignFontViewData::ready(names.into_iter().map(|name| {
+        let regular = DesignFontStyle::imported("regular", "Regular");
+        let mut italic = DesignFontStyle::imported("italic", "Italic");
+        italic.italic = true;
+        DesignFontFamily::local(name.clone(), name, [regular, italic])
+    }))
+}
+
+fn font_apply_operations(
+    doc: &Doc,
+    id: NodeId,
+    family: &str,
+    style: &DesignFontStyle,
+) -> Vec<Operation> {
+    replace_data_operation(doc, id, |data| {
+        if let NodeData::Text(text) = data {
+            text.style.font_family = family.to_owned();
+            text.style.italic = style.italic;
+            if let Some(weight) = style.weight {
+                text.style.weight = weight;
+            }
+            for run in &mut text.style_runs {
+                run.style.font_family = family.to_owned();
+                run.style.italic = style.italic;
+                if let Some(weight) = style.weight {
+                    run.style.weight = weight;
+                }
+            }
+        }
+    })
 }
 
 fn design_stroke(
@@ -682,7 +976,15 @@ fn design_stroke(
     let paints = snapshots
         .iter()
         .enumerate()
-        .map(|(index, snapshot)| design_paint(id, "stroke", index, snapshot))
+        .map(|(index, snapshot)| {
+            design_paint(
+                id,
+                "stroke",
+                index,
+                snapshot,
+                strokes.get(index).map(|stroke| &stroke.paint),
+            )
+        })
         .collect();
     let mut stroke = DesignStroke::for_node(
         kind,
@@ -694,6 +996,20 @@ fn design_stroke(
             StrokeAlign::Outside => DesignStrokeAlign::Outside,
         },
     );
+    stroke.capabilities.variable_width = false;
+    stroke.capabilities.complex_stroke = false;
+    if matches!(
+        kind,
+        DesignPanelNodeKind::Line
+            | DesignPanelNodeKind::Arrow
+            | DesignPanelNodeKind::Vector
+            | DesignPanelNodeKind::Pen
+            | DesignPanelNodeKind::Pencil
+    ) {
+        // The engine stores one cap for every endpoint. The aggregate
+        // control exposes that cap without offering an ineffective swap.
+        stroke.edit_context = DesignStrokeEditContext::branching(2);
+    }
     stroke.paints = paints;
     if let Some([top, right, bottom, left]) = first.per_side {
         stroke.weights = DesignStrokeWeights {
@@ -712,11 +1028,13 @@ fn design_stroke(
     stroke.start_cap = cap;
     stroke.end_cap = cap;
     stroke.endpoint_cap = cap;
+    stroke.dash_cap = cap;
     stroke.join = match first.join {
         StrokeJoin::Miter => DesignStrokeJoin::Miter,
         StrokeJoin::Round => DesignStrokeJoin::Round,
         StrokeJoin::Bevel => DesignStrokeJoin::Bevel,
     };
+    stroke.miter_angle = ((1.0 / first.miter_limit.max(1.0)).asin().to_degrees() * 2.0) as f32;
     stroke.dashes = if first.dash.is_empty() {
         DesignStrokeDashes::solid()
     } else {
@@ -755,7 +1073,11 @@ fn gate_capabilities(
     capabilities.arrange = false;
     capabilities.transforms = true;
     capabilities.resize_to_fit = false;
-    capabilities.add_auto_layout = false;
+    capabilities.add_auto_layout = kind != DesignPanelNodeKind::Other;
+    capabilities.auto_layout_container = matches!(
+        kind,
+        DesignPanelNodeKind::Frame | DesignPanelNodeKind::Group | DesignPanelNodeKind::Component
+    );
     capabilities.grid_auto_layout = false;
     capabilities.layout_guides = false;
     capabilities.pass_through_blend = matches!(
@@ -836,6 +1158,7 @@ pub(crate) fn design_node(
     out.typography = None;
     out.layout = None;
     out.fill_shows_in_exports = None;
+    out.shape_geometry = DesignShapeGeometry::None;
 
     out.visible = section.visible;
     out.x = section.x as f32;
@@ -846,6 +1169,37 @@ pub(crate) fn design_node(
     out.lock_aspect_ratio = false;
     out.opacity = section.opacity_percent as f32;
     out.blend_mode = display_blend_mode(kind, node);
+    out.shape_geometry = match &node.data {
+        NodeData::Vector(vector) => match vector.parametric {
+            Some(ParametricShape::Polygon { points }) => {
+                DesignShapeGeometry::Polygon(DesignPolygonGeometry::new(points.clamp(3, 60) as u16))
+            }
+            Some(ParametricShape::Star {
+                points,
+                inner_ratio,
+            }) => DesignShapeGeometry::Star(DesignStarGeometry::new(
+                points.clamp(3, 60) as u16,
+                inner_ratio as f32,
+            )),
+            Some(ParametricShape::Arc {
+                start_rad,
+                sweep_rad,
+                inner_ratio,
+            }) => DesignShapeGeometry::Ellipse(DesignArcData::new(
+                start_rad as f32,
+                (start_rad + sweep_rad) as f32,
+                inner_ratio as f32,
+            )),
+            None => DesignShapeGeometry::None,
+        },
+        NodeData::Boolean(boolean) => DesignShapeGeometry::Boolean(match boolean.op {
+            BooleanOp::Union => DesignBooleanOperation::Union,
+            BooleanOp::Subtract => DesignBooleanOperation::Subtract,
+            BooleanOp::Intersect => DesignBooleanOperation::Intersect,
+            BooleanOp::Exclude => DesignBooleanOperation::Exclude,
+        }),
+        _ => DesignShapeGeometry::None,
+    };
 
     match section.corner_radius {
         CornerRadiusValue::NotApplicable => {
@@ -875,7 +1229,18 @@ pub(crate) fn design_node(
         out.fills = fills
             .iter()
             .enumerate()
-            .map(|(index, snapshot)| design_paint(id, "fill", index, snapshot))
+            .map(|(index, snapshot)| {
+                let fill = match &node.data {
+                    NodeData::Vector(vector) => vector.fills.get(index),
+                    NodeData::Group(group) => group
+                        .background
+                        .iter()
+                        .chain(group.background_fills.iter())
+                        .nth(index),
+                    _ => None,
+                };
+                design_paint(id, "fill", index, snapshot, fill)
+            })
             .collect();
     } else if let Some(typography) = &section.typography {
         // A text node's Fill section is its glyph color.
@@ -909,11 +1274,12 @@ pub(crate) fn design_node(
         .collect();
     out.effect_capabilities.progressive_blur = false;
     out.effect_capabilities.shadow_blend_mode = false;
-    out.layout = design_layout(&section);
+    out.layout = design_layout(doc, node, &section);
     out.typography = section.typography.as_ref().map(design_typography);
     out.is_mask = node.is_mask;
     out.mask_mode = match node.mask_type {
         MaskType::Alpha => DesignMaskType::Alpha,
+        MaskType::Vector => DesignMaskType::Vector,
         MaskType::Luminance => DesignMaskType::Luminance,
     };
     out.mask_type = node
@@ -923,12 +1289,8 @@ pub(crate) fn design_node(
     if let Some(instance) = &section.instance {
         out.component_context = Some(DesignComponentContext {
             role: DesignComponentRole::Instance,
-            main_component: Some(match instance.main_root {
-                Some(root) => DesignComponentReference::local(
-                    root.to_string(),
-                    instance.component_name.clone(),
-                ),
-                None => DesignComponentReference::local("", instance.component_name.clone()),
+            main_component: instance.main_root.map(|root| {
+                DesignComponentReference::local(root.to_string(), instance.component_name.clone())
             }),
             description: None,
             documentation_links: Vec::new(),
@@ -956,9 +1318,6 @@ pub(crate) fn design_node(
                         format_number(*value),
                         format_number(*value),
                     ),
-                    // Color and display-only props are inspectable; their
-                    // edits are rejected by the strict kind guard in
-                    // `handle_design_component_prop`.
                     PropValueSnapshot::Color(color) => DesignComponentProperty::text(
                         prop_id,
                         prop.name.clone(),
@@ -981,7 +1340,27 @@ pub(crate) fn design_node(
         node.is_mask,
         out.corner_capabilities,
     ));
-    let states = boxless_geometry_states(&section);
+    let mut states = boxless_geometry_states(&section);
+    if let Some(instance) = &section.instance {
+        states.extend(
+            instance
+                .props
+                .iter()
+                .enumerate()
+                .filter_map(|(index, prop)| {
+                    let PropValueSnapshot::Display(value) = &prop.value else {
+                        return None;
+                    };
+                    Some((
+                        DesignPanelProperty::ComponentProperty(index),
+                        DesignPanelPropertyValueState::Uniform(DesignPanelValue::Text(
+                            value.clone(),
+                        ))
+                        .read_only_with_reason("This component property cannot be edited here"),
+                    ))
+                }),
+        );
+    }
     Some((out, states))
 }
 
@@ -1093,7 +1472,8 @@ pub(crate) fn aggregate_selection(
     capabilities.arrange = true;
     capabilities.transforms = true;
     capabilities.resize_to_fit = false;
-    capabilities.add_auto_layout = false;
+    capabilities.add_auto_layout = true;
+    capabilities.sections.push(DesignPanelSection::Layout);
     capabilities.grid_auto_layout = false;
     capabilities.layout_guides = false;
     capabilities.pass_through_blend = false;
@@ -1179,15 +1559,53 @@ pub(crate) struct DesignEditSession {
     pub snapshot: NodeSnapshot,
 }
 
+struct DesignCropSession {
+    node: NodeId,
+    is_stroke: bool,
+    index: usize,
+    state: DesignMediaCropToolState,
+}
+
 pub(crate) struct DesignAdapter {
     pub panel: Entity<DesignPanel>,
     pub(crate) last_echo: Option<DesignEchoKey>,
     pub(crate) session: Option<DesignEditSession>,
+    crop_session: Option<DesignCropSession>,
+    font_catalog: DesignFontViewData,
+    font_catalog_dirty: bool,
     _subscription: Subscription,
 }
 
 impl DesignAdapter {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<FigView>) -> Self {
+        theme::FontFamilyCache::init_global(cx);
+        let font_cache = theme::FontFamilyCache::global(cx);
+        let font_catalog =
+            design_font_catalog(font_cache.try_list_font_families().unwrap_or_default());
+        cx.spawn({
+            let font_cache = font_cache.clone();
+            async move |this, cx| {
+                let families = loop {
+                    if let Some(families) = font_cache.try_list_font_families() {
+                        break families;
+                    }
+                    font_cache.prefetch(cx).await;
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                };
+                this.update(cx, |view, cx| {
+                    if let Some(adapter) = view.gpui_design.as_mut() {
+                        adapter.font_catalog = design_font_catalog(families);
+                        adapter.font_catalog_dirty = true;
+                        adapter.last_echo = None;
+                    }
+                    view.refresh_gpui_design(cx);
+                })?;
+                Ok::<(), anyhow::Error>(())
+            }
+        })
+        .detach_and_log_err(cx);
         let panel = cx.new(|cx| {
             DesignPanel::new(
                 "fig-gpui-design",
@@ -1198,10 +1616,25 @@ impl DesignAdapter {
         });
         panel.update(cx, |panel, cx| {
             panel.set_supported_paint_types(
-                &[DesignPaintType::Solid, DesignPaintType::Gradient],
+                &[
+                    DesignPaintType::Solid,
+                    DesignPaintType::Gradient,
+                    DesignPaintType::Pattern,
+                    DesignPaintType::Image,
+                ],
                 cx,
             );
             panel.set_paint_visibility_supported(false, cx);
+            panel.set_eyedropper_enabled(false, cx);
+            panel.set_color_variable_creation_enabled(false, cx);
+            panel.set_paint_style_view_data(
+                DesignPaintStyleViewData::default().with_enabled(false),
+                cx,
+            );
+            panel.set_effect_style_view_data(
+                DesignEffectStyleViewData::default().with_enabled(false),
+                cx,
+            );
             let supported_blend_modes: Vec<_> = DesignBlendMode::ALL
                 .into_iter()
                 .filter(|mode| {
@@ -1218,6 +1651,9 @@ impl DesignAdapter {
             panel,
             last_echo: None,
             session: None,
+            crop_session: None,
+            font_catalog,
+            font_catalog_dirty: true,
             _subscription: subscription,
         }
     }
@@ -1296,9 +1732,19 @@ impl FigView {
                 .and_then(|adapter| adapter.panel.read(cx).page_view_data().cloned());
             let view_data =
                 build_design_view_data(document, &selection, page_index, editable, previous_page);
-            Some((key, view_data, text_selection))
+            let pattern_sources = selection
+                .first()
+                .filter(|_| selection.len() == 1)
+                .map(|selected| {
+                    pattern_source_candidates(doc, *selected)
+                        .into_iter()
+                        .map(|(id, name)| DesignPatternSource::new(id.to_string(), name))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((key, view_data, text_selection, pattern_sources))
         };
-        let Some((key, mut view_data, text_selection)) = built else {
+        let Some((key, mut view_data, text_selection, pattern_sources)) = built else {
             return;
         };
         // Granular, not `set_view_data` — see this method's docs. Page first,
@@ -1307,19 +1753,39 @@ impl FigView {
         // unchanged Page projection is a no-op inside `apply_page_view_data`,
         // so carrying the retained value forward costs nothing.
         let page_view_data = view_data.projections.page.take();
+        let add_auto_layout = view_data.projections.add_auto_layout.take();
         let selection_header = view_data.projections.selection_header.take();
+        let media_paints = media_paint_view_data(
+            &view_data.inspection_context,
+            self.gpui_design
+                .as_ref()
+                .and_then(|adapter| adapter.crop_session.as_ref()),
+            pattern_sources,
+        );
         let inspection_context = view_data.inspection_context;
         let property_states = view_data.property_states;
         let Some(adapter) = self.gpui_design.as_mut() else {
             return;
         };
+        let font_catalog = adapter
+            .font_catalog_dirty
+            .then(|| adapter.font_catalog.clone());
+        adapter.font_catalog_dirty = false;
         adapter.last_echo = Some(key);
         adapter.panel.update(cx, |panel, cx| {
+            if let Some(font_catalog) = font_catalog {
+                panel.set_font_view_data(font_catalog, cx);
+            }
             panel.set_supported_paint_types(
                 if text_selection {
                     &[DesignPaintType::Solid]
                 } else {
-                    &[DesignPaintType::Solid, DesignPaintType::Gradient]
+                    &[
+                        DesignPaintType::Solid,
+                        DesignPaintType::Gradient,
+                        DesignPaintType::Pattern,
+                        DesignPaintType::Image,
+                    ]
                 },
                 cx,
             );
@@ -1327,6 +1793,12 @@ impl FigView {
                 panel.set_page_view_data(page_view_data, cx);
             }
             panel.set_inspection_context(inspection_context, cx);
+            panel.set_media_paint_view_data(media_paints, cx);
+            if let Some(add_auto_layout) = add_auto_layout {
+                panel.set_add_auto_layout_view_data(add_auto_layout, cx);
+            } else {
+                panel.clear_add_auto_layout_view_data(cx);
+            }
             if let Some(selection_header) = selection_header {
                 panel.set_selection_header_view_data_for_target(
                     selection_header.target,
@@ -1344,11 +1816,12 @@ impl FigView {
     /// Begin snapshot — the transaction boundary `finish_panel_edits` needs
     /// before an external mutation lands.
     pub(crate) fn finish_gpui_design_edits(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self
-            .gpui_design
-            .as_mut()
-            .and_then(|adapter| adapter.session.take())
-        else {
+        let Some(adapter) = self.gpui_design.as_mut() else {
+            return;
+        };
+        adapter.crop_session = None;
+        adapter.last_echo = None;
+        let Some(session) = adapter.session.take() else {
             return;
         };
         let item = self.item().clone();
@@ -1467,11 +1940,25 @@ impl FigView {
                 };
                 self.handle_design_phased_edit(id, *property, value, *phase, window, cx);
             }
+            DesignPanelAction::PropertyCopyRequested {
+                target,
+                displayed_value,
+                ..
+            } => {
+                if self.design_target_matches_selection(target, cx) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                        displayed_value.to_string(),
+                    ));
+                }
+            }
             DesignPanelAction::TargetedNodeActionRequested { target, action } => {
                 self.handle_design_targeted_action(target, action, window, cx);
             }
             DesignPanelAction::SelectionHeaderCommandRequested { target, command } => {
                 self.handle_design_selection_header_command(target, command, window, cx);
+            }
+            DesignPanelAction::AddAutoLayoutRequested { target } => {
+                self.handle_design_add_auto_layout(target, window, cx);
             }
             DesignPanelAction::ArrangeRequested { target, operation } => {
                 self.handle_design_arrange(target, *operation, window, cx);
@@ -1492,6 +1979,82 @@ impl FigView {
                     return;
                 };
                 self.handle_design_paint_edit(id, *collection, *index, edit, *phase, window, cx);
+            }
+            DesignPanelAction::PaintMediaSourceActionRequested {
+                node_id: id,
+                collection,
+                index,
+                source_id,
+                action,
+                ..
+            } => {
+                if *action != fanta_gpui::design::DesignMediaSourceAction::Upload {
+                    return;
+                }
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                let is_stroke = match collection {
+                    DesignPanelCollection::Fill => false,
+                    DesignPanelCollection::Stroke => true,
+                    _ => return,
+                };
+                self.handle_design_image_upload(
+                    id,
+                    is_stroke,
+                    *index,
+                    Some(source_id.clone()),
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            DesignPanelAction::PaintMediaSourceDropRequested {
+                node_id: id,
+                collection,
+                index,
+                expected_source_id,
+                expected_media_kind,
+                file,
+                ..
+            } => {
+                if *expected_media_kind != fanta_gpui::design::DesignMediaKind::Image {
+                    return;
+                }
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                let is_stroke = match collection {
+                    DesignPanelCollection::Fill => false,
+                    DesignPanelCollection::Stroke => true,
+                    _ => return,
+                };
+                self.handle_design_image_upload(
+                    id,
+                    is_stroke,
+                    *index,
+                    Some(expected_source_id.clone()),
+                    Some(file.path.clone()),
+                    window,
+                    cx,
+                );
+            }
+            DesignPanelAction::PaintMediaCropActionRequested {
+                node_id: id,
+                collection,
+                index,
+                action,
+                ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                let is_stroke = match collection {
+                    DesignPanelCollection::Fill => false,
+                    DesignPanelCollection::Stroke => true,
+                    _ => return,
+                };
+                self.handle_design_crop_action(id, is_stroke, *index, action, window, cx);
             }
             DesignPanelAction::PaintChangeRequested {
                 node_id: id,
@@ -1689,6 +2252,45 @@ impl FigView {
                 };
                 self.handle_design_effect_edit(id, reference, *property, value, *phase, window, cx);
             }
+            DesignPanelAction::TypographyFontApplyRequested {
+                node_id: id,
+                target,
+                font,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                if !matches!(font.source, DesignFontSource::Local) {
+                    return;
+                }
+                let Some((family, style)) = self
+                    .gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.font_catalog.font(font))
+                    .filter(|(_, style)| style.availability.can_apply())
+                else {
+                    return;
+                };
+                let family = family.name.to_string();
+                let style = style.clone();
+                if target.is_selected_text_range() {
+                    if self.text_selection_typography(id).is_none() {
+                        return;
+                    }
+                    self.with_text_selection_style(cx, |text_style| {
+                        text_style.font_family.clone_from(&family);
+                        text_style.italic = style.italic;
+                        if let Some(weight) = style.weight {
+                            text_style.weight = weight;
+                        }
+                    });
+                } else {
+                    self.finish_document_edits_for_external_change(cx);
+                    let ops =
+                        self.design_ops(cx, |doc| font_apply_operations(doc, id, &family, &style));
+                    self.design_apply_ops(ops, cx);
+                }
+            }
             DesignPanelAction::ComponentPropertyChangeRequested {
                 node_id: id,
                 property_id,
@@ -1873,6 +2475,66 @@ impl FigView {
             return;
         }
         self.design_apply_ops(ops, cx);
+    }
+
+    fn handle_design_add_auto_layout(
+        &mut self,
+        target: &DesignPanelTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.design_target_matches_selection(target, cx) {
+            log::warn!("fig design adapter: rejecting stale auto layout target");
+            return;
+        }
+        let DesignPanelTarget::Nodes { node_ids } = target else {
+            return;
+        };
+        let ids: Vec<NodeId> = node_ids.iter().filter_map(node_id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.apply_structure_edit(
+            "Add auto layout",
+            move |doc| {
+                anyhow::ensure!(
+                    ids.iter()
+                        .all(|id| crate::layer_context_ops::editable(doc, *id)),
+                    "A selected layer is locked or is a page"
+                );
+                if ids.len() == 1 {
+                    let id = ids[0];
+                    let operations = crate::layer_context_ops::auto_layout(
+                        doc,
+                        id,
+                        Some(LayoutMode::Horizontal),
+                    )?;
+                    let created = crate::layer_context_ops::created_roots(&operations);
+                    return Ok((
+                        operations,
+                        if created.is_empty() {
+                            vec![id]
+                        } else {
+                            created
+                        },
+                    ));
+                }
+                let grouped = crate::structure::frame_selection_operations(doc, &ids, None)?;
+                let mut scratch = doc.clone();
+                for operation in &grouped.operations {
+                    scratch.apply(operation.clone())?;
+                }
+                let mut operations = grouped.operations;
+                operations.extend(crate::layer_context_ops::auto_layout(
+                    &scratch,
+                    grouped.group,
+                    Some(LayoutMode::Horizontal),
+                )?);
+                Ok((operations, vec![grouped.group]))
+            },
+            window,
+            cx,
+        );
     }
 
     /// Align or distribute the exact ordered target as one history entry.
@@ -2289,6 +2951,260 @@ impl FigView {
         }
     }
 
+    fn handle_design_crop_action(
+        &mut self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        action: &DesignMediaCropAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let collection = if is_stroke {
+            DesignPanelCollection::Stroke
+        } else {
+            DesignPanelCollection::Fill
+        };
+        let image = self
+            .item()
+            .read(cx)
+            .document()
+            .and_then(|document| image_payload_for(&document.doc, id, is_stroke, index));
+        let Some(mut image) = image else {
+            return;
+        };
+        match action {
+            DesignMediaCropAction::Begin => {
+                let DesignMediaPaintPlacement::Crop { transform } = image.placement else {
+                    return;
+                };
+                self.handle_design_phased_edit(
+                    id,
+                    DesignPanelProperty::Opacity,
+                    &DesignPanelValue::Number(0.0),
+                    DesignPanelEditPhase::Begin,
+                    window,
+                    cx,
+                );
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    adapter.crop_session = Some(DesignCropSession {
+                        node: id,
+                        is_stroke,
+                        index,
+                        state: DesignMediaCropToolState {
+                            active: true,
+                            transform,
+                            ..DesignMediaCropToolState::default()
+                        },
+                    });
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+            }
+            DesignMediaCropAction::Preview {
+                transform,
+                zoom,
+                aspect_ratio,
+            }
+            | DesignMediaCropAction::Commit {
+                transform,
+                zoom,
+                aspect_ratio,
+            } => {
+                let Some(adapter) = self.gpui_design.as_mut() else {
+                    return;
+                };
+                let Some(session) = adapter.crop_session.as_mut().filter(|session| {
+                    session.node == id && session.is_stroke == is_stroke && session.index == index
+                }) else {
+                    return;
+                };
+                session.state.transform = *transform;
+                session.state.zoom = *zoom;
+                session.state.aspect_ratio = *aspect_ratio;
+                let state = session.state;
+                adapter.last_echo = None;
+                let source_aspect = self.item().read(cx).document().and_then(|document| {
+                    let Fill::Image { asset, .. } =
+                        current_paint(&document.doc, id, is_stroke, index)?
+                    else {
+                        return None;
+                    };
+                    let image = document.asset_resolver.as_ref()?.resolve(*asset)?;
+                    Some(image.width as f32 / image.height.max(1) as f32)
+                });
+                let Some(transform) =
+                    source_aspect.and_then(|aspect| crop_transform_for_state(state, aspect))
+                else {
+                    crate::view::show_canvas_notice(
+                        "This crop transform cannot be applied.".into(),
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                image.placement = DesignMediaPaintPlacement::Crop { transform };
+                let edit = fanta_gpui::design::DesignPaintEdit {
+                    property: DesignPaintProperty::Payload,
+                    value: DesignPaintValue::Payload(DesignPaintPayload::Image(image)),
+                };
+                let phase = if matches!(action, DesignMediaCropAction::Commit { .. }) {
+                    DesignPanelEditPhase::Commit
+                } else {
+                    DesignPanelEditPhase::Preview
+                };
+                self.handle_design_paint_edit(id, collection, index, &edit, phase, window, cx);
+                if phase == DesignPanelEditPhase::Commit
+                    && let Some(adapter) = self.gpui_design.as_mut()
+                {
+                    adapter.crop_session = None;
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+            }
+            DesignMediaCropAction::Cancel => {
+                self.handle_design_phased_edit(
+                    id,
+                    DesignPanelProperty::Opacity,
+                    &DesignPanelValue::Number(0.0),
+                    DesignPanelEditPhase::Cancel,
+                    window,
+                    cx,
+                );
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    adapter.crop_session = None;
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+            }
+            DesignMediaCropAction::ResizeToFit => {
+                image.placement = DesignMediaPaintPlacement::Fit {
+                    rotation: DesignMediaQuarterTurn::None,
+                };
+                let edit = fanta_gpui::design::DesignPaintEdit {
+                    property: DesignPaintProperty::Payload,
+                    value: DesignPaintValue::Payload(DesignPaintPayload::Image(image)),
+                };
+                self.handle_design_paint_edit(
+                    id,
+                    collection,
+                    index,
+                    &edit,
+                    DesignPanelEditPhase::Commit,
+                    window,
+                    cx,
+                );
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    adapter.crop_session = None;
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+            }
+        }
+    }
+
+    fn handle_design_image_upload(
+        &mut self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        expected_source_id: Option<SharedString>,
+        path: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_document_edits_for_external_change(cx);
+        let item = self.item().clone();
+        let expected = item.read(cx).document().and_then(|document| {
+            Some((
+                document.doc.id,
+                current_paint(&document.doc, id, is_stroke, index)?.clone(),
+            ))
+        });
+        let Some((document_id, expected_fill)) = expected else {
+            return;
+        };
+        if let Some(source_id) = expected_source_id
+            && !matches!(&expected_fill, Fill::Image { asset, .. } if asset.to_string() == source_id.as_ref())
+        {
+            return;
+        }
+        let chooser = path.is_none().then(|| {
+            cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Choose image fill".into()),
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                let path = match (path, chooser) {
+                    (Some(path), _) => path,
+                    (None, Some(chooser)) => {
+                        let Some(path) = chooser.await??.and_then(|paths| paths.into_iter().next())
+                        else {
+                            return Ok(());
+                        };
+                        path
+                    }
+                    (None, None) => return Ok(()),
+                };
+                let prepared = cx
+                    .background_spawn(async move {
+                        let length = std::fs::metadata(&path)
+                            .with_context(|| format!("reading {}", path.display()))?
+                            .len();
+                        anyhow::ensure!(
+                            usize::try_from(length)
+                                .ok()
+                                .is_some_and(|length| length <= MAX_IMAGE_SOURCE_BYTES),
+                            "image must be smaller than {MAX_IMAGE_SOURCE_BYTES} bytes"
+                        );
+                        let bytes = std::fs::read(&path)
+                            .with_context(|| format!("reading {}", path.display()))?;
+                        PreparedImage::new(bytes)
+                    })
+                    .await?;
+                item.update(cx, |item, cx| {
+                    anyhow::ensure!(item.is_editable(), "this document is read-only");
+                    item.with_document(cx, |document| {
+                        let result: anyhow::Result<bool> = (|| {
+                            let (doc, mut assets) = document.doc_and_assets();
+                            anyhow::ensure!(doc.id == document_id, "the document changed");
+                            replace_image_paint_with_asset(
+                                doc,
+                                &mut assets,
+                                id,
+                                is_stroke,
+                                index,
+                                &expected_fill,
+                                prepared,
+                            )
+                        })();
+                        let change = if result.as_ref().is_ok_and(|changed| *changed) {
+                            DocChange::Content
+                        } else {
+                            DocChange::None
+                        };
+                        (result, change)
+                    })
+                    .context("the document is closed")??;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                this.update_in(cx, |_, window, cx| {
+                    crate::view::show_canvas_notice(format!("Image fill: {error:#}"), window, cx)
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn handle_design_paint_edit(
         &mut self,
         id: NodeId,
@@ -2304,7 +3220,17 @@ impl FigView {
             DesignPanelCollection::Stroke => true,
             _ => return,
         };
-        let value = match (&edit.property, &edit.value) {
+        if phase == DesignPanelEditPhase::Commit
+            && let (
+                DesignPaintProperty::Payload,
+                DesignPaintValue::Payload(DesignPaintPayload::Image(image)),
+            ) = (&edit.property, &edit.value)
+            && image.source.id.is_empty()
+        {
+            self.handle_design_image_upload(id, is_stroke, index, None, None, window, cx);
+            return;
+        }
+        let mut value = match (&edit.property, &edit.value) {
             (DesignPaintProperty::Color, DesignPaintValue::Color(color)) => {
                 PaintEditValue::Color(fanta_color(*color))
             }
@@ -2315,6 +3241,9 @@ impl FigView {
             }
             (DesignPaintProperty::BlendMode, DesignPaintValue::BlendMode(mode)) => {
                 let Some(mode) = engine_blend_mode(*mode) else {
+                    if phase == DesignPanelEditPhase::Commit {
+                        crate::view::notify_unavailable("This blend mode", window, cx);
+                    }
                     return;
                 };
                 PaintEditValue::BlendMode(mode)
@@ -2344,6 +3273,19 @@ impl FigView {
             (DesignPaintProperty::GradientStopRemove { index, .. }, DesignPaintValue::None) => {
                 PaintEditValue::GradientStopRemove(*index)
             }
+            (
+                DesignPaintProperty::PatternSourceNode
+                | DesignPaintProperty::PatternTileType
+                | DesignPaintProperty::PatternScalingFactor
+                | DesignPaintProperty::PatternSpacing
+                | DesignPaintProperty::PatternHorizontalAlignment
+                | DesignPaintProperty::MediaScaleMode
+                | DesignPaintProperty::MediaCropTransform
+                | DesignPaintProperty::MediaTileScalingFactor
+                | DesignPaintProperty::MediaQuarterTurn
+                | DesignPaintProperty::MediaFilter(_),
+                _,
+            ) => PaintEditValue::ModelEdit(edit.clone()),
             _ => {
                 log::debug!(
                     "fig design adapter: unhandled paint edit {:?}",
@@ -2352,6 +3294,25 @@ impl FigView {
                 return;
             }
         };
+        if phase == DesignPanelEditPhase::Commit
+            && let PaintEditValue::Payload(DesignPaintPayload::Pattern(pattern)) = &mut value
+            && pattern.source_node_id.is_empty()
+        {
+            let source = self.item().read(cx).document().and_then(|document| {
+                pattern_source_candidates(&document.doc, id)
+                    .first()
+                    .map(|(source, _)| *source)
+            });
+            let Some(source) = source else {
+                crate::view::show_canvas_notice(
+                    "Add another vector or frame to use as a pattern source.".into(),
+                    window,
+                    cx,
+                );
+                return;
+            };
+            pattern.source_node_id = source.to_string().into();
+        }
         // Route through the shared phased machinery by synthesizing the
         // property key: paint edits reuse a whole-node snapshot, so Begin /
         // Preview / Cancel behave exactly like ordinary property gestures.
@@ -2530,10 +3491,18 @@ impl FigView {
         self.finish_document_edits_for_external_change(cx);
         let value = value.cloned();
         let ops = self.design_ops(cx, |doc| {
-            // Strict kind guard: an edit only applies when the incoming panel
-            // value matches the schema's default value kind, so a text draft
-            // can never corrupt a Color or unsupported prop.
             let kind = current_prop_kind(doc, id, prop);
+            if !matches!(
+                kind,
+                Some(
+                    EnginePropKind::Boolean
+                        | EnginePropKind::Number
+                        | EnginePropKind::Text
+                        | EnginePropKind::Color
+                )
+            ) {
+                return Vec::new();
+            }
             let new = match &value {
                 None => None,
                 Some(DesignComponentPropertyValue::Boolean(value)) => {
@@ -2550,6 +3519,10 @@ impl FigView {
                     Some(EnginePropKind::Text) => Some(VarValue::String {
                         value: text.to_string(),
                     }),
+                    Some(EnginePropKind::Color) => match parse_color(text) {
+                        Some(value) => Some(VarValue::Color { value }),
+                        None => return Vec::new(),
+                    },
                     _ => return Vec::new(),
                 },
                 Some(other) => {
@@ -2753,9 +3726,7 @@ fn targeted_property_operations(
         .map(|operations| operations.into_iter().flatten().collect())
 }
 
-/// Maps one panel arrange command onto engine operations, or `None` when the
-/// engine has no equivalent (Tidy up, which is auto-layout inference rather
-/// than an align pass).
+/// Maps one panel arrange command onto engine operations.
 ///
 /// `distribute` deliberately returns nothing for fewer than three nodes:
 /// two nodes are already as far apart as they can be, so there is no gap to
@@ -2779,7 +3750,40 @@ fn arrange_operations(
         DesignArrangeOperation::AlignBottom => align_vertical(scene, ids, VAlign::Bottom),
         DesignArrangeOperation::DistributeHorizontal => distribute(scene, ids, Axis::X),
         DesignArrangeOperation::DistributeVertical => distribute(scene, ids, Axis::Y),
-        DesignArrangeOperation::TidyUp => return None,
+        DesignArrangeOperation::TidyUp => {
+            if ids.len() < 2 {
+                return Some(Vec::new());
+            }
+            let bounds = ids
+                .iter()
+                .map(|id| scene.world_bounds(*id))
+                .collect::<Option<Vec<_>>>()?;
+            let centers_x = bounds.iter().map(|bounds| bounds.center().x);
+            let centers_y = bounds.iter().map(|bounds| bounds.center().y);
+            let horizontal_span = centers_x.clone().fold(f64::NEG_INFINITY, f64::max)
+                - centers_x.fold(f64::INFINITY, f64::min);
+            let vertical_span = centers_y.clone().fold(f64::NEG_INFINITY, f64::max)
+                - centers_y.fold(f64::INFINITY, f64::min);
+            let horizontal = horizontal_span >= vertical_span;
+            let mut operations = if horizontal {
+                align_vertical(scene, ids, VAlign::Middle)
+            } else {
+                align_horizontal(scene, ids, HAlign::Center)
+            };
+            let mut scratch = doc.clone();
+            for operation in &operations {
+                if let Err(error) = scratch.apply(operation.clone()) {
+                    log::warn!("tidy up alignment failed: {error:#}");
+                    return None;
+                }
+            }
+            operations.extend(distribute(
+                &scratch.scene,
+                ids,
+                if horizontal { Axis::X } else { Axis::Y },
+            ));
+            operations
+        }
     })
 }
 
@@ -2863,12 +3867,296 @@ enum PaintEditValue {
     Opacity(f64),
     BlendMode(BlendMode),
     Payload(DesignPaintPayload),
+    ModelEdit(fanta_gpui::design::DesignPaintEdit),
     GradientKind(DesignPaintKind),
     GradientTransform(DesignPaintTransform),
     GradientStopColor(usize, FantaColor),
     GradientStopPosition(usize, f32),
     GradientStopAdd(f32, FantaColor),
     GradientStopRemove(usize),
+}
+
+fn pattern_source_is_valid(doc: &Doc, target: NodeId, source: NodeId) -> bool {
+    source != target
+        && doc
+            .scene
+            .get(source)
+            .is_some_and(|node| matches!(&node.data, NodeData::Vector(_) | NodeData::Group(_)))
+        && !doc.scene.ancestors_of(target).any(|node| node.id == source)
+}
+
+fn pattern_source_candidates(doc: &Doc, target: NodeId) -> Vec<(NodeId, String)> {
+    let ancestors = doc
+        .scene
+        .ancestors_of(target)
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    let page_root = doc
+        .scene
+        .ancestors_of(target)
+        .last()
+        .map_or(target, |node| node.id);
+    doc.scene
+        .descendants_of(page_root)
+        .filter(|candidate| *candidate != target && !ancestors.contains(candidate))
+        .filter_map(|candidate| {
+            doc.scene.get(candidate).and_then(|node| {
+                matches!(&node.data, NodeData::Vector(_) | NodeData::Group(_))
+                    .then(|| (candidate, node.name.clone()))
+            })
+        })
+        .collect()
+}
+
+fn pattern_fill_from_design(
+    doc: &Doc,
+    target: NodeId,
+    payload: &DesignPatternPaint,
+) -> Option<PatternFill> {
+    let source_node_id = payload.source_node_id.parse().ok()?;
+    if !pattern_source_is_valid(doc, target, source_node_id)
+        || !payload.scaling_factor.is_finite()
+        || payload.scaling_factor <= 0.0
+        || !payload.spacing.x.is_finite()
+        || !payload.spacing.y.is_finite()
+    {
+        return None;
+    }
+    Some(PatternFill {
+        source_node_id,
+        tile_type: match payload.tile_type {
+            DesignPatternTileType::Rectangular => PatternTileType::Rectangular,
+            DesignPatternTileType::HorizontalHexagonal => PatternTileType::HorizontalHexagonal,
+            DesignPatternTileType::VerticalHexagonal => PatternTileType::VerticalHexagonal,
+        },
+        scaling_factor: payload.scaling_factor,
+        spacing: PatternSpacing {
+            x: payload.spacing.x,
+            y: payload.spacing.y,
+        },
+        horizontal_alignment: match payload.horizontal_alignment {
+            DesignPatternHorizontalAlignment::Start => PatternHorizontalAlignment::Start,
+            DesignPatternHorizontalAlignment::Center => PatternHorizontalAlignment::Center,
+            DesignPatternHorizontalAlignment::End => PatternHorizontalAlignment::End,
+        },
+    })
+}
+
+fn image_fill_from_design(
+    payload: &fanta_gpui::design::DesignImagePaint,
+    opacity: f32,
+    blend: BlendMode,
+) -> Option<Fill> {
+    let asset = payload.source.id.parse().ok()?;
+    if !payload.placement.is_valid() {
+        return None;
+    }
+    let (mode, crop, scale, rotation) = match payload.placement {
+        DesignMediaPaintPlacement::Fill { rotation } => (
+            ImageFitMode::Fill,
+            None,
+            None,
+            Some(f32::from(rotation.degrees())),
+        ),
+        DesignMediaPaintPlacement::Fit { rotation } => (
+            ImageFitMode::Fit,
+            None,
+            None,
+            Some(f32::from(rotation.degrees())),
+        ),
+        DesignMediaPaintPlacement::Crop { transform } => {
+            if transform.m12.abs() > 1e-6
+                || transform.m21.abs() > 1e-6
+                || transform.m11 <= 0.0
+                || transform.m22 <= 0.0
+            {
+                return None;
+            }
+            (
+                ImageFitMode::Fill,
+                Some(Box::new([
+                    transform.tx,
+                    transform.ty,
+                    transform.m11,
+                    transform.m22,
+                ])),
+                None,
+                None,
+            )
+        }
+        DesignMediaPaintPlacement::Tile {
+            scaling_factor,
+            rotation,
+        } => (
+            ImageFitMode::Tile,
+            None,
+            Some(scaling_factor),
+            Some(f32::from(rotation.degrees())),
+        ),
+    };
+    let filters = payload.filters.normalized()?;
+    Some(Fill::Image {
+        asset,
+        mode,
+        opacity,
+        crop,
+        scale,
+        rotation,
+        blend,
+        adjust: fanta_doc::ImageAdjust {
+            exposure: filters.exposure,
+            contrast: filters.contrast,
+            saturation: filters.saturation,
+            temperature: filters.temperature,
+            tint: filters.tint,
+            highlights: filters.highlights,
+            shadows: filters.shadows,
+        },
+    })
+}
+
+fn current_paint(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Option<&Fill> {
+    let node = doc.scene.get(id)?;
+    match &node.data {
+        NodeData::Vector(vector) => {
+            if is_stroke {
+                vector.strokes.get(index).map(|stroke| &stroke.paint)
+            } else {
+                vector.fills.get(index)
+            }
+        }
+        NodeData::Group(group) => {
+            if is_stroke {
+                group.strokes.get(index).map(|stroke| &stroke.paint)
+            } else {
+                group
+                    .background
+                    .iter()
+                    .chain(group.background_fills.iter())
+                    .nth(index)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn replace_image_paint_with_asset(
+    doc: &mut Doc,
+    assets: &mut AssetStores<'_>,
+    id: NodeId,
+    is_stroke: bool,
+    index: usize,
+    expected_fill: &Fill,
+    prepared: PreparedImage,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        current_paint(doc, id, is_stroke, index) == Some(expected_fill),
+        "the paint changed while choosing an image"
+    );
+    let (asset, _, inserted) = assets.add_prepared_image_tracked(prepared)?;
+    let mut new_fill = match expected_fill {
+        Fill::Image { .. } => expected_fill.clone(),
+        other => Fill::Image {
+            asset,
+            mode: ImageFitMode::Fill,
+            opacity: match other {
+                Fill::Pattern { opacity, .. } => *opacity,
+                _ => 1.0,
+            },
+            crop: None,
+            scale: None,
+            rotation: None,
+            blend: crate::properties_ops::paint_blend(other),
+            adjust: fanta_doc::ImageAdjust::default(),
+        },
+    };
+    if let Fill::Image { asset: source, .. } = &mut new_fill {
+        *source = asset;
+    }
+    let operations = replace_data_operation(doc, id, |data| {
+        if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
+            *paint = new_fill.clone();
+        }
+    });
+    let mut changed = false;
+    for operation in operations {
+        if let Err(error) = doc.apply(operation) {
+            if inserted {
+                assets.remove(asset);
+            }
+            return Err(error.into());
+        }
+        changed = true;
+    }
+    if !changed && inserted {
+        assets.remove(asset);
+    }
+    Ok(changed)
+}
+
+fn image_payload_for(
+    doc: &Doc,
+    id: NodeId,
+    is_stroke: bool,
+    index: usize,
+) -> Option<fanta_gpui::design::DesignImagePaint> {
+    let fill = current_paint(doc, id, is_stroke, index)?;
+    let snapshot = crate::properties_snapshot::paint_snapshot(fill, None);
+    let paint = design_paint(
+        id,
+        if is_stroke { "stroke" } else { "fill" },
+        index,
+        &snapshot,
+        Some(fill),
+    );
+    match paint.payload {
+        DesignPaintPayload::Image(image) if !paint.read_only => Some(image),
+        _ => None,
+    }
+}
+
+fn crop_transform_for_state(
+    state: DesignMediaCropToolState,
+    source_aspect: f32,
+) -> Option<DesignPaintTransform> {
+    let mut transform = state.transform;
+    if !state.zoom.is_finite()
+        || state.zoom <= 0.0
+        || !source_aspect.is_finite()
+        || source_aspect <= 0.0
+        || !transform.m11.is_finite()
+        || !transform.m22.is_finite()
+        || !transform.tx.is_finite()
+        || !transform.ty.is_finite()
+        || transform.m12.abs() > 1e-6
+        || transform.m21.abs() > 1e-6
+        || transform.m11 <= 0.0
+        || transform.m22 <= 0.0
+    {
+        return None;
+    }
+    let width = transform.m11 / state.zoom;
+    let mut height = transform.m22 / state.zoom;
+    let ratio = match state.aspect_ratio {
+        fanta_gpui::design::DesignMediaCropAspectRatio::Free => None,
+        fanta_gpui::design::DesignMediaCropAspectRatio::Original => Some(source_aspect),
+        fanta_gpui::design::DesignMediaCropAspectRatio::Square => Some(1.0),
+        fanta_gpui::design::DesignMediaCropAspectRatio::FourByThree => Some(4.0 / 3.0),
+        fanta_gpui::design::DesignMediaCropAspectRatio::SixteenByNine => Some(16.0 / 9.0),
+    };
+    if let Some(ratio) = ratio {
+        height = width * source_aspect / ratio;
+    }
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let center_x = transform.tx + transform.m11 * 0.5;
+    let center_y = transform.ty + transform.m22 * 0.5;
+    transform.m11 = width.min(1.0);
+    transform.m22 = height.min(1.0);
+    transform.tx = (center_x - transform.m11 * 0.5).clamp(0.0, 1.0 - transform.m11);
+    transform.ty = (center_y - transform.m22 * 0.5).clamp(0.0, 1.0 - transform.m22);
+    Some(transform)
 }
 
 fn paint_edit_operations(
@@ -2940,7 +4228,8 @@ fn paint_edit_operations(
                         match paint {
                             Fill::Solid { blend: current, .. }
                             | Fill::Gradient { blend: current, .. }
-                            | Fill::Image { blend: current, .. } => *current = *blend,
+                            | Fill::Image { blend: current, .. }
+                            | Fill::Pattern { blend: current, .. } => *current = *blend,
                         }
                     }
                 })
@@ -2970,8 +4259,68 @@ fn paint_edit_operations(
                     );
                 })
             }
+            DesignPaintPayload::Pattern(pattern) if !is_text => {
+                let Some(pattern) = pattern_fill_from_design(doc, id, pattern) else {
+                    return Vec::new();
+                };
+                replace_data_operation(doc, id, |data| {
+                    if let Some(paint) =
+                        crate::properties_ops::paint_slot_mut(data, index, is_stroke)
+                    {
+                        let blend = crate::properties_ops::paint_blend(paint);
+                        let opacity = match paint {
+                            Fill::Pattern { opacity, .. } | Fill::Image { opacity, .. } => *opacity,
+                            _ => 1.0,
+                        };
+                        *paint = Fill::Pattern {
+                            pattern: Box::new(pattern.clone()),
+                            opacity,
+                            blend,
+                        };
+                    }
+                })
+            }
+            DesignPaintPayload::Image(image) if !is_text => {
+                replace_data_operation(doc, id, |data| {
+                    if let Some(paint) =
+                        crate::properties_ops::paint_slot_mut(data, index, is_stroke)
+                    {
+                        let blend = crate::properties_ops::paint_blend(paint);
+                        let opacity = match paint {
+                            Fill::Image { opacity, .. } | Fill::Pattern { opacity, .. } => *opacity,
+                            _ => 1.0,
+                        };
+                        if let Some(image_fill) = image_fill_from_design(image, opacity, blend) {
+                            *paint = image_fill;
+                        }
+                    }
+                })
+            }
             _ => Vec::new(),
         },
+        PaintEditValue::ModelEdit(edit) => {
+            let Some(fill) = current_paint(doc, id, is_stroke, index) else {
+                return Vec::new();
+            };
+            let snapshot = crate::properties_snapshot::paint_snapshot(fill, None);
+            let mut paint = design_paint(
+                id,
+                if is_stroke { "stroke" } else { "fill" },
+                index,
+                &snapshot,
+                Some(fill),
+            );
+            if !paint.apply_edit(edit) {
+                return Vec::new();
+            }
+            paint_edit_operations(
+                doc,
+                id,
+                is_stroke,
+                index,
+                &PaintEditValue::Payload(paint.payload),
+            )
+        }
         PaintEditValue::GradientKind(kind) => {
             gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
                 let design_transform = design_gradient_transform(gradient);
@@ -3105,7 +4454,7 @@ fn effect_edit_operations(
     match reference {
         EffectRef::Shadow(index) => {
             let number = |value: &DesignPanelValue| match value {
-                DesignPanelValue::Number(value) => Some(f64::from(*value)),
+                DesignPanelValue::Number(value) if value.is_finite() => Some(f64::from(*value)),
                 _ => None,
             };
             Some(match property {
@@ -3156,6 +4505,9 @@ fn effect_edit_operations(
                 let DesignPanelValue::Number(radius) = value else {
                     return None;
                 };
+                if !radius.is_finite() {
+                    return None;
+                }
                 let radius = f64::from(*radius).max(0.0);
                 blurs_operations(doc, id, |blurs| {
                     if let Some(blur) = blurs.get_mut(index) {
@@ -3264,6 +4616,7 @@ enum EnginePropKind {
     Boolean,
     Number,
     Text,
+    Color,
     Other,
 }
 
@@ -3278,11 +4631,14 @@ fn current_prop_kind(
     };
     let definition = crate::properties_snapshot::resolved_instance_def(&doc.components, instance)?;
     let schema = definition.props.iter().find(|schema| schema.id == prop)?;
-    Some(match schema.default {
-        VarValue::Boolean { .. } => EnginePropKind::Boolean,
-        VarValue::Float { .. } => EnginePropKind::Number,
-        VarValue::String { .. } => EnginePropKind::Text,
-        _ => EnginePropKind::Other,
+    Some(match schema.kind {
+        ComponentPropKind::Bool => EnginePropKind::Boolean,
+        ComponentPropKind::Number => EnginePropKind::Number,
+        ComponentPropKind::Text => EnginePropKind::Text,
+        ComponentPropKind::Color => EnginePropKind::Color,
+        ComponentPropKind::InstanceSwap | ComponentPropKind::Variant { .. } => {
+            EnginePropKind::Other
+        }
     })
 }
 
@@ -3357,7 +4713,120 @@ fn property_operations(
                 new: node.flags ^ NodeFlags::HIDDEN,
             }])
         }
-        (P::BlendMode, V::BlendMode(mode)) => Some(blend_mode_operations(doc, id, *mode)),
+        (P::IsMask, V::Bool(masked)) => {
+            let node = doc.scene.get(id)?;
+            Some(
+                (node.is_mask != *masked)
+                    .then(|| Operation::SetMask {
+                        id,
+                        old: node.is_mask,
+                        new: *masked,
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+        }
+        (P::MaskType, V::MaskType(kind)) => {
+            let node = doc.scene.get(id)?;
+            let target = match kind {
+                DesignMaskType::Luminance => MaskType::Luminance,
+                DesignMaskType::Alpha => MaskType::Alpha,
+                DesignMaskType::Vector => MaskType::Vector,
+            };
+            Some(
+                (node.mask_type != target)
+                    .then(|| Operation::SetMaskType {
+                        id,
+                        old: node.mask_type,
+                        new: target,
+                    })
+                    .into_iter()
+                    .collect(),
+            )
+        }
+        (P::PolygonCount, _) => {
+            let points = number(value)?.clamp(3.0, 60.0) as u32;
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Polygon { points: current } = shape {
+                    *current = points;
+                }
+            }))
+        }
+        (P::StarPointCount, _) => {
+            let points = number(value)?.clamp(3.0, 60.0) as u32;
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Star {
+                    points: current, ..
+                } = shape
+                {
+                    *current = points;
+                }
+            }))
+        }
+        (P::StarInnerRadius, V::Ratio(ratio)) => {
+            let ratio = f64::from(*ratio).clamp(0.0, 1.0);
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Star { inner_ratio, .. } = shape {
+                    *inner_ratio = ratio;
+                }
+            }))
+        }
+        (P::ArcStartingAngle, V::AngleRadians(angle)) => {
+            let angle = f64::from(*angle);
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Arc { start_rad, .. } = shape {
+                    *start_rad = angle;
+                }
+            }))
+        }
+        (P::ArcSweep, V::AngleRadians(angle)) => {
+            let angle = f64::from(*angle);
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Arc { sweep_rad, .. } = shape {
+                    *sweep_rad = angle;
+                }
+            }))
+        }
+        (P::ArcEndingAngle, V::AngleRadians(angle)) => {
+            let angle = f64::from(*angle);
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Arc {
+                    start_rad,
+                    sweep_rad,
+                    ..
+                } = shape
+                {
+                    *sweep_rad = angle - *start_rad;
+                }
+            }))
+        }
+        (P::ArcInnerRadius, V::Ratio(ratio)) => {
+            let ratio = f64::from(*ratio).clamp(0.0, 1.0);
+            Some(parametric_shape_operations(doc, id, move |shape| {
+                if let ParametricShape::Arc { inner_ratio, .. } = shape {
+                    *inner_ratio = ratio;
+                }
+            }))
+        }
+        (P::BooleanOperation, V::BooleanOperation(operation)) => {
+            let target = match operation {
+                DesignBooleanOperation::Union => BooleanOp::Union,
+                DesignBooleanOperation::Subtract => BooleanOp::Subtract,
+                DesignBooleanOperation::Intersect => BooleanOp::Intersect,
+                DesignBooleanOperation::Exclude => BooleanOp::Exclude,
+            };
+            Some(replace_data_operation(doc, id, |data| {
+                if let NodeData::Boolean(boolean) = data {
+                    boolean.op = target;
+                }
+            }))
+        }
+        (P::BlendMode, V::BlendMode(mode)) => {
+            if !matches!(mode, DesignBlendMode::PassThrough) && engine_blend_mode(*mode).is_none() {
+                return None;
+            }
+            Some(blend_mode_operations(doc, id, *mode))
+        }
         (P::ClipContent, V::Bool(enabled)) => {
             Some(set_clip_content_meta_operation(doc, id, *enabled))
         }
@@ -3366,8 +4835,25 @@ fn property_operations(
             Some(replace_data_operation(doc, id, |data| {
                 if let Some(strokes) = stroke_list_mut(data) {
                     for stroke in strokes.iter_mut() {
-                        stroke.width = weight;
-                        stroke.per_side = None;
+                        if let Some(per_side) = stroke.per_side.as_mut() {
+                            per_side[0] = weight;
+                        } else {
+                            stroke.width = weight;
+                        }
+                    }
+                }
+            }))
+        }
+        (P::StrokeWeightMode, V::StrokeWeightMode(mode)) => {
+            let custom = *mode != DesignStrokeWeightMode::All;
+            Some(replace_data_operation(doc, id, |data| {
+                if let Some(strokes) = stroke_list_mut(data) {
+                    for stroke in strokes.iter_mut() {
+                        if custom {
+                            stroke.per_side.get_or_insert([stroke.width; 4]);
+                        } else if let Some(per_side) = stroke.per_side.take() {
+                            stroke.width = per_side[0];
+                        }
                     }
                 }
             }))
@@ -3409,7 +4895,8 @@ fn property_operations(
         }
         (P::StrokeStartCap, V::StrokeCap(cap))
         | (P::StrokeEndCap, V::StrokeCap(cap))
-        | (P::StrokeEndpointCap, V::StrokeCap(cap)) => {
+        | (P::StrokeEndpointCap, V::StrokeCap(cap))
+        | (P::StrokeDashCap, V::StrokeCap(cap)) => {
             // The engine has one cap per stroke; every endpoint leaf writes it.
             let cap = match cap {
                 DesignStrokeCap::Round => StrokeCap::Round,
@@ -3434,6 +4921,17 @@ fn property_operations(
                 if let Some(strokes) = stroke_list_mut(data) {
                     for stroke in strokes.iter_mut() {
                         stroke.join = join;
+                    }
+                }
+            }))
+        }
+        (P::StrokeMiterAngle, _) => {
+            let angle = number(value)?.clamp(1.0, 180.0).to_radians();
+            let miter_limit = (1.0 / (angle * 0.5).sin()).clamp(1.0, 1000.0);
+            Some(replace_data_operation(doc, id, |data| {
+                if let Some(strokes) = stroke_list_mut(data) {
+                    for stroke in strokes.iter_mut() {
+                        stroke.miter_limit = miter_limit;
                     }
                 }
             }))
@@ -3469,7 +4967,89 @@ fn property_operations(
                 }
             }))
         }
-        (P::LayoutMode, V::LayoutMode(mode)) => Some(layout_mode_operations(doc, id, *mode)),
+        (P::LayoutMode, V::LayoutMode(mode)) => layout_mode_operations(doc, id, *mode),
+        (P::AutoLayoutAlignment, V::AutoLayoutAlignment(alignment)) => {
+            let (x, y) = (alignment.x, alignment.y);
+            Some(auto_layout_operations(doc, id, move |layout| {
+                set_auto_layout_alignment(layout, x, y);
+            }))
+        }
+        (P::AlignmentX, _) | (P::AlignmentY, _) => {
+            let cell = number(value)?.clamp(0.0, 2.0) as u8;
+            let node = doc.scene.get(id)?;
+            let NodeData::Group(group) = &node.data else {
+                return None;
+            };
+            let layout = group.auto_layout?;
+            let (mut x, mut y) = auto_layout_alignment(layout);
+            if property == P::AlignmentX {
+                x = cell;
+            } else {
+                y = cell;
+            }
+            Some(auto_layout_operations(doc, id, move |layout| {
+                set_auto_layout_alignment(layout, x, y);
+            }))
+        }
+        (P::ItemSpacingMode, V::ItemSpacingMode(mode)) => {
+            let auto = *mode == DesignItemSpacingMode::Auto;
+            Some(auto_layout_operations(doc, id, move |layout| {
+                if auto {
+                    layout.primary_align = PrimaryAlign::SpaceBetween;
+                } else if matches!(
+                    layout.primary_align,
+                    PrimaryAlign::SpaceBetween | PrimaryAlign::SpaceEvenly
+                ) {
+                    layout.primary_align = PrimaryAlign::Start;
+                }
+            }))
+        }
+        (P::CounterAxisAlignContent, V::CounterAxisAlignContent(alignment)) => {
+            let space_between = *alignment == DesignCounterAxisAlignContent::SpaceBetween;
+            Some(auto_layout_operations(doc, id, move |layout| {
+                layout.counter_auto_spacing = space_between;
+            }))
+        }
+        (P::StackingOrder, V::StackingOrder(order)) => {
+            let first_on_top = *order == DesignStackingOrder::FirstOnTop;
+            Some(auto_layout_operations(doc, id, move |layout| {
+                layout.reverse_z = first_on_top;
+            }))
+        }
+        (P::IncludeStrokes, V::Bool(include)) => {
+            let include = *include;
+            Some(auto_layout_operations(doc, id, move |layout| {
+                layout.include_strokes = include;
+            }))
+        }
+        (P::BaselineAlignment, V::BaselineAlignment(alignment)) => {
+            let baseline = *alignment == DesignBaselineAlignment::Baseline;
+            Some(auto_layout_operations(doc, id, move |layout| {
+                layout.counter_align = if baseline {
+                    CounterAlign::Baseline
+                } else {
+                    CounterAlign::Start
+                };
+            }))
+        }
+        (P::LayoutPositioning, V::LayoutPositioning(positioning)) => {
+            let absolute = *positioning == DesignLayoutPositioning::Absolute;
+            Some(layout_child_operations(doc, id, move |child| {
+                child.absolute = absolute;
+            }))
+        }
+        (P::LayoutAlignSelf, V::LayoutAlignSelf(alignment)) => {
+            let stretch = *alignment == DesignLayoutAlignSelf::Stretch;
+            Some(layout_child_operations(doc, id, move |child| {
+                child.align_self = stretch.then_some(CounterAlign::Stretch);
+            }))
+        }
+        (P::LayoutGrow, _) => {
+            let grow = number(value)?.clamp(0.0, 1.0) as f32;
+            Some(layout_child_operations(doc, id, move |child| {
+                child.grow = grow;
+            }))
+        }
         (P::Gap, _) => {
             let gap = number(value)?;
             let horizontal = primary_axis_is_horizontal(doc, id)?;
@@ -3512,14 +5092,20 @@ fn property_operations(
             &format_number(number(value)?),
             false,
         )),
-        (P::PaddingShorthand, _) => {
-            let padding = number(value)?.max(0.0);
-            Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Group(group) = data
-                    && let Some(layout) = group.auto_layout.as_mut()
-                {
-                    layout.padding = [padding; 4];
-                }
+        (P::PaddingShorthand, V::NumberList(values)) if (1..=4).contains(&values.len()) => {
+            let values: Vec<f64> = values
+                .iter()
+                .map(|value| f64::from(*value).max(0.0))
+                .collect();
+            let padding = match values.as_slice() {
+                [all] => [*all; 4],
+                [vertical, horizontal] => [*vertical, *horizontal, *vertical, *horizontal],
+                [top, horizontal, bottom] => [*top, *horizontal, *bottom, *horizontal],
+                [top, right, bottom, left] => [*top, *right, *bottom, *left],
+                _ => return None,
+            };
+            Some(auto_layout_operations(doc, id, move |layout| {
+                layout.padding = padding;
             }))
         }
         (P::PaddingTop, _) | (P::PaddingRight, _) | (P::PaddingBottom, _) | (P::PaddingLeft, _) => {
@@ -3549,24 +5135,83 @@ fn property_operations(
             }))
         }
         (P::HorizontalSizing, V::SizingMode(mode)) | (P::VerticalSizing, V::SizingMode(mode)) => {
-            let sizing = match mode {
-                DesignSizingMode::Fixed => fanta_doc::AxisSizing::Fixed,
-                DesignSizingMode::Hug => fanta_doc::AxisSizing::Hug,
-                _ => return None,
-            };
             let horizontal = property == P::HorizontalSizing;
-            Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Group(group) = data
-                    && let Some(layout) = group.auto_layout.as_mut()
-                {
-                    let primary = horizontal == (layout.mode == LayoutMode::Horizontal);
-                    if primary {
-                        layout.primary_sizing = sizing;
-                    } else {
-                        layout.counter_sizing = sizing;
+            let node = doc.scene.get(id)?;
+            let parent_layout = node
+                .parent
+                .and_then(|parent| doc.scene.get(parent))
+                .and_then(|parent| match &parent.data {
+                    NodeData::Group(group) => group.auto_layout,
+                    _ => None,
+                });
+            let mut operations = Vec::new();
+            if let Some(parent_layout) = parent_layout {
+                let primary = horizontal == (parent_layout.mode == LayoutMode::Horizontal);
+                match mode {
+                    DesignSizingMode::Fill => {
+                        return Some(layout_child_operations(doc, id, move |child| {
+                            if primary {
+                                child.grow = 1.0;
+                            } else {
+                                child.align_self = Some(CounterAlign::Stretch);
+                            }
+                        }));
+                    }
+                    DesignSizingMode::Fixed | DesignSizingMode::Hug => {
+                        operations.extend(layout_child_operations(doc, id, move |child| {
+                            if primary {
+                                child.grow = 0.0;
+                            } else if child.align_self == Some(CounterAlign::Stretch) {
+                                child.align_self = None;
+                            }
+                        }));
                     }
                 }
-            }))
+            } else if *mode == DesignSizingMode::Fill {
+                return None;
+            }
+            if matches!(node.data, NodeData::Group(_)) {
+                let sizing = match mode {
+                    DesignSizingMode::Fixed | DesignSizingMode::Fill => {
+                        fanta_doc::AxisSizing::Fixed
+                    }
+                    DesignSizingMode::Hug => fanta_doc::AxisSizing::Hug,
+                };
+                operations.extend(replace_data_operation(doc, id, |data| {
+                    if let NodeData::Group(group) = data
+                        && let Some(layout) = group.auto_layout.as_mut()
+                    {
+                        let primary = horizontal == (layout.mode == LayoutMode::Horizontal);
+                        if primary {
+                            layout.primary_sizing = sizing;
+                        } else {
+                            layout.counter_sizing = sizing;
+                        }
+                    }
+                }));
+            } else if matches!(node.data, NodeData::Text(_)) {
+                operations.extend(replace_data_operation(doc, id, |data| {
+                    if let NodeData::Text(text) = data {
+                        text.auto_resize = match (horizontal, mode) {
+                            (true, DesignSizingMode::Hug) => TextAutoResize::WidthAndHeight,
+                            (false, DesignSizingMode::Hug)
+                                if text.auto_resize == TextAutoResize::WidthAndHeight =>
+                            {
+                                TextAutoResize::WidthAndHeight
+                            }
+                            (false, DesignSizingMode::Hug) => TextAutoResize::Height,
+                            (true, DesignSizingMode::Fixed)
+                                if text.auto_resize == TextAutoResize::WidthAndHeight =>
+                            {
+                                TextAutoResize::Height
+                            }
+                            (_, DesignSizingMode::Fixed) => TextAutoResize::None,
+                            (_, DesignSizingMode::Fill) => text.auto_resize,
+                        };
+                    }
+                }));
+            }
+            Some(operations)
         }
         (P::MinWidth, value)
         | (P::MaxWidth, value)
@@ -3625,6 +5270,20 @@ fn property_operations(
             Some(replace_data_operation(doc, id, |data| {
                 if let NodeData::Text(text) = data {
                     text.vertical_align = align;
+                }
+            }))
+        }
+        (P::TextDecoration, V::TextDecoration(decoration)) => {
+            let underline = *decoration == DesignTextDecoration::Underline;
+            let strikethrough = *decoration == DesignTextDecoration::Strikethrough;
+            Some(replace_data_operation(doc, id, |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.underline = underline;
+                    text.style.strikethrough = strikethrough;
+                    for run in &mut text.style_runs {
+                        run.style.underline = underline;
+                        run.style.strikethrough = strikethrough;
+                    }
                 }
             }))
         }
@@ -3719,17 +5378,141 @@ fn set_independent_corners(data: &mut NodeData, independent: bool) {
     }
 }
 
-fn layout_mode_operations(doc: &Doc, id: NodeId, mode: DesignLayoutMode) -> Vec<Operation> {
+fn parametric_shape_operations(
+    doc: &Doc,
+    id: NodeId,
+    change: impl FnOnce(&mut ParametricShape),
+) -> Vec<Operation> {
+    replace_data_operation(doc, id, |data| {
+        let NodeData::Vector(vector) = data else {
+            return;
+        };
+        let Some(shape) = vector.parametric.as_mut() else {
+            return;
+        };
+        let size = vector.local_size.or_else(|| {
+            vector
+                .path
+                .rough_bounds()
+                .map(|bounds| [bounds.width(), bounds.height()])
+        });
+        let Some([width, height]) = size else {
+            return;
+        };
+        change(shape);
+        vector.path = shape.to_path(width, height);
+    })
+}
+
+fn auto_layout_alignment(layout: fanta_doc::AutoLayout) -> (u8, u8) {
+    let primary = match layout.primary_align {
+        PrimaryAlign::Start | PrimaryAlign::SpaceBetween | PrimaryAlign::SpaceEvenly => 0,
+        PrimaryAlign::Center => 1,
+        PrimaryAlign::End => 2,
+    };
+    let counter = match layout.counter_align {
+        CounterAlign::Start | CounterAlign::Stretch | CounterAlign::Baseline => 0,
+        CounterAlign::Center => 1,
+        CounterAlign::End => 2,
+    };
+    match layout.mode {
+        LayoutMode::Horizontal => (primary, counter),
+        LayoutMode::Vertical => (counter, primary),
+    }
+}
+
+fn set_auto_layout_alignment(layout: &mut fanta_doc::AutoLayout, x: u8, y: u8) {
+    let (primary, counter) = if layout.mode == LayoutMode::Horizontal {
+        (x, y)
+    } else {
+        (y, x)
+    };
+    if !matches!(
+        layout.primary_align,
+        PrimaryAlign::SpaceBetween | PrimaryAlign::SpaceEvenly
+    ) {
+        layout.primary_align = match primary {
+            0 => PrimaryAlign::Start,
+            1 => PrimaryAlign::Center,
+            _ => PrimaryAlign::End,
+        };
+    }
+    layout.counter_align = match counter {
+        0 => CounterAlign::Start,
+        1 => CounterAlign::Center,
+        _ => CounterAlign::End,
+    };
+}
+
+fn auto_layout_operations(
+    doc: &Doc,
+    id: NodeId,
+    change: impl FnOnce(&mut fanta_doc::AutoLayout),
+) -> Vec<Operation> {
+    replace_data_operation(doc, id, |data| {
+        if let NodeData::Group(group) = data
+            && let Some(layout) = group.auto_layout.as_mut()
+        {
+            change(layout);
+        }
+    })
+}
+
+fn layout_child_operations(
+    doc: &Doc,
+    id: NodeId,
+    change: impl FnOnce(&mut LayoutChild),
+) -> Vec<Operation> {
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    let Some(parent_layout) = node
+        .parent
+        .and_then(|parent| doc.scene.get(parent))
+        .and_then(|parent| match &parent.data {
+            NodeData::Group(group) => group.auto_layout,
+            _ => None,
+        })
+    else {
+        return Vec::new();
+    };
+    if !parent_layout.child_layout {
+        return Vec::new();
+    }
+    let old = node.layout_child;
+    let mut child = old.unwrap_or(LayoutChild {
+        grow: 0.0,
+        absolute: false,
+        align_self: None,
+    });
+    change(&mut child);
+    let new = (!child.is_trivial()).then_some(child);
+    if new == old {
+        Vec::new()
+    } else {
+        vec![Operation::SetLayoutChild { id, old, new }]
+    }
+}
+
+fn layout_mode_operations(doc: &Doc, id: NodeId, mode: DesignLayoutMode) -> Option<Vec<Operation>> {
     let target = match mode {
         DesignLayoutMode::None => None,
         DesignLayoutMode::Horizontal => Some(LayoutMode::Horizontal),
         DesignLayoutMode::Vertical => Some(LayoutMode::Vertical),
         DesignLayoutMode::Grid => {
             log::debug!("fig design adapter: grid auto layout is not supported by the engine");
-            return Vec::new();
+            return None;
         }
     };
-    replace_data_operation(doc, id, |data| {
+    let node = doc.scene.get(id)?;
+    if !matches!(node.data, NodeData::Group(_)) {
+        return None;
+    }
+    let size = doc
+        .scene
+        .local_bounds(id)
+        .map(|bounds| [bounds.width(), bounds.height()]);
+    Some(replace_data_operation(doc, id, |data| {
         let NodeData::Group(group) = data else {
             return;
         };
@@ -3738,6 +5521,9 @@ fn layout_mode_operations(doc: &Doc, id: NodeId, mode: DesignLayoutMode) -> Vec<
             Some(mode) => match group.auto_layout.as_mut() {
                 Some(layout) => layout.mode = mode,
                 None => {
+                    if group.local_size.is_none() && group.clip_size.is_none() {
+                        group.local_size = size;
+                    }
                     group.auto_layout = Some(fanta_doc::AutoLayout {
                         mode,
                         ..fanta_doc::AutoLayout::default()
@@ -3745,7 +5531,7 @@ fn layout_mode_operations(doc: &Doc, id: NodeId, mode: DesignLayoutMode) -> Vec<
                 }
             },
         }
-    })
+    }))
 }
 
 fn primary_axis_is_horizontal(doc: &Doc, id: NodeId) -> Option<bool> {
@@ -3765,13 +5551,18 @@ fn primary_axis_is_horizontal(doc: &Doc, id: NodeId) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use fanta_doc::{CanvasNode, Doc, GroupNode, VectorNode};
+    use fanta_doc::{
+        BooleanNode, CanvasNode, ComponentDef, ComponentPropDef, ComponentPropId, Doc, GroupNode,
+        InstanceNode, VectorNode,
+    };
     use fanta_gpui::design::{
-        DesignPageBackground, DesignPageViewData, DesignPaintEdit, DesignPaintTarget,
-        DesignPanelInspectionContext, DesignPanelPermissions, DesignPanelSurface,
+        DesignFontCatalogState, DesignFontSelection, DesignPageBackground, DesignPageViewData,
+        DesignPaintEdit, DesignPaintTarget, DesignPanelInspectionContext, DesignPanelPermissions,
+        DesignPanelSurface, DesignTypographyTarget,
     };
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
     use project::{FakeFs, Project};
@@ -3849,6 +5640,146 @@ mod tests {
         }
         let ids = [ids[0], ids[1], ids[2]];
         (doc, page_id, ids)
+    }
+
+    #[test]
+    fn pattern_picker_settings_write_and_echo_into_the_scene() {
+        let (mut doc, page, [target, source, replacement_source]) = doc_with_three_squares();
+        let candidates = pattern_source_candidates(&doc, target);
+        assert!(candidates.iter().any(|(id, _)| *id == source));
+        assert!(candidates.iter().any(|(id, _)| *id == replacement_source));
+        assert!(
+            candidates
+                .iter()
+                .all(|(id, _)| *id != target && *id != page)
+        );
+        let mut paint = DesignPaint::pattern(source.to_string());
+        let DesignPaintPayload::Pattern(pattern) = &mut paint.payload else {
+            panic!("pattern constructor must create a pattern payload");
+        };
+        pattern.tile_type = DesignPatternTileType::HorizontalHexagonal;
+        pattern.scaling_factor = 0.75;
+        pattern.spacing = fanta_gpui::design::DesignPatternSpacing::new(0.2, 0.35);
+        pattern.horizontal_alignment = DesignPatternHorizontalAlignment::End;
+        let operations = paint_edit_operations(
+            &doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::Payload(paint.payload.clone()),
+        );
+        assert_eq!(operations.len(), 1);
+        doc.apply(operations.into_iter().next().expect("one paint operation"))
+            .expect("apply pattern");
+        let fill = current_paint(&doc, target, false, 0).expect("target fill");
+        let snapshot = crate::properties_snapshot::paint_snapshot(fill, None);
+        let echoed = design_paint(target, "fill", 0, &snapshot, Some(fill));
+        assert_eq!(echoed.payload, paint.payload);
+        let operations = paint_edit_operations(
+            &doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::ModelEdit(DesignPaintEdit {
+                property: DesignPaintProperty::PatternSourceNode,
+                value: DesignPaintValue::PatternSourceNode(replacement_source.to_string().into()),
+            }),
+        );
+        assert_eq!(operations.len(), 1);
+        doc.apply(operations.into_iter().next().expect("one source operation"))
+            .expect("replace source");
+        assert!(matches!(
+            current_paint(&doc, target, false, 0),
+            Some(Fill::Pattern { pattern, .. }) if pattern.source_node_id == replacement_source
+        ));
+        assert!(
+            paint_edit_operations(
+                &doc,
+                target,
+                false,
+                0,
+                &PaintEditValue::ModelEdit(DesignPaintEdit {
+                    property: DesignPaintProperty::PatternSourceNode,
+                    value: DesignPaintValue::PatternSourceNode(target.to_string().into()),
+                }),
+            )
+            .is_empty(),
+            "a pattern cannot source itself"
+        );
+    }
+
+    #[test]
+    fn image_upload_creates_an_asset_and_media_controls_edit_the_fill() {
+        let (mut doc, _page, target) = doc_with_rect();
+        let before = current_paint(&doc, target, false, 0)
+            .expect("rectangle fill")
+            .clone();
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode image");
+        let prepared = PreparedImage::new(bytes).expect("prepare image");
+        let mut stores = crate::document::TestAssetStores::default();
+        assert!(
+            replace_image_paint_with_asset(
+                &mut doc,
+                &mut stores.stores(),
+                target,
+                false,
+                0,
+                &before,
+                prepared,
+            )
+            .expect("apply image fill")
+        );
+        let fill = current_paint(&doc, target, false, 0).expect("image fill");
+        let Fill::Image { asset, .. } = fill else {
+            panic!("upload should create an image fill");
+        };
+        assert!(stores.raw_assets().contains_key(asset));
+        let filter_edit = DesignPaintEdit {
+            property: DesignPaintProperty::MediaFilter(
+                fanta_gpui::design::DesignImageFilter::Contrast,
+            ),
+            value: DesignPaintValue::Number(0.4),
+        };
+        let operations = paint_edit_operations(
+            &doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::ModelEdit(filter_edit),
+        );
+        assert_eq!(operations.len(), 1);
+        doc.apply(operations.into_iter().next().expect("one filter operation"))
+            .expect("apply image filter");
+        let fill = current_paint(&doc, target, false, 0).expect("image fill");
+        let Fill::Image { adjust, .. } = fill else {
+            panic!("filter edit must retain image fill");
+        };
+        assert!((adjust.contrast - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn crop_zoom_and_ratio_produce_a_bounded_window() {
+        let state = DesignMediaCropToolState {
+            active: true,
+            transform: DesignPaintTransform::IDENTITY,
+            zoom: 2.0,
+            aspect_ratio: fanta_gpui::design::DesignMediaCropAspectRatio::Square,
+        };
+        let crop = crop_transform_for_state(state, 2.0).expect("valid crop");
+        assert!((crop.m11 - 0.5).abs() < 1e-6);
+        assert!((crop.m22 - 1.0).abs() < 1e-6);
+        assert!(crop.tx >= 0.0 && crop.ty >= 0.0);
+        assert!(crop.tx + crop.m11 <= 1.0 && crop.ty + crop.m22 <= 1.0);
     }
 
     #[test]
@@ -3961,7 +5892,7 @@ mod tests {
     }
 
     #[test]
-    fn arrange_maps_align_and_distribute_and_declines_tidy_up() {
+    fn arrange_maps_align_distribute_and_tidy_up() {
         let (mut doc, _page, ids) = doc_with_three_squares();
 
         // Align Left leaves the already-leftmost square alone: the engine
@@ -4001,10 +5932,284 @@ mod tests {
             .expect("distribute is wired");
         assert_eq!(ops.len(), 1, "the outermost squares stay anchored");
 
-        assert!(
-            arrange_operations(&doc, &ids, DesignArrangeOperation::TidyUp).is_none(),
-            "Tidy up has no engine equivalent and must be declined, not faked"
+        let mut tidy = doc.clone();
+        let ops = arrange_operations(&tidy, &ids, DesignArrangeOperation::TidyUp)
+            .expect("tidy up is wired");
+        assert!(!ops.is_empty());
+        for op in ops {
+            tidy.apply(op).expect("apply tidy up");
+        }
+        assert!((min_x(&tidy, ids[1]) - 65.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_layout_controls_write_and_echo_container_and_child_values() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let create =
+            crate::layer_context_ops::auto_layout(&doc, rect, Some(LayoutMode::Horizontal))
+                .expect("wrap the rectangle in auto layout");
+        let group = crate::layer_context_ops::created_roots(&create)[0];
+        for operation in create {
+            doc.apply(operation).expect("create layout frame");
+        }
+
+        let mut change = |id, property, value| {
+            let operations = property_operations(&doc, id, property, &value)
+                .expect("the exposed layout control is backed");
+            for operation in operations {
+                doc.apply(operation).expect("apply layout control");
+            }
+        };
+        change(
+            group,
+            DesignPanelProperty::LayoutMode,
+            DesignPanelValue::LayoutMode(DesignLayoutMode::Vertical),
         );
+        change(
+            group,
+            DesignPanelProperty::AutoLayoutAlignment,
+            DesignPanelValue::AutoLayoutAlignment(
+                fanta_gpui::design::DesignAutoLayoutAlignment::new(2, 1),
+            ),
+        );
+        change(
+            group,
+            DesignPanelProperty::ItemSpacingMode,
+            DesignPanelValue::ItemSpacingMode(DesignItemSpacingMode::Auto),
+        );
+        change(
+            group,
+            DesignPanelProperty::PaddingShorthand,
+            DesignPanelValue::NumberList(vec![3.0, 5.0, 7.0, 11.0]),
+        );
+        change(
+            group,
+            DesignPanelProperty::StackingOrder,
+            DesignPanelValue::StackingOrder(DesignStackingOrder::FirstOnTop),
+        );
+        change(
+            group,
+            DesignPanelProperty::IncludeStrokes,
+            DesignPanelValue::Bool(true),
+        );
+        change(
+            rect,
+            DesignPanelProperty::LayoutPositioning,
+            DesignPanelValue::LayoutPositioning(DesignLayoutPositioning::Absolute),
+        );
+        change(
+            rect,
+            DesignPanelProperty::LayoutAlignSelf,
+            DesignPanelValue::LayoutAlignSelf(DesignLayoutAlignSelf::Stretch),
+        );
+        change(
+            rect,
+            DesignPanelProperty::HorizontalSizing,
+            DesignPanelValue::SizingMode(DesignSizingMode::Fill),
+        );
+
+        let node = doc.scene.get(group).expect("layout frame exists");
+        let NodeData::Group(frame) = &node.data else {
+            panic!("the wrapper is a group");
+        };
+        let layout = frame.auto_layout.expect("layout is active");
+        assert_eq!(layout.mode, LayoutMode::Vertical);
+        assert_eq!(layout.primary_align, PrimaryAlign::SpaceBetween);
+        assert_eq!(layout.counter_align, CounterAlign::End);
+        assert_eq!(layout.padding, [3.0, 5.0, 7.0, 11.0]);
+        assert!(layout.reverse_z);
+        assert!(layout.include_strokes);
+        let section = node_section(&doc, group, &master_roots(&doc.components))
+            .expect("layout frame snapshot");
+        let echoed = design_layout(&doc, node, &section).expect("layout controls are visible");
+        assert_eq!(echoed.mode, DesignLayoutMode::Vertical);
+        assert_eq!(echoed.item_spacing_mode, DesignItemSpacingMode::Auto);
+        assert_eq!(echoed.padding, [3.0, 5.0, 7.0, 11.0]);
+        assert_eq!(echoed.stacking_order, DesignStackingOrder::FirstOnTop);
+        assert!(echoed.include_strokes);
+
+        let child = doc.scene.get(rect).expect("rectangle still exists");
+        let child_settings = child.layout_child.expect("child layout settings");
+        assert!(child_settings.absolute);
+        assert_eq!(child_settings.align_self, Some(CounterAlign::Stretch));
+        assert_eq!(child_settings.grow, 0.0);
+        let section =
+            node_section(&doc, rect, &master_roots(&doc.components)).expect("child snapshot");
+        let echoed = design_layout(&doc, child, &section).expect("child controls are visible");
+        assert_eq!(echoed.item.positioning, DesignLayoutPositioning::Absolute);
+        assert_eq!(echoed.item.align_self, DesignLayoutAlignSelf::Stretch);
+        assert_eq!(echoed.horizontal_sizing, DesignSizingMode::Fill);
+    }
+
+    #[test]
+    fn mask_type_and_shape_geometry_changes_echo_into_the_inspector() {
+        let (mut doc, page, rect) = doc_with_rect();
+        let mask_operations = property_operations(
+            &doc,
+            rect,
+            DesignPanelProperty::IsMask,
+            &DesignPanelValue::Bool(true),
+        )
+        .expect("mask toggle is backed");
+        for operation in mask_operations {
+            doc.apply(operation).expect("enable mask");
+        }
+        let mask_type_operations = property_operations(
+            &doc,
+            rect,
+            DesignPanelProperty::MaskType,
+            &DesignPanelValue::MaskType(DesignMaskType::Vector),
+        )
+        .expect("vector mask type is backed");
+        for operation in mask_type_operations {
+            doc.apply(operation).expect("set vector mask");
+        }
+
+        let node = doc.scene.get_mut(rect).expect("rectangle exists");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("rectangle is a vector");
+        };
+        let shape = ParametricShape::Star {
+            points: 5,
+            inner_ratio: 0.5,
+        };
+        vector.path = shape.to_path(200.0, 100.0);
+        vector.local_size = Some([200.0, 100.0]);
+        vector.parametric = Some(shape);
+        let operations = property_operations(
+            &doc,
+            rect,
+            DesignPanelProperty::StarPointCount,
+            &DesignPanelValue::Number(8.0),
+        )
+        .expect("star point count is backed");
+        for operation in operations {
+            doc.apply(operation).expect("change star points");
+        }
+
+        let mut boolean = CanvasNode::new(NodeData::Boolean(BooleanNode::default()));
+        boolean.parent = Some(page);
+        let boolean_id = boolean.id;
+        doc.scene.insert(boolean).expect("insert boolean");
+        let operations = property_operations(
+            &doc,
+            boolean_id,
+            DesignPanelProperty::BooleanOperation,
+            &DesignPanelValue::BooleanOperation(DesignBooleanOperation::Intersect),
+        )
+        .expect("boolean operation is backed");
+        for operation in operations {
+            doc.apply(operation).expect("change boolean operation");
+        }
+
+        let document = FigDocument::from_doc(doc, BTreeMap::new());
+        let masters = master_roots(&document.doc.components);
+        let (star, _) = design_node(&document, rect, &masters).expect("star is projected");
+        assert!(star.is_mask);
+        assert_eq!(star.mask_mode, DesignMaskType::Vector);
+        assert!(matches!(
+            star.shape_geometry,
+            DesignShapeGeometry::Star(DesignStarGeometry { point_count: 8, .. })
+        ));
+        let (boolean, _) =
+            design_node(&document, boolean_id, &masters).expect("boolean is projected");
+        assert!(matches!(
+            boolean.shape_geometry,
+            DesignShapeGeometry::Boolean(DesignBooleanOperation::Intersect)
+        ));
+    }
+
+    #[gpui::test]
+    async fn add_auto_layout_and_direction_are_undoable_from_design_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.node().supports_add_auto_layout());
+            assert!(panel.view_data().projections.add_auto_layout.is_some());
+        });
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::AddAutoLayoutRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![rect.to_string().into()],
+                },
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let group = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let group = *doc.selection.iter().next().expect("wrapper selected");
+            assert_ne!(group, rect);
+            assert_eq!(
+                doc.scene.get(group).expect("group exists").parent,
+                Some(page)
+            );
+            assert_eq!(
+                doc.scene.get(rect).expect("rect exists").parent,
+                Some(group)
+            );
+            let NodeData::Group(frame) = &doc.scene.get(group).expect("group exists").data else {
+                panic!("wrapper is a group");
+            };
+            assert_eq!(
+                frame.auto_layout.expect("layout active").mode,
+                LayoutMode::Horizontal
+            );
+            group
+        });
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyChangeRequested {
+                node_id: group.to_string().into(),
+                property: DesignPanelProperty::LayoutMode,
+                value: DesignPanelValue::LayoutMode(DesignLayoutMode::Vertical),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(frame) = &doc.scene.get(group).expect("group exists").data else {
+                panic!("wrapper is a group");
+            };
+            assert_eq!(
+                frame.auto_layout.expect("layout active").mode,
+                LayoutMode::Vertical
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.node().layout.as_ref().expect("layout echo").mode,
+                DesignLayoutMode::Vertical
+            );
+        });
+        item.update(cx, |item, cx| item.undo(cx).expect("undo direction"));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(frame) = &doc.scene.get(group).expect("group exists").data else {
+                panic!("wrapper is a group");
+            };
+            assert_eq!(
+                frame.auto_layout.expect("layout active").mode,
+                LayoutMode::Horizontal
+            );
+        });
+        item.update(cx, |item, cx| {
+            item.undo(cx).expect("undo auto layout wrapper")
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            assert!(doc.scene.get(group).is_none());
+            assert_eq!(doc.scene.get(rect).expect("rect exists").parent, Some(page));
+        });
     }
 
     #[test]
@@ -4100,6 +6305,219 @@ mod tests {
                 "exports are gated off"
             );
             assert!(!capabilities.aspect_ratio_lock);
+            assert!(!panel.paint_style_view_data().enabled);
+        });
+    }
+
+    #[gpui::test]
+    async fn font_browser_catalog_and_apply_action_update_the_text_layer(cx: &mut TestAppContext) {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut text = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+            "Hello", 100.0, 30.0,
+        )));
+        text.parent = Some(page);
+        let id = text.id;
+        doc.scene.insert(text).expect("insert text");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                !panel
+                    .node()
+                    .typography
+                    .as_ref()
+                    .expect("text typography")
+                    .advanced_type_settings_enabled
+            );
+            let fonts = &panel.view_data().resources.fonts;
+            assert_eq!(fonts.state, DesignFontCatalogState::Ready);
+            assert!(
+                fonts
+                    .font(&DesignFontSelection::local("Source Serif 4", "italic"))
+                    .is_some()
+            );
+        });
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyFontApplyRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::WholeLayer,
+                font: DesignFontSelection::local("Source Serif 4", "italic"),
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Text(text) = &doc.scene.get(id).expect("text exists").data else {
+                panic!("text node");
+            };
+            assert_eq!(text.style.font_family, "Source Serif 4");
+            assert!(text.style.italic);
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn component_color_edit_applies_and_unsupported_value_is_read_only(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, master_root) = doc_with_rect();
+        let component = ComponentId::new();
+        let color_prop = ComponentPropId::new();
+        let unsupported_prop = ComponentPropId::new();
+        let mut definition = ComponentDef::new(component, master_root, "Badge");
+        definition.props = vec![
+            ComponentPropDef {
+                id: color_prop,
+                name: "Tint".into(),
+                kind: ComponentPropKind::Color,
+                formatter: Default::default(),
+                default: VarValue::Color {
+                    value: FantaColor::BLACK,
+                },
+                bindings: Vec::new(),
+            },
+            ComponentPropDef {
+                id: unsupported_prop,
+                name: "Nested component".into(),
+                kind: ComponentPropKind::InstanceSwap,
+                formatter: Default::default(),
+                default: VarValue::String {
+                    value: "Original".into(),
+                },
+                bindings: Vec::new(),
+            },
+        ];
+        doc.components.defs.insert(component, definition);
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [120.0, 60.0],
+        }));
+        instance.parent = Some(page);
+        let id = instance.id;
+        doc.scene.insert(instance).expect("insert instance");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().component_properties.len(), 2);
+            assert!(
+                !panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::ComponentProperty(0))
+                    .is_some_and(DesignPanelPropertyValueState::is_read_only)
+            );
+            assert!(
+                panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::ComponentProperty(1))
+                    .is_some_and(DesignPanelPropertyValueState::is_read_only)
+            );
+            assert_eq!(
+                panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::ComponentProperty(1))
+                    .and_then(DesignPanelPropertyValueState::resolved),
+                Some(&DesignPanelValue::Text("Original".into()))
+            );
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: color_prop.to_string().into(),
+                value: DesignComponentPropertyValue::Text("#33669980".into()),
+            });
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: unsupported_prop.to_string().into(),
+                value: DesignComponentPropertyValue::Text("Changed".into()),
+            });
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: color_prop.to_string().into(),
+                value: DesignComponentPropertyValue::Text("invalid hex".into()),
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Instance(instance) = &doc.scene.get(id).expect("instance exists").data
+            else {
+                panic!("instance node");
+            };
+            assert_eq!(
+                instance.prop_values.get(&color_prop),
+                Some(&VarValue::Color {
+                    value: FantaColor::rgba(0x33, 0x66, 0x99, 0x80),
+                })
+            );
+            assert!(!instance.prop_values.contains_key(&unsupported_prop));
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn property_copy_action_writes_the_displayed_value(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (_view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyCopyRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![rect.to_string().into()],
+                },
+                property: DesignPanelProperty::Width,
+                displayed_value: "200 px".into(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("200 px".to_string())
+        );
+    }
+
+    #[gpui::test]
+    async fn finishing_external_edit_clears_a_stale_crop_session(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, _panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| {
+            view.refresh_gpui_design(cx);
+            let adapter = view.gpui_design.as_mut().expect("design adapter mounted");
+            assert!(adapter.last_echo.is_some());
+            adapter.crop_session = Some(DesignCropSession {
+                node: rect,
+                is_stroke: false,
+                index: 0,
+                state: DesignMediaCropToolState {
+                    active: true,
+                    ..DesignMediaCropToolState::default()
+                },
+            });
+            view.finish_gpui_design_edits(cx);
+            let adapter = view.gpui_design.as_ref().expect("design adapter mounted");
+            assert!(adapter.crop_session.is_none());
+            assert!(adapter.last_echo.is_none());
         });
     }
 
@@ -4209,6 +6627,74 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    #[gpui::test]
+    async fn adding_drop_shadow_by_click_renders_in_the_mounted_inspector(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1200.), px(1600.)));
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let add = cx
+            .debug_bounds("fig-gpui-design-add-effect")
+            .expect("the selected rectangle exposes Add Effect");
+        cx.simulate_click(add.center(), Modifiers::none());
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().effects.len(), 1);
+            assert_eq!(panel.node().effects[0].kind, DesignEffectKind::DropShadow);
+        });
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let shadow = &doc.scene.get(rect).expect("rect exists").effects[0];
+            assert_eq!(shadow.color, default_shadow().color);
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[test]
+    fn effect_edits_reject_nonfinite_filter_values() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let node = doc.scene.get_mut(rect).expect("rect exists");
+        node.effects.push(default_shadow());
+        node.blurs.push(default_blur(BlurKind::Layer));
+
+        for value in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            for property in [
+                DesignPanelProperty::EffectShadowBlur(0),
+                DesignPanelProperty::EffectShadowSpread(0),
+                DesignPanelProperty::EffectShadowOffsetX(0),
+                DesignPanelProperty::EffectShadowOffsetY(0),
+            ] {
+                assert!(
+                    effect_edit_operations(
+                        &doc,
+                        rect,
+                        EffectRef::Shadow(0),
+                        property,
+                        &DesignPanelValue::Number(value),
+                    )
+                    .is_none(),
+                    "nonfinite shadow value must not reach the renderer"
+                );
+            }
+            assert!(
+                effect_edit_operations(
+                    &doc,
+                    rect,
+                    EffectRef::Blur(0),
+                    DesignPanelProperty::EffectBlurRadius(0),
+                    &DesignPanelValue::Number(value),
+                )
+                .is_none(),
+                "nonfinite blur value must not reach the renderer"
+            );
+        }
     }
 
     #[gpui::test]
@@ -4526,6 +7012,77 @@ mod tests {
             doc.scene.get(id).expect("text exists").blend_mode,
             BlendMode::Normal
         );
+    }
+
+    #[test]
+    fn font_catalog_deduplicates_names_and_exposes_italic() {
+        let catalog = design_font_catalog([
+            SharedString::from("Inter"),
+            SharedString::from("inter"),
+            SharedString::from(".Hidden Font"),
+        ]);
+        let inter = catalog
+            .families
+            .iter()
+            .filter(|family| family.name.eq_ignore_ascii_case("Inter"))
+            .collect::<Vec<_>>();
+        assert_eq!(inter.len(), 1);
+        assert!(
+            !catalog
+                .families
+                .iter()
+                .any(|family| family.name.starts_with('.'))
+        );
+        assert!(
+            catalog
+                .font(&DesignFontSelection::local("Inter", "italic"))
+                .is_some_and(|(_, style)| style.italic)
+        );
+    }
+
+    #[test]
+    fn applying_a_font_and_text_decoration_is_undoable() {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut text = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+            "Hello", 100.0, 30.0,
+        )));
+        text.parent = Some(page);
+        let id = text.id;
+        doc.scene.insert(text).expect("insert text");
+
+        let catalog = design_font_catalog(Vec::<SharedString>::new());
+        let (family, style) = catalog
+            .font(&DesignFontSelection::local("Source Serif 4", "italic"))
+            .expect("bundled family and style");
+        for operation in font_apply_operations(&doc, id, family.name.as_ref(), style) {
+            doc.apply(operation).expect("apply font");
+        }
+        for operation in property_operations(
+            &doc,
+            id,
+            DesignPanelProperty::TextDecoration,
+            &DesignPanelValue::TextDecoration(DesignTextDecoration::Underline),
+        )
+        .expect("underline is supported")
+        {
+            doc.apply(operation).expect("apply underline");
+        }
+        let NodeData::Text(text) = &doc.scene.get(id).expect("text node").data else {
+            panic!("node is text");
+        };
+        assert_eq!(text.style.font_family, "Source Serif 4");
+        assert!(text.style.italic);
+        assert!(text.style.underline);
+        assert!(doc.undo().expect("undo underline"));
+        assert!(!matches!(
+            &doc.scene.get(id).expect("text node").data,
+            NodeData::Text(text) if text.style.underline
+        ));
+        assert!(doc.undo().expect("undo font"));
+        assert!(matches!(
+            &doc.scene.get(id).expect("text node").data,
+            NodeData::Text(text) if text.style.font_family == "Inter" && !text.style.italic
+        ));
     }
 
     #[gpui::test]

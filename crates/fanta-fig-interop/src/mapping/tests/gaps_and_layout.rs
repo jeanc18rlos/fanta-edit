@@ -488,10 +488,8 @@ fn imports_luminance_mask_type_and_counts_it() {
 }
 
 #[test]
-fn vector_mask_type_collapses_to_alpha() {
+fn vector_mask_type_is_preserved() {
     use fanta_doc::node::MaskType;
-    // Figma's VECTOR / OUTLINE mask types are the alpha coverage of the shape, so
-    // they import as ALPHA (the renderer's alpha path produces the outline mask).
     let fig = doc_from(vec![o(
         "NodeChange",
         vec![
@@ -504,7 +502,7 @@ fn vector_mask_type_collapses_to_alpha() {
         ],
     )]);
     let (doc, _report, _) = fig_to_doc(&fig).unwrap();
-    assert_eq!(node_named(&doc, "Vec").mask_type, MaskType::Alpha);
+    assert_eq!(node_named(&doc, "Vec").mask_type, MaskType::Vector);
 }
 
 #[test]
@@ -531,7 +529,7 @@ fn vector_family_node_honors_the_mask_flag() {
         "VECTOR maps to a vector node"
     );
     assert!(n.is_mask, "a VECTOR-path node must honor the mask flag");
-    assert_eq!(n.mask_type, MaskType::Alpha, "OUTLINE collapses to ALPHA");
+    assert_eq!(n.mask_type, MaskType::Vector);
     assert_eq!(report.masks_imported, 1);
 }
 

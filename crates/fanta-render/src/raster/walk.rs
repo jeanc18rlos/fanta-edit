@@ -6,8 +6,8 @@ use super::effects::{effects_layer_paint, group_clips_children};
 use super::layer_cache::{LayerCache, LayerLookup, render_layer_via_cache};
 use super::{
     AssetResolver, BlendMode, BooleanCache, Bounds, Canvas, CanvasNode, IdHashMap, ImageCache,
-    InstanceCache, MaskType, NodeData, NodeFlags, NodeId, Paint, PathCache, RenderInputs,
-    RenderMetrics, Scene, Transform2D, apply_background_blur, draw_inner_shadows,
+    InstanceCache, MaskType, NodeData, NodeFlags, NodeId, Paint, PathCache, PatternCache,
+    RenderInputs, RenderMetrics, Scene, Transform2D, apply_background_blur, draw_inner_shadows,
     effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect, paint_node_content,
     paint_node_foreground, render_instance, resolve_bound_value, shadow_expanded_local_bounds,
     to_sk_matrix, visible_effects,
@@ -30,6 +30,8 @@ pub(crate) struct RenderCtx<'a> {
     pub(crate) boolean_cache: &'a mut BooleanCache,
     /// Built vector-node path cache. See [`PathCache`].
     pub(crate) path_cache: &'a mut PathCache,
+    pub(crate) pattern_cache: &'a mut PatternCache,
+    pub(crate) pattern_stack: Vec<NodeId>,
     /// Component library + variable registry + active modes for instance
     /// expansion and the binding overlay.
     pub(crate) inputs: &'a RenderInputs<'a>,
@@ -217,7 +219,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     let scratch = resolve_overlay(ctx, id, node);
     let node: &CanvasNode = scratch.as_deref().unwrap_or(node);
 
-    if node.flags.contains(NodeFlags::HIDDEN) {
+    if node.flags.contains(NodeFlags::HIDDEN) && ctx.pattern_stack.last() != Some(&id) {
         return;
     }
     let opacity = node.opacity.get();

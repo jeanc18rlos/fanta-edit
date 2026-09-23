@@ -80,6 +80,10 @@ pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
         counter_spacing: f("stackCounterSpacing").unwrap_or(0.0),
         counter_auto_spacing,
         padding,
+        include_strokes: matches!(
+            change.get("strokesIncludedInLayout"),
+            Some(KiwiValue::Bool(true))
+        ),
         primary_align,
         counter_align,
         primary_sizing: map_axis_sizing(
@@ -181,8 +185,8 @@ pub(crate) fn read_layout_child(change: &KiwiValue) -> Option<LayoutChild> {
 ///
 /// - `ALPHA` (default, and the fallback when absent) → [`MaskType::Alpha`].
 /// - `LUMINANCE` → [`MaskType::Luminance`].
-/// - `VECTOR` / `OUTLINE` → [`MaskType::Alpha`]: a vector/outline mask is the
-///   alpha coverage of the mask shape, which alpha masking already produces.
+/// - `VECTOR` / `OUTLINE` → [`MaskType::Vector`]: rendered through the alpha
+///   coverage of the mask shape while preserving the editable mask type.
 ///
 /// A change with no/`false` mask flag leaves `node.is_mask == false`, so this is
 /// a no-op on the overwhelming majority of nodes.
@@ -197,7 +201,7 @@ pub(crate) fn read_mask(change: &KiwiValue, node: &mut CanvasNode) {
     node.is_mask = true;
     node.mask_type = match change.get("maskType").and_then(KiwiValue::as_str) {
         Some("LUMINANCE") => MaskType::Luminance,
-        // ALPHA / VECTOR / OUTLINE / absent → alpha coverage of the mask shape.
+        Some("VECTOR") | Some("OUTLINE") => MaskType::Vector,
         _ => MaskType::Alpha,
     };
 }

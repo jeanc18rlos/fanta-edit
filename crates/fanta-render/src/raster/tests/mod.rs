@@ -25,6 +25,7 @@ mod layer_cache;
 mod masks;
 mod media;
 mod motion;
+mod pattern;
 mod shadows;
 mod shapes_basics;
 mod shapes_fill_rule;

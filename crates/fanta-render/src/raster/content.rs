@@ -4,8 +4,9 @@
 //! placed directly in the scene.
 use super::{
     AudioNode, Bounds, Canvas, CanvasNode, Color, Fill, GroupNode, Model3dNode, NodeData, NodeId,
-    Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached, draw_placeholder,
-    draw_text_node, draw_vector, fill_to_paint, rounded_rect_path, stroke_box_path,
+    Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached, draw_pattern_fill,
+    draw_placeholder, draw_text_node, draw_vector, fill_to_paint, rounded_rect_path,
+    stroke_box_path,
 };
 
 /// This node's live playback position (0..=1) from the app-playback→render seam,
@@ -309,7 +310,20 @@ fn paint_group(
     // Drawn as the rounded box path so a rounded card's fill matches its
     // border (no square fill peeking past rounded corners).
     if let (Some(b), Some(path)) = (box_bounds, &box_path) {
+        let background_cleared_viewport =
+            scene_id.is_some() && scene_id == ctx.page_background_root;
         let mut paint_box_fill = |fill: &Fill| {
+            if let Fill::Pattern {
+                pattern,
+                opacity,
+                blend,
+            } = fill
+            {
+                if draw_pattern_fill(canvas, path, b, pattern, *opacity, *blend, ctx) {
+                    return;
+                }
+                ctx.layer_volatile = true;
+            }
             if let Fill::Image {
                 asset,
                 mode,
@@ -364,8 +378,6 @@ fn paint_group(
         // The page root's background was already applied as the full-viewport
         // clear (see `page_background_color`); painting it again here would
         // double-composite a translucent page color over the children rect.
-        let background_cleared_viewport =
-            scene_id.is_some() && scene_id == ctx.page_background_root;
         if let Some(bg) = &g.background
             && !background_cleared_viewport
         {

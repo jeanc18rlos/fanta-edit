@@ -751,6 +751,7 @@ pub(crate) enum HiddenPaintAlpha {
     /// One alpha per gradient stop, in stop order.
     Gradient(Vec<u8>),
     Image(f32),
+    Pattern(f32),
 }
 
 /// The paint-type choices the fill/stroke type selector cycles through.
@@ -837,6 +838,7 @@ pub(crate) fn page_section(
             Some(Fill::Solid { color, .. }) => PageBackgroundValue::Solid(*color),
             Some(Fill::Gradient { .. }) => PageBackgroundValue::Other("Gradient".into()),
             Some(Fill::Image { .. }) => PageBackgroundValue::Other("Image".into()),
+            Some(Fill::Pattern { .. }) => PageBackgroundValue::Other("Pattern".into()),
         }),
         _ => None,
     });
@@ -1708,6 +1710,14 @@ pub(crate) fn paint_snapshot(fill: &Fill, stroke_width: Option<f64>) -> PaintSna
             Some(f64::from(*opacity) * 100.0),
             Some(*blend),
         ),
+        Fill::Pattern { opacity, blend, .. } => (
+            None,
+            "Pattern".into(),
+            None,
+            None,
+            Some(f64::from(*opacity) * 100.0),
+            Some(*blend),
+        ),
     };
     PaintSnapshot {
         color,
@@ -1734,6 +1744,7 @@ pub(crate) fn paint_is_visible(fill: &Fill) -> bool {
             .iter()
             .any(|stop| stop.color.a != 0),
         Fill::Image { opacity, .. } => *opacity > 0.0,
+        Fill::Pattern { opacity, .. } => *opacity > 0.0,
     }
 }
 
@@ -1748,6 +1759,7 @@ pub(crate) fn paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
                 .collect(),
         ),
         Fill::Image { opacity, .. } => HiddenPaintAlpha::Image(*opacity),
+        Fill::Pattern { opacity, .. } => HiddenPaintAlpha::Pattern(*opacity),
     }
 }
 
@@ -1756,6 +1768,7 @@ pub(crate) fn paint_alpha_is_visible(alpha: &HiddenPaintAlpha) -> bool {
         HiddenPaintAlpha::Solid(a) => *a != 0,
         HiddenPaintAlpha::Gradient(stops) => stops.iter().any(|a| *a != 0),
         HiddenPaintAlpha::Image(opacity) => *opacity > 0.0,
+        HiddenPaintAlpha::Pattern(opacity) => *opacity > 0.0,
     }
 }
 
@@ -1765,6 +1778,7 @@ pub(crate) fn zeroed_paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
         HiddenPaintAlpha::Solid(_) => HiddenPaintAlpha::Solid(0),
         HiddenPaintAlpha::Gradient(stops) => HiddenPaintAlpha::Gradient(vec![0; stops.len()]),
         HiddenPaintAlpha::Image(_) => HiddenPaintAlpha::Image(0.0),
+        HiddenPaintAlpha::Pattern(_) => HiddenPaintAlpha::Pattern(0.0),
     }
 }
 
@@ -1775,6 +1789,7 @@ pub(crate) fn opaque_paint_alpha(alpha: &HiddenPaintAlpha) -> HiddenPaintAlpha {
         HiddenPaintAlpha::Solid(_) => HiddenPaintAlpha::Solid(255),
         HiddenPaintAlpha::Gradient(stops) => HiddenPaintAlpha::Gradient(vec![255; stops.len()]),
         HiddenPaintAlpha::Image(_) => HiddenPaintAlpha::Image(1.0),
+        HiddenPaintAlpha::Pattern(_) => HiddenPaintAlpha::Pattern(1.0),
     }
 }
 
@@ -1792,6 +1807,7 @@ pub(crate) fn set_paint_alpha(fill: &mut Fill, alpha: &HiddenPaintAlpha) {
             }
         }
         (Fill::Image { opacity, .. }, HiddenPaintAlpha::Image(value)) => *opacity = *value,
+        (Fill::Pattern { opacity, .. }, HiddenPaintAlpha::Pattern(value)) => *opacity = *value,
         _ => {}
     }
 }

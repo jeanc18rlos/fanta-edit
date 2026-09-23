@@ -30,6 +30,30 @@ fn horizontal_stack_with_spacing_and_padding() {
 }
 
 #[test]
+fn included_inside_stroke_offsets_children_and_hug_size() {
+    let mut tree = VecTree::new();
+    let layout = AutoLayout {
+        primary_sizing: AxisSizing::Hug,
+        counter_sizing: AxisSizing::Hug,
+        include_strokes: true,
+        ..Default::default()
+    };
+    let mut container = frame(999.0, 999.0, layout);
+    if let NodeData::Group(group) = &mut container.data {
+        let mut stroke = crate::style::Stroke::solid(Color::BLACK, 4.0);
+        stroke.align = crate::style::StrokeAlign::Inside;
+        group.strokes.push(stroke);
+    }
+    let frame_id = tree.push(container);
+    let child_id = tree.push(rect_child(frame_id, 20.0, 10.0));
+
+    solve_auto_layout(&mut tree, frame_id, &mut no_measure);
+
+    approx(placed_origin(&tree, child_id), [4.0, 4.0]);
+    approx(placed_size(&tree, frame_id), [28.0, 18.0]);
+}
+
+#[test]
 fn space_evenly_puts_equal_gaps_before_between_and_after() {
     let mut t = VecTree::new();
     let al = AutoLayout {

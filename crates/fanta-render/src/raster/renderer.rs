@@ -8,9 +8,9 @@
 use super::{
     AlphaType, Arc, AssetResolver, BTreeMap, Canvas, Color, ColorType, ComponentLibrary,
     EncodedImageFormat, ExpandedNode, Fill, Hash, Hasher, IdHashMap, ImageCache, ImageInfo,
-    InstanceNode, Instant, LayerCache, LayerEpoch, ModeId, NodeData, NodeId, Rect, RenderCtx,
-    Scene, Surface, VariableCollectionId, VariableRegistry, Viewport, render_node, surfaces,
-    to_sk_color, visible_world_rect,
+    InstanceNode, Instant, LayerCache, LayerEpoch, ModeId, NodeData, NodeId, PatternCache, Rect,
+    RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry, Viewport, render_node,
+    surfaces, to_sk_color, visible_world_rect,
 };
 
 /// Errors returned by the renderer.
@@ -583,6 +583,9 @@ pub struct RasterRenderer {
     /// is via `scene.revision()`, like the boolean cache.
     path_cache: PathCache,
 
+    /// Rasterized node sources reused by node-backed pattern fills.
+    pattern_cache: PatternCache,
+
     /// Cross-frame cache of rendered effect layers (blur / shadow / blend /
     /// opacity-group save-layers), keyed per node and dropped wholesale on
     /// any content edit. See [`LayerCache`] and
@@ -636,6 +639,7 @@ impl RasterRenderer {
             instance_cache: InstanceCache::default(),
             boolean_cache: BooleanCache::default(),
             path_cache: PathCache::default(),
+            pattern_cache: PatternCache::default(),
             layer_cache: LayerCache::default(),
             pixel_snap_pan: false,
             last_scene_instance_id: None,
@@ -713,6 +717,7 @@ impl RasterRenderer {
     /// Cheap — stores an [`Arc`] clone; no decode happens here.
     pub fn set_asset_resolver(&mut self, resolver: Arc<dyn AssetResolver>) {
         self.asset_resolver = Some(resolver);
+        self.pattern_cache.clear();
     }
 
     /// Drop every cached uploaded image. Assets are content-addressed and
@@ -721,6 +726,7 @@ impl RasterRenderer {
     /// documents) or after swapping the asset resolver for an unrelated store.
     pub fn clear_image_cache(&mut self) {
         self.image_cache.clear();
+        self.pattern_cache.clear();
     }
 
     /// Number of images currently held in the upload cache. Primarily for
@@ -746,6 +752,7 @@ impl RasterRenderer {
     /// feeds the asset GC, which is keyed by asset id). Returns whether an entry
     /// was present.
     pub fn invalidate_image(&mut self, id: fanta_doc::AssetId) -> bool {
+        self.pattern_cache.clear();
         self.image_cache.remove(id)
     }
 
@@ -990,6 +997,7 @@ impl RasterRenderer {
         let instance_cache = &mut self.instance_cache;
         let boolean_cache = &mut self.boolean_cache;
         let path_cache = &mut self.path_cache;
+        let pattern_cache = &mut self.pattern_cache;
         let layer_cache = &mut self.layer_cache;
         let pixel_snap_pan = self.pixel_snap_pan;
         let canvas = self.surface.canvas();
@@ -1005,6 +1013,7 @@ impl RasterRenderer {
             instance_cache,
             boolean_cache,
             path_cache,
+            pattern_cache,
             layer_cache,
             pixel_snap_pan,
             scene,
@@ -1083,6 +1092,7 @@ impl RasterRenderer {
         let instance_cache = &mut self.instance_cache;
         let boolean_cache = &mut self.boolean_cache;
         let path_cache = &mut self.path_cache;
+        let pattern_cache = &mut self.pattern_cache;
         let layer_cache = &mut self.layer_cache;
         let pixel_snap_pan = self.pixel_snap_pan;
 
@@ -1097,6 +1107,7 @@ impl RasterRenderer {
             instance_cache,
             boolean_cache,
             path_cache,
+            pattern_cache,
             layer_cache,
             pixel_snap_pan,
             scene,
@@ -1203,6 +1214,7 @@ impl RasterRenderer {
         let instance_cache = &mut self.instance_cache;
         let boolean_cache = &mut self.boolean_cache;
         let path_cache = &mut self.path_cache;
+        let pattern_cache = &mut self.pattern_cache;
         let layer_cache = &mut self.layer_cache;
         let canvas = self.surface.canvas();
         Self::draw_tile_onto(
@@ -1218,6 +1230,7 @@ impl RasterRenderer {
             instance_cache,
             boolean_cache,
             path_cache,
+            pattern_cache,
             layer_cache,
             scene,
             viewport,
@@ -1255,6 +1268,7 @@ impl RasterRenderer {
         let instance_cache = &mut self.instance_cache;
         let boolean_cache = &mut self.boolean_cache;
         let path_cache = &mut self.path_cache;
+        let pattern_cache = &mut self.pattern_cache;
         let layer_cache = &mut self.layer_cache;
         Self::draw_tile_onto(
             canvas,
@@ -1269,6 +1283,7 @@ impl RasterRenderer {
             instance_cache,
             boolean_cache,
             path_cache,
+            pattern_cache,
             layer_cache,
             scene,
             viewport,
@@ -1297,6 +1312,7 @@ impl RasterRenderer {
         instance_cache: &mut InstanceCache,
         boolean_cache: &mut BooleanCache,
         path_cache: &mut PathCache,
+        pattern_cache: &mut PatternCache,
         layer_cache: &mut LayerCache,
         scene: &Scene,
         viewport: &Viewport,
@@ -1331,6 +1347,8 @@ impl RasterRenderer {
             instance_cache,
             boolean_cache,
             path_cache,
+            pattern_cache,
+            pattern_stack: Vec::new(),
             inputs,
             instance_mode_anchor: None,
             resolved_local_transforms: IdHashMap::default(),
@@ -1378,6 +1396,7 @@ impl RasterRenderer {
         instance_cache: &mut InstanceCache,
         boolean_cache: &mut BooleanCache,
         path_cache: &mut PathCache,
+        pattern_cache: &mut PatternCache,
         layer_cache: &mut LayerCache,
         pixel_snap_pan: bool,
         scene: &Scene,
@@ -1462,6 +1481,8 @@ impl RasterRenderer {
             instance_cache,
             boolean_cache,
             path_cache,
+            pattern_cache,
+            pattern_stack: Vec::new(),
             inputs,
             instance_mode_anchor: None,
             resolved_local_transforms: IdHashMap::default(),

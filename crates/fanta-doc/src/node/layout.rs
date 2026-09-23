@@ -117,6 +117,9 @@ pub struct AutoLayout {
     /// the same fallback chain OpenPencil uses.
     #[serde(default)]
     pub padding: [f64; 4],
+    /// Reserve the frame's own inside stroke width as part of its content inset.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_strokes: bool,
     /// Distribution of children along the primary axis.
     #[serde(default)]
     pub primary_align: PrimaryAlign,
@@ -178,6 +181,7 @@ impl Default for AutoLayout {
             counter_spacing: 0.0,
             counter_auto_spacing: false,
             padding: [0.0; 4],
+            include_strokes: false,
             primary_align: PrimaryAlign::default(),
             counter_align: CounterAlign::default(),
             primary_sizing: AxisSizing::default(),

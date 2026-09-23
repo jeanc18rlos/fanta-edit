@@ -37,6 +37,7 @@ use crate::node::{
     AutoLayout, AxisSizing, CanvasNode, CounterAlign, LayoutMode, NodeData, NodeFlags,
     PrimaryAlign, TextAutoResize, TextNode,
 };
+use crate::style::StrokeAlign;
 use crate::transform::Transform2D;
 use glam::{DMat2, DVec2};
 use size::{LocalBox, local_box, set_size};
@@ -176,7 +177,29 @@ fn solve_node<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut Measure) {
 /// cursor makes the whole subtree vanish — so non-finite values collapse to 0.
 fn auto_layout_of<T: LayoutTree>(tree: &T, id: NodeId) -> Option<AutoLayout> {
     let mut al = match &tree.node(id)?.data {
-        NodeData::Group(g) => g.auto_layout?,
+        NodeData::Group(g) => {
+            let mut al = g.auto_layout?;
+            if al.include_strokes {
+                let mut inset = [0.0_f64; 4];
+                for stroke in &g.strokes {
+                    let fraction = match stroke.align {
+                        StrokeAlign::Inside => 1.0,
+                        StrokeAlign::Center => 0.5,
+                        StrokeAlign::Outside => 0.0,
+                    };
+                    let widths = stroke.per_side.unwrap_or([stroke.width; 4]);
+                    for (current, width) in inset.iter_mut().zip(widths) {
+                        if width.is_finite() {
+                            *current = (*current).max(width.max(0.0) * fraction);
+                        }
+                    }
+                }
+                for (padding, inset) in al.padding.iter_mut().zip(inset) {
+                    *padding += inset;
+                }
+            }
+            al
+        }
         _ => return None,
     };
     let finite_or_zero = |value: f64| if value.is_finite() { value } else { 0.0 };

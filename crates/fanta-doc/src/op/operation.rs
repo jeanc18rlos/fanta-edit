@@ -11,7 +11,7 @@ use crate::id::{
 };
 use crate::index::IndexKey;
 use crate::motion::{AnimationClip, AnimationTrack, Keyframe, MotionTarget};
-use crate::node::{CanvasNode, LayoutChild, NodeData, NodeFlags, Override, Reaction};
+use crate::node::{CanvasNode, LayoutChild, MaskType, NodeData, NodeFlags, Override, Reaction};
 use crate::op::ModeScope;
 use crate::style::{BlendMode, Blur, Shadow, UnitInterval};
 use crate::transform::Transform2D;
@@ -116,6 +116,13 @@ pub enum Operation {
 
     /// Toggle whether this node masks following siblings.
     SetMask { id: NodeId, old: bool, new: bool },
+
+    /// Change whether a mask uses alpha or luminance.
+    SetMaskType {
+        id: NodeId,
+        old: MaskType,
+        new: MaskType,
+    },
 
     /// Change how a node participates as a child of an auto-layout parent
     /// (FILL/grow, absolute positioning, per-child align-self).
@@ -431,6 +438,7 @@ impl Operation {
             | Self::SetBlurs { id, .. }
             | Self::SetFlags { id, .. }
             | Self::SetMask { id, .. }
+            | Self::SetMaskType { id, .. }
             | Self::SetLayoutChild { id, .. }
             | Self::ReplaceData { id, .. }
             | Self::SetInstanceOverride { id, .. }
@@ -474,6 +482,7 @@ impl Operation {
             Self::SetBlurs { .. } => "Blur",
             Self::SetFlags { .. } => "Flags",
             Self::SetMask { .. } => "Mask",
+            Self::SetMaskType { .. } => "Mask type",
             Self::SetLayoutChild { .. } => "Layout Child",
             Self::ReplaceData { .. } => "Edit",
             Self::CreateInstance { .. } => "Insert Instance",

@@ -43,11 +43,11 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
                 paint.set_blend_mode(to_sk_blend_mode(*blend));
             }
         }
-        Fill::Image { .. } => {
-            // Image fills are resolved by the renderer (it knows the asset
-            // store) and applied as a shader at draw time. The paint we hand
-            // back here is a transparent-magenta placeholder so missing-asset
-            // states are visible in debugging.
+        Fill::Image { .. } | Fill::Pattern { .. } => {
+            // Image and pattern fills are resolved by the renderer (it knows the
+            // asset store and scene) and applied as shaders at draw time. The
+            // paint we hand back here is a transparent-magenta placeholder so
+            // missing sources are visible in debugging.
             paint.set_color(to_sk_color(fanta_doc::Color::rgba(255, 0, 255, 64)));
         }
     }

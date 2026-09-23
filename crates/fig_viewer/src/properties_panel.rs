@@ -1575,7 +1575,9 @@ impl FantaPropertiesPanel {
             move |data| {
                 if let Some(paint) = paint_slot_mut(data, index, is_stroke) {
                     match paint {
-                        Fill::Gradient { blend: slot, .. } | Fill::Image { blend: slot, .. } => {
+                        Fill::Gradient { blend: slot, .. }
+                        | Fill::Image { blend: slot, .. }
+                        | Fill::Pattern { blend: slot, .. } => {
                             *slot = blend;
                         }
                         Fill::Solid { .. } => {}

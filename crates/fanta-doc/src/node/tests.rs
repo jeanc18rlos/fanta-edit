@@ -124,6 +124,13 @@ fn mask_defaults_are_skipped_and_round_trip() {
     assert!(back.is_mask);
     assert_eq!(back.mask_type, MaskType::Luminance);
 
+    let mut vector = mask;
+    vector.mask_type = MaskType::Vector;
+    let json = serde_json::to_value(&vector).unwrap();
+    assert_eq!(json["mask_type"], "vector");
+    let restored: CanvasNode = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.mask_type, MaskType::Vector);
+
     // An ALPHA mask serializes the flag but skips the default type.
     let mut alpha = plain;
     alpha.is_mask = true;
@@ -587,6 +594,7 @@ fn auto_layout_round_trips_and_is_back_compat() {
         counter_spacing: 4.0,
         counter_auto_spacing: true,
         padding: [10.0, 12.0, 10.0, 12.0],
+        include_strokes: true,
         primary_align: PrimaryAlign::SpaceBetween,
         counter_align: CounterAlign::Stretch,
         primary_sizing: AxisSizing::Hug,
@@ -606,6 +614,7 @@ fn auto_layout_round_trips_and_is_back_compat() {
     let j = serde_json::to_value(&g).unwrap();
     assert_eq!(j["auto_layout"]["mode"], "vertical");
     assert_eq!(j["auto_layout"]["primary_align"], "space_between");
+    assert_eq!(j["auto_layout"]["include_strokes"], true);
     assert_eq!(j["auto_layout"]["counter_align"], "stretch");
     assert_eq!(j["auto_layout"]["primary_sizing"], "hug");
     assert_eq!(j["auto_layout"]["counter_sizing"], "fixed");

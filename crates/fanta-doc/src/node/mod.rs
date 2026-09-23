@@ -371,18 +371,20 @@ bitflags! {
 ///
 /// Maps from Figma's `maskType` (Kiwi `maskType`): `ALPHA` (the default) →
 /// [`MaskType::Alpha`]; `LUMINANCE` → [`MaskType::Luminance`]; `VECTOR` /
-/// `OUTLINE` are treated as alpha of the vector shape, so they also map to
-/// [`MaskType::Alpha`] (the mask shape's coverage is its outline). The renderer
+/// `OUTLINE` → [`MaskType::Vector`]. Vector masks use the same alpha coverage
+/// as alpha masks while retaining their type for editing and round-tripping. The renderer
 /// composites masked siblings against the mask with `DstIn`: ALPHA uses the
 /// mask's painted alpha directly; LUMINANCE first runs the mask's pixels through
 /// a luma→alpha color filter so brighter mask pixels reveal more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaskType {
-    /// Mask by the mask shape's ALPHA coverage (the default). Also the target for
-    /// Figma's `VECTOR`/`OUTLINE` mask type.
+    /// Mask by the mask shape's ALPHA coverage (the default).
     #[default]
     Alpha,
+    /// Mask by the painted vector shape's alpha coverage. This currently
+    /// composites the same way as an alpha mask.
+    Vector,
     /// Mask by the mask's painted LUMINANCE — brighter mask pixels reveal more of
     /// the masked siblings, black hides them.
     Luminance,

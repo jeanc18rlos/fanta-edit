@@ -6,7 +6,7 @@
 //! per-paint sampling.
 
 use crate::color::{Color, Gradient};
-use crate::id::AssetId;
+use crate::id::{AssetId, NodeId};
 use crate::serde_util::{default_opacity, is_default_opacity, is_false};
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +169,61 @@ pub enum Fill {
         #[serde(default, skip_serializing_if = "ImageAdjust::is_default")]
         adjust: ImageAdjust,
     },
+    /// A live scene node repeated as a pattern. The referenced node stays in
+    /// the document, so changing it updates every fill that uses it.
+    Pattern {
+        pattern: Box<PatternFill>,
+        #[serde(
+            default = "default_opacity",
+            skip_serializing_if = "is_default_opacity"
+        )]
+        opacity: f32,
+        #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+        blend: BlendMode,
+    },
+}
+
+/// Placement of a node-backed pattern fill. Spacing is expressed as a
+/// fraction of the rendered source width/height, as in the Design picker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatternFill {
+    pub source_node_id: NodeId,
+    #[serde(default)]
+    pub tile_type: PatternTileType,
+    #[serde(default = "default_pattern_scale")]
+    pub scaling_factor: f32,
+    #[serde(default)]
+    pub spacing: PatternSpacing,
+    #[serde(default)]
+    pub horizontal_alignment: PatternHorizontalAlignment,
+}
+
+fn default_pattern_scale() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternTileType {
+    #[default]
+    Rectangular,
+    HorizontalHexagonal,
+    VerticalHexagonal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct PatternSpacing {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternHorizontalAlignment {
+    Start,
+    #[default]
+    Center,
+    End,
 }
 
 impl Fill {
@@ -186,7 +241,7 @@ impl Fill {
     pub fn solid_color(&self) -> Option<Color> {
         match self {
             Self::Solid { color, .. } => Some(*color),
-            Self::Gradient { .. } | Self::Image { .. } => None,
+            Self::Gradient { .. } | Self::Image { .. } | Self::Pattern { .. } => None,
         }
     }
 
@@ -199,7 +254,7 @@ impl Fill {
     pub fn set_solid_color(&mut self, color: Color) {
         match self {
             Self::Solid { color: c, .. } => *c = color,
-            Self::Gradient { .. } | Self::Image { .. } => {
+            Self::Gradient { .. } | Self::Image { .. } | Self::Pattern { .. } => {
                 *self = Self::Solid {
                     color,
                     blend: BlendMode::Normal,
@@ -425,6 +480,40 @@ mod tests {
         let f = Fill::solid(Color::rgb(255, 0, 0));
         let j = serde_json::to_value(&f).unwrap();
         assert_eq!(j["kind"], "solid");
+    }
+
+    #[test]
+    fn pattern_fill_round_trips_all_picker_controls() {
+        let source_node_id = NodeId::new();
+        for tile_type in [
+            PatternTileType::Rectangular,
+            PatternTileType::HorizontalHexagonal,
+            PatternTileType::VerticalHexagonal,
+        ] {
+            for horizontal_alignment in [
+                PatternHorizontalAlignment::Start,
+                PatternHorizontalAlignment::Center,
+                PatternHorizontalAlignment::End,
+            ] {
+                let fill = Fill::Pattern {
+                    pattern: Box::new(PatternFill {
+                        source_node_id,
+                        tile_type,
+                        scaling_factor: 0.75,
+                        spacing: PatternSpacing { x: 0.2, y: 0.3 },
+                        horizontal_alignment,
+                    }),
+                    opacity: 0.6,
+                    blend: BlendMode::Multiply,
+                };
+                let json = serde_json::to_string(&fill).expect("serialize pattern");
+                assert!(json.contains("\"kind\":\"pattern\""));
+                assert_eq!(
+                    serde_json::from_str::<Fill>(&json).expect("deserialize pattern"),
+                    fill
+                );
+            }
+        }
     }
 
     #[test]

@@ -109,7 +109,8 @@ pub use snapshot::{
 };
 pub use spatial::SpatialIndex;
 pub use style::{
-    BlendMode, Blur, BlurKind, Fill, ImageAdjust, ImageFitMode, Shadow, ShadowKind, Stroke,
+    BlendMode, Blur, BlurKind, Fill, ImageAdjust, ImageFitMode, PatternFill,
+    PatternHorizontalAlignment, PatternSpacing, PatternTileType, Shadow, ShadowKind, Stroke,
     StrokeAlign, StrokeCap, StrokeJoin, UnitInterval,
 };
 pub use transform::{Bounds, Transform2D};

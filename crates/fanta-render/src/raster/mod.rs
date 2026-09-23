@@ -91,6 +91,7 @@ mod effects;
 mod instance;
 mod layer_cache;
 mod media;
+mod pattern;
 mod renderer;
 mod text;
 mod vector;
@@ -126,6 +127,7 @@ pub(crate) use effects::{
 };
 pub(crate) use instance::render_instance;
 pub(crate) use layer_cache::{LayerCache, LayerEpoch};
+pub(crate) use pattern::{PatternCache, draw_pattern_fill, pattern_paint};
 pub(crate) use renderer::{
     BooleanCache, CachedVectorPaths, InstanceCache, InstanceCacheKey, PathCache,
 };

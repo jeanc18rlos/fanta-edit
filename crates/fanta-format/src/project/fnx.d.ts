@@ -83,6 +83,8 @@ declare global {
   }
 
   type FnxImageFitMode = "fill" | "fit" | "stretch" | "tile";
+  type FnxPatternTileType = "rectangular" | "horizontal_hexagonal" | "vertical_hexagonal";
+  type FnxPatternHorizontalAlignment = "start" | "center" | "end";
   type FnxFill =
     | { kind: "solid"; color: FnxColor; blend?: FnxBlendMode }
     | { kind: "gradient"; gradient: FnxGradient; blend?: FnxBlendMode }
@@ -96,6 +98,18 @@ declare global {
         rotation?: number;
         blend?: FnxBlendMode;
         adjust?: FnxImageAdjust;
+      }
+    | {
+        kind: "pattern";
+        pattern: {
+          source_node_id: string;
+          tile_type?: FnxPatternTileType;
+          scaling_factor?: number;
+          spacing?: { x: number; y: number };
+          horizontal_alignment?: FnxPatternHorizontalAlignment;
+        };
+        opacity?: number;
+        blend?: FnxBlendMode;
       };
 
   interface FnxStroke {
@@ -129,6 +143,7 @@ declare global {
     counter_spacing?: number;
     counter_auto_spacing?: boolean;
     padding?: readonly [number, number, number, number];
+    include_strokes?: boolean;
     primary_align?: "start" | "center" | "end" | "space_between" | "space_evenly";
     counter_align?: "start" | "center" | "end" | "stretch" | "baseline";
     primary_sizing?: "fixed" | "hug";
@@ -218,7 +233,7 @@ declare global {
     /** iOS-squircle amount, 0..=1. */
     corner_smoothing?: number;
     is_mask?: boolean;
-    mask_type?: "alpha" | "luminance";
+    mask_type?: "alpha" | "vector" | "luminance";
     /** Behavior while an ancestor frame scrolls. */
     scroll_behavior?: "scrolls" | "fixed" | "sticky";
     /**

@@ -32,9 +32,10 @@
 
 use fanta_doc::NodeId;
 use fanta_gpui::design::{
-    DesignColor, DesignPageBackground, DesignPageViewData, DesignPanelInspectionContext,
-    DesignPanelMultipleSelection, DesignPanelParentLayout, DesignPanelPermissions,
-    DesignPanelTarget, DesignPanelTargetedSelectionHeader, DesignPanelViewData,
+    DesignAddAutoLayoutViewData, DesignColor, DesignPageBackground, DesignPageViewData,
+    DesignPanelInspectionContext, DesignPanelMultipleSelection, DesignPanelParentLayout,
+    DesignPanelPermissions, DesignPanelTarget, DesignPanelTargetedSelectionHeader,
+    DesignPanelViewData,
 };
 
 use super::design::{
@@ -138,6 +139,22 @@ pub(crate) fn build_design_view_data(
     let mut view_data = DesignPanelViewData::new(context);
     view_data.property_states = states.into_iter().collect();
     view_data.projections.page = page_data.or(previous_page);
+    if editable
+        && !selection.is_empty()
+        && selection
+            .iter()
+            .all(|id| crate::layer_context_ops::editable(doc, *id))
+    {
+        view_data.projections.add_auto_layout = Some(DesignAddAutoLayoutViewData::eligible(
+            DesignPanelTarget::Nodes {
+                node_ids: selection
+                    .iter()
+                    .map(ToString::to_string)
+                    .map(Into::into)
+                    .collect(),
+            },
+        ));
+    }
     view_data.projections.selection_header = selection_header_for_doc(
         doc,
         selection,

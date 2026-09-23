@@ -3,8 +3,8 @@
 //! the debug placeholder / unresolved-instance outline helpers.
 use super::{
     Bounds, CachedVectorPaths, Canvas, Color, Fill, ImageFillMods, NodeId, Paint, Rect, RenderCtx,
-    draw_image_cached, fill_to_paint, scale_paint_alpha, stroke_to_paint, to_sk_color,
-    to_sk_fill_path, to_sk_path,
+    draw_image_cached, draw_pattern_fill, fill_to_paint, pattern_paint, scale_paint_alpha,
+    stroke_to_paint, to_sk_color, to_sk_fill_path, to_sk_path,
 };
 
 /// Whether a [`PathData`] is an axis-aligned rectangle (the shape `corner_radius`
@@ -166,7 +166,7 @@ pub(crate) fn stroke_sk_path(
         // width path below. (Per-side already self-guards each zero-width edge, so
         // the uniform-width guard below does not apply when `per_side` is set.)
         if let Some(sides) = stroke.per_side {
-            if draw_per_side_border(canvas, sk_path, stroke, sides, local_bounds_f32) {
+            if draw_per_side_border(canvas, sk_path, stroke, sides, local_bounds_f32, ctx) {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
@@ -194,6 +194,13 @@ pub(crate) fn stroke_sk_path(
             }
             // Missing / still-decoding asset: placeholder stroke below, and
             // no enclosing effects layer may be cached from this frame.
+            ctx.layer_volatile = true;
+        }
+        if matches!(stroke.paint, Fill::Pattern { .. }) {
+            if draw_pattern_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
+                ctx.metrics.nodes_drawn += 1;
+                continue;
+            }
             ctx.layer_volatile = true;
         }
         // `ctx.paint_alpha` is 1.0 unless the walk folded this leaf's node
@@ -310,6 +317,49 @@ fn draw_image_stroke(
     drawn
 }
 
+fn draw_pattern_stroke(
+    canvas: &Canvas,
+    sk_path: &skia_safe::Path,
+    stroke: &fanta_doc::Stroke,
+    local_bounds_f32: [f32; 4],
+    ctx: &mut RenderCtx,
+) -> bool {
+    let Fill::Pattern {
+        pattern,
+        opacity,
+        blend,
+    } = &stroke.paint
+    else {
+        return false;
+    };
+    let mut geometry = stroke_to_paint(stroke, local_bounds_f32);
+    if !matches!(stroke.align, fanta_doc::StrokeAlign::Center) {
+        geometry.set_stroke_width((stroke.width * 2.0) as f32);
+    }
+    let mut outline = skia_safe::Path::new();
+    if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geometry, &mut outline, None, None) {
+        return false;
+    }
+    let [x, y, width, height] = local_bounds_f32;
+    let bounds = Bounds::from_xywh(x as f64, y as f64, width as f64, height as f64);
+    let Some(paint) = pattern_paint(bounds, pattern, *opacity, *blend, ctx) else {
+        return false;
+    };
+    canvas.save();
+    match stroke.align {
+        fanta_doc::StrokeAlign::Inside => {
+            canvas.clip_path(sk_path, skia_safe::ClipOp::Intersect, true);
+        }
+        fanta_doc::StrokeAlign::Outside => {
+            canvas.clip_path(sk_path, skia_safe::ClipOp::Difference, true);
+        }
+        fanta_doc::StrokeAlign::Center => {}
+    }
+    canvas.draw_path(&outline, &paint);
+    canvas.restore();
+    true
+}
+
 pub(crate) fn stroke_box_path(
     canvas: &Canvas,
     local_bounds_f32: [f32; 4],
@@ -331,7 +381,7 @@ pub(crate) fn stroke_box_path(
     for stroke in strokes {
         if let Some(sides) = stroke.per_side {
             let box_path = original_path();
-            if draw_per_side_border(canvas, &box_path, stroke, sides, local_bounds_f32) {
+            if draw_per_side_border(canvas, &box_path, stroke, sides, local_bounds_f32, ctx) {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
@@ -345,7 +395,7 @@ pub(crate) fn stroke_box_path(
         // An image-paint box border can't be a color/shader stroke; route it
         // through the outline-and-clip path (`stroke_sk_path` → `draw_image_stroke`)
         // on the box outline so the ring is filled with the image.
-        if matches!(stroke.paint, Fill::Image { .. }) {
+        if matches!(stroke.paint, Fill::Image { .. } | Fill::Pattern { .. }) {
             let box_path = original_path();
             stroke_sk_path(
                 canvas,
@@ -473,6 +523,7 @@ pub(crate) fn draw_per_side_border(
     stroke: &fanta_doc::Stroke,
     sides: [f64; 4],
     local_bounds_f32: [f32; 4],
+    ctx: &mut RenderCtx,
 ) -> bool {
     let [x, y, w, h] = local_bounds_f32;
     if w <= 0.0 || h <= 0.0 {
@@ -480,7 +531,23 @@ pub(crate) fn draw_per_side_border(
     }
     // A fill paint sampled from the stroke's paint over the box bounds (so a
     // gradient border maps across the whole box just like a uniform stroke).
-    let mut paint = stroke_to_paint(stroke, local_bounds_f32);
+    let mut paint = if let Fill::Pattern {
+        pattern,
+        opacity,
+        blend,
+    } = &stroke.paint
+    {
+        let bounds = Bounds::from_xywh(x as f64, y as f64, w as f64, h as f64);
+        match pattern_paint(bounds, pattern, *opacity, *blend, ctx) {
+            Some(paint) => paint,
+            None => {
+                ctx.layer_volatile = true;
+                stroke_to_paint(stroke, local_bounds_f32)
+            }
+        }
+    } else {
+        stroke_to_paint(stroke, local_bounds_f32)
+    };
     paint.set_style(skia_safe::paint::Style::Fill);
     paint.set_path_effect(None); // edges are solid bands, not dashed lines
 
@@ -820,6 +887,17 @@ pub(crate) fn paint_path_fills(
 ) {
     let local_bounds_f32 = bounds_to_f32(&bounds);
     for fill in fills {
+        if let Fill::Pattern {
+            pattern,
+            opacity,
+            blend,
+        } = fill
+        {
+            if draw_pattern_fill(canvas, fill_path, bounds, pattern, *opacity, *blend, ctx) {
+                continue;
+            }
+            ctx.layer_volatile = true;
+        }
         // Image fills route through the same decode/fit path as BitmapNode:
         // clip to the path, then draw the image fitted to the path's bounding
         // box. `paint.rs` cannot do this (it has no resolver), so the renderer
