@@ -3490,36 +3490,49 @@ impl FigView {
     // === Pages ============================================================
 
     pub fn select_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self
+            .item
+            .read(cx)
+            .document()
+            .is_none_or(|document| index >= document.pages.len())
+        {
+            return;
+        }
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
-        let (root, prewarm) = self
-            .item
-            .update(cx, |item, cx| {
-                item.with_document(cx, |document| {
-                    document.ensure_page_solved(index);
-                    let root = document.pages.get(index).and_then(|page| page.root);
-                    if document.doc.set_active_page(root) {
-                        document.doc.selection.clear();
-                    }
-                    let prewarm = root.and_then(|root| document.take_page_prewarm(root));
-                    ((root, prewarm), DocChange::Selection)
-                })
+        let Some(root) = self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.ensure_page_solved(index);
+                let root = document.pages.get(index).and_then(|page| page.root);
+                let changed = document.doc.set_active_page(root);
+                if changed {
+                    document.doc.selection.clear();
+                }
+                (
+                    root,
+                    if changed {
+                        DocChange::Selection
+                    } else {
+                        DocChange::None
+                    },
+                )
             })
-            .unwrap_or((None, None));
-        if let Some(prewarm) = prewarm {
-            // Decoding the page's images here would stall the frame that
-            // shows it; the render thread picks up whatever has landed.
-            cx.background_spawn(async move { prewarm.run() }).detach();
-        }
+        }) else {
+            return;
+        };
+        let changed_for_view = self.last_seen_root != root;
         self.selected_page_index = Some(index);
         self.selected_page_root = root;
         // Focus re-assertion must follow in-tab navigation: this tab now
         // means this page, and the root it shows is already current.
         self.scope = root.map(FigScope::Page);
         self.last_seen_root = root;
-        self.viewport = None;
-        self.hovered_node = None;
+        if changed_for_view {
+            self.viewport = None;
+            self.hovered_node = None;
+            self.invalidate_canvas_cache();
+        }
         cx.notify();
     }
 
@@ -5206,7 +5219,9 @@ impl Render for FigView {
             // event (a preloaded document); memoized, so later frames skip.
             self.refresh_gpui_design(cx);
             self.refresh_properties_inspector(window, cx);
-            self.refresh_shared_timeline(window, cx);
+            if editor_mode == EditorMode::Motion {
+                self.refresh_shared_timeline(window, cx);
+            }
         }
         let cursor_style = match &self.text_edit {
             // The I-beam over the edited text, an arrow elsewhere — clicking
@@ -8170,6 +8185,58 @@ mod tests {
         id
     }
 
+    #[gpui::test]
+    async fn selecting_the_current_page_preserves_its_viewport(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, first_page, second_page) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("view");
+        let zoomed = Viewport {
+            center: [120.0, -40.0],
+            zoom: 3.0,
+        };
+
+        view.update(cx, |view, cx| {
+            view.viewport = Some(zoomed);
+            view.select_page(0, cx);
+        });
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.viewport, Some(zoomed));
+            assert_eq!(view.last_seen_root, Some(first_page));
+            assert_eq!(
+                view.item.read(cx).doc().and_then(|doc| doc.active_page()),
+                Some(first_page)
+            );
+        });
+
+        view.update(cx, |view, cx| view.select_page(1, cx));
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.viewport, None);
+            assert_eq!(view.last_seen_root, Some(second_page));
+            assert_eq!(
+                view.item.read(cx).doc().and_then(|doc| doc.active_page()),
+                Some(second_page)
+            );
+        });
+
+        view.update(cx, |view, cx| {
+            view.viewport = Some(zoomed);
+            view.select_page(1, cx);
+        });
+        view.read_with(cx, |view, _| assert_eq!(view.viewport, Some(zoomed)));
+    }
+
     #[test]
     fn structure_commands_ignore_layers_left_on_another_page() {
         let (mut doc, page_one, page_two) = doc_with_two_pages();
@@ -9328,6 +9395,34 @@ impl FigView {
                 tool: ToolbarTool::Resources,
                 ..
             } => self.reveal_layers_sidebar(window, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::MotionSelect,
+                ..
+            } => self.activate_tool(ToolKind::Select, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::Code,
+                ..
+            } => self.set_editor_workspace(EditorWorkspace::Code, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::Variables,
+                ..
+            } => self.set_editor_workspace(EditorWorkspace::Variables, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::Inspect,
+                ..
+            } => self.set_editor_mode(EditorMode::Code, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::AddKeyframe,
+                ..
+            } => self.add_toolbar_keyframe(window, cx),
+            ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::PlayPreview,
+                ..
+            } => {
+                let playing = !self.timeline_shell.read(cx).is_playing();
+                self.timeline_shell
+                    .update(cx, |clock, cx| clock.set_playing(playing, cx));
+            }
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
                     // Text-on-path has a canvas tool object but no
@@ -9389,6 +9484,12 @@ impl FigView {
                 }
                 ToolbarCommand::Delete => self.delete_selection(&DeleteSelection, window, cx),
                 ToolbarCommand::SelectAll => self.select_all(&SelectAll, window, cx),
+                ToolbarCommand::DeselectAll => self.deselect_canvas(cx),
+                ToolbarCommand::OpenVariables => {
+                    self.set_editor_workspace(EditorWorkspace::Variables, cx)
+                }
+                ToolbarCommand::OpenDrawMode => self.set_editor_mode(EditorMode::Draw, cx),
+                ToolbarCommand::OpenDevMode => self.set_editor_mode(EditorMode::Code, cx),
                 ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
                 ToolbarCommand::ZoomToSelection => self.zoom_to_selection(cx),
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
@@ -9419,10 +9520,54 @@ impl FigView {
                 cx.notify();
             }
             ToolbarAction::DrawActionInvoked { action } => {
-                notify_unavailable(&format!("{action:?}"), window, cx);
+                use fanta_gpui::toolbar::DrawToolbarAction;
+                match action {
+                    DrawToolbarAction::SelectAll => self.select_all(&SelectAll, window, cx),
+                    DrawToolbarAction::Deselect => self.deselect_canvas(cx),
+                    other => notify_unavailable(&format!("{other:?}"), window, cx),
+                }
             }
             ToolbarAction::CommandQueryChanged { .. } => {}
         }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn deselect_canvas(&mut self, cx: &mut Context<Self>) {
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                if document.doc.selection.is_empty() {
+                    ((), DocChange::None)
+                } else {
+                    document.doc.selection.clear();
+                    ((), DocChange::Selection)
+                }
+            });
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn add_toolbar_keyframe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        let has_single_selection = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| single_selection(&document.doc))
+            .is_some();
+        if !has_single_selection {
+            show_canvas_notice(
+                "Select one layer before adding a keyframe.".into(),
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.active_motion_clip.is_none() {
+            self.create_motion_clip(cx);
+        }
+        self.add_motion_keyframe(TimelineProperty::Opacity, cx);
     }
 
     /// The toolbar's Export command runs the inspector's export flow — the
@@ -9571,9 +9716,14 @@ impl FigView {
                 cx.notify();
             }
             (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
-                if let Some(adapter) = self.gpui_toolbar.as_mut()
-                    && adapter.accept_animation_style(style)
-                {
+                let accepted = self
+                    .gpui_toolbar
+                    .as_mut()
+                    .is_some_and(|adapter| adapter.accept_animation_style(style));
+                if accepted {
+                    self.motion_sidebar
+                        .update(cx, |panel, cx| panel.apply_inspector_preset(style, cx));
+                    self.sync_motion_timeline(cx);
                     cx.notify();
                 }
             }
@@ -9606,16 +9756,7 @@ impl FigView {
         use fanta_gpui::toolbar::ToolbarSecondaryControl;
         match control {
             ToolbarSecondaryControl::MotionAddKeyframe => {
-                // `add_motion_keyframe` needs a `TimelineProperty`; the chip
-                // carries none, and inventing one would author a keyframe the
-                // user did not ask for. The timeline's per-track controls own
-                // that flow.
-                show_canvas_notice(
-                    "Add keyframe needs a track: use the timeline's per-track controls."
-                        .to_string(),
-                    window,
-                    cx,
-                );
+                self.add_toolbar_keyframe(window, cx);
             }
             ToolbarSecondaryControl::MotionTimeline => {
                 show_canvas_notice(

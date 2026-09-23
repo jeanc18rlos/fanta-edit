@@ -372,6 +372,9 @@ impl FantaPrototypePanel {
     pub fn new(item: Entity<FigItem>, cx: &mut Context<Self>) -> Self {
         let item_subscription =
             cx.subscribe(&item, |this: &mut Self, item, event: &FigItemEvent, cx| {
+                if matches!(event, FigItemEvent::EditedTransient) {
+                    return;
+                }
                 let restore = if matches!(event, FigItemEvent::StateChanged) {
                     Some(false)
                 } else if matches!(event, FigItemEvent::SourceEditLockChanged)

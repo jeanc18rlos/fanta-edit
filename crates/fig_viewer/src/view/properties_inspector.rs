@@ -14,7 +14,8 @@ pub(super) struct PropertiesAdapter {
     comments: Entity<CommentsInspector>,
     draw: Entity<DrawInspector>,
     motion: Entity<MotionInspector>,
-    snapshot: Option<(u64, Vec<NodeId>, Option<usize>, bool)>,
+    code_snapshot: Option<(u64, Vec<NodeId>, Option<usize>)>,
+    comments_snapshot: Option<(u64, bool, Option<String>)>,
     zoom: u16,
     _subscriptions: Vec<Subscription>,
 }
@@ -130,7 +131,8 @@ impl FigView {
                 comments,
                 draw,
                 motion,
-                snapshot: None,
+                code_snapshot: None,
+                comments_snapshot: None,
                 zoom,
                 _subscriptions: subscriptions,
             });
@@ -165,105 +167,143 @@ impl FigView {
                 .layout
                 .update(cx, |layout, cx| layout.set_zoom(zoom, cx));
         }
-        let mut draw = adapter.draw.read(cx).view_data().clone();
-        draw.tool_name = self.tools.kind().label().into();
-        if let Some(toolbar) = &self.gpui_toolbar {
-            draw.options = toolbar.draw_options.clone();
-        }
-        if adapter.draw.read(cx).view_data() != &draw {
-            adapter
-                .draw
-                .update(cx, |panel, cx| panel.set_view_data(draw, cx));
-        }
-        let motion = motion_view_data(
-            self.item.read(cx),
-            self.active_motion_clip,
-            self.timeline_shell.read(cx),
-        );
-        if adapter.motion.read(cx).view_data() != &motion {
-            adapter
-                .motion
-                .update(cx, |panel, cx| panel.set_view_data(motion, cx));
-        }
-        let item = self.item.read(cx);
-        let Some(document) = item.document() else {
-            return;
-        };
-        let key = (
-            document.render_generation(),
-            document.doc.selection.as_slice().to_vec(),
-            self.selected_page_index,
-            item.is_editable(),
-        );
-        if adapter.snapshot.as_ref() == Some(&key) {
+        if collapsed {
             return;
         }
-        adapter.snapshot = Some(key);
-        let mut code = adapter.code.read(cx).view_data().clone();
-        let nodes = document
-            .doc
-            .selection
-            .iter()
-            .filter_map(|id| document.doc.scene.get(*id))
-            .collect::<Vec<_>>();
-        code.selection_name = match nodes.as_slice() {
-            [node] => node.name.clone().into(),
-            [] => "Select a layer to inspect its source".into(),
-            nodes => format!("{} selected layers", nodes.len()).into(),
-        };
-        code.code = if nodes.is_empty() {
-            SharedString::default()
-        } else {
-            match serde_json::to_string_pretty(&nodes) {
-                Ok(source) => source.into(),
-                Err(error) => {
-                    log::error!("encoding inspector source failed: {error:#}");
-                    format!("Unable to encode selection: {error}").into()
+        match mode {
+            PropertiesInspectorTab::Draw => {
+                let mut draw = adapter.draw.read(cx).view_data().clone();
+                draw.tool_name = self.tools.kind().label().into();
+                if let Some(toolbar) = &self.gpui_toolbar {
+                    draw.options = toolbar.draw_options.clone();
+                }
+                if adapter.draw.read(cx).view_data() != &draw {
+                    adapter
+                        .draw
+                        .update(cx, |panel, cx| panel.set_view_data(draw, cx));
                 }
             }
-        };
-        let mut comments = adapter.comments.read(cx).view_data().clone();
-        comments.can_comment = item.is_editable();
-        comments.selected_thread = self.comment_state.open_thread.clone().map(Into::into);
-        comments.threads = document
-            .pages
-            .iter()
-            .filter_map(|page| page.root.map(|root| (root, page)))
-            .flat_map(|(root, page)| {
-                crate::comments::read_comments(&document.doc, root)
-                    .into_iter()
-                    .map(|thread| {
-                        let mut messages = vec![InspectorComment {
-                            id: thread.id.clone().into(),
-                            author: thread.author.into(),
-                            time_label: crate::comments_ui::relative_time(thread.created).into(),
-                            body: thread.text.into(),
-                        }];
-                        messages.extend(thread.replies.into_iter().enumerate().map(
-                            |(index, reply)| InspectorComment {
-                                id: format!("{}-{index}", thread.id).into(),
-                                author: reply.author.into(),
-                                time_label: crate::comments_ui::relative_time(reply.created).into(),
-                                body: reply.body.into(),
-                            },
-                        ));
-                        InspectorCommentThread {
-                            id: thread.id.into(),
-                            location: page.name.clone(),
-                            resolved: thread.resolved,
-                            unread: false,
-                            comments: messages,
+            PropertiesInspectorTab::Motion => {
+                let motion = motion_view_data(
+                    self.item.read(cx),
+                    self.active_motion_clip,
+                    self.timeline_shell.read(cx),
+                );
+                if adapter.motion.read(cx).view_data() != &motion {
+                    adapter
+                        .motion
+                        .update(cx, |panel, cx| panel.set_view_data(motion, cx));
+                }
+            }
+            PropertiesInspectorTab::Code => {
+                let item = self.item.read(cx);
+                let Some(document) = item.document() else {
+                    adapter.code_snapshot = None;
+                    return;
+                };
+                let generation = document.render_generation();
+                let selection = document.doc.selection.as_slice();
+                if adapter.code_snapshot.as_ref().is_some_and(
+                    |(cached_generation, cached_selection, cached_page)| {
+                        *cached_generation == generation
+                            && cached_selection.as_slice() == selection
+                            && *cached_page == self.selected_page_index
+                    },
+                ) {
+                    return;
+                }
+                adapter.code_snapshot =
+                    Some((generation, selection.to_vec(), self.selected_page_index));
+                let mut code = adapter.code.read(cx).view_data().clone();
+                let nodes = document
+                    .doc
+                    .selection
+                    .iter()
+                    .filter_map(|id| document.doc.scene.get(*id))
+                    .collect::<Vec<_>>();
+                code.selection_name = match nodes.as_slice() {
+                    [node] => node.name.clone().into(),
+                    [] => "Select a layer to inspect its source".into(),
+                    nodes => format!("{} selected layers", nodes.len()).into(),
+                };
+                code.code = if nodes.is_empty() {
+                    SharedString::default()
+                } else {
+                    match serde_json::to_string_pretty(&nodes) {
+                        Ok(source) => source.into(),
+                        Err(error) => {
+                            log::error!("encoding inspector source failed: {error:#}");
+                            format!("Unable to encode selection: {error}").into()
                         }
+                    }
+                };
+                adapter
+                    .code
+                    .update(cx, |panel, cx| panel.set_view_data(code, cx));
+            }
+            PropertiesInspectorTab::Comments => {
+                let item = self.item.read(cx);
+                let Some(document) = item.document() else {
+                    adapter.comments_snapshot = None;
+                    return;
+                };
+                let generation = document.render_generation();
+                let editable = item.is_editable();
+                let selected_thread = self.comment_state.open_thread.clone();
+                if adapter.comments_snapshot.as_ref().is_some_and(
+                    |(cached_generation, cached_editable, cached_thread)| {
+                        *cached_generation == generation
+                            && *cached_editable == editable
+                            && *cached_thread == selected_thread
+                    },
+                ) {
+                    return;
+                }
+                adapter.comments_snapshot = Some((generation, editable, selected_thread.clone()));
+                let mut comments = adapter.comments.read(cx).view_data().clone();
+                comments.can_comment = editable;
+                comments.selected_thread = selected_thread.map(Into::into);
+                comments.threads = document
+                    .pages
+                    .iter()
+                    .filter_map(|page| page.root.map(|root| (root, page)))
+                    .flat_map(|(root, page)| {
+                        crate::comments::read_comments(&document.doc, root)
+                            .into_iter()
+                            .map(|thread| {
+                                let mut messages = vec![InspectorComment {
+                                    id: thread.id.clone().into(),
+                                    author: thread.author.into(),
+                                    time_label: crate::comments_ui::relative_time(thread.created)
+                                        .into(),
+                                    body: thread.text.into(),
+                                }];
+                                messages.extend(thread.replies.into_iter().enumerate().map(
+                                    |(index, reply)| InspectorComment {
+                                        id: format!("{}-{index}", thread.id).into(),
+                                        author: reply.author.into(),
+                                        time_label:
+                                            crate::comments_ui::relative_time(reply.created).into(),
+                                        body: reply.body.into(),
+                                    },
+                                ));
+                                InspectorCommentThread {
+                                    id: thread.id.into(),
+                                    location: page.name.clone(),
+                                    resolved: thread.resolved,
+                                    unread: false,
+                                    comments: messages,
+                                }
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        adapter
-            .code
-            .update(cx, |panel, cx| panel.set_view_data(code, cx));
-        adapter
-            .comments
-            .update(cx, |panel, cx| panel.set_view_data(comments, cx));
+                    .collect();
+                adapter
+                    .comments
+                    .update(cx, |panel, cx| panel.set_view_data(comments, cx));
+            }
+            PropertiesInspectorTab::Design | PropertiesInspectorTab::Prototype => {}
+        }
     }
 
     fn handle_properties_action(
@@ -413,7 +453,7 @@ impl FigView {
             CommentsInspectorAction::FilterChangeRequested { .. } => {}
         }
         if let Some(adapter) = &mut self.gpui_properties {
-            adapter.snapshot = None;
+            adapter.comments_snapshot = None;
         }
         cx.notify();
     }

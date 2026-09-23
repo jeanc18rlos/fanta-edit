@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use credentials_provider::CredentialsProvider;
 use futures::FutureExt as _;
 use gpui::{App, AsyncApp, Global};
@@ -22,6 +22,9 @@ use release_channel::ReleaseChannel;
 static ZED_DEVELOPMENT_USE_KEYCHAIN: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("ZED_DEVELOPMENT_USE_KEYCHAIN").is_ok_and(|value| !value.is_empty())
 });
+
+static STATELESS_CREDENTIALS: LazyLock<Arc<StatelessCredentialsProvider>> =
+    LazyLock::new(|| Arc::new(StatelessCredentialsProvider::default()));
 
 pub struct ZedCredentialsProvider(pub Arc<dyn CredentialsProvider>);
 
@@ -43,6 +46,10 @@ pub fn global(cx: &App) -> Arc<dyn CredentialsProvider> {
 }
 
 fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
+    if *zed_env_vars::ZED_STATELESS {
+        return STATELESS_CREDENTIALS.clone();
+    }
+
     let use_development_provider = match ReleaseChannel::try_global(cx) {
         Some(ReleaseChannel::Dev) => {
             // In development we default to using the development
@@ -62,6 +69,61 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
         Arc::new(DevelopmentCredentialsProvider::new())
     } else {
         Arc::new(KeychainCredentialsProvider)
+    }
+}
+
+#[derive(Default)]
+struct StatelessCredentialsProvider {
+    credentials: Mutex<HashMap<String, (String, Vec<u8>)>>,
+}
+
+impl CredentialsProvider for StatelessCredentialsProvider {
+    fn read_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+        async move {
+            Ok(self
+                .credentials
+                .lock()
+                .map_err(|_| anyhow!("stateless credentials lock was poisoned"))?
+                .get(url)
+                .cloned())
+        }
+        .boxed_local()
+    }
+
+    fn write_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        username: &'a str,
+        password: &'a [u8],
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            self.credentials
+                .lock()
+                .map_err(|_| anyhow!("stateless credentials lock was poisoned"))?
+                .insert(url.to_string(), (username.to_string(), password.to_vec()));
+            Ok(())
+        }
+        .boxed_local()
+    }
+
+    fn delete_credentials<'a>(
+        &'a self,
+        url: &'a str,
+        _cx: &'a AsyncApp,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+        async move {
+            self.credentials
+                .lock()
+                .map_err(|_| anyhow!("stateless credentials lock was poisoned"))?
+                .remove(url);
+            Ok(())
+        }
+        .boxed_local()
     }
 }
 
