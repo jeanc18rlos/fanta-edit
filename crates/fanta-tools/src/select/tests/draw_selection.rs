@@ -71,12 +71,12 @@ fn ellipse_and_polygonal_lasso_select_vector_regions() {
 
     ellipse.handle_event(
         &mut context,
-        pe_press([300.0, 200.0], ModifierKeys::empty()),
+        pe_press([350.0, 250.0], ModifierKeys::empty()),
     );
-    ellipse.handle_event(&mut context, pe_move([500.0, 400.0], ModifierKeys::empty()));
+    ellipse.handle_event(&mut context, pe_move([450.0, 350.0], ModifierKeys::empty()));
     ellipse.handle_event(
         &mut context,
-        pe_release([500.0, 400.0], ModifierKeys::empty()),
+        pe_release([450.0, 350.0], ModifierKeys::empty()),
     );
     assert_eq!(context.doc.selection.as_slice(), &[center]);
 
@@ -277,6 +277,109 @@ fn crop_applies_to_bitmap_and_cancel_preserves_it() {
         context.doc.scene.get(id).expect("image").parent,
         Some(group_id)
     );
+}
+
+#[test]
+fn small_draw_rectangle_inside_bitmap_can_be_applied_as_crop_and_undone() {
+    let mut doc = Doc::new();
+    let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+        asset: fanta_doc::AssetId::new(),
+        natural_size: [200, 200],
+        local_size: [200.0, 200.0],
+        crop: None,
+        fit: fanta_doc::ImageFitMode::Stretch,
+        tint: None,
+    }));
+    bitmap.transform = Transform2D::translation(-100.0, -100.0);
+    let bitmap_id = bitmap.id;
+    doc.apply(Operation::create_node(bitmap))
+        .expect("create bitmap");
+    let mut viewport = Viewport::default();
+    let mut context = context(&mut doc, &mut viewport);
+    let mut rectangle = RectangleSelectTool::new();
+    rectangle.handle_event(
+        &mut context,
+        pe_press([380.0, 280.0], ModifierKeys::empty()),
+    );
+    rectangle.handle_event(
+        &mut context,
+        pe_release([420.0, 320.0], ModifierKeys::empty()),
+    );
+    assert_eq!(context.doc.selection.as_slice(), &[bitmap_id]);
+    assert!(matches!(
+        context.draw_selection_region.as_ref().map(|region| &region.shape),
+        Some(crate::select::DrawSelectionShape::Rectangle(bounds))
+            if *bounds == Bounds::from_xywh(-20.0, -20.0, 40.0, 40.0)
+    ));
+
+    let mut crop = CropTool::new();
+    crop.handle_event(
+        &mut context,
+        ToolEvent::Key(KeyEvent::press(LogicalKey::Enter)),
+    );
+    let crop_id = context.doc.selection.as_slice()[0];
+    let crop_group = context.doc.scene.get(crop_id).expect("crop group");
+    assert!(
+        matches!(&crop_group.data, NodeData::Group(group) if group.clip_size == Some([40.0, 40.0]))
+    );
+    assert_eq!(
+        context.doc.scene.get(bitmap_id).expect("bitmap").parent,
+        Some(crop_id)
+    );
+    context.doc.undo().expect("undo crop");
+    assert_eq!(
+        context
+            .doc
+            .scene
+            .get(bitmap_id)
+            .expect("restored bitmap")
+            .parent,
+        None
+    );
+}
+
+#[test]
+fn small_draw_ellipse_and_lasso_inside_bitmap_select_it() {
+    let mut doc = Doc::new();
+    let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+        asset: fanta_doc::AssetId::new(),
+        natural_size: [200, 200],
+        local_size: [200.0, 200.0],
+        crop: None,
+        fit: fanta_doc::ImageFitMode::Stretch,
+        tint: None,
+    }));
+    bitmap.transform = Transform2D::translation(-100.0, -100.0);
+    let bitmap_id = bitmap.id;
+    doc.apply(Operation::create_node(bitmap))
+        .expect("create bitmap");
+    let mut viewport = Viewport::default();
+    let mut context = context(&mut doc, &mut viewport);
+
+    let mut ellipse = RegionSelectTool::new(RegionSelectionKind::Ellipse);
+    ellipse.handle_event(
+        &mut context,
+        pe_press([380.0, 280.0], ModifierKeys::empty()),
+    );
+    ellipse.handle_event(
+        &mut context,
+        pe_release([420.0, 320.0], ModifierKeys::empty()),
+    );
+    assert_eq!(context.doc.selection.as_slice(), &[bitmap_id]);
+
+    let mut lasso = RegionSelectTool::new(RegionSelectionKind::Lasso);
+    lasso.handle_event(
+        &mut context,
+        pe_press([380.0, 280.0], ModifierKeys::empty()),
+    );
+    for point in [[420.0, 280.0], [420.0, 320.0], [380.0, 320.0]] {
+        lasso.handle_event(&mut context, pe_move(point, ModifierKeys::empty()));
+    }
+    lasso.handle_event(
+        &mut context,
+        pe_release([380.0, 280.0], ModifierKeys::empty()),
+    );
+    assert_eq!(context.doc.selection.as_slice(), &[bitmap_id]);
 }
 
 #[test]

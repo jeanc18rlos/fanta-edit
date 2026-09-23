@@ -189,7 +189,7 @@ impl RegionSelectTool {
             .iter()
             .map(|point| ctx.screen_to_world(*point))
             .collect();
-        let mode = if modifiers.contains(ModifierKeys::ALT) {
+        let mode = if ctx.draw_content_only || modifiers.contains(ModifierKeys::ALT) {
             MarqueeMode::Intersects
         } else {
             MarqueeMode::Contains

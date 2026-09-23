@@ -109,7 +109,7 @@ impl RectangleSelectTool {
             return ToolResponse::cursor(CursorHint::Crosshair);
         };
         if (screen - screen_press).length() >= DRAG_THRESHOLD_PX {
-            let mode = if modifiers.contains(ModifierKeys::ALT) {
+            let mode = if ctx.draw_content_only || modifiers.contains(ModifierKeys::ALT) {
                 MarqueeMode::Intersects
             } else {
                 MarqueeMode::Contains
