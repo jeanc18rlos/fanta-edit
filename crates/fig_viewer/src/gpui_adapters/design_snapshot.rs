@@ -118,11 +118,15 @@ pub(crate) fn build_design_view_data(
             Some(crate::properties_snapshot::PageBackgroundValue::Solid(color)) => {
                 DesignPageBackground::new(design_color(color))
             }
-            Some(_) => DesignPageBackground::new(DesignColor::WHITE)
-                .read_only("Non-solid page backgrounds are edited on canvas"),
-            None => DesignPageBackground::new(design_color(
-                crate::properties_ops::DEFAULT_PAGE_BACKGROUND,
-            )),
+            Some(crate::properties_snapshot::PageBackgroundValue::Other(_)) => {
+                DesignPageBackground::new(DesignColor::WHITE)
+                    .read_only("Non-solid page backgrounds are edited on canvas")
+            }
+            Some(crate::properties_snapshot::PageBackgroundValue::None) | None => {
+                DesignPageBackground::new(design_color(
+                    crate::properties_ops::DEFAULT_PAGE_BACKGROUND,
+                ))
+            }
         };
         let page_id = page
             .id

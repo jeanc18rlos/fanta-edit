@@ -160,6 +160,10 @@ actions!(
         ActivateTextTool,
         /// Activate the pencil (freehand) tool.
         ActivatePencilTool,
+        /// Activate the vector brush tool.
+        ActivateBrushTool,
+        /// Activate the vector stroke eraser.
+        ActivateEraserTool,
         /// Activate the section tool.
         ActivateSectionTool,
         /// Activate the slice tool.
@@ -168,6 +172,8 @@ actions!(
         ActivateScaleTool,
         /// Activate direct selection of vector anchors and segments.
         ActivatePathSelectTool,
+        /// Select vector layers with a drawn rectangle.
+        ActivateRectangleSelectTool,
         /// Activate the text-on-path tool (placeholder).
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
@@ -190,6 +196,7 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
     match kind {
         ToolKind::Select => Box::new(ActivateSelectTool),
         ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
+        ToolKind::RectangleSelect => Box::new(ActivateRectangleSelectTool),
         ToolKind::NodeEdit => Box::new(ActivateNodeEditTool),
         ToolKind::Hand => Box::new(ActivateHandTool),
         ToolKind::Scale => Box::new(ActivateScaleTool),
@@ -199,7 +206,9 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Polygon => Box::new(ActivatePolygonTool),
         ToolKind::Star => Box::new(ActivateStarTool),
         ToolKind::Pen => Box::new(ActivatePenTool),
+        ToolKind::Brush => Box::new(ActivateBrushTool),
         ToolKind::Pencil => Box::new(ActivatePencilTool),
+        ToolKind::Eraser => Box::new(ActivateEraserTool),
         ToolKind::Frame => Box::new(ActivateFrameTool),
         ToolKind::Section => Box::new(ActivateSectionTool),
         ToolKind::Slice => Box::new(ActivateSliceTool),
@@ -1041,7 +1050,7 @@ impl FigView {
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
         match mode {
-            EditorMode::Draw => self.activate_tool(ToolKind::Pencil, cx),
+            EditorMode::Draw => self.activate_tool(ToolKind::Brush, cx),
             EditorMode::Design if previous_mode == EditorMode::Draw => {
                 self.activate_tool(ToolKind::Select, cx)
             }
@@ -1841,30 +1850,60 @@ impl FigView {
         let active_tool = self.tools.kind();
         #[cfg(feature = "fanta-gpui-ui")]
         let draw_stroke = (self.editor_mode(cx) == EditorMode::Draw
-            && active_tool == ToolKind::Pencil)
-            .then(|| {
-                let draw = self
-                    .gpui_properties
-                    .as_ref()?
-                    .draw
-                    .read(cx)
-                    .view_data()
-                    .clone();
-                let color = fanta_doc::Color::from_hex(&format!("#{}", draw.color_hex))?;
+            && matches!(
+                active_tool,
+                ToolKind::Brush | ToolKind::Pencil | ToolKind::Eraser
+            ))
+        .then(|| {
+            let draw = self
+                .gpui_properties
+                .as_ref()?
+                .draw
+                .read(cx)
+                .view_data()
+                .clone();
+            let color = fanta_doc::Color::from_hex(&format!("#{}", draw.color_hex)).map(|color| {
                 let opacity = u16::from(color.a) * u16::from(draw.options.opacity) / 100;
-                let color = fanta_doc::Color::rgba(color.r, color.g, color.b, opacity as u8);
-                let blend = match draw.blend_mode.as_ref() {
-                    "multiply" => fanta_doc::BlendMode::Multiply,
-                    "screen" => fanta_doc::BlendMode::Screen,
-                    "overlay" => fanta_doc::BlendMode::Overlay,
-                    _ => fanta_doc::BlendMode::Normal,
-                };
-                Some((
-                    color,
-                    f64::from(draw.options.size),
-                    0.2 + f64::from(draw.options.smoothing) * 0.058,
-                    blend,
-                ))
+                fanta_doc::Color::rgba(color.r, color.g, color.b, opacity as u8)
+            });
+            let blend = match draw.blend_mode.as_ref() {
+                "multiply" => fanta_doc::BlendMode::Multiply,
+                "screen" => fanta_doc::BlendMode::Screen,
+                "overlay" => fanta_doc::BlendMode::Overlay,
+                _ => fanta_doc::BlendMode::Normal,
+            };
+            Some((
+                color,
+                f64::from(draw.options.size),
+                0.2 + f64::from(draw.options.smoothing) * 0.058,
+                blend,
+                match draw.options.brush_tip.as_ref() {
+                    "Flat" => fanta_tools::BrushStyle::Flat,
+                    "Ink" => fanta_tools::BrushStyle::Ink,
+                    _ => fanta_tools::BrushStyle::Round,
+                },
+            ))
+        })
+        .flatten();
+        #[cfg(feature = "fanta-gpui-ui")]
+        let rectangle_selection_operation = (self.editor_mode(cx) == EditorMode::Draw
+            && active_tool == ToolKind::RectangleSelect)
+            .then(|| {
+                let operation = self.gpui_toolbar.as_ref()?.draw_options.selection_operation;
+                Some(match operation {
+                    fanta_gpui::toolbar::DrawSelectionOperation::Replace => {
+                        fanta_tools::select::RectangleSelectionOperation::Replace
+                    }
+                    fanta_gpui::toolbar::DrawSelectionOperation::Add => {
+                        fanta_tools::select::RectangleSelectionOperation::Add
+                    }
+                    fanta_gpui::toolbar::DrawSelectionOperation::Subtract => {
+                        fanta_tools::select::RectangleSelectionOperation::Subtract
+                    }
+                    fanta_gpui::toolbar::DrawSelectionOperation::Intersect => {
+                        fanta_tools::select::RectangleSelectionOperation::Intersect
+                    }
+                })
             })
             .flatten();
         let tools = &mut self.tools;
@@ -1880,11 +1919,18 @@ impl FigView {
                 let mut ctx =
                     tool_context(&mut document.doc, &mut viewport, screen_size, active_tool);
                 #[cfg(feature = "fanta-gpui-ui")]
-                if let Some((color, width, smoothing, blend)) = draw_stroke {
-                    ctx.new_shape_fill = color;
+                if let Some((color, width, smoothing, blend, brush_style)) = draw_stroke {
+                    if let Some(color) = color {
+                        ctx.new_shape_fill = color;
+                    }
                     ctx.new_stroke_width = width;
                     ctx.stroke_smoothing = smoothing;
                     ctx.new_blend_mode = blend;
+                    ctx.brush_style = brush_style;
+                }
+                #[cfg(feature = "fanta-gpui-ui")]
+                if let Some(operation) = rectangle_selection_operation {
+                    ctx.rectangle_selection_operation = operation;
                 }
                 let response = tools.handle_event(&mut ctx, event);
                 wants_exit = response.wants_exit;
@@ -5479,6 +5525,12 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivatePencilTool, _, cx| {
                 this.activate_tool(ToolKind::Pencil, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActivateBrushTool, _, cx| {
+                this.activate_tool(ToolKind::Brush, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateEraserTool, _, cx| {
+                this.activate_tool(ToolKind::Eraser, cx)
+            }))
             .on_action(cx.listener(|this, _: &ActivateSectionTool, _, cx| {
                 this.activate_tool(ToolKind::Section, cx)
             }))
@@ -5490,6 +5542,9 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivatePathSelectTool, _, cx| {
                 this.activate_tool(ToolKind::PathSelect, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateRectangleSelectTool, _, cx| {
+                this.activate_tool(ToolKind::RectangleSelect, cx)
             }))
             .on_action(cx.listener(|this, _: &ActivateCommentTool, _, cx| {
                 this.activate_tool(ToolKind::Comment, cx)
@@ -9871,30 +9926,19 @@ impl FigView {
             show_canvas_notice("The design inspector is unavailable.".into(), window, cx);
             return;
         };
-        cx.defer(move |cx| {
-            let Some(window) = cx.active_window() else {
-                return;
-            };
-            window
-                .update(cx, |_, window, cx| {
-                    match inspector.update(cx, |inspector, cx| {
-                        inspector
-                            .controller()
-                            .update(cx, |panel, cx| panel.open_color_picker(window, cx))
-                    }) {
-                        Ok(true) => {}
-                        Ok(false) => show_canvas_notice(
-                            "Select a page or a layer with a fill to edit its color.".into(),
-                            window,
-                            cx,
-                        ),
-                        Err(error) => {
-                            log::warn!("opening the design color picker failed: {error:#}");
-                        }
-                    }
-                })
-                .log_err();
-        });
+        match inspector.update(cx, |inspector, cx| {
+            inspector
+                .controller()
+                .update(cx, |panel, cx| panel.open_color_picker(window, cx))
+        }) {
+            Ok(true) => {}
+            Ok(false) => show_canvas_notice(
+                "Select a page or a layer with a fill to edit its color.".into(),
+                window,
+                cx,
+            ),
+            Err(error) => log::warn!("opening the design color picker failed: {error:#}"),
+        }
     }
 
     /// The toolbar's Export command runs the inspector's export flow — the

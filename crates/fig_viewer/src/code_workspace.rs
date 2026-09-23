@@ -1147,15 +1147,22 @@ mod tests {
             .expect("read code workspace")
     }
 
-    /// The row of the opening tag carrying `name`, read straight from the file
-    /// the pane is showing (the printer puts one element per line).
+    /// The row of the opening tag carrying `name` in the formatted preview
+    /// shown by the pane. Formatting can wrap attributes across many lines.
     fn source_row_of(source_path: &Path, name: &str) -> u32 {
         let source = std::fs::read_to_string(source_path).expect("read FNX source");
+        let source = format_fnx_preview(&source);
         let needle = format!("name=\"{name}\"");
-        source
-            .lines()
-            .position(|line| line.contains(&needle))
-            .expect("the child is named in the source") as u32
+        let attribute_offset = source
+            .find(&needle)
+            .expect("the child is named in the source");
+        let opening_offset = source[..attribute_offset]
+            .rfind('<')
+            .expect("the child has an opening tag");
+        source[..opening_offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32
     }
 
     async fn open_test_project(root: &Path, cx: &mut TestAppContext) -> Entity<Project> {

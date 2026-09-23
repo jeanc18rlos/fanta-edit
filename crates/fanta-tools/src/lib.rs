@@ -32,8 +32,10 @@
 #![forbid(unsafe_code)]
 
 pub mod boolean;
+pub mod brush;
 pub mod context;
 pub mod ellipse;
+pub mod eraser;
 pub mod event;
 pub mod frame;
 pub mod hand;
@@ -57,8 +59,10 @@ pub mod tool;
 
 // Flat re-exports for ergonomic call sites in `fanta-app`.
 pub use boolean::make_boolean;
+pub use brush::{BrushStyle, BrushTool};
 pub use context::ToolContext;
 pub use ellipse::EllipseTool;
+pub use eraser::EraserTool;
 pub use event::{Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 pub use frame::FrameTool;
 pub use hand::HandTool;

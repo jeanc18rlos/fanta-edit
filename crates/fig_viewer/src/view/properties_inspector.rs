@@ -186,6 +186,11 @@ impl FigView {
                 let mut draw = adapter.draw.read(cx).view_data().clone();
                 draw.tool_name = self.tools.kind().label().into();
                 draw.read_only = !editable;
+                let capabilities =
+                    crate::gpui_adapters::toolbar::draw_capabilities(self.tools.kind());
+                adapter
+                    .draw
+                    .update(cx, |panel, cx| panel.set_capabilities(capabilities, cx));
                 if let Some(toolbar) = &self.gpui_toolbar {
                     draw.options = toolbar.draw_options.clone();
                 }

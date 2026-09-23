@@ -17,6 +17,9 @@ use fanta_canvas::{SnapEngine, screen_to_world, world_to_screen};
 use fanta_doc::{BlendMode, CanvasNode, Color, Doc, NodeId, Transform2D, Viewport};
 use glam::DVec2;
 
+use crate::brush::BrushStyle;
+use crate::select::RectangleSelectionOperation;
+
 /// Neutral fill a shape-creation tool uses when the shell doesn't specify one
 /// (e.g. in unit tests that call [`ToolContext::new`] directly).
 /// Black so newly created shapes/text land with visible color (not low-contrast
@@ -63,6 +66,8 @@ pub struct ToolContext<'a> {
     pub new_stroke_width: f64,
     pub stroke_smoothing: f64,
     pub new_blend_mode: BlendMode,
+    pub brush_style: BrushStyle,
+    pub rectangle_selection_operation: RectangleSelectionOperation,
 
     /// The subtree root the active editor view is scoped to (selection
     /// container-walk, deep hit-test base, and new-node parent). The shell sets
@@ -90,6 +95,8 @@ impl<'a> ToolContext<'a> {
             new_stroke_width: 2.0,
             stroke_smoothing: 1.2,
             new_blend_mode: BlendMode::Normal,
+            brush_style: BrushStyle::Round,
+            rectangle_selection_operation: RectangleSelectionOperation::Replace,
             scope_root: None,
         }
     }

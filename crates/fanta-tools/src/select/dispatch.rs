@@ -236,7 +236,11 @@ impl SelectTool {
     /// the leaf's own page root is used so the result is a top-level node and
     /// never the page backdrop. Falls back to `leaf` when nothing on the chain
     /// is a direct child of `container` (e.g. `container == leaf`).
-    fn resolve_in_scope(scene: &Scene, leaf: NodeId, container: Option<NodeId>) -> NodeId {
+    pub(super) fn resolve_in_scope(
+        scene: &Scene,
+        leaf: NodeId,
+        container: Option<NodeId>,
+    ) -> NodeId {
         let container = container.or_else(|| Self::page_root_of(scene, leaf));
         if scene.get(leaf).and_then(|n| n.parent) == container {
             return leaf;

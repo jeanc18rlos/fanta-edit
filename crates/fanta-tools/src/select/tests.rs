@@ -28,6 +28,7 @@ mod container_select;
 mod keys;
 mod marquee;
 mod move_drag;
+mod rectangle;
 mod reparent;
 mod resize;
 mod rotate;

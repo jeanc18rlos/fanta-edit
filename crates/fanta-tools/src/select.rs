@@ -47,6 +47,7 @@
 
 mod dispatch;
 mod mv;
+mod rectangle;
 mod reparent;
 mod resize;
 mod rotate;
@@ -55,4 +56,5 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use rectangle::{RectangleSelectTool, RectangleSelectionOperation};
 pub use state::SelectTool;

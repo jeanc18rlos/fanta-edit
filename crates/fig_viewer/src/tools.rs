@@ -5,11 +5,12 @@
 //! ([`ToolOverlay`]s and a [`CursorHint`]) for the canvas element to paint.
 
 use fanta_doc::{Color, Doc, Viewport};
+use fanta_tools::select::RectangleSelectTool;
 use fanta_tools::{
-    Button, CursorHint, EllipseTool, FrameTool, HandTool, KeyEvent, LineTool, LogicalKey,
-    ModifierKeys, NodeEditTool, PathSelectTool, PenTool, PencilTool, PointerEvent, PolygonTool,
-    RectTool, ScaleTool, SectionTool, SelectTool, SliceTool, StarTool, TextPathTool, TextTool,
-    Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
+    BrushTool, Button, CursorHint, EllipseTool, EraserTool, FrameTool, HandTool, KeyEvent,
+    LineTool, LogicalKey, ModifierKeys, NodeEditTool, PathSelectTool, PenTool, PencilTool,
+    PointerEvent, PolygonTool, RectTool, ScaleTool, SectionTool, SelectTool, SliceTool, StarTool,
+    TextPathTool, TextTool, Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
 };
 use glam::DVec2;
 use gpui::{CursorStyle, Modifiers, MouseButton};
@@ -35,6 +36,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
     &[
         ToolKind::Select,
         ToolKind::PathSelect,
+        ToolKind::RectangleSelect,
         ToolKind::Hand,
         ToolKind::Scale,
     ],
@@ -46,7 +48,13 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
         ToolKind::Polygon,
         ToolKind::Star,
     ],
-    &[ToolKind::NodeEdit, ToolKind::Pencil, ToolKind::Pen],
+    &[
+        ToolKind::NodeEdit,
+        ToolKind::Brush,
+        ToolKind::Pencil,
+        ToolKind::Eraser,
+        ToolKind::Pen,
+    ],
     &[ToolKind::Text, ToolKind::TextPath],
     &[ToolKind::Comment],
 ];
@@ -70,6 +78,7 @@ pub fn group_index_of(kind: ToolKind) -> Option<usize> {
 pub enum ToolKind {
     Select,
     PathSelect,
+    RectangleSelect,
     NodeEdit,
     Hand,
     Scale,
@@ -79,7 +88,9 @@ pub enum ToolKind {
     Polygon,
     Star,
     Pen,
+    Brush,
     Pencil,
+    Eraser,
     Frame,
     Section,
     Slice,
@@ -93,6 +104,7 @@ impl ToolKind {
         match self {
             Self::Select => "Move",
             Self::PathSelect => "Path Selection",
+            Self::RectangleSelect => "Rectangle Selection",
             Self::NodeEdit => "Edit Path",
             Self::Hand => "Hand",
             Self::Scale => "Scale",
@@ -102,7 +114,9 @@ impl ToolKind {
             Self::Polygon => "Polygon",
             Self::Star => "Star",
             Self::Pen => "Pen",
+            Self::Brush => "Brush",
             Self::Pencil => "Pencil",
+            Self::Eraser => "Eraser",
             Self::Frame => "Frame",
             Self::Section => "Section",
             Self::Slice => "Slice",
@@ -116,6 +130,7 @@ impl ToolKind {
         match self {
             Self::Select => IconName::ToolSelect,
             Self::PathSelect => IconName::ToolPathSelect,
+            Self::RectangleSelect => IconName::ToolRect,
             Self::NodeEdit => IconName::ToolNodeEdit,
             Self::Hand => IconName::ToolHand,
             Self::Scale => IconName::ToolScale,
@@ -125,7 +140,9 @@ impl ToolKind {
             Self::Polygon => IconName::ToolPolygon,
             Self::Star => IconName::ToolStar,
             Self::Pen => IconName::ToolPen,
+            Self::Brush => IconName::ToolPencil,
             Self::Pencil => IconName::ToolPencil,
+            Self::Eraser => IconName::Eraser,
             Self::Frame => IconName::ToolFrame,
             Self::Section => IconName::ToolSection,
             Self::Slice => IconName::ToolSlice,
@@ -151,6 +168,7 @@ impl ToolKind {
         match self {
             Self::Select => Box::new(SelectTool::new()),
             Self::PathSelect => Box::new(PathSelectTool::new()),
+            Self::RectangleSelect => Box::new(RectangleSelectTool::new()),
             Self::NodeEdit => Box::new(NodeEditTool::new()),
             Self::Hand => Box::new(HandTool::new()),
             Self::Scale => Box::new(ScaleTool::new()),
@@ -160,7 +178,9 @@ impl ToolKind {
             Self::Polygon => Box::new(PolygonTool::new()),
             Self::Star => Box::new(StarTool::new()),
             Self::Pen => Box::new(PenTool::new()),
+            Self::Brush => Box::new(BrushTool::new()),
             Self::Pencil => Box::new(PencilTool::new()),
+            Self::Eraser => Box::new(EraserTool::new()),
             Self::Frame => Box::new(FrameTool::new()),
             Self::Section => Box::new(SectionTool::new()),
             Self::Slice => Box::new(SliceTool::new()),
@@ -296,7 +316,9 @@ pub fn tool_context<'a>(
 /// The fill a tool creates its node with.
 fn new_fill_for(kind: ToolKind) -> Color {
     match kind {
-        ToolKind::Text | ToolKind::Line | ToolKind::Pencil | ToolKind::Pen => NEW_MARK_FILL,
+        ToolKind::Text | ToolKind::Line | ToolKind::Brush | ToolKind::Pencil | ToolKind::Pen => {
+            NEW_MARK_FILL
+        }
         _ => NEW_SHAPE_FILL,
     }
 }
@@ -381,6 +403,7 @@ mod tests {
         for kind in [
             ToolKind::Text,
             ToolKind::Line,
+            ToolKind::Brush,
             ToolKind::Pencil,
             ToolKind::Pen,
         ] {

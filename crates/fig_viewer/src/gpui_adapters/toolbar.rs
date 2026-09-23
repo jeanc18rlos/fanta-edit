@@ -4,9 +4,9 @@
 
 use fanta_doc::{Color as FantaColor, Doc, Fill, NodeData, NodeId};
 use fanta_gpui::toolbar::{
-    DevToolbarOptions, DrawBrushCapabilities, DrawToolbarAction, DrawToolbarOptions, EditorToolbar,
-    MotionToolbarOptions, ToolbarChromeControl, ToolbarCommand, ToolbarMode,
-    ToolbarSecondaryControl, ToolbarTool,
+    DevToolbarOptions, DrawBrushCapabilities, DrawSelectionCapabilities, DrawToolbarAction,
+    DrawToolbarOptions, EditorToolbar, MotionToolbarOptions, ToolbarChromeControl, ToolbarCommand,
+    ToolbarMode, ToolbarSecondaryControl, ToolbarTool,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 #[cfg(test)]
@@ -80,7 +80,10 @@ pub(crate) const SUPPORTED_TOOLS: &[ToolbarTool] = &[
     ToolbarTool::Polygon,
     ToolbarTool::Star,
     ToolbarTool::Pen,
+    ToolbarTool::Brush,
     ToolbarTool::Pencil,
+    ToolbarTool::Eraser,
+    ToolbarTool::RectangleSelect,
     ToolbarTool::Text,
     ToolbarTool::Comment,
     ToolbarTool::Actions,
@@ -132,6 +135,18 @@ pub(crate) fn draw_sample_color(doc: &Doc, page: Option<NodeId>) -> Option<Fanta
     }
 }
 
+pub(crate) fn draw_capabilities(tool: ToolKind) -> DrawBrushCapabilities {
+    match tool {
+        ToolKind::Brush => DrawBrushCapabilities {
+            brush_tip: true,
+            ..DrawBrushCapabilities::VECTOR_PENCIL
+        },
+        ToolKind::Pencil => DrawBrushCapabilities::VECTOR_PENCIL,
+        ToolKind::Eraser => DrawBrushCapabilities::VECTOR_ERASER,
+        _ => DrawBrushCapabilities::NONE,
+    }
+}
+
 /// The entrance presets fig_viewer's Motion inspector can author — the same
 /// catalog as `motion_panel.rs`'s `AnimationProperty` preset labels (Position,
 /// Scale, Rotation, Size, Opacity). The document has no per-clip style field
@@ -177,6 +192,7 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
     match kind {
         ToolKind::Select => ToolbarTool::Move,
         ToolKind::PathSelect => ToolbarTool::PathSelect,
+        ToolKind::RectangleSelect => ToolbarTool::RectangleSelect,
         ToolKind::NodeEdit => ToolbarTool::NodeEdit,
         ToolKind::Hand => ToolbarTool::Hand,
         ToolKind::Scale => ToolbarTool::Scale,
@@ -186,7 +202,9 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
         ToolKind::Polygon => ToolbarTool::Polygon,
         ToolKind::Star => ToolbarTool::Star,
         ToolKind::Pen => ToolbarTool::Pen,
+        ToolKind::Brush => ToolbarTool::Brush,
         ToolKind::Pencil => ToolbarTool::Pencil,
+        ToolKind::Eraser => ToolbarTool::Eraser,
         ToolKind::Frame => ToolbarTool::Frame,
         ToolKind::Section => ToolbarTool::Section,
         ToolKind::Slice => ToolbarTool::Slice,
@@ -205,6 +223,7 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
     Some(match tool {
         ToolbarTool::Move => ToolKind::Select,
         ToolbarTool::PathSelect => ToolKind::PathSelect,
+        ToolbarTool::RectangleSelect => ToolKind::RectangleSelect,
         ToolbarTool::NodeEdit => ToolKind::NodeEdit,
         ToolbarTool::Hand => ToolKind::Hand,
         ToolbarTool::Scale => ToolKind::Scale,
@@ -214,7 +233,9 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
         ToolbarTool::Polygon => ToolKind::Polygon,
         ToolbarTool::Star => ToolKind::Star,
         ToolbarTool::Pen => ToolKind::Pen,
+        ToolbarTool::Brush => ToolKind::Brush,
         ToolbarTool::Pencil => ToolKind::Pencil,
+        ToolbarTool::Eraser => ToolKind::Eraser,
         ToolbarTool::Frame => ToolKind::Frame,
         ToolbarTool::Section => ToolKind::Section,
         ToolbarTool::Slice => ToolKind::Slice,
@@ -245,6 +266,8 @@ pub(crate) struct ToolbarAdapter {
     last_pushed_motion: Option<MotionToolbarOptions>,
     last_pushed_dev: Option<DevToolbarOptions>,
     pub(crate) draw_options: DrawToolbarOptions,
+    last_pushed_draw_capabilities: DrawBrushCapabilities,
+    last_pushed_draw_selection_capabilities: DrawSelectionCapabilities,
     last_pushed_chrome: Option<Vec<ToolbarChromeControl>>,
     /// The accepted Motion animation style. Host-side UI state held on the
     /// adapter because the document model has no per-clip style field yet;
@@ -261,6 +284,11 @@ pub(crate) struct ToolbarAdapter {
 impl ToolbarAdapter {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<FigView>) -> Self {
         let initial = (ToolbarMode::Design, ToolbarTool::Move, 100);
+        let mut draw_options = DrawToolbarOptions::default();
+        draw_options.brush_tips = ["Round", "Flat", "Ink"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
         let panel = cx.new(|cx| {
             let mut toolbar = EditorToolbar::new(
                 "fig-gpui-toolbar",
@@ -275,6 +303,9 @@ impl ToolbarAdapter {
             toolbar
                 .set_supported_secondary_controls(SUPPORTED_SECONDARY_CONTROLS.iter().copied(), cx);
             toolbar.set_draw_brush_capabilities(DrawBrushCapabilities::VECTOR_PENCIL, cx);
+            toolbar
+                .set_draw_selection_capabilities(DrawSelectionCapabilities::VECTOR_RECTANGLE, cx);
+            toolbar.set_draw_options(draw_options.clone(), cx);
             toolbar.set_supported_draw_actions(
                 [DrawToolbarAction::SelectAll, DrawToolbarAction::Deselect],
                 cx,
@@ -291,7 +322,9 @@ impl ToolbarAdapter {
             last_pushed: initial,
             last_pushed_motion: None,
             last_pushed_dev: None,
-            draw_options: DrawToolbarOptions::default(),
+            draw_options,
+            last_pushed_draw_capabilities: DrawBrushCapabilities::VECTOR_PENCIL,
+            last_pushed_draw_selection_capabilities: DrawSelectionCapabilities::VECTOR_RECTANGLE,
             last_pushed_chrome: None,
             animation_style,
             #[cfg(test)]
@@ -364,6 +397,26 @@ impl ToolbarAdapter {
             });
         }
 
+        let draw_capabilities = draw_capabilities(tool);
+        if self.last_pushed_draw_capabilities != draw_capabilities {
+            self.last_pushed_draw_capabilities = draw_capabilities;
+            self.panel.update(cx, |toolbar, cx| {
+                toolbar.set_draw_brush_capabilities(draw_capabilities, cx)
+            });
+        }
+
+        let selection_capabilities = if tool == ToolKind::RectangleSelect {
+            DrawSelectionCapabilities::VECTOR_RECTANGLE
+        } else {
+            DrawSelectionCapabilities::default()
+        };
+        if self.last_pushed_draw_selection_capabilities != selection_capabilities {
+            self.last_pushed_draw_selection_capabilities = selection_capabilities;
+            self.panel.update(cx, |toolbar, cx| {
+                toolbar.set_draw_selection_capabilities(selection_capabilities, cx)
+            });
+        }
+
         let motion = MotionToolbarOptions {
             playing: options.playing,
             looping: options.looping,
@@ -425,6 +478,7 @@ mod tests {
         for kind in [
             ToolKind::Select,
             ToolKind::PathSelect,
+            ToolKind::RectangleSelect,
             ToolKind::NodeEdit,
             ToolKind::Hand,
             ToolKind::Scale,
@@ -434,7 +488,9 @@ mod tests {
             ToolKind::Polygon,
             ToolKind::Star,
             ToolKind::Pen,
+            ToolKind::Brush,
             ToolKind::Pencil,
+            ToolKind::Eraser,
             ToolKind::Frame,
             ToolKind::Section,
             ToolKind::Slice,
@@ -450,6 +506,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn draw_brushes_have_distinct_wired_tools_and_tip_capabilities() {
+        for (toolbar, kind) in [
+            (ToolbarTool::Brush, ToolKind::Brush),
+            (ToolbarTool::Pencil, ToolKind::Pencil),
+            (ToolbarTool::Eraser, ToolKind::Eraser),
+        ] {
+            assert!(SUPPORTED_TOOLS.contains(&toolbar));
+            assert_eq!(tool_kind(toolbar), Some(kind));
+        }
+        assert!(draw_capabilities(ToolKind::Brush).brush_tip);
+        assert!(!draw_capabilities(ToolKind::Pencil).brush_tip);
+        assert!(!draw_capabilities(ToolKind::Eraser).brush_tip);
+        assert!(!draw_capabilities(ToolKind::Eraser).paint);
+        assert!(!draw_capabilities(ToolKind::Eraser).smoothing);
+        assert!(!draw_capabilities(ToolKind::Pen).brush_settings);
+    }
+
     /// The exact set of toolbar faces with no canvas tool today. A new
     /// `ToolbarTool` variant lands here on purpose or gets a mapping —
     /// never silently.
@@ -463,9 +537,6 @@ mod tests {
         assert_eq!(
             unmapped,
             vec![
-                ToolbarTool::Brush,
-                ToolbarTool::Eraser,
-                ToolbarTool::RectangleSelect,
                 ToolbarTool::EllipseSelect,
                 ToolbarTool::Lasso,
                 ToolbarTool::PolygonalLasso,

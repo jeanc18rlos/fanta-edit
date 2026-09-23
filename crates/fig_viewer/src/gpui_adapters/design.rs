@@ -3277,14 +3277,16 @@ fn primary_axis_is_horizontal(doc: &Doc, id: NodeId) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use fanta_doc::{CanvasNode, Doc, GroupNode, VectorNode};
     use fanta_gpui::design::{
         DesignPageBackground, DesignPageViewData, DesignPanelInspectionContext,
         DesignPanelPermissions, DesignPanelSurface,
     };
-    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
     use project::{FakeFs, Project};
 
     use super::*;
@@ -3701,6 +3703,83 @@ mod tests {
             };
             assert_eq!(group.background, Some(Fill::solid(fanta_color(color))));
         });
+    }
+
+    #[gpui::test]
+    async fn page_background_picker_accepts_a_click_in_the_mounted_inspector(
+        cx: &mut TestAppContext,
+    ) {
+        let (doc, page, _) = doc_with_rect();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let actions = Rc::new(RefCell::new(Vec::<DesignPanelAction>::new()));
+        let _subscription = cx.update(|_, app| {
+            let actions = actions.clone();
+            app.subscribe(&panel, move |_, action: &DesignPanelAction, _| {
+                actions.borrow_mut().push(action.clone());
+            })
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.inspection_context().permissions().can_edit());
+            assert!(
+                !panel
+                    .page_view_data()
+                    .expect("page projection")
+                    .background
+                    .read_only
+            );
+        });
+        let row = cx
+            .debug_bounds("design-page-background-row")
+            .expect("the mounted inspector shows a page background row");
+        cx.simulate_click(row.center(), Modifiers::none());
+        cx.run_until_parked();
+        let spectrum = cx
+            .debug_bounds("color-picker-spectrum")
+            .expect("the page background picker is visible");
+        let color_point = point(
+            spectrum.left() + spectrum.size.width * 0.75,
+            spectrum.top() + spectrum.size.height * 0.25,
+        );
+        cx.simulate_click(color_point, Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(actions.borrow().iter().any(|action| {
+            matches!(
+                action,
+                DesignPanelAction::PageBackgroundEditRequested {
+                    page_id,
+                    phase: DesignPanelEditPhase::Commit,
+                    ..
+                } if page_id.as_ref() == page.to_string()
+            )
+        }));
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                panic!("page is a group");
+            };
+            assert!(
+                group.background.is_some(),
+                "clicking the picker spectrum changes the page background"
+            );
+            assert!(doc.history.can_undo());
+        });
+
+        let close = cx
+            .debug_bounds("paint-picker-close")
+            .expect("the picker close button is visible");
+        cx.simulate_click(close.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("color-picker-spectrum").is_none(),
+            "the picker close button accepts clicks"
+        );
     }
 
     #[gpui::test]

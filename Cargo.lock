@@ -4298,7 +4298,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-components",
  "fanta-gpui-core",
@@ -4311,7 +4311,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-async-process"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "async-channel 2.5.0",
  "async-io",
@@ -4328,7 +4328,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-collections"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-gpui-util",
  "indexmap 2.14.0",
@@ -4338,7 +4338,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-components"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4377,7 +4377,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-core"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4462,7 +4462,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-derive-refineable"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4472,7 +4472,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-linux"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -4523,7 +4523,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-macos"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4570,7 +4570,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-macros"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -4581,7 +4581,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-platform"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "console_error_panic_hook",
  "fanta-gpui-core",
@@ -4594,7 +4594,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-shared-string"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "schemars 1.0.4",
  "serde",
@@ -4604,7 +4604,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-tokio"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "fanta-gpui-core",
@@ -4615,7 +4615,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-util"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "log",
@@ -4625,7 +4625,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-web"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -4649,7 +4649,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-wgpu"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4678,7 +4678,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-gpui-windows"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -4707,7 +4707,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-http-client"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4732,7 +4732,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-http-client-tls"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "rustls",
  "rustls-platform-verifier",
@@ -4741,7 +4741,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-media"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4759,7 +4759,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-perf"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-collections",
  "serde",
@@ -4769,7 +4769,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-proptest"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "bit-set 0.8.0",
  "bit-vec 0.8.0",
@@ -4788,7 +4788,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-proptest-macro"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -4799,7 +4799,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-refineable"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-derive-refineable",
 ]
@@ -4807,7 +4807,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-reqwest-client"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "bytes 1.11.1",
@@ -4825,7 +4825,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-scheduler"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "async-task",
  "backtrace",
@@ -4840,7 +4840,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-smol"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "async-channel 2.5.0",
  "async-executor",
@@ -4856,7 +4856,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-sum-tree"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-ztracing",
  "heapless",
@@ -4868,7 +4868,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-util"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -4910,7 +4910,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-util-macros"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-perf",
  "quote",
@@ -4920,7 +4920,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-zlog"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4931,7 +4931,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-ztracing"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 dependencies = [
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing-macro",
@@ -4944,7 +4944,7 @@ dependencies = [
 [[package]]
 name = "fanta-gpui-ztracing-macro"
 version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=ed4f317ba91960a89159e589c0a4167510a01690#ed4f317ba91960a89159e589c0a4167510a01690"
+source = "git+https://github.com/squidred-dev/fanta-ui?rev=1a707b18ff1b39b55f181db0a44e261adbe45ae7#1a707b18ff1b39b55f181db0a44e261adbe45ae7"
 
 [[package]]
 name = "fanta-present"
