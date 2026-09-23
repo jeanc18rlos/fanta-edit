@@ -24,6 +24,7 @@ use gpui::{App, AppContext as _, Context, Entity, TaskExt as _, Window};
 use project::{Project, ProjectPath, WorktreeId};
 use util::rel_path::RelPath;
 use workspace::Workspace;
+use worktree::PathChange;
 
 use crate::view::FigView;
 
@@ -44,10 +45,19 @@ pub fn init(cx: &mut App) {
         cx.subscribe_in(
             &project,
             window,
-            |workspace, _project, event, window, cx| {
-                if let project::Event::WorktreeAdded(worktree_id) = event {
+            |workspace, _project, event, window, cx| match event {
+                project::Event::WorktreeAdded(worktree_id) => {
                     open_design_for_worktree(workspace, *worktree_id, window, cx);
                 }
+                project::Event::WorktreeUpdatedEntries(worktree_id, changes)
+                    if changes.iter().any(|(path, _, change)| {
+                        path.as_std_path() == Path::new(MANIFEST)
+                            && !matches!(change, PathChange::Loaded)
+                    }) =>
+                {
+                    open_design_for_worktree(workspace, *worktree_id, window, cx);
+                }
+                _ => {}
             },
         )
         .detach();

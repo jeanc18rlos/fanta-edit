@@ -238,6 +238,9 @@ pub enum WorkspaceDirty {
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
+    Created {
+        id: ArtifactId,
+    },
     Reloaded {
         id: ArtifactId,
     },

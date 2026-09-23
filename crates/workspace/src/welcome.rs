@@ -1,16 +1,17 @@
 use crate::{
-    Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation, ToggleWorkspaceSidebar,
-    Workspace, WorkspaceSettings,
+    Open, OpenMode, PathList, RecentWorkspace, RecentWorkspaceStatus, SerializedWorkspaceLocation,
+    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
 use agent_settings::AgentSettings;
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    ParentElement, Render, Styled, Task, TaskExt, Window, actions,
+    ParentElement, PathPromptOptions, Render, Styled, Task, TaskExt, Window, actions,
 };
 use gpui::{ClipboardItem, WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
+use project::DirectoryLister;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,7 @@ impl RenderOnce for SectionHeader {
 #[derive(IntoElement)]
 struct SectionButton {
     label: SharedString,
+    detail: Option<SharedString>,
     icon: IconName,
     action: Box<dyn Action>,
     tab_index: usize,
@@ -97,11 +99,17 @@ impl SectionButton {
     ) -> Self {
         Self {
             label: label.into(),
+            detail: None,
             icon,
             action: action.boxed_clone(),
             tab_index,
             focus_handle,
         }
+    }
+
+    fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 }
 
@@ -126,7 +134,16 @@ impl RenderOnce for SectionButton {
                                     .color(Color::Muted)
                                     .size(IconSize::Small),
                             )
-                            .child(Label::new(self.label)),
+                            .child(v_flex().child(Label::new(self.label)).when_some(
+                                self.detail,
+                                |this, detail| {
+                                    this.child(
+                                        Label::new(detail)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
+                                },
+                            )),
                     )
                     .child(
                         KeyBinding::for_action_in(action_ref, &self.focus_handle, cx)
@@ -290,29 +307,120 @@ impl WelcomePage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(recent_workspaces) = &self.recent_workspaces {
-            if let Some(workspace) = recent_workspaces.get(action.index) {
-                let is_local = matches!(workspace.location, SerializedWorkspaceLocation::Local);
+        let Some(workspace) = self
+            .recent_workspaces
+            .as_ref()
+            .and_then(|workspaces| workspaces.get(action.index))
+            .cloned()
+        else {
+            return;
+        };
+        if matches!(workspace.location, SerializedWorkspaceLocation::Local) {
+            if workspace.status == RecentWorkspaceStatus::Available {
+                self.open_local_paths(workspace.paths.paths().to_vec(), window, cx);
+            } else {
+                self.locate_recent_project(workspace, window, cx);
+            }
+        } else {
+            use zed_actions::OpenRecent;
+            window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
+        }
+    }
 
-                if is_local {
-                    let paths = workspace.paths.paths().to_vec();
-                    let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
-                        DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
-                        DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
-                    };
-                    self.workspace
-                        .update(cx, |workspace, cx| {
-                            workspace
-                                .open_workspace_for_paths(open_mode, paths, window, cx)
-                                .detach_and_log_err(cx);
-                        })
-                        .log_err();
-                } else {
-                    use zed_actions::OpenRecent;
-                    window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
+    fn open_local_paths(
+        &self,
+        paths: Vec<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
+            DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
+            DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_workspace_for_paths(open_mode, paths, window, cx)
+                    .detach_and_log_err(cx);
+            })
+            .log_err();
+    }
+
+    fn locate_recent_project(
+        &mut self,
+        recent: RecentWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let paths = workspace.update(cx, |workspace, cx| {
+            workspace.prompt_for_open_path(
+                PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: None,
+                },
+                DirectoryLister::Local(workspace.project().clone(), fs.clone()),
+                window,
+                cx,
+            )
+        });
+        let db = WorkspaceDb::global(cx);
+        let open_mode = match WorkspaceSettings::get_global(cx).default_open_behavior {
+            DefaultOpenBehavior::ExistingWindow => OpenMode::Activate,
+            DefaultOpenBehavior::NewWindow => OpenMode::NewWindow,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = match paths.await {
+                Ok(Some(paths)) => paths,
+                Ok(None) => return,
+                Err(error) => {
+                    log::debug!("project location prompt closed before completion: {error}");
+                    return;
+                }
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            if recent.fanta_project_id.is_some() {
+                if let Err(error) = db
+                    .relink_fanta_project(recent.workspace_id, &path, fs.as_ref())
+                    .await
+                {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_error(format!("Could not locate project: {error:#}"), cx)
+                    });
+                    return;
                 }
             }
-        }
+            if let Some(recent_workspaces) =
+                db.recent_project_workspaces(fs.as_ref()).await.log_err()
+            {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |this, cx| {
+                        this.recent_workspaces = Some(recent_workspaces);
+                        cx.notify();
+                    });
+                }
+            }
+            if let Some(task) = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_workspace_for_paths(open_mode, vec![path], window, cx)
+                })
+                .log_err()
+            {
+                if let Err(error) = task.await {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_error(format!("Could not open project: {error:#}"), cx)
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -459,25 +567,50 @@ impl WelcomePage {
         &self,
         project_index: usize,
         tab_index: usize,
-        location: &SerializedWorkspaceLocation,
-        paths: &PathList,
+        workspace: &RecentWorkspace,
     ) -> impl IntoElement {
-        let name = project_name(paths);
+        let name = project_name(&workspace.identity_paths);
 
-        let (icon, title) = match location {
-            SerializedWorkspaceLocation::Local => (IconName::Folder, name),
-            SerializedWorkspaceLocation::Remote(_) => (IconName::Server, name),
+        let (icon, detail) = match (&workspace.location, &workspace.status) {
+            (SerializedWorkspaceLocation::Local, RecentWorkspaceStatus::Unavailable { .. }) => (
+                IconName::Warning,
+                Some(if workspace.fanta_project_id.is_some() {
+                    "Folder missing · Locate project"
+                } else {
+                    "Folder missing · Open another copy"
+                }),
+            ),
+            (
+                SerializedWorkspaceLocation::Local,
+                RecentWorkspaceStatus::ProjectIdentityChanged { found, .. },
+            ) => (
+                IconName::Warning,
+                Some(if found.is_some() {
+                    "Project identity changed · Locate original"
+                } else {
+                    "Project identity unavailable · Locate original"
+                }),
+            ),
+            (SerializedWorkspaceLocation::Local, RecentWorkspaceStatus::Available) => {
+                (IconName::Folder, None)
+            }
+            (SerializedWorkspaceLocation::Remote(_), _) => (IconName::Server, None),
         };
 
-        SectionButton::new(
-            title,
+        let button = SectionButton::new(
+            name,
             icon,
             &OpenRecentProject {
                 index: project_index,
             },
             tab_index,
             self.focus_handle.clone(),
-        )
+        );
+        if let Some(detail) = detail {
+            button.detail(detail)
+        } else {
+            button
+        }
     }
 }
 
@@ -497,12 +630,7 @@ impl Render for WelcomePage {
             .take(5)
             .enumerate()
             .map(|(index, workspace)| {
-                self.render_recent_project(
-                    index,
-                    first_section_entries + index,
-                    &workspace.location,
-                    &workspace.identity_paths,
-                )
+                self.render_recent_project(index, first_section_entries + index, workspace)
             })
             .collect::<Vec<_>>();
 

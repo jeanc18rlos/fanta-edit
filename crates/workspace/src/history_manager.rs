@@ -7,8 +7,8 @@ use ui::{App, Context};
 use util::{ResultExt, paths::PathExt};
 
 use crate::{
-    NewWindow, SerializedWorkspaceLocation, WorkspaceId, path_list::PathList,
-    persistence::WorkspaceDb,
+    NewWindow, RecentWorkspaceStatus, SerializedWorkspaceLocation, WorkspaceId,
+    path_list::PathList, persistence::WorkspaceDb,
 };
 
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
@@ -50,7 +50,9 @@ impl HistoryManager {
                 .into_iter()
                 .rev()
                 .filter_map(|workspace| {
-                    if matches!(workspace.location, SerializedWorkspaceLocation::Local) {
+                    if matches!(workspace.location, SerializedWorkspaceLocation::Local)
+                        && workspace.status == RecentWorkspaceStatus::Available
+                    {
                         Some(HistoryManagerEntry::new(
                             workspace.workspace_id,
                             &workspace.paths,

@@ -3,9 +3,8 @@
 //! An [`FnxElement`] is the readable shape of one scene node: its element tag
 //! (derived 1:1 from the node's `type`), its attributes (every other serde
 //! field of the node's JSON, verbatim), and its nested children. Node identity
-//! (`id`) and sibling order (`index`) are NOT attributes — they live in the
-//! [`IdEntry`] sidecar so the source file stays free of opaque ULIDs while the
-//! round-trip stays lossless.
+//! (`id`) is an explicit attribute in new source; sibling order (`index`)
+//! remains in the [`IdEntry`] sidecar. Legacy source without `id` is accepted.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -15,7 +14,7 @@ use std::collections::BTreeMap;
 pub struct FnxElement {
     /// JSX tag — a 1:1 projection of the node's `NodeData` type tag.
     pub tag: String,
-    /// Every node field except `type`/`id`/`parent`/`index`, verbatim JSON.
+    /// Every node field except `type`/`parent`/`index`, verbatim JSON.
     pub attrs: BTreeMap<String, Value>,
     /// Child elements, in render (z) order.
     pub children: Vec<FnxElement>,
@@ -32,8 +31,8 @@ impl FnxElement {
 }
 
 /// Sidecar entry pinning one element (in pre-order) to its stable identity and
-/// fractional sibling order — the bits a readable source file deliberately
-/// omits but that must round-trip exactly.
+/// exact fractional sibling order. New source mirrors IDs; legacy source can
+/// still recover them from these entries.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct IdEntry {
     /// The scene node id (bare ULID, as it serializes inside the doc JSON).

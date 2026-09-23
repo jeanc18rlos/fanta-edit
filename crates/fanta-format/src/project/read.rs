@@ -43,6 +43,15 @@ pub(super) fn read_project_tree_with_source_override(
     dir: &Path,
     source_override: Option<&FnxSourceOverride<'_>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
+    super::layout::with_project_read_lock(dir, || {
+        read_project_tree_with_source_override_locked(dir, source_override)
+    })
+}
+
+fn read_project_tree_with_source_override_locked(
+    dir: &Path,
+    source_override: Option<&FnxSourceOverride<'_>>,
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     let manifest = read_manifest(dir)?;
     if manifest.schema_version > SCHEMA_VERSION {
         return Err(FormatError::UnsupportedSchema {
@@ -171,6 +180,9 @@ fn read_pages(
                 read_nodes_into(&entry.join(NODES_DIR), nodes)?;
                 continue;
             }
+            if !entry.join(PAGE_JSON).is_file() {
+                continue;
+            }
             let header = read_json_file(&entry.join(PAGE_JSON))?;
             let (id, id_from_header) = match header.get("id").and_then(Value::as_str) {
                 Some(id) => {
@@ -224,7 +236,7 @@ fn read_pages(
             }
             // A page always has at least its root node, so a missing `.fnx`
             // (with no `nodes/` fallback) in a v2 tree is corruption, not empty.
-            read_design_nodes(
+            let decoded_root = read_design_nodes(
                 &candidate.entry,
                 PAGE_FNX,
                 PAGE_IDS,
@@ -234,6 +246,14 @@ fn read_pages(
                 refs,
                 nodes,
             )?;
+            if let Some(decoded_root) = decoded_root
+                && decoded_root != candidate.id
+            {
+                return Err(FormatError::InvalidProjectTree(format!(
+                    "page {}: page.json id {} differs from FNX root {decoded_root}",
+                    candidate.name, candidate.id
+                )));
+            }
             // A page root is an unsized, unclipped group by invariant — its
             // background is the canvas color filling the whole viewport, and
             // sizing it would clip the page and demote that background to a
@@ -291,7 +311,9 @@ fn read_pages(
 ///    deterministic.
 /// Returns the winning indices; each losing directory is logged and must be
 /// skipped entirely by the caller.
-fn select_design_winners<Id: Ord + Copy>(candidates: &[(Id, bool, &Path)]) -> HashSet<usize> {
+pub(super) fn select_design_winners<Id: Ord + Copy>(
+    candidates: &[(Id, bool, &Path)],
+) -> HashSet<usize> {
     let mut groups: BTreeMap<Id, Vec<usize>> = BTreeMap::new();
     for (index, (id, _, _)) in candidates.iter().enumerate() {
         groups.entry(*id).or_default().push(index);
@@ -348,7 +370,7 @@ struct ComponentScan {
     sets: Value,
     /// Winning component directories, in def order — the set
     /// [`read_component_masters`] materializes.
-    winner_dirs: Vec<PathBuf>,
+    winner_dirs: Vec<(PathBuf, Option<NodeId>)>,
 }
 
 /// Scan `components/`: `sets.json` plus one `def.json` per component
@@ -385,6 +407,9 @@ fn scan_components(dir: &Path) -> Result<ComponentScan> {
                 continue;
             }
             let name = dir_name(&entry)?;
+            if !entry.join(DEF_JSON).is_file() {
+                continue;
+            }
             let def = read_json_file(&entry.join(DEF_JSON))?;
             let (id, id_from_header) = match def.get("id").and_then(Value::as_str) {
                 Some(key) => {
@@ -427,8 +452,20 @@ fn scan_components(dir: &Path) -> Result<ComponentScan> {
             if !winners.contains(&index) {
                 continue;
             }
+            let expected_root = candidate
+                .def
+                .get("root")
+                .map(|value| {
+                    serde_json::from_value::<NodeId>(value.clone()).map_err(|error| {
+                        FormatError::InvalidProjectTree(format!(
+                            "{}: def.json root is invalid: {error}",
+                            candidate.entry.display()
+                        ))
+                    })
+                })
+                .transpose()?;
             defs.insert(json_key(&candidate.id)?, candidate.def);
-            winner_dirs.push(candidate.entry);
+            winner_dirs.push((candidate.entry, expected_root));
         }
     }
     Ok(ComponentScan {
@@ -448,11 +485,11 @@ fn read_component_masters(
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
 ) -> Result<()> {
-    for entry in &scan.winner_dirs {
+    for (entry, expected_root) in &scan.winner_dirs {
         // A component master can be legitimately absent (a dangling def whose
         // master was deleted), so a missing `master.fnx` is tolerated, not
         // an error.
-        read_design_nodes(
+        let decoded_root = read_design_nodes(
             entry,
             MASTER_FNX,
             MASTER_IDS,
@@ -462,6 +499,14 @@ fn read_component_masters(
             refs,
             nodes,
         )?;
+        if let (Some(expected_root), Some(decoded_root)) = (expected_root, decoded_root)
+            && *expected_root != decoded_root
+        {
+            return Err(FormatError::InvalidProjectTree(format!(
+                "{}: def.json root {expected_root} differs from FNX root {decoded_root}",
+                entry.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -482,7 +527,7 @@ fn read_design_nodes(
     source_override: Option<&FnxSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
-) -> Result<()> {
+) -> Result<Option<NodeId>> {
     let fnx_path = design_dir.join(fnx_name);
     let source_override = source_override.filter(|source| source.path == fnx_path);
     if source_override.is_none() && !fnx_path.is_file() {
@@ -493,14 +538,15 @@ fn read_design_nodes(
         // NOT a silently-empty page that the next save would erase forever.
         let nodes_dir = design_dir.join(NODES_DIR);
         if nodes_dir.is_dir() {
-            return read_nodes_into(&nodes_dir, nodes);
+            read_nodes_into(&nodes_dir, nodes)?;
+            return Ok(None);
         }
         if required && version >= 2 {
             return Err(FormatError::MissingFile {
                 name: fnx_path.display().to_string(),
             });
         }
-        return Ok(());
+        return Ok(None);
     }
     let text = match source_override {
         Some(source_override) => source_override.source.to_owned(),
@@ -518,9 +564,29 @@ fn read_design_nodes(
                 },
             )?,
         };
-    let sidecar = reconcile_fnx_sidecar(&fnx_path, &text, &sidecar)?;
+    let sidecar = reconcile_fnx_sidecar(&fnx_path, &text, &sidecar).map_err(|error| {
+        FormatError::InvalidProjectTree(format!("{}: {error}", fnx_path.display()))
+    })?;
     let decoded = fanta_fnx::decode_subtree_with(&text, &sidecar, refs)
         .map_err(|e| FormatError::InvalidProjectTree(format!("{}: {e}", fnx_path.display())))?;
+    let decoded_root: NodeId = serde_json::from_value(
+        decoded
+            .first()
+            .and_then(|node| node.get("id"))
+            .cloned()
+            .ok_or_else(|| {
+                FormatError::InvalidProjectTree(format!(
+                    "{}: decoded FNX has no root id",
+                    fnx_path.display()
+                ))
+            })?,
+    )
+    .map_err(|error| {
+        FormatError::InvalidProjectTree(format!(
+            "{}: invalid FNX root id: {error}",
+            fnx_path.display()
+        ))
+    })?;
     for mut node in decoded {
         backfill_required_geometry(&mut node);
         let key = node
@@ -535,7 +601,7 @@ fn read_design_nodes(
             .to_owned();
         nodes.insert(key, node);
     }
-    Ok(())
+    Ok(Some(decoded_root))
 }
 
 /// Backfill `local_size` on decoded nodes whose payload struct requires it.
@@ -613,14 +679,16 @@ fn estimate_text_box(obj: &Map<String, Value>) -> [f64; 2] {
 }
 
 pub(super) fn reconcile_fnx_sidecar(
-    fnx_path: &Path,
+    _fnx_path: &Path,
     source: &str,
     sidecar: &fanta_fnx::FnxSidecar,
 ) -> Result<fanta_fnx::FnxSidecar> {
     let mut seed_hasher = Sha256::new();
-    let canonical_path = fnx_path.canonicalize()?;
-    seed_hasher.update(canonical_path.as_os_str().as_encoded_bytes());
+    seed_hasher.update(b"fanta-fnx-node-ids-v2");
+    seed_hasher.update((source.len() as u64).to_le_bytes());
+    seed_hasher.update(source.as_bytes());
     for entry in &sidecar.ids {
+        seed_hasher.update((entry.id.len() as u64).to_le_bytes());
         seed_hasher.update(entry.id.as_bytes());
     }
     let seed = seed_hasher.finalize();
@@ -641,7 +709,7 @@ pub(super) fn reconcile_fnx_sidecar(
             }
         }
     })
-    .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", fnx_path.display())))
+    .map_err(|error| FormatError::InvalidProjectTree(error.to_string()))
 }
 
 /// Read every `<node-id>.json` in `nodes_dir` into the flat scene map, keyed
@@ -672,15 +740,36 @@ fn read_assets(dir: &Path) -> Result<BTreeMap<AssetId, Vec<u8>>> {
     let mut assets = BTreeMap::new();
     let assets_dir = dir.join(ASSETS_DIR);
     if assets_dir.is_dir() {
-        collect_assets(&assets_dir, &mut assets)?;
+        let index_path = assets_dir.join(super::media::ASSET_INDEX_FILE);
+        let index = index_path
+            .is_file()
+            .then(|| std::fs::read(&index_path))
+            .transpose()?
+            .map(|bytes| super::media::read_asset_index(&bytes))
+            .transpose()?;
+        collect_assets(&assets_dir, &mut assets, index.as_ref())?;
+        if let Some(index) = index {
+            index.verify_complete(&assets)?;
+        }
     }
     Ok(assets)
 }
 
-fn collect_assets(dir: &Path, assets: &mut BTreeMap<AssetId, Vec<u8>>) -> Result<()> {
+fn collect_assets(
+    dir: &Path,
+    assets: &mut BTreeMap<AssetId, Vec<u8>>,
+    index: Option<&super::media::AssetIndex>,
+) -> Result<()> {
     for path in sorted_entries(dir)? {
         if path.is_dir() {
-            collect_assets(&path, assets)?;
+            collect_assets(&path, assets, index)?;
+            continue;
+        }
+        if path.parent() == Some(dir)
+            && path
+                .file_name()
+                .is_some_and(|name| name == super::media::ASSET_INDEX_FILE)
+        {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -690,7 +779,17 @@ fn collect_assets(dir: &Path, assets: &mut BTreeMap<AssetId, Vec<u8>>) -> Result
             tracing::warn!(path = %path.display(), "skipping non-asset file in assets/");
             continue;
         };
-        assets.insert(id, std::fs::read(&path)?);
+        let bytes = std::fs::read(&path)?;
+        if assets.contains_key(&id) {
+            return Err(FormatError::InvalidProjectTree(format!(
+                "duplicate asset id {id} at {}",
+                path.display()
+            )));
+        }
+        if let Some(index) = index {
+            index.verify_entry(id, &bytes)?;
+        }
+        assets.insert(id, bytes);
     }
     Ok(())
 }

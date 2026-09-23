@@ -39,7 +39,7 @@ pub use render_snapshot::{ArtifactRenderRevision, ArtifactRenderSnapshot};
 pub use review::{
     MergeReview, ProposalApplied, ReviewConflict, ReviewResolution, SourceProposalOutcome,
 };
-pub use sync::ApplyReport;
+pub use sync::{ApplyReport, IncrementalDocApply, WorkspaceDiskSnapshot};
 pub use types::{
     ArtifactDirty, ArtifactEdition, ArtifactId, ArtifactMeta, ArtifactOpImpact, ClosePolicy,
     ConflictOrigin, ConflictResolution, ConflictState, EditionSide, FsEvent, MergePreview,

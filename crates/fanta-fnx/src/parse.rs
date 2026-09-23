@@ -262,7 +262,7 @@ impl Scanner {
         }
         // Children until the matching close tag.
         loop {
-            self.skip_ws();
+            self.skip_child_trivia()?;
             if self.peek() == Some('<') && self.peek2() == Some('/') {
                 self.expect('<')?;
                 self.expect('/')?;
@@ -278,6 +278,25 @@ impl Scanner {
                 return Err(self.err(format!("unterminated <{tag}>")));
             }
             el.children.push(self.element()?);
+        }
+    }
+
+    fn skip_child_trivia(&mut self) -> Result<(), FnxError> {
+        loop {
+            self.skip_ws();
+            if self.chars.get(self.pos..self.pos + 3) != Some(&['{', '/', '*']) {
+                return Ok(());
+            }
+            self.pos += 3;
+            while self.pos + 2 < self.chars.len()
+                && self.chars[self.pos..self.pos + 3] != ['*', '/', '}']
+            {
+                self.pos += 1;
+            }
+            if self.pos + 2 >= self.chars.len() {
+                return Err(self.err("unterminated JSX comment"));
+            }
+            self.pos += 3;
         }
     }
 

@@ -400,11 +400,13 @@ pub(crate) struct VideoPoster {
 #[derive(Clone)]
 pub(crate) struct PreparedVideo {
     pub bytes: Arc<[u8]>,
+    pub asset: AssetId,
     pub metadata: VideoMetadata,
     pub poster: Option<VideoPoster>,
 }
 
 pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
+    let asset = fanta_format::asset_id_for_bytes(&bytes);
     let metadata = mp4_metadata(&bytes)?;
     ensure!(
         u64::from(metadata.width) * u64::from(metadata.height) <= 32 * 1024 * 1024,
@@ -439,6 +441,7 @@ pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
     let poster = None;
     Ok(PreparedVideo {
         bytes,
+        asset,
         metadata,
         poster,
     })
@@ -535,10 +538,10 @@ pub(crate) fn trim_video(
         if expected.time_range_us == trim.range_us {
             return Ok(false);
         }
-        let (poster, _) = document
+        let (poster, _, inserted) = document
             .doc_and_assets()
             .1
-            .add_image(trim.poster.png.to_vec())
+            .add_image_tracked(trim.poster.png.to_vec())
             .context("The trimmed video preview could not be added.")?;
         let mut updated = expected.clone();
         updated.time_range_us = trim.range_us;
@@ -551,7 +554,9 @@ pub(crate) fn trim_video(
         }) {
             Ok(()) => Ok(true),
             Err(error) => {
-                document.doc_and_assets().1.remove(poster);
+                if inserted {
+                    document.doc_and_assets().1.remove(poster);
+                }
                 Err(error.into())
             }
         }
@@ -730,12 +735,17 @@ pub(crate) fn place_video(
 ) -> (Result<()>, DocChange) {
     let PreparedVideo {
         bytes,
+        asset,
         metadata,
         poster,
     } = video;
     let poster_asset = match poster.as_ref() {
-        Some(poster) => match document.doc_and_assets().1.add_image(poster.png.to_vec()) {
-            Ok((asset, _)) => Some(asset),
+        Some(poster) => match document
+            .doc_and_assets()
+            .1
+            .add_image_tracked(poster.png.to_vec())
+        {
+            Ok((asset, _, inserted)) => Some((asset, inserted)),
             Err(error) => {
                 return (
                     Err(error.context("The video preview could not be added.")),
@@ -745,7 +755,19 @@ pub(crate) fn place_video(
         },
         None => None,
     };
-    let asset = AssetId::new();
+    if let Some(existing) = document.raw_assets.get(&asset) {
+        if existing.as_slice() != bytes.as_ref() {
+            if let Some((poster, true)) = poster_asset {
+                document.doc_and_assets().1.remove(poster);
+            }
+            return (
+                Err(anyhow::anyhow!(
+                    "Video asset {asset} has a content hash collision"
+                )),
+                DocChange::None,
+            );
+        }
+    }
     let mut node = CanvasNode::new(NodeData::Video(VideoNode {
         asset,
         natural_size: [metadata.width, metadata.height],
@@ -755,7 +777,7 @@ pub(crate) fn place_video(
         muted: false,
         volume: 1.,
         poster_frame_us: poster.map(|poster| poster.time_us),
-        poster: poster_asset,
+        poster: poster_asset.map(|(asset, _)| asset),
         fit: ImageFitMode::Fit,
     }));
     node.name = "Generated video".into();
@@ -767,12 +789,14 @@ pub(crate) fn place_video(
     }
     match document.doc.apply(Operation::create_node(node)) {
         Ok(()) => {
-            Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+            if !document.raw_assets.contains_key(&asset) {
+                Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+            }
             (Ok(()), DocChange::Content)
         }
         Err(error) => {
-            if let Some(asset) = poster_asset {
-                document.doc_and_assets().1.remove(asset);
+            if let Some((poster, true)) = poster_asset {
+                document.doc_and_assets().1.remove(poster);
             }
             (Err(error.into()), DocChange::None)
         }

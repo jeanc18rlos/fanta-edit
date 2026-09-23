@@ -60,6 +60,46 @@ use self::model::{DockStructure, SerializedWorkspaceLocation, SessionWorkspace};
 // > <..> the maximum value of a host parameter number is SQLITE_MAX_VARIABLE_NUMBER,
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
+const MAX_FANTA_MANIFEST_BYTES: u64 = 64 * 1024;
+
+#[derive(Default)]
+struct LocalPathInspection {
+    unavailable_paths: Vec<PathBuf>,
+    has_directory: bool,
+}
+
+impl LocalPathInspection {
+    fn can_restore(&self) -> bool {
+        self.has_directory && self.unavailable_paths.is_empty()
+    }
+}
+
+#[derive(Deserialize)]
+struct FantaManifestIdentity {
+    format: String,
+    project_id: String,
+}
+
+async fn fanta_project_id_at(path: &Path, fs: &dyn Fs) -> Option<String> {
+    let manifest_path = path.join("fanta.json");
+    let metadata = fs.metadata(&manifest_path).await.ok().flatten()?;
+    if metadata.is_dir || metadata.len > MAX_FANTA_MANIFEST_BYTES {
+        return None;
+    }
+    let text = fs.load(&manifest_path).await.ok()?;
+    if text.len() as u64 > MAX_FANTA_MANIFEST_BYTES {
+        return None;
+    }
+    let manifest: FantaManifestIdentity = serde_json::from_str(&text).ok()?;
+    let valid_id = manifest.project_id.strip_prefix("d_").is_some_and(|body| {
+        body.len() == 26
+            && body.bytes().enumerate().all(|(index, byte)| match index {
+                0 => matches!(byte, b'0'..=b'7'),
+                _ => b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&byte),
+            })
+    });
+    (manifest.format == "fanta-project" && valid_id).then_some(manifest.project_id)
+}
 
 fn parse_timestamp(text: &str) -> DateTime<Utc> {
     NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
@@ -1051,6 +1091,9 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE bookmarks ADD COLUMN label TEXT NOT NULL DEFAULT "";
         ),
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN fanta_project_id TEXT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1601,6 +1644,11 @@ impl WorkspaceDb {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
+                        fanta_project_id = CASE
+                            WHEN workspaces.paths IS ?2 AND workspaces.remote_connection_id IS ?6
+                            THEN workspaces.fanta_project_id
+                            ELSE NULL
+                        END,
                         paths = ?2,
                         paths_order = ?3,
                         identity_paths = ?4,
@@ -1803,6 +1851,7 @@ impl WorkspaceDb {
             Option<PathList>,
             Option<RemoteConnectionId>,
             Option<String>,
+            Option<String>,
             DateTime<Utc>,
         )>,
     > {
@@ -1818,6 +1867,7 @@ impl WorkspaceDb {
                     identity_paths_order,
                     remote_connection_id,
                     session_id,
+                    fanta_project_id,
                     timestamp,
                 )| {
                     (
@@ -1831,6 +1881,7 @@ impl WorkspaceDb {
                         }),
                         remote_connection_id.map(RemoteConnectionId),
                         session_id,
+                        fanta_project_id,
                         parse_timestamp(&timestamp),
                     )
                 },
@@ -1839,14 +1890,149 @@ impl WorkspaceDb {
     }
 
     query! {
-        fn recent_workspaces_query() -> Result<Vec<(WorkspaceId, String, String, Option<String>, Option<String>, Option<u64>, Option<String>, String)>> {
-            SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, remote_connection_id, session_id, timestamp
+        fn recent_workspaces_query() -> Result<Vec<(WorkspaceId, String, String, Option<String>, Option<String>, Option<u64>, Option<String>, Option<String>, String)>> {
+            SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, remote_connection_id, session_id, fanta_project_id, timestamp
             FROM workspaces
             WHERE
                 paths IS NOT NULL OR
                 remote_connection_id IS NOT NULL
             ORDER BY timestamp DESC
         }
+    }
+
+    query! {
+        async fn store_fanta_project_id(workspace_id: WorkspaceId, project_id: String, paths: String) -> Result<()> {
+            UPDATE workspaces
+            SET fanta_project_id = ?2
+            WHERE workspace_id = ?1 AND fanta_project_id IS NULL
+                AND paths IS ?3 AND remote_connection_id IS NULL
+        }
+    }
+
+    fn stored_fanta_project_id(&self, workspace_id: WorkspaceId) -> Result<Option<String>> {
+        self.select_row_bound(sql!(
+            SELECT fanta_project_id FROM workspaces WHERE workspace_id = ?
+        ))?(workspace_id)?
+        .context("workspace was not found")
+    }
+
+    /// Capture the manifest identity while a project is accessible, before a
+    /// later move makes its saved path unusable. A changed manifest at the
+    /// same path is reported rather than silently replacing the stored id.
+    pub async fn remember_fanta_project_identity(
+        &self,
+        workspace_id: WorkspaceId,
+        project_root: &Path,
+        fs: &dyn Fs,
+    ) -> Result<String> {
+        let workspace = self
+            .workspace_for_id(workspace_id)
+            .context("workspace was not found")?;
+        if workspace.location != SerializedWorkspaceLocation::Local
+            || workspace.paths.paths().len() != 1
+            || workspace.paths.paths().first().map(PathBuf::as_path) != Some(project_root)
+        {
+            bail!("workspace does not point to this local project folder");
+        }
+        let project_id = fanta_project_id_at(project_root, fs)
+            .await
+            .with_context(|| {
+                format!("{} is not a readable Fanta project", project_root.display())
+            })?;
+        if let Some(expected) = self.stored_fanta_project_id(workspace_id)? {
+            if expected != project_id {
+                bail!(
+                    "Fanta project identity changed at {}: expected {expected}, found {project_id}",
+                    project_root.display()
+                );
+            }
+        } else {
+            self.store_fanta_project_id(
+                workspace_id,
+                project_id.clone(),
+                workspace.paths.serialize().paths,
+            )
+            .await?;
+            if self.stored_fanta_project_id(workspace_id)?.as_deref() != Some(project_id.as_str()) {
+                bail!("workspace location changed while recording Fanta project identity");
+            }
+        }
+        Ok(project_id)
+    }
+
+    /// Move a saved workspace to a user-selected folder with the same Fanta
+    /// project id. The workspace row (and its pane state) retains its id.
+    pub async fn relink_fanta_project(
+        &self,
+        workspace_id: WorkspaceId,
+        replacement: &Path,
+        fs: &dyn Fs,
+    ) -> Result<()> {
+        let workspace = self
+            .workspace_for_id(workspace_id)
+            .context("workspace was not found")?;
+        if workspace.location != SerializedWorkspaceLocation::Local
+            || workspace.paths.paths().len() != 1
+        {
+            bail!("only a local, single-folder Fanta workspace can be relinked");
+        }
+        let expected = self
+            .stored_fanta_project_id(workspace_id)?
+            .context("the saved workspace has no recorded Fanta project id")?;
+        if !replacement.is_absolute() || !fs.is_dir(replacement).await {
+            bail!("replacement must be an existing absolute project folder");
+        }
+        let found = fanta_project_id_at(replacement, fs)
+            .await
+            .with_context(|| {
+                format!("{} is not a readable Fanta project", replacement.display())
+            })?;
+        if found != expected {
+            bail!("replacement folder has project id {found}; expected {expected}");
+        }
+
+        let paths = PathList::new(&[replacement]);
+        let identity_paths = resolve_local_workspace_identity(fs, &paths)
+            .await
+            .unwrap_or_else(|| paths.clone());
+        let original_paths = workspace.paths.serialize().paths;
+        let paths = paths.serialize();
+        let identity_paths = identity_paths.serialize();
+        let updated: Option<WorkspaceId> = self
+            .write(move |connection| {
+                connection.select_row_bound(sql!(
+                    UPDATE workspaces
+                    SET paths = ?2,
+                        paths_order = ?3,
+                        identity_paths = ?4,
+                        identity_paths_order = ?5,
+                        timestamp = CURRENT_TIMESTAMP
+                    WHERE workspace_id = ?1
+                        AND fanta_project_id = ?6
+                        AND paths IS ?7
+                        AND remote_connection_id IS NULL
+                        AND NOT EXISTS (
+                        SELECT other.workspace_id FROM workspaces AS other
+                            WHERE other.workspace_id != ?1
+                                AND other.paths IS ?2
+                                AND other.remote_connection_id IS NULL
+                        )
+                    RETURNING workspace_id
+                ))?((
+                    workspace_id,
+                    paths.paths,
+                    paths.order,
+                    identity_paths.paths,
+                    identity_paths.order,
+                    expected,
+                    original_paths,
+                ))
+            })
+            .await?;
+        if updated.is_none() {
+            bail!("the replacement folder already has a workspace, or this workspace changed");
+        }
+        Ok(())
     }
 
     fn session_workspaces(
@@ -1858,18 +2044,20 @@ impl WorkspaceDb {
             PathList,
             Option<u64>,
             Option<RemoteConnectionId>,
+            Option<String>,
         )>,
     > {
         Ok(self
             .session_workspaces_query(session_id)?
             .into_iter()
             .map(
-                |(workspace_id, paths, order, window_id, remote_connection_id)| {
+                |(workspace_id, paths, order, window_id, remote_connection_id, project_id)| {
                     (
                         WorkspaceId(workspace_id),
                         PathList::deserialize(&SerializedPathList { paths, order }),
                         window_id,
                         remote_connection_id.map(RemoteConnectionId),
+                        project_id,
                     )
                 },
             )
@@ -1877,8 +2065,8 @@ impl WorkspaceDb {
     }
 
     query! {
-        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, String, String, Option<u64>, Option<u64>)>> {
-            SELECT workspace_id, paths, paths_order, window_id, remote_connection_id
+        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, String, String, Option<u64>, Option<u64>, Option<String>)>> {
+            SELECT workspace_id, paths, paths_order, window_id, remote_connection_id, fanta_project_id
             FROM workspaces
             WHERE session_id = ?1
             ORDER BY timestamp DESC
@@ -1998,19 +2186,20 @@ impl WorkspaceDb {
         }
     }
 
-    async fn all_paths_exist_with_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> bool {
-        let mut any_dir = false;
-        for path in paths {
-            match fs.metadata(path).await.ok().flatten() {
-                None => return false,
-                Some(meta) => {
-                    if meta.is_dir {
-                        any_dir = true;
-                    }
-                }
+    async fn inspect_local_paths(paths: &[PathBuf], fs: &dyn Fs) -> LocalPathInspection {
+        let metadata = futures::future::join_all(paths.iter().map(|path| fs.metadata(path))).await;
+        let mut inspection = LocalPathInspection::default();
+        for (path, metadata) in paths.iter().zip(metadata) {
+            match metadata {
+                Ok(Some(metadata)) => inspection.has_directory |= metadata.is_dir,
+                Ok(None) | Err(_) => inspection.unavailable_paths.push(path.clone()),
             }
         }
-        any_dir
+        inspection
+    }
+
+    async fn all_paths_exist_with_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> bool {
+        Self::inspect_local_paths(paths, fs).await.can_restore()
     }
 
     // Returns the raw recent workspace history. Scratch workspaces (no paths) are filtered
@@ -2021,8 +2210,15 @@ impl WorkspaceDb {
     ) -> Result<Vec<RecentWorkspace>> {
         let remote_connections = self.remote_connections()?;
         let mut result = Vec::new();
-        for (id, paths, identity_paths_hint, remote_connection_id, _session_id, timestamp) in
-            self.recent_workspaces()?
+        for (
+            id,
+            paths,
+            identity_paths_hint,
+            remote_connection_id,
+            _session_id,
+            stored_project_id,
+            timestamp,
+        ) in self.recent_workspaces()?
         {
             if let Some(remote_connection_id) = remote_connection_id {
                 if let Some(connection_options) = remote_connections.get(&remote_connection_id) {
@@ -2031,6 +2227,8 @@ impl WorkspaceDb {
                         location: SerializedWorkspaceLocation::Remote(connection_options.clone()),
                         paths: paths.clone(),
                         identity_paths: identity_paths_hint.unwrap_or(paths),
+                        status: RecentWorkspaceStatus::Available,
+                        fanta_project_id: None,
                         timestamp,
                     });
                 }
@@ -2041,19 +2239,56 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
-                let identity_paths = resolve_local_workspace_identity(fs, &paths)
+            let inspection = Self::inspect_local_paths(paths.paths(), fs).await;
+            let observed_project_id = if inspection.can_restore() && paths.paths().len() == 1 {
+                match paths.paths().first() {
+                    Some(path) => fanta_project_id_at(path, fs).await,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if stored_project_id.is_none()
+                && let Some(project_id) = observed_project_id.as_ref()
+            {
+                self.store_fanta_project_id(id, project_id.clone(), paths.serialize().paths)
+                    .await?;
+            }
+            let status = if !inspection.unavailable_paths.is_empty() {
+                RecentWorkspaceStatus::Unavailable {
+                    paths: inspection.unavailable_paths,
+                }
+            } else if !inspection.has_directory {
+                RecentWorkspaceStatus::Unavailable {
+                    paths: paths.paths().to_vec(),
+                }
+            } else if let Some(expected) = stored_project_id.as_ref()
+                && observed_project_id.as_ref() != Some(expected)
+            {
+                RecentWorkspaceStatus::ProjectIdentityChanged {
+                    expected: expected.clone(),
+                    found: observed_project_id.clone(),
+                }
+            } else {
+                RecentWorkspaceStatus::Available
+            };
+            let identity_paths = if status == RecentWorkspaceStatus::Available {
+                resolve_local_workspace_identity(fs, &paths)
                     .await
                     .or(identity_paths_hint)
-                    .unwrap_or_else(|| paths.clone());
-                result.push(RecentWorkspace {
-                    workspace_id: id,
-                    location: SerializedWorkspaceLocation::Local,
-                    paths,
-                    identity_paths,
-                    timestamp,
-                });
-            }
+                    .unwrap_or_else(|| paths.clone())
+            } else {
+                identity_paths_hint.unwrap_or_else(|| paths.clone())
+            };
+            result.push(RecentWorkspace {
+                workspace_id: id,
+                location: SerializedWorkspaceLocation::Local,
+                paths,
+                identity_paths,
+                status,
+                fanta_project_id: stored_project_id.or(observed_project_id),
+                timestamp,
+            });
         }
 
         Ok(result)
@@ -2083,7 +2318,7 @@ impl WorkspaceDb {
         let remote_connections = self.remote_connections()?;
 
         let mut workspace_ids = Vec::new();
-        for (workspace_id, paths, identity_paths, remote_connection_id, _, _) in
+        for (workspace_id, paths, identity_paths, remote_connection_id, _, _, _) in
             self.recent_workspaces()?
         {
             let remote_connection = if let Some(id) = remote_connection_id {
@@ -2126,8 +2361,15 @@ impl WorkspaceDb {
         let remote_connections = self.remote_connections()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
-        for (id, paths, _identity_paths_hint, remote_connection_id, session_id, timestamp) in
-            self.recent_workspaces()?
+        for (
+            id,
+            paths,
+            _identity_paths_hint,
+            remote_connection_id,
+            session_id,
+            fanta_project_id,
+            timestamp,
+        ) in self.recent_workspaces()?
         {
             if let Some(session_id) = session_id.as_deref() {
                 if session_id == current_session_id || Some(session_id) == last_session_id {
@@ -2152,7 +2394,8 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if !Self::all_paths_exist_with_a_directory(paths.paths(), fs).await
+            if fanta_project_id.is_none()
+                && !Self::all_paths_exist_with_a_directory(paths.paths(), fs).await
                 && now - timestamp >= chrono::Duration::days(7)
             {
                 workspaces_to_delete.push(id);
@@ -2169,7 +2412,12 @@ impl WorkspaceDb {
     }
 
     pub async fn last_workspace(&self, fs: &dyn Fs) -> Result<Option<RecentWorkspace>> {
-        Ok(self.recent_project_workspaces(fs).await?.into_iter().next())
+        Ok(self
+            .recent_project_workspaces(fs)
+            .await?
+            .into_iter()
+            .filter(|workspace| workspace.status == RecentWorkspaceStatus::Available)
+            .max_by(|left, right| left.timestamp.cmp(&right.timestamp)))
     }
 
     // Returns the locations of the workspaces that were still opened when the last
@@ -2182,9 +2430,36 @@ impl WorkspaceDb {
         last_session_window_stack: Option<Vec<WindowId>>,
         fs: &dyn Fs,
     ) -> Result<Vec<SessionWorkspace>> {
-        let mut workspaces = Vec::new();
+        let report = self
+            .last_session_workspace_locations_with_recovery(
+                last_session_id,
+                last_session_window_stack,
+                fs,
+            )
+            .await?;
+        for diagnostic in &report.diagnostics {
+            log::warn!(
+                "workspace {} could not be restored from {:?}: {:?}",
+                diagnostic.workspace_id.0,
+                diagnostic.paths.paths(),
+                diagnostic.issue
+            );
+        }
+        Ok(report.workspaces)
+    }
 
-        for (workspace_id, paths, window_id, remote_connection_id) in
+    /// Restorable windows plus explicit reasons for local workspaces that
+    /// require a folder relink or an identity decision before reopening.
+    pub async fn last_session_workspace_locations_with_recovery(
+        &self,
+        last_session_id: &str,
+        last_session_window_stack: Option<Vec<WindowId>>,
+        fs: &dyn Fs,
+    ) -> Result<SessionRestoreReport> {
+        let mut workspaces = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for (workspace_id, paths, window_id, remote_connection_id, project_id) in
             self.session_workspaces(last_session_id.to_owned())?
         {
             let window_id = window_id.map(WindowId::from);
@@ -2201,7 +2476,44 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if paths.is_empty() || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
+            if paths.is_empty() {
+                workspaces.push(SessionWorkspace {
+                    workspace_id,
+                    location: SerializedWorkspaceLocation::Local,
+                    paths,
+                    window_id,
+                });
+                continue;
+            }
+
+            let inspection = Self::inspect_local_paths(paths.paths(), fs).await;
+            let issue = if !inspection.unavailable_paths.is_empty() {
+                Some(SessionRestoreIssue::UnavailablePaths(
+                    inspection.unavailable_paths,
+                ))
+            } else if !inspection.has_directory {
+                Some(SessionRestoreIssue::NoDirectory)
+            } else if let Some(expected) = project_id
+                && paths.paths().len() == 1
+            {
+                let found = match paths.paths().first() {
+                    Some(path) => fanta_project_id_at(path, fs).await,
+                    None => None,
+                };
+                (found.as_ref() != Some(&expected))
+                    .then_some(SessionRestoreIssue::ProjectIdentityChanged { expected, found })
+            } else {
+                None
+            };
+
+            if let Some(issue) = issue {
+                diagnostics.push(SessionRestoreDiagnostic {
+                    workspace_id,
+                    paths,
+                    window_id,
+                    issue,
+                });
+            } else {
                 workspaces.push(SessionWorkspace {
                     workspace_id,
                     location: SerializedWorkspaceLocation::Local,
@@ -2220,7 +2532,10 @@ impl WorkspaceDb {
             });
         }
 
-        Ok(workspaces)
+        Ok(SessionRestoreReport {
+            workspaces,
+            diagnostics,
+        })
     }
 
     fn get_center_pane_group(&self, workspace_id: WorkspaceId) -> Result<SerializedPaneGroup> {
@@ -2662,7 +2977,45 @@ pub struct RecentWorkspace {
     pub location: SerializedWorkspaceLocation,
     pub paths: PathList,
     pub identity_paths: PathList,
+    pub status: RecentWorkspaceStatus,
+    pub fanta_project_id: Option<String>,
     pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecentWorkspaceStatus {
+    Available,
+    Unavailable {
+        paths: Vec<PathBuf>,
+    },
+    ProjectIdentityChanged {
+        expected: String,
+        found: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionRestoreIssue {
+    UnavailablePaths(Vec<PathBuf>),
+    NoDirectory,
+    ProjectIdentityChanged {
+        expected: String,
+        found: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionRestoreDiagnostic {
+    pub workspace_id: WorkspaceId,
+    pub paths: PathList,
+    pub window_id: Option<WindowId>,
+    pub issue: SessionRestoreIssue,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionRestoreReport {
+    pub workspaces: Vec<SessionWorkspace>,
+    pub diagnostics: Vec<SessionRestoreDiagnostic>,
 }
 
 impl RecentWorkspace {
@@ -2717,7 +3070,13 @@ fn dedupe_recent_workspaces(
         };
         let key = (location_identity, workspace.identity_paths.paths().to_vec());
         if let Some(&existing_index) = indices_by_key.get(&key) {
-            if workspace.timestamp > result[existing_index].timestamp {
+            let existing_available =
+                result[existing_index].status == RecentWorkspaceStatus::Available;
+            let candidate_available = workspace.status == RecentWorkspaceStatus::Available;
+            if (candidate_available && !existing_available)
+                || (candidate_available == existing_available
+                    && workspace.timestamp > result[existing_index].timestamp)
+            {
                 result[existing_index] = workspace;
             }
         } else {
@@ -3830,8 +4189,283 @@ mod tests {
             location: SerializedWorkspaceLocation::Local,
             paths,
             identity_paths,
+            status: RecentWorkspaceStatus::Available,
+            fanta_project_id: None,
             timestamp,
         }
+    }
+
+    async fn insert_fanta_project(fs: &fs::FakeFs, path: &Path, project_id: &str) {
+        let manifest = json!({
+            "format": "fanta-project",
+            "version": 4,
+            "project_id": project_id,
+        });
+        fs.insert_tree(path, json!({ "fanta.json": manifest.to_string() }))
+            .await;
+    }
+
+    #[gpui::test]
+    async fn test_moved_fanta_project_can_relink_without_losing_workspace_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb::open_test_db("test_moved_fanta_project_relink").await;
+        let old = PathBuf::from("/fanta/old");
+        let moved = PathBuf::from("/fanta/moved");
+        let wrong = PathBuf::from("/fanta/wrong");
+        let project_id = format!("d_{:026}", 1);
+        insert_fanta_project(&fs, &old, &project_id).await;
+        insert_fanta_project(&fs, &wrong, &format!("d_{:026}", 2)).await;
+        db.save_workspace(workspace_with(
+            1,
+            &[old.as_path()],
+            empty_pane_group(),
+            Some("s"),
+        ))
+        .await;
+        assert_eq!(
+            db.remember_fanta_project_identity(WorkspaceId(1), &old, fs.as_ref())
+                .await
+                .unwrap(),
+            project_id
+        );
+
+        fs.rename(&old, &moved, fs::RenameOptions::default())
+            .await
+            .unwrap();
+        let recent = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].workspace_id, WorkspaceId(1));
+        assert_eq!(
+            recent[0].status,
+            RecentWorkspaceStatus::Unavailable {
+                paths: vec![old.clone()]
+            }
+        );
+        assert!(db.last_workspace(fs.as_ref()).await.unwrap().is_none());
+
+        let restore = db
+            .last_session_workspace_locations_with_recovery("s", None, fs.as_ref())
+            .await
+            .unwrap();
+        assert!(restore.workspaces.is_empty());
+        assert_eq!(restore.diagnostics.len(), 1);
+        assert_eq!(
+            restore.diagnostics[0].issue,
+            SessionRestoreIssue::UnavailablePaths(vec![old.clone()])
+        );
+
+        assert!(
+            db.relink_fanta_project(WorkspaceId(1), &wrong, fs.as_ref())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.workspace_for_id(WorkspaceId(1)).unwrap().paths.paths(),
+            std::slice::from_ref(&old)
+        );
+        db.relink_fanta_project(WorkspaceId(1), &moved, fs.as_ref())
+            .await
+            .unwrap();
+        let restored = db.workspace_for_id(WorkspaceId(1)).unwrap();
+        assert_eq!(restored.paths.paths(), std::slice::from_ref(&moved));
+        let recent = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        assert_eq!(recent[0].status, RecentWorkspaceStatus::Available);
+        assert_eq!(
+            recent[0].fanta_project_id.as_deref(),
+            Some(project_id.as_str())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_replaced_fanta_manifest_is_reported_before_restore(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb::open_test_db("test_replaced_fanta_manifest_identity").await;
+        let root = PathBuf::from("/fanta/replaced");
+        let old_id = format!("d_{:026}", 3);
+        let new_id = format!("d_{:026}", 4);
+        insert_fanta_project(&fs, &root, &old_id).await;
+        db.save_workspace(workspace_with(
+            1,
+            &[root.as_path()],
+            empty_pane_group(),
+            Some("s"),
+        ))
+        .await;
+        db.remember_fanta_project_identity(WorkspaceId(1), &root, fs.as_ref())
+            .await
+            .unwrap();
+
+        fs.write(
+            &root.join("fanta.json"),
+            json!({"format":"fanta-project","project_id":new_id})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let recent = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        assert_eq!(
+            recent[0].status,
+            RecentWorkspaceStatus::ProjectIdentityChanged {
+                expected: old_id.clone(),
+                found: Some(new_id.clone()),
+            }
+        );
+        assert!(db.last_workspace(fs.as_ref()).await.unwrap().is_none());
+        let restore = db
+            .last_session_workspace_locations_with_recovery("s", None, fs.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(restore.diagnostics.len(), 1);
+        assert_eq!(
+            restore.diagnostics[0].issue,
+            SessionRestoreIssue::ProjectIdentityChanged {
+                expected: old_id,
+                found: Some(new_id),
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_gc_keeps_missing_fanta_project_for_relink(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb::open_test_db("test_gc_keeps_missing_fanta_project_for_relink").await;
+        let old = PathBuf::from("/fanta/old");
+        let moved = PathBuf::from("/fanta/moved");
+        let project_id = format!("d_{:026}", 5);
+        insert_fanta_project(&fs, &old, &project_id).await;
+        db.save_workspace(workspace_with(
+            1,
+            &[old.as_path()],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+        db.remember_fanta_project_identity(WorkspaceId(1), &old, fs.as_ref())
+            .await
+            .unwrap();
+        fs.rename(&old, &moved, fs::RenameOptions::default())
+            .await
+            .unwrap();
+        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
+            .await
+            .unwrap();
+
+        db.garbage_collect_workspaces(fs.as_ref(), "current", None)
+            .await
+            .unwrap();
+
+        assert!(db.workspace_for_id(WorkspaceId(1)).is_some());
+        let recent = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].fanta_project_id.as_deref(),
+            Some(project_id.as_str())
+        );
+        assert_eq!(
+            recent[0].status,
+            RecentWorkspaceStatus::Unavailable { paths: vec![old] }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_workspace_path_change_clears_fanta_project_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db =
+            WorkspaceDb::open_test_db("test_workspace_path_change_clears_fanta_project_identity")
+                .await;
+        let first = PathBuf::from("/fanta/first");
+        let second = PathBuf::from("/fanta/second");
+        let first_id = format!("d_{:026}", 6);
+        let second_id = format!("d_{:026}", 7);
+        insert_fanta_project(&fs, &first, &first_id).await;
+        insert_fanta_project(&fs, &second, &second_id).await;
+        db.save_workspace(workspace_with(
+            1,
+            &[first.as_path()],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+        db.remember_fanta_project_identity(WorkspaceId(1), &first, fs.as_ref())
+            .await
+            .unwrap();
+
+        db.save_workspace(workspace_with(
+            1,
+            &[second.as_path()],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+
+        assert_eq!(db.stored_fanta_project_id(WorkspaceId(1)).unwrap(), None);
+        let recent = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].status, RecentWorkspaceStatus::Available);
+        assert_eq!(
+            recent[0].fanta_project_id.as_deref(),
+            Some(second_id.as_str())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_last_workspace_uses_latest_available_timestamp_after_deduplication(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb::open_test_db("test_last_workspace_latest_available").await;
+        fs.insert_tree("/repo", json!({})).await;
+        fs.insert_tree("/other", json!({})).await;
+
+        db.save_workspace(SerializedWorkspace {
+            identity_paths: Some(PathList::new(&["/repo"])),
+            ..workspace_with(
+                1,
+                &[Path::new("/missing-worktree")],
+                empty_pane_group(),
+                None,
+            )
+        })
+        .await;
+        db.save_workspace(workspace_with(
+            2,
+            &[Path::new("/repo")],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+        db.save_workspace(workspace_with(
+            3,
+            &[Path::new("/other")],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+        for (workspace_id, timestamp) in [
+            (1, "2024-01-01 00:00:03"),
+            (2, "2024-01-01 00:00:01"),
+            (3, "2024-01-01 00:00:02"),
+        ] {
+            db.set_timestamp_for_tests(WorkspaceId(workspace_id), timestamp.to_owned())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.last_workspace(fs.as_ref())
+                .await
+                .unwrap()
+                .unwrap()
+                .workspace_id,
+            WorkspaceId(3)
+        );
     }
 
     #[gpui::test]

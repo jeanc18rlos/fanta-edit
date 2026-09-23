@@ -2,18 +2,17 @@
 //! [`FnxElement`] tree + [`IdEntry`] sidecar.
 //!
 //! Losslessness rests on the doc model: `id`, `parent`, and `index` are always
-//! present in a node's serde JSON (no `skip_serializing_if`). So the four
-//! structural fields can be reconstructed with their exact serde shape — `type`
-//! from the tag, `id`/`index` from the sidecar, `parent` from tree nesting —
-//! and every other field is carried verbatim as an attribute.
+//! present in a node's serde JSON. New source writes the stable `id` explicitly;
+//! legacy source recovers it from the sidecar. The sidecar also retains exact
+//! fractional sibling order while `parent` follows tree nesting.
 
 use crate::model::{FnxElement, IdEntry, tag_for_type, type_for_tag};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 /// Reserved structural keys that are NOT attributes: handled by tag (`type`),
-/// sidecar (`id`, `index`), or nesting (`parent`).
-const STRUCTURAL: [&str; 4] = ["type", "id", "parent", "index"];
+/// sidecar (`index`), or nesting (`parent`).
+const STRUCTURAL: [&str; 3] = ["type", "parent", "index"];
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum FnxError {
@@ -46,7 +45,7 @@ pub struct FnxTree {
 }
 
 /// One node object → an attribute-only [`FnxElement`] (children attached by the
-/// caller). Drops the four structural keys.
+/// caller). Drops the three structural keys.
 pub(crate) fn element_of(node: &Value) -> Result<FnxElement, FnxError> {
     let obj = node.as_object().ok_or(FnxError::NotObject)?;
     let ty = obj
@@ -194,6 +193,13 @@ fn element_to_value(
     index: &Value,
 ) -> Result<Value, FnxError> {
     let ty = type_for_tag(&el.tag).ok_or_else(|| FnxError::UnknownTag(el.tag.clone()))?;
+    if let Some(explicit_id) = el.attrs.get("id") {
+        if explicit_id.as_str() != Some(id) {
+            return Err(FnxError::Parse(format!(
+                "explicit node id {explicit_id} disagrees with sidecar id {id}"
+            )));
+        }
+    }
     let mut obj = Map::new();
     for (k, v) in &el.attrs {
         obj.insert(k.clone(), v.clone());

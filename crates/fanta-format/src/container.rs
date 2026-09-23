@@ -176,12 +176,16 @@ impl FantaFile {
     /// always yields the same id and we only keep one copy.
     pub fn put_asset(&mut self, bytes: &[u8]) -> Result<AssetId> {
         let (id, hash_hex) = compute_asset_id(bytes);
-        if !self.has_asset(id) {
-            let path = format!("{ASSETS_PREFIX}{hash_hex}.bin");
-            self.assets.insert(id, bytes.to_vec());
-            self.manifest.set_asset(id, path);
-            self.flush()?;
+        if self.has_asset(id) {
+            if !self.asset_equals(id, bytes)? {
+                return Err(FormatError::AssetIdCollision(id));
+            }
+            return Ok(id);
         }
+        let path = format!("{ASSETS_PREFIX}{hash_hex}.bin");
+        self.assets.insert(id, bytes.to_vec());
+        self.manifest.set_asset(id, path);
+        self.flush()?;
         Ok(id)
     }
 
@@ -191,12 +195,16 @@ impl FantaFile {
     /// [`Self::put_asset`] would orphan them. Content producers should prefer
     /// `put_asset`'s dedup.
     pub fn put_asset_as(&mut self, id: AssetId, bytes: &[u8]) -> Result<()> {
-        if !self.has_asset(id) {
-            let path = format!("{ASSETS_PREFIX}{id}.bin");
-            self.assets.insert(id, bytes.to_vec());
-            self.manifest.set_asset(id, path);
-            self.flush()?;
+        if self.has_asset(id) {
+            if !self.asset_equals(id, bytes)? {
+                return Err(FormatError::AssetIdCollision(id));
+            }
+            return Ok(());
         }
+        let path = format!("{ASSETS_PREFIX}{id}.bin");
+        self.assets.insert(id, bytes.to_vec());
+        self.manifest.set_asset(id, path);
+        self.flush()?;
         Ok(())
     }
 
@@ -252,6 +260,16 @@ impl FantaFile {
         self.assets.contains_key(&id) || self.asset_paths_pending.contains_key(&id)
     }
 
+    fn asset_equals(&self, id: AssetId, bytes: &[u8]) -> Result<bool> {
+        if let Some(existing) = self.assets.get(&id) {
+            return Ok(existing.as_slice() == bytes);
+        }
+        if let Some(path) = self.asset_paths_pending.get(&id) {
+            return Ok(self.read_asset_from_disk(path, id)?.as_slice() == bytes);
+        }
+        Err(FormatError::AssetNotFound(id))
+    }
+
     /// Lazily decompress an asset blob from the on-disk zip.
     fn read_asset_from_disk(&self, entry_path: &str, id: AssetId) -> Result<Vec<u8>> {
         let file = File::open(&self.path)?;
@@ -261,6 +279,7 @@ impl FantaFile {
             .map_err(|_| FormatError::AssetNotFound(id))?;
         let mut buf = Vec::with_capacity(e.size() as usize);
         e.read_to_end(&mut buf)?;
+        validate_hash_named_asset(entry_path, id, &buf)?;
         Ok(buf)
     }
 
@@ -441,16 +460,36 @@ fn compute_asset_id(bytes: &[u8]) -> (AssetId, String) {
     let mut first_16 = [0u8; 16];
     first_16.copy_from_slice(&digest[..16]);
     let id = AssetId::from_u128(u128::from_be_bytes(first_16));
-    let hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push(HEX[usize::from(byte >> 4)] as char);
+        hex.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
     (id, hex)
+}
+
+fn validate_hash_named_asset(path: &str, id: AssetId, bytes: &[u8]) -> Result<()> {
+    let Some(stem) = Path::new(path).file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(());
+    };
+    if stem.len() != 64 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    let (expected_id, full_hash) = compute_asset_id(bytes);
+    if id != expected_id || !stem.eq_ignore_ascii_case(&full_hash) {
+        return Err(FormatError::CorruptAsset {
+            id,
+            path: path.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn compute_asset_id_is_deterministic() {
@@ -465,5 +504,48 @@ mod tests {
         let (a, _) = compute_asset_id(b"hello world");
         let (b, _) = compute_asset_id(b"goodbye world");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn duplicate_id_never_discards_different_bytes() {
+        let directory = tempdir().unwrap();
+        let mut file = FantaFile::create(directory.path().join("assets.fant")).unwrap();
+        let id = asset_id_for_bytes(b"intended bytes");
+        file.put_asset_as(id, b"legacy bytes").unwrap();
+        assert!(matches!(
+            file.put_asset_as(id, b"changed bytes"),
+            Err(FormatError::AssetIdCollision(found)) if found == id
+        ));
+        assert!(matches!(
+            file.put_asset(b"intended bytes"),
+            Err(FormatError::AssetIdCollision(found)) if found == id
+        ));
+        assert_eq!(file.get_asset(id).unwrap().as_slice(), b"legacy bytes");
+    }
+
+    #[test]
+    fn hash_named_snapshot_asset_rejects_same_length_corruption() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("assets.fant");
+        let mut file = FantaFile::create(&path).unwrap();
+        let id = file.put_asset(b"first").unwrap();
+        let entry_path = file.manifest.asset_path(id).unwrap().to_owned();
+        let manifest = serde_json::to_vec(&file.manifest).unwrap();
+        drop(file);
+
+        let output = File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(output);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file(MANIFEST_NAME, options).unwrap();
+        zip.write_all(&manifest).unwrap();
+        zip.start_file(&entry_path, options).unwrap();
+        zip.write_all(b"other").unwrap();
+        zip.finish().unwrap();
+
+        let opened = FantaFile::open(&path).unwrap();
+        assert!(matches!(
+            opened.get_asset(id),
+            Err(FormatError::CorruptAsset { id: found, .. }) if found == id
+        ));
     }
 }

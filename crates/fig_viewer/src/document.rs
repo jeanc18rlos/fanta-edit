@@ -3,7 +3,8 @@
 //! as an unwrapped `fanta-project` directory.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    io::Read as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -19,17 +20,12 @@ use gpui::{
     SharedString, Subscription, Task, WeakEntity,
 };
 use project::{Project, ProjectPath};
+use sha2::{Digest as _, Sha256};
 use worktree::{PathChange, ProjectEntryId, UpdatedEntriesSet, WorktreeId};
 
 /// How long to let a burst of external writes (an agent rewriting several
 /// project files) settle before reloading from disk.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
-
-/// How long after our own project writes to keep ignoring watcher events:
-/// long enough to cover the file-system watcher's delivery latency, short
-/// enough that a genuinely external edit right after a save is only briefly
-/// missed (the next edit's events will still arrive).
-const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
 
 /// Cap on the encoded bytes of one image ingested as a project asset (a paste,
 /// a drop, an agent's `create_image`). Generous for any generated PNG while
@@ -64,7 +60,6 @@ impl SaveTestBarrier {
 struct ProjectWriteState {
     active: usize,
     changing_destination: bool,
-    quiet_until: Option<Instant>,
     last_write: Option<futures::future::Shared<futures::future::BoxFuture<'static, ()>>>,
 }
 
@@ -76,6 +71,14 @@ struct ProjectWriteLease {
 }
 
 impl ProjectWrites {
+    fn has_active_writes(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            > 0
+    }
+
     fn begin(self: &Arc<Self>) -> Arc<ProjectWriteLease> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         self.enqueue(&mut state, false)
@@ -131,11 +134,6 @@ impl ProjectWrites {
             .unwrap_or_else(|error| error.into_inner())
             .changing_destination
     }
-
-    fn suppresses_watcher(&self, now: Instant) -> bool {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.active > 0 || state.quiet_until.is_some_and(|until| now < until)
-    }
 }
 
 impl ProjectWriteLease {
@@ -165,7 +163,6 @@ impl Drop for ProjectWriteLease {
         if state.active == 0 {
             state.last_write = None;
         }
-        state.quiet_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
     }
 }
 
@@ -186,13 +183,15 @@ pub struct FigItem {
     /// persisted project tree. The validated source may still be previewed,
     /// but canvas-authored content changes must not race it.
     source_edit_locked: bool,
-    /// Serializes source persistence/reconciliation across split views that
-    /// share this item and its project buffer.
-    /// Ignore worktree events until this instant; set around our own project
-    /// writes so saving from the canvas does not trigger a self-reload.
-    suppress_watcher_until: Option<Instant>,
+    /// Watcher paths are checked after queued writes finish. Events are never
+    /// discarded merely because they arrived during a save.
+    pending_watcher_paths: BTreeSet<PathBuf>,
+    watcher_check_in_flight: bool,
+    own_write_hashes: BTreeMap<PathBuf, [u8; 32]>,
+    own_write_removed: BTreeSet<PathBuf>,
+    watcher_check_task: Option<Task<()>>,
     // A synchronous writer cannot be interrupted when its foreground task is
-    // canceled. Its shared lease keeps watcher suppression alive until both
+    // canceled. Its shared lease keeps watcher checks queued until both
     // sides have released that save, including overlapping or failed saves.
     project_writes: Arc<ProjectWrites>,
     /// The last document state both the canvas and the disk agreed on (as of
@@ -200,6 +199,11 @@ pub struct FigItem {
     /// three-way merge that reconciles concurrent canvas edits with external
     /// (agent/hand) file edits instead of forcing Overwrite/Discard.
     merge_base: Option<Doc>,
+    last_saved_assets: Option<Arc<BTreeMap<AssetId, Vec<u8>>>>,
+    /// Scene watermark of the last persisted snapshot. Its instance identity
+    /// lets a common property edit identify changed artifacts from the bounded
+    /// scene delta without scanning every page.
+    last_saved_scene: Option<(u64, u64)>,
     /// A scope requested while the document was still loading (from the open
     /// path — `page.fnx` / `master.fnx` / `doc/variables.json` — or a scoped
     /// re-open of the shared item). Applied and cleared when the load lands.
@@ -222,6 +226,9 @@ pub struct FigItem {
     /// it absent starts from an empty one. Dropped whenever the document or
     /// its project root is replaced.
     write_cache: Option<fanta_format::ProjectWriteCache>,
+    /// Retained artifact sources and their disk baselines. The live document
+    /// is an editing/render cache; this session owns authored FNX text.
+    workspace_session: Option<fanta_format::WorkspaceSession>,
     /// Worktree-event subscriptions, one per [`Project`] that opened this
     /// item. The item is shared across windows and each window brings its OWN
     /// `Project` entity, so watching only the first opener's project would
@@ -445,6 +452,13 @@ pub struct FigDocument {
     prewarmed_pages: HashSet<NodeId>,
 }
 
+struct CachedAssetPresentation {
+    resolver: Option<Arc<dyn AssetResolver>>,
+    embedded: Option<Arc<LazyAssetResolver>>,
+    overlay: Option<Arc<OverlayAssetResolver>>,
+    images: HashMap<AssetId, Arc<Image>>,
+}
+
 /// The decode work for one page's images, handed out by
 /// [`FigDocument::take_page_prewarm`] to run off the UI thread.
 pub(crate) struct PagePrewarm {
@@ -489,7 +503,19 @@ pub struct FigPage {
 }
 
 impl FigDocument {
-    fn from_doc(mut doc: Doc, raw_assets: BTreeMap<AssetId, Vec<u8>>) -> Self {
+    fn from_doc(doc: Doc, raw_assets: BTreeMap<AssetId, Vec<u8>>) -> Self {
+        Self::from_doc_with_assets(doc, Arc::new(raw_assets))
+    }
+
+    fn from_doc_with_assets(doc: Doc, raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>) -> Self {
+        Self::from_doc_with_cached_assets(doc, raw_assets, None)
+    }
+
+    fn from_doc_with_cached_assets(
+        mut doc: Doc,
+        raw_assets: Arc<BTreeMap<AssetId, Vec<u8>>>,
+        cached_assets: Option<CachedAssetPresentation>,
+    ) -> Self {
         // Figma bakes each instance's fully-resolved paints as sparse overrides;
         // the ones that merely restate the master pin the instance and block
         // master edits from propagating. Drop them on load (both `.fig` imports
@@ -514,19 +540,29 @@ impl FigDocument {
             crate::report_slow("document load: solve default page layout", started);
             solved_pages.insert(page_root);
         }
-        let started = Instant::now();
-        let gpui_images = decode_gpui_images(&raw_assets);
-        crate::report_slow("document load: gpui thumbnails", started);
-        let raw_assets = Arc::new(raw_assets);
-        let embedded_assets = (!raw_assets.is_empty()).then(|| {
-            Arc::new(LazyAssetResolver::new(
-                raw_assets.clone(),
-                Arc::new(decode_embedded_image),
-            ))
-        });
-        let asset_resolver = embedded_assets
-            .clone()
-            .map(|resolver| resolver as Arc<dyn AssetResolver>);
+        let (gpui_images, embedded_assets, asset_resolver, agent_asset_overlay) =
+            if let Some(cached) = cached_assets {
+                (
+                    cached.images,
+                    cached.embedded,
+                    cached.resolver,
+                    cached.overlay,
+                )
+            } else {
+                let started = Instant::now();
+                let gpui_images = decode_gpui_images(&raw_assets);
+                crate::report_slow("document load: gpui thumbnails", started);
+                let embedded_assets = (!raw_assets.is_empty()).then(|| {
+                    Arc::new(LazyAssetResolver::new(
+                        raw_assets.clone(),
+                        Arc::new(decode_embedded_image),
+                    ))
+                });
+                let asset_resolver = embedded_assets
+                    .clone()
+                    .map(|resolver| resolver as Arc<dyn AssetResolver>);
+                (gpui_images, embedded_assets, asset_resolver, None)
+            };
         let pages = collect_pages(&doc, &visible_page_roots);
         let default_page_index = default_page_root
             .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
@@ -558,11 +594,20 @@ impl FigDocument {
             embedded_assets,
             raw_assets,
             gpui_images,
-            agent_asset_overlay: None,
+            agent_asset_overlay,
             uses_auto_layout,
             render_generation: 0,
             variables_generation: next_variables_generation(),
             prewarmed_pages: HashSet::new(),
+        }
+    }
+
+    fn cached_asset_presentation(&self) -> CachedAssetPresentation {
+        CachedAssetPresentation {
+            resolver: self.asset_resolver.clone(),
+            embedded: self.embedded_assets.clone(),
+            overlay: self.agent_asset_overlay.clone(),
+            images: self.gpui_images.clone(),
         }
     }
 
@@ -831,6 +876,37 @@ pub(crate) struct AssetStores<'a> {
     gpui_images: &'a mut HashMap<AssetId, Arc<Image>>,
 }
 
+pub(crate) struct PreparedImage {
+    id: AssetId,
+    bytes: Vec<u8>,
+    rgba: Vec<u8>,
+    size: [u32; 2],
+    format: Option<ImageFormat>,
+}
+
+impl PreparedImage {
+    pub(crate) fn new(bytes: Vec<u8>) -> Result<Self> {
+        anyhow::ensure!(
+            bytes.len() <= MAX_IMAGE_SOURCE_BYTES,
+            "the image is {} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES} bytes",
+            bytes.len()
+        );
+        let id = fanta_format::asset_id_for_bytes(&bytes);
+        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
+        let rgba = decoded.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
+        let format = image::guess_format(&bytes).ok().and_then(gpui_image_format);
+        Ok(Self {
+            id,
+            bytes,
+            rgba: rgba.into_raw(),
+            size: [width, height],
+            format,
+        })
+    }
+}
+
 /// Owned backing for [`AssetStores`] — for tests that exercise batch
 /// application without a full [`FigDocument`].
 #[cfg(test)]
@@ -863,20 +939,40 @@ impl TestAssetStores {
 }
 
 impl AssetStores<'_> {
-    /// Ingest encoded image bytes as a fresh project asset. Decodes eagerly
-    /// (so a corrupt payload fails the op instead of rendering a placeholder)
-    /// and returns the new id plus the natural pixel size.
+    /// Ingest encoded image bytes as a project asset and return its natural size.
+    #[cfg(test)]
     pub(crate) fn add_image(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2])> {
-        anyhow::ensure!(
-            bytes.len() <= MAX_IMAGE_SOURCE_BYTES,
-            "the image is {} bytes; the limit is {MAX_IMAGE_SOURCE_BYTES} bytes",
-            bytes.len()
-        );
-        let decoded = image::load_from_memory(&bytes).context("decoding image bytes")?;
-        let rgba = decoded.to_rgba8();
-        let (width, height) = rgba.dimensions();
-        anyhow::ensure!(width > 0 && height > 0, "the image has no pixels");
-        let id = AssetId::new();
+        self.add_image_tracked(bytes)
+            .map(|(asset, natural_size, _)| (asset, natural_size))
+    }
+
+    /// The final value says whether this call inserted a new asset, so a
+    /// failed batch can roll it back without removing an existing duplicate.
+    pub(crate) fn add_image_tracked(
+        &mut self,
+        bytes: Vec<u8>,
+    ) -> Result<(AssetId, [u32; 2], bool)> {
+        self.add_prepared_image_tracked(PreparedImage::new(bytes)?)
+    }
+
+    pub(crate) fn add_prepared_image_tracked(
+        &mut self,
+        prepared: PreparedImage,
+    ) -> Result<(AssetId, [u32; 2], bool)> {
+        let PreparedImage {
+            id,
+            bytes,
+            rgba,
+            size: [width, height],
+            format,
+        } = prepared;
+        if let Some(existing) = self.raw_assets.get(&id) {
+            anyhow::ensure!(
+                existing == &bytes,
+                "asset {id} has a content hash collision"
+            );
+            return Ok((id, [width, height], false));
+        }
 
         // `raw_assets` is shared behind an `Arc` with the load-time asset
         // resolver, so ingesting usually clones the byte map (the resolver
@@ -891,17 +987,18 @@ impl AssetStores<'_> {
                 added: std::sync::RwLock::new(HashMap::default()),
             })
         });
-        overlay.added.write().unwrap().insert(
-            id,
-            DecodedImage::new(Arc::new(rgba.into_raw()), width, height),
-        );
+        overlay
+            .added
+            .write()
+            .unwrap()
+            .insert(id, DecodedImage::new(Arc::new(rgba), width, height));
         *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
 
-        if let Some(format) = image::guess_format(&bytes).ok().and_then(gpui_image_format) {
+        if let Some(format) = format {
             self.gpui_images
                 .insert(id, Arc::new(Image::from_bytes(format, bytes)));
         }
-        Ok((id, [width, height]))
+        Ok((id, [width, height], true))
     }
 
     /// Drop an asset ingested by [`add_image`](Self::add_image) again — the
@@ -924,7 +1021,17 @@ impl project::ProjectItem for FigItem {
         cx: &mut App,
     ) -> Option<Task<Result<Entity<Self>>>> {
         let abs_path = project.read(cx).absolute_path(path, cx);
-        let is_fig = is_fig_file(path) || abs_path.as_deref().is_some_and(path_has_fig_extension);
+        let is_importable = match import_formats() {
+            Ok(formats) => formats.can_import_path(
+                abs_path
+                    .as_deref()
+                    .unwrap_or_else(|| path.path.as_std_path()),
+            ),
+            Err(error) => {
+                log::error!("registering design import formats failed: {error:#}");
+                false
+            }
+        };
         let is_manifest = is_fanta_manifest(path.path.as_std_path())
             || abs_path.as_deref().is_some_and(is_fanta_manifest);
         // A project source file opens the editor SCOPED to what it describes:
@@ -934,7 +1041,7 @@ impl project::ProjectItem for FigItem {
         // `is_project_dir` probe (one tiny fanta.json read) so a loose
         // look-alike path still falls through to the text editor.
         let scoped = abs_path.as_deref().and_then(scoped_project_source);
-        if !is_fig && !is_manifest && scoped.is_none() {
+        if !is_importable && !is_manifest && scoped.is_none() {
             return None;
         }
 
@@ -947,7 +1054,7 @@ impl project::ProjectItem for FigItem {
 
         Some(cx.spawn(async move |cx| {
             let abs_path =
-                abs_path.context("Figma viewer only supports local .fig files and projects")?;
+                abs_path.context("the design editor only supports local files and projects")?;
             let initial_scope = scoped.as_ref().map(|(_, scope)| *scope);
             let project_root = if let Some((root, _)) = scoped {
                 Some(root)
@@ -1020,7 +1127,9 @@ impl project::ProjectItem for FigItem {
                             .background_spawn(async move {
                                 match load_project_root {
                                     Some(root) => {
-                                        load_project_document(&root).map(|document| (document, None))
+                                        let session = fanta_format::WorkspaceSession::open(&root)?;
+                                        let document = load_project_document(&root)?;
+                                        Ok((document, None, Some(session)))
                                     }
                                     // First open of a bare `.fig`: parse it AND
                                     // materialize the project directory right
@@ -1031,21 +1140,29 @@ impl project::ProjectItem for FigItem {
                                     // degrades to the old in-memory mode — the
                                     // parse is still shown and the first save
                                     // retries the write.
-                                    None => load_fig_document(&load_path).map(|document| {
+                                    None => load_imported_document(&load_path).map(|document| {
                                         let materialized =
                                             materialize_project_on_open(&load_path, &document);
-                                        (document, materialized)
+                                        let session = materialized
+                                            .as_ref()
+                                            .and_then(|project| {
+                                                fanta_format::WorkspaceSession::open(&project.root)
+                                                    .ok()
+                                            });
+                                        (document, materialized, session)
                                     }),
                                 }
                             })
                             .await;
 
-                        let (document, materialized) = match load_result {
-                            Ok((document, materialized)) => (Ok(document), materialized),
-                            Err(error) => (Err(error), None),
+                        let (document, materialized, session) = match load_result {
+                            Ok((document, materialized, session)) => {
+                                (Ok(document), materialized, session)
+                            }
+                            Err(error) => (Err(error), None, None),
                         };
                         if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
-                            this.adopt_initial_load(document, materialized, cx);
+                            this.adopt_initial_load(document, materialized, session, cx);
                         }) {
                             log::debug!("dropping loaded update for closed .fig item: {error:#}");
                             return;
@@ -1115,15 +1232,22 @@ impl project::ProjectItem for FigItem {
                     preview_dirty_before: None,
                     conflict: false,
                     source_edit_locked: false,
-                    suppress_watcher_until: None,
+                    pending_watcher_paths: BTreeSet::new(),
+                    watcher_check_in_flight: false,
+                    own_write_hashes: BTreeMap::new(),
+                    own_write_removed: BTreeSet::new(),
+                    watcher_check_task: None,
                     project_writes: Arc::default(),
                     merge_base: None,
+                    last_saved_assets: None,
+                    last_saved_scene: None,
                     pending_scope: initial_scope,
                     last_scope: None,
                     sync_epoch: 0,
                     reload_task: None,
                     _load_task: Some(load_task),
                     write_cache: None,
+                    workspace_session: None,
                     project_subscriptions: vec![(project.downgrade(), project_subscription)],
                 }
             });
@@ -1277,37 +1401,89 @@ impl FigItem {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        let now = Instant::now();
-        if self.project_writes.suppresses_watcher(now)
-            || self.suppress_watcher_until.is_some_and(|until| now < until)
-        {
-            return;
-        }
         let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
             return;
         };
         let worktree = worktree.read(cx);
-        let relevant = changes.iter().any(|(path, _, change)| {
-            // `Loaded` entries come from the initial worktree scan, not from
-            // anything changing on disk.
-            !matches!(change, PathChange::Loaded)
-                && is_relevant_project_change(&project_root, &worktree.absolutize(path))
-        });
-        if !relevant {
+        let changed_paths: BTreeSet<PathBuf> = changes
+            .iter()
+            .filter(|(_, _, change)| !matches!(change, PathChange::Loaded))
+            .map(|(path, _, _)| worktree.absolutize(path))
+            .filter(|path| is_relevant_project_change(&project_root, path))
+            .collect();
+        if changed_paths.is_empty() {
             return;
         }
-        if self.source_edit_locked {
-            // A dirty FNX buffer owns its live preview; merging under it
-            // would race the text the user is still editing.
-            self.set_conflict(true, cx);
-        } else if self.dirty {
-            // Unsaved canvas edits + external file edits: try a three-way
-            // merge against the last agreed state instead of forcing the
-            // binary Overwrite/Discard choice.
-            self.schedule_merge(cx);
-        } else {
-            self.schedule_reload(cx);
+        self.pending_watcher_paths.extend(changed_paths);
+        self.schedule_watcher_check(cx);
+    }
+
+    fn schedule_watcher_check(&mut self, cx: &mut Context<Self>) {
+        if self.pending_watcher_paths.is_empty() || self.watcher_check_in_flight {
+            return;
         }
+        self.watcher_check_in_flight = true;
+        self.watcher_check_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RELOAD_DEBOUNCE).await;
+            let snapshot = this.update(cx, |this, _cx| {
+                if this.project_writes.has_active_writes() {
+                    return None;
+                }
+                let Some(root) = this.project_root.clone() else {
+                    this.pending_watcher_paths.clear();
+                    return None;
+                };
+                Some((
+                    root,
+                    without_redundant_directory_events(std::mem::take(
+                        &mut this.pending_watcher_paths,
+                    )),
+                    this.own_write_hashes.clone(),
+                    this.own_write_removed.clone(),
+                    this.sync_epoch,
+                ))
+            });
+            if let Ok(Some((root, paths, hashes, removed, epoch))) = snapshot {
+                let paths_for_check = paths.clone();
+                let root_for_check = root.clone();
+                let changed = cx
+                    .background_spawn(async move {
+                        watcher_paths_differ_from_own_writes(
+                            &root_for_check,
+                            &paths_for_check,
+                            &hashes,
+                            &removed,
+                        )
+                    })
+                    .await;
+                if let Err(error) = this.update(cx, |this, cx| {
+                    if this.sync_epoch != epoch || this.project_writes.has_active_writes() {
+                        this.pending_watcher_paths.extend(paths);
+                    } else if changed {
+                        let asset_changed = paths.iter().any(|path| {
+                            path.strip_prefix(&root)
+                                .ok()
+                                .is_some_and(|relative| relative.starts_with("assets"))
+                        });
+                        if this.source_edit_locked {
+                            this.set_conflict(true, cx);
+                        } else if this.dirty {
+                            this.schedule_merge_with_full(asset_changed, cx);
+                        } else {
+                            this.schedule_reload_with_full(asset_changed, cx);
+                        }
+                    }
+                }) {
+                    log::debug!("dropping watcher check for closed Fanta project item: {error:#}");
+                }
+            }
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.watcher_check_in_flight = false;
+                this.schedule_watcher_check(cx);
+            }) {
+                log::debug!("dropping watcher check for closed Fanta project item: {error:#}");
+            }
+        }));
     }
 
     /// Debounce an external disk change that landed while the canvas has
@@ -1315,25 +1491,56 @@ impl FigItem {
     /// merge is adopted silently (the canvas stays dirty — its half is not
     /// on disk yet); any real conflict falls back to the conflict banner.
     fn schedule_merge(&mut self, cx: &mut Context<Self>) {
+        self.schedule_merge_with_full(false, cx);
+    }
+
+    fn schedule_merge_with_full(&mut self, force_full: bool, cx: &mut Context<Self>) {
         let Some(root) = self.project_root.clone() else {
             self.set_conflict(true, cx);
             return;
         };
-        let Some(base) = self.merge_base.clone() else {
+        if self.merge_base.is_none() {
             self.set_conflict(true, cx);
             return;
-        };
+        }
         let epoch = self.sync_epoch;
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DEBOUNCE).await;
+            let snapshot = this.update(cx, |this, cx| {
+                if this.sync_epoch != epoch {
+                    this.schedule_resync(cx);
+                    return None;
+                }
+                let base = this.merge_base.as_ref()?.clone_for_persist();
+                let incremental = (!force_full)
+                    .then(|| {
+                        this.workspace_session
+                            .as_ref()
+                            .zip(this.last_saved_assets.as_ref())
+                            .map(|(session, assets)| {
+                                (
+                                    session.disk_snapshot(),
+                                    base.clone_for_persist(),
+                                    assets.clone(),
+                                    None,
+                                )
+                            })
+                    })
+                    .flatten();
+                Some((base, incremental))
+            });
+            let Ok(Some((base, incremental))) = snapshot else {
+                return;
+            };
             let loaded = cx
                 .background_spawn({
                     let root = root.clone();
-                    async move { load_project_document(&root) }
+                    async move { load_changed_project_document(&root, incremental) }
                 })
                 .await;
-            let theirs = match loaded {
-                Ok(theirs) => theirs,
+            let (theirs, session) = match loaded {
+                Ok(Some(theirs)) => theirs,
+                Ok(None) => return,
                 Err(error) => {
                     log::error!(
                         "loading external changes for merge from {} failed: {error:#}",
@@ -1383,7 +1590,7 @@ impl FigItem {
                 if !this.dirty {
                     // The canvas edits were saved or discarded mid-merge;
                     // plain reload semantics apply.
-                    this.apply_reloaded_document(theirs, cx);
+                    this.apply_reloaded_document_with_session(theirs, Some(session), cx);
                     cx.emit(FigItemEvent::ReloadedFromDisk { merged: false });
                     return;
                 }
@@ -1401,7 +1608,7 @@ impl FigItem {
                 }
                 match merge {
                     Ok(merge) if merge.is_clean() => {
-                        this.adopt_merged_document(merge.doc, theirs, cx);
+                        this.adopt_merged_document(merge.doc, theirs, session, cx);
                         cx.emit(FigItemEvent::ReloadedFromDisk { merged: true });
                     }
                     Ok(merge) => {
@@ -1427,7 +1634,13 @@ impl FigItem {
     /// of the merge is not on disk yet) and the merge base advances to the
     /// disk state so the next external change merges against the right
     /// ancestor.
-    fn adopt_merged_document(&mut self, merged: Doc, disk: FigDocument, cx: &mut Context<Self>) {
+    fn adopt_merged_document(
+        &mut self,
+        merged: Doc,
+        disk: FigDocument,
+        session: fanta_format::WorkspaceSession,
+        cx: &mut Context<Self>,
+    ) {
         let mut raw_assets: BTreeMap<AssetId, Vec<u8>> = (*disk.raw_assets).clone();
         if let Some(current) = self.document.ready() {
             for (id, bytes) in current.raw_assets.iter() {
@@ -1468,7 +1681,10 @@ impl FigItem {
         );
         self.document = FigDocumentState::Ready(document);
         self.merge_base = Some(disk.doc);
+        self.last_saved_assets = Some(disk.raw_assets);
+        self.last_saved_scene = None;
         self.write_cache = None;
+        self.workspace_session = Some(session);
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
@@ -1494,14 +1710,43 @@ impl FigItem {
     /// mid-gesture reload can only interrupt selection-style gestures, which
     /// tolerate having their selection reset.
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
+        self.schedule_reload_with_full(false, cx);
+    }
+
+    fn schedule_reload_with_full(&mut self, force_full: bool, cx: &mut Context<Self>) {
         let Some(root) = self.project_root.clone() else {
             return;
         };
         let epoch = self.sync_epoch;
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DEBOUNCE).await;
+            let snapshot = this.update(cx, |this, cx| {
+                if this.sync_epoch != epoch {
+                    this.schedule_resync(cx);
+                    return None;
+                }
+                let incremental = (!force_full)
+                    .then(|| {
+                        this.workspace_session
+                            .as_ref()
+                            .zip(this.document.ready())
+                            .map(|(session, document)| {
+                                (
+                                    session.disk_snapshot(),
+                                    document.doc.clone_for_persist(),
+                                    document.raw_assets.clone(),
+                                    Some(document.cached_asset_presentation()),
+                                )
+                            })
+                    })
+                    .flatten();
+                Some(incremental)
+            });
+            let Ok(Some(incremental)) = snapshot else {
+                return;
+            };
             let loaded = cx
-                .background_spawn(async move { load_project_document(&root) })
+                .background_spawn(async move { load_changed_project_document(&root, incremental) })
                 .await;
             if let Err(error) = this.update(cx, |this, cx| {
                 if this.sync_epoch != epoch {
@@ -1513,6 +1758,9 @@ impl FigItem {
                     this.schedule_resync(cx);
                     return;
                 }
+                if matches!(&loaded, Ok(None)) {
+                    return;
+                }
                 if this.dirty || this.source_edit_locked {
                     // Canvas or FNX edits landed while the reload was in
                     // flight; keep them and flag the divergence.
@@ -1520,10 +1768,11 @@ impl FigItem {
                     return;
                 }
                 match loaded {
-                    Ok(document) => {
-                        this.apply_reloaded_document(document, cx);
+                    Ok(Some((document, session))) => {
+                        this.apply_reloaded_document_with_session(document, Some(session), cx);
                         cx.emit(FigItemEvent::ReloadedFromDisk { merged: false });
                     }
+                    Ok(None) => {}
                     Err(error) => {
                         log::error!(
                             "reloading Fanta project after a disk change failed: {error:#}"
@@ -1535,6 +1784,8 @@ impl FigItem {
                             this.document = FigDocumentState::Error(Arc::new(error));
                             cx.emit(FigItemEvent::StateChanged);
                             cx.notify();
+                        } else {
+                            this.set_conflict(true, cx);
                         }
                     }
                 }
@@ -1548,7 +1799,16 @@ impl FigItem {
     /// its root node id) when it still exists. The viewport lives on the
     /// view and survives untouched; the selection resets with the new
     /// document.
-    fn apply_reloaded_document(&mut self, mut document: FigDocument, cx: &mut Context<Self>) {
+    fn apply_reloaded_document(&mut self, document: FigDocument, cx: &mut Context<Self>) {
+        self.apply_reloaded_document_with_session(document, None, cx);
+    }
+
+    fn apply_reloaded_document_with_session(
+        &mut self,
+        mut document: FigDocument,
+        session: Option<fanta_format::WorkspaceSession>,
+        cx: &mut Context<Self>,
+    ) {
         let previous_page_root = self
             .document
             .ready()
@@ -1562,8 +1822,14 @@ impl FigItem {
                 .map(|current| current.render_generation()),
         );
         self.merge_base = Some(document.doc.clone());
+        self.last_saved_assets = Some(document.raw_assets.clone());
+        self.last_saved_scene = Some((
+            document.doc.scene.instance_id(),
+            document.doc.scene.revision(),
+        ));
         self.document = FigDocumentState::Ready(document);
         self.write_cache = None;
+        self.workspace_session = session;
         self.dirty = false;
         self.preview_dirty_before = None;
         self.sync_epoch += 1;
@@ -1844,6 +2110,7 @@ impl FigItem {
         &mut self,
         document: Result<FigDocument>,
         materialized: Option<MaterializedProject>,
+        session: Option<fanta_format::WorkspaceSession>,
         cx: &mut Context<Self>,
     ) {
         if self.sync_epoch != 0 {
@@ -1853,11 +2120,8 @@ impl FigItem {
             return;
         }
         self.write_cache = None;
+        self.workspace_session = session;
         if let Some(MaterializedProject { root, write_cache }) = materialized {
-            // The materializing write echoes back through the worktree
-            // watcher once the folder is adopted; suppress it exactly like a
-            // save's self-write.
-            self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
             self.project_root = Some(root.clone());
             self.write_cache = Some(write_cache);
             // The project directory now exists; share this item so later
@@ -1874,6 +2138,16 @@ impl FigItem {
             cx.emit(FigItemEvent::ScopeApplied(scope, ScopeRequester::Load));
         }
         self.merge_base = self.document.ready().map(|document| document.doc.clone());
+        self.last_saved_assets = self
+            .document
+            .ready()
+            .map(|document| document.raw_assets.clone());
+        self.last_saved_scene = self.document.ready().map(|document| {
+            (
+                document.doc.scene.instance_id(),
+                document.doc.scene.revision(),
+            )
+        });
         cx.emit(FigItemEvent::StateChanged);
         cx.notify();
     }
@@ -1915,20 +2189,25 @@ impl FigItem {
             return Task::ready(Err(anyhow::anyhow!("the document is still loading")));
         };
 
+        let changed_artifacts = changed_artifact_ids(
+            &document.doc,
+            self.merge_base.as_ref(),
+            self.last_saved_scene,
+        );
         // The write needs the content, not the presence state: the undo
         // stack's subtree snapshots can outweigh the scene, and cloning them
         // once per autosave was the save path's memory high-water mark.
         let doc = document.doc.clone_for_persist();
         let raw_assets = document.raw_assets.clone();
+        let previous_assets = self.last_saved_assets.clone();
         let generation = document.render_generation();
-        // Our own writes echo back through the worktree watcher; suppress it
-        // both from save start (covers sub-second saves entirely) and again at
-        // completion (covers watcher latency after longer saves). On the
-        // materializing save this window also spans the moment the directory is
-        // adopted as a worktree, so its initial scan does not bounce back as a
-        // reload.
+        let scene_watermark = (
+            document.doc.scene.instance_id(),
+            document.doc.scene.revision(),
+        );
+        // Keep watcher events queued until this write finishes, then compare
+        // their exact content hashes with the committed report.
         let write_lease = self.project_writes.begin();
-        self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
         // A pending merge/reload holds a disk snapshot from before this save;
         // cancel it so it can't adopt that stale snapshot after the write
         // lands (silently reverting — and on the next save destroying — the
@@ -1943,7 +2222,7 @@ impl FigItem {
             .take();
         cx.spawn(async move |this, cx| {
             write_lease.wait_for_turn().await;
-            let (target, materializing, write_cache) = this.update(cx, |this, _| {
+            let (target, materializing, write_cache, workspace_session) = this.update(cx, |this, _| {
                 anyhow::ensure!(
                     !this.source_edit_locked,
                     "the FNX source is dirty; save it through the code workspace before saving the canvas"
@@ -1966,42 +2245,135 @@ impl FigItem {
                     target,
                     materializing,
                     this.write_cache.take().unwrap_or_default(),
+                    this.workspace_session.take(),
                 ))
             })??;
             // The persisted clone travels through the write and comes back
             // to become the merge base — one clone per save, not two.
-            let (result, saved_doc, write_cache) = cx
+            let (result, saved_doc, saved_assets, write_cache, workspace_session) = cx
                 .background_spawn({
                     let target = target.clone();
                     let write_lease = write_lease.clone();
                     async move {
                         let _write_lease = write_lease;
                         let mut write_cache = write_cache;
+                        let mut workspace_session = workspace_session;
                         #[cfg(test)]
                         let mut save_barrier = save_barrier;
                         #[cfg(test)]
                         if save_barrier.as_ref().is_some_and(|barrier| !barrier.after_write) {
                             save_barrier.take().expect("before-write barrier").wait().await;
                         }
-                        let result =
-                            write_project_cached(&target, &doc, &raw_assets, &mut write_cache);
+                        let result = (|| -> Result<fanta_format::WriteReport> {
+                            if materializing {
+                                let report = write_project_cached_report(
+                                    &target,
+                                    &doc,
+                                    &raw_assets,
+                                    &mut write_cache,
+                                )?;
+                                match fanta_format::WorkspaceSession::open(&target) {
+                                    Ok(session) => workspace_session = Some(session),
+                                    Err(error) => log::error!(
+                                        "initializing source session for {} failed after save: {error:#}",
+                                        target.display()
+                                    ),
+                                }
+                                return Ok(report);
+                            }
+                            if workspace_session.is_none() {
+                                workspace_session = Some(fanta_format::WorkspaceSession::open(&target)?);
+                            }
+                            let session = workspace_session
+                                .as_mut()
+                                .context("The Fanta source session is unavailable")?;
+                            for id in &changed_artifacts {
+                                let Some(indexed_hash) = session.file_index.get(id).copied() else {
+                                    continue;
+                                };
+                                if !session.has_indexed_source(id) {
+                                    continue;
+                                }
+                                session.open_artifact(id.clone())?;
+                                anyhow::ensure!(
+                                    session.artifact(&id).map(|artifact| artifact.disk_hash)
+                                        == Some(indexed_hash),
+                                    "{} changed on disk while opening its source; reconcile before saving",
+                                    id.debug_label(),
+                                );
+                            }
+                            session.adopt_document_shared(&doc);
+                            for id in &changed_artifacts {
+                                if let Some(artifact) = session.artifact_mut(id) {
+                                    artifact.adopt_document(&doc)?;
+                                }
+                            }
+                            let sources = session.validated_source_overrides_for_document(&doc)?;
+                            let mut expected_disk = session.source_write_preconditions(&doc)?;
+                            if let Some(previous_assets) = &previous_assets {
+                                add_asset_write_preconditions(
+                                    &target,
+                                    &mut expected_disk,
+                                    previous_assets,
+                                    &raw_assets,
+                                )?;
+                            }
+                            let report = write_project_cached_report_with_sources(
+                                &target,
+                                &doc,
+                                &raw_assets,
+                                &mut write_cache,
+                                Some(&sources),
+                                Some(&expected_disk),
+                            )?;
+                            let asset_index_hash = report
+                                .written_hashes
+                                .get(Path::new("assets/index.json"))
+                                .copied()
+                                .or_else(|| session.asset_index_disk_hash())
+                                .context("The project asset index has no committed hash")?;
+                            session.accept_written_sources(
+                                &doc,
+                                asset_index_hash,
+                                &sources,
+                                &report.written_hashes,
+                            )?;
+                            if doc.pages().iter().any(|id| {
+                                !session.artifacts.contains_key(&fanta_format::ArtifactId::Page(*id))
+                            }) || doc.components.defs.keys().any(|id| {
+                                !session.artifacts.contains_key(&fanta_format::ArtifactId::Component(*id))
+                            }) {
+                                session.reconcile_disk_snapshot()?;
+                            }
+                            Ok(report)
+                        })();
                         #[cfg(test)]
                         if let Some(barrier) = save_barrier {
                             barrier.wait().await;
                         }
-                        (result, doc, write_cache)
+                        (result, doc, raw_assets, write_cache, workspace_session)
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
-                if result.is_ok() {
+                this.workspace_session = workspace_session;
+                if let Ok(report) = &result {
+                    for path in &report.removed {
+                        this.own_write_hashes.remove(path);
+                        this.own_write_removed.insert(path.clone());
+                    }
+                    for (path, hash) in &report.written_hashes {
+                        this.own_write_removed.remove(path);
+                        this.own_write_hashes.insert(path.clone(), *hash);
+                    }
                     if materializing {
                         this.project_root = Some(target.clone());
                     }
                     // The disk contains this snapshot even if the live
                     // document advanced while the writer was running.
                     this.merge_base = Some(saved_doc);
+                    this.last_saved_assets = Some(saved_assets);
+                    this.last_saved_scene = Some(scene_watermark);
                     this.dirty = this
                         .document
                         .ready()
@@ -2018,7 +2390,10 @@ impl FigItem {
                         cx.emit(FigItemEvent::Edited);
                     }
                     cx.notify();
+                } else if this.project_root.is_some() {
+                    this.schedule_resync(cx);
                 }
+                this.schedule_watcher_check(cx);
                 // The memo is only worth keeping for the tree it describes; a
                 // failed write leaves it valid too (entries are content
                 // fingerprints, not disk state).
@@ -2027,7 +2402,7 @@ impl FigItem {
                 }
             })?;
             drop(write_lease);
-            result.map(|()| materializing.then_some(target))
+            result.map(|_| materializing.then_some(target))
         })
     }
 
@@ -2062,11 +2437,25 @@ impl FigItem {
                 manifest_path,
                 document.doc.clone_for_persist(),
                 document.raw_assets.clone(),
+                document.raw_assets.clone(),
                 document.render_generation(),
+                (
+                    document.doc.scene.instance_id(),
+                    document.doc.scene.revision(),
+                ),
                 lease,
             ))
         })();
-        let (target, manifest_path, document, assets, generation, lease) = match preparation {
+        let (
+            target,
+            manifest_path,
+            document,
+            assets,
+            saved_assets,
+            generation,
+            scene_watermark,
+            lease,
+        ) = match preparation {
             Ok(preparation) => preparation,
             Err(error) => {
                 if self.dirty {
@@ -2105,7 +2494,12 @@ impl FigItem {
                     this.abs_path = root.join("fanta.json");
                     this.project_root = Some(root.clone());
                     this.merge_base = Some(document);
+                    this.last_saved_assets = Some(saved_assets);
+                    this.last_saved_scene = Some(scene_watermark);
                     this.write_cache = Some(cache);
+                    this.workspace_session = None;
+                    this.own_write_hashes.clear();
+                    this.own_write_removed.clear();
                     this.dirty = this
                         .document
                         .ready()
@@ -2113,7 +2507,6 @@ impl FigItem {
                     this.preview_dirty_before = None;
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
-                    this.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
                     this.subscribe_to_project(&project, cx);
                     // All split/scoped views share this document. Remove its old
                     // lookup keys so reopening the original reads the original tree.
@@ -2203,15 +2596,22 @@ pub(crate) fn ready_item_with_root_for_test(
         preview_dirty_before: None,
         conflict: false,
         source_edit_locked: false,
-        suppress_watcher_until: None,
+        pending_watcher_paths: BTreeSet::new(),
+        watcher_check_in_flight: false,
+        own_write_hashes: BTreeMap::new(),
+        own_write_removed: BTreeSet::new(),
+        watcher_check_task: None,
         project_writes: Arc::default(),
         merge_base: None,
+        last_saved_assets: None,
+        last_saved_scene: None,
         pending_scope: None,
         last_scope: None,
         sync_epoch: 0,
         reload_task: None,
         _load_task: None,
         write_cache: None,
+        workspace_session: None,
         project_subscriptions: Vec::new(),
     });
     item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
@@ -2378,10 +2778,108 @@ pub(crate) fn write_project_cached(
     raw_assets: &BTreeMap<AssetId, Vec<u8>>,
     cache: &mut fanta_format::ProjectWriteCache,
 ) -> Result<()> {
-    fanta_format::scaffold_project_tree(root)
-        .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
-    fanta_format::write_project_tree_cached(root, doc, raw_assets, cache)
-        .with_context(|| format!("writing Fanta project at {}", root.display()))?;
+    write_project_cached_report(root, doc, raw_assets, cache).map(|_| ())
+}
+
+fn write_project_cached_report(
+    root: &Path,
+    doc: &Doc,
+    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
+    cache: &mut fanta_format::ProjectWriteCache,
+) -> Result<fanta_format::WriteReport> {
+    write_project_cached_report_with_sources(root, doc, raw_assets, cache, None, None)
+}
+
+fn add_asset_write_preconditions(
+    project_root: &Path,
+    expected_disk: &mut BTreeMap<PathBuf, Option<[u8; 32]>>,
+    previous_assets: &BTreeMap<AssetId, Vec<u8>>,
+    current_assets: &BTreeMap<AssetId, Vec<u8>>,
+) -> Result<()> {
+    let media = fanta_format::MediaRegistry::default();
+    let asset_path = |id: &AssetId, bytes: &[u8]| {
+        let (family, extension) = media
+            .sniff(bytes)
+            .map(|format| (format.family, format.extension))
+            .unwrap_or(("other", "bin"));
+        PathBuf::from("assets")
+            .join(family)
+            .join(format!("{id}.{extension}"))
+    };
+    let mut found = BTreeSet::new();
+    for family in std::fs::read_dir(project_root.join("assets"))? {
+        let family = family?;
+        if !family.file_type()?.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(family.path())? {
+            let file = file?;
+            let path = file.path();
+            let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<AssetId>().ok())
+            else {
+                continue;
+            };
+            anyhow::ensure!(
+                file.file_type()?.is_file(),
+                "asset {} is not a regular file",
+                path.display()
+            );
+            let expected = previous_assets
+                .get(&id)
+                .with_context(|| format!("asset {id} appeared since the last saved snapshot"))?;
+            anyhow::ensure!(found.insert(id), "asset {id} has duplicate files");
+            expected_disk.insert(
+                PathBuf::from("assets")
+                    .join(family.file_name())
+                    .join(file.file_name()),
+                Some(Sha256::digest(expected).into()),
+            );
+        }
+    }
+    anyhow::ensure!(
+        found.len() == previous_assets.len(),
+        "an asset disappeared since the last saved snapshot"
+    );
+    for (id, bytes) in current_assets {
+        expected_disk.entry(asset_path(id, bytes)).or_insert(None);
+    }
+    Ok(())
+}
+
+fn write_project_cached_report_with_sources(
+    root: &Path,
+    doc: &Doc,
+    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
+    cache: &mut fanta_format::ProjectWriteCache,
+    sources: Option<&BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>>,
+    expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
+) -> Result<fanta_format::WriteReport> {
+    if root.join("fanta.json").exists() {
+        anyhow::ensure!(
+            fanta_format::is_project_dir(root),
+            "{} has a Fanta manifest that cannot be read",
+            root.display()
+        );
+    } else {
+        fanta_format::scaffold_project_tree(root)
+            .with_context(|| format!("scaffolding Fanta project at {}", root.display()))?;
+    }
+    let report = if let (Some(sources), Some(expected_disk)) = (sources, expected_disk) {
+        fanta_format::write_project_tree_cached_with_sources_checked(
+            root,
+            doc,
+            raw_assets,
+            cache,
+            sources,
+            expected_disk,
+        )
+    } else {
+        fanta_format::write_project_tree_cached(root, doc, raw_assets, cache)
+    }
+    .with_context(|| format!("writing Fanta project at {}", root.display()))?;
     #[cfg(feature = "fanta-gpui-ui")]
     if let Some(thumbnail) = doc
         .scene
@@ -2412,7 +2910,7 @@ pub(crate) fn write_project_cached(
         }
     }
     git_init_if_needed(root);
-    Ok(())
+    Ok(report)
 }
 
 /// Turn a freshly written project into a git repository, so that every later
@@ -2499,13 +2997,131 @@ fn is_relevant_project_change(project_root: &Path, abs_path: &Path) -> bool {
     }
 }
 
-pub(crate) fn is_fig_file(path: &ProjectPath) -> bool {
-    path_has_fig_extension(path.path.as_std_path())
+fn without_redundant_directory_events(paths: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut directories_with_child_events = BTreeSet::new();
+    for path in &paths {
+        for ancestor in path.ancestors().skip(1) {
+            if paths.contains(ancestor) {
+                directories_with_child_events.insert(ancestor.to_path_buf());
+            }
+        }
+    }
+    paths
+        .difference(&directories_with_child_events)
+        .cloned()
+        .collect()
 }
 
-fn path_has_fig_extension(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("fig"))
+fn watcher_paths_differ_from_own_writes(
+    root: &Path,
+    paths: &BTreeSet<PathBuf>,
+    hashes: &BTreeMap<PathBuf, [u8; 32]>,
+    removed: &BTreeSet<PathBuf>,
+) -> bool {
+    for path in paths {
+        let Ok(relative) = path.strip_prefix(root) else {
+            return true;
+        };
+        if let Some(expected) = hashes.get(relative) {
+            if !matches!(
+                std::fs::symlink_metadata(path),
+                Ok(metadata) if metadata.file_type().is_file()
+            ) {
+                return true;
+            }
+            let Ok(file) = std::fs::File::open(path) else {
+                return true;
+            };
+            let Ok(metadata) = file.metadata() else {
+                return true;
+            };
+            if !metadata.is_file() {
+                return true;
+            }
+            let mut file = file;
+            let mut digest = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(size) => digest.update(&buffer[..size]),
+                    Err(_) => return true,
+                }
+            }
+            if digest.finalize().as_slice() != expected {
+                return true;
+            }
+        } else if removed.contains(relative) {
+            if std::fs::symlink_metadata(path).is_ok() {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+fn changed_artifact_ids(
+    document: &Doc,
+    base: Option<&Doc>,
+    watermark: Option<(u64, u64)>,
+) -> BTreeSet<fanta_format::ArtifactId> {
+    let all = || {
+        document
+            .pages()
+            .iter()
+            .copied()
+            .map(fanta_format::ArtifactId::Page)
+            .chain(
+                document
+                    .components
+                    .defs
+                    .keys()
+                    .copied()
+                    .map(fanta_format::ArtifactId::Component),
+            )
+            .collect()
+    };
+    let Some((instance, revision)) = watermark else {
+        return all();
+    };
+    if instance != document.scene.instance_id()
+        || base.is_none_or(|base| {
+            base.pages() != document.pages()
+                || base.components != document.components
+                || base.variables != document.variables
+                || base.active_modes != document.active_modes
+        })
+    {
+        return all();
+    }
+    let Some(delta) = document.scene.changes_since(revision) else {
+        return all();
+    };
+    let component_roots: HashMap<NodeId, fanta_doc::ComponentId> = document
+        .components
+        .defs
+        .iter()
+        .map(|(id, def)| (def.root, *id))
+        .collect();
+    let page_roots: HashSet<NodeId> = document.pages().iter().copied().collect();
+    let mut changed = BTreeSet::new();
+    for node in delta.nodes.into_iter().chain(delta.transforms) {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if let Some(component) = component_roots.get(&id) {
+                changed.insert(fanta_format::ArtifactId::Component(*component));
+                break;
+            }
+            if page_roots.contains(&id) {
+                changed.insert(fanta_format::ArtifactId::Page(id));
+                break;
+            }
+            current = document.scene.get(id).and_then(|node| node.parent);
+        }
+    }
+    changed
 }
 
 fn is_fanta_manifest(path: &Path) -> bool {
@@ -2610,19 +3226,60 @@ fn apply_scope(document: &mut FigDocument, scope: FigScope) {
     }
 }
 
-fn load_fig_document(path: &Path) -> Result<FigDocument> {
+fn import_formats() -> Result<&'static fanta_format::FormatRegistry> {
+    static FORMATS: std::sync::OnceLock<std::result::Result<fanta_format::FormatRegistry, String>> =
+        std::sync::OnceLock::new();
+    FORMATS
+        .get_or_init(|| {
+            let mut formats = fanta_format::FormatRegistry::with_native_formats();
+            formats
+                .register(FigImportFormat)
+                .map_err(|error| error.to_string())?;
+            Ok(formats)
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.clone()))
+}
+
+fn load_imported_document(path: &Path) -> Result<FigDocument> {
     let started = Instant::now();
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    crate::report_slow("document load: read .fig", started);
-    let started = Instant::now();
-    let fig = read_fig(&bytes).context("parsing .fig")?;
-    crate::report_slow("document load: parse .fig", started);
-    let started = Instant::now();
-    let (doc, _report, assets) = fig_to_doc(&fig).context("mapping .fig to Fanta document")?;
-    crate::report_slow("document load: map .fig to doc", started);
-    let mut document = FigDocument::from_doc(doc, assets.into_iter().collect());
+    let imported = import_formats()?.import_path(path)?;
+    crate::report_slow("document load: import design", started);
+    let mut document = FigDocument::from_doc(imported.doc, imported.assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+struct FigImportFormat;
+
+impl fanta_format::FormatHandler for FigImportFormat {
+    fn descriptor(&self) -> fanta_format::FormatDescriptor {
+        fanta_format::FormatDescriptor {
+            id: "fig-import",
+            name: "Figma document",
+            paths: &[fanta_format::FormatPath::Extension("fig")],
+            capabilities: fanta_format::FormatCapabilities {
+                import: true,
+                export: false,
+                display: true,
+                edit: false,
+                version: false,
+            },
+        }
+    }
+
+    fn import(
+        &self,
+        path: &Path,
+    ) -> fanta_format::FormatHandlerResult<fanta_format::ImportedDesign> {
+        let bytes = std::fs::read(path)?;
+        let fig = read_fig(&bytes)?;
+        let (doc, _report, assets) = fig_to_doc(&fig)?;
+        Ok(fanta_format::ImportedDesign {
+            doc,
+            assets: assets.into_iter().collect(),
+        })
+    }
 }
 
 fn load_project_document(root: &Path) -> Result<FigDocument> {
@@ -2633,6 +3290,40 @@ fn load_project_document(root: &Path) -> Result<FigDocument> {
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+type IncrementalProjectLoad = (
+    fanta_format::WorkspaceDiskSnapshot,
+    Doc,
+    Arc<BTreeMap<AssetId, Vec<u8>>>,
+    Option<CachedAssetPresentation>,
+);
+
+fn load_changed_project_document(
+    root: &Path,
+    incremental: Option<IncrementalProjectLoad>,
+) -> Result<Option<(FigDocument, fanta_format::WorkspaceSession)>> {
+    if let Some((baseline, doc, assets, cached_assets)) = incremental {
+        let mut session = fanta_format::WorkspaceSession::open(root)?;
+        let report = session.reconcile_from_disk_snapshot(&baseline)?;
+        if !report.requires_full_reload {
+            if report.changed.is_empty() && report.events.is_empty() {
+                return Ok(None);
+            }
+            match session.apply_report_to_owned_doc(doc, &report)? {
+                (fanta_format::IncrementalDocApply::Applied, doc) => {
+                    let mut document =
+                        FigDocument::from_doc_with_cached_assets(doc, assets, cached_assets);
+                    document.prewarm_default_page_assets();
+                    return Ok(Some((document, session)));
+                }
+                (fanta_format::IncrementalDocApply::RequiresFullReload, _) => {}
+            }
+        }
+    }
+    let session = fanta_format::WorkspaceSession::open(root)?;
+    let document = load_project_document(root)?;
+    Ok(Some((document, session)))
 }
 
 /// Whether this single node carries an auto layout. O(1) — the incremental
@@ -2938,6 +3629,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn asset_preconditions_allow_checked_relocation_and_guard_both_paths() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let document = Doc::new();
+        let id = AssetId::from_u128(42);
+        let original = b"\x89PNG\r\n\x1a\noriginal".to_vec();
+        let replacement = b"replacement binary".to_vec();
+        let previous_assets = BTreeMap::from([(id, original.clone())]);
+        fanta_format::write_project_tree(directory.path(), &document, &previous_assets)?;
+
+        let previous_path = PathBuf::from(format!("assets/images/{id}.png"));
+        let relocated_path = PathBuf::from(format!("assets/other/{id}.bin"));
+        std::fs::create_dir_all(directory.path().join("assets/other"))?;
+        std::fs::rename(
+            directory.path().join(&previous_path),
+            directory.path().join(&relocated_path),
+        )?;
+        let mut preconditions = BTreeMap::new();
+        add_asset_write_preconditions(
+            directory.path(),
+            &mut preconditions,
+            &previous_assets,
+            &previous_assets,
+        )?;
+        assert_eq!(
+            preconditions.get(&relocated_path),
+            Some(&Some(Sha256::digest(&original).into()))
+        );
+        assert_eq!(preconditions.get(&previous_path), Some(&None));
+
+        let report = fanta_format::write_project_tree_cached_with_sources_checked(
+            directory.path(),
+            &document,
+            &previous_assets,
+            &mut fanta_format::ProjectWriteCache::default(),
+            &BTreeMap::new(),
+            &preconditions,
+        )?;
+        assert!(report.removed.contains(&relocated_path));
+        assert_eq!(
+            std::fs::read(directory.path().join(&previous_path))?,
+            original
+        );
+
+        let current_assets = BTreeMap::from([(id, replacement.clone())]);
+        let replacement_path = PathBuf::from(format!("assets/other/{id}.bin"));
+        let mut preconditions = BTreeMap::new();
+        add_asset_write_preconditions(
+            directory.path(),
+            &mut preconditions,
+            &previous_assets,
+            &current_assets,
+        )?;
+        assert_eq!(
+            preconditions.get(&previous_path),
+            Some(&Some(Sha256::digest(&original).into()))
+        );
+        assert_eq!(preconditions.get(&replacement_path), Some(&None));
+        let report = fanta_format::write_project_tree_cached_with_sources_checked(
+            directory.path(),
+            &document,
+            &current_assets,
+            &mut fanta_format::ProjectWriteCache::default(),
+            &BTreeMap::new(),
+            &preconditions,
+        )?;
+        assert!(report.removed.contains(&previous_path));
+        assert_eq!(
+            std::fs::read(directory.path().join(replacement_path))?,
+            replacement
+        );
+        Ok(())
+    }
+
+    #[test]
     fn project_git_prefers_the_app_bundle_without_depending_on_system_tools() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let executable = directory.path().join("fanta");
@@ -3201,6 +3966,7 @@ mod tests {
         .write_to(&mut png, image::ImageFormat::Png)?;
         Ok(crate::generation_media::PreparedVideo {
             bytes: Arc::from(&b"exact video source bytes"[..]),
+            asset: fanta_format::asset_id_for_bytes(b"exact video source bytes"),
             metadata: crate::generation_media::VideoMetadata {
                 width: 180,
                 height: 320,
@@ -3713,6 +4479,14 @@ mod tests {
     }
 
     #[test]
+    fn design_import_registry_accepts_fig_and_fant_snapshots() {
+        let formats = import_formats().expect("design formats");
+        assert!(formats.can_import_path(Path::new("Design.fig")));
+        assert!(formats.can_import_path(Path::new("Design.fant")));
+        assert!(!formats.can_import_path(Path::new("notes.txt")));
+    }
+
+    #[test]
     fn watcher_relevance_covers_sources_but_not_outputs_or_foreign_paths() {
         let root = Path::new("/tmp/project");
         assert!(is_relevant_project_change(
@@ -3760,6 +4534,151 @@ mod tests {
             root,
             Path::new("/tmp/other/pages/page-1.fnx")
         ));
+    }
+
+    #[test]
+    fn watcher_prefers_file_events_over_their_directory_echoes() {
+        let directory = tempfile::tempdir().expect("temporary project");
+        let design = directory.path().join("pages/home");
+        std::fs::create_dir_all(&design).expect("create design directory");
+        let source = design.join("page.fnx");
+        std::fs::write(&source, b"<Frame />").expect("write source");
+        let paths = BTreeSet::from([directory.path().join("pages"), design, source.clone()]);
+        let checked = without_redundant_directory_events(paths);
+        assert_eq!(checked, BTreeSet::from([source]));
+        let hashes = BTreeMap::from([(
+            PathBuf::from("pages/home/page.fnx"),
+            Sha256::digest(b"<Frame />").into(),
+        )]);
+        assert!(!watcher_paths_differ_from_own_writes(
+            directory.path(),
+            &checked,
+            &hashes,
+            &BTreeSet::new()
+        ));
+    }
+
+    #[gpui::test]
+    async fn clean_external_page_edit_reloads_only_that_artifact(cx: &mut TestAppContext) {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData};
+        use project::ProjectItem as _;
+
+        init_test(cx);
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary project");
+        let mut initial = doc_with_one_page();
+        let first_page = initial.pages()[0];
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        second.name = "Page 2".to_owned();
+        let second_page = second.id;
+        initial
+            .apply(Operation::create_node(second))
+            .expect("create second page");
+        initial.add_page(second_page);
+        write_project(directory.path(), &initial, &BTreeMap::new()).expect("initial project");
+
+        let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
+        let project = Project::test(file_system, [directory.path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .expect("open project item")
+            .await
+            .expect("load project");
+        cx.run_until_parked();
+
+        let mut external = initial.clone_for_persist();
+        external
+            .scene
+            .get_mut(second_page)
+            .expect("second page")
+            .name = "Changed externally".to_owned();
+        write_project(directory.path(), &external, &BTreeMap::new()).expect("external page edit");
+        item.update(cx, |item, cx| item.schedule_reload(cx));
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("reloaded document");
+            assert_eq!(
+                document.doc.scene.get(first_page).expect("first page").name,
+                "Page 1"
+            );
+            assert_eq!(
+                document
+                    .doc
+                    .scene
+                    .get(second_page)
+                    .expect("second page")
+                    .name,
+                "Changed externally"
+            );
+            let session = item.workspace_session.as_ref().expect("project session");
+            assert_eq!(session.open.len(), 1, "only changed FNX was reparsed");
+            assert!(
+                session
+                    .open
+                    .contains_key(&fanta_format::ArtifactId::Page(second_page))
+            );
+        });
+
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(first_page)
+                    .expect("first page")
+                    .name = "Local canvas edit".into();
+                ((), DocChange::Content)
+            });
+        });
+        external
+            .scene
+            .get_mut(second_page)
+            .expect("second page")
+            .name = "Second external edit".into();
+        write_project(directory.path(), &external, &BTreeMap::new())
+            .expect("another external page edit");
+        item.update(cx, |item, cx| item.schedule_merge(cx));
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("merged document");
+            assert!(!item.has_conflict());
+            assert!(item.is_dirty(), "the local half is not saved yet");
+            assert_eq!(
+                document.doc.scene.get(first_page).expect("first page").name,
+                "Local canvas edit"
+            );
+            assert_eq!(
+                document
+                    .doc
+                    .scene
+                    .get(second_page)
+                    .expect("second page")
+                    .name,
+                "Second external edit"
+            );
+            let session = item.workspace_session.as_ref().expect("project session");
+            assert_eq!(session.open.len(), 1, "merge parsed only the changed page");
+        });
     }
 
     #[test]
@@ -4229,7 +5148,7 @@ mod tests {
             futures::poll!(&mut turn).is_pending(),
             "canceling the middle save cannot bypass the first writer"
         );
-        assert!(writes.suppresses_watcher(Instant::now() + Duration::from_secs(120)));
+        assert!(writes.has_active_writes());
         drop(background);
         turn.await;
         drop(surviving);
@@ -4763,16 +5682,16 @@ mod tests {
         Ok(())
     }
 
-    /// The load that materializes a bare `.fig` hands the item both the
-    /// adopted root and the materializing write's memo; without the memo the
-    /// first autosave starts cold and re-prints every page.
+    /// A watcher event received while saving stays queued until the writer
+    /// completes. The file digest distinguishes its echo from a later edit.
     #[gpui::test]
-    async fn a_save_suppresses_its_watcher_after_the_initial_deadline_expires(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_save_keeps_watcher_events_for_exact_hash_check(cx: &mut TestAppContext) {
         init_test(cx);
         let directory = tempfile::tempdir().expect("temporary project");
         let root = directory.path().join("Design");
+        let initial = doc_with_one_page();
+        let page = initial.pages()[0];
+        write_project(&root, &initial, &BTreeMap::new()).expect("initial project");
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(&root, serde_json::json!({"fanta.json":"{}"}))
             .await;
@@ -4788,8 +5707,8 @@ mod tests {
         let item = ready_item(
             &project,
             directory.path().join("Design.fig"),
-            Some(root),
-            doc_with_one_page(),
+            Some(root.clone()),
+            initial,
             cx,
         );
         let changes: UpdatedEntriesSet = vec![(
@@ -4799,52 +5718,49 @@ mod tests {
         )]
         .into();
         let save = item.update(cx, |item, cx| {
-            item.dirty = true;
+            item.with_document(cx, |document| {
+                document.doc.scene.get_mut(page).expect("page").name = "Saved edit".into();
+                ((), DocChange::Content)
+            });
             let save = item.save(SaveKind::Explicit, cx);
-            // Model a writer still running after the old one-second deadline.
-            // Wall-clock Instant does not follow the GPUI test clock.
-            item.suppress_watcher_until = Some(Instant::now() - Duration::from_secs(2));
             item.worktree_entries_updated(&project, worktree_id, &changes, cx);
             assert!(
-                item.reload_task.is_none(),
-                "our own save must not start a reload or merge"
+                !item.pending_watcher_paths.is_empty(),
+                "an event during a save must remain queued"
             );
             assert!(
                 !item.has_conflict(),
                 "our own save must not be treated as an external edit"
             );
-            assert!(
-                item.project_writes
-                    .suppresses_watcher(Instant::now() + Duration::from_secs(2))
-            );
             save
         });
         save.await.expect("save completes");
-        item.update(cx, |item, cx| {
-            assert_eq!(
-                item.project_writes
-                    .state
-                    .lock()
-                    .expect("write state")
-                    .active,
-                0
-            );
-            assert!(
-                item.project_writes.suppresses_watcher(Instant::now()),
-                "completion keeps the delivery cooldown"
-            );
-            item.suppress_watcher_until = None;
-            item.project_writes
-                .state
-                .lock()
-                .expect("write state")
-                .quiet_until = Some(Instant::now() - Duration::from_secs(1));
-            item.worktree_entries_updated(&project, worktree_id, &changes, cx);
-            assert!(
-                item.reload_task.is_some(),
-                "external edits still reload after the cooldown"
-            );
-            item.reload_task = None;
+        item.read_with(cx, |item, _| {
+            assert!(!item.own_write_hashes.is_empty());
+            let relative = item
+                .own_write_hashes
+                .keys()
+                .find(|path| path.extension().is_some_and(|ext| ext == "fnx"))
+                .expect("saved FNX source");
+            let path = item
+                .project_root
+                .as_ref()
+                .expect("project root")
+                .join(relative);
+            let paths = BTreeSet::from([path.clone()]);
+            assert!(!watcher_paths_differ_from_own_writes(
+                &root,
+                &paths,
+                &item.own_write_hashes,
+                &item.own_write_removed
+            ));
+            std::fs::write(&path, b"external edit").expect("modify saved source");
+            assert!(watcher_paths_differ_from_own_writes(
+                &root,
+                &paths,
+                &item.own_write_hashes,
+                &item.own_write_removed
+            ));
         });
     }
 
@@ -4856,16 +5772,9 @@ mod tests {
         let overlapping = writes.begin();
         drop(foreground);
         drop(overlapping);
-        assert!(
-            writes.suppresses_watcher(Instant::now() + Duration::from_secs(120)),
-            "a canceled foreground must not unprotect its still-running writer"
-        );
+        assert!(writes.has_active_writes());
         drop(worker);
-        assert!(!writes.suppresses_watcher(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW * 2));
-        assert!(
-            writes.suppresses_watcher(Instant::now()),
-            "even canceled writes get a completion cooldown"
-        );
+        assert!(!writes.has_active_writes());
     }
 
     #[gpui::test]
@@ -4949,7 +5858,7 @@ mod tests {
             .expect("materializes next to the .fig");
         let root = materialized.root.clone();
         item.update(cx, |item, cx| {
-            item.adopt_initial_load(Ok(document), Some(materialized), cx)
+            item.adopt_initial_load(Ok(document), Some(materialized), None, cx)
         });
 
         item.read_with(cx, |item, _| {
@@ -4975,19 +5884,21 @@ mod tests {
             "the materialized project is registered for scoped re-opens"
         );
 
-        // The first autosave takes the seeded memo and hands it back.
+        // Source ownership replaces the canonical projection memo after the
+        // first autosave, so subsequent edits can retain authored FNX text.
         item.update(cx, |item, _| item.dirty = true);
         item.update(cx, |item, cx| item.save(SaveKind::Auto, cx))
             .await
             .expect("autosave into the materialized project");
         item.read_with(cx, |item, _| {
             assert!(!item.is_dirty());
+            assert!(item.workspace_session.is_some());
             assert_eq!(
                 item.write_cache
                     .as_ref()
                     .map(|cache| cache.cached_designs()),
-                Some(1),
-                "the memo survives the save round trip"
+                Some(0),
+                "authored sources supersede the canonical memo"
             );
         });
     }
@@ -5015,15 +5926,22 @@ mod tests {
             preview_dirty_before: None,
             conflict: false,
             source_edit_locked: false,
-            suppress_watcher_until: None,
+            pending_watcher_paths: BTreeSet::new(),
+            watcher_check_in_flight: false,
+            own_write_hashes: BTreeMap::new(),
+            own_write_removed: BTreeSet::new(),
+            watcher_check_task: None,
             project_writes: Arc::default(),
             merge_base: None,
+            last_saved_assets: None,
+            last_saved_scene: None,
             pending_scope: None,
             last_scope: None,
             sync_epoch: 0,
             reload_task: None,
             _load_task: None,
             write_cache: None,
+            workspace_session: None,
             project_subscriptions: Vec::new(),
         });
         item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
@@ -5416,6 +6334,8 @@ mod tests {
         second_project.update(cx, |_, cx| {
             cx.emit(project::Event::WorktreeUpdatedEntries(worktree_id, changes));
         });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
         cx.run_until_parked();
         second_item.read_with(cx, |item, _| {
             assert!(

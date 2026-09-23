@@ -36,6 +36,99 @@ fn page_fixture() -> (tempfile::TempDir, NodeId) {
     (dir, page)
 }
 
+#[test]
+fn session_indexes_the_same_duplicate_page_winner_as_the_reader() {
+    let (directory, page) = page_fixture();
+    let original = WorkspaceSession::open(directory.path()).expect("open project");
+    let old_dir = directory
+        .path()
+        .join(&original.artifacts[&ArtifactId::Page(page)].design_dir);
+    let preferred_dir = directory.path().join("pages/a-preferred");
+    std::fs::create_dir_all(&preferred_dir).expect("create replacement directory");
+    for name in ["page.json", "page.fnx", "page.ids.json"] {
+        std::fs::copy(old_dir.join(name), preferred_dir.join(name))
+            .expect("copy the generated page artifact");
+    }
+    let preferred_source = std::fs::read_to_string(preferred_dir.join("page.fnx"))
+        .expect("read replacement source")
+        .replace("Home", "Preferred");
+    std::fs::write(preferred_dir.join("page.fnx"), preferred_source)
+        .expect("edit replacement source");
+    let mut old_header: Value = crate::project::layout::read_json_file(&old_dir.join("page.json"))
+        .expect("read old page header");
+    old_header
+        .as_object_mut()
+        .expect("page header object")
+        .remove("id");
+    crate::project::layout::write_json_file(&old_dir.join("page.json"), &old_header)
+        .expect("make the old directory a v2 fallback");
+
+    let (loaded, _) = crate::read_project_tree(directory.path()).expect("read project");
+    assert_eq!(loaded.scene.get(page).expect("page root").name, "Preferred");
+    let session = WorkspaceSession::open(directory.path()).expect("reopen session");
+    assert_eq!(
+        session.artifacts[&ArtifactId::Page(page)].design_dir,
+        std::path::PathBuf::from("pages/a-preferred")
+    );
+}
+
+#[test]
+fn session_indexes_the_same_duplicate_component_winner_as_the_reader() {
+    use fanta_doc::{ComponentDef, ComponentId};
+
+    let directory = tempdir().expect("temporary project");
+    let mut document = Doc::new();
+    let page = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("page root");
+    document.add_page(page);
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    master.name = "Button".into();
+    master.parent = Some(page);
+    let master_id = document.scene.insert(master).expect("component master");
+    let component_id = ComponentId::new();
+    document.components.defs.insert(
+        component_id,
+        ComponentDef::new(component_id, master_id, "Button"),
+    );
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        .expect("write project");
+    let original = WorkspaceSession::open(directory.path()).expect("open project");
+    let old_dir = directory
+        .path()
+        .join(&original.artifacts[&ArtifactId::Component(component_id)].design_dir);
+    let preferred_dir = directory.path().join("components/a-preferred");
+    std::fs::create_dir_all(&preferred_dir).expect("create replacement directory");
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    for name in ["def.json", "master.fnx", "master.ids.json"] {
+        let target = preferred_dir.join(name);
+        std::fs::copy(old_dir.join(name), &target).expect("copy component artifact");
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .expect("open replacement artifact")
+            .set_times(std::fs::FileTimes::new().set_modified(future))
+            .expect("set replacement freshness");
+    }
+    let preferred_source = std::fs::read_to_string(preferred_dir.join("master.fnx"))
+        .expect("read replacement source")
+        .replace("Button", "Preferred");
+    std::fs::write(preferred_dir.join("master.fnx"), preferred_source)
+        .expect("edit replacement source");
+
+    let (loaded, _) = crate::read_project_tree(directory.path()).expect("read project");
+    assert_eq!(
+        loaded.scene.get(master_id).expect("master root").name,
+        "Preferred"
+    );
+    let session = WorkspaceSession::open(directory.path()).expect("reopen session");
+    assert_eq!(
+        session.artifacts[&ArtifactId::Component(component_id)].design_dir,
+        std::path::PathBuf::from("components/a-preferred")
+    );
+}
+
 // ---- hash -------------------------------------------------------------------
 
 #[test]
@@ -1320,4 +1413,400 @@ fn partial_on_disk_deletion_while_dirty_enters_deleted_conflict() {
             .name,
         "Rescue me"
     );
+}
+
+#[test]
+fn watcher_discovers_created_and_renamed_pages_by_header_id() {
+    let (directory, existing_page) = page_fixture();
+    let mut workspace = WorkspaceSession::open(directory.path()).unwrap();
+    let (mut document, assets) = crate::read_project_tree(directory.path()).unwrap();
+
+    let mut added_root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    added_root.name = "Settings".into();
+    let added_page = document.scene.insert(added_root).unwrap();
+    document.add_page(added_page);
+    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+    let created_dir = crate::projected_design_dirs(&document).0[&added_page].clone();
+    let created_events = workspace.notify_fs_event(FsEvent::Created {
+        path: directory.path().join(&created_dir).join("page.fnx"),
+    });
+    assert!(matches!(
+        created_events.as_slice(),
+        [SessionEvent::Created { id }] if *id == ArtifactId::Page(added_page)
+    ));
+    assert!(
+        workspace
+            .artifacts
+            .contains_key(&ArtifactId::Page(added_page))
+    );
+
+    let old_dir = workspace.artifacts[&ArtifactId::Page(existing_page)]
+        .design_dir
+        .clone();
+    document.scene.get_mut(existing_page).unwrap().name = "Landing".into();
+    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+    let renamed_dir = crate::projected_design_dirs(&document).0[&existing_page].clone();
+    assert_ne!(old_dir, renamed_dir);
+    let rename_events = workspace.notify_fs_event(FsEvent::Removed {
+        path: directory.path().join(old_dir).join("page.fnx"),
+    });
+    assert!(rename_events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Reloaded { id } if *id == ArtifactId::Page(existing_page)
+    )));
+    assert_eq!(
+        workspace.artifacts[&ArtifactId::Page(existing_page)].design_dir,
+        renamed_dir
+    );
+}
+
+#[test]
+fn fresh_disk_snapshot_applies_changed_page_and_shared_metadata() {
+    let (directory, page) = page_fixture();
+    let workspace = WorkspaceSession::open(directory.path()).unwrap();
+    let baseline = workspace.disk_snapshot();
+    let (mut document, assets) = crate::read_project_tree(directory.path()).unwrap();
+    let mut running_document = document.clone_for_persist();
+    document.scene.get_mut(page).unwrap().name = "Agent Home".into();
+    document.metadata.title = "Agent Project".into();
+    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+
+    let mut fresh = WorkspaceSession::open(directory.path()).unwrap();
+    let report = fresh.reconcile_from_disk_snapshot(&baseline).unwrap();
+    assert!(!report.requires_full_reload);
+    assert_eq!(report.changed, vec![ArtifactId::Page(page)]);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::WorkspaceGeneration { .. }))
+    );
+    assert_eq!(
+        fresh
+            .apply_report_to_doc(&mut running_document, &report)
+            .unwrap(),
+        IncrementalDocApply::Applied
+    );
+    assert_eq!(running_document.scene.get(page).unwrap().name, "Agent Home");
+    assert_eq!(running_document.metadata.title, "Agent Project");
+}
+
+#[test]
+fn fresh_disk_snapshot_requests_full_reload_for_flow_change() {
+    let (directory, page) = page_fixture();
+    let workspace = WorkspaceSession::open(directory.path()).unwrap();
+    let baseline = workspace.disk_snapshot();
+    let (mut document, assets) = crate::read_project_tree(directory.path()).unwrap();
+    let mut running_document = document.clone_for_persist();
+    document.flow_start = Some(page);
+    crate::write_project_tree(directory.path(), &document, &assets).unwrap();
+
+    let mut fresh = WorkspaceSession::open(directory.path()).unwrap();
+    let report = fresh.reconcile_from_disk_snapshot(&baseline).unwrap();
+    assert!(report.requires_full_reload);
+    assert_eq!(
+        fresh
+            .apply_report_to_doc(&mut running_document, &report)
+            .unwrap(),
+        IncrementalDocApply::RequiresFullReload
+    );
+}
+
+#[test]
+fn hand_added_node_id_is_stable_across_source_paths() {
+    let root = NodeId::new();
+    let child = NodeId::new();
+    let (mut source, sidecar) = fanta_fnx::encode_subtree(
+        &[
+            group_json(root, "Home", None),
+            group_json(child, "Card", Some(root)),
+        ],
+        "Home",
+    )
+    .unwrap();
+    let closing = source.rfind("</Frame>").unwrap();
+    source.insert_str(closing, "  <Frame name=\"Hand\" />\n");
+
+    let first = crate::project::read::reconcile_fnx_sidecar(
+        std::path::Path::new("/tmp/first/page.fnx"),
+        &source,
+        &sidecar,
+    )
+    .unwrap();
+    let second = crate::project::read::reconcile_fnx_sidecar(
+        std::path::Path::new("/tmp/second/page.fnx"),
+        &source,
+        &sidecar,
+    )
+    .unwrap();
+    assert_eq!(first.ids, second.ids);
+    assert_eq!(first.ids.len(), 3);
+    assert_eq!(first.ids[0].id, root.0.to_string());
+    assert_eq!(first.ids[1].id, child.0.to_string());
+    let divergent = source.replacen("name=\"Hand\"", "name=\"Other\"", 1);
+    let other = crate::project::read::reconcile_fnx_sidecar(
+        std::path::Path::new("/tmp/second/page.fnx"),
+        &divergent,
+        &sidecar,
+    )
+    .unwrap();
+    assert_ne!(first.ids[2].id, other.ids[2].id);
+}
+
+#[test]
+fn cached_source_preconditions_reject_external_edit_at_writer() {
+    let (directory, page) = page_fixture();
+    let mut workspace = WorkspaceSession::open(directory.path()).unwrap();
+    workspace.open_artifact(ArtifactId::Page(page)).unwrap();
+    let (document, assets) = crate::read_project_tree(directory.path()).unwrap();
+    let overrides = workspace
+        .validated_source_overrides_for_document(&document)
+        .unwrap();
+    let source_path = workspace.artifacts[&ArtifactId::Page(page)]
+        .design_dir
+        .join("page.fnx");
+    let original = std::fs::read(directory.path().join(&source_path)).unwrap();
+    let changed =
+        String::from_utf8(original)
+            .unwrap()
+            .replacen("name=\"Home\"", "name=\"External\"", 1);
+    std::fs::write(directory.path().join(&source_path), &changed).unwrap();
+
+    let preconditions = workspace.source_write_preconditions(&document).unwrap();
+    assert!(preconditions[&source_path].is_some());
+    let mut cache = crate::ProjectWriteCache::default();
+    assert!(
+        crate::write_project_tree_cached_with_sources_checked(
+            directory.path(),
+            &document,
+            &assets,
+            &mut cache,
+            &overrides,
+            &preconditions,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join(source_path)).unwrap(),
+        changed
+    );
+}
+
+#[test]
+fn canvas_save_keeps_unopened_authored_source_without_projecting_it() {
+    let directory = tempdir().expect("project directory");
+    let mut document = Doc::new();
+    let mut first_root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    first_root.name = "First".into();
+    let first_page = document.scene.insert(first_root).expect("first root");
+    document.add_page(first_page);
+    let mut second_root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    second_root.name = "Second".into();
+    let second_page = document.scene.insert(second_root).expect("second root");
+    document.add_page(second_page);
+    let assets = BTreeMap::new();
+    crate::write_project_tree(directory.path(), &document, &assets).expect("initial write");
+
+    let indexed = WorkspaceSession::open(directory.path()).expect("index project");
+    let second_source = indexed.artifacts[&ArtifactId::Page(second_page)]
+        .design_dir
+        .join("page.fnx");
+    let authored = [
+        b"// Keep this authored note\n".as_slice(),
+        &std::fs::read(directory.path().join(&second_source)).expect("original source"),
+    ]
+    .concat();
+    std::fs::write(directory.path().join(&second_source), &authored).expect("author source");
+
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("reindex authored source");
+    workspace
+        .open_artifact(ArtifactId::Page(first_page))
+        .expect("open edited page");
+    document
+        .scene
+        .get_mut(first_page)
+        .expect("first root")
+        .transform = Transform2D::translation(8.0, 13.0);
+    workspace
+        .artifact_mut(&ArtifactId::Page(first_page))
+        .expect("open page session")
+        .adopt_document(&document)
+        .expect("adopt canvas edit");
+
+    let sources = workspace
+        .validated_source_overrides_for_document(&document)
+        .expect("validated retained sources");
+    let second_dir = workspace.artifacts[&ArtifactId::Page(second_page)]
+        .design_dir
+        .clone();
+    assert_eq!(sources[&second_dir].0, authored);
+    assert!(!workspace.open.contains_key(&ArtifactId::Page(second_page)));
+    let preconditions = workspace
+        .source_write_preconditions(&document)
+        .expect("indexed preconditions");
+    assert!(preconditions.contains_key(&second_source));
+
+    let mut cache = crate::ProjectWriteCache::default();
+    let report = crate::write_project_tree_cached_with_sources_checked(
+        directory.path(),
+        &document,
+        &assets,
+        &mut cache,
+        &sources,
+        &preconditions,
+    )
+    .expect("checked canvas save");
+    workspace
+        .accept_written_sources(
+            &document,
+            workspace.asset_index_disk_hash().expect("asset index hash"),
+            &sources,
+            &report.written_hashes,
+        )
+        .expect("accept saved sources");
+    assert!(!workspace.open.contains_key(&ArtifactId::Page(second_page)));
+    assert_eq!(
+        std::fs::read(directory.path().join(second_source)).expect("saved source"),
+        authored
+    );
+    std::fs::write(
+        directory.path().join(&second_dir).join("page.fnx"),
+        b"// external edit\n",
+    )
+    .expect("external edit");
+    assert!(matches!(
+        workspace.validated_source_overrides_for_document(&document),
+        Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain))
+    ));
+}
+
+#[test]
+fn checked_canvas_save_migrates_indexed_legacy_nodes() {
+    let (directory, page) = page_fixture();
+    let (document, assets) = crate::read_project_tree(directory.path()).expect("read source tree");
+    let indexed = WorkspaceSession::open(directory.path()).expect("index source tree");
+    let design_dir = indexed.artifacts[&ArtifactId::Page(page)]
+        .design_dir
+        .clone();
+    let nodes_dir = directory.path().join(&design_dir).join("nodes");
+    std::fs::create_dir_all(&nodes_dir).expect("legacy nodes directory");
+    for node_id in document.scene.descendants_of(page) {
+        let node = document.scene.get(node_id).expect("page node");
+        std::fs::write(
+            nodes_dir.join(format!("{node_id}.json")),
+            serde_json::to_vec_pretty(node).expect("node JSON"),
+        )
+        .expect("legacy node");
+    }
+    std::fs::remove_file(directory.path().join(&design_dir).join("page.fnx"))
+        .expect("remove modern source");
+    std::fs::remove_file(directory.path().join(&design_dir).join("page.ids.json"))
+        .expect("remove modern sidecar");
+
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("index legacy tree");
+    assert!(!workspace.has_indexed_source(&ArtifactId::Page(page)));
+    let node_path = design_dir.join("nodes").join(format!("{page}.json"));
+    let preconditions = workspace
+        .source_write_preconditions(&document)
+        .expect("legacy preconditions");
+    assert!(preconditions[&node_path].is_some());
+    let sources = workspace
+        .validated_source_overrides_for_document(&document)
+        .expect("no legacy FNX override");
+    assert!(sources.is_empty());
+
+    let original = std::fs::read(directory.path().join(&node_path)).expect("indexed node");
+    std::fs::write(directory.path().join(&node_path), b"{}\n").expect("external edit");
+    let mut cache = crate::ProjectWriteCache::default();
+    assert!(
+        crate::write_project_tree_cached_with_sources_checked(
+            directory.path(),
+            &document,
+            &assets,
+            &mut cache,
+            &sources,
+            &preconditions,
+        )
+        .is_err()
+    );
+    std::fs::write(directory.path().join(&node_path), original).expect("restore indexed node");
+
+    let report = crate::write_project_tree_cached_with_sources_checked(
+        directory.path(),
+        &document,
+        &assets,
+        &mut cache,
+        &sources,
+        &preconditions,
+    )
+    .expect("checked legacy migration");
+    workspace
+        .accept_written_sources(
+            &document,
+            workspace.asset_index_disk_hash().expect("asset index hash"),
+            &sources,
+            &report.written_hashes,
+        )
+        .expect("accept migration");
+    assert!(workspace.has_indexed_source(&ArtifactId::Page(page)));
+    assert!(!directory.path().join(node_path).exists());
+}
+
+#[test]
+fn session_skips_headerless_design_dirs_but_rejects_malformed_headers() {
+    let (directory, page) = page_fixture();
+    let notes = directory.path().join("pages/hand-notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::write(notes.join("README.md"), b"keep this note").unwrap();
+    let workspace = WorkspaceSession::open(directory.path()).unwrap();
+    assert_eq!(workspace.list_pages(), vec![ArtifactId::Page(page)]);
+
+    let header = workspace.artifacts[&ArtifactId::Page(page)]
+        .design_dir
+        .join("page.json");
+    std::fs::write(directory.path().join(header), b"{bad json").unwrap();
+    assert!(WorkspaceSession::open(directory.path()).is_err());
+}
+
+#[test]
+fn page_header_identity_cannot_rebind_an_unchanged_source_root() {
+    let (directory, page) = page_fixture();
+    let workspace = WorkspaceSession::open(directory.path()).unwrap();
+    let relative = workspace.artifacts[&ArtifactId::Page(page)]
+        .design_dir
+        .join("page.json");
+    let path = directory.path().join(relative);
+    let replacement = NodeId::new();
+    let mut header: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    header["id"] = json!(replacement.to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(&header).unwrap()).unwrap();
+
+    let mut reopened = WorkspaceSession::open(directory.path()).unwrap();
+    let error = reopened
+        .open_artifact(ArtifactId::Page(replacement))
+        .unwrap_err();
+    assert!(matches!(error, SessionError::InvalidSource(_)));
+    assert!(crate::read_project_tree(directory.path()).is_err());
+}
+
+#[test]
+fn component_definition_root_cannot_rebind_an_unchanged_master() {
+    let directory = tempdir().unwrap();
+    let mut document = Doc::new();
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    master.name = "Button".into();
+    let root = document.scene.insert(master).unwrap();
+    let component_id = fanta_doc::ComponentId::new();
+    document.components.defs.insert(
+        component_id,
+        fanta_doc::ComponentDef::new(component_id, root, "Button"),
+    );
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new()).unwrap();
+    let relative = crate::projected_design_dirs(&document).1[&component_id].join("def.json");
+    let path = directory.path().join(relative);
+    let mut definition: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    definition["root"] = serde_json::to_value(NodeId::new()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&definition).unwrap()).unwrap();
+
+    assert!(crate::read_project_tree(directory.path()).is_err());
 }

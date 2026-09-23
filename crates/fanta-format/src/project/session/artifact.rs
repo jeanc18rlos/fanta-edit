@@ -23,7 +23,7 @@ use fanta_doc::{
 };
 use fanta_fnx::{
     ArtifactIr, ArtifactKind, FnxElement, FnxSidecar, FnxSourceMirror, RefTable,
-    artifact_file_names, reconcile_sidecar,
+    artifact_file_names,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -153,6 +153,78 @@ impl ArtifactSession {
         let mut transaction = Transaction::new(op.label());
         transaction.push(op);
         self.apply_transaction_atomic(transaction).map(|_| ())
+    }
+
+    /// Install a complete artifact scene from a host document and reconcile it
+    /// against the retained source before exposing the change. Existing source
+    /// spans survive property edits; a failed reconciliation leaves the live
+    /// session untouched.
+    pub fn adopt_scoped_doc(&mut self, scoped: ScopedDoc) -> Result<SourceSync, SessionError> {
+        if !matches!(
+            self.state,
+            ArtifactDirty::Clean | ArtifactDirty::DirtyCanvas
+        ) {
+            return Err(SessionError::InvalidState(
+                "cannot adopt a scene while text is dirty or the artifact is in conflict".into(),
+            ));
+        }
+        if scoped.root != self.scoped.root {
+            return Err(SessionError::InvalidState(
+                "adopted artifact has a different root id".into(),
+            ));
+        }
+        let mut scratch = self.clone();
+        scratch.scoped = scoped;
+        let source_sync = scratch.synchronize_retained_source_with_scene()?;
+        if scratch.projected_canvas_header()? != self.projected_canvas_header()? {
+            scratch.state = ArtifactDirty::DirtyCanvas;
+            scratch.working_generation = scratch.working_generation.wrapping_add(1);
+        }
+        *self = scratch;
+        Ok(source_sync)
+    }
+
+    /// Extract only this artifact's subtree from a whole workspace document.
+    /// The host can call this for the artifact it knows changed without cloning
+    /// or scanning the other pages' scene nodes.
+    pub fn adopt_document(&mut self, document: &Doc) -> Result<SourceSync, SessionError> {
+        let nodes = super::materialize::collect_subtree_nodes(document, self.scoped.root)?;
+        let ir = ArtifactIr::from_nodes(self.kind, self.fn_name.clone(), &nodes)?;
+        let scoped =
+            match self.id {
+                ArtifactId::Page(_) => super::materialize::materialize_page(
+                    &ir,
+                    document.id,
+                    document.components.clone(),
+                    document.variables.clone(),
+                    document.active_modes.clone(),
+                )?,
+                ArtifactId::Component(id) => {
+                    let def =
+                        document.components.defs.get(&id).cloned().ok_or_else(|| {
+                            SessionError::ArtifactNotFound(format!("component:{id}"))
+                        })?;
+                    super::materialize::materialize_component(
+                        &ir,
+                        document.id,
+                        def,
+                        document.variables.clone(),
+                        document.active_modes.clone(),
+                    )?
+                }
+                ArtifactId::Graphics(_) => super::graphics::materialize_graphics(
+                    &ir,
+                    document.id,
+                    document.variables.clone(),
+                    document.active_modes.clone(),
+                )?,
+                _ => {
+                    return Err(SessionError::InvalidState(
+                        "this artifact has no editable scene".into(),
+                    ));
+                }
+            };
+        self.adopt_scoped_doc(scoped)
     }
 
     /// Undo one canvas transaction while keeping the retained FNX projection
@@ -588,8 +660,9 @@ impl ArtifactSession {
             reconciled.clone(),
             &ref_table,
         )?;
-        let source_mirror =
+        let mut source_mirror =
             FnxSourceMirror::from_source_with(source, &reconciled, Arc::clone(&ref_table))?;
+        source_mirror.insert_missing_ids(&reconciled)?;
         let mut map = Map::new();
         for n in &nodes {
             if let Some(id) = n.get("id").and_then(Value::as_str) {
@@ -779,7 +852,7 @@ impl ArtifactSession {
         self.synchronize_retained_source_with_scene()?;
 
         let candidate_hash = hash_file_set(&[("candidate.fnx", source.as_bytes())]);
-        let theirs = self.candidate_node_map(source, candidate_hash)?;
+        let theirs = self.candidate_node_map(source)?;
         let ours = self.projected_node_map()?;
         let merged = merge_artifact(&self.base_nodes, &ours, &theirs);
         let review = MergeReview::new(
@@ -1298,15 +1371,10 @@ impl ArtifactSession {
             .collect()
     }
 
-    fn candidate_node_map(
-        &self,
-        source: &str,
-        candidate_hash: ContentHash,
-    ) -> Result<NodeMapEdition, SessionError> {
+    fn candidate_node_map(&self, source: &str) -> Result<NodeMapEdition, SessionError> {
         let base_values: Vec<Value> = self.base_nodes.nodes.values().cloned().collect();
         let base_ir = ArtifactIr::from_nodes(self.kind, self.fn_name.clone(), &base_values)?;
-        let reconciled =
-            deterministic_reconcile_with_hash(source, base_ir.sidecar(), candidate_hash)?;
+        let reconciled = deterministic_reconcile(source, base_ir.sidecar())?;
         let nodes = fanta_fnx::decode_subtree_with(source, &reconciled, &self.ref_table)?;
         let mut map = Map::new();
         for node in nodes {
@@ -1586,9 +1654,13 @@ impl ArtifactSession {
     ) -> Result<SourceSync, SessionError> {
         let header = self.base_nodes.header.clone();
         let (ir, _map) = project_scene_to_node_map(&self.scoped, self.kind, &self.fn_name, header)?;
-        let text = ir.print_with(&self.ref_table);
-        let source =
-            FnxSourceMirror::from_source_with(&text, ir.sidecar(), Arc::clone(&self.ref_table))?;
+        let source = match self.source.rebuild_tree(&self.ir, &ir) {
+            Ok(source) => source,
+            Err(_) => {
+                let text = ir.print_with(&self.ref_table);
+                FnxSourceMirror::from_source_with(&text, ir.sidecar(), Arc::clone(&self.ref_table))?
+            }
+        };
         self.ir = ir;
         self.source = source;
         self.ir_stale = false;
@@ -1652,8 +1724,15 @@ pub fn load_artifact_session(
         .ok_or_else(|| SessionError::other("artifact source disappeared while opening"))?;
     let source_text = std::str::from_utf8(&source_text)
         .map_err(|error| SessionError::other(error.to_string()))?;
-    let source =
+    let mut source =
         FnxSourceMirror::from_source_with(source_text, ir.sidecar(), Arc::clone(&ref_table))?;
+    let missing_ids = source.insert_missing_ids(ir.sidecar())?;
+    let persisted_sidecar: FnxSidecar = file_bytes(&files, file_names(meta.kind).1)
+        .ok_or_else(|| SessionError::other("artifact sidecar disappeared while opening"))
+        .and_then(|bytes| {
+            serde_json::from_slice(&bytes).map_err(|error| SessionError::other(error.to_string()))
+        })?;
+    let needs_migration = missing_ids || persisted_sidecar != *ir.sidecar();
     let scoped = match meta.kind {
         ArtifactKind::Page => {
             materialize_page(&ir, project_id, components, variables, active_modes)?
@@ -1680,6 +1759,14 @@ pub fn load_artifact_session(
             )));
         }
     };
+    if let ArtifactId::Page(expected_root) = meta.id
+        && scoped.root != expected_root
+    {
+        return Err(SessionError::InvalidSource(format!(
+            "page header id {expected_root} differs from FNX root {}",
+            scoped.root
+        )));
+    }
     let scene_instance = scoped.doc.scene.instance_id();
     let scene_revision = scoped.doc.scene.revision();
     // The disk source is authored: an unknown attribute persisted by an
@@ -1690,7 +1777,11 @@ pub fn load_artifact_session(
         id: meta.id.clone(),
         kind: meta.kind,
         meta: meta.clone(),
-        state: ArtifactDirty::Clean,
+        state: if needs_migration {
+            ArtifactDirty::DirtyCanvas
+        } else {
+            ArtifactDirty::Clean
+        },
         ir,
         source,
         ir_stale: false,
@@ -1747,6 +1838,7 @@ fn load_ir_and_map(
     let header: Value = file_bytes(files, header_name)
         .map(|b| serde_json::from_slice(&b).unwrap_or(Value::Null))
         .unwrap_or(Value::Null);
+    let sidecar = deterministic_reconcile(source, &sidecar)?;
     let nodes = fanta_fnx::decode_subtree_with(source, &sidecar, refs)?;
     let ir = ArtifactIr::from_source_with(kind, fn_name, source, sidecar, refs)?;
     let mut map = Map::new();
@@ -1968,32 +2060,8 @@ fn deterministic_reconcile(
     source: &str,
     previous: &FnxSidecar,
 ) -> Result<FnxSidecar, SessionError> {
-    let hash = hash_file_set(&[("candidate.fnx", source.as_bytes())]);
-    deterministic_reconcile_with_hash(source, previous, hash)
-}
-
-fn deterministic_reconcile_with_hash(
-    source: &str,
-    previous: &FnxSidecar,
-    hash: ContentHash,
-) -> Result<FnxSidecar, SessionError> {
-    let mut seed_bytes = [0u8; 16];
-    seed_bytes.copy_from_slice(&hash.0[..16]);
-    let seed = u128::from_be_bytes(seed_bytes);
-    let existing: std::collections::BTreeSet<String> =
-        previous.ids.iter().map(|entry| entry.id.clone()).collect();
-    let mut ordinal = 0u128;
-    reconcile_sidecar(source, previous, || {
-        loop {
-            ordinal = ordinal.wrapping_add(1);
-            let id = NodeId::from_u128(seed.wrapping_add(ordinal).wrapping_add(FANTA_SEED));
-            let encoded = id.0.to_string();
-            if !existing.contains(&encoded) {
-                break encoded;
-            }
-        }
-    })
-    .map_err(SessionError::from)
+    crate::project::read::reconcile_fnx_sidecar(Path::new(""), source, previous)
+        .map_err(SessionError::from)
 }
 
 fn filter_selection(sel: Selection, doc: &Doc) -> Selection {
@@ -2001,6 +2069,3 @@ fn filter_selection(sel: Selection, doc: &Doc) -> Selection {
     let _ = doc;
     sel
 }
-
-// Seed constant for local id minting in reconcile during text commit.
-const FANTA_SEED: u128 = 0xFA_00_A0_0001;

@@ -880,10 +880,12 @@ fn apply_one(
         } => {
             let parent = resolve_container(doc, parent.as_deref())?;
             let bytes = decode_image_source(source)?;
-            let (asset, natural_size) = assets.add_image(bytes)?;
+            let (asset, natural_size, inserted) = assets.add_image_tracked(bytes)?;
             // Track before any fallible step so a later failure in this batch
             // rolls the asset back out of the stores too.
-            ingested_assets.push(asset);
+            if inserted {
+                ingested_assets.push(asset);
+            }
 
             let natural_width = f64::from(natural_size[0].max(1));
             let natural_height = f64::from(natural_size[1].max(1));

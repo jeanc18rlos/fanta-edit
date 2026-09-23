@@ -156,7 +156,8 @@ impl ArtifactIr {
         sidecar: FnxSidecar,
     ) -> Result<Self, FnxError> {
         validate_unique_ids(&sidecar)?;
-        let root = parse_doc(source)?;
+        let mut root = parse_doc(source)?;
+        materialize_ids(&mut root, &sidecar)?;
         Ok(Self::from_parts(kind, fn_name.into(), root, sidecar))
     }
 
@@ -171,7 +172,8 @@ impl ArtifactIr {
         refs: &RefTable,
     ) -> Result<Self, FnxError> {
         validate_unique_ids(&sidecar)?;
-        let root = parse_doc_with(source, refs)?;
+        let mut root = parse_doc_with(source, refs)?;
+        materialize_ids(&mut root, &sidecar)?;
         Ok(Self::from_parts(kind, fn_name.into(), root, sidecar))
     }
 
@@ -392,6 +394,45 @@ fn validate_unique_ids(sidecar: &FnxSidecar) -> Result<(), FnxError> {
                 entry.id
             )));
         }
+    }
+    Ok(())
+}
+
+fn materialize_ids(root: &mut FnxElement, sidecar: &FnxSidecar) -> Result<(), FnxError> {
+    fn visit(
+        element: &mut FnxElement,
+        ids: &[crate::model::IdEntry],
+        cursor: &mut usize,
+    ) -> Result<(), FnxError> {
+        let entry = ids.get(*cursor).ok_or(FnxError::SidecarMismatch {
+            sidecar: ids.len(),
+            elements: *cursor + 1,
+        })?;
+        *cursor += 1;
+        if let Some(explicit) = element.attrs.get("id")
+            && explicit.as_str() != Some(entry.id.as_str())
+        {
+            return Err(FnxError::Parse(format!(
+                "explicit node id {explicit} disagrees with sidecar id {}",
+                entry.id
+            )));
+        }
+        element
+            .attrs
+            .insert("id".into(), Value::String(entry.id.clone()));
+        for child in &mut element.children {
+            visit(child, ids, cursor)?;
+        }
+        Ok(())
+    }
+
+    let mut cursor = 0;
+    visit(root, &sidecar.ids, &mut cursor)?;
+    if cursor != sidecar.ids.len() {
+        return Err(FnxError::SidecarMismatch {
+            sidecar: sidecar.ids.len(),
+            elements: cursor,
+        });
     }
     Ok(())
 }

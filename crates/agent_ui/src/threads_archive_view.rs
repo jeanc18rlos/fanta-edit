@@ -40,8 +40,8 @@ use ui_input::ErasedEditor;
 use util::ResultExt;
 use util::paths::PathExt;
 use workspace::{
-    CloseWindow, ModalView, PathList, RecentWorkspace, SerializedWorkspaceLocation, Workspace,
-    WorkspaceDb, WorkspaceId,
+    CloseWindow, ModalView, PathList, RecentWorkspace, RecentWorkspaceStatus,
+    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
 };
 
 use zed_actions::agents_sidebar::FocusSidebarFilter;
@@ -1153,7 +1153,10 @@ impl ProjectPickerModal {
                 .recent_project_workspaces(fs.as_ref())
                 .await
                 .log_err()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|workspace| workspace.status == RecentWorkspaceStatus::Available)
+                .collect();
             this.update_in(cx, move |this, window, cx| {
                 this.picker.update(cx, move |picker, cx| {
                     picker.delegate.workspaces = workspaces;

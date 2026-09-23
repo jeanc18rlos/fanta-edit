@@ -8,6 +8,7 @@
 
 use crate::api::FnxSidecar;
 use crate::convert::FnxError;
+use crate::ir::ArtifactIr;
 use crate::model::{FnxElement, SUGAR_TAGS};
 use crate::print::{render_attr, render_close_tag, render_open_tag};
 use crate::refs::RefTable;
@@ -151,6 +152,100 @@ impl FnxSourceMirror {
             source.push_str(piece);
         }
         source
+    }
+
+    /// Migrate legacy or newly hand-added elements to explicit source IDs by
+    /// inserting only missing attributes in their existing opening tags.
+    pub fn insert_missing_ids(&mut self, sidecar: &FnxSidecar) -> Result<bool, FnxError> {
+        let mut changed = false;
+        for entry in &sidecar.ids {
+            let node = self.nodes.get(&entry.id).ok_or_else(|| {
+                FnxError::Parse(format!("source mirror has no node id {}", entry.id))
+            })?;
+            let opening = &mut self.pieces[node.open];
+            let layout = OpenTagLayout::parse(opening)?;
+            if layout.attrs.contains_key("id") {
+                continue;
+            }
+            let attribute = format!(
+                " id={}",
+                render_attr(&serde_json::Value::String(entry.id.clone()))
+            );
+            opening.insert_str(layout.insert_at, &attribute);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// Rebuild a changed tree while retaining byte-identical source for every
+    /// unchanged subtree. This is used for canvas inserts, deletes, and
+    /// reorders, where individual opening-tag patches cannot express the
+    /// change but canonicalizing the whole file would erase author trivia.
+    pub fn rebuild_tree(&self, previous: &ArtifactIr, next: &ArtifactIr) -> Result<Self, FnxError> {
+        let mut previous_elements = Vec::new();
+        flatten_elements(previous.root(), None, &mut previous_elements);
+        if previous_elements.len() != previous.sidecar().ids.len() {
+            return Err(FnxError::SidecarMismatch {
+                sidecar: previous.sidecar().ids.len(),
+                elements: previous_elements.len(),
+            });
+        }
+
+        let mut patched = self.clone();
+        let by_id: BTreeMap<&str, usize> = previous
+            .sidecar()
+            .ids
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| (entry.id.as_str(), position))
+            .collect();
+        let mut next_elements = Vec::new();
+        flatten_elements(next.root(), None, &mut next_elements);
+        for (entry, (next_element, _)) in next.sidecar().ids.iter().zip(&next_elements) {
+            let Some(position) = by_id.get(entry.id.as_str()).copied() else {
+                continue;
+            };
+            let previous_element = previous_elements[position].0;
+            if previous_element.tag == next_element.tag
+                && previous_element.children.is_empty() == next_element.children.is_empty()
+            {
+                // A changed tag is handled by the builder below. A same-tag
+                // delta edits only that opening-tag slot, preserving the
+                // author's attribute order and spellings before reconstruction.
+                patched.patch_element_delta(&entry.id, previous_element, next_element)?;
+            }
+        }
+
+        let source = patched.render();
+        let spans = SourceScanner::new(&source).scan()?;
+        if spans.len() != previous_elements.len() {
+            return Err(FnxError::SidecarMismatch {
+                sidecar: previous_elements.len(),
+                elements: spans.len(),
+            });
+        }
+        let root_span = spans
+            .first()
+            .ok_or_else(|| FnxError::Parse("source has no root element".into()))?;
+        let root_end = span_end(root_span);
+        let mut builder = StructuralSourceBuilder::new(
+            &source,
+            &spans,
+            &previous_elements,
+            &by_id,
+            next,
+            &self.refs,
+        );
+        let mut rebuilt = String::with_capacity(source.len());
+        rebuilt.push_str(&source[..root_span.open.start]);
+        builder.append(next.root(), 2, &mut rebuilt)?;
+        rebuilt.push_str(&source[root_end..]);
+        if crate::parse::parse_doc_with(&rebuilt, &self.refs)? != *next.root() {
+            return Err(FnxError::Parse(
+                "structural source rebuild changed the artifact semantics".into(),
+            ));
+        }
+        Self::from_source_with(&rebuilt, next.sidecar(), Arc::clone(&self.refs))
     }
 
     /// Replace one node's semantic tag/attributes without touching any other
@@ -398,6 +493,166 @@ struct ElementSpans {
     close: Option<Range<usize>>,
 }
 
+fn span_end(span: &ElementSpans) -> usize {
+    span.close.as_ref().map_or(span.open.end, |close| close.end)
+}
+
+fn flatten_elements<'a>(
+    element: &'a FnxElement,
+    parent: Option<usize>,
+    elements: &mut Vec<(&'a FnxElement, Option<usize>)>,
+) {
+    let position = elements.len();
+    elements.push((element, parent));
+    for child in &element.children {
+        flatten_elements(child, Some(position), elements);
+    }
+}
+
+fn element_count(element: &FnxElement) -> usize {
+    1 + element.children.iter().map(element_count).sum::<usize>()
+}
+
+struct StructuralSourceBuilder<'a> {
+    source: &'a str,
+    spans: &'a [ElementSpans],
+    previous_elements: &'a [(&'a FnxElement, Option<usize>)],
+    by_id: BTreeMap<String, usize>,
+    children: Vec<Vec<usize>>,
+    leading: Vec<Option<Range<usize>>>,
+    next: &'a ArtifactIr,
+    refs: &'a RefTable,
+    cursor: usize,
+}
+
+impl<'a> StructuralSourceBuilder<'a> {
+    fn new(
+        source: &'a str,
+        spans: &'a [ElementSpans],
+        previous_elements: &'a [(&'a FnxElement, Option<usize>)],
+        by_id: &BTreeMap<&str, usize>,
+        next: &'a ArtifactIr,
+        refs: &'a RefTable,
+    ) -> Self {
+        let mut children = vec![Vec::new(); previous_elements.len()];
+        for (position, (_, parent)) in previous_elements.iter().enumerate() {
+            if let Some(parent) = parent {
+                children[*parent].push(position);
+            }
+        }
+        let mut leading = vec![None; previous_elements.len()];
+        for (parent, siblings) in children.iter().enumerate() {
+            let mut start = spans[parent].open.end;
+            for &child in siblings {
+                leading[child] = Some(start..spans[child].open.start);
+                start = span_end(&spans[child]);
+            }
+        }
+        Self {
+            source,
+            spans,
+            previous_elements,
+            by_id: by_id
+                .iter()
+                .map(|(id, position)| ((*id).to_owned(), *position))
+                .collect(),
+            children,
+            leading,
+            next,
+            refs,
+            cursor: 0,
+        }
+    }
+
+    fn append(
+        &mut self,
+        element: &FnxElement,
+        depth: usize,
+        out: &mut String,
+    ) -> Result<(), FnxError> {
+        let entry = self
+            .next
+            .sidecar()
+            .ids
+            .get(self.cursor)
+            .ok_or_else(|| FnxError::Parse("new tree exceeds sidecar".into()))?;
+        self.cursor += 1;
+        let old_position = self.by_id.get(&entry.id).copied();
+        if let Some(position) = old_position {
+            let old_element = self.previous_elements[position].0;
+            if old_element == element {
+                let span = &self.spans[position];
+                out.push_str(&self.source[span.open.start..span_end(span)]);
+                self.cursor += element_count(element) - 1;
+                return Ok(());
+            }
+        }
+
+        let mut shaped = element.clone();
+        crate::sugar::sugar_shapes(&mut shaped);
+        crate::sugar::sugar_transform(&mut shaped);
+        crate::refs::sugar_refs(&mut shaped, self.refs);
+        let reusable = old_position.filter(|position| {
+            let old_element = self.previous_elements[*position].0;
+            old_element.tag == element.tag
+                && old_element.children.is_empty() == element.children.is_empty()
+        });
+        if let Some(position) = reusable {
+            let span = &self.spans[position];
+            out.push_str(&self.source[span.open.clone()]);
+        } else {
+            out.push_str(&render_open_tag(&shaped));
+        }
+        if element.children.is_empty() {
+            return Ok(());
+        }
+
+        for child in &element.children {
+            let child_id = self
+                .next
+                .sidecar()
+                .ids
+                .get(self.cursor)
+                .ok_or_else(|| FnxError::Parse("new child exceeds sidecar".into()))?
+                .id
+                .as_str();
+            let child_old_position = self.by_id.get(child_id).copied();
+            let old_leading = old_position
+                .zip(child_old_position)
+                .filter(|(parent, child)| self.previous_elements[*child].1 == Some(*parent))
+                .and_then(|(_, child)| self.leading[child].as_ref());
+            if let Some(leading) = old_leading {
+                out.push_str(&self.source[leading.clone()]);
+            } else {
+                out.push('\n');
+                out.push_str(&"  ".repeat(depth + 1));
+            }
+            self.append(child, depth + 1, out)?;
+        }
+
+        if let Some(position) = old_position
+            && let Some(close) = &self.spans[position].close
+        {
+            let tail_start = self.children[position]
+                .last()
+                .map_or(self.spans[position].open.end, |last| {
+                    span_end(&self.spans[*last])
+                });
+            out.push_str(&self.source[tail_start..close.start]);
+            if self.previous_elements[position].0.tag == element.tag {
+                out.push_str(&self.source[close.clone()]);
+            } else {
+                out.push_str(&render_close_tag(&shaped));
+            }
+        } else {
+            out.push('\n');
+            out.push_str(&"  ".repeat(depth));
+            out.push_str(&render_close_tag(&shaped));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct SourceToken {
     range: Range<usize>,
@@ -480,7 +735,7 @@ impl<'a> SourceScanner<'a> {
         }
 
         loop {
-            self.skip_ws();
+            self.skip_child_trivia()?;
             if self.peek() == Some(b'<') && self.peek_at(1) == Some(b'/') {
                 let close_start = self.cursor;
                 self.cursor += 2;
@@ -497,6 +752,25 @@ impl<'a> SourceScanner<'a> {
                 return Err(self.error(format!("unterminated <{tag}>")));
             }
             self.element(spans)?;
+        }
+    }
+
+    fn skip_child_trivia(&mut self) -> Result<(), FnxError> {
+        loop {
+            self.skip_ws();
+            if self.bytes.get(self.cursor..self.cursor + 3) != Some(b"{/*") {
+                return Ok(());
+            }
+            self.cursor += 3;
+            while self.cursor + 2 < self.bytes.len()
+                && self.bytes.get(self.cursor..self.cursor + 3) != Some(b"*/}")
+            {
+                self.cursor += 1;
+            }
+            if self.cursor + 2 >= self.bytes.len() {
+                return Err(self.error("unterminated JSX comment"));
+            }
+            self.cursor += 3;
         }
     }
 
@@ -607,7 +881,7 @@ impl<'a> SourceScanner<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IdEntry, parse_doc};
+    use crate::{ArtifactIr, ArtifactKind, IdEntry, parse_doc};
     use serde_json::Value;
 
     fn sidecar() -> FnxSidecar {
@@ -663,5 +937,47 @@ mod tests {
         let duplicate_attr = "<Frame name=\"A\" name=\"B\"><Text /></Frame>";
         assert!(FnxSourceMirror::from_source(duplicate_attr, &sidecar()).is_err());
         assert!(parse_doc(duplicate_attr).is_err());
+    }
+
+    #[test]
+    fn structural_insert_preserves_existing_subtree_and_jsx_comment() {
+        let source = "// authored wrapper\nexport default () => (\n  <Frame id=\"root\" name=\"Root\">\n    {/* keep this explanation */}\n    <Text id=\"child\" name=\"Label\" content=\"héllo\" />\n  </Frame>\n);\n";
+        let previous = ArtifactIr::from_source(ArtifactKind::Page, "Root", source, sidecar())
+            .expect("previous IR");
+        let mut next = previous.clone();
+        let mut root = next.root().clone();
+        let mut inserted = FnxElement::new("Text");
+        inserted.attrs.insert("id".into(), Value::from("new-child"));
+        inserted.attrs.insert("name".into(), Value::from("New"));
+        root.children.push(inserted);
+        let mut ids = next.sidecar().clone();
+        ids.ids.push(IdEntry {
+            id: "new-child".into(),
+            index: Value::from(2),
+            tag: Some("Text".into()),
+            name: Some("New".into()),
+            parent_index: Some(0),
+        });
+        next.replace_structure(root, ids).expect("next IR");
+        let mirror = FnxSourceMirror::from_source(source, previous.sidecar()).expect("mirror");
+        let rebuilt = mirror
+            .rebuild_tree(&previous, &next)
+            .expect("rebuild")
+            .render();
+        assert!(rebuilt.starts_with("// authored wrapper\n"));
+        assert!(rebuilt.contains("{/* keep this explanation */}"));
+        assert!(rebuilt.contains("<Text id=\"child\" name=\"Label\" content=\"héllo\" />"));
+        assert!(rebuilt.contains("id=\"new-child\""));
+        assert_eq!(parse_doc(&rebuilt).expect("parse"), *next.root());
+    }
+
+    #[test]
+    fn legacy_source_gets_explicit_ids_without_reformatting() {
+        let source = "<Frame   name=\"Root\">\n <Text name=\"Label\" />\n</Frame>";
+        let mut mirror = FnxSourceMirror::from_source(source, &sidecar()).expect("mirror");
+        assert!(mirror.insert_missing_ids(&sidecar()).expect("insert IDs"));
+        let rendered = mirror.render();
+        assert!(rendered.contains("<Frame   name=\"Root\" id=\"root\">"));
+        assert!(rendered.contains("<Text name=\"Label\" id=\"child\" />"));
     }
 }

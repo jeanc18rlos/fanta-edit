@@ -4952,6 +4952,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.prepared_video = Some(Arc::new(generation_media::PreparedVideo {
                 bytes: expected.clone(),
+                asset: fanta_format::asset_id_for_bytes(&expected),
                 metadata: generation_media::VideoMetadata {
                     width: 320,
                     height: 180,
@@ -5272,6 +5273,7 @@ mod tests {
             }];
             view.prepared_video = Some(Arc::new(generation_media::PreparedVideo {
                 bytes: expected.clone(),
+                asset: fanta_format::asset_id_for_bytes(&expected),
                 metadata: generation_media::VideoMetadata {
                     width: 320,
                     height: 180,

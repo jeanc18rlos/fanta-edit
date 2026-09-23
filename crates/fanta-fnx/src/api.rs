@@ -9,11 +9,12 @@ use crate::parse::{parse_doc, parse_doc_with};
 use crate::print::{print_doc, print_doc_with};
 use crate::refs::RefTable;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The companion sidecar for one `.fnx` file: the root's external parent id
 /// (so the subtree re-links into the wider scene) and the pre-order id/index of
-/// every element (the identity + sibling order the readable source omits).
+/// every element. IDs also appear in new source; the sidecar preserves exact
+/// fractional sibling indices and supports older source without ID attributes.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FnxSidecar {
     /// The id this subtree's root node's `parent` points at, or `None` for a
@@ -115,6 +116,29 @@ pub fn reconcile_sidecar(
         .filter(|index| !index.is_null())
         .unwrap_or_else(|| Value::from(1.0));
     let elements = flatten_elements(&root, root_index);
+    let explicit_ids: Vec<Option<&str>> = elements
+        .iter()
+        .map(|element| match element.element.attrs.get("id") {
+            Some(Value::String(id)) => Ok(Some(id.as_str())),
+            Some(_) => Err(FnxError::Parse("node id must be a string".into())),
+            None => Ok(None),
+        })
+        .collect::<Result<_, _>>()?;
+    let mut seen_explicit = HashSet::new();
+    for id in explicit_ids.iter().flatten() {
+        if !seen_explicit.insert(*id) {
+            return Err(FnxError::Parse(format!("duplicate explicit node id {id}")));
+        }
+    }
+    if let (Some(Some(explicit_root)), Some(persisted_root)) =
+        (explicit_ids.first(), sidecar.ids.first())
+        && *explicit_root != persisted_root.id
+    {
+        return Err(FnxError::Parse(format!(
+            "root id {explicit_root} disagrees with sidecar root {}",
+            persisted_root.id
+        )));
+    }
 
     // Pure attribute edit: same shape, every fingerprint still in place. The
     // root pair keeps its id even when its tag or name changed — the file's
@@ -133,6 +157,10 @@ pub fn reconcile_sidecar(
     };
     if root_tag_unchanged
         && elements.len() == sidecar.ids.len()
+        && explicit_ids
+            .iter()
+            .zip(&sidecar.ids)
+            .all(|(explicit, entry)| explicit.is_none_or(|id| id == entry.id))
         && sidecar
             .ids
             .iter()
@@ -145,22 +173,52 @@ pub fn reconcile_sidecar(
                             == element.parent.and_then(|parent| u32::try_from(parent).ok()))
             })
     {
-        return Ok(sidecar.clone());
+        let mut refreshed = sidecar.clone();
+        if let (Some(entry), Some(element)) = (refreshed.ids.first_mut(), elements.first()) {
+            if entry.tag.is_some() {
+                entry.name = element_name(element.element).map(str::to_owned);
+            }
+        }
+        return Ok(refreshed);
     }
 
     let has_fingerprints = sidecar.ids.iter().any(|entry| entry.tag.is_some());
-    let assignments = if has_fingerprints {
+    let mut assignments = if has_fingerprints {
         align_entries(&sidecar.ids, &elements)
     } else {
         positional_assignments(sidecar.ids.len(), elements.len())
     };
 
+    let existing_by_id: HashMap<&str, usize> = sidecar
+        .ids
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.id.as_str(), position))
+        .collect();
+    for (position, explicit) in explicit_ids.iter().enumerate() {
+        if let Some(id) = explicit {
+            assignments[position] = existing_by_id.get(id).copied();
+        } else if assignments[position]
+            .is_some_and(|old| seen_explicit.contains(sidecar.ids[old].id.as_str()))
+        {
+            assignments[position] = None;
+        }
+    }
+
     let mut ids = Vec::with_capacity(elements.len());
-    for (element, assignment) in elements.iter().zip(&assignments) {
-        let id = match assignment {
-            Some(existing) => sidecar.ids[*existing].id.clone(),
-            None => next_id(),
+    let mut used_ids: HashSet<String> = seen_explicit.iter().map(|id| (*id).to_owned()).collect();
+    for ((element, assignment), explicit) in elements.iter().zip(&assignments).zip(&explicit_ids) {
+        let id = match (explicit, assignment) {
+            (Some(id), _) => (*id).to_owned(),
+            (None, Some(existing)) => sidecar.ids[*existing].id.clone(),
+            (None, None) => loop {
+                let id = next_id();
+                if used_ids.insert(id.clone()) {
+                    break id;
+                }
+            },
         };
+        used_ids.insert(id.clone());
         ids.push(IdEntry {
             id,
             index: element.index.clone(),

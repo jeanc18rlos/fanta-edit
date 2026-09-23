@@ -52,7 +52,7 @@ use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::{FantaDesignPanel, FileInspectorVisibilityChanged};
 use crate::document::{
     AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigScope, MAX_IMAGE_SOURCE_BYTES,
-    SaveKind, ScopeRequester,
+    PreparedImage, SaveKind, ScopeRequester,
 };
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
@@ -3063,11 +3063,52 @@ impl FigView {
             .map(bounds_size)
             .map(|(width, height)| [width / viewport.zoom, height / viewport.zoom])
             .unwrap_or([1024.0, 768.0]);
+        let target_page = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.active_page());
+        let preparation = cx.background_spawn(async move {
+            images
+                .into_iter()
+                .map(PreparedImage::new)
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            this.update(cx, |this, cx| {
+                this.place_prepared_images(prepared, viewport.center, visible, target_page, cx)
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn place_prepared_images(
+        &mut self,
+        images: Vec<Result<PreparedImage>>,
+        center: [f64; 2],
+        visible: [f64; 2],
+        target_page: Option<NodeId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.active_page())
+            != target_page
+        {
+            show_canvas_notice_deferred(
+                "The active page changed before paste completed.".into(),
+                cx,
+            );
+            return;
+        }
 
         let pasted = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let (doc, mut assets) = document.doc_and_assets();
-                match paste_images(doc, &mut assets, images, viewport.center, visible) {
+                match paste_prepared_images(doc, &mut assets, images, center, visible) {
                     Ok(pasted) => {
                         let change = if pasted.placed.is_empty() {
                             DocChange::None
@@ -3539,9 +3580,13 @@ impl FigView {
         let save = self
             .item
             .update(cx, |item, cx| item.save(SaveKind::Auto, cx));
-        cx.spawn(async move |_, _| {
+        cx.spawn(async move |view, cx| {
             if let Err(error) = save.await {
                 log::error!("autosaving the canvas failed: {error:#}");
+                view.update(cx, |_, cx| {
+                    show_canvas_notice_deferred(format!("Autosave failed: {error:#}"), cx);
+                })
+                .log_err();
             }
         })
         .detach();
@@ -5670,17 +5715,17 @@ struct PastedImages {
 /// larger, and cascaded by 16 world units so a batch stays distinguishable.
 /// Every ingested asset is dropped again when the layers cannot be created,
 /// so a failed paste leaves no orphan bytes.
-fn paste_images(
+fn paste_prepared_images(
     doc: &mut Doc,
     assets: &mut AssetStores<'_>,
-    images: Vec<Vec<u8>>,
+    images: Vec<Result<PreparedImage>>,
     center: [f64; 2],
     visible: [f64; 2],
 ) -> Result<PastedImages> {
     let mut ingested = Vec::new();
     let mut skipped = Vec::new();
-    for bytes in images {
-        match assets.add_image(bytes) {
+    for image in images {
+        match image.and_then(|image| assets.add_prepared_image_tracked(image)) {
             Ok(image) => ingested.push(image),
             Err(error) => skipped.push(error),
         }
@@ -5688,8 +5733,10 @@ fn paste_images(
     match place_ingested_images(doc, &ingested, center, visible) {
         Ok(placed) => Ok(PastedImages { placed, skipped }),
         Err(error) => {
-            for (asset, _) in ingested {
-                assets.remove(asset);
+            for (asset, _, inserted) in ingested {
+                if inserted {
+                    assets.remove(asset);
+                }
             }
             Err(error)
         }
@@ -5698,12 +5745,12 @@ fn paste_images(
 
 fn place_ingested_images(
     doc: &mut Doc,
-    ingested: &[(AssetId, [u32; 2])],
+    ingested: &[(AssetId, [u32; 2], bool)],
     center: [f64; 2],
     visible: [f64; 2],
 ) -> Result<Vec<NodeId>> {
     let mut nodes: Vec<CanvasNode> = Vec::with_capacity(ingested.len());
-    for (position, (asset, natural_size)) in ingested.iter().copied().enumerate() {
+    for (position, (asset, natural_size, _)) in ingested.iter().copied().enumerate() {
         let natural = [
             f64::from(natural_size[0].max(1)),
             f64::from(natural_size[1].max(1)),
@@ -7198,11 +7245,14 @@ mod tests {
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("Design");
+        let initial = doc_with_one_page();
+        crate::document::write_project(&root, &initial, &BTreeMap::new())
+            .expect("materialize project fixture");
         let item = crate::document::ready_item_with_root_for_test(
             &project,
             dir.path().join("Design.fig"),
             Some(root.clone()),
-            doc_with_one_page(),
+            initial,
             cx,
         );
         let scratch = cx.add_window(|_, _| gpui::Empty);
@@ -7652,9 +7702,14 @@ mod tests {
         item.read_with(cx, |item, _| {
             assert!(item.is_dirty(), "a save mid-gesture would disrupt the drag")
         });
-        assert!(
-            !root.exists(),
-            "nothing was written while the pointer was down"
+        assert_eq!(
+            fanta_format::read_project_tree(&root)
+                .expect("project on disk")
+                .0
+                .scene
+                .len(),
+            1,
+            "the drag has not reached disk while the pointer is down"
         );
 
         scratch

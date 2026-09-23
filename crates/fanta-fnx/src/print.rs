@@ -8,7 +8,7 @@ use crate::model::FnxElement;
 use crate::refs::RefTable;
 use serde_json::{Number, Value};
 
-const GENERATED_MARKER: &str = "// @generated fanta source — the design is the source of truth; ids live in the .ids sidecar\n";
+const GENERATED_MARKER: &str = "// @generated fanta source — the design is the source of truth; ids are mirrored in the .ids sidecar\n";
 
 /// Magnitude below which a printed float is arithmetic dust rather than a
 /// value anyone authored, and prints as a flush zero.

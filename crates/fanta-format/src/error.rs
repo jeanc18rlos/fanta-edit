@@ -40,6 +40,16 @@ pub enum FormatError {
     #[error("asset not found: {0}")]
     AssetNotFound(AssetId),
 
+    /// An existing id was offered different bytes; replacing the blob would
+    /// silently change every document reference to it.
+    #[error("asset id {0} already contains different bytes")]
+    AssetIdCollision(AssetId),
+
+    /// A hash-named asset blob in a `.fant` archive did not match its name or
+    /// the id in the manifest.
+    #[error("asset {id} is corrupt at {path}")]
+    CorruptAsset { id: AssetId, path: String },
+
     /// The manifest parsed as JSON but failed semantic validation — wrong
     /// field types, missing required keys, etc.
     #[error("invalid manifest: {0}")]

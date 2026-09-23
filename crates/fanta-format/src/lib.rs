@@ -44,12 +44,17 @@
 
 mod container;
 mod error;
+pub mod formats;
 mod manifest;
 mod migrate;
 mod project;
 
 pub use container::{FantaFile, asset_id_for_bytes};
 pub use error::{FormatError, Result};
+pub use formats::{
+    FormatCapabilities, FormatDescriptor, FormatHandler, FormatHandlerResult, FormatOperation,
+    FormatPath, FormatRegistry, FormatRegistryError, FormatRegistryResult, ImportedDesign,
+};
 pub use manifest::Manifest;
 pub use migrate::migrate;
 pub use project::session;
@@ -57,17 +62,23 @@ pub use project::{
     ApplyReport, ArtifactAddress, ArtifactDirty, ArtifactId, ArtifactMerge, ArtifactMeta,
     ArtifactOpImpact, ArtifactRenderRevision, ArtifactRenderSnapshot, ArtifactSession, ClosePolicy,
     ConflictResolution, ContentHash, DependencyGraph, DocMerge, DocMutGuard, FsEvent,
-    JsonPathSegment, MergeReview, MotionIndex, MotionSource, NodeMapEdition, PresenceValue,
-    ProjectManifest, ProjectSourceEdit, ProjectWriteCache, PropertyConflict, ProposalApplied,
-    ReviewConflict, ReviewResolution, SaveBlocked, SaveResult, ScopedDesign, ScopedDoc,
-    SessionError, SessionEvent, SourceDiagnostic, SourceProposalOutcome, SourceRebuildReason,
-    SourceSeverity, SourceSync, WorkspaceDirty, WorkspaceIr, WorkspaceSession,
-    WorkspaceSharedState, WriteReport, apply_project_source_edit,
-    apply_project_source_edit_with_diagnostics, artifact_op_impact, canonicalize_legacy_source,
-    component_id_of_dir, ensure_project_editor_support, export_fant_snapshot, hash_file_set,
-    import_fant_snapshot, is_project_dir, locate_master_source, locate_page_source, merge_artifact,
-    merge_docs, page_id_of_dir, page_scope_of_source, read_motion_dual, read_project_tree,
-    scaffold_project_tree, synthesize_workspace_fnx, validate_project_source_edit,
-    validate_project_source_edit_with_diagnostics, write_artifact_files, write_project_tree,
-    write_project_tree_cached,
+    IncrementalDocApply, JsonPathSegment, MediaFormat, MediaRegistry, MediaRegistryError,
+    MergeReview, MotionIndex, MotionSource, NodeMapEdition, PresenceValue, ProjectManifest,
+    ProjectSourceEdit, ProjectWriteCache, PropertyConflict, ProposalApplied, ReviewConflict,
+    ReviewResolution, SaveBlocked, SaveResult, ScopedDesign, ScopedDoc, SessionError, SessionEvent,
+    SourceDiagnostic, SourceProposalOutcome, SourceRebuildReason, SourceSeverity, SourceSync,
+    WorkspaceDirty, WorkspaceDiskSnapshot, WorkspaceIr, WorkspaceSession, WorkspaceSharedState,
+    WriteReport, apply_project_source_edit, apply_project_source_edit_with_diagnostics,
+    artifact_op_impact, canonicalize_legacy_source, component_id_of_dir,
+    ensure_project_editor_support, export_fant_snapshot, hash_file_set, import_fant_snapshot,
+    is_project_dir, locate_master_source, locate_page_source, merge_artifact, merge_docs,
+    page_id_of_dir, page_scope_of_source, projected_design_dirs, read_motion_dual,
+    read_project_tree, scaffold_project_tree, synthesize_workspace_fnx,
+    validate_project_source_edit, validate_project_source_edit_with_diagnostics,
+    write_artifact_files, write_project_tree, write_project_tree_cached,
+    write_project_tree_cached_with_media_registry, write_project_tree_cached_with_sources,
+    write_project_tree_cached_with_sources_and_media_registry,
+    write_project_tree_cached_with_sources_checked,
+    write_project_tree_cached_with_sources_checked_and_media_registry,
+    write_project_tree_with_media_registry,
 };

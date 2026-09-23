@@ -188,6 +188,7 @@ declare global {
   interface FnxNodeProps {
     [attribute: string]: unknown;
     children?: JSX.Element | readonly JSX.Element[];
+    id?: string;
     name?: string;
     opacity?: number;
     blend_mode?: FnxBlendMode;

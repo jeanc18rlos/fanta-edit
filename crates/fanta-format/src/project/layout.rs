@@ -11,6 +11,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub(crate) use super::write::with_project_read_lock;
+
 /// Manifest file at the root of every project directory.
 pub(crate) const FANTA_JSON: &str = "fanta.json";
 /// Value of [`ProjectManifest::format`] — the tag that makes a directory a
@@ -21,20 +23,20 @@ pub(crate) const FORMAT_TAG: &str = "fanta-project";
 /// v2 replaced one-JSON-file-per-node (`<design>/nodes/<id>.json`) with one
 /// readable `.fnx` source file + an `.ids` sidecar per page/component. v1 trees
 /// still read (the loader falls back to `nodes/`) and upgrade to v2 on the next
-/// save (the full-overwrite write drops the old `nodes/` dirs).
+/// save (the writer prunes the old `nodes/` files).
 ///
 /// v3 renamed the design directories from raw ids (`pages/n_<ULID>/`) to
 /// human-readable slugs of the design's name (`pages/home-screen/`); identity
 /// moved into the JSON headers (`page.json` gained `"id"`, `def.json` already
 /// carried the `ComponentDef` id). v2 trees still read (the loader falls back
 /// to parsing the directory name as the id) and upgrade to v3 dirs on the next
-/// full-overwrite save.
+/// save.
 ///
 /// **v4** marks name-based references in `.fnx` sources (`component="Button"`,
 /// `$Collection/Name` token paths): the printer only emits names inside a
 /// v4-tagged project, so a v3-era build never encounters source it cannot
 /// resolve — its manifest gate refuses v4 outright instead of half-loading.
-/// v3 trees still read; the next full-overwrite save upgrades them.
+/// v3 trees still read; the next save upgrades them.
 pub(crate) const PROJECT_VERSION: u32 = 4;
 
 pub(crate) const DOC_DIR: &str = "doc";
@@ -83,7 +85,7 @@ pub(crate) const FLOW_START_JSON: &str = "flow_start.json";
 
 pub(crate) const GITIGNORE_NAME: &str = ".gitignore";
 /// Derived/transient directories and OS noise stay out of history.
-pub(crate) const GITIGNORE: &str = "previews/\nexports/\n.DS_Store\n";
+pub(crate) const GITIGNORE: &str = "previews/\nexports/\n.fanta-transaction*/\n.DS_Store\n";
 
 /// Agent-guide file at the project root. Zed's agent auto-loads it as a rules
 /// file (`RULES_FILE_NAMES` in `prompt_store`), so seeding it teaches any AI
@@ -99,8 +101,8 @@ pub(crate) const FNX_TYPES: &str = include_str!("fnx.d.ts");
 pub(crate) const FNX_PRETTIER_NAME: &str = ".prettierrc.json";
 pub(crate) const FNX_PRETTIER: &str = include_str!("fnx.prettierrc.json");
 
-/// The seed contents of [`AGENTS_MD_NAME`]. Written only when absent (unlike
-/// the always-regenerated `.gitignore`) so a user's edits are never clobbered.
+/// The seed contents of [`AGENTS_MD_NAME`]. Written only when absent so a
+/// user's edits are never clobbered.
 /// The guide is intentionally practical and format-accurate — it is derived
 /// from the real `.fnx` projection, not invented.
 pub(crate) const AGENTS_MD: &str = r##"# Working on this Fanta design project
@@ -108,7 +110,7 @@ pub(crate) const AGENTS_MD: &str = r##"# Working on this Fanta design project
 This directory is a Fanta *design project*: a Figma-class design stored as
 editable source files. **The design is the source of truth.** Editing these
 files edits the design. When this project is open in the editor, saving your
-edits to the `.fnx` files reloads the canvas about 300 ms later, and edits made
+edits to the `.fnx` files update the canvas about 300 ms later, and edits made
 on the canvas save back to these same files. So working here as a text agent
 *is* the design-to-canvas loop — no export step.
 
@@ -133,12 +135,13 @@ doc/
 pages/<page-slug>/
   page.json                      # { "id": "n_…", "name": ..., "order": N }
   page.fnx                       # the page's node tree as readable source  <- edit this
-  page.ids.json                  # id + sibling-order sidecar for page.fnx  — do not hand-edit
+  page.ids.json                  # legacy id/order sidecar kept in sync  — do not hand-edit
 components/<component-slug>/
   def.json                       # component definition (id, root, name)
   master.fnx                     # the component master's tree as source    <- edit this
-  master.ids.json                # id sidecar for master.fnx                — do not hand-edit
+  master.ids.json                # legacy id/order sidecar kept in sync  — do not hand-edit
 components/sets.json             # component-set (variant) registry
+assets/index.json                # asset sizes and full SHA-256 digests
 assets/<family>/<AssetId>.<ext>  # shared binary assets, one folder per family:
                                  #   images/ video/ audio/ models/ svg/ fonts/ other/
 previews/  exports/              # generated output — git-ignored, never an input
@@ -146,8 +149,9 @@ previews/  exports/              # generated output — git-ignored, never an in
 
 Directory names under `pages/` and `components/` are human-readable slugs of
 the design's name (two pages named the same get `-2`, `-3` suffixes). The
-design's *identity* lives in the JSON header next to the source: `page.json`'s
-`"id"` and `def.json`'s `id`. Do not hand-edit ids, and renaming the folder is
+design's *identity* lives in the JSON header and root source element: `page.json`'s
+`"id"`, `def.json`'s `id`, and the root element's bare ULID must identify the
+same node. Renaming the folder is
 not how you rename a page — edit the root element's `name` attribute and the
 app re-derives the folder name on the next save.
 
@@ -188,9 +192,9 @@ element:
 A short real snippet:
 
 ```jsx
-<Frame background={{"kind": "solid", "color": fnxColor("#444444")}} blend_mode="normal"
+<Frame id="00000000000000000000000001" background={{"kind": "solid", "color": fnxColor("#444444")}} blend_mode="normal"
        corner_radius={2.0} name="Header" opacity={1.0} x={-734.0} y={-491.0}>
-  <Text align="left" content="Little Lemon" name="Title" opacity={1.0}
+  <Text id="00000000000000000000000002" align="left" content="Little Lemon" name="Title" opacity={1.0}
         style={{"font_family": "Inter", "size_px": 64.0, "weight": 700, "color": fnxColor("#1E1E1E")}}
         x={275.0} y={146.0} />
 </Frame>
@@ -230,13 +234,13 @@ A node with rotation, scale, or skew shows a raw
 `transform={[a, b, c, d, tx, ty]}` array instead of `x`/`y` — leave that
 verbatim unless you mean to change the matrix.
 
-### Ids live in the sidecar, not the source
+### Stable node IDs
 
-Stable node ids and fractional sibling order are lifted out of the `.fnx` into
-the neighboring `page.ids.json` / `master.ids.json` sidecar (in pre-order), so
-the source stays readable. **Do not hand-edit the `.ids.json` sidecars or ids
-in `fanta.json`.** The round trip stays lossless as long as you leave identity
-to the sidecar and edit only the readable source.
+Every element has a stable bare-ULID `id="…"` in `.fnx`. Keep that ID when changing or
+moving an element. To duplicate one, remove `id` from the copy so the editor
+assigns and writes a fresh ID; two elements with the same explicit ID fail to
+parse. The neighboring `.ids.json` file is a compatibility/order sidecar kept
+in sync by the editor. Do not hand-edit sidecars or ids in `fanta.json`.
 
 ## What you can do by editing `.fnx`
 
@@ -249,23 +253,25 @@ Editing the readable source changes the design directly:
   Text `style.color`. Colors use the TSX-valid `fnxColor("#RRGGBB")` helper.
 - **Move / resize** — change `x` / `y` (and size-related attributes).
 - **Reorder** — change an element's position among its siblings.
-- **Duplicate / delete** — copy an element (the app assigns a fresh id on the
-  next save) or remove it.
+- **Duplicate / delete** — copy an element, remove `id` from the copy, or
+  remove the element. The editor inserts a fresh ID for the copy.
 
 ## Guardrails
 
 - Keep the JSX well-formed: balanced tags, valid attribute values. A `.fnx`
   that fails to parse will not load.
-- Do not hand-edit `page.ids.json`, `master.ids.json`, or the ids in
-  `fanta.json` — ids and sibling order are owned by the sidecars.
+- Do not hand-edit `page.ids.json`, `master.ids.json`, or ids in
+  `fanta.json`. Preserve each existing element's explicit `id` in `.fnx`.
 - Assets are shared **by reference**: they live under `assets/<family>/` and are
-  named by content id. Reference them; never paste binary data inline into a
-  `.fnx`.
+  named by content id. `assets/index.json` records full SHA-256 digests and
+  sizes. Reference assets by id; never paste binary data inline into `.fnx`.
 - For **auto-layout** frames (those with an `auto_layout={…}` attribute), the
   app solves child positions from the layout rules — set the auto-layout
   properties and let the solver place children rather than fighting it with
   manual `x`/`y`.
 - `previews/` and `exports/` are generated; they are never read back.
+- `.fanta-transaction/` is a temporary recovery journal. If a save stops
+  midway, opening the project replays it. Leave it for the editor to recover.
 - Positioning: `x`/`y` are sugar for a translation-only transform. A node with
   rotation/scale shows a raw `transform={[a,b,c,d,tx,ty]}` instead — writing
   BOTH `x`/`y` and `transform` on one element is an error, not a merge.
@@ -425,10 +431,9 @@ to commit a broken tree:
 editor is still holding changes that have not reached disk, and re-reading the
 `.fnx` will show you the state *before* those edits.
 
-Saving rewrites the project tree, which also **regenerates the `.ids.json`
-sidecars**. So after any edit — yours or the user's — let the editor save once
-*before* you `git add`. Committing while `dirty` is `true` captures sources whose
-sidecars, manifest timestamps and asset files do not match them.
+Saving updates only changed project files and keeps the `.ids.json` sidecars in
+sync. After an edit, let the editor save before `git add`. Committing while
+`dirty` is `true` can capture source and sidecars from different revisions.
 
 ## Finding the node the user means
 
@@ -445,9 +450,8 @@ surrounding text before editing.
 /// `fanta.json` — the root manifest of a project directory.
 ///
 /// Mirrors the `.fant` [`crate::Manifest`] in spirit (schema version, doc id,
-/// app version, timestamps) but for the unzipped, git-native tree. No asset
-/// index: assets are discovered by scanning `assets/**`, with the id encoded
-/// in each filename — the directory *is* the index.
+/// app version, timestamps) but for the unzipped, git-native tree. Binary
+/// integrity metadata lives in `assets/index.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectManifest {
     /// Always [`FORMAT_TAG`]. The presence of this tag is what
@@ -507,6 +511,10 @@ impl ProjectManifest {
 /// a `.gitignore`, and a fresh [`ProjectManifest`]. No git operations — repo
 /// init is the app layer's job (spec 09 §A.1).
 pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
+    let existing_manifest = dir.join(FANTA_JSON).exists();
+    if existing_manifest {
+        read_manifest(dir)?;
+    }
     fs::create_dir_all(dir.join(DOC_DIR))?;
     fs::create_dir_all(dir.join(PAGES_DIR))?;
     fs::create_dir_all(dir.join(COMPONENTS_DIR))?;
@@ -515,14 +523,17 @@ pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
     }
     fs::create_dir_all(dir.join(PREVIEWS_DIR))?;
     fs::create_dir_all(dir.join(EXPORTS_DIR))?;
-    fs::write(dir.join(GITIGNORE_NAME), GITIGNORE)?;
+    seed_gitignore(dir)?;
     seed_agents_md(dir)?;
     seed_fnx_types(dir)?;
     seed_fnx_prettier(dir)?;
-    write_json_file(
-        &dir.join(FANTA_JSON),
-        &serde_json::to_value(ProjectManifest::new_empty())?,
-    )
+    if !existing_manifest {
+        write_json_file(
+            &dir.join(FANTA_JSON),
+            &serde_json::to_value(ProjectManifest::new_empty())?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Seed editor support files that are missing from an existing project.
@@ -533,6 +544,7 @@ pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
 /// are left untouched.
 pub fn ensure_project_editor_support(dir: &Path) -> Result<()> {
     read_manifest(dir)?;
+    seed_gitignore(dir)?;
     seed_fnx_types(dir)?;
     seed_fnx_prettier(dir)?;
     seed_prettierignore(dir)?;
@@ -543,14 +555,29 @@ pub fn ensure_project_editor_support(dir: &Path) -> Result<()> {
     seed_agents_md(dir)
 }
 
+fn seed_gitignore(dir: &Path) -> Result<()> {
+    let path = dir.join(GITIGNORE_NAME);
+    match fs::read(&path) {
+        Ok(existing) if existing == b"previews/\nexports/\n.DS_Store\n" => {
+            super::write::write_with_parents(&path, GITIGNORE.as_bytes())?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            super::write::write_with_parents(&path, GITIGNORE.as_bytes())?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 /// Write the [`AGENTS_MD`] guide to the project root, but only when no
-/// `AGENTS.md` already exists. Unlike the regenerated `.gitignore`, this file
+/// `AGENTS.md` already exists. Unlike the seeded `.gitignore`, this file
 /// is a user-ownable seed: once present (whether from an earlier scaffold or
 /// hand-authored) it is left untouched so customizations survive re-saves.
 fn seed_agents_md(dir: &Path) -> Result<()> {
     let path = dir.join(AGENTS_MD_NAME);
     if !path.exists() {
-        fs::write(path, AGENTS_MD)?;
+        super::write::write_with_parents(&path, AGENTS_MD.as_bytes())?;
     }
     Ok(())
 }
@@ -558,7 +585,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
 fn seed_fnx_types(dir: &Path) -> Result<()> {
     let path = dir.join(FNX_TYPES_NAME);
     if !path.exists() {
-        fs::write(path, FNX_TYPES)?;
+        super::write::write_with_parents(&path, FNX_TYPES.as_bytes())?;
     }
     Ok(())
 }
@@ -580,7 +607,7 @@ fn seed_prettierignore(dir: &Path) -> Result<()> {
 ";
     let path = dir.join(PRETTIERIGNORE_NAME);
     if !path.exists() {
-        fs::write(path, PRETTIERIGNORE)?;
+        super::write::write_with_parents(&path, PRETTIERIGNORE.as_bytes())?;
     }
     Ok(())
 }
@@ -605,7 +632,7 @@ fn seed_fnx_prettier(dir: &Path) -> Result<()> {
     .into_iter()
     .any(|name| dir.join(name).exists());
     if !existing_config {
-        fs::write(dir.join(FNX_PRETTIER_NAME), FNX_PRETTIER)?;
+        super::write::write_with_parents(&dir.join(FNX_PRETTIER_NAME), FNX_PRETTIER.as_bytes())?;
     }
     Ok(())
 }
@@ -627,6 +654,7 @@ pub fn is_project_dir(dir: &Path) -> bool {
 /// is [`FormatError::NotAProject`]; a newer layout version is
 /// [`FormatError::UnsupportedProjectVersion`].
 pub(crate) fn read_manifest(dir: &Path) -> Result<ProjectManifest> {
+    super::write::recover_project_transaction(dir)?;
     let not_a_project = || FormatError::NotAProject {
         path: dir.to_path_buf(),
     };
@@ -659,11 +687,7 @@ pub(crate) fn json_bytes(value: &Value) -> Result<Vec<u8>> {
 
 /// Write `value` in the [`json_bytes`] form, creating parent directories.
 pub(crate) fn write_json_file(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, json_bytes(value)?)?;
-    Ok(())
+    super::write::write_with_parents(path, &json_bytes(value)?)
 }
 
 /// Read a JSON file. A missing file maps to [`FormatError::MissingFile`] with
@@ -831,6 +855,29 @@ mod tests {
         assert_eq!(manifest.version, PROJECT_VERSION);
         assert_eq!(manifest.schema_version, fanta_doc::SCHEMA_VERSION);
         assert!(manifest.project_id.starts_with("d_"));
+    }
+
+    #[test]
+    fn scaffolding_an_existing_project_preserves_its_manifest_and_custom_ignore() {
+        let dir = tempdir().expect("project directory");
+        scaffold_project_tree(dir.path()).expect("initial scaffold");
+        let manifest = fs::read(dir.path().join(FANTA_JSON)).expect("initial manifest");
+        fs::write(
+            dir.path().join(GITIGNORE_NAME),
+            b"# project-specific rules\n",
+        )
+        .expect("custom ignore");
+
+        scaffold_project_tree(dir.path()).expect("repeat scaffold");
+
+        assert_eq!(
+            fs::read(dir.path().join(FANTA_JSON)).expect("manifest"),
+            manifest
+        );
+        assert_eq!(
+            fs::read(dir.path().join(GITIGNORE_NAME)).expect("custom ignore"),
+            b"# project-specific rules\n"
+        );
     }
 
     /// A project written before the manifest dropped its per-save timestamp

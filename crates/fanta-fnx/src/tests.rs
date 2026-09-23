@@ -138,11 +138,7 @@ fn printed_source_looks_like_react() {
         text.contains("fnxColor(\"#2563EB\")"),
         "color should render through fnxColor: {text}"
     );
-    // The opaque ULIDs are NOT in the readable source — they live in the sidecar.
-    assert!(
-        !text.contains("ROOT0000000000000000000000"),
-        "node ids must not leak into the source: {text}"
-    );
+    assert!(text.contains("id=\"ROOT0000000000000000000000\""));
     assert_eq!(tree.sidecar.len(), nodes.len());
     assert_eq!(tree.sidecar[0].id, "ROOT0000000000000000000000");
 }
@@ -380,7 +376,7 @@ fn sidecar_reconciliation_assigns_ids_and_source_order_to_added_elements() {
             "index": 9.0, "name": "Existing"
         }),
     ];
-    let (source, sidecar) = encode_subtree(&nodes, "Page").unwrap();
+    let (source, sidecar) = encode_legacy_subtree(&nodes, "Page");
     let source = source.replace(
         "      <Vector name=\"Existing\" />\n",
         "      <Vector name=\"Existing\" />\n      <Vector name=\"Added\" />\n",
@@ -407,6 +403,22 @@ fn sidecar_reconciliation_assigns_ids_and_source_order_to_added_elements() {
 
 /// A root frame with three named children — the fixture for the mid-tree
 /// reconciliation tests below.
+fn encode_legacy_subtree(nodes: &[Value], name: &str) -> (String, FnxSidecar) {
+    let (source, sidecar) = encode_subtree(nodes, name).expect("encode legacy fixture");
+    let mut without_ids = String::with_capacity(source.len());
+    let mut remaining = source.as_str();
+    while let Some(position) = remaining.find(" id=\"") {
+        without_ids.push_str(&remaining[..position]);
+        let value = &remaining[position + " id=\"".len()..];
+        let Some(end) = value.find('"') else {
+            panic!("generated node id attribute must close");
+        };
+        remaining = &value[end + 1..];
+    }
+    without_ids.push_str(remaining);
+    (without_ids, sidecar)
+}
+
 fn reconcile_fixture() -> (String, FnxSidecar) {
     let nodes = vec![
         json!({
@@ -426,7 +438,20 @@ fn reconcile_fixture() -> (String, FnxSidecar) {
             "index": 3.0, "name": "C"
         }),
     ];
-    encode_subtree(&nodes, "Page").expect("encode fixture")
+    encode_legacy_subtree(&nodes, "Page")
+}
+
+#[test]
+fn root_name_change_refreshes_sidecar_fingerprint() {
+    let (source, sidecar) = reconcile_fixture();
+    let renamed = source.replacen("name=\"Page\"", "name=\"Landing\"", 1);
+    assert_ne!(renamed, source);
+    let reconciled = reconcile_sidecar(&renamed, &sidecar, || {
+        panic!("renaming a root must not mint a node id")
+    })
+    .unwrap();
+    assert_eq!(reconciled.ids[0].id, sidecar.ids[0].id);
+    assert_eq!(reconciled.ids[0].name.as_deref(), Some("Landing"));
 }
 
 #[test]
@@ -640,7 +665,7 @@ fn deleting_above_the_lcs_cap_keeps_every_surviving_id() {
             "index": f64::from(i + 1), "name": format!("shape-{i}")
         }));
     }
-    let (source, sidecar) = encode_subtree(&nodes, "Page").expect("encode big page");
+    let (source, sidecar) = encode_legacy_subtree(&nodes, "Page");
     let edited = source.replacen("      <Vector name=\"shape-0\" />\n", "", 1);
     assert_ne!(edited, source);
 
@@ -679,7 +704,7 @@ fn preorder_preserving_reparent_normalizes_indices_and_keeps_ids() {
             "index": 2.0, "name": "B"
         }),
     ];
-    let (source, sidecar) = encode_subtree(&nodes, "Page").expect("encode fixture");
+    let (source, sidecar) = encode_legacy_subtree(&nodes, "Page");
     assert_eq!(sidecar.ids[1].parent_index, Some(0));
     assert_eq!(sidecar.ids[2].parent_index, Some(1));
 
@@ -769,7 +794,7 @@ fn swapping_identical_frames_keeps_every_subtree_id() {
             "index": 1.0, "name": "Label"
         }),
     ];
-    let (source, sidecar) = encode_subtree(&nodes, "Page").expect("encode fixture");
+    let (source, sidecar) = encode_legacy_subtree(&nodes, "Page");
     let edited = source.replace(
         "      <Frame name=\"Card\">\n        <Vector name=\"Icon\" />\n      </Frame>\n      <Frame name=\"Card\">\n        <Text name=\"Label\" />\n      </Frame>\n",
         "      <Frame name=\"Card\">\n        <Text name=\"Label\" />\n      </Frame>\n      <Frame name=\"Card\">\n        <Vector name=\"Icon\" />\n      </Frame>\n",

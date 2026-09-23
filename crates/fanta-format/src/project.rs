@@ -57,6 +57,7 @@ pub use fanta_fnx::canonicalize_legacy_source;
 pub use layout::{
     ProjectManifest, ensure_project_editor_support, is_project_dir, scaffold_project_tree,
 };
+pub use media::{MediaFormat, MediaRegistry, MediaRegistryError};
 pub use merge::{
     ArtifactAddress, ArtifactMerge, DocMerge, JsonPathSegment, NodeMapEdition, PresenceValue,
     PropertyConflict, merge_artifact, merge_docs,
@@ -68,19 +69,27 @@ pub use read::{
 pub use session::{
     ApplyReport, ArtifactDirty, ArtifactId, ArtifactMeta, ArtifactOpImpact, ArtifactRenderRevision,
     ArtifactRenderSnapshot, ArtifactSession, ClosePolicy, ConflictResolution, ContentHash,
-    DependencyGraph, DocMutGuard, FsEvent, MergeReview, MotionIndex, MotionSource, ProposalApplied,
-    ReviewConflict, ReviewResolution, SaveBlocked, SaveResult, ScopedDoc, SessionError,
-    SessionEvent, SourceDiagnostic, SourceProposalOutcome, SourceRebuildReason, SourceSeverity,
-    SourceSync, WorkspaceDirty, WorkspaceIr, WorkspaceSession, WorkspaceSharedState,
-    artifact_op_impact, hash_file_set, read_motion_dual, synthesize_workspace_fnx,
-    write_artifact_files,
+    DependencyGraph, DocMutGuard, FsEvent, IncrementalDocApply, MergeReview, MotionIndex,
+    MotionSource, ProposalApplied, ReviewConflict, ReviewResolution, SaveBlocked, SaveResult,
+    ScopedDoc, SessionError, SessionEvent, SourceDiagnostic, SourceProposalOutcome,
+    SourceRebuildReason, SourceSeverity, SourceSync, WorkspaceDirty, WorkspaceDiskSnapshot,
+    WorkspaceIr, WorkspaceSession, WorkspaceSharedState, artifact_op_impact, hash_file_set,
+    read_motion_dual, synthesize_workspace_fnx, write_artifact_files,
 };
 pub use snapshot::{export_fant_snapshot, import_fant_snapshot};
 pub use source_edit::{
     ProjectSourceEdit, apply_project_source_edit, apply_project_source_edit_with_diagnostics,
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
-pub use write::{ProjectWriteCache, WriteReport, write_project_tree, write_project_tree_cached};
+pub use write::{
+    ProjectWriteCache, WriteReport, projected_design_dirs, write_project_tree,
+    write_project_tree_cached, write_project_tree_cached_with_media_registry,
+    write_project_tree_cached_with_sources,
+    write_project_tree_cached_with_sources_and_media_registry,
+    write_project_tree_cached_with_sources_checked,
+    write_project_tree_cached_with_sources_checked_and_media_registry,
+    write_project_tree_with_media_registry,
+};
 
 #[cfg(test)]
 mod tests {
@@ -1030,9 +1039,11 @@ mod tests {
             "the dir removal itself failed"
         );
 
-        // With the obstacle gone, the next save finishes the prune.
+        // Once the generated files are gone, an empty directory has no
+        // ownership marker. Keep it rather than deleting an indistinguishable
+        // user-created empty directory on a later save.
         write_project_tree(dir.path(), &f.doc, &assets).unwrap();
-        assert!(!dir.path().join("pages/page-2").exists());
+        assert!(dir.path().join("pages/page-2").is_dir());
         let (reread, _) = read_project_tree(dir.path()).unwrap();
         assert_eq!(persisted(&reread), persisted(&f.doc));
     }
@@ -1486,12 +1497,15 @@ mod tests {
         assert!(report.written.is_empty(), "written: {:?}", report.written);
         assert_eq!(mtime(&png_path), png_mtime);
 
-        // Dropping an asset removes exactly its file, and its now-empty
-        // family directory.
+        // Dropping an asset updates the integrity index and removes its file
+        // and now-empty family directory.
         let (gone_id, gone_family, gone_ext) = expected[1];
         assets.remove(&gone_id);
         let report = write_project_tree(dir.path(), &f.doc, &assets).unwrap();
-        assert!(report.written.is_empty(), "written: {:?}", report.written);
+        assert_eq!(
+            report.written,
+            vec![std::path::PathBuf::from("assets/index.json")]
+        );
         assert_eq!(
             rel_strings(&report.removed),
             BTreeSet::from([format!("assets/{gone_family}/{gone_id}.{gone_ext}")])

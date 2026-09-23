@@ -774,8 +774,11 @@ pub(crate) fn replace_media(
     let mut added = Vec::new();
     let data = match (&node.data, video) {
         (NodeData::Bitmap(bitmap), None) => {
-            let (asset, natural_size) = document.doc_and_assets().1.add_image(bytes)?;
-            added.push(asset);
+            let (asset, natural_size, inserted) =
+                document.doc_and_assets().1.add_image_tracked(bytes)?;
+            if inserted {
+                added.push(asset);
+            }
             let mut bitmap = bitmap.clone();
             bitmap.asset = asset;
             bitmap.natural_size = natural_size;
@@ -783,16 +786,30 @@ pub(crate) fn replace_media(
             NodeData::Bitmap(bitmap)
         }
         (NodeData::Video(old), Some(video)) => {
+            let asset = video.asset;
+            if let Some(existing) = document.raw_assets.get(&asset) {
+                ensure!(
+                    existing.as_slice() == video.bytes.as_ref(),
+                    "Video asset {asset} has a content hash collision"
+                );
+            }
             let poster = if let Some(poster) = &video.poster {
-                let (asset, _) = document.doc_and_assets().1.add_image(poster.png.to_vec())?;
-                added.push(asset);
+                let (asset, _, inserted) = document
+                    .doc_and_assets()
+                    .1
+                    .add_image_tracked(poster.png.to_vec())?;
+                if inserted {
+                    added.push(asset);
+                }
                 Some(asset)
             } else {
                 None
             };
-            let asset = fanta_doc::AssetId::new();
-            std::sync::Arc::make_mut(&mut document.raw_assets).insert(asset, video.bytes.to_vec());
-            added.push(asset);
+            if !document.raw_assets.contains_key(&asset) {
+                std::sync::Arc::make_mut(&mut document.raw_assets)
+                    .insert(asset, video.bytes.to_vec());
+                added.push(asset);
+            }
             let mut value = old.clone();
             value.asset = asset;
             value.natural_size = [video.metadata.width, video.metadata.height];

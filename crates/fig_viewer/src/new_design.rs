@@ -127,8 +127,21 @@ fn create_project(root: &Path) -> Result<()> {
         }
     }
 
+    let parent = root
+        .parent()
+        .context("The new design folder needs a parent directory")?;
+    let staging = tempfile::Builder::new()
+        .prefix(".fanta-new-design-")
+        .tempdir_in(parent)
+        .with_context(|| format!("staging the new design near {}", root.display()))?;
     let doc = new_document(root)?;
-    crate::document::write_project(root, &doc, &BTreeMap::new())
+    crate::document::write_project(staging.path(), &doc, &BTreeMap::new())?;
+    if root.exists() {
+        std::fs::remove_dir(root)
+            .with_context(|| format!("publishing the new design at {}", root.display()))?;
+    }
+    std::fs::rename(staging.path(), root)
+        .with_context(|| format!("publishing the new design at {}", root.display()))
 }
 
 /// A document with exactly one empty page.

@@ -16,6 +16,8 @@ step: read the files here, or on GitHub.
 - [`alpha/SOL_REVIEW_2026-09-12.md`](./alpha/SOL_REVIEW_2026-09-12.md) —
   review findings, reproduced failures, completed Sol work, and remaining gaps.
 - [`fanta/`](./fanta) — notes on the app itself, including
+  [`project-schema.md`](./fanta/project-schema.md) for the editable project tree and
+  [`code-first-audit.md`](./fanta/code-first-audit.md) for the architecture review, plus
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
   the record of which inherited Zed services are switched off and why.
 - [`live-mcp-v2.md`](./live-mcp-v2.md) and

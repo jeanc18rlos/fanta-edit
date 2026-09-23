@@ -24,14 +24,14 @@ use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, TaskExt, WeakEntity, Window, actions, px,
+    PathPromptOptions, Subscription, Task, TaskExt, WeakEntity, Window, actions, px,
 };
 
 use picker::{
     Picker, PickerDelegate, ScrollBehavior,
     highlighted_match_with_paths::{HighlightedMatch, HighlightedMatchWithPaths},
 };
-use project::{Worktree, git_store::Repository};
+use project::{DirectoryLister, Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
 pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
@@ -45,8 +45,8 @@ use ui::{
 use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, PathList,
-    RecentWorkspace, SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
-    notifications::DetachAndPromptErr, with_active_or_new_workspace,
+    RecentWorkspace, RecentWorkspaceStatus, SerializedWorkspaceLocation, Workspace, WorkspaceDb,
+    WorkspaceId, notifications::DetachAndPromptErr, with_active_or_new_workspace,
 };
 use zed_actions::{OpenRecent, OpenRemote};
 
@@ -757,7 +757,9 @@ impl RecentProjects {
                 picker.delegate.filtered_entries.get(ix)
             {
                 if let Some(workspace) = picker.delegate.workspaces.get(hit.candidate_id) {
-                    if matches!(workspace.location, SerializedWorkspaceLocation::Local) {
+                    if matches!(workspace.location, SerializedWorkspaceLocation::Local)
+                        && workspace.status == RecentWorkspaceStatus::Available
+                    {
                         let paths_to_add = workspace.paths.paths().to_vec();
                         picker
                             .delegate
@@ -1444,6 +1446,23 @@ impl PickerDelegate for RecentProjectsDelegate {
                 let raw_paths = &workspace.paths;
                 let identity_paths = &workspace.identity_paths;
                 let is_local = matches!(location, SerializedWorkspaceLocation::Local);
+                let recovery_label = match &workspace.status {
+                    RecentWorkspaceStatus::Available => None,
+                    RecentWorkspaceStatus::Unavailable { .. } => {
+                        Some(if workspace.fanta_project_id.is_some() {
+                            "Folder missing · Locate"
+                        } else {
+                            "Folder missing · Open copy"
+                        })
+                    }
+                    RecentWorkspaceStatus::ProjectIdentityChanged { found, .. } => {
+                        Some(if found.is_some() {
+                            "Project identity changed"
+                        } else {
+                            "Project identity unavailable"
+                        })
+                    }
+                };
                 let paths_to_add = raw_paths.paths().to_vec();
                 let ordered_paths: Vec<_> = identity_paths
                     .ordered_paths()
@@ -1494,12 +1513,16 @@ impl PickerDelegate for RecentProjectsDelegate {
                 };
 
                 let focus_handle = self.focus_handle.clone();
-                let secondary_confirm_tooltip = if self.create_new_window {
+                let secondary_confirm_tooltip = if recovery_label.is_some() {
+                    "Locate Project Folder"
+                } else if self.create_new_window {
                     "Open Project in This Window"
                 } else {
                     "Open Project in New Window"
                 };
-                let primary_confirm_tooltip = if self.create_new_window {
+                let primary_confirm_tooltip = if recovery_label.is_some() {
+                    "Locate Project Folder"
+                } else if self.create_new_window {
                     "Open Project in New Window"
                 } else {
                     "Open Project in This Window"
@@ -1512,7 +1535,7 @@ impl PickerDelegate for RecentProjectsDelegate {
 
                 let secondary_actions = h_flex()
                     .gap_px()
-                    .when(is_local, |this| {
+                    .when(is_local && recovery_label.is_none(), |this| {
                         this.child(
                             IconButton::new("add_to_workspace", IconName::FolderInclude)
                                 .icon_size(IconSize::Small)
@@ -1602,8 +1625,14 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 .min_w_0()
                                 .gap_2p5()
                                 .flex_grow_1()
-                                .when(show_icon, |this| {
-                                    this.child(Icon::new(icon).color(Color::Muted))
+                                .when(show_icon || recovery_label.is_some(), |this| {
+                                    if recovery_label.is_some() {
+                                        this.child(
+                                            Icon::new(IconName::Warning).color(Color::Warning),
+                                        )
+                                    } else {
+                                        this.child(Icon::new(icon).color(Color::Muted))
+                                    }
                                 })
                                 .child({
                                     let mut highlighted = highlighted_match;
@@ -1611,6 +1640,13 @@ impl PickerDelegate for RecentProjectsDelegate {
                                         highlighted.paths.clear();
                                     }
                                     highlighted.render(window, cx)
+                                })
+                                .when_some(recovery_label, |this, label| {
+                                    this.child(
+                                        Label::new(label)
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Warning),
+                                    )
                                 })
                                 .tooltip(move |_, cx| {
                                     Tooltip::with_meta(
@@ -2116,6 +2152,8 @@ impl RecentProjectsDelegate {
         let candidate_workspace_id = candidate_workspace.workspace_id;
         let candidate_workspace_location = candidate_workspace.location.clone();
         let candidate_workspace_paths = candidate_workspace.paths.clone();
+        let candidate_workspace_status = candidate_workspace.status.clone();
+        let has_fanta_project_id = candidate_workspace.fanta_project_id.is_some();
 
         workspace.update(cx, |workspace, cx| {
             if workspace.database_id() == Some(candidate_workspace_id) {
@@ -2123,6 +2161,110 @@ impl RecentProjectsDelegate {
             }
             match candidate_workspace_location {
                 SerializedWorkspaceLocation::Local => {
+                    if candidate_workspace_status != RecentWorkspaceStatus::Available {
+                        let fs = workspace.app_state().fs.clone();
+                        let paths = workspace.prompt_for_open_path(
+                            PathPromptOptions {
+                                files: false,
+                                directories: true,
+                                multiple: false,
+                                prompt: None,
+                            },
+                            DirectoryLister::Local(workspace.project().clone(), fs.clone()),
+                            window,
+                            cx,
+                        );
+                        let db = WorkspaceDb::global(cx);
+                        let multi_workspace = window.window_handle().downcast::<MultiWorkspace>();
+                        cx.spawn_in(window, async move |workspace, cx| {
+                            let paths = match paths.await {
+                                Ok(Some(paths)) => paths,
+                                Ok(None) => return,
+                                Err(error) => {
+                                    log::debug!(
+                                        "project location prompt closed before completion: {error}"
+                                    );
+                                    return;
+                                }
+                            };
+                            let Some(path) = paths.into_iter().next() else {
+                                return;
+                            };
+                            if has_fanta_project_id {
+                                if let Err(error) = db
+                                    .relink_fanta_project(
+                                        candidate_workspace_id,
+                                        &path,
+                                        fs.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    workspace
+                                        .update(cx, |workspace, cx| {
+                                            workspace.show_error(
+                                                format!("Could not locate project: {error:#}"),
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                    return;
+                                }
+                            }
+                            if replace_current_window {
+                                if let Some(multi_workspace) = multi_workspace {
+                                    if let Some(task) = multi_workspace
+                                        .update(cx, |multi_workspace, window, cx| {
+                                            multi_workspace.open_project(
+                                                vec![path],
+                                                OpenMode::Activate,
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .log_err()
+                                    {
+                                        if let Err(error) = task.await {
+                                            workspace
+                                                .update(cx, |workspace, cx| {
+                                                    workspace.show_error(
+                                                        format!(
+                                                            "Could not open project: {error:#}"
+                                                        ),
+                                                        cx,
+                                                    )
+                                                })
+                                                .log_err();
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                            if let Some(task) = workspace
+                                .update_in(cx, |workspace, window, cx| {
+                                    workspace.open_workspace_for_paths(
+                                        OpenMode::NewWindow,
+                                        vec![path],
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .log_err()
+                            {
+                                if let Err(error) = task.await {
+                                    workspace
+                                        .update(cx, |workspace, cx| {
+                                            workspace.show_error(
+                                                format!("Could not open project: {error:#}"),
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                }
+                            }
+                        })
+                        .detach();
+                        return;
+                    }
                     let paths = candidate_workspace_paths.paths().to_vec();
                     if replace_current_window {
                         if let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() {
@@ -2474,6 +2616,8 @@ mod tests {
             location: SerializedWorkspaceLocation::Local,
             paths: paths.clone(),
             identity_paths: paths,
+            status: RecentWorkspaceStatus::Available,
+            fanta_project_id: None,
             timestamp: Utc::now(),
         }
     }
