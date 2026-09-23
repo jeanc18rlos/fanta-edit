@@ -71,7 +71,10 @@ pub fn import_fant_snapshot(fant_path: &Path, dest_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::asset_id_for_bytes;
-    use fanta_doc::{AssetId, CanvasNode, Doc, GroupNode, NodeData, NodeId, Viewport};
+    use fanta_doc::{
+        AssetId, BlendMode, CanvasNode, Color, Doc, Fill, GroupNode, ImageAdjust, ImageFitMode,
+        NodeData, NodeId, VectorNode, VideoFill, Viewport,
+    };
     use serde_json::Value;
     use std::fs;
     use tempfile::tempdir;
@@ -214,6 +217,64 @@ mod tests {
         import_fant_snapshot(&fant_path, &dest_dir).unwrap();
         let (_, assets2) = read_project_tree(&dest_dir).unwrap();
         assert_eq!(assets2.get(&foreign_id), Some(&bytes));
+    }
+
+    #[test]
+    fn video_fill_and_both_media_assets_survive_project_and_snapshot_round_trip()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let source = AssetId::new();
+        let poster = AssetId::new();
+        let mut doc = Doc::new();
+        let page = insert_group(&mut doc, None, "Page");
+        doc.add_page(page);
+        let fill = Fill::Video {
+            video: Box::new(VideoFill {
+                asset: source,
+                poster: Some(poster),
+                mode: ImageFitMode::Fit,
+                crop: Some(Box::new([0.1, 0.2, 0.7, 0.6])),
+                scale: None,
+                rotation: Some(90.0),
+                adjust: ImageAdjust {
+                    saturation: -0.3,
+                    ..Default::default()
+                },
+            }),
+            opacity: 0.65,
+            blend: BlendMode::Screen,
+        };
+        let mut vector = VectorNode::rect_solid(0.0, 0.0, 64.0, 48.0, Color::BLACK);
+        vector.fills.clear();
+        vector.fills.push(fill.clone());
+        let mut node = CanvasNode::new(NodeData::Vector(vector));
+        node.parent = Some(page);
+        let node_id = node.id;
+        doc.scene.insert(node)?;
+
+        let assets = BTreeMap::from([
+            (source, b"\0\0\0\x18ftypisomvideo source".to_vec()),
+            (poster, b"\x89PNG\r\n\x1a\nposter image".to_vec()),
+        ]);
+        let project = tempdir()?;
+        write_project_tree(project.path(), &doc, &assets)?;
+        let snapshot_dir = tempdir()?;
+        let snapshot_path = snapshot_dir.path().join("video-fill.fant");
+        export_fant_snapshot(project.path(), &snapshot_path)?;
+        let restored_dir = tempdir()?;
+        let restored_path = restored_dir.path().join("restored");
+        import_fant_snapshot(&snapshot_path, &restored_path)?;
+        let (restored, restored_assets) = read_project_tree(&restored_path)?;
+
+        let restored_fill = restored
+            .scene
+            .get(node_id)
+            .and_then(|node| match &node.data {
+                NodeData::Vector(vector) => vector.fills.first(),
+                _ => None,
+            });
+        assert_eq!(restored_fill, Some(&fill));
+        assert_eq!(restored_assets, assets);
+        Ok(())
     }
 
     #[test]

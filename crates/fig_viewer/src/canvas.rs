@@ -11,6 +11,8 @@
 //! waits for a raster, however heavy the page.
 
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
@@ -39,7 +41,7 @@ use core_video::{
 use fanta_canvas::ResizeHandle;
 #[cfg(target_os = "macos")]
 use fanta_doc::scene::SceneDelta;
-use fanta_doc::{Action, AnimationClipId, MotionEvaluation, NodeId, Viewport};
+use fanta_doc::{Action, AnimationClipId, AssetId, MotionEvaluation, NodeId, Viewport};
 #[cfg(target_os = "macos")]
 use fanta_doc::{
     CanvasNode, ComponentLibrary, ModeId, Scene, Transform2D, VariableCollectionId,
@@ -122,6 +124,10 @@ pub(crate) struct RenderedCanvas {
     video_frame: Option<VideoFrameKey>,
     #[cfg(target_os = "macos")]
     video_image: Option<skia_safe::Image>,
+    #[cfg(target_os = "macos")]
+    video_fill_frame: Option<u64>,
+    #[cfg(target_os = "macos")]
+    video_fill_images: HashMap<AssetId, (VideoFillFrameKey, skia_safe::Image)>,
 }
 
 #[cfg(target_os = "macos")]
@@ -132,6 +138,55 @@ pub(crate) struct CanvasVideoFrame {
     pub progress: f32,
     pub session_revision: u64,
     pub revision: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct CanvasVideoFillFrame {
+    pub asset: AssetId,
+    pub buffer: CVPixelBuffer,
+    pub session_revision: u64,
+    pub revision: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct VideoFillFrameKey {
+    asset: AssetId,
+    session_revision: u64,
+    revision: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl From<&CanvasVideoFillFrame> for VideoFillFrameKey {
+    fn from(frame: &CanvasVideoFillFrame) -> Self {
+        Self {
+            asset: frame.asset,
+            session_revision: frame.session_revision,
+            revision: frame.revision,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn video_fill_frame_fingerprint(frames: &[CanvasVideoFillFrame]) -> Option<u64> {
+    let keys = frames
+        .iter()
+        .map(VideoFillFrameKey::from)
+        .collect::<Vec<_>>();
+    video_fill_key_fingerprint(&keys)
+}
+
+#[cfg(target_os = "macos")]
+fn video_fill_key_fingerprint(keys: &[VideoFillFrameKey]) -> Option<u64> {
+    if keys.is_empty() {
+        return None;
+    }
+    let mut keys = keys.to_vec();
+    keys.sort_unstable_by_key(|key| key.asset);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    keys.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 #[cfg(target_os = "macos")]
@@ -245,6 +300,7 @@ struct SurfaceKey {
     epoch: u64,
     motion_frame: Option<MotionFrameKey>,
     video_frame: Option<VideoFrameKey>,
+    video_fill_frame: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -259,6 +315,7 @@ impl SurfaceKey {
             && self.epoch == other.epoch
             && self.motion_frame == other.motion_frame
             && self.video_frame == other.video_frame
+            && self.video_fill_frame == other.video_fill_frame
     }
 
     /// Whether two keys show the same page of the same scene instance — the
@@ -897,6 +954,23 @@ struct RenderVideoFrame {
 }
 
 #[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct RenderVideoFillFrame {
+    asset: AssetId,
+    buffer: SendBuffer,
+}
+
+#[cfg(target_os = "macos")]
+impl From<CanvasVideoFillFrame> for RenderVideoFillFrame {
+    fn from(frame: CanvasVideoFillFrame) -> Self {
+        Self {
+            asset: frame.asset,
+            buffer: SendBuffer(frame.buffer),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl From<CanvasVideoFrame> for RenderVideoFrame {
     fn from(frame: CanvasVideoFrame) -> Self {
         Self {
@@ -936,6 +1010,7 @@ struct RenderRequest {
     scale_factor: f32,
     motion: Option<MotionEvaluation>,
     video: Option<RenderVideoFrame>,
+    video_fills: Vec<RenderVideoFillFrame>,
     /// `RenderInputs::mode_generation` for this frame: the variables/modes
     /// half of the document's [`InputsFingerprint`].
     mode_generation: u64,
@@ -1208,8 +1283,7 @@ impl MacGpuRenderer {
         create_bgra_pixel_buffer(size.0, size.1)
     }
 
-    fn import_video_frame(&mut self, frame: &RenderVideoFrame) -> Result<ImportedVideoFrame> {
-        let buffer = &frame.buffer.0;
+    fn import_video_frame(&mut self, buffer: &CVPixelBuffer) -> Result<ImportedVideoFrame> {
         let (width, height) = video_buffer_dimensions(buffer)?;
         let texture = self
             .texture_cache
@@ -1270,8 +1344,20 @@ impl MacGpuRenderer {
         let video_image = request
             .video
             .as_ref()
-            .map(|frame| self.import_video_frame(frame))
+            .map(|frame| self.import_video_frame(&frame.buffer.0))
             .transpose()?;
+        let video_fill_images = request
+            .video_fills
+            .iter()
+            .map(|frame| {
+                self.import_video_frame(&frame.buffer.0)
+                    .map(|image| (frame.asset, image))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let video_fill_frames = video_fill_images
+            .iter()
+            .map(|(asset, imported)| (*asset, imported.image.clone()))
+            .collect::<HashMap<_, _>>();
         let playback = request
             .video
             .as_ref()
@@ -1329,6 +1415,7 @@ impl MacGpuRenderer {
             mode_generation: request.mode_generation,
             motion: request.motion.as_ref(),
             playback: playback.as_ref(),
+            video_fill_frames: Some(&video_fill_frames),
             dark_ui: false,
         };
         let render_started = Instant::now();
@@ -1702,6 +1789,7 @@ impl GpuCanvas {
         scale_factor: f32,
         motion: Option<MotionEvaluation>,
         video: Option<CanvasVideoFrame>,
+        video_fills: Vec<CanvasVideoFillFrame>,
     ) -> Result<(Option<GpuFrame>, bool)> {
         self.pump_replies();
         if let Some(reason) = &self.failed {
@@ -1720,6 +1808,7 @@ impl GpuCanvas {
             epoch: self.epoch,
             motion_frame: motion.as_ref().map(MotionFrameKey::from),
             video_frame: video.as_ref().map(VideoFrameKey::from),
+            video_fill_frame: video_fill_frame_fingerprint(&video_fills),
         };
         let within_render_interval = self
             .last_render_at
@@ -1743,6 +1832,10 @@ impl GpuCanvas {
                     scale_factor,
                     motion,
                     video: video.map(RenderVideoFrame::from),
+                    video_fills: video_fills
+                        .into_iter()
+                        .map(RenderVideoFillFrame::from)
+                        .collect(),
                     mode_generation: self.inputs_fingerprint(document).variables,
                 };
                 self.render_blocking(LiveInputs::of(document), request)?;
@@ -1755,6 +1848,10 @@ impl GpuCanvas {
                     scale_factor,
                     motion,
                     video: video.map(RenderVideoFrame::from),
+                    video_fills: video_fills
+                        .into_iter()
+                        .map(RenderVideoFillFrame::from)
+                        .collect(),
                     mode_generation: fingerprint.variables,
                 };
                 let source = self.snapshot_source(document, stamp, fingerprint);
@@ -1931,6 +2028,7 @@ fn render_fig_canvas(
     scale_factor: f32,
     motion: Option<&MotionEvaluation>,
     playback: Option<&HashMap<NodeId, MediaPlayback>>,
+    video_fill_frames: Option<&HashMap<AssetId, skia_safe::Image>>,
 ) -> Result<Arc<RenderImage>> {
     let mut renderer =
         RasterRenderer::new(width, height).context("creating Skia raster surface")?;
@@ -1951,6 +2049,7 @@ fn render_fig_canvas(
         mode_generation: InputsFingerprint::of(&document.doc).variables,
         motion,
         playback,
+        video_fill_frames,
         dark_ui: false,
     };
     renderer.render_page_with(&document.doc.scene, &render_viewport, page_root, &inputs);
@@ -1983,24 +2082,35 @@ impl FigView {
         scale_factor: f32,
         motion: Option<&MotionEvaluation>,
         #[cfg(target_os = "macos")] video: Option<&CanvasVideoFrame>,
+        #[cfg(target_os = "macos")] video_fills: &[CanvasVideoFillFrame],
     ) -> Result<Arc<RenderImage>> {
         let revision = document.render_generation();
         let motion_frame = motion.map(MotionFrameKey::from);
         #[cfg(target_os = "macos")]
         let video_frame = video.map(VideoFrameKey::from);
         #[cfg(target_os = "macos")]
+        let video_fill_frame = video_fill_frame_fingerprint(video_fills);
+        #[cfg(target_os = "macos")]
         let video_matches = self
             .rendered_canvas
             .as_ref()
             .is_some_and(|rendered| rendered.video_frame == video_frame);
+        #[cfg(target_os = "macos")]
+        let video_fill_matches = self
+            .rendered_canvas
+            .as_ref()
+            .is_some_and(|rendered| rendered.video_fill_frame == video_fill_frame);
         #[cfg(not(target_os = "macos"))]
         let video_matches = true;
+        #[cfg(not(target_os = "macos"))]
+        let video_fill_matches = true;
         if let Some(rendered) = &self.rendered_canvas
             && rendered.size == size
             && rendered.page_root == page_root
             && rendered.revision == revision
             && rendered.motion_frame == motion_frame
             && video_matches
+            && video_fill_matches
             && same_viewport(rendered.viewport, viewport)
         {
             return Ok(rendered.image.clone());
@@ -2033,6 +2143,27 @@ impl FigView {
         });
         #[cfg(not(target_os = "macos"))]
         let playback = None;
+        #[cfg(target_os = "macos")]
+        let video_fill_images = video_fills
+            .iter()
+            .map(|frame| {
+                let key = VideoFillFrameKey::from(frame);
+                let image = self
+                    .rendered_canvas
+                    .as_ref()
+                    .and_then(|rendered| rendered.video_fill_images.get(&frame.asset))
+                    .filter(|(cached_key, _)| *cached_key == key)
+                    .map(|(_, image)| image.clone())
+                    .map(Ok)
+                    .unwrap_or_else(|| copy_video_frame(&frame.buffer))?;
+                Ok((frame.asset, (key, image)))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        #[cfg(target_os = "macos")]
+        let video_fill_frames = video_fill_images
+            .iter()
+            .map(|(asset, (_, image))| (*asset, image.clone()))
+            .collect::<HashMap<_, _>>();
 
         let image = render_fig_canvas(
             document,
@@ -2043,6 +2174,10 @@ impl FigView {
             scale_factor,
             motion,
             playback.as_ref(),
+            #[cfg(target_os = "macos")]
+            Some(&video_fill_frames),
+            #[cfg(not(target_os = "macos"))]
+            None,
         )?;
         self.rendered_canvas = Some(RenderedCanvas {
             image: image.clone(),
@@ -2055,6 +2190,10 @@ impl FigView {
             video_frame,
             #[cfg(target_os = "macos")]
             video_image,
+            #[cfg(target_os = "macos")]
+            video_fill_frame,
+            #[cfg(target_os = "macos")]
+            video_fill_images,
         });
         Ok(image)
     }
@@ -2267,6 +2406,8 @@ impl Element for CanvasElement {
         let paint_canvas = self.view.update(cx, |this, cx| {
             #[cfg(target_os = "macos")]
             let video = this.canvas_video_frame(cx);
+            #[cfg(target_os = "macos")]
+            let video_fills = this.canvas_video_fill_frames(cx);
             let viewport = this
                 .viewport()
                 .ok_or_else(|| anyhow!("Figma canvas viewport was not initialized"))?;
@@ -2309,6 +2450,7 @@ impl Element for CanvasElement {
                     scale_factor,
                     motion.clone(),
                     video.clone(),
+                    video_fills.clone(),
                 ) {
                     Ok((frame, repaint)) => {
                         this.clear_rendered_canvas();
@@ -2331,6 +2473,8 @@ impl Element for CanvasElement {
                 motion.as_ref(),
                 #[cfg(target_os = "macos")]
                 video.as_ref(),
+                #[cfg(target_os = "macos")]
+                &video_fills,
             )
             .map(|image| (PaintCanvas::Image(image), false))
         });
@@ -4155,6 +4299,7 @@ mod tests {
             epoch: 0,
             motion_frame: None,
             video_frame: None,
+            video_fill_frame: None,
         }
     }
 
@@ -4209,16 +4354,15 @@ mod tests {
         let node_id = scene.insert(rect(0., 0.)).expect("scene node");
         let worker = worker(&scene, 7);
         let before = serde_json::to_value(&scene).expect("scene before playback");
-        let frame = CanvasVideoFrame {
+        let frame = VideoFrameKey {
             node_id,
-            buffer: create_bgra_pixel_buffer(2, 2).expect("video buffer"),
-            progress: 0.25,
             session_revision: 3,
             revision: 10,
+            progress_bits: 0.25_f32.to_bits(),
         };
         let mut cached = surface_key([0., 0.], 1., 7);
         cached.scene = (scene.instance_id(), scene.revision());
-        cached.video_frame = Some(VideoFrameKey::from(&frame));
+        cached.video_frame = Some(frame);
         assert_eq!(
             frame_decision(&cached, &cached, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::ReuseCached
@@ -4227,7 +4371,7 @@ mod tests {
         let mut next_pixels = frame.clone();
         next_pixels.revision += 1;
         let mut next_progress = frame.clone();
-        next_progress.progress = 0.5;
+        next_progress.progress_bits = 0.5_f32.to_bits();
         let mut replacement_session = frame.clone();
         replacement_session.session_revision += 1;
         let mut other_node = frame.clone();
@@ -4240,7 +4384,7 @@ mod tests {
             None,
         ] {
             let mut requested = cached;
-            requested.video_frame = next.as_ref().map(VideoFrameKey::from);
+            requested.video_frame = next;
             assert_eq!(
                 frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
                 FrameDecision::RenderFresh,
@@ -4270,6 +4414,42 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&scene).expect("scene after playback"),
             before
+        );
+    }
+
+    #[test]
+    fn independent_video_fill_revisions_invalidate_the_surface_key() {
+        let asset_a = AssetId::from_u128(10);
+        let asset_b = AssetId::from_u128(20);
+        let first = VideoFillFrameKey {
+            asset: asset_a,
+            session_revision: 1,
+            revision: 5,
+        };
+        let second = VideoFillFrameKey {
+            asset: asset_b,
+            session_revision: 2,
+            revision: 9,
+        };
+        let mut cached = surface_key([0.0, 0.0], 1.0, 7);
+        cached.video_fill_frame = video_fill_key_fingerprint(&[first, second]);
+        assert_eq!(
+            cached.video_fill_frame,
+            video_fill_key_fingerprint(&[second, first]),
+            "frame ordering must not cause a redundant render"
+        );
+        let mut changed = second;
+        changed.revision += 1;
+        let mut requested = cached;
+        requested.video_fill_frame = video_fill_key_fingerprint(&[first, changed]);
+        assert_eq!(
+            frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+            FrameDecision::RenderFresh
+        );
+        assert_eq!(
+            video_fill_key_fingerprint(&[]),
+            None,
+            "inactive fills fall back to their posters"
         );
     }
 

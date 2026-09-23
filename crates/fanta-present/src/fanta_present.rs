@@ -1169,6 +1169,7 @@ impl PresentSession {
                     mode_generation: self.mode_generation,
                     motion: motion.as_ref(),
                     playback: None,
+                    video_fill_frames: None,
                     dark_ui: false,
                 };
                 self.renderer
@@ -1209,6 +1210,7 @@ impl PresentSession {
             mode_generation: self.mode_generation,
             motion: motion.as_ref(),
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         };
         if let Some(patched) = self.build_runtime_scene(frame) {
@@ -1258,6 +1260,7 @@ impl PresentSession {
             mode_generation: self.mode_generation,
             motion: motion.as_ref(),
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         };
         self.renderer
@@ -1282,6 +1285,7 @@ impl PresentSession {
             mode_generation: self.mode_generation,
             motion: motion.as_ref(),
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         };
         self.renderer
@@ -1303,6 +1307,7 @@ impl PresentSession {
             mode_generation: self.mode_generation,
             motion: motion.as_ref(),
             playback: Some(&playback),
+            video_fill_frames: None,
             dark_ui: false,
         };
         if let Some(patched) = self.build_runtime_scene(self.current) {

@@ -514,3 +514,91 @@ fn bitmap_wand_pixel_region_crops_with_a_disconnected_mask_and_undo() {
         None
     );
 }
+
+#[test]
+fn invert_draw_region_complements_vector_and_image_bounds_without_selecting_designs() {
+    let mut doc = Doc::new();
+    let vector_id = rect_at(&mut doc, -100.0, -100.0, 200.0, 200.0);
+    let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+        asset: fanta_doc::AssetId::new(),
+        natural_size: [80, 40],
+        local_size: [80.0, 40.0],
+        crop: None,
+        fit: fanta_doc::ImageFitMode::Stretch,
+        tint: None,
+    }));
+    bitmap.transform = Transform2D::translation(250.0, 20.0);
+    let bitmap_id = bitmap.id;
+    doc.apply(Operation::create_node(bitmap))
+        .expect("create bitmap");
+    let design = CanvasNode::new(NodeData::Group(GroupNode {
+        local_size: Some([500.0, 500.0]),
+        ..GroupNode::default()
+    }));
+    let design_id = design.id;
+    doc.apply(Operation::create_node(design))
+        .expect("create design");
+    let original = DrawSelectionShape::Ellipse(Bounds::from_xywh(-40.0, -40.0, 80.0, 80.0));
+    let region = DrawSelectionRegion {
+        shape: original.clone(),
+        targets: vec![vector_id, bitmap_id, design_id],
+    };
+
+    let inverted = region.inverted(&doc.scene).expect("drawable targets");
+    assert_eq!(inverted.targets, vec![vector_id, bitmap_id]);
+    let expected_bounds = doc
+        .scene
+        .world_bounds(vector_id)
+        .expect("vector bounds")
+        .union(&doc.scene.world_bounds(bitmap_id).expect("bitmap bounds"));
+    assert!(matches!(
+        &inverted.shape,
+        DrawSelectionShape::Combined {
+            operation: DrawShapeOperation::Subtract,
+            first,
+            second,
+        } if **first == DrawSelectionShape::Rectangle(expected_bounds) && **second == original
+    ));
+    assert_eq!(
+        inverted.inverted(&doc.scene).expect("invert twice").shape,
+        original
+    );
+}
+
+#[test]
+fn inverted_draw_region_crops_vector_with_complement_mask_and_undoes() {
+    let mut doc = Doc::new();
+    let vector_id = rect_at(&mut doc, -100.0, -100.0, 200.0, 200.0);
+    doc.selection.select_only(vector_id);
+    let region = DrawSelectionRegion {
+        shape: DrawSelectionShape::Rectangle(Bounds::from_xywh(-50.0, -50.0, 100.0, 100.0)),
+        targets: vec![vector_id],
+    };
+    let mut viewport = Viewport::default();
+    let mut context = context(&mut doc, &mut viewport);
+    context.draw_selection_region = region.inverted(&context.doc.scene);
+    let mut crop = CropTool::new();
+    crop.handle_event(
+        &mut context,
+        ToolEvent::Key(KeyEvent::press(LogicalKey::Enter)),
+    );
+
+    let crop_id = context.doc.selection.as_slice()[0];
+    let crop_group = context.doc.scene.get(crop_id).expect("crop group");
+    assert!(matches!(
+        &crop_group.data,
+        NodeData::Group(group) if group.clip_size == Some([200.0, 200.0])
+    ));
+    let mask_id = context.doc.scene.children_of(Some(crop_id))[0];
+    let mask = context.doc.scene.get(mask_id).expect("mask");
+    assert!(matches!(
+        &mask.data,
+        NodeData::Boolean(boolean) if boolean.op == fanta_doc::BooleanOp::Subtract
+    ));
+    assert_eq!(context.doc.scene.children_of(Some(mask_id)).len(), 2);
+    context.doc.undo().expect("undo crop");
+    assert_eq!(
+        context.doc.scene.get(vector_id).expect("vector").parent,
+        None
+    );
+}

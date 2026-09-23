@@ -15,6 +15,53 @@ pub struct DrawSelectionRegion {
     pub targets: Vec<NodeId>,
 }
 
+impl DrawSelectionRegion {
+    pub fn inverted(&self, scene: &Scene) -> Option<Self> {
+        let mut targets = Vec::new();
+        let mut content_bounds: Option<Bounds> = None;
+        for id in &self.targets {
+            let Some(node) = scene.get(*id) else {
+                continue;
+            };
+            if !matches!(
+                &node.data,
+                NodeData::Vector(_) | NodeData::Bitmap(_) | NodeData::Boolean(_)
+            ) {
+                continue;
+            }
+            let Some(bounds) = scene
+                .world_bounds(*id)
+                .filter(|bounds| bounds.is_finite() && bounds.width() > 0. && bounds.height() > 0.)
+            else {
+                continue;
+            };
+            content_bounds = Some(
+                content_bounds
+                    .map(|current| current.union(&bounds))
+                    .unwrap_or(bounds),
+            );
+            targets.push(*id);
+        }
+        let content_bounds = content_bounds?;
+        let full_content = DrawSelectionShape::Rectangle(content_bounds);
+        let shape = match &self.shape {
+            // Unwrap the exact complement so repeated inversions do not build
+            // arbitrarily deep Boolean masks.
+            DrawSelectionShape::Combined {
+                operation: DrawShapeOperation::Subtract,
+                first,
+                second,
+            } if **first == full_content => (**second).clone(),
+            shape => DrawSelectionShape::Combined {
+                operation: DrawShapeOperation::Subtract,
+                first: Box::new(full_content),
+                second: Box::new(shape.clone()),
+            },
+        };
+        Some(Self { shape, targets })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DrawSelectionShape {
     Rectangle(Bounds),

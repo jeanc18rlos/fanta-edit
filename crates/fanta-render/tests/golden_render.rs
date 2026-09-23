@@ -245,6 +245,7 @@ fn render_scene() -> Vec<u8> {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
     // Frame the 300x180 page (origin top-left) in the 320x200 surface with a

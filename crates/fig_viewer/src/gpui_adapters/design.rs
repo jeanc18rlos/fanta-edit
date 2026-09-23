@@ -1,12 +1,13 @@
 //! Connects the document model to the Design inspector read model and actions.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 
 use fanta_doc::{
-    BlendMode, Blur, BlurKind, BooleanOp, BoundProp, Color as FantaColor, ComponentId,
+    AssetId, BlendMode, Blur, BlurKind, BooleanOp, BoundProp, Color as FantaColor, ComponentId,
     ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode,
     MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, PatternFill,
     PatternHorizontalAlignment, PatternSpacing, PatternTileType, PrimaryAlign, Shadow, ShadowKind,
@@ -19,27 +20,31 @@ use fanta_gpui::design::{
     DesignComponentProperty, DesignComponentPropertyValue, DesignComponentReference,
     DesignComponentRole, DesignCornerCapabilities, DesignCounterAxisAlignContent, DesignEffect,
     DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings,
-    DesignEffectStyleViewData, DesignFontFamily, DesignFontSource, DesignFontStyle,
-    DesignFontViewData, DesignGradientStop, DesignImageFilters, DesignItemSpacingMode,
-    DesignLayout, DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning,
-    DesignLetterSpacing, DesignLineHeight, DesignMaskType, DesignMediaCropAction,
-    DesignMediaCropToolState, DesignMediaPaintCapabilities, DesignMediaPaintPlacement,
-    DesignMediaPaintView, DesignMediaPaintViewData, DesignMediaQuarterTurn, DesignPaint,
-    DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
-    DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel,
-    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
-    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
-    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
-    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
-    DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
+    DesignEffectStyleViewData, DesignEffectVector, DesignFontFamily, DesignFontSource,
+    DesignFontStyle, DesignFontViewData, DesignGradientStop, DesignImageFilters,
+    DesignItemSpacingMode, DesignLayout, DesignLayoutAlignSelf, DesignLayoutMode,
+    DesignLayoutPositioning, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
+    DesignMediaCropAction, DesignMediaCropToolState, DesignMediaPaintCapabilities,
+    DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
+    DesignMediaQuarterTurn, DesignPaint, DesignPaintKind, DesignPaintPayload, DesignPaintProperty,
+    DesignPaintSource, DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType,
+    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
+    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
+    DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind,
+    DesignPanelParentLayout, DesignPanelProperty, DesignPanelPropertyValueState,
+    DesignPanelSection, DesignPanelSelection, DesignPanelTarget, DesignPanelValue,
+    DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
     DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
     DesignSelectionHeaderControl, DesignSelectionHeaderControlKind, DesignSelectionHeaderMenu,
-    DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShapeGeometry,
-    DesignSizingMode, DesignStackingOrder, DesignStarGeometry, DesignStroke, DesignStrokeAlign,
-    DesignStrokeCap, DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeEditContext,
-    DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
-    DesignTextHorizontalAlignment, DesignTextResize, DesignTextVerticalAlignment,
-    DesignTransformOperation, DesignTypography,
+    DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShaderDefinition,
+    DesignShaderGradientStop, DesignShaderPaint, DesignShaderPropertyAssignment,
+    DesignShaderPropertyDefinition, DesignShaderPropertyKind, DesignShaderPropertyValue,
+    DesignShaderViewData, DesignShapeGeometry, DesignSizingMode, DesignStackingOrder,
+    DesignStarGeometry, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
+    DesignStrokeDashes, DesignStrokeEditContext, DesignStrokeJoin, DesignStrokeWeightMode,
+    DesignStrokeWeights, DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
+    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
+    DesignVideoPreviewAction, DesignVideoPreviewState,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, TaskExt as _, Window};
 
@@ -68,6 +73,29 @@ pub(crate) fn design_enabled() -> bool {
         std::env::var("FANTA_GPUI_DESIGN").as_deref(),
         Ok("0") | Ok("false") | Ok("off")
     )
+}
+
+fn supported_paint_types(text_selection: bool) -> &'static [DesignPaintType] {
+    if text_selection {
+        &[DesignPaintType::Solid]
+    } else if cfg!(target_os = "macos") {
+        &[
+            DesignPaintType::Solid,
+            DesignPaintType::Gradient,
+            DesignPaintType::Pattern,
+            DesignPaintType::Image,
+            DesignPaintType::Video,
+            DesignPaintType::Shader,
+        ]
+    } else {
+        &[
+            DesignPaintType::Solid,
+            DesignPaintType::Gradient,
+            DesignPaintType::Pattern,
+            DesignPaintType::Image,
+            DesignPaintType::Shader,
+        ]
+    }
 }
 
 /// Parses a panel node id back to the engine id; a failure means a stale row.
@@ -404,6 +432,38 @@ fn design_paint(
             }
             paint
         }
+        Some(Fill::Video { video, .. }) => {
+            let source_id = video.asset.to_string();
+            let mut source = DesignPaintSource::new(source_id.clone(), "Video");
+            source.reference = Some(source_id.into());
+            let mut paint = DesignPaint::video(source);
+            if let DesignPaintPayload::Video(payload) = &mut paint.payload {
+                payload.placement = design_media_placement(
+                    video.mode,
+                    video.crop.as_deref(),
+                    video.scale,
+                    video.rotation,
+                );
+                payload.filters = design_image_filters(&video.adjust);
+            }
+            let degrees = video.rotation.unwrap_or(0.0).rem_euclid(360.0);
+            let quarter_turn = [0.0_f32, 90.0, 180.0, 270.0]
+                .into_iter()
+                .any(|quarter| (degrees - quarter).abs() < 0.001);
+            if video.mode == ImageFitMode::Stretch && video.crop.is_none() || !quarter_turn {
+                paint.read_only = true;
+            }
+            paint
+        }
+        Some(Fill::Shader { shader, .. }) => DesignPaint::from_payload(DesignPaintPayload::Shader(
+            DesignShaderPaint::new(&shader.shader_id, &shader.name).with_properties(
+                shader.properties.iter().filter_map(|property| {
+                    design_shader_value(&property.value).map(|value| {
+                        DesignShaderPropertyAssignment::new(&property.definition_id, value)
+                    })
+                }),
+            ),
+        )),
         _ => match (&snapshot.kind, &snapshot.gradient) {
             (Some(EnginePaintKind::Solid), _) => {
                 design_solid_paint(snapshot.color.unwrap_or(FantaColor::BLACK))
@@ -429,7 +489,7 @@ fn design_paint(
                 paint
             }
             _ => {
-                // An image/video fill (or a gradient whose payload went missing):
+                // An unknown fill (or a gradient whose payload went missing):
                 // inspectable, never editable through this adapter yet.
                 let mut paint = DesignPaint::image(fanta_gpui::design::DesignPaintSource::new(
                     format!("{node_id}-{collection}-{index}-source"),
@@ -462,10 +522,221 @@ fn design_solid_paint(color: FantaColor) -> DesignPaint {
     paint
 }
 
+fn design_media_placement(
+    mode: ImageFitMode,
+    crop: Option<&[f32; 4]>,
+    scale: Option<f32>,
+    rotation: Option<f32>,
+) -> DesignMediaPaintPlacement {
+    let degrees = rotation.unwrap_or(0.0).rem_euclid(360.0);
+    let quarter_turn = match degrees {
+        degrees if (degrees - 90.0).abs() < 0.001 => DesignMediaQuarterTurn::Clockwise90,
+        degrees if (degrees - 180.0).abs() < 0.001 => DesignMediaQuarterTurn::Clockwise180,
+        degrees if (degrees - 270.0).abs() < 0.001 => DesignMediaQuarterTurn::Clockwise270,
+        _ => DesignMediaQuarterTurn::None,
+    };
+    if let Some(crop) = crop {
+        DesignMediaPaintPlacement::Crop {
+            transform: DesignPaintTransform {
+                m11: crop[2],
+                m12: 0.0,
+                m21: 0.0,
+                m22: crop[3],
+                tx: crop[0],
+                ty: crop[1],
+            },
+        }
+    } else {
+        match mode {
+            ImageFitMode::Fill | ImageFitMode::Stretch => DesignMediaPaintPlacement::Fill {
+                rotation: quarter_turn,
+            },
+            ImageFitMode::Fit => DesignMediaPaintPlacement::Fit {
+                rotation: quarter_turn,
+            },
+            ImageFitMode::Tile => DesignMediaPaintPlacement::Tile {
+                scaling_factor: scale.unwrap_or(1.0),
+                rotation: quarter_turn,
+            },
+        }
+    }
+}
+
+fn design_image_filters(adjust: &fanta_doc::ImageAdjust) -> DesignImageFilters {
+    DesignImageFilters {
+        exposure: adjust.exposure,
+        contrast: adjust.contrast,
+        saturation: adjust.saturation,
+        temperature: adjust.temperature,
+        tint: adjust.tint,
+        highlights: adjust.highlights,
+        shadows: adjust.shadows,
+    }
+}
+
+fn design_shader_value(
+    value: &fanta_doc::ShaderPropertyValue,
+) -> Option<DesignShaderPropertyValue> {
+    use fanta_doc::ShaderPropertyValue as Value;
+    Some(match value {
+        Value::Boolean(value) => DesignShaderPropertyValue::Boolean(*value),
+        Value::Text(value) => DesignShaderPropertyValue::Text(value.clone().into()),
+        Value::Number(value) if value.is_finite() => DesignShaderPropertyValue::Number(*value),
+        Value::Number(_) => return None,
+        Value::AssetId(value) => DesignShaderPropertyValue::AssetId(value.clone().into()),
+        Value::Color(value) => DesignShaderPropertyValue::Color(design_color(*value)),
+        Value::Point(value) => {
+            DesignShaderPropertyValue::Point(DesignEffectVector::new(value[0], value[1]))
+        }
+        Value::Line { start, end } => DesignShaderPropertyValue::Line {
+            start: DesignEffectVector::new(start[0], start[1]),
+            end: DesignEffectVector::new(end[0], end[1]),
+        },
+        Value::Circle { center, radius } => DesignShaderPropertyValue::Circle {
+            center: DesignEffectVector::new(center[0], center[1]),
+            radius: *radius,
+        },
+        Value::CirclePoint {
+            center,
+            radius,
+            angle,
+        } => DesignShaderPropertyValue::CirclePoint {
+            center: DesignEffectVector::new(center[0], center[1]),
+            radius: *radius,
+            angle: *angle,
+        },
+        Value::ColorPoint {
+            point,
+            color,
+            variable_id,
+        } => DesignShaderPropertyValue::ColorPoint {
+            point: DesignEffectVector::new(point[0], point[1]),
+            color: design_color(*color),
+            variable_id: variable_id.clone().map(Into::into),
+        },
+        Value::Gradient(stops) => DesignShaderPropertyValue::Gradient(
+            stops
+                .iter()
+                .map(|stop| DesignShaderGradientStop {
+                    position: stop.position,
+                    color: design_color(stop.color),
+                    variable_id: stop.variable_id.clone().map(Into::into),
+                })
+                .collect(),
+        ),
+        Value::VariableAlias { variable_id } => DesignShaderPropertyValue::VariableAlias {
+            variable_id: variable_id.clone().into(),
+        },
+        Value::Opaque { type_name, payload } => DesignShaderPropertyValue::Opaque {
+            type_name: type_name.clone().into(),
+            payload: payload.clone().into(),
+        },
+    })
+}
+
+fn engine_shader_value(
+    value: &DesignShaderPropertyValue,
+) -> Option<fanta_doc::ShaderPropertyValue> {
+    use fanta_doc::ShaderPropertyValue as Value;
+    Some(match value {
+        DesignShaderPropertyValue::Boolean(value) => Value::Boolean(*value),
+        DesignShaderPropertyValue::Text(value) => Value::Text(value.to_string()),
+        DesignShaderPropertyValue::Number(value) if value.is_finite() => Value::Number(*value),
+        DesignShaderPropertyValue::Number(_) => return None,
+        DesignShaderPropertyValue::AssetId(value) => Value::AssetId(value.to_string()),
+        DesignShaderPropertyValue::Color(value) => Value::Color(fanta_color(*value)),
+        DesignShaderPropertyValue::Point(value) => Value::Point([value.x, value.y]),
+        DesignShaderPropertyValue::Line { start, end } => Value::Line {
+            start: [start.x, start.y],
+            end: [end.x, end.y],
+        },
+        DesignShaderPropertyValue::Circle { center, radius } => Value::Circle {
+            center: [center.x, center.y],
+            radius: *radius,
+        },
+        DesignShaderPropertyValue::CirclePoint {
+            center,
+            radius,
+            angle,
+        } => Value::CirclePoint {
+            center: [center.x, center.y],
+            radius: *radius,
+            angle: *angle,
+        },
+        DesignShaderPropertyValue::ColorPoint {
+            point,
+            color,
+            variable_id,
+        } => Value::ColorPoint {
+            point: [point.x, point.y],
+            color: fanta_color(*color),
+            variable_id: variable_id.as_ref().map(ToString::to_string),
+        },
+        DesignShaderPropertyValue::Gradient(stops) => Value::Gradient(
+            stops
+                .iter()
+                .map(|stop| fanta_doc::ShaderGradientStop {
+                    position: stop.position,
+                    color: fanta_color(stop.color),
+                    variable_id: stop.variable_id.as_ref().map(ToString::to_string),
+                })
+                .collect(),
+        ),
+        DesignShaderPropertyValue::VariableAlias { variable_id } => Value::VariableAlias {
+            variable_id: variable_id.to_string(),
+        },
+        DesignShaderPropertyValue::Opaque { type_name, payload } => Value::Opaque {
+            type_name: type_name.to_string(),
+            payload: payload.to_string(),
+        },
+    })
+}
+
+fn bundled_shader_catalog() -> DesignShaderViewData {
+    use DesignShaderPropertyKind::{Color, Number};
+    use DesignShaderPropertyValue::{Color as ColorValue, Number as NumberValue};
+    DesignShaderViewData::new(
+        [
+            DesignShaderDefinition::new(
+                "fanta:shader:fractal-noise",
+                "Fractal noise",
+                true,
+                [
+                    DesignShaderPropertyDefinition::new("frequency", "Frequency", Number)
+                        .with_default(NumberValue(4.0)),
+                    DesignShaderPropertyDefinition::new("octaves", "Octaves", Number)
+                        .with_default(NumberValue(4.0)),
+                    DesignShaderPropertyDefinition::new("color_a", "First color", Color)
+                        .with_default(ColorValue(DesignColor::rgb(0x25, 0x1f, 0x48))),
+                    DesignShaderPropertyDefinition::new("color_b", "Second color", Color)
+                        .with_default(ColorValue(DesignColor::rgb(0x7d, 0xe3, 0xd6))),
+                ],
+            ),
+            DesignShaderDefinition::new(
+                "fanta:shader:halftone",
+                "Halftone",
+                true,
+                [
+                    DesignShaderPropertyDefinition::new("columns", "Columns", Number)
+                        .with_default(NumberValue(18.0)),
+                    DesignShaderPropertyDefinition::new("radius", "Dot radius", Number)
+                        .with_default(NumberValue(1.0)),
+                    DesignShaderPropertyDefinition::new("ink_color", "Ink", Color)
+                        .with_default(ColorValue(DesignColor::rgb(0x1e, 0x29, 0x3b))),
+                    DesignShaderPropertyDefinition::new("paper_color", "Paper", Color)
+                        .with_default(ColorValue(DesignColor::rgb(0xf8, 0xfa, 0xfc))),
+                ],
+            ),
+        ],
+        [],
+    )
+}
+
 fn media_paint_view_data(
     context: &fanta_gpui::design::DesignPanelInspectionContext,
     crop_session: Option<&DesignCropSession>,
     pattern_sources: Vec<DesignPatternSource>,
+    video_previews: &HashMap<String, DesignVideoPreviewState>,
 ) -> DesignMediaPaintViewData {
     let DesignPanelSelection::Single(node) = context.selection() else {
         return DesignMediaPaintViewData::default();
@@ -474,10 +745,22 @@ fn media_paint_view_data(
         .with_source_actions(true, false, false)
         .with_crop_rotation(false);
     let fills = node.fills.iter().enumerate().filter_map(|(index, paint)| {
-        matches!(paint.payload, DesignPaintPayload::Image(_)).then(|| {
+        matches!(
+            paint.payload,
+            DesignPaintPayload::Image(_) | DesignPaintPayload::Video(_)
+        )
+        .then(|| {
             let mut view =
                 DesignMediaPaintView::new(DesignPanelCollection::Fill, paint.id.clone(), index)
                     .with_capabilities(capabilities);
+            if let DesignPaintPayload::Video(video) = &paint.payload {
+                view = view.with_video_preview(
+                    video_previews
+                        .get(video.source.id.as_ref())
+                        .cloned()
+                        .unwrap_or_else(DesignVideoPreviewState::loading),
+                );
+            }
             if let Some(session) = crop_session
                 && node_id(&node.id) == Some(session.node)
                 && !session.is_stroke
@@ -494,13 +777,25 @@ fn media_paint_view_data(
         .into_iter()
         .flat_map(|stroke| stroke.paints.iter().enumerate())
         .filter_map(|(index, paint)| {
-            matches!(paint.payload, DesignPaintPayload::Image(_)).then(|| {
+            matches!(
+                paint.payload,
+                DesignPaintPayload::Image(_) | DesignPaintPayload::Video(_)
+            )
+            .then(|| {
                 let mut view = DesignMediaPaintView::new(
                     DesignPanelCollection::Stroke,
                     paint.id.clone(),
                     index,
                 )
                 .with_capabilities(capabilities);
+                if let DesignPaintPayload::Video(video) = &paint.payload {
+                    view = view.with_video_preview(
+                        video_previews
+                            .get(video.source.id.as_ref())
+                            .cloned()
+                            .unwrap_or_else(DesignVideoPreviewState::loading),
+                    );
+                }
                 if let Some(session) = crop_session
                     && node_id(&node.id) == Some(session.node)
                     && session.is_stroke
@@ -1053,6 +1348,7 @@ fn design_stroke(
 /// multi-selection context built by `aggregate_selection`.
 fn gate_capabilities(
     kind: DesignPanelNodeKind,
+    data: &NodeData,
     is_mask: bool,
     corner_capabilities: DesignCornerCapabilities,
 ) -> DesignPanelNodeCapabilities {
@@ -1088,6 +1384,18 @@ fn gate_capabilities(
         kind,
         DesignPanelNodeKind::Frame | DesignPanelNodeKind::Group | DesignPanelNodeKind::Component
     );
+    capabilities.fill &= matches!(
+        data,
+        NodeData::Vector(_) | NodeData::Group(_) | NodeData::Text(_)
+    );
+    capabilities.stroke &= matches!(data, NodeData::Vector(_) | NodeData::Group(_));
+    let fill = capabilities.fill;
+    let stroke = capabilities.stroke;
+    capabilities.sections.retain(|section| match section {
+        DesignPanelSection::Fill => fill,
+        DesignPanelSection::Stroke => stroke,
+        _ => true,
+    });
     if kind == DesignPanelNodeKind::Other {
         // The engine can move, hide, and re-composite these nodes but cannot
         // edit their content: wrapper-level surfaces only.
@@ -1337,6 +1645,7 @@ pub(crate) fn design_node(
 
     out.capabilities = Some(gate_capabilities(
         kind,
+        &node.data,
         node.is_mask,
         out.corner_capabilities,
     ));
@@ -1550,6 +1859,13 @@ pub(crate) struct DesignEchoKey {
     generation: u64,
     editable: bool,
     page_index: Option<usize>,
+    video_previews: Vec<(
+        AssetId,
+        u32,
+        u32,
+        bool,
+        fanta_gpui::design::DesignVideoPreviewStatus,
+    )>,
 }
 
 /// An in-flight Begin/Preview/Commit/Cancel property gesture: the pre-gesture
@@ -1615,16 +1931,10 @@ impl DesignAdapter {
             )
         });
         panel.update(cx, |panel, cx| {
-            panel.set_supported_paint_types(
-                &[
-                    DesignPaintType::Solid,
-                    DesignPaintType::Gradient,
-                    DesignPaintType::Pattern,
-                    DesignPaintType::Image,
-                ],
-                cx,
-            );
+            panel.set_supported_paint_types(supported_paint_types(false), cx);
             panel.set_paint_visibility_supported(false, cx);
+            panel.set_shader_view_data(bundled_shader_catalog(), cx);
+            panel.set_shader_variable_binding_enabled(false, cx);
             panel.set_eyedropper_enabled(false, cx);
             panel.set_color_variable_creation_enabled(false, cx);
             panel.set_paint_style_view_data(
@@ -1664,6 +1974,37 @@ impl DesignAdapter {
 // =============================================================================
 
 impl FigView {
+    #[cfg(target_os = "macos")]
+    fn design_video_preview_state(
+        &mut self,
+        asset: AssetId,
+        cx: &mut Context<Self>,
+    ) -> DesignVideoPreviewState {
+        self.ensure_video_fill_playback(asset, cx);
+        if let Some(error) = self.video_fill_error(asset) {
+            return DesignVideoPreviewState::error(error);
+        }
+        if self.video_fill_loading(asset) {
+            return DesignVideoPreviewState::loading();
+        }
+        let Some(playback) = self.video_fill_playback(asset) else {
+            return DesignVideoPreviewState::loading();
+        };
+        let playback = playback.read(cx);
+        if let Some(error) = playback.error() {
+            return DesignVideoPreviewState::error(error.clone());
+        }
+        let status = playback.status();
+        if status.duration_us == 0 {
+            return DesignVideoPreviewState::loading();
+        }
+        DesignVideoPreviewState::ready(
+            status.duration_us as f32 / 1_000_000.0,
+            status.current_time_us as f32 / 1_000_000.0,
+            status.state == media::video::VideoPlaybackState::Playing,
+        )
+    }
+
     /// Echo document state into the DesignPanel — inspection context, property
     /// value states, and Page view data — built as one snapshot by
     /// [`build_design_view_data`] and memoized on (selection identity, render
@@ -1687,6 +2028,28 @@ impl FigView {
         if self.gpui_design.is_none() {
             return;
         }
+        let mut video_previews = HashMap::new();
+        #[cfg(target_os = "macos")]
+        for asset in self.selected_canvas_video_fill_assets(cx) {
+            video_previews.insert(
+                asset.to_string(),
+                self.design_video_preview_state(asset, cx),
+            );
+        }
+        let mut video_preview_signature = video_previews
+            .iter()
+            .filter_map(|(source, preview)| {
+                let asset = source.parse::<AssetId>().ok()?;
+                Some((
+                    asset,
+                    (preview.duration_seconds * 10.0) as u32,
+                    (preview.current_seconds * 10.0) as u32,
+                    preview.playing,
+                    preview.status.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        video_preview_signature.sort_by_key(|(asset, ..)| *asset);
         let item = self.item().clone();
         let page_index = self.selected_page_index();
         let built = {
@@ -1714,6 +2077,7 @@ impl FigView {
                 generation: document.render_generation(),
                 editable,
                 page_index,
+                video_previews: video_preview_signature,
             };
             if self
                 .gpui_design
@@ -1761,6 +2125,7 @@ impl FigView {
                 .as_ref()
                 .and_then(|adapter| adapter.crop_session.as_ref()),
             pattern_sources,
+            &video_previews,
         );
         let inspection_context = view_data.inspection_context;
         let property_states = view_data.property_states;
@@ -1773,22 +2138,15 @@ impl FigView {
         adapter.font_catalog_dirty = false;
         adapter.last_echo = Some(key);
         adapter.panel.update(cx, |panel, cx| {
+            panel.set_paint_collection_item_actions_enabled(
+                DesignPanelCollection::Fill,
+                !text_selection,
+                cx,
+            );
             if let Some(font_catalog) = font_catalog {
                 panel.set_font_view_data(font_catalog, cx);
             }
-            panel.set_supported_paint_types(
-                if text_selection {
-                    &[DesignPaintType::Solid]
-                } else {
-                    &[
-                        DesignPaintType::Solid,
-                        DesignPaintType::Gradient,
-                        DesignPaintType::Pattern,
-                        DesignPaintType::Image,
-                    ]
-                },
-                cx,
-            );
+            panel.set_supported_paint_types(supported_paint_types(text_selection), cx);
             if let Some(page_view_data) = page_view_data {
                 panel.set_page_view_data(page_view_data, cx);
             }
@@ -1999,15 +2357,33 @@ impl FigView {
                     DesignPanelCollection::Stroke => true,
                     _ => return,
                 };
-                self.handle_design_image_upload(
-                    id,
-                    is_stroke,
-                    *index,
-                    Some(source_id.clone()),
-                    None,
-                    window,
-                    cx,
-                );
+                let is_video = self.item().read(cx).document().is_some_and(|document| {
+                    matches!(
+                        current_paint(&document.doc, id, is_stroke, *index),
+                        Some(Fill::Video { .. })
+                    )
+                });
+                if is_video {
+                    self.handle_design_video_upload(
+                        id,
+                        is_stroke,
+                        *index,
+                        Some(source_id.clone()),
+                        None,
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.handle_design_image_upload(
+                        id,
+                        is_stroke,
+                        *index,
+                        Some(source_id.clone()),
+                        None,
+                        window,
+                        cx,
+                    );
+                }
             }
             DesignPanelAction::PaintMediaSourceDropRequested {
                 node_id: id,
@@ -2018,9 +2394,6 @@ impl FigView {
                 file,
                 ..
             } => {
-                if *expected_media_kind != fanta_gpui::design::DesignMediaKind::Image {
-                    return;
-                }
                 let Some(id) = node_id(id) else {
                     return;
                 };
@@ -2029,15 +2402,26 @@ impl FigView {
                     DesignPanelCollection::Stroke => true,
                     _ => return,
                 };
-                self.handle_design_image_upload(
-                    id,
-                    is_stroke,
-                    *index,
-                    Some(expected_source_id.clone()),
-                    Some(file.path.clone()),
-                    window,
-                    cx,
-                );
+                match expected_media_kind {
+                    fanta_gpui::design::DesignMediaKind::Image => self.handle_design_image_upload(
+                        id,
+                        is_stroke,
+                        *index,
+                        Some(expected_source_id.clone()),
+                        Some(file.path.clone()),
+                        window,
+                        cx,
+                    ),
+                    fanta_gpui::design::DesignMediaKind::Video => self.handle_design_video_upload(
+                        id,
+                        is_stroke,
+                        *index,
+                        Some(expected_source_id.clone()),
+                        Some(file.path.clone()),
+                        window,
+                        cx,
+                    ),
+                }
             }
             DesignPanelAction::PaintMediaCropActionRequested {
                 node_id: id,
@@ -2055,6 +2439,105 @@ impl FigView {
                     _ => return,
                 };
                 self.handle_design_crop_action(id, is_stroke, *index, action, window, cx);
+            }
+            DesignPanelAction::PaintVideoPreviewActionRequested {
+                node_id: id,
+                collection,
+                paint_id,
+                index,
+                action,
+                ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                let collection_name = match collection {
+                    DesignPanelCollection::Fill => "fill",
+                    DesignPanelCollection::Stroke => "stroke",
+                    _ => return,
+                };
+                if paint_id.as_ref() != format!("{id}-{collection_name}-{index}") {
+                    return;
+                }
+                let asset =
+                    self.item().read(cx).document().and_then(|document| {
+                        match current_paint(
+                            &document.doc,
+                            id,
+                            *collection == DesignPanelCollection::Stroke,
+                            *index,
+                        ) {
+                            Some(Fill::Video { video, .. }) => Some(video.asset),
+                            _ => None,
+                        }
+                    });
+                let Some(asset) = asset else {
+                    return;
+                };
+                #[cfg(target_os = "macos")]
+                {
+                    self.ensure_video_fill_playback(asset, cx);
+                    let Some(playback) = self.video_fill_playback(asset) else {
+                        return;
+                    };
+                    playback.update(cx, |playback, cx| {
+                        match action {
+                            DesignVideoPreviewAction::Play => playback.play(cx),
+                            DesignVideoPreviewAction::Pause => playback.pause(cx),
+                            DesignVideoPreviewAction::Seek { seconds }
+                            | DesignVideoPreviewAction::Scrub {
+                                seconds,
+                                phase: DesignPanelEditPhase::Preview | DesignPanelEditPhase::Commit,
+                            } => {
+                                if seconds.is_finite() && *seconds >= 0.0 {
+                                    playback.seek((*seconds as f64 * 1_000_000.0) as u64, cx);
+                                }
+                            }
+                            DesignVideoPreviewAction::Scrub { .. } => {}
+                        }
+                        playback.tick(window, cx);
+                    });
+                    if let Some(adapter) = self.gpui_design.as_mut() {
+                        adapter.last_echo = None;
+                    }
+                    cx.notify();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (asset, action);
+                    crate::view::notify_unavailable("Video preview", window, cx);
+                }
+            }
+            DesignPanelAction::PaintShaderApplyRequested {
+                node_id: id,
+                collection,
+                index,
+                shader,
+                ..
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                let catalog = bundled_shader_catalog();
+                let Some(payload) = catalog
+                    .shader(shader)
+                    .and_then(DesignShaderPaint::from_definition)
+                else {
+                    return;
+                };
+                let edit = fanta_gpui::design::DesignPaintEdit {
+                    property: DesignPaintProperty::Payload,
+                    value: DesignPaintValue::Payload(DesignPaintPayload::Shader(payload)),
+                };
+                self.handle_design_paint_edit(
+                    id,
+                    *collection,
+                    *index,
+                    &edit,
+                    DesignPanelEditPhase::Commit,
+                    window,
+                    cx,
+                );
             }
             DesignPanelAction::PaintChangeRequested {
                 node_id: id,
@@ -2251,6 +2734,52 @@ impl FigView {
                     return;
                 };
                 self.handle_design_effect_edit(id, reference, *property, value, *phase, window, cx);
+            }
+            DesignPanelAction::TypographyPropertyChangeRequested {
+                node_id: id,
+                target,
+                property,
+                value,
+            } => {
+                if target.is_selected_text_range() {
+                    crate::view::notify_unavailable("Selected text formatting", window, cx);
+                    return;
+                }
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let mut unhandled = false;
+                let ops = self.design_ops(cx, |doc| {
+                    property_operations(doc, id, *property, value).unwrap_or_else(|| {
+                        unhandled = true;
+                        Vec::new()
+                    })
+                });
+                if unhandled {
+                    log::debug!("fig design adapter: unhandled typography property {property:?}");
+                    crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+                    return;
+                }
+                self.design_apply_ops(ops, cx);
+            }
+            DesignPanelAction::TypographyPropertyEditRequested {
+                node_id: id,
+                target,
+                property,
+                value,
+                phase,
+            } => {
+                if target.is_selected_text_range() {
+                    if *phase == DesignPanelEditPhase::Commit {
+                        crate::view::notify_unavailable("Selected text formatting", window, cx);
+                    }
+                    return;
+                }
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_phased_edit(id, *property, value, *phase, window, cx);
             }
             DesignPanelAction::TypographyFontApplyRequested {
                 node_id: id,
@@ -2965,17 +3494,17 @@ impl FigView {
         } else {
             DesignPanelCollection::Fill
         };
-        let image = self
+        let media = self
             .item()
             .read(cx)
             .document()
-            .and_then(|document| image_payload_for(&document.doc, id, is_stroke, index));
-        let Some(mut image) = image else {
+            .and_then(|document| media_payload_for(&document.doc, id, is_stroke, index));
+        let Some(mut media) = media else {
             return;
         };
         match action {
             DesignMediaCropAction::Begin => {
-                let DesignMediaPaintPlacement::Crop { transform } = image.placement else {
+                let DesignMediaPaintPlacement::Crop { transform } = media_placement(&media) else {
                     return;
                 };
                 self.handle_design_phased_edit(
@@ -3025,12 +3554,12 @@ impl FigView {
                 let state = session.state;
                 adapter.last_echo = None;
                 let source_aspect = self.item().read(cx).document().and_then(|document| {
-                    let Fill::Image { asset, .. } =
-                        current_paint(&document.doc, id, is_stroke, index)?
-                    else {
-                        return None;
+                    let source = match current_paint(&document.doc, id, is_stroke, index)? {
+                        Fill::Image { asset, .. } => *asset,
+                        Fill::Video { video, .. } => video.poster?,
+                        _ => return None,
                     };
-                    let image = document.asset_resolver.as_ref()?.resolve(*asset)?;
+                    let image = document.asset_resolver.as_ref()?.resolve(source)?;
                     Some(image.width as f32 / image.height.max(1) as f32)
                 });
                 let Some(transform) =
@@ -3043,10 +3572,10 @@ impl FigView {
                     );
                     return;
                 };
-                image.placement = DesignMediaPaintPlacement::Crop { transform };
+                set_media_placement(&mut media, DesignMediaPaintPlacement::Crop { transform });
                 let edit = fanta_gpui::design::DesignPaintEdit {
                     property: DesignPaintProperty::Payload,
-                    value: DesignPaintValue::Payload(DesignPaintPayload::Image(image)),
+                    value: DesignPaintValue::Payload(media),
                 };
                 let phase = if matches!(action, DesignMediaCropAction::Commit { .. }) {
                     DesignPanelEditPhase::Commit
@@ -3078,12 +3607,15 @@ impl FigView {
                 self.refresh_gpui_design(cx);
             }
             DesignMediaCropAction::ResizeToFit => {
-                image.placement = DesignMediaPaintPlacement::Fit {
-                    rotation: DesignMediaQuarterTurn::None,
-                };
+                set_media_placement(
+                    &mut media,
+                    DesignMediaPaintPlacement::Fit {
+                        rotation: DesignMediaQuarterTurn::None,
+                    },
+                );
                 let edit = fanta_gpui::design::DesignPaintEdit {
                     property: DesignPaintProperty::Payload,
-                    value: DesignPaintValue::Payload(DesignPaintPayload::Image(image)),
+                    value: DesignPaintValue::Payload(media),
                 };
                 self.handle_design_paint_edit(
                     id,
@@ -3205,6 +3737,102 @@ impl FigView {
         .detach_and_log_err(cx);
     }
 
+    fn handle_design_video_upload(
+        &mut self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        expected_source_id: Option<SharedString>,
+        path: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_document_edits_for_external_change(cx);
+        let item = self.item().clone();
+        let expected = item.read(cx).document().and_then(|document| {
+            Some((
+                document.doc.id,
+                current_paint(&document.doc, id, is_stroke, index)?.clone(),
+            ))
+        });
+        let Some((document_id, expected_fill)) = expected else {
+            return;
+        };
+        if let Some(source_id) = expected_source_id
+            && !matches!(&expected_fill, Fill::Video { video, .. } if video.asset.to_string() == source_id.as_ref())
+        {
+            return;
+        }
+        let chooser = path.is_none().then(|| {
+            cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: true,
+                directories: false,
+                multiple: false,
+                prompt: Some("Choose video fill".into()),
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = async {
+                let path = match (path, chooser) {
+                    (Some(path), _) => path,
+                    (None, Some(chooser)) => {
+                        let Some(path) = chooser.await??.and_then(|paths| paths.into_iter().next())
+                        else {
+                            return Ok(());
+                        };
+                        path
+                    }
+                    (None, None) => return Ok(()),
+                };
+                let prepared = cx
+                    .background_spawn(async move {
+                        let length = std::fs::metadata(&path)
+                            .with_context(|| format!("reading {}", path.display()))?
+                            .len();
+                        anyhow::ensure!(
+                            length > 0 && length <= 100 * 1024 * 1024,
+                            "video must be nonempty and no larger than 100 MiB"
+                        );
+                        let bytes = std::fs::read(&path)
+                            .with_context(|| format!("reading {}", path.display()))?;
+                        crate::generation_media::prepare_video(Arc::from(bytes)).await
+                    })
+                    .await?;
+                item.update(cx, |item, cx| {
+                    anyhow::ensure!(item.is_editable(), "this document is read-only");
+                    item.with_document(cx, |document| {
+                        let result = replace_video_paint_with_asset(
+                            document,
+                            id,
+                            is_stroke,
+                            index,
+                            document_id,
+                            &expected_fill,
+                            prepared,
+                        );
+                        let change = if result.as_ref().is_ok_and(|changed| *changed) {
+                            DocChange::Content
+                        } else {
+                            DocChange::None
+                        };
+                        (result, change)
+                    })
+                    .context("the document is closed")??;
+                    Ok(())
+                })?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                this.update_in(cx, |_, window, cx| {
+                    crate::view::show_canvas_notice(format!("Video fill: {error:#}"), window, cx)
+                })?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn handle_design_paint_edit(
         &mut self,
         id: NodeId,
@@ -3228,6 +3856,16 @@ impl FigView {
             && image.source.id.is_empty()
         {
             self.handle_design_image_upload(id, is_stroke, index, None, None, window, cx);
+            return;
+        }
+        if phase == DesignPanelEditPhase::Commit
+            && let (
+                DesignPaintProperty::Payload,
+                DesignPaintValue::Payload(DesignPaintPayload::Video(video)),
+            ) = (&edit.property, &edit.value)
+            && video.source.id.is_empty()
+        {
+            self.handle_design_video_upload(id, is_stroke, index, None, None, window, cx);
             return;
         }
         let mut value = match (&edit.property, &edit.value) {
@@ -3283,7 +3921,8 @@ impl FigView {
                 | DesignPaintProperty::MediaCropTransform
                 | DesignPaintProperty::MediaTileScalingFactor
                 | DesignPaintProperty::MediaQuarterTurn
-                | DesignPaintProperty::MediaFilter(_),
+                | DesignPaintProperty::MediaFilter(_)
+                | DesignPaintProperty::ShaderProperty { .. },
                 _,
             ) => PaintEditValue::ModelEdit(edit.clone()),
             _ => {
@@ -3948,10 +4587,32 @@ fn image_fill_from_design(
     blend: BlendMode,
 ) -> Option<Fill> {
     let asset = payload.source.id.parse().ok()?;
-    if !payload.placement.is_valid() {
+    let (mode, crop, scale, rotation) = engine_media_placement(payload.placement)?;
+    let filters = payload.filters.normalized()?;
+    Some(Fill::Image {
+        asset,
+        mode,
+        opacity,
+        crop,
+        scale,
+        rotation,
+        blend,
+        adjust: engine_image_filters(filters),
+    })
+}
+
+fn engine_media_placement(
+    placement: DesignMediaPaintPlacement,
+) -> Option<(
+    ImageFitMode,
+    Option<Box<[f32; 4]>>,
+    Option<f32>,
+    Option<f32>,
+)> {
+    if !placement.is_valid() {
         return None;
     }
-    let (mode, crop, scale, rotation) = match payload.placement {
+    Some(match placement {
         DesignMediaPaintPlacement::Fill { rotation } => (
             ImageFitMode::Fill,
             None,
@@ -3993,26 +4654,113 @@ fn image_fill_from_design(
             Some(scaling_factor),
             Some(f32::from(rotation.degrees())),
         ),
-    };
-    let filters = payload.filters.normalized()?;
-    Some(Fill::Image {
-        asset,
-        mode,
-        opacity,
-        crop,
-        scale,
-        rotation,
-        blend,
-        adjust: fanta_doc::ImageAdjust {
-            exposure: filters.exposure,
-            contrast: filters.contrast,
-            saturation: filters.saturation,
-            temperature: filters.temperature,
-            tint: filters.tint,
-            highlights: filters.highlights,
-            shadows: filters.shadows,
-        },
     })
+}
+
+fn engine_image_filters(filters: DesignImageFilters) -> fanta_doc::ImageAdjust {
+    fanta_doc::ImageAdjust {
+        exposure: filters.exposure,
+        contrast: filters.contrast,
+        saturation: filters.saturation,
+        temperature: filters.temperature,
+        tint: filters.tint,
+        highlights: filters.highlights,
+        shadows: filters.shadows,
+    }
+}
+
+fn video_fill_from_design(
+    payload: &fanta_gpui::design::DesignVideoPaint,
+    previous: Option<&fanta_doc::VideoFill>,
+    opacity: f32,
+    blend: BlendMode,
+) -> Option<Fill> {
+    let asset = payload.source.id.parse().ok()?;
+    let (mode, crop, scale, rotation) = engine_media_placement(payload.placement)?;
+    let filters = payload.filters.normalized()?;
+    Some(Fill::Video {
+        video: Box::new(fanta_doc::VideoFill {
+            asset,
+            poster: previous
+                .filter(|previous| previous.asset == asset)
+                .and_then(|previous| previous.poster),
+            mode,
+            crop,
+            scale,
+            rotation,
+            adjust: engine_image_filters(filters),
+        }),
+        opacity,
+        blend,
+    })
+}
+
+fn shader_fill_from_design(
+    payload: &DesignShaderPaint,
+    previous: Option<&fanta_doc::ShaderFill>,
+    opacity: f32,
+    blend: BlendMode,
+) -> Option<Fill> {
+    let catalog = bundled_shader_catalog();
+    let definition = catalog.definition(&payload.shader_id)?;
+    let mut properties: Vec<fanta_doc::ShaderPropertyAssignment> = payload
+        .properties
+        .iter()
+        .filter_map(|assignment| {
+            if definition
+                .property(&assignment.definition_id)
+                .is_some_and(|property| !assignment.value.is_compatible_with(property.kind))
+            {
+                return None;
+            }
+            engine_shader_value(&assignment.value).map(|value| {
+                fanta_doc::ShaderPropertyAssignment {
+                    definition_id: assignment.definition_id.to_string(),
+                    value,
+                }
+            })
+        })
+        .collect();
+    if let Some(previous) = previous.filter(|previous| previous.shader_id == payload.shader_id) {
+        for assignment in &previous.properties {
+            let unknown_or_opaque = definition.property(&assignment.definition_id).is_none()
+                || matches!(
+                    &assignment.value,
+                    fanta_doc::ShaderPropertyValue::Opaque { .. }
+                );
+            if unknown_or_opaque
+                && !properties
+                    .iter()
+                    .any(|property| property.definition_id == assignment.definition_id)
+            {
+                properties.push(assignment.clone());
+            }
+        }
+    }
+    Some(Fill::Shader {
+        shader: Box::new(fanta_doc::ShaderFill {
+            shader_id: definition.id.to_string(),
+            name: definition.name.to_string(),
+            properties,
+        }),
+        opacity,
+        blend,
+    })
+}
+
+fn paint_opacity_fraction(fill: &Fill) -> f32 {
+    match fill {
+        Fill::Solid { color, .. } => f32::from(color.a) / 255.0,
+        Fill::Gradient { gradient, .. } => crate::color_picker::gradient_stops(gradient)
+            .iter()
+            .map(|stop| f32::from(stop.color.a) / 255.0)
+            .reduce(f32::max)
+            .unwrap_or(1.0),
+        Fill::Image { opacity, .. }
+        | Fill::Pattern { opacity, .. }
+        | Fill::Video { opacity, .. }
+        | Fill::Shader { opacity, .. } => *opacity,
+    }
 }
 
 fn current_paint(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Option<&Fill> {
@@ -4059,10 +4807,7 @@ fn replace_image_paint_with_asset(
         other => Fill::Image {
             asset,
             mode: ImageFitMode::Fill,
-            opacity: match other {
-                Fill::Pattern { opacity, .. } => *opacity,
-                _ => 1.0,
-            },
+            opacity: paint_opacity_fraction(other),
             crop: None,
             scale: None,
             rotation: None,
@@ -4094,12 +4839,90 @@ fn replace_image_paint_with_asset(
     Ok(changed)
 }
 
-fn image_payload_for(
+fn replace_video_paint_with_asset(
+    document: &mut FigDocument,
+    id: NodeId,
+    is_stroke: bool,
+    index: usize,
+    document_id: fanta_doc::DocId,
+    expected_fill: &Fill,
+    prepared: crate::generation_media::PreparedVideo,
+) -> anyhow::Result<bool> {
+    anyhow::ensure!(document.doc.id == document_id, "the document changed");
+    anyhow::ensure!(
+        current_paint(&document.doc, id, is_stroke, index) == Some(expected_fill),
+        "the paint changed while choosing a video"
+    );
+    let crate::generation_media::PreparedVideo {
+        bytes,
+        asset,
+        poster,
+        ..
+    } = prepared;
+    if let Some(existing) = document.raw_assets.get(&asset) {
+        anyhow::ensure!(
+            existing.as_slice() == bytes.as_ref(),
+            "video asset hash collision"
+        );
+    }
+    let poster_asset = match poster {
+        Some(poster) => Some(
+            document
+                .doc_and_assets()
+                .1
+                .add_image_tracked(poster.png.to_vec())?,
+        ),
+        None => None,
+    };
+    let mut new_fill = match expected_fill {
+        Fill::Video { .. } => expected_fill.clone(),
+        other => Fill::Video {
+            video: Box::new(fanta_doc::VideoFill {
+                asset,
+                poster: None,
+                mode: ImageFitMode::Fill,
+                crop: None,
+                scale: None,
+                rotation: None,
+                adjust: fanta_doc::ImageAdjust::default(),
+            }),
+            opacity: paint_opacity_fraction(other),
+            blend: crate::properties_ops::paint_blend(other),
+        },
+    };
+    if let Fill::Video { video, .. } = &mut new_fill {
+        video.asset = asset;
+        video.poster = poster_asset.map(|(id, _, _)| id);
+    }
+    let operations = replace_data_operation(&document.doc, id, |data| {
+        if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
+            *paint = new_fill.clone();
+        }
+    });
+    let mut changed = false;
+    for operation in operations {
+        if let Err(error) = document.doc.apply(operation) {
+            if let Some((poster, _, true)) = poster_asset {
+                document.doc_and_assets().1.remove(poster);
+            }
+            return Err(error.into());
+        }
+        changed = true;
+    }
+    if changed {
+        Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+    } else if let Some((poster, _, true)) = poster_asset {
+        document.doc_and_assets().1.remove(poster);
+    }
+    Ok(changed)
+}
+
+fn media_payload_for(
     doc: &Doc,
     id: NodeId,
     is_stroke: bool,
     index: usize,
-) -> Option<fanta_gpui::design::DesignImagePaint> {
+) -> Option<DesignPaintPayload> {
     let fill = current_paint(doc, id, is_stroke, index)?;
     let snapshot = crate::properties_snapshot::paint_snapshot(fill, None);
     let paint = design_paint(
@@ -4109,9 +4932,27 @@ fn image_payload_for(
         &snapshot,
         Some(fill),
     );
-    match paint.payload {
-        DesignPaintPayload::Image(image) if !paint.read_only => Some(image),
-        _ => None,
+    (!paint.read_only
+        && matches!(
+            paint.payload,
+            DesignPaintPayload::Image(_) | DesignPaintPayload::Video(_)
+        ))
+    .then_some(paint.payload)
+}
+
+fn media_placement(payload: &DesignPaintPayload) -> DesignMediaPaintPlacement {
+    match payload {
+        DesignPaintPayload::Image(image) => image.placement,
+        DesignPaintPayload::Video(video) => video.placement,
+        _ => DesignMediaPaintPlacement::default(),
+    }
+}
+
+fn set_media_placement(payload: &mut DesignPaintPayload, placement: DesignMediaPaintPlacement) {
+    match payload {
+        DesignPaintPayload::Image(image) => image.placement = placement,
+        DesignPaintPayload::Video(video) => video.placement = placement,
+        _ => {}
     }
 }
 
@@ -4229,7 +5070,9 @@ fn paint_edit_operations(
                             Fill::Solid { blend: current, .. }
                             | Fill::Gradient { blend: current, .. }
                             | Fill::Image { blend: current, .. }
-                            | Fill::Pattern { blend: current, .. } => *current = *blend,
+                            | Fill::Pattern { blend: current, .. }
+                            | Fill::Video { blend: current, .. }
+                            | Fill::Shader { blend: current, .. } => *current = *blend,
                         }
                     }
                 })
@@ -4269,7 +5112,10 @@ fn paint_edit_operations(
                     {
                         let blend = crate::properties_ops::paint_blend(paint);
                         let opacity = match paint {
-                            Fill::Pattern { opacity, .. } | Fill::Image { opacity, .. } => *opacity,
+                            Fill::Pattern { opacity, .. }
+                            | Fill::Image { opacity, .. }
+                            | Fill::Video { opacity, .. }
+                            | Fill::Shader { opacity, .. } => *opacity,
                             _ => 1.0,
                         };
                         *paint = Fill::Pattern {
@@ -4287,12 +5133,65 @@ fn paint_edit_operations(
                     {
                         let blend = crate::properties_ops::paint_blend(paint);
                         let opacity = match paint {
-                            Fill::Image { opacity, .. } | Fill::Pattern { opacity, .. } => *opacity,
+                            Fill::Image { opacity, .. }
+                            | Fill::Pattern { opacity, .. }
+                            | Fill::Video { opacity, .. }
+                            | Fill::Shader { opacity, .. } => *opacity,
                             _ => 1.0,
                         };
                         if let Some(image_fill) = image_fill_from_design(image, opacity, blend) {
                             *paint = image_fill;
                         }
+                    }
+                })
+            }
+            DesignPaintPayload::Video(video) if !is_text => {
+                let previous = current_paint(doc, id, is_stroke, index).and_then(|paint| {
+                    if let Fill::Video { video, .. } = paint {
+                        Some(video.as_ref())
+                    } else {
+                        None
+                    }
+                });
+                let Some(new_fill) = video_fill_from_design(
+                    video,
+                    previous,
+                    current_paint(doc, id, is_stroke, index).map_or(1.0, paint_opacity_fraction),
+                    current_paint(doc, id, is_stroke, index)
+                        .map_or(BlendMode::Normal, crate::properties_ops::paint_blend),
+                ) else {
+                    return Vec::new();
+                };
+                replace_data_operation(doc, id, |data| {
+                    if let Some(paint) =
+                        crate::properties_ops::paint_slot_mut(data, index, is_stroke)
+                    {
+                        *paint = new_fill.clone();
+                    }
+                })
+            }
+            DesignPaintPayload::Shader(shader) if !is_text => {
+                let previous = current_paint(doc, id, is_stroke, index).and_then(|paint| {
+                    if let Fill::Shader { shader, .. } = paint {
+                        Some(shader.as_ref())
+                    } else {
+                        None
+                    }
+                });
+                let Some(new_fill) = shader_fill_from_design(
+                    shader,
+                    previous,
+                    current_paint(doc, id, is_stroke, index).map_or(1.0, paint_opacity_fraction),
+                    current_paint(doc, id, is_stroke, index)
+                        .map_or(BlendMode::Normal, crate::properties_ops::paint_blend),
+                ) else {
+                    return Vec::new();
+                };
+                replace_data_operation(doc, id, |data| {
+                    if let Some(paint) =
+                        crate::properties_ops::paint_slot_mut(data, index, is_stroke)
+                    {
+                        *paint = new_fill.clone();
                     }
                 })
             }
@@ -5226,26 +6125,71 @@ fn property_operations(
             let minimum = matches!(property, P::MinWidth | P::MinHeight);
             Some(layout_limit_operations(doc, id, &text, horizontal, minimum))
         }
-        (P::FontFamily, V::Text(family)) => Some(field_operations(
-            doc,
-            &InspectorField::FontFamily(id),
-            family,
-        )),
-        (P::FontSize, _) => field(InspectorField::FontSize(id), number(value)?),
+        (P::FontFamily, V::Text(family)) if !family.is_empty() => {
+            Some(replace_data_operation(doc, id, |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.font_family = family.to_string();
+                    for run in &mut text.style_runs {
+                        run.style.font_family = family.to_string();
+                    }
+                }
+            }))
+        }
+        (P::FontSize, _) => {
+            let size = number(value)?;
+            if !size.is_finite() || size <= 0.0 {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.size_px = size;
+                    for run in &mut text.style_runs {
+                        run.style.size_px = size;
+                    }
+                }
+            }))
+        }
         (P::FontWeight, _) => {
             let weight = number(value)?.clamp(1.0, 1000.0) as u16;
             Some(replace_data_operation(doc, id, |data| {
                 if let NodeData::Text(text) = data {
                     text.style.weight = weight;
+                    for run in &mut text.style_runs {
+                        run.style.weight = weight;
+                    }
                 }
             }))
         }
         (P::LineHeight, V::LineHeight(DesignLineHeight::Percent(percent))) => {
-            field(InspectorField::LineHeight(id), f64::from(*percent) / 100.0)
+            let line_height = f64::from(*percent) / 100.0;
+            if !line_height.is_finite() || line_height <= 0.0 {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.line_height = line_height;
+                    text.style.line_height_auto_percent = None;
+                    for run in &mut text.style_runs {
+                        run.style.line_height = line_height;
+                        run.style.line_height_auto_percent = None;
+                    }
+                }
+            }))
         }
         (P::LineHeight, _) => None,
         (P::LetterSpacing, V::LetterSpacing(DesignLetterSpacing::Pixels(pixels))) => {
-            field(InspectorField::LetterSpacing(id), f64::from(*pixels))
+            let spacing = f64::from(*pixels);
+            if !spacing.is_finite() {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| {
+                if let NodeData::Text(text) = data {
+                    text.style.letter_spacing = spacing;
+                    for run in &mut text.style_runs {
+                        run.style.letter_spacing = spacing;
+                    }
+                }
+            }))
         }
         (P::LetterSpacing, _) => None,
         (P::HorizontalTextAlignment, V::TextHorizontalAlignment(align)) => {
@@ -5765,6 +6709,202 @@ mod tests {
             panic!("filter edit must retain image fill");
         };
         assert!((adjust.contrast - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn video_upload_keeps_source_and_poster_and_edits_filters() {
+        let (doc, _page, target) = doc_with_rect();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let before = current_paint(&document.doc, target, false, 0)
+            .expect("rectangle fill")
+            .clone();
+        let mut poster = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut poster),
+            image::ImageFormat::Png,
+        )
+        .expect("encode poster");
+        let bytes = Arc::<[u8]>::from(&b"mp4 fixture"[..]);
+        let asset = fanta_format::asset_id_for_bytes(&bytes);
+        let prepared = crate::generation_media::PreparedVideo {
+            bytes: bytes.clone(),
+            asset,
+            metadata: crate::generation_media::VideoMetadata {
+                width: 2,
+                height: 2,
+                duration_us: 1_000_000,
+            },
+            poster: Some(crate::generation_media::VideoPoster {
+                png: Arc::from(poster),
+                time_us: 0,
+            }),
+        };
+        let document_id = document.doc.id;
+        assert!(
+            replace_video_paint_with_asset(
+                &mut document,
+                target,
+                false,
+                0,
+                document_id,
+                &before,
+                prepared,
+            )
+            .expect("apply video fill")
+        );
+        assert_eq!(document.raw_assets.get(&asset), Some(&bytes.to_vec()));
+        let fill = current_paint(&document.doc, target, false, 0).expect("video fill");
+        let Fill::Video { video, .. } = fill else {
+            panic!("upload should create a video fill")
+        };
+        assert_eq!(video.asset, asset);
+        assert!(
+            video
+                .poster
+                .is_some_and(|poster| document.raw_assets.contains_key(&poster))
+        );
+        let snapshot = crate::properties_snapshot::paint_snapshot(fill, None);
+        let echoed = design_paint(target, "fill", 0, &snapshot, Some(fill));
+        assert!(matches!(echoed.payload, DesignPaintPayload::Video(_)));
+        let (node, _) = design_node(&document, target, &master_roots(&document.doc.components))
+            .expect("selected node projects");
+        let context = DesignPanelInspectionContext::single(
+            node,
+            parent_layout_for(&document.doc, target),
+            DesignPanelPermissions::editor(),
+        );
+        let preview = DesignVideoPreviewState::ready(4.0, 1.5, true);
+        let media = media_paint_view_data(
+            &context,
+            None,
+            Vec::new(),
+            &HashMap::from([(asset.to_string(), preview.clone())]),
+        );
+        assert_eq!(
+            media
+                .paint(DesignPanelCollection::Fill, &echoed.id, 0)
+                .and_then(|view| view.video_preview.as_ref()),
+            Some(&preview)
+        );
+        let operations = paint_edit_operations(
+            &document.doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::ModelEdit(DesignPaintEdit {
+                property: DesignPaintProperty::MediaFilter(
+                    fanta_gpui::design::DesignImageFilter::Contrast,
+                ),
+                value: DesignPaintValue::Number(0.4),
+            }),
+        );
+        assert_eq!(operations.len(), 1);
+        document
+            .doc
+            .apply(
+                operations
+                    .into_iter()
+                    .next()
+                    .expect("one video filter operation"),
+            )
+            .expect("apply video filter");
+        let Some(Fill::Video { video, .. }) = current_paint(&document.doc, target, false, 0) else {
+            panic!("filter edit must retain video fill");
+        };
+        assert!((video.adjust.contrast - 0.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bundled_shader_selection_and_property_edit_roundtrip() {
+        let (mut doc, _page, target) = doc_with_rect();
+        let catalog = bundled_shader_catalog();
+        assert_eq!(catalog.page_shaders.len(), 2);
+        let definition = catalog
+            .definition("fanta:shader:halftone")
+            .expect("halftone shader");
+        let payload = DesignShaderPaint::from_definition(definition).expect("imported shader");
+        let operations = paint_edit_operations(
+            &doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::Payload(DesignPaintPayload::Shader(payload.clone())),
+        );
+        assert_eq!(operations.len(), 1);
+        doc.apply(operations.into_iter().next().expect("one shader operation"))
+            .expect("apply shader");
+        let fill = current_paint(&doc, target, false, 0).expect("shader fill");
+        let snapshot = crate::properties_snapshot::paint_snapshot(fill, None);
+        let echoed = design_paint(target, "fill", 0, &snapshot, Some(fill));
+        assert_eq!(echoed.payload, DesignPaintPayload::Shader(payload.clone()));
+        let future_property = fanta_doc::ShaderPropertyAssignment {
+            definition_id: "future_property".into(),
+            value: fanta_doc::ShaderPropertyValue::Opaque {
+                type_name: "future_type".into(),
+                payload: "preserve this value".into(),
+            },
+        };
+        for operation in replace_data_operation(&doc, target, |data| {
+            if let NodeData::Vector(vector) = data
+                && let Some(Fill::Shader { shader, .. }) = vector.fills.first_mut()
+            {
+                shader.properties.push(future_property.clone());
+            }
+        }) {
+            doc.apply(operation).expect("add future shader property");
+        }
+        let mut edited_payload = payload;
+        edited_payload
+            .properties
+            .iter_mut()
+            .find(|property| property.definition_id == "radius")
+            .expect("halftone radius property")
+            .value = DesignShaderPropertyValue::Number(1.25);
+        let operations = paint_edit_operations(
+            &doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::Payload(DesignPaintPayload::Shader(edited_payload)),
+        );
+        assert_eq!(operations.len(), 1);
+        doc.apply(operations.into_iter().next().expect("one shader operation"))
+            .expect("apply shader catalog defaults");
+        assert!(matches!(
+            current_paint(&doc, target, false, 0),
+            Some(Fill::Shader { shader, .. }) if shader.properties.contains(&future_property)
+        ));
+        let operations = paint_edit_operations(
+            &doc,
+            target,
+            false,
+            0,
+            &PaintEditValue::ModelEdit(DesignPaintEdit {
+                property: DesignPaintProperty::ShaderProperty {
+                    definition_id: "radius".into(),
+                },
+                value: DesignPaintValue::ShaderProperty(DesignShaderPropertyValue::Number(1.5)),
+            }),
+        );
+        assert_eq!(operations.len(), 1);
+        doc.apply(operations.into_iter().next().expect("one radius operation"))
+            .expect("edit radius");
+        let Some(Fill::Shader { shader, .. }) = current_paint(&doc, target, false, 0) else {
+            panic!("property edit must retain shader fill");
+        };
+        assert!(
+            shader
+                .properties
+                .iter()
+                .any(|property| property.definition_id == "radius"
+                    && property.value == fanta_doc::ShaderPropertyValue::Number(1.5))
+        );
+        assert!(shader.properties.contains(&future_property));
     }
 
     #[test]
@@ -6360,6 +7500,141 @@ mod tests {
             assert!(text.style.italic);
             assert!(doc.history.can_undo());
         });
+    }
+
+    #[gpui::test]
+    async fn typography_property_actions_update_the_text_layer(cx: &mut TestAppContext) {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut text_data = fanta_doc::TextNode::new("Hello", 100.0, 30.0);
+        text_data.style_runs.push(fanta_doc::TextStyleRun {
+            start: 0,
+            end: 5,
+            style: text_data.style.clone(),
+        });
+        let mut text = CanvasNode::new(NodeData::Text(text_data));
+        text.parent = Some(page);
+        let id = text.id;
+        doc.scene.insert(text).expect("insert text");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::WholeLayer,
+                property: DesignPanelProperty::FontSize,
+                value: DesignPanelValue::Number(28.0),
+            });
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::WholeLayer,
+                property: DesignPanelProperty::FontWeight,
+                value: DesignPanelValue::Number(600.0),
+            });
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyPropertyEditRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::WholeLayer,
+                property: DesignPanelProperty::LineHeight,
+                value: DesignPanelValue::LineHeight(DesignLineHeight::Percent(150.0)),
+                phase: DesignPanelEditPhase::Commit,
+            });
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyPropertyEditRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::WholeLayer,
+                property: DesignPanelProperty::LetterSpacing,
+                value: DesignPanelValue::LetterSpacing(DesignLetterSpacing::Pixels(2.0)),
+                phase: DesignPanelEditPhase::Commit,
+            });
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyPropertyEditRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::WholeLayer,
+                property: DesignPanelProperty::TextDecoration,
+                value: DesignPanelValue::TextDecoration(DesignTextDecoration::Underline),
+                phase: DesignPanelEditPhase::Commit,
+            });
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TypographyPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                target: DesignTypographyTarget::SelectedTextRange,
+                property: DesignPanelProperty::FontSize,
+                value: DesignPanelValue::Number(99.0),
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Text(text) = &doc.scene.get(id).expect("text exists").data else {
+                panic!("text node");
+            };
+            assert_eq!(text.style.size_px, 28.0);
+            assert_eq!(text.style.weight, 600);
+            assert_eq!(text.style.line_height, 1.5);
+            assert_eq!(text.style.letter_spacing, 2.0);
+            assert!(text.style.underline);
+            assert_eq!(text.style_runs.len(), 1);
+            assert_eq!(text.style_runs[0].style.size_px, 28.0);
+            assert_eq!(text.style_runs[0].style.weight, 600);
+            assert_eq!(text.style_runs[0].style.line_height, 1.5);
+            assert_eq!(text.style_runs[0].style.letter_spacing, 2.0);
+            assert!(text.style_runs[0].style.underline);
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[test]
+    fn unsupported_node_paint_sections_are_hidden() {
+        let text = NodeData::Text(fanta_doc::TextNode::new("Hello", 100.0, 30.0));
+        let text_caps = gate_capabilities(
+            DesignPanelNodeKind::Text,
+            &text,
+            false,
+            DesignCornerCapabilities::NONE,
+        );
+        assert!(text_caps.fill);
+        assert!(!text_caps.stroke);
+        assert!(!text_caps.sections.contains(&DesignPanelSection::Stroke));
+
+        let boolean = NodeData::Boolean(BooleanNode::default());
+        let boolean_caps = gate_capabilities(
+            DesignPanelNodeKind::BooleanOperation,
+            &boolean,
+            false,
+            DesignCornerCapabilities::NONE,
+        );
+        assert!(!boolean_caps.fill && !boolean_caps.stroke);
+        assert!(!boolean_caps.sections.contains(&DesignPanelSection::Fill));
+        assert!(!boolean_caps.sections.contains(&DesignPanelSection::Stroke));
+
+        let vector = NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            FantaColor::BLACK,
+        ));
+        let vector_caps = gate_capabilities(
+            DesignPanelNodeKind::Rectangle,
+            &vector,
+            false,
+            DesignCornerCapabilities::NONE,
+        );
+        assert!(vector_caps.fill && vector_caps.stroke);
     }
 
     #[gpui::test]

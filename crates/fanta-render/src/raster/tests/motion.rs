@@ -261,6 +261,7 @@ fn motion_bound_property_overrides_the_resolved_variable_value() {
         mode_generation: 0,
         motion: Some(&motion),
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 

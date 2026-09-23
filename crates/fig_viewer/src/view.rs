@@ -17,7 +17,7 @@ use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
     AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, BoundProp,
-    CanvasNode, Doc, Easing, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
+    CanvasNode, Doc, Easing, Fill, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
     MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue,
     Transaction, Viewport,
 };
@@ -82,7 +82,7 @@ use crate::tools::{
 use crate::variables_workspace::FantaVariablesWorkspace;
 
 #[cfg(target_os = "macos")]
-use crate::canvas::{CanvasVideoFrame, GpuCanvas};
+use crate::canvas::{CanvasVideoFillFrame, CanvasVideoFrame, GpuCanvas};
 #[cfg(target_os = "macos")]
 use crate::video_playback::VideoPlaybackView;
 
@@ -339,7 +339,11 @@ pub struct FigView {
     #[cfg(target_os = "macos")]
     canvas_video: Option<CanvasVideoSession>,
     #[cfg(target_os = "macos")]
+    canvas_video_fills: HashMap<AssetId, CanvasVideoFillSession>,
+    #[cfg(target_os = "macos")]
     canvas_video_generation: u64,
+    #[cfg(target_os = "macos")]
+    canvas_video_fill_generation: u64,
     #[cfg(target_os = "macos")]
     canvas_video_removed: std::cell::Cell<bool>,
     #[cfg(target_os = "macos")]
@@ -418,6 +422,57 @@ struct CanvasVideoSession {
     audio: (bool, u32),
     bytes: Option<std::sync::Arc<[u8]>>,
     trim: Option<CanvasVideoTrim>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanvasVideoFillSource {
+    scene: u64,
+    node: NodeId,
+    asset: AssetId,
+    assets_identity: usize,
+    bytes_identity: Option<(usize, usize)>,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasVideoFillSession {
+    source: CanvasVideoFillSource,
+    generation: u64,
+    loading: Option<Task<()>>,
+    playback: Option<Entity<VideoPlaybackView>>,
+    observation: Option<Subscription>,
+    error: Option<SharedString>,
+}
+
+#[cfg(target_os = "macos")]
+fn video_fill_assets(node: &CanvasNode) -> Vec<AssetId> {
+    let mut assets = HashSet::new();
+    let mut add = |fill: &Fill| {
+        if let Fill::Video { video, .. } = fill {
+            assets.insert(video.asset);
+        }
+    };
+    match &node.data {
+        NodeData::Vector(vector) => {
+            vector.fills.iter().for_each(&mut add);
+            vector.strokes.iter().for_each(|stroke| add(&stroke.paint));
+        }
+        NodeData::Boolean(boolean) => {
+            boolean.fills.iter().for_each(&mut add);
+            boolean.strokes.iter().for_each(|stroke| add(&stroke.paint));
+        }
+        NodeData::Group(group) => {
+            if let Some(background) = &group.background {
+                add(background);
+            }
+            group.background_fills.iter().for_each(&mut add);
+            group.strokes.iter().for_each(|stroke| add(&stroke.paint));
+        }
+        _ => {}
+    }
+    let mut assets = assets.into_iter().collect::<Vec<_>>();
+    assets.sort_unstable();
+    assets
 }
 
 #[cfg(target_os = "macos")]
@@ -637,7 +692,11 @@ impl FigView {
             #[cfg(target_os = "macos")]
             canvas_video: None,
             #[cfg(target_os = "macos")]
+            canvas_video_fills: HashMap::new(),
+            #[cfg(target_os = "macos")]
             canvas_video_generation: 0,
+            #[cfg(target_os = "macos")]
+            canvas_video_fill_generation: 0,
             #[cfg(target_os = "macos")]
             canvas_video_removed: std::cell::Cell::new(false),
             #[cfg(target_os = "macos")]
@@ -4900,6 +4959,243 @@ impl FigView {
         ))
     }
 
+    fn selected_canvas_video_fill_sources(&self, cx: &App) -> Vec<CanvasVideoFillSource> {
+        let Some(document) = self.item.read(cx).document() else {
+            return Vec::new();
+        };
+        let Some(node_id) = single_selection(&document.doc) else {
+            return Vec::new();
+        };
+        if !crate::clipboard::node_is_on_active_page(&document.doc, node_id) {
+            return Vec::new();
+        }
+        let Some(node) = document.doc.scene.get(node_id) else {
+            return Vec::new();
+        };
+        video_fill_assets(node)
+            .into_iter()
+            .map(|asset| CanvasVideoFillSource {
+                scene: document.doc.scene.instance_id(),
+                node: node_id,
+                asset,
+                assets_identity: Arc::as_ptr(&document.raw_assets) as usize,
+                bytes_identity: document
+                    .raw_assets
+                    .get(&asset)
+                    .map(|bytes| (bytes.as_ptr() as usize, bytes.len())),
+            })
+            .collect()
+    }
+
+    pub(crate) fn selected_canvas_video_fill_assets(&self, cx: &App) -> Vec<AssetId> {
+        self.selected_canvas_video_fill_sources(cx)
+            .into_iter()
+            .map(|source| source.asset)
+            .collect()
+    }
+
+    fn remove_canvas_video_fill(&mut self, asset: AssetId, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_video_fills.remove(&asset) {
+            if let Some(playback) = session.playback {
+                playback.update(cx, |playback, cx| playback.close(cx));
+            }
+            self.rendered_canvas = None;
+            cx.notify();
+        }
+    }
+
+    fn clear_canvas_video_fills(&mut self, cx: &mut Context<Self>) {
+        let assets = self.canvas_video_fills.keys().copied().collect::<Vec<_>>();
+        for asset in assets {
+            self.remove_canvas_video_fill(asset, cx);
+        }
+    }
+
+    fn start_canvas_video_fill(&mut self, source: CanvasVideoFillSource, cx: &mut Context<Self>) {
+        self.canvas_video_fill_generation = self.canvas_video_fill_generation.wrapping_add(1);
+        let generation = self.canvas_video_fill_generation;
+        let Some(document) = self.item.read(cx).document() else {
+            return;
+        };
+        let raw_assets = document.raw_assets.clone();
+        let resolver = document.asset_resolver.clone();
+        let loading = cx.background_spawn(async move {
+            let resolved;
+            let bytes = if let Some(bytes) = raw_assets.get(&source.asset) {
+                bytes.as_slice()
+            } else {
+                resolved = resolver
+                    .as_ref()
+                    .and_then(|resolver| resolver.resolve_bytes(source.asset))
+                    .context("The video fill source is missing from this project.")?;
+                resolved.as_slice()
+            };
+            anyhow::ensure!(
+                !bytes.is_empty() && bytes.len() <= 100 * 1024 * 1024,
+                "The video fill must be nonempty and no larger than 100 MiB."
+            );
+            Ok(Arc::<[u8]>::from(bytes))
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = loading.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.finish_canvas_video_fill_load(source, generation, result, cx);
+            }) {
+                log::debug!("Canvas video fill owner was released: {error}");
+            }
+        });
+        self.canvas_video_fills.insert(
+            source.asset,
+            CanvasVideoFillSession {
+                source,
+                generation,
+                loading: Some(task),
+                playback: None,
+                observation: None,
+                error: None,
+            },
+        );
+        cx.notify();
+    }
+
+    fn finish_canvas_video_fill_load(
+        &mut self,
+        source: CanvasVideoFillSource,
+        generation: u64,
+        result: Result<Arc<[u8]>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.canvas_video_removed.get()
+            || !self
+                .selected_canvas_video_fill_sources(cx)
+                .contains(&source)
+            || !self
+                .canvas_video_fills
+                .get(&source.asset)
+                .is_some_and(|session| session.source == source && session.generation == generation)
+        {
+            return;
+        }
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if let Some(session) = self.canvas_video_fills.get_mut(&source.asset) {
+                    session.loading = None;
+                    session.error = Some(format!("Could not load video fill: {error:#}").into());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let playback = cx.new(|cx| VideoPlaybackView::new(bytes, 2048, cx));
+        playback.update(cx, |playback, cx| {
+            playback.set_audio(true, 0.0, cx);
+            playback.set_active(self.canvas_video_active.get(), cx);
+        });
+        let observation = cx.observe(&playback, |_, _, cx| cx.notify());
+        if let Some(session) = self.canvas_video_fills.get_mut(&source.asset) {
+            session.loading = None;
+            session.playback = Some(playback);
+            session.observation = Some(observation);
+            cx.notify();
+        }
+    }
+
+    fn sync_canvas_video_fills(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.canvas_video_removed.get()
+            || self.prototype_player.is_some()
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+        {
+            self.clear_canvas_video_fills(cx);
+            return;
+        }
+        let sources = self.selected_canvas_video_fill_sources(cx);
+        let desired = sources
+            .iter()
+            .map(|source| (source.asset, *source))
+            .collect::<HashMap<_, _>>();
+        let stale = self
+            .canvas_video_fills
+            .iter()
+            .filter_map(|(&asset, session)| {
+                (desired.get(&asset) != Some(&session.source)).then_some(asset)
+            })
+            .collect::<Vec<_>>();
+        for asset in stale {
+            self.remove_canvas_video_fill(asset, cx);
+        }
+        self.canvas_video_active.set(window.is_window_active());
+        for source in sources {
+            if !self.canvas_video_fills.contains_key(&source.asset) {
+                self.start_canvas_video_fill(source, cx);
+            }
+        }
+        for session in self.canvas_video_fills.values() {
+            if let Some(playback) = &session.playback {
+                playback.update(cx, |playback, cx| {
+                    playback.set_active(window.is_window_active(), cx);
+                    playback.tick(window, cx);
+                });
+            }
+        }
+    }
+
+    pub(crate) fn ensure_video_fill_playback(&mut self, asset: AssetId, cx: &mut Context<Self>) {
+        if self.canvas_video_fills.contains_key(&asset) {
+            return;
+        }
+        if let Some(source) = self
+            .selected_canvas_video_fill_sources(cx)
+            .into_iter()
+            .find(|source| source.asset == asset)
+        {
+            self.start_canvas_video_fill(source, cx);
+        }
+    }
+
+    pub(crate) fn video_fill_playback(&self, asset: AssetId) -> Option<Entity<VideoPlaybackView>> {
+        self.canvas_video_fills.get(&asset)?.playback.clone()
+    }
+
+    pub(crate) fn video_fill_error(&self, asset: AssetId) -> Option<SharedString> {
+        self.canvas_video_fills.get(&asset)?.error.clone()
+    }
+
+    pub(crate) fn video_fill_loading(&self, asset: AssetId) -> bool {
+        self.canvas_video_fills.get(&asset).is_some_and(|session| {
+            session.error.is_none() && (session.loading.is_some() || session.playback.is_none())
+        })
+    }
+
+    pub(crate) fn canvas_video_fill_frames(&self, cx: &App) -> Vec<CanvasVideoFillFrame> {
+        if !self.canvas_video_active.get() || self.canvas_video_removed.get() {
+            return Vec::new();
+        }
+        let selected = self
+            .selected_canvas_video_fill_sources(cx)
+            .into_iter()
+            .map(|source| source.asset)
+            .collect::<HashSet<_>>();
+        let mut frames = self
+            .canvas_video_fills
+            .iter()
+            .filter_map(|(&asset, session)| {
+                if !selected.contains(&asset) {
+                    return None;
+                }
+                let playback = session.playback.as_ref()?.read(cx);
+                Some(CanvasVideoFillFrame {
+                    asset,
+                    buffer: playback.frame()?,
+                    session_revision: session.generation,
+                    revision: playback.frame_revision(),
+                })
+            })
+            .collect::<Vec<_>>();
+        frames.sort_unstable_by_key(|frame| frame.asset);
+        frames
+    }
+
     fn clear_canvas_video(&mut self, cx: &mut Context<Self>) {
         if let Some(session) = self.canvas_video.take() {
             if let Some(playback) = session.playback {
@@ -4922,6 +5218,11 @@ impl FigView {
             .and_then(|session| session.playback.as_ref())
         {
             playback.update(cx, |playback, cx| playback.set_active(active, cx));
+        }
+        for session in self.canvas_video_fills.values() {
+            if let Some(playback) = &session.playback {
+                playback.update(cx, |playback, cx| playback.set_active(active, cx));
+            }
         }
     }
 
@@ -5565,6 +5866,8 @@ impl Render for FigView {
         let editor_mode = self.editor_mode(cx);
         #[cfg(target_os = "macos")]
         self.sync_canvas_video(window.is_window_active(), cx);
+        #[cfg(target_os = "macos")]
+        self.sync_canvas_video_fills(window, cx);
         #[cfg(feature = "fanta-gpui-ui")]
         if editor_workspace == EditorWorkspace::Canvas {
             // Hidden canvas inspectors must not project document data on table scrolls.
@@ -6347,6 +6650,7 @@ impl Item for FigView {
         #[cfg(target_os = "macos")]
         if self.canvas_video_removed.replace(false) {
             self.clear_canvas_video(_cx);
+            self.clear_canvas_video_fills(_cx);
         }
     }
 
@@ -6371,6 +6675,11 @@ impl Item for FigView {
                 .and_then(|session| session.playback.as_ref())
             {
                 playback.update(_cx, |playback, cx| playback.close(cx));
+            }
+            for session in self.canvas_video_fills.values() {
+                if let Some(playback) = &session.playback {
+                    playback.update(_cx, |playback, cx| playback.close(cx));
+                }
             }
         }
     }
@@ -6728,7 +7037,11 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 canvas_video: None,
                 #[cfg(target_os = "macos")]
+                canvas_video_fills: HashMap::new(),
+                #[cfg(target_os = "macos")]
                 canvas_video_generation: 0,
+                #[cfg(target_os = "macos")]
+                canvas_video_fill_generation: 0,
                 #[cfg(target_os = "macos")]
                 canvas_video_removed: std::cell::Cell::new(false),
                 #[cfg(target_os = "macos")]
@@ -6864,6 +7177,110 @@ mod tests {
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;
     use settings::SettingsStore;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn video_fill_assets_collects_distinct_sources_from_shape_and_frame_paints() {
+        let first = AssetId::new();
+        let second = AssetId::new();
+        let make_fill = |asset| Fill::Video {
+            video: Box::new(fanta_doc::VideoFill {
+                asset,
+                poster: None,
+                mode: fanta_doc::ImageFitMode::Fill,
+                crop: None,
+                scale: None,
+                rotation: None,
+                adjust: fanta_doc::ImageAdjust::default(),
+            }),
+            opacity: 1.0,
+            blend: fanta_doc::BlendMode::Normal,
+        };
+        let mut vector = VectorNode::rect_solid(0.0, 0.0, 40.0, 40.0, Color::BLACK);
+        vector.fills.clear();
+        vector.fills.push(make_fill(first));
+        vector.fills.push(make_fill(second));
+        vector.strokes.push(fanta_doc::Stroke {
+            paint: make_fill(first),
+            ..fanta_doc::Stroke::solid(Color::BLACK, 1.0)
+        });
+        let shape = CanvasNode::new(NodeData::Vector(vector));
+        let mut actual = video_fill_assets(&shape);
+        actual.sort_unstable();
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+
+        let frame = CanvasNode::new(NodeData::Group(GroupNode {
+            background: Some(make_fill(first)),
+            background_fills: [make_fill(second)].into_iter().collect(),
+            ..GroupNode::default()
+        }));
+        assert_eq!(video_fill_assets(&frame), expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn video_fill_sessions_are_per_asset_and_stale_loads_cannot_reopen_them(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, _, item, view) = autosave_fixture(cx).await;
+        let assets = [AssetId::new(), AssetId::new()];
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut vector = VectorNode::rect_solid(0.0, 0.0, 40.0, 40.0, Color::BLACK);
+                vector.fills.clear();
+                for asset in assets {
+                    vector.fills.push(Fill::Video {
+                        video: Box::new(fanta_doc::VideoFill {
+                            asset,
+                            poster: None,
+                            mode: fanta_doc::ImageFitMode::Fill,
+                            crop: None,
+                            scale: None,
+                            rotation: None,
+                            adjust: fanta_doc::ImageAdjust::default(),
+                        }),
+                        opacity: 1.0,
+                        blend: fanta_doc::BlendMode::Normal,
+                    });
+                }
+                let mut shape = CanvasNode::new(NodeData::Vector(vector));
+                shape.parent = document.doc.active_page();
+                let id = shape.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(shape))
+                    .expect("create video fill shape");
+                document.doc.selection.replace_with([id]);
+                ((), DocChange::Content)
+            });
+        });
+        view.update(cx, |view, cx| {
+            let sources = view.selected_canvas_video_fill_sources(cx);
+            assert_eq!(sources.len(), 2);
+            for source in sources {
+                view.ensure_video_fill_playback(source.asset, cx);
+            }
+            assert_eq!(view.canvas_video_fills.len(), 2);
+            assert_ne!(
+                view.canvas_video_fills[&assets[0]].generation,
+                view.canvas_video_fills[&assets[1]].generation
+            );
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.clear();
+                ((), DocChange::Selection)
+            });
+        });
+        view.update(cx, |view, cx| view.clear_canvas_video_fills(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert!(view.canvas_video_fills.is_empty());
+            assert!(view.canvas_video_fill_frames(cx).is_empty());
+        });
+    }
 
     #[cfg(target_os = "macos")]
     async fn canvas_video_fixture(
@@ -10049,6 +10466,15 @@ impl FigView {
 
     #[cfg(feature = "fanta-gpui-ui")]
     fn invert_draw_selection(&mut self, cx: &mut Context<Self>) {
+        if self
+            .item
+            .read(cx)
+            .document()
+            .is_some_and(|document| self.tools.invert_draw_selection_region(&document.doc))
+        {
+            cx.notify();
+            return;
+        }
         self.tools.clear_draw_selection_region();
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {

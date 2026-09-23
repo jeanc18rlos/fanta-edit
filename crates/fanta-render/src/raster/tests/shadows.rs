@@ -416,6 +416,7 @@ fn instance_inner_shadow_uses_its_box_silhouette() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
     let mut r = RasterRenderer::new(64, 64).unwrap();

@@ -43,7 +43,7 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
                 paint.set_blend_mode(to_sk_blend_mode(*blend));
             }
         }
-        Fill::Image { .. } | Fill::Pattern { .. } => {
+        Fill::Image { .. } | Fill::Video { .. } | Fill::Pattern { .. } | Fill::Shader { .. } => {
             // Image and pattern fills are resolved by the renderer (it knows the
             // asset store and scene) and applied as shaders at draw time. The
             // paint we hand back here is a transparent-magenta placeholder so

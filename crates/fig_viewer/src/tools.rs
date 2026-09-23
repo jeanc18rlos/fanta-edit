@@ -318,6 +318,20 @@ impl ToolShell {
         self.overlays.clear();
     }
 
+    pub fn invert_draw_selection_region(&mut self, doc: &Doc) -> bool {
+        let Some(region) = self
+            .draw_selection_region
+            .as_ref()
+            .and_then(|region| region.inverted(&doc.scene))
+        else {
+            return false;
+        };
+        self.draw_selection_region = Some(region);
+        self.overlays.clear();
+        self.append_selection_region_overlay();
+        true
+    }
+
     fn append_selection_region_overlay(&mut self) {
         if let Some(region) = &self.draw_selection_region {
             self.overlays.extend(region.shape.overlays());
@@ -670,5 +684,61 @@ mod tests {
         );
         assert_eq!(children[1], node_id);
         assert!(shell.draw_selection_region.is_none());
+    }
+
+    #[test]
+    fn inverting_draw_region_keeps_it_available_for_crop() {
+        use fanta_doc::{Bounds, CanvasNode, NodeData, Operation, VectorNode};
+        use fanta_tools::select::{DrawSelectionShape, DrawShapeOperation};
+
+        let mut doc = Doc::new();
+        let node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -100.0,
+            -100.0,
+            200.0,
+            200.0,
+            Color::WHITE,
+        )));
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create vector");
+        doc.selection.select_only(node_id);
+        let mut shell = ToolShell::new();
+        shell.draw_selection_region = Some(DrawSelectionRegion {
+            shape: DrawSelectionShape::Rectangle(Bounds::from_xywh(-50., -50., 100., 100.)),
+            targets: vec![node_id],
+        });
+        assert!(shell.invert_draw_selection_region(&doc));
+        assert!(matches!(
+            shell
+                .draw_selection_region
+                .as_ref()
+                .map(|region| &region.shape),
+            Some(DrawSelectionShape::Combined {
+                operation: DrawShapeOperation::Subtract,
+                ..
+            })
+        ));
+        assert!(doc.selection.contains(node_id));
+
+        let mut viewport = Viewport::default();
+        let mut context = tool_context(
+            &mut doc,
+            &mut viewport,
+            DVec2::new(800.0, 600.0),
+            ToolKind::Crop,
+        );
+        context.draw_content_only = true;
+        shell.activate(ToolKind::Crop, &mut context);
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Key(KeyEvent::press(LogicalKey::Enter)),
+        );
+        let crop_id = context.doc.selection.as_slice()[0];
+        let mask_id = context.doc.scene.children_of(Some(crop_id))[0];
+        assert!(matches!(
+            &context.doc.scene.get(mask_id).expect("mask").data,
+            NodeData::Boolean(boolean) if boolean.op == fanta_doc::BooleanOp::Subtract
+        ));
     }
 }

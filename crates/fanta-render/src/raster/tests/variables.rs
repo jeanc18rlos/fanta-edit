@@ -97,6 +97,7 @@ fn bound_fill_paints_dark_color_when_active_mode_is_dark() {
         mode_generation: 1,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -152,6 +153,7 @@ fn bound_fill_paints_default_mode_color_when_no_active_mode() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -194,6 +196,7 @@ fn bound_frame_background_paints_dark_color_when_active_mode_is_dark() {
         mode_generation: 1,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -269,6 +272,7 @@ fn component_alias_reexpands_on_mode_change() -> Result<(), Box<dyn std::error::
             mode_generation: 1,
             motion: None,
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         },
     );
@@ -289,6 +293,7 @@ fn component_alias_reexpands_on_mode_change() -> Result<(), Box<dyn std::error::
             mode_generation: 2,
             motion: None,
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         },
     );

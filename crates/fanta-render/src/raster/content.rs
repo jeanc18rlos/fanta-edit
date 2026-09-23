@@ -5,8 +5,8 @@
 use super::{
     AudioNode, Bounds, Canvas, CanvasNode, Color, Fill, GroupNode, Model3dNode, NodeData, NodeId,
     Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached, draw_pattern_fill,
-    draw_placeholder, draw_text_node, draw_vector, fill_to_paint, rounded_rect_path,
-    stroke_box_path,
+    draw_placeholder, draw_shader_fill, draw_text_node, draw_vector, draw_video_fill,
+    fill_to_paint, rounded_rect_path, stroke_box_path,
 };
 
 /// This node's live playback position (0..=1) from the app-playback→render seam,
@@ -323,6 +323,28 @@ fn paint_group(
                     return;
                 }
                 ctx.layer_volatile = true;
+            }
+            if let Fill::Shader {
+                shader,
+                opacity,
+                blend,
+            } = fill
+            {
+                if draw_shader_fill(canvas, path, b, shader, *opacity, *blend, ctx.paint_alpha) {
+                    ctx.metrics.nodes_drawn += 1;
+                    return;
+                }
+            }
+            if let Fill::Video {
+                video,
+                opacity,
+                blend,
+            } = fill
+            {
+                if draw_video_fill(canvas, path, b, video, *opacity, *blend, ctx) {
+                    ctx.metrics.nodes_drawn += 1;
+                    return;
+                }
             }
             if let Fill::Image {
                 asset,

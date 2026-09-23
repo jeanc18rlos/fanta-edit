@@ -3554,9 +3554,11 @@ fn page_image_assets(doc: &Doc, page_root: NodeId) -> Vec<AssetId> {
 fn image_fill_asset(fill: &fanta_doc::Fill) -> Option<AssetId> {
     match fill {
         fanta_doc::Fill::Image { asset, .. } => Some(*asset),
+        fanta_doc::Fill::Video { video, .. } => video.poster,
         fanta_doc::Fill::Solid { .. }
         | fanta_doc::Fill::Gradient { .. }
-        | fanta_doc::Fill::Pattern { .. } => None,
+        | fanta_doc::Fill::Pattern { .. }
+        | fanta_doc::Fill::Shader { .. } => None,
     }
 }
 

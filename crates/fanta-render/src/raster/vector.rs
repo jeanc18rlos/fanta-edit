@@ -3,8 +3,9 @@
 //! the debug placeholder / unresolved-instance outline helpers.
 use super::{
     Bounds, CachedVectorPaths, Canvas, Color, Fill, ImageFillMods, NodeId, Paint, Rect, RenderCtx,
-    draw_image_cached, draw_pattern_fill, fill_to_paint, pattern_paint, scale_paint_alpha,
-    stroke_to_paint, to_sk_color, to_sk_fill_path, to_sk_path,
+    draw_image_cached, draw_pattern_fill, draw_shader_fill, draw_video_fill, fill_to_paint,
+    pattern_paint, scale_paint_alpha, shader_paint, stroke_to_paint, to_sk_color, to_sk_fill_path,
+    to_sk_path,
 };
 
 /// Whether a [`PathData`] is an axis-aligned rectangle (the shape `corner_radius`
@@ -196,12 +197,25 @@ pub(crate) fn stroke_sk_path(
             // no enclosing effects layer may be cached from this frame.
             ctx.layer_volatile = true;
         }
+        if matches!(stroke.paint, Fill::Video { .. }) {
+            if draw_video_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
+                ctx.metrics.nodes_drawn += 1;
+                continue;
+            }
+            ctx.layer_volatile = true;
+        }
         if matches!(stroke.paint, Fill::Pattern { .. }) {
             if draw_pattern_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
             ctx.layer_volatile = true;
+        }
+        if matches!(stroke.paint, Fill::Shader { .. }) {
+            if draw_shader_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
+                ctx.metrics.nodes_drawn += 1;
+                continue;
+            }
         }
         // `ctx.paint_alpha` is 1.0 unless the walk folded this leaf's node
         // opacity into its single draw (see `opacity_folds_into_paint`).
@@ -360,6 +374,99 @@ fn draw_pattern_stroke(
     true
 }
 
+fn draw_video_stroke(
+    canvas: &Canvas,
+    sk_path: &skia_safe::Path,
+    stroke: &fanta_doc::Stroke,
+    local_bounds_f32: [f32; 4],
+    ctx: &mut RenderCtx,
+) -> bool {
+    let Fill::Video {
+        video,
+        opacity,
+        blend,
+    } = &stroke.paint
+    else {
+        return false;
+    };
+    let mut geometry = stroke_to_paint(stroke, local_bounds_f32);
+    if !matches!(stroke.align, fanta_doc::StrokeAlign::Center) {
+        geometry.set_stroke_width((stroke.width * 2.0) as f32);
+    }
+    let mut outline = skia_safe::Path::new();
+    if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geometry, &mut outline, None, None) {
+        return false;
+    }
+    let [x, y, width, height] = local_bounds_f32;
+    let outset = match stroke.align {
+        fanta_doc::StrokeAlign::Inside => 0.0,
+        fanta_doc::StrokeAlign::Center => stroke.width as f32 * 0.5,
+        fanta_doc::StrokeAlign::Outside => stroke.width as f32,
+    };
+    let bounds = Bounds::from_xywh(
+        (x - outset) as f64,
+        (y - outset) as f64,
+        (width + 2.0 * outset) as f64,
+        (height + 2.0 * outset) as f64,
+    );
+    canvas.save();
+    match stroke.align {
+        fanta_doc::StrokeAlign::Inside => {
+            canvas.clip_path(sk_path, skia_safe::ClipOp::Intersect, true);
+        }
+        fanta_doc::StrokeAlign::Outside => {
+            canvas.clip_path(sk_path, skia_safe::ClipOp::Difference, true);
+        }
+        fanta_doc::StrokeAlign::Center => {}
+    }
+    let drawn = draw_video_fill(canvas, &outline, bounds, video, *opacity, *blend, ctx);
+    canvas.restore();
+    drawn
+}
+
+fn draw_shader_stroke(
+    canvas: &Canvas,
+    sk_path: &skia_safe::Path,
+    stroke: &fanta_doc::Stroke,
+    local_bounds_f32: [f32; 4],
+    ctx: &mut RenderCtx,
+) -> bool {
+    let Fill::Shader {
+        shader,
+        opacity,
+        blend,
+    } = &stroke.paint
+    else {
+        return false;
+    };
+    let mut geometry = stroke_to_paint(stroke, local_bounds_f32);
+    if !matches!(stroke.align, fanta_doc::StrokeAlign::Center) {
+        geometry.set_stroke_width((stroke.width * 2.0) as f32);
+    }
+    let mut outline = skia_safe::Path::new();
+    if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geometry, &mut outline, None, None) {
+        return false;
+    }
+    let [x, y, width, height] = local_bounds_f32;
+    let bounds = Bounds::from_xywh(x as f64, y as f64, width as f64, height as f64);
+    let Some(paint) = shader_paint(bounds, shader, *opacity, *blend, ctx.paint_alpha) else {
+        return false;
+    };
+    canvas.save();
+    match stroke.align {
+        fanta_doc::StrokeAlign::Inside => {
+            canvas.clip_path(sk_path, skia_safe::ClipOp::Intersect, true);
+        }
+        fanta_doc::StrokeAlign::Outside => {
+            canvas.clip_path(sk_path, skia_safe::ClipOp::Difference, true);
+        }
+        fanta_doc::StrokeAlign::Center => {}
+    }
+    canvas.draw_path(&outline, &paint);
+    canvas.restore();
+    true
+}
+
 pub(crate) fn stroke_box_path(
     canvas: &Canvas,
     local_bounds_f32: [f32; 4],
@@ -395,7 +502,10 @@ pub(crate) fn stroke_box_path(
         // An image-paint box border can't be a color/shader stroke; route it
         // through the outline-and-clip path (`stroke_sk_path` → `draw_image_stroke`)
         // on the box outline so the ring is filled with the image.
-        if matches!(stroke.paint, Fill::Image { .. } | Fill::Pattern { .. }) {
+        if matches!(
+            stroke.paint,
+            Fill::Image { .. } | Fill::Video { .. } | Fill::Pattern { .. } | Fill::Shader { .. }
+        ) {
             let box_path = original_path();
             stroke_sk_path(
                 canvas,
@@ -545,21 +655,64 @@ pub(crate) fn draw_per_side_border(
                 stroke_to_paint(stroke, local_bounds_f32)
             }
         }
+    } else if let Fill::Shader {
+        shader,
+        opacity,
+        blend,
+    } = &stroke.paint
+    {
+        let bounds = Bounds::from_xywh(x as f64, y as f64, w as f64, h as f64);
+        shader_paint(bounds, shader, *opacity, *blend, ctx.paint_alpha)
+            .unwrap_or_else(|| stroke_to_paint(stroke, local_bounds_f32))
     } else {
         stroke_to_paint(stroke, local_bounds_f32)
     };
     paint.set_style(skia_safe::paint::Style::Fill);
     paint.set_path_effect(None); // edges are solid bands, not dashed lines
 
+    let video_bounds = matches!(stroke.paint, Fill::Video { .. }).then(|| {
+        let outer_fraction = match stroke.align {
+            fanta_doc::StrokeAlign::Inside => 0.0,
+            fanta_doc::StrokeAlign::Center => 0.5,
+            fanta_doc::StrokeAlign::Outside => 1.0,
+        };
+        let outset = sides
+            .iter()
+            .fold(0.0_f64, |maximum, width| maximum.max(*width)) as f32
+            * outer_fraction;
+        Bounds::from_xywh(
+            (x - outset) as f64,
+            (y - outset) as f64,
+            (w + 2.0 * outset) as f64,
+            (h + 2.0 * outset) as f64,
+        )
+    });
+
     // Rounded outline: axis-aligned bands cannot follow the corner arcs (the
     // band fades out where the arc curves away from the edge, dropping the
     // stroke exactly where Figma paints it through the corner). Build each
     // side's band as real ring geometry instead; the plain-rect fast path below
     // stays byte-identical.
-    if shape_path.is_rect().is_none()
-        && draw_per_side_border_rounded(canvas, shape_path, stroke, sides, &paint)
-    {
-        return true;
+    if shape_path.is_rect().is_none() {
+        if let Some(bands) = per_side_border_rounded_paths(shape_path, stroke, sides) {
+            for band in &bands {
+                let drawn = match (&stroke.paint, video_bounds) {
+                    (
+                        Fill::Video {
+                            video,
+                            opacity,
+                            blend,
+                        },
+                        Some(bounds),
+                    ) => draw_video_fill(canvas, band, bounds, video, *opacity, *blend, ctx),
+                    _ => false,
+                };
+                if !drawn {
+                    canvas.draw_path(band, &paint);
+                }
+            }
+            return true;
+        }
     }
 
     // For each side, `(outer_off, inner_off)` are how far the band extends past
@@ -608,6 +761,7 @@ pub(crate) fn draw_per_side_border(
     // is fine for a single-color border; for differing widths the corner is owned
     // by whichever edge is wider, matching Figma's overlap).
     let mut drew = false;
+    let mut video_bands = video_bounds.map(|_| skia_safe::Path::new());
     if t > 0.0 {
         let rect = Rect::from_ltrb(
             x0 - l * out_frac,
@@ -615,7 +769,11 @@ pub(crate) fn draw_per_side_border(
             x1 + r * out_frac,
             y0 + t * in_frac,
         );
-        canvas.draw_rect(rect, &paint);
+        if let Some(path) = &mut video_bands {
+            path.add_rect(rect, None);
+        } else {
+            canvas.draw_rect(rect, &paint);
+        }
         drew = true;
     }
     if b > 0.0 {
@@ -625,7 +783,11 @@ pub(crate) fn draw_per_side_border(
             x1 + r * out_frac,
             y1 + b * out_frac,
         );
-        canvas.draw_rect(rect, &paint);
+        if let Some(path) = &mut video_bands {
+            path.add_rect(rect, None);
+        } else {
+            canvas.draw_rect(rect, &paint);
+        }
         drew = true;
     }
     if l > 0.0 {
@@ -635,7 +797,11 @@ pub(crate) fn draw_per_side_border(
             x0 + l * in_frac,
             y1 + b * out_frac,
         );
-        canvas.draw_rect(rect, &paint);
+        if let Some(path) = &mut video_bands {
+            path.add_rect(rect, None);
+        } else {
+            canvas.draw_rect(rect, &paint);
+        }
         drew = true;
     }
     if r > 0.0 {
@@ -645,8 +811,26 @@ pub(crate) fn draw_per_side_border(
             x1 + r * out_frac,
             y1 + b * out_frac,
         );
-        canvas.draw_rect(rect, &paint);
+        if let Some(path) = &mut video_bands {
+            path.add_rect(rect, None);
+        } else {
+            canvas.draw_rect(rect, &paint);
+        }
         drew = true;
+    }
+    if let (
+        Some(path),
+        Some(bounds),
+        Fill::Video {
+            video,
+            opacity,
+            blend,
+        },
+    ) = (video_bands, video_bounds, &stroke.paint)
+    {
+        if !draw_video_fill(canvas, &path, bounds, video, *opacity, *blend, ctx) {
+            canvas.draw_path(&path, &paint);
+        }
     }
     if clip_to_shape {
         canvas.restore();
@@ -672,20 +856,18 @@ pub(crate) fn draw_per_side_border(
 /// of the adjacent arcs (CSS's border-corner ownership, which is also how Figma
 /// resolves differing side widths at a corner).
 ///
-/// Returns `false` when any Skia path op fails (degenerate geometry); the caller
+/// Returns `None` when any Skia path op fails (degenerate geometry); the caller
 /// then falls back to the axis-aligned band path (previous behavior).
-fn draw_per_side_border_rounded(
-    canvas: &Canvas,
+fn per_side_border_rounded_paths(
     shape_path: &skia_safe::Path,
     stroke: &fanta_doc::Stroke,
     sides: [f64; 4],
-    paint: &Paint,
-) -> bool {
+) -> Option<Vec<skia_safe::Path>> {
     let bounds = shape_path.compute_tight_bounds();
     let (x0, y0, x1, y1) = (bounds.left, bounds.top, bounds.right, bounds.bottom);
     let (w, h) = (x1 - x0, y1 - y0);
     if w <= 0.0 || h <= 0.0 {
-        return false;
+        return None;
     }
     let widths = sides.map(|v| v.max(0.0) as f32);
     // Outward reach of the widest band + margin, so every wedge fully covers
@@ -776,19 +958,16 @@ fn draw_per_side_border_rounded(
         let Some(band) =
             ring_for(*width).and_then(|ring| ring.op(wedge, skia_safe::PathOp::Intersect))
         else {
-            return false;
+            return None;
         };
         bands.push(band);
     }
     // All-zero sides: nothing to draw — report unhandled so the caller keeps
     // the same fall-through the axis-aligned path has.
     if bands.is_empty() {
-        return false;
+        return None;
     }
-    for band in &bands {
-        canvas.draw_path(band, paint);
-    }
-    true
+    Some(bands)
 }
 
 /// Build the silhouette of `shape_path` grown **outward** by `offset` logical px,
@@ -897,6 +1076,36 @@ pub(crate) fn paint_path_fills(
                 continue;
             }
             ctx.layer_volatile = true;
+        }
+        if let Fill::Shader {
+            shader,
+            opacity,
+            blend,
+        } = fill
+        {
+            if draw_shader_fill(
+                canvas,
+                fill_path,
+                bounds,
+                shader,
+                *opacity,
+                *blend,
+                ctx.paint_alpha,
+            ) {
+                ctx.metrics.nodes_drawn += 1;
+                continue;
+            }
+        }
+        if let Fill::Video {
+            video,
+            opacity,
+            blend,
+        } = fill
+        {
+            if draw_video_fill(canvas, fill_path, bounds, video, *opacity, *blend, ctx) {
+                ctx.metrics.nodes_drawn += 1;
+                continue;
+            }
         }
         // Image fills route through the same decode/fit path as BitmapNode:
         // clip to the path, then draw the image fitted to the path's bounding

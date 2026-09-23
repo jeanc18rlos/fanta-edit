@@ -93,8 +93,10 @@ mod layer_cache;
 mod media;
 mod pattern;
 mod renderer;
+mod shader;
 mod text;
 mod vector;
+mod video_fill;
 mod walk;
 
 #[cfg(test)]
@@ -131,11 +133,13 @@ pub(crate) use pattern::{PatternCache, draw_pattern_fill, pattern_paint};
 pub(crate) use renderer::{
     BooleanCache, CachedVectorPaths, InstanceCache, InstanceCacheKey, PathCache,
 };
+pub(crate) use shader::{draw_shader_fill, shader_paint};
 pub(crate) use text::{draw_text_node, with_shaped_layout};
 pub(crate) use vector::{
     bounds_to_f32, draw_placeholder, draw_unresolved_outline, draw_vector, path_is_rect,
     rounded_rect_path, stroke_box_path,
 };
+pub(crate) use video_fill::draw_video_fill;
 pub(crate) use walk::{RenderCtx, paint_child_sequence, render_node, resolve_overlay};
 
 // Internals exercised ONLY by the co-located `tests` module (and otherwise used

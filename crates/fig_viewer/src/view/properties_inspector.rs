@@ -577,7 +577,7 @@ fn motion_view_data(
     data
 }
 
-fn motion_preset_available(doc: &fanta_doc::Doc, item_editable: bool) -> bool {
+pub(super) fn motion_preset_available(doc: &fanta_doc::Doc, item_editable: bool) -> bool {
     item_editable
         && super::single_selection(doc)
             .is_some_and(|id| crate::layer_context_ops::editable(doc, id))

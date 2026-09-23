@@ -5,12 +5,12 @@
 use super::effects::{effects_layer_paint, group_clips_children};
 use super::layer_cache::{LayerCache, LayerLookup, render_layer_via_cache};
 use super::{
-    AssetResolver, BlendMode, BooleanCache, Bounds, Canvas, CanvasNode, IdHashMap, ImageCache,
-    InstanceCache, MaskType, NodeData, NodeFlags, NodeId, Paint, PathCache, PatternCache,
-    RenderInputs, RenderMetrics, Scene, Transform2D, apply_background_blur, draw_inner_shadows,
-    effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect, paint_node_content,
-    paint_node_foreground, render_instance, resolve_bound_value, shadow_expanded_local_bounds,
-    to_sk_matrix, visible_effects,
+    AssetResolver, BlendMode, BooleanCache, Bounds, Canvas, CanvasNode, Fill, IdHashMap,
+    ImageCache, InstanceCache, MaskType, NodeData, NodeFlags, NodeId, Paint, PathCache,
+    PatternCache, RenderInputs, RenderMetrics, Scene, Transform2D, apply_background_blur,
+    draw_inner_shadows, effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect,
+    paint_node_content, paint_node_foreground, render_instance, resolve_bound_value,
+    shadow_expanded_local_bounds, to_sk_matrix, visible_effects,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,7 @@ pub(crate) struct RenderCtx<'a> {
     /// Whether this frame may ADD entries to the layer cache (see
     /// [`LayerCache::begin_frame`]). Never true when lookups are off.
     pub(crate) layer_cache_populate: bool,
+    pub(crate) live_video_fill_subtrees: IdHashMap<NodeId, bool>,
     /// Set by content painters when what they drew may change without any
     /// [`LayerEpoch`](super::layer_cache::LayerEpoch) input moving — an
     /// unresolved image (placeholder), live media, an orbitable 3D model.
@@ -87,6 +88,45 @@ pub(crate) struct RenderCtx<'a> {
     /// store a volatile layer; nested layers propagate it outward.
     pub(crate) layer_volatile: bool,
     pub(crate) metrics: &'a mut RenderMetrics,
+}
+
+fn subtree_has_live_video_fill(ctx: &mut RenderCtx, id: NodeId) -> bool {
+    let Some(frames) = ctx
+        .inputs
+        .video_fill_frames
+        .filter(|frames| !frames.is_empty())
+    else {
+        return false;
+    };
+    if let Some(live) = ctx.live_video_fill_subtrees.get(&id) {
+        return *live;
+    }
+    let is_live = |fill: &Fill| matches!(fill, Fill::Video { video, .. } if frames.contains_key(&video.asset));
+    let own_fill_is_live = ctx.scene.get(id).is_some_and(|node| match &node.data {
+        NodeData::Vector(vector) => {
+            vector.fills.iter().any(&is_live)
+                || vector.strokes.iter().any(|stroke| is_live(&stroke.paint))
+        }
+        NodeData::Boolean(boolean) => {
+            boolean.fills.iter().any(&is_live)
+                || boolean.strokes.iter().any(|stroke| is_live(&stroke.paint))
+        }
+        NodeData::Group(group) => {
+            group.background.as_ref().is_some_and(&is_live)
+                || group.background_fills.iter().any(&is_live)
+                || group.strokes.iter().any(|stroke| is_live(&stroke.paint))
+        }
+        _ => false,
+    });
+    let scene: &Scene = ctx.scene;
+    let live = own_fill_is_live
+        || scene
+            .children_of(Some(id))
+            .iter()
+            .copied()
+            .any(|child| subtree_has_live_video_fill(ctx, child));
+    ctx.live_video_fill_subtrees.insert(id, live);
+    live
 }
 
 /// The transform that will actually be painted for a live node this frame.
@@ -351,7 +391,9 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             // cache — pixel-identical, for a whole-device-pixel pan at the
             // same zoom — or rendered through an offscreen that populates it.
             // Everything else takes the direct save-layer path.
-            let cacheable = ctx.layer_cache_lookups && path_cache_id.is_some();
+            let cacheable = ctx.layer_cache_lookups
+                && path_cache_id.is_some()
+                && !subtree_has_live_video_fill(ctx, id);
             let served = cacheable
                 && matches!(
                     ctx.layer_cache.lookup(canvas, id, &layer.composite_paint()),

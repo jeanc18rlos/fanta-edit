@@ -169,6 +169,18 @@ pub enum Fill {
         #[serde(default, skip_serializing_if = "ImageAdjust::is_default")]
         adjust: ImageAdjust,
     },
+    /// A video source painted into a shape or frame. The decoded poster is
+    /// stored separately so saved documents render without active playback.
+    Video {
+        video: Box<VideoFill>,
+        #[serde(
+            default = "default_opacity",
+            skip_serializing_if = "is_default_opacity"
+        )]
+        opacity: f32,
+        #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+        blend: BlendMode,
+    },
     /// A live scene node repeated as a pattern. The referenced node stays in
     /// the document, so changing it updates every fill that uses it.
     Pattern {
@@ -181,6 +193,96 @@ pub enum Fill {
         #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
         blend: BlendMode,
     },
+    Shader {
+        shader: Box<ShaderFill>,
+        #[serde(
+            default = "default_opacity",
+            skip_serializing_if = "is_default_opacity"
+        )]
+        opacity: f32,
+        #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+        blend: BlendMode,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoFill {
+    pub asset: AssetId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster: Option<AssetId>,
+    #[serde(default = "default_video_fill_mode")]
+    pub mode: ImageFitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<Box<[f32; 4]>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<f32>,
+    #[serde(default, skip_serializing_if = "ImageAdjust::is_default")]
+    pub adjust: ImageAdjust,
+}
+
+fn default_video_fill_mode() -> ImageFitMode {
+    ImageFitMode::Fill
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShaderFill {
+    pub shader_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<ShaderPropertyAssignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShaderPropertyAssignment {
+    pub definition_id: String,
+    pub value: ShaderPropertyValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ShaderPropertyValue {
+    Boolean(bool),
+    Text(String),
+    Number(f32),
+    AssetId(String),
+    Color(Color),
+    Point([f32; 2]),
+    Line {
+        start: [f32; 2],
+        end: [f32; 2],
+    },
+    Circle {
+        center: [f32; 2],
+        radius: f32,
+    },
+    CirclePoint {
+        center: [f32; 2],
+        radius: f32,
+        angle: f32,
+    },
+    ColorPoint {
+        point: [f32; 2],
+        color: Color,
+        variable_id: Option<String>,
+    },
+    Gradient(Vec<ShaderGradientStop>),
+    VariableAlias {
+        variable_id: String,
+    },
+    Opaque {
+        type_name: String,
+        payload: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShaderGradientStop {
+    pub position: f32,
+    pub color: Color,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variable_id: Option<String>,
 }
 
 /// Placement of a node-backed pattern fill. Spacing is expressed as a
@@ -241,7 +343,11 @@ impl Fill {
     pub fn solid_color(&self) -> Option<Color> {
         match self {
             Self::Solid { color, .. } => Some(*color),
-            Self::Gradient { .. } | Self::Image { .. } | Self::Pattern { .. } => None,
+            Self::Gradient { .. }
+            | Self::Image { .. }
+            | Self::Video { .. }
+            | Self::Pattern { .. }
+            | Self::Shader { .. } => None,
         }
     }
 
@@ -254,7 +360,11 @@ impl Fill {
     pub fn set_solid_color(&mut self, color: Color) {
         match self {
             Self::Solid { color: c, .. } => *c = color,
-            Self::Gradient { .. } | Self::Image { .. } | Self::Pattern { .. } => {
+            Self::Gradient { .. }
+            | Self::Image { .. }
+            | Self::Video { .. }
+            | Self::Pattern { .. }
+            | Self::Shader { .. } => {
                 *self = Self::Solid {
                     color,
                     blend: BlendMode::Normal,
@@ -514,6 +624,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn video_fill_round_trips_source_poster_and_image_controls() {
+        let source = AssetId::new();
+        let poster = AssetId::new();
+        let fill = Fill::Video {
+            video: Box::new(VideoFill {
+                asset: source,
+                poster: Some(poster),
+                mode: ImageFitMode::Tile,
+                crop: Some(Box::new([0.1, 0.2, 0.5, 0.6])),
+                scale: Some(0.8),
+                rotation: Some(90.0),
+                adjust: ImageAdjust {
+                    contrast: 0.3,
+                    ..Default::default()
+                },
+            }),
+            opacity: 0.7,
+            blend: BlendMode::Multiply,
+        };
+        let json = serde_json::to_string(&fill).expect("serialize video paint");
+        assert!(json.contains("\"kind\":\"video\""));
+        assert_eq!(
+            serde_json::from_str::<Fill>(&json).expect("deserialize video paint"),
+            fill
+        );
+
+        let bare = Fill::Video {
+            video: Box::new(VideoFill {
+                asset: source,
+                poster: None,
+                mode: ImageFitMode::Fill,
+                crop: None,
+                scale: None,
+                rotation: None,
+                adjust: ImageAdjust::default(),
+            }),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+        };
+        let json = serde_json::to_string(&bare).expect("serialize default video paint");
+        for key in [
+            "poster", "crop", "scale", "rotation", "adjust", "opacity", "blend",
+        ] {
+            assert!(
+                !json.contains(key),
+                "{key} should have no default payload: {json}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<Fill>(&json).expect("deserialize default video paint"),
+            bare
+        );
+    }
+
+    #[test]
+    fn shader_fill_round_trips_typed_properties() {
+        let fill = Fill::Shader {
+            shader: Box::new(ShaderFill {
+                shader_id: "fanta:shader:halftone".into(),
+                name: "Halftone".into(),
+                properties: vec![
+                    ShaderPropertyAssignment {
+                        definition_id: "columns".into(),
+                        value: ShaderPropertyValue::Number(18.0),
+                    },
+                    ShaderPropertyAssignment {
+                        definition_id: "ink_color".into(),
+                        value: ShaderPropertyValue::Color(Color::BLACK),
+                    },
+                    ShaderPropertyAssignment {
+                        definition_id: "future".into(),
+                        value: ShaderPropertyValue::Opaque {
+                            type_name: "mesh".into(),
+                            payload: "{}".into(),
+                        },
+                    },
+                ],
+            }),
+            opacity: 0.4,
+            blend: BlendMode::Screen,
+        };
+        let json = serde_json::to_string(&fill).expect("serialize shader paint");
+        assert_eq!(
+            serde_json::from_str::<Fill>(&json).expect("deserialize shader paint"),
+            fill
+        );
     }
 
     #[test]

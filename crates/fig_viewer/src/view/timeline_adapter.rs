@@ -126,8 +126,15 @@ impl FigView {
         };
         let item = self.item.read(cx);
         let Some(document) = item.document() else {
+            adapter
+                .panel
+                .update(cx, |panel, cx| panel.set_transport_available(false, cx));
             return;
         };
+        let transport_available = self
+            .active_motion_clip
+            .and_then(|id| document.doc.motion.clip(id))
+            .is_some();
         let clock = self.timeline_shell.read(cx);
         let mut data = shared::TimelineViewData {
             current_time_ms: (clock.playhead_us().max(0) / 1000) as u32,
@@ -148,6 +155,15 @@ impl FigView {
             selected_keyframes: adapter.selected.clone(),
             ..Default::default()
         };
+        if super::properties_inspector::motion_preset_available(&document.doc, item.is_editable()) {
+            data.presets = crate::gpui_adapters::toolbar::motion_animation_styles()
+                .into_iter()
+                .map(|name| shared::TimelinePreset {
+                    id: name.clone(),
+                    name,
+                })
+                .collect();
+        }
         if let Some(clip) = self
             .active_motion_clip
             .and_then(|id| document.doc.motion.clip(id))
@@ -204,6 +220,23 @@ impl FigView {
                     .any(|key| key.id == *id)
             });
         }
+        if !data.presets.is_empty()
+            && let Some(selected) = super::single_selection(&document.doc)
+            && let Some(node) = document.doc.scene.get(selected)
+            && !data
+                .tracks
+                .iter()
+                .any(|track| track.id == selected.to_string())
+        {
+            let mut track = shared::TimelineTrack::new(selected.to_string(), node.name.clone());
+            track.selected = true;
+            track.visible = !node.flags.contains(fanta_doc::NodeFlags::HIDDEN);
+            track.locked = node.flags.contains(fanta_doc::NodeFlags::LOCKED);
+            data.tracks.push(track);
+        }
+        adapter.panel.update(cx, |panel, cx| {
+            panel.set_transport_available(transport_available, cx)
+        });
         if adapter.panel.read(cx).view_data() != &data {
             adapter
                 .panel
@@ -313,7 +346,20 @@ impl FigView {
                     }).collect::<Vec<_>>())
                 }).unwrap_or_default();
                 if operations.is_empty() {
-                    show_canvas_notice("No new keyframes can be added at this time".into(), window, cx);
+                    let has_selected_track = self.active_motion_clip.is_some_and(|clip_id| {
+                        self.item.read(cx).document().is_some_and(|document| {
+                            document.doc.motion.clip(clip_id).is_some_and(|clip| {
+                                clip.tracks.values().any(|track| {
+                                    document.doc.selection.contains(track.target.node)
+                                })
+                            })
+                        })
+                    });
+                    if has_selected_track {
+                        show_canvas_notice("No new keyframes can be added at this time".into(), window, cx);
+                    } else {
+                        self.add_toolbar_keyframe(window, cx);
+                    }
                 } else {
                     self.apply_inspector_operations(operations, "Add keyframes", window, cx);
                 }
@@ -325,7 +371,30 @@ impl FigView {
             Action::CollapsedChanged { .. } | Action::EmptyStateDismissed => {}
             Action::HelpRequested => show_canvas_notice("Drag keys or timing bars to retime. Double-click a layer name to rename it. Use the + beside a property to add a keyframe.".into(), window, cx),
             Action::AutoKeyframeChangeRequested { .. } => notify_unavailable("Auto keyframe recording", window, cx),
-            Action::PresetApplyRequested { .. } | Action::ClipTimingChangeRequested { .. } | Action::CommentAddRequested { .. } | Action::CommentOpenRequested { .. } | Action::AskAgentRequested => notify_unavailable("This timeline action", window, cx),
+            Action::PresetApplyRequested {
+                track_ids,
+                preset_id,
+                ..
+            } => {
+                let can_apply = self.is_editable(cx)
+                    && crate::gpui_adapters::toolbar::motion_animation_styles()
+                        .contains(preset_id)
+                    && self.item.read(cx).document().is_some_and(|document| {
+                        super::properties_inspector::motion_preset_available(&document.doc, true)
+                            && super::single_selection(&document.doc).is_some_and(|selected| {
+                                track_ids.len() == 1
+                                    && track_ids.first().is_some_and(|track| {
+                                        track.as_ref() == selected.to_string().as_str()
+                                    })
+                            })
+                    });
+                if can_apply {
+                    self.motion_sidebar
+                        .update(cx, |panel, cx| panel.apply_inspector_preset(preset_id, cx));
+                    self.sync_motion_timeline(cx);
+                }
+            }
+            Action::ClipTimingChangeRequested { .. } | Action::CommentAddRequested { .. } | Action::CommentOpenRequested { .. } | Action::AskAgentRequested => notify_unavailable("This timeline action", window, cx),
         }
         cx.notify();
     }
@@ -435,5 +504,241 @@ impl FigView {
             }
         }
         operations
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fanta_doc::{
+        AnimationClip, AnimationClipId, CanvasNode, Doc, GroupNode, NodeData, TextNode,
+    };
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use std::path::PathBuf;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+    }
+
+    async fn setup(
+        cx: &mut TestAppContext,
+        with_clip: bool,
+    ) -> (Entity<FigView>, Entity<Timeline>, NodeId, VisualTestContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut target = CanvasNode::new(NodeData::Text(TextNode::new("Target", 120., 40.)));
+        target.parent = Some(page_id);
+        let target_id = target.id;
+        doc.apply(Operation::create_node(target))
+            .expect("create target");
+        doc.selection.select_only(target_id);
+        if with_clip {
+            let clip_id = AnimationClipId::new();
+            doc.motion
+                .clips
+                .insert(clip_id, AnimationClip::new(clip_id, "Entrance", 1_500));
+        }
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Motion-timeline-presets.fig"),
+            doc,
+            cx,
+        );
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| FigView::new(item, project, window, cx));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.set_editor_mode(EditorMode::Motion, cx));
+        cx.run_until_parked();
+        let timeline = view.read_with(cx, |view, _| {
+            view.gpui_timeline
+                .as_ref()
+                .expect("timeline adapter")
+                .panel
+                .clone()
+        });
+        (view, timeline, target_id, cx.clone())
+    }
+
+    #[gpui::test]
+    async fn timeline_transport_requires_an_active_clip(cx: &mut TestAppContext) {
+        let (view, timeline, _, mut cx) = setup(cx, false).await;
+        let cx = &mut cx;
+        assert!(!timeline.read_with(cx, |timeline, _| timeline.transport_available()));
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::AddKeyframeRequested { time_ms: 0 });
+        });
+        cx.run_until_parked();
+
+        assert!(view.read_with(cx, |view, cx| {
+            view.item
+                .read(cx)
+                .document()
+                .is_some_and(|document| !document.doc.motion.clips.is_empty())
+        }));
+        assert!(timeline.read_with(cx, |timeline, _| timeline.transport_available()));
+    }
+
+    #[gpui::test]
+    async fn timeline_presets_author_tracks_and_reject_invalid_requests(cx: &mut TestAppContext) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        let data = timeline.read_with(cx, |timeline, _| timeline.view_data().clone());
+        assert_eq!(data.presets.len(), 5);
+        assert!(
+            data.tracks
+                .iter()
+                .any(|track| track.id == target_id.to_string() && track.selected)
+        );
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::PresetApplyRequested {
+                track_ids: vec![target_id.to_string().into()],
+                preset_id: "Slide in".into(),
+                time_ms: 0,
+            })
+        });
+        cx.run_until_parked();
+
+        let before = view.read_with(cx, |view, cx| {
+            let document = view.item.read(cx).document().expect("document");
+            let clip = document
+                .doc
+                .motion
+                .clips
+                .values()
+                .next()
+                .expect("active clip");
+            clip.tracks.len()
+        });
+        assert!(before > 0, "the first preset should create a timeline row");
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::PresetApplyRequested {
+                track_ids: vec![target_id.to_string().into()],
+                preset_id: "Fade in".into(),
+                time_ms: 0,
+            })
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let document = view.item.read(cx).document().expect("document");
+            let clip = document
+                .doc
+                .motion
+                .clips
+                .values()
+                .next()
+                .expect("active clip");
+            assert!(clip.tracks.len() > before);
+            assert!(clip.tracks.values().any(|track| {
+                track.target.node == target_id
+                    && matches!(
+                        track.target.property,
+                        MotionProperty::Bound {
+                            prop: BoundProp::Opacity
+                        }
+                    )
+            }));
+        });
+
+        let after = view.read_with(cx, |view, cx| {
+            view.item
+                .read(cx)
+                .document()
+                .expect("document")
+                .doc
+                .motion
+                .clips
+                .values()
+                .next()
+                .expect("active clip")
+                .tracks
+                .len()
+        });
+        for (tracks, preset) in [
+            (vec![target_id.to_string().into()], "Unknown"),
+            (vec![NodeId::new().to_string().into()], "Grow"),
+        ] {
+            timeline.update(cx, |_, cx| {
+                cx.emit(Action::PresetApplyRequested {
+                    track_ids: tracks,
+                    preset_id: preset.into(),
+                    time_ms: 0,
+                })
+            });
+            cx.run_until_parked();
+        }
+        view.read_with(cx, |view, cx| {
+            let document = view.item.read(cx).document().expect("document");
+            let clip = document
+                .doc
+                .motion
+                .clips
+                .values()
+                .next()
+                .expect("active clip");
+            assert_eq!(clip.tracks.len(), after);
+        });
+    }
+
+    #[gpui::test]
+    async fn add_keyframe_on_unanimated_timeline_row_creates_opacity_track(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        assert!(timeline.read_with(cx, |timeline, _| {
+            timeline.view_data().tracks.iter().any(|track| {
+                track.id == target_id.to_string() && track.selected && track.properties.is_empty()
+            })
+        }));
+
+        timeline.update(cx, |_, cx| {
+            cx.emit(Action::AddKeyframeRequested { time_ms: 0 });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let document = view.item.read(cx).document().expect("document");
+            let clip = document
+                .doc
+                .motion
+                .clips
+                .values()
+                .next()
+                .expect("active clip");
+            assert!(clip.tracks.values().any(|track| {
+                track.target.node == target_id
+                    && matches!(
+                        track.target.property,
+                        MotionProperty::Bound {
+                            prop: BoundProp::Opacity
+                        }
+                    )
+                    && track
+                        .keyframes
+                        .values()
+                        .any(|keyframe| keyframe.time_ms == 0)
+            }));
+        });
     }
 }

@@ -1577,7 +1577,9 @@ impl FantaPropertiesPanel {
                     match paint {
                         Fill::Gradient { blend: slot, .. }
                         | Fill::Image { blend: slot, .. }
-                        | Fill::Pattern { blend: slot, .. } => {
+                        | Fill::Pattern { blend: slot, .. }
+                        | Fill::Video { blend: slot, .. }
+                        | Fill::Shader { blend: slot, .. } => {
                             *slot = blend;
                         }
                         Fill::Solid { .. } => {}

@@ -65,6 +65,7 @@ fn instance_of_one_rect_master_renders_that_rect() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -128,6 +129,7 @@ fn unclipped_component_root_effect_layer_includes_overflowing_children() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
     let mut renderer = RasterRenderer::new(64, 64).unwrap();
@@ -198,6 +200,7 @@ fn instance_text_override_renders_the_overridden_glyphs() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -239,6 +242,7 @@ fn dangling_instance_draws_a_faint_outline_not_a_blue_block() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -355,6 +359,7 @@ fn derived_instance_preserves_baked_positions_instead_of_reflowing() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -399,6 +404,7 @@ fn instance_expansion_is_memoized_across_frames() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
 
@@ -475,6 +481,7 @@ fn instance_master_root_outside_stroke_escapes_the_instance_box() {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
     let mut r = RasterRenderer::new(64, 64).unwrap();
@@ -563,6 +570,7 @@ fn editing_a_master_repaints_a_plain_instance() {
             mode_generation: 0,
             motion: None,
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         },
     );
@@ -584,6 +592,7 @@ fn editing_a_master_repaints_a_plain_instance() {
             mode_generation: 0,
             motion: None,
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         },
     );

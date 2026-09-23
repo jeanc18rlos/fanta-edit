@@ -233,6 +233,9 @@ pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) ->
                                 }
                                 Fill::Image { opacity, .. } => *opacity = fraction as f32,
                                 Fill::Pattern { opacity, .. } => *opacity = fraction as f32,
+                                Fill::Video { opacity, .. } | Fill::Shader { opacity, .. } => {
+                                    *opacity = fraction as f32
+                                }
                                 Fill::Gradient { .. } => {}
                             }
                         }
@@ -1367,7 +1370,9 @@ pub(crate) fn paint_blend(fill: &Fill) -> BlendMode {
         Fill::Solid { blend, .. }
         | Fill::Gradient { blend, .. }
         | Fill::Image { blend, .. }
-        | Fill::Pattern { blend, .. } => *blend,
+        | Fill::Pattern { blend, .. }
+        | Fill::Video { blend, .. }
+        | Fill::Shader { blend, .. } => *blend,
     }
 }
 
@@ -1429,7 +1434,10 @@ pub(crate) fn convert_paint_kind(
             let color = match paint {
                 Fill::Solid { color, .. } => *color,
                 Fill::Gradient { gradient, .. } => representative_gradient_color(gradient),
-                Fill::Image { .. } | Fill::Pattern { .. } => return,
+                Fill::Image { .. }
+                | Fill::Pattern { .. }
+                | Fill::Video { .. }
+                | Fill::Shader { .. } => return,
             };
             *paint = solid_fill_with_blend(color, blend);
         }
@@ -1443,7 +1451,10 @@ pub(crate) fn convert_paint_kind(
                     &seed_gradient_from_color(*color),
                     gradient_kind,
                 ),
-                Fill::Image { .. } | Fill::Pattern { .. } => return,
+                Fill::Image { .. }
+                | Fill::Pattern { .. }
+                | Fill::Video { .. }
+                | Fill::Shader { .. } => return,
             };
             *paint = Fill::Gradient { gradient, blend };
         }

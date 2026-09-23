@@ -1091,20 +1091,27 @@ impl FantaPrototypePanel {
         reaction: ReactionId,
         current: Option<T>,
         options: &'static [(T, &'static str)],
+        unavailable: &[T],
         apply: fn(&mut Self, NodeId, ReactionId, T, &mut Context<Self>),
         editable: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let panel = cx.weak_entity();
+        let unavailable = unavailable.to_vec();
         let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
             for (value, name) in options {
                 let panel = panel.clone();
                 let value = *value;
+                let disabled = unavailable.contains(&value);
                 menu.push_item(
                     ContextMenuEntry::new(*name)
+                        .disabled(disabled)
                         .toggleable(IconPosition::End, current == Some(value))
                         .handler(move |_, cx| {
+                            if disabled {
+                                return;
+                            }
                             panel
                                 .update(cx, |panel, cx| apply(panel, node, reaction, value, cx))
                                 .log_err();
@@ -1448,6 +1455,12 @@ impl FantaPrototypePanel {
         let trigger = TriggerChoice::from_trigger(&reaction.trigger);
         let action = ActionChoice::from_action(&reaction.action);
         let transition = TransitionChoice::from_transition(reaction.transition.as_ref());
+        let unavailable_actions = self
+            .item
+            .read(cx)
+            .document()
+            .map(|document| unavailable_action_choices(&document.doc, node))
+            .unwrap_or_default();
         let reaction_id = reaction.id;
         let mut card = v_flex()
             .id(reaction_element_id("fanta-prototype-reaction", reaction_id))
@@ -1489,6 +1502,7 @@ impl FantaPrototypePanel {
                     reaction.id,
                     Some(trigger),
                     &TRIGGER_CHOICES,
+                    &[],
                     Self::set_trigger_choice,
                     editable,
                     window,
@@ -1541,6 +1555,7 @@ impl FantaPrototypePanel {
                 reaction.id,
                 action,
                 &ACTION_CHOICES,
+                &unavailable_actions,
                 Self::set_action_choice,
                 editable,
                 window,
@@ -1626,6 +1641,7 @@ impl FantaPrototypePanel {
                     reaction.id,
                     Some(position),
                     &OVERLAY_POSITION_CHOICES,
+                    &[],
                     Self::set_overlay_position,
                     editable,
                     window,
@@ -1700,6 +1716,7 @@ impl FantaPrototypePanel {
                 reaction.id,
                 Some(transition),
                 &TRANSITION_CHOICES,
+                &[],
                 Self::set_transition_choice,
                 editable,
                 window,
@@ -1721,6 +1738,7 @@ impl FantaPrototypePanel {
                         reaction.id,
                         Some(transition.duration_ms),
                         &DURATION_CHOICES,
+                        &[],
                         Self::set_transition_duration,
                         editable,
                         window,
@@ -1742,6 +1760,7 @@ impl FantaPrototypePanel {
                             reaction.id,
                             easing,
                             &EASING_CHOICES,
+                            &[],
                             Self::set_transition_easing,
                             editable,
                             window,
@@ -1761,6 +1780,7 @@ impl FantaPrototypePanel {
                         reaction.id,
                         Some(direction),
                         &DIRECTION_CHOICES,
+                        &[],
                         Self::set_transition_direction,
                         editable,
                         window,
@@ -2009,6 +2029,17 @@ fn action_for_choice(doc: &Doc, node: NodeId, choice: ActionChoice) -> Option<Ac
         ActionChoice::Back => Some(Action::Back),
         ActionChoice::Close => Some(Action::Close),
     }
+}
+
+fn unavailable_action_choices(doc: &Doc, node: NodeId) -> Vec<ActionChoice> {
+    ACTION_CHOICES
+        .into_iter()
+        .filter_map(|(choice, _)| {
+            action_for_choice(doc, node, choice)
+                .is_none()
+                .then_some(choice)
+        })
+        .collect()
 }
 
 fn prototype_variables(doc: &Doc) -> Vec<PrototypeVariable> {
@@ -2623,6 +2654,92 @@ mod tests {
         let second_id = second.id;
         doc.apply(Operation::create_node(second)).unwrap();
         (doc, first_id, second_id)
+    }
+
+    #[gpui::test]
+    async fn action_choices_require_their_targets_before_applying(cx: &mut TestAppContext) {
+        init_test(cx);
+        let mut doc = Doc::new();
+        let first = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        let first_id = first.id;
+        doc.apply(Operation::create_node(first))
+            .expect("create first frame");
+        let reaction_id = ReactionId::new();
+        doc.apply(Operation::AddReaction {
+            node: first_id,
+            reaction: Reaction {
+                id: reaction_id,
+                trigger: Trigger::Click,
+                action: Action::Back,
+                extra_actions: Vec::new(),
+                transition: None,
+                animation: None,
+            },
+        })
+        .expect("add interaction");
+        doc.selection.select_only(first_id);
+        assert_eq!(
+            unavailable_action_choices(&doc, first_id),
+            vec![
+                ActionChoice::Navigate,
+                ActionChoice::OpenOverlay,
+                ActionChoice::ScrollTo,
+                ActionChoice::SetVariable,
+                ActionChoice::UpdateVariant,
+            ]
+        );
+
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeActionAvailability.fanta"),
+            doc,
+            cx,
+        );
+        let panel_item = item.clone();
+        let panel = cx.add_window(move |_, cx| FantaPrototypePanel::new(panel_item, cx));
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_action_choice(first_id, reaction_id, ActionChoice::Navigate, cx);
+            })
+            .expect("try unavailable action");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                reaction_by_id(doc, first_id, reaction_id).map(|reaction| &reaction.action),
+                Some(&Action::Back)
+            );
+        });
+
+        let mut second = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..GroupNode::default()
+        }));
+        second.name = "Second".into();
+        let second_id = second.id;
+        item.update(cx, |item, cx| {
+            item.apply(Operation::create_node(second), cx)
+        })
+        .expect("create destination frame");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert!(!unavailable_action_choices(doc, first_id).contains(&ActionChoice::Navigate));
+        });
+        panel
+            .update(cx, |panel, _, cx| {
+                panel.set_action_choice(first_id, reaction_id, ActionChoice::Navigate, cx);
+            })
+            .expect("select available action");
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(
+                reaction_by_id(doc, first_id, reaction_id).map(|reaction| &reaction.action),
+                Some(&Action::Navigate { to: second_id })
+            );
+        });
     }
 
     #[test]

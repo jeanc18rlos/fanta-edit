@@ -752,6 +752,8 @@ pub(crate) enum HiddenPaintAlpha {
     Gradient(Vec<u8>),
     Image(f32),
     Pattern(f32),
+    Video(f32),
+    Shader(f32),
 }
 
 /// The paint-type choices the fill/stroke type selector cycles through.
@@ -839,6 +841,8 @@ pub(crate) fn page_section(
             Some(Fill::Gradient { .. }) => PageBackgroundValue::Other("Gradient".into()),
             Some(Fill::Image { .. }) => PageBackgroundValue::Other("Image".into()),
             Some(Fill::Pattern { .. }) => PageBackgroundValue::Other("Pattern".into()),
+            Some(Fill::Video { .. }) => PageBackgroundValue::Other("Video".into()),
+            Some(Fill::Shader { .. }) => PageBackgroundValue::Other("Shader".into()),
         }),
         _ => None,
     });
@@ -1718,6 +1722,26 @@ pub(crate) fn paint_snapshot(fill: &Fill, stroke_width: Option<f64>) -> PaintSna
             Some(f64::from(*opacity) * 100.0),
             Some(*blend),
         ),
+        Fill::Video { opacity, blend, .. } => (
+            None,
+            "Video".into(),
+            None,
+            None,
+            Some(f64::from(*opacity) * 100.0),
+            Some(*blend),
+        ),
+        Fill::Shader {
+            shader,
+            opacity,
+            blend,
+        } => (
+            None,
+            shader.name.clone().into(),
+            None,
+            None,
+            Some(f64::from(*opacity) * 100.0),
+            Some(*blend),
+        ),
     };
     PaintSnapshot {
         color,
@@ -1745,6 +1769,7 @@ pub(crate) fn paint_is_visible(fill: &Fill) -> bool {
             .any(|stop| stop.color.a != 0),
         Fill::Image { opacity, .. } => *opacity > 0.0,
         Fill::Pattern { opacity, .. } => *opacity > 0.0,
+        Fill::Video { opacity, .. } | Fill::Shader { opacity, .. } => *opacity > 0.0,
     }
 }
 
@@ -1760,6 +1785,8 @@ pub(crate) fn paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
         ),
         Fill::Image { opacity, .. } => HiddenPaintAlpha::Image(*opacity),
         Fill::Pattern { opacity, .. } => HiddenPaintAlpha::Pattern(*opacity),
+        Fill::Video { opacity, .. } => HiddenPaintAlpha::Video(*opacity),
+        Fill::Shader { opacity, .. } => HiddenPaintAlpha::Shader(*opacity),
     }
 }
 
@@ -1769,6 +1796,7 @@ pub(crate) fn paint_alpha_is_visible(alpha: &HiddenPaintAlpha) -> bool {
         HiddenPaintAlpha::Gradient(stops) => stops.iter().any(|a| *a != 0),
         HiddenPaintAlpha::Image(opacity) => *opacity > 0.0,
         HiddenPaintAlpha::Pattern(opacity) => *opacity > 0.0,
+        HiddenPaintAlpha::Video(opacity) | HiddenPaintAlpha::Shader(opacity) => *opacity > 0.0,
     }
 }
 
@@ -1779,6 +1807,8 @@ pub(crate) fn zeroed_paint_alpha(fill: &Fill) -> HiddenPaintAlpha {
         HiddenPaintAlpha::Gradient(stops) => HiddenPaintAlpha::Gradient(vec![0; stops.len()]),
         HiddenPaintAlpha::Image(_) => HiddenPaintAlpha::Image(0.0),
         HiddenPaintAlpha::Pattern(_) => HiddenPaintAlpha::Pattern(0.0),
+        HiddenPaintAlpha::Video(_) => HiddenPaintAlpha::Video(0.0),
+        HiddenPaintAlpha::Shader(_) => HiddenPaintAlpha::Shader(0.0),
     }
 }
 
@@ -1790,6 +1820,8 @@ pub(crate) fn opaque_paint_alpha(alpha: &HiddenPaintAlpha) -> HiddenPaintAlpha {
         HiddenPaintAlpha::Gradient(stops) => HiddenPaintAlpha::Gradient(vec![255; stops.len()]),
         HiddenPaintAlpha::Image(_) => HiddenPaintAlpha::Image(1.0),
         HiddenPaintAlpha::Pattern(_) => HiddenPaintAlpha::Pattern(1.0),
+        HiddenPaintAlpha::Video(_) => HiddenPaintAlpha::Video(1.0),
+        HiddenPaintAlpha::Shader(_) => HiddenPaintAlpha::Shader(1.0),
     }
 }
 
@@ -1808,6 +1840,8 @@ pub(crate) fn set_paint_alpha(fill: &mut Fill, alpha: &HiddenPaintAlpha) {
         }
         (Fill::Image { opacity, .. }, HiddenPaintAlpha::Image(value)) => *opacity = *value,
         (Fill::Pattern { opacity, .. }, HiddenPaintAlpha::Pattern(value)) => *opacity = *value,
+        (Fill::Video { opacity, .. }, HiddenPaintAlpha::Video(value)) => *opacity = *value,
+        (Fill::Shader { opacity, .. }, HiddenPaintAlpha::Shader(value)) => *opacity = *value,
         _ => {}
     }
 }

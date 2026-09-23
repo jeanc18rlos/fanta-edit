@@ -415,6 +415,7 @@ pub(crate) fn render_inputs(document: &Doc) -> RenderInputs<'_> {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     }
 }

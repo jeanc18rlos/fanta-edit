@@ -12,6 +12,7 @@ use super::{
     RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry, Viewport, render_node,
     surfaces, to_sk_color, visible_world_rect,
 };
+use fanta_doc::AssetId;
 
 /// Errors returned by the renderer.
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +165,9 @@ pub struct RenderInputs<'a> {
     /// playing / for headless renders. Read by the audio + video content arms to
     /// draw the playhead / progress bar. See [`MediaPlayback`].
     pub playback: Option<&'a std::collections::HashMap<NodeId, MediaPlayback>>,
+    /// Decoded video-fill frames keyed by their source asset. A node may carry
+    /// several video paints, so these cannot share the node playback key.
+    pub video_fill_frames: Option<&'a std::collections::HashMap<AssetId, skia_safe::Image>>,
     /// Whether the app is in dark appearance — lets theme-aware node content
     /// (the audio waveform card) pick a card fill + accent that read on the
     /// active theme instead of a hardcoded dark pill. Defaults to `false`
@@ -197,6 +201,7 @@ impl<'a> RenderInputs<'a> {
             mode_generation: 0,
             motion: None,
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         }
     }
@@ -217,6 +222,7 @@ impl<'a> RenderInputs<'a> {
             mode_generation: 0,
             motion: None,
             playback: None,
+            video_fill_frames: None,
             dark_ui: false,
         }
     }
@@ -1364,6 +1370,7 @@ impl RasterRenderer {
             layer_cache,
             layer_cache_lookups: false,
             layer_cache_populate: false,
+            live_video_fill_subtrees: IdHashMap::default(),
             layer_volatile: false,
             metrics: &mut metrics,
         };
@@ -1496,6 +1503,7 @@ impl RasterRenderer {
             layer_cache,
             layer_cache_lookups,
             layer_cache_populate: layer_cache_lookups && layer_cache_populate,
+            live_video_fill_subtrees: IdHashMap::default(),
             layer_volatile: false,
             metrics,
         };
